@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Notes on running a small, calm web service for a decade — FeatherReader</title>
+  <link rel="stylesheet" href="feather.css" />
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      ["theme", "state", "overlay"].forEach(function (k) {
+        var v = q.get(k);
+        if (v) document.documentElement.dataset[k] = v;
+      });
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <div class="shell" id="shell">
+
+    <!-- Mobile top bar: back to list + context -->
+    <header class="topbar">
+      <a class="icon-btn" href="list.html" aria-label="Back to unread">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 5l-7 7 7 7"/>
+        </svg>
+      </a>
+      <h1 class="topbar-title">Simon Willison</h1>
+      <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+              aria-expanded="false" aria-controls="rail">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16"/>
+        </svg>
+      </button>
+    </header>
+
+    <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
+
+    <!-- Rail (persistent at >=900px, drawer on mobile) -->
+    <nav class="rail" id="rail" aria-label="Feeds">
+      <div class="rail-head">
+        <a class="brand" href="list.html">
+          <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+            <path d="M16 8 5 19"/>
+          </svg>
+          <span>FeatherReader</span>
+        </a>
+        <button class="icon-btn rail-close" id="rail-close" aria-label="Close navigation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+
+      <div class="rail-scroll">
+        <div class="filter" role="group" aria-label="Filter entries">
+          <a class="filter-opt" href="#">All</a>
+          <a class="filter-opt" href="#" aria-current="page">Unread</a>
+          <a class="filter-opt" href="#">Starred</a>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Tech</h2>
+          <ul class="feed-list">
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">Julia Evans</span><span class="feed-count">3</span></a></li>
+            <li><a class="feed-link has-unread" href="#" aria-current="page"><span class="feed-name">Simon Willison</span><span class="feed-count">7</span></a></li>
+            <li><a class="feed-link" href="#"><span class="feed-name">Dan Luu</span></a></li>
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">The Pragmatic Engineer</span><span class="feed-count">2</span></a></li>
+          </ul>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Essays</h2>
+          <ul class="feed-list">
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">Craig Mod</span><span class="feed-count">1</span></a></li>
+            <li><a class="feed-link" href="#"><span class="feed-name">Robin Rendle</span></a></li>
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">The Marginalian</span><span class="feed-count">11</span></a></li>
+          </ul>
+        </div>
+
+        <div class="rail-tools">
+          <a class="rail-tool" href="add-feed.html">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            Manage feeds
+          </a>
+        </div>
+      </div>
+
+      <p class="kbd-hint">Press <kbd>?</kbd> for keyboard shortcuts</p>
+
+      <div class="identity">
+        <span class="avatar" aria-hidden="true">js</span>
+        <span class="identity-meta">
+          <span class="identity-handle">@justin-stanley.com</span>
+          <span class="identity-note">your feeds live in your PDS</span>
+        </span>
+        <button class="btn-quiet" type="submit" form="signout">Sign out</button>
+        <form id="signout" method="post" action="/logout" hidden></form>
+      </div>
+    </nav>
+
+    <!-- Article -->
+    <main class="content" id="content">
+      <article class="article">
+        <header class="article-head">
+          <p class="article-eyebrow">
+            <span class="feed">Simon Willison</span>
+            <span aria-hidden="true">·</span>
+            <time datetime="2026-07-12T08:20:00Z">July 12, 2026</time>
+          </p>
+          <h1 class="article-title">Notes on running a small, calm web service for a decade</h1>
+          <p class="article-byline">
+            8 min read ·
+            <a href="https://example.com/decade-of-calm" rel="noopener noreferrer nofollow"
+               target="_blank">example.com</a>
+          </p>
+        </header>
+
+        <!-- .prose wraps ammonia-sanitized feed HTML -->
+        <div class="prose">
+          <p>Ten years ago I deployed a small web service on a five-dollar VPS and promised
+          myself I would keep it alive for a decade. Last month it quietly crossed that line.
+          Nobody noticed, which is the highest compliment infrastructure can receive.</p>
+
+          <p>What follows is not a heroic story. It is a list of the things that actually
+          mattered, most of which I would not have guessed at the start — and almost none of
+          which involve the application code.</p>
+
+          <h2>The code was never the problem</h2>
+
+          <p>In ten years I made forty-one deploys. Six of them fixed bugs; the rest were
+          <a href="#">dependency updates</a> and two migrations. The application itself — a few
+          thousand lines behind a reverse proxy — has been the most reliable component of the
+          whole system by an enormous margin.</p>
+
+          <blockquote>
+            <p>The half-life of enthusiasm is shorter than the half-life of software.
+            Design for the person who has stopped caring, because in year seven, that
+            person is you.</p>
+          </blockquote>
+
+          <p>What broke instead, in descending order of drama: TLS certificates (twice,
+          before ACME), a full disk (log rotation I <em>swore</em> I had configured), and
+          a hosting provider acquisition that required an evening of migration.</p>
+
+          <h2>Boring choices compound</h2>
+
+          <p>Every technology choice was made with one question: <strong>will this still be
+          maintained when I am not paying attention?</strong> That ruled out most of what was
+          exciting in 2016, and the survivors look almost embarrassingly plain:</p>
+
+          <ul>
+            <li>One static binary, supervised by the init system — nothing to orchestrate.</li>
+            <li>SQLite, backed up nightly with a single <code>sqlite3 .backup</code> call.</li>
+            <li>Plain-text logs, rotated, greppable at 3 a.m. with no dashboard between us.</li>
+          </ul>
+
+          <p>The whole restore procedure fits in a shell script that has aged better than
+          most of my opinions:</p>
+
+          <pre><code>#!/bin/sh
+# restore.sh — the entire disaster-recovery plan
+scp backup:/srv/backups/app-$(date +%F).db ./app.db
+./app --db ./app.db --listen :8080</code></pre>
+
+          <p>There is a lesson in the fact that the script is nine lines and the runbook for
+          the Kubernetes cluster at my day job is nine pages.</p>
+
+          <h2>Calm is a budget you spend</h2>
+
+          <p>The service costs me about forty minutes a year now. That number is the product
+          of every boring decision above, and it is the only metric I still track. Uptime is
+          a lagging indicator; <em>attention spent</em> is the leading one.</p>
+
+          <p>If you are starting something small this weekend: pick the dull database, write
+          the nine-line restore script, and set a calendar reminder for 2036. The web needs
+          more services that simply, quietly, keep working.</p>
+        </div>
+      </article>
+
+      <!-- Action bar: fixed bottom (thumb zone) on mobile, floating pill on desktop -->
+      <nav class="actionbar" aria-label="Entry actions">
+        <a class="icon-btn" href="#" aria-label="Previous entry (k)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 5l-7 7 7 7"/>
+          </svg>
+        </a>
+        <button class="icon-btn actionbar-read" aria-pressed="true"
+                aria-label="Read — toggle unread (m)"
+                hx-post="/entries/1/read" hx-swap="none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 12.5l5 5L20 6.5"/>
+          </svg>
+        </button>
+        <button class="icon-btn actionbar-star" aria-pressed="false" aria-label="Star entry (s)"
+                hx-post="/entries/1/star" hx-swap="none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+          </svg>
+        </button>
+        <a class="icon-btn" href="https://example.com/decade-of-calm" target="_blank"
+           rel="noopener noreferrer nofollow" aria-label="Open original (o)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 5h5v5M19 5l-8 8M9 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/>
+          </svg>
+        </a>
+        <a class="icon-btn" href="#" aria-label="Next entry (j)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 5l7 7-7 7"/>
+          </svg>
+        </a>
+      </nav>
+    </main>
+  </div>
+
+  <!-- Keyboard shortcuts overlay -->
+  <div class="kbd-overlay" id="kbd-overlay" role="dialog" aria-modal="true"
+       aria-labelledby="kbd-title">
+    <div class="kbd-card">
+      <h2 id="kbd-title">Keyboard shortcuts</h2>
+      <dl>
+        <dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Next / previous entry</dd>
+        <dt><kbd>o</kbd></dt><dd>Open original</dd>
+        <dt><kbd>m</kbd></dt><dd>Toggle read</dd>
+        <dt><kbd>s</kbd></dt><dd>Star / unstar</dd>
+        <dt><kbd>A</kbd></dt><dd>Mark all read</dd>
+        <dt><kbd>?</kbd></dt><dd>This overlay</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close</dd>
+      </dl>
+      <button class="btn kbd-close" id="kbd-close">Close</button>
+    </div>
+  </div>
+
+  <script src="keyboard.js" defer></script>
+</body>
+</html>
