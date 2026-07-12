@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+
+{% block title %}Manage feeds — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell" id="shell">
+
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back to unread">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">Manage feeds</h1>
+    <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+            aria-expanded="false" aria-controls="rail">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h16"/>
+      </svg>
+    </button>
+  </header>
+
+  <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
+
+  {% include "rail.html" %}
+
+  <main class="content" id="content">
+    <div class="manage">
+      <h1>Manage feeds</h1>
+
+      {% if !flash.is_empty() %}
+        <p class="flash" role="status">{{ flash }}</p>
+      {% endif %}
+
+      <!-- Add a feed -->
+      <section class="manage-section" aria-labelledby="add-h">
+        <h2 id="add-h">Add a feed</h2>
+        <form class="add-feed-form" method="post" action="/subscriptions">
+          <label class="visually-hidden" for="feed-url">Feed or site URL</label>
+          <input class="input" id="feed-url" name="url" type="url" inputmode="url"
+                 placeholder="Paste a feed or site URL…" required />
+          {% if !folder_options.is_empty() %}
+            <label class="visually-hidden" for="folder-pick">Folder</label>
+            <select class="select" id="folder-pick" name="folder">
+              <option value="">No folder</option>
+              {% for f in folder_options %}
+                <option value="{{ f.uri }}">{{ f.name }}</option>
+              {% endfor %}
+            </select>
+          {% endif %}
+          <button class="btn btn-primary" type="submit">
+            Subscribe
+            <span class="htmx-indicator spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+        <p class="form-hint">A site URL works too — FeatherReader discovers the feed.</p>
+        <p class="pds-note">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 3l7 4v5c0 4.4-3 7.4-7 9-4-1.6-7-4.6-7-9V7z"/>
+          </svg>
+          Saved to <strong>your PDS</strong> as a <code>community.lexicon.rss.subscription</code> record — portable to any reader.
+        </p>
+      </section>
+
+      <!-- New folder -->
+      <section class="manage-section" aria-labelledby="folder-h">
+        <h2 id="folder-h">New folder</h2>
+        <form class="add-feed-form" method="post" action="/folders">
+          <label class="visually-hidden" for="folder-name">Folder name</label>
+          <input class="input" id="folder-name" name="name" type="text"
+                 placeholder="Folder name…" required />
+          <button class="btn" type="submit">Create folder</button>
+        </form>
+      </section>
+
+      <!-- Your feeds -->
+      <section class="manage-section" aria-labelledby="feeds-h">
+        <h2 id="feeds-h">Your feeds</h2>
+
+        {% if folders.is_empty() && loose_feeds.is_empty() %}
+          <p class="form-hint">No subscriptions yet. Add a feed above.</p>
+        {% endif %}
+
+        {% for folder in folders %}
+          <div class="manage-folder">
+            <div class="manage-folder-head">
+              <h3 class="manage-folder-name">{{ folder.name }}</h3>
+              <details class="folder-menu">
+                <summary class="btn-quiet">Rename</summary>
+                <form method="post" action="/folders/{{ folder.rkey }}/rename" class="inline-form">
+                  <input class="input" type="text" name="name" value="{{ folder.name }}" required />
+                  <button class="btn-quiet" type="submit">Save</button>
+                </form>
+              </details>
+              <form method="post" action="/folders/{{ folder.rkey }}/delete" class="inline-form">
+                <button class="btn-quiet btn-danger-quiet" type="submit">Delete folder</button>
+              </form>
+            </div>
+            {% if !folder.feeds.is_empty() %}
+              <ul class="manage-list">
+                {% for feed in folder.feeds %}
+                  {% include "manage_row.html" %}
+                {% endfor %}
+              </ul>
+            {% endif %}
+          </div>
+        {% endfor %}
+
+        {% if !loose_feeds.is_empty() %}
+          <div class="manage-folder">
+            <div class="manage-folder-head">
+              <h3 class="manage-folder-name">Feeds</h3>
+            </div>
+            <ul class="manage-list">
+              {% for feed in loose_feeds %}
+                {% include "manage_row.html" %}
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+      </section>
+
+      <!-- OPML -->
+      <section class="manage-section" aria-labelledby="opml-h">
+        <h2 id="opml-h">OPML</h2>
+        <div class="opml-row">
+          <form method="post" action="/opml" enctype="multipart/form-data" class="inline-form">
+            <label class="visually-hidden" for="opml-file">OPML file</label>
+            <input id="opml-file" name="file" type="file"
+                   accept=".opml,.xml,text/xml,text/x-opml" />
+            <button class="btn" type="submit">Import OPML</button>
+          </form>
+          <a class="btn" href="/opml/export" download="featherreader-subscriptions.opml">Export OPML</a>
+          <p class="opml-note">
+            Import writes one subscription record per feed into your PDS.
+            Export is always available — leaving must be as easy as arriving.
+          </p>
+        </div>
+
+        <details class="opml-paste">
+          <summary class="btn-quiet">…or paste OPML text</summary>
+          <form method="post" action="/opml" enctype="multipart/form-data" class="opml-paste-form">
+            <label class="visually-hidden" for="opml">OPML text</label>
+            <textarea class="input" id="opml" name="opml" rows="4"
+                      placeholder="&lt;opml&gt;…&lt;/opml&gt;"></textarea>
+            <button class="btn" type="submit">Import text</button>
+          </form>
+        </details>
+      </section>
+    </div>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+
+{% include "overlay.html" %}
+{% endblock %}

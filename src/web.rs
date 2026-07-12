@@ -69,6 +69,13 @@ mod opml;
 /// The name of the signed session cookie.
 const SESSION_COOKIE: &str = "fr_session";
 
+/// The canonical AGPL-3.0 source repository — surfaced in the footer, the
+/// sign-in pitch, and `/about` (design §4.6, cloud plan public-experiment UI).
+const REPO_URL: &str = "https://github.com/justin-stanley/feather-reader";
+
+/// The tip / support link (cloud plan public-experiment UI).
+const KOFI_URL: &str = "https://ko-fi.com/justinstanley";
+
 /// The resolved identity for the current request.
 ///
 /// `did` is the primary key for all per-user local state; `handle` is display
@@ -107,6 +114,8 @@ fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/about", get(about))
+        .route("/manage", get(manage))
         .route("/", get(index))
         .route("/entries/{id}", get(entry_view))
         .route("/entries/{id}/read", post(mark_read))
@@ -135,6 +144,17 @@ pub fn router(state: AppState) -> Router {
 /// `GET /health` — a cheap liveness probe returning `200 ok` + the crate version.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, format!("ok featherreader/{VERSION}\n"))
+}
+
+/// `GET /about` — the public-experiment page: the full disclaimer (experimental,
+/// no SLA, may pause anytime), the OSS / self-host pitch, and the tip link. A
+/// static render; readable whether or not a session exists.
+async fn about() -> Response {
+    render(&AboutTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -185,30 +205,69 @@ struct FolderOption {
     name: String,
 }
 
+/// The shared navigation "rail" model (design §4.1): the same DOM element is the
+/// mobile drawer and the desktop sidebar, so every chrome page (list / reader /
+/// manage) renders it from this one struct. Feed management lives on `/manage`,
+/// not here — the rail is navigation only.
+struct Nav {
+    /// `@handle` for the identity chip (falls back to the DID's tail).
+    handle: String,
+    /// Two-letter avatar initials for the identity chip.
+    avatar: String,
+    /// The active filter: `"unread" | "all" | "starred"` (drives `aria-current`).
+    view: String,
+    /// The scope query suffix (`feed=…` / `folder=…`) carried onto filter links,
+    /// empty for the unscoped "everything" views.
+    scope_qs: String,
+    /// Folders (each with its feeds) then un-foldered feeds, for the rail lists.
+    /// Per-feed `selected` flags drive the rail's feed `aria-current`.
+    folders: Vec<FolderView>,
+    loose_feeds: Vec<FeedView>,
+    /// Whether the "Manage feeds" rail tool is the current page.
+    manage_active: bool,
+}
+
 /// The reader index (`GET /`).
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
     version: &'static str,
-    did: String,
-    handle: Option<String>,
+    repo_url: &'static str,
+    kofi_url: &'static str,
     flash: String,
-    /// Sidebar: folders (each with its feeds) then un-foldered feeds.
-    folders: Vec<FolderView>,
-    loose_feeds: Vec<FeedView>,
-    /// All folders as move-targets for the per-feed folder select.
-    folder_options: Vec<FolderOption>,
+    /// The shared rail (drawer + desktop sidebar) navigation model.
+    nav: Nav,
     /// The article list for the selected scope + view.
     entries: Vec<EntryRow>,
     /// The list heading (the selected view/feed/folder name).
     heading: String,
-    /// The active view: `"unread" | "all" | "starred"`.
-    view: String,
-    /// The active scope query string suffix to preserve across links/forms,
-    /// e.g. `feed=https%3A%2F%2F…` or `folder=at%3A%2F%2F…`, empty for "all".
-    scope_qs: String,
     /// Whether a feed scope is active (enables per-feed mark-all-read).
     feed_scope: Option<String>,
+}
+
+/// The feed-management page (`GET /manage`) — subscribe / your-feeds / OPML.
+#[derive(Template)]
+#[template(path = "manage.html")]
+struct ManageTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+    flash: String,
+    nav: Nav,
+    /// All folders as move-targets for the subscribe folder select.
+    folder_options: Vec<FolderOption>,
+    /// Folders (each with feeds) + loose feeds, for the "Your feeds" list.
+    folders: Vec<FolderView>,
+    loose_feeds: Vec<FeedView>,
+}
+
+/// The public-experiment `/about` page — disclaimer + OSS pitch + tip link.
+#[derive(Template)]
+#[template(path = "about.html")]
+struct AboutTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
 }
 
 /// The single-entry reader view (`GET /entries/:id`).
@@ -216,8 +275,9 @@ struct IndexTemplate {
 #[template(path = "entry.html")]
 struct EntryTemplate {
     version: &'static str,
-    did: String,
-    handle: Option<String>,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+    nav: Nav,
     id: i64,
     title: String,
     feed_title: String,
@@ -245,9 +305,7 @@ struct EntryRowTemplate {
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginTemplate {
-    version: &'static str,
-    did: String,
-    handle: Option<String>,
+    repo_url: &'static str,
     error: String,
 }
 
@@ -297,6 +355,34 @@ fn display_title(title: Option<&str>, url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| url.to_string())
+}
+
+/// A display `@handle` for the identity chip: the stored handle if present,
+/// else the tail of the DID so the chip is never empty.
+fn display_handle(handle: Option<&str>, did: &str) -> String {
+    match handle {
+        Some(h) if !h.trim().is_empty() => format!("@{}", h.trim().trim_start_matches('@')),
+        _ => did.rsplit(':').next().unwrap_or(did).to_string(),
+    }
+}
+
+/// Two-letter, lowercase avatar initials from a handle/DID (design §4.1).
+fn avatar_initials(handle: Option<&str>, did: &str) -> String {
+    let source = handle
+        .map(|h| h.trim().trim_start_matches('@'))
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| did.rsplit(':').next().unwrap_or(did));
+    let letters: String = source
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_lowercase();
+    if letters.is_empty() {
+        "fr".to_string()
+    } else {
+        letters
+    }
 }
 
 /// Trim a stored RFC3339 timestamp down to the `YYYY-MM-DD` date for calm,
@@ -421,11 +507,6 @@ async fn index(
     let pool = &state.db;
 
     let subs = resolve_subscriptions(&state, &did).await;
-    let folders = state
-        .sidecar
-        .list_folders_sorted(&did)
-        .await
-        .unwrap_or_default();
 
     // Per-DID working sets, once.
     let unread = store::get_unread_for_did(pool, &did).await?;
@@ -542,73 +623,12 @@ async fn index(
         })
         .collect();
 
-    // Build the sidebar. Unread count per feed uses the unread working set.
-    let unread_count = |feed_id: Option<i64>| -> i64 {
-        match feed_id {
-            Some(id) => unread.iter().filter(|e| e.feed_id == id).count() as i64,
-            None => 0,
-        }
-    };
-
     let selected_feed = q.feed.as_deref();
     let selected_folder = q.folder.as_deref();
 
-    let mk_feed_view = |s: &ResolvedSub| FeedView {
-        rkey: s.rkey.clone(),
-        url: s.sub.url.clone(),
-        title: display_title(
-            s.sub
-                .title
-                .as_deref()
-                .or(s.feed.as_ref().and_then(|f| f.title.as_deref())),
-            &s.sub.url,
-        ),
-        unread: unread_count(s.feed.as_ref().map(|f| f.id)),
-        selected: selected_feed == Some(s.sub.url.as_str()),
-    };
-
-    let mut folder_views = Vec::with_capacity(folders.len());
-    for (rkey, folder) in &folders {
-        let uri = folder_uri(&did, rkey);
-        let feeds: Vec<FeedView> = subs
-            .iter()
-            .filter(|s| s.sub.folder.as_deref() == Some(uri.as_str()))
-            .map(mk_feed_view)
-            .collect();
-        folder_views.push(FolderView {
-            rkey: rkey.clone(),
-            uri: uri.clone(),
-            name: folder.name.clone(),
-            feeds,
-            selected: selected_folder == Some(uri.as_str()),
-        });
-    }
-
-    // Un-foldered feeds: those whose `folder` ref is None or unknown.
-    let known_uris: std::collections::HashSet<String> =
-        folders.iter().map(|(r, _)| folder_uri(&did, r)).collect();
-    let loose_feeds: Vec<FeedView> = subs
-        .iter()
-        .filter(|s| {
-            s.sub
-                .folder
-                .as_deref()
-                .map(|f| !known_uris.contains(f))
-                .unwrap_or(true)
-        })
-        .map(mk_feed_view)
-        .collect();
-
-    let folder_options: Vec<FolderOption> = folders
-        .iter()
-        .map(|(rkey, folder)| {
-            let uri = folder_uri(&did, rkey);
-            FolderOption {
-                name: folder.name.clone(),
-                uri,
-            }
-        })
-        .collect();
+    // Build the shared sidebar (folders + loose feeds, with unread counts).
+    let (folder_views, loose_feeds, _folder_options) =
+        build_sidebar(&state, &did, &subs, selected_feed, selected_folder).await;
 
     // Heading + scope query-string suffix.
     let (heading, scope_qs) = if let Some(feed_url) = selected_feed {
@@ -642,21 +662,91 @@ async fn index(
         (h.to_string(), String::new())
     };
 
+    let feed_scope = selected_feed.map(str::to_string);
+    let nav = build_nav(&user, &view, scope_qs, folder_views, loose_feeds, false);
+
     let tmpl = IndexTemplate {
         version: VERSION,
-        did,
-        handle: user.handle,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
         flash: q.flash.unwrap_or_default(),
-        folders: folder_views,
-        loose_feeds,
-        folder_options,
+        nav,
         entries,
         heading,
-        feed_scope: selected_feed.map(str::to_string),
-        view,
-        scope_qs,
+        feed_scope,
     };
     Ok(render(&tmpl))
+}
+
+/// Query for `GET /manage` — carries an optional flash after an action redirect.
+#[derive(Debug, Deserialize, Default)]
+struct ManageQuery {
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+/// `GET /manage` — the feed-management page (design §4.5). Renders the rail plus
+/// the subscribe / your-feeds / OPML surfaces; the forms POST to the existing
+/// Phase-2 routes unchanged (`/subscriptions`, `/folders`, `/opml`, …). A
+/// read/render route only — no new mutation logic.
+async fn manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ManageQuery>,
+) -> Result<Response, WebError> {
+    let user = match current_session(&state, &headers) {
+        Some(u) => u,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let did = user.did.clone();
+
+    let subs = resolve_subscriptions(&state, &did).await;
+    let (folder_views, loose_feeds, folder_options) =
+        build_sidebar(&state, &did, &subs, None, None).await;
+
+    // Clone the sidebar for the rail; the page body reuses folders/loose feeds.
+    let nav = build_nav(
+        &user,
+        "unread",
+        String::new(),
+        folder_views.iter().map(clone_folder_view).collect(),
+        loose_feeds.iter().map(clone_feed_view).collect(),
+        true,
+    );
+
+    let tmpl = ManageTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+        flash: q.flash.unwrap_or_default(),
+        nav,
+        folder_options,
+        folders: folder_views,
+        loose_feeds,
+    };
+    Ok(render(&tmpl))
+}
+
+/// Shallow clone helpers so `/manage` can hand the same sidebar to both the rail
+/// (`Nav`) and the page body without an extra DB round-trip.
+fn clone_feed_view(f: &FeedView) -> FeedView {
+    FeedView {
+        rkey: f.rkey.clone(),
+        url: f.url.clone(),
+        title: f.title.clone(),
+        unread: f.unread,
+        selected: f.selected,
+    }
+}
+
+fn clone_folder_view(f: &FolderView) -> FolderView {
+    FolderView {
+        rkey: f.rkey.clone(),
+        uri: f.uri.clone(),
+        name: f.name.clone(),
+        feeds: f.feeds.iter().map(clone_feed_view).collect(),
+        selected: f.selected,
+    }
 }
 
 /// The set of feed URLs a scope covers: `Some([one url])` for a single-feed
@@ -683,6 +773,108 @@ fn scope_urls_for(
 /// The `at://` URI for a folder record given the owner DID + rkey.
 fn folder_uri(did: &str, rkey: &str) -> String {
     format!("at://{did}/{}/{rkey}", lexicon::nsid::FOLDER)
+}
+
+/// Build the sidebar folder/loose-feed views (with per-feed unread counts) for a
+/// DID — the shared source for both the reader index and the rail on every
+/// chrome page. `selected_feed` / `selected_folder` drive `aria-current`.
+async fn build_sidebar(
+    state: &AppState,
+    did: &str,
+    subs: &[ResolvedSub],
+    selected_feed: Option<&str>,
+    selected_folder: Option<&str>,
+) -> (Vec<FolderView>, Vec<FeedView>, Vec<FolderOption>) {
+    let pool = &state.db;
+    let unread = store::get_unread_for_did(pool, did)
+        .await
+        .unwrap_or_default();
+    let folders = state
+        .sidecar
+        .list_folders_sorted(did)
+        .await
+        .unwrap_or_default();
+
+    let unread_count = |feed_id: Option<i64>| -> i64 {
+        match feed_id {
+            Some(id) => unread.iter().filter(|e| e.feed_id == id).count() as i64,
+            None => 0,
+        }
+    };
+    let mk_feed_view = |s: &ResolvedSub| FeedView {
+        rkey: s.rkey.clone(),
+        url: s.sub.url.clone(),
+        title: display_title(
+            s.sub
+                .title
+                .as_deref()
+                .or(s.feed.as_ref().and_then(|f| f.title.as_deref())),
+            &s.sub.url,
+        ),
+        unread: unread_count(s.feed.as_ref().map(|f| f.id)),
+        selected: selected_feed == Some(s.sub.url.as_str()),
+    };
+
+    let mut folder_views = Vec::with_capacity(folders.len());
+    for (rkey, folder) in &folders {
+        let uri = folder_uri(did, rkey);
+        let feeds: Vec<FeedView> = subs
+            .iter()
+            .filter(|s| s.sub.folder.as_deref() == Some(uri.as_str()))
+            .map(mk_feed_view)
+            .collect();
+        folder_views.push(FolderView {
+            rkey: rkey.clone(),
+            uri: uri.clone(),
+            name: folder.name.clone(),
+            feeds,
+            selected: selected_folder == Some(uri.as_str()),
+        });
+    }
+
+    let known_uris: std::collections::HashSet<String> =
+        folders.iter().map(|(r, _)| folder_uri(did, r)).collect();
+    let loose_feeds: Vec<FeedView> = subs
+        .iter()
+        .filter(|s| {
+            s.sub
+                .folder
+                .as_deref()
+                .map(|f| !known_uris.contains(f))
+                .unwrap_or(true)
+        })
+        .map(mk_feed_view)
+        .collect();
+
+    let folder_options: Vec<FolderOption> = folders
+        .iter()
+        .map(|(rkey, folder)| FolderOption {
+            name: folder.name.clone(),
+            uri: folder_uri(did, rkey),
+        })
+        .collect();
+
+    (folder_views, loose_feeds, folder_options)
+}
+
+/// Assemble the shared rail [`Nav`] for a chrome page.
+fn build_nav(
+    user: &CurrentUser,
+    view: &str,
+    scope_qs: String,
+    folders: Vec<FolderView>,
+    loose_feeds: Vec<FeedView>,
+    manage_active: bool,
+) -> Nav {
+    Nav {
+        handle: display_handle(user.handle.as_deref(), &user.did),
+        avatar: avatar_initials(user.handle.as_deref(), &user.did),
+        view: view.to_string(),
+        scope_qs,
+        folders,
+        loose_feeds,
+        manage_active,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,10 +924,29 @@ async fn entry_view(
 
     let back_qs = scope_query(&q);
 
+    // Rail: the same navigation as the list, in the reader's scope.
+    let subs = resolve_subscriptions(&state, &did).await;
+    let (folder_views, loose_feeds, _) =
+        build_sidebar(&state, &did, &subs, q.feed.as_deref(), q.folder.as_deref()).await;
+    let nav_view = match q.view.as_deref() {
+        Some("all") => "all",
+        Some("starred") => "starred",
+        _ => "unread",
+    };
+    let nav = build_nav(
+        &user,
+        nav_view,
+        back_qs.clone(),
+        folder_views,
+        loose_feeds,
+        false,
+    );
+
     let tmpl = EntryTemplate {
         version: VERSION,
-        did,
-        handle: user.handle,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+        nav,
         id: entry.id,
         title: entry
             .title
@@ -1306,9 +1517,7 @@ async fn login_form(State(state): State<AppState>, Query(q): Query<LoginQuery>) 
         return start_oauth(&state, &handle);
     }
     render(&LoginTemplate {
-        version: VERSION,
-        did: String::new(),
-        handle: None,
+        repo_url: REPO_URL,
         error: q.error.unwrap_or_default(),
     })
 }
@@ -1404,9 +1613,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// Re-render the login form with an error banner.
 fn login_error(msg: &str) -> Response {
     render(&LoginTemplate {
-        version: VERSION,
-        did: String::new(),
-        handle: None,
+        repo_url: REPO_URL,
         error: msg.to_string(),
     })
 }

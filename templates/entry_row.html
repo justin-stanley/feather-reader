@@ -1,11 +1,13 @@
-<li class="entry-row{% if e.read %} is-read{% endif %}" id="entry-{{ e.id }}">
-  <a class="entry-link" href="{{ e.link }}">
+<li class="entry{% if e.read %} is-read{% endif %}" id="entry-{{ e.id }}">
+  <a class="entry-main" href="{{ e.link }}">
     <span class="entry-title">{{ e.title }}</span>
     <span class="entry-meta">
       {% if !e.feed_title.is_empty() %}<span class="entry-feed">{{ e.feed_title }}</span>{% endif %}
-      {% if !e.published.is_empty() %}<span class="entry-date">{{ e.published }}</span>{% endif %}
+      {% if !e.feed_title.is_empty() && !e.published.is_empty() %}<span class="sep" aria-hidden="true">·</span>{% endif %}
+      {% if !e.published.is_empty() %}<time class="entry-time" datetime="{{ e.published }}">{{ e.published }}</time>{% endif %}
     </span>
   </a>
+
   <div class="entry-actions">
     <form
       class="star-form"
@@ -18,13 +20,17 @@
       <input type="hidden" name="starred" value="{% if e.starred %}false{% else %}true{% endif %}" />
       <button
         type="submit"
-        class="star{% if e.starred %} is-starred{% endif %}"
-        title="{% if e.starred %}Unstar{% else %}Star{% endif %}"
-        aria-label="{% if e.starred %}Unstar{% else %}Star{% endif %}"
+        class="star-btn"
+        aria-pressed="{% if e.starred %}true{% else %}false{% endif %}"
+        aria-label="{% if e.starred %}Unstar entry (s){% else %}Star entry (s){% endif %}"
       >
-        {% if e.starred %}★{% else %}☆{% endif %}
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+        </svg>
       </button>
     </form>
+
     <form
       class="mark-read-form"
       method="post"
@@ -34,7 +40,7 @@
       hx-swap="outerHTML"
     >
       <input type="hidden" name="read" value="{% if e.read %}false{% else %}true{% endif %}" />
-      <button type="submit" class="mark-read">
+      <button type="submit" class="mark-read visually-hidden">
         {% if e.read %}Mark unread{% else %}Mark read{% endif %}
       </button>
     </form>

@@ -1,0 +1,78 @@
+<nav class="rail" id="rail" aria-label="Feeds">
+  <div class="rail-head">
+    <a class="brand" href="/">
+      <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+        <path d="M16 8 5 19"/>
+      </svg>
+      <span>FeatherReader</span>
+    </a>
+    <button class="icon-btn rail-close" id="rail-close" aria-label="Close navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+
+  <div class="rail-scroll">
+    <div class="filter" role="group" aria-label="Filter entries">
+      <a class="filter-opt" href="/{% if nav.scope_qs.is_empty() %}?view=all{% else %}?{{ nav.scope_qs }}&view=all{% endif %}"
+         {% if nav.view == "all" %}aria-current="page"{% endif %}>All</a>
+      <a class="filter-opt" href="/{% if nav.scope_qs.is_empty() %}{% else %}?{{ nav.scope_qs }}{% endif %}"
+         {% if nav.view == "unread" %}aria-current="page"{% endif %}>Unread</a>
+      <a class="filter-opt" href="/{% if nav.scope_qs.is_empty() %}?view=starred{% else %}?{{ nav.scope_qs }}&view=starred{% endif %}"
+         {% if nav.view == "starred" %}aria-current="page"{% endif %}>Starred</a>
+    </div>
+
+    {% for folder in nav.folders %}
+      <div class="folder">
+        <h2 class="folder-name">
+          <a class="folder-link" href="/?folder={{ folder.uri|urlencode }}&view={{ nav.view }}"
+             {% if folder.selected %}aria-current="page"{% endif %}>{{ folder.name }}</a>
+        </h2>
+        {% if !folder.feeds.is_empty() %}
+          <ul class="feed-list">
+            {% for feed in folder.feeds %}
+              {% include "feed_item.html" %}
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </div>
+    {% endfor %}
+
+    {% if !nav.loose_feeds.is_empty() %}
+      <div class="folder">
+        <h2 class="folder-name">Feeds</h2>
+        <ul class="feed-list">
+          {% for feed in nav.loose_feeds %}
+            {% include "feed_item.html" %}
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+
+    {% if nav.folders.is_empty() && nav.loose_feeds.is_empty() %}
+      <p class="kbd-hint">No subscriptions yet. <a href="/manage">Add a feed →</a></p>
+    {% endif %}
+
+    <div class="rail-tools">
+      <a class="rail-tool" href="/manage"{% if nav.manage_active %} aria-current="page"{% endif %}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        Manage feeds
+      </a>
+    </div>
+  </div>
+
+  <p class="kbd-hint">Press <kbd>?</kbd> for keyboard shortcuts</p>
+
+  <div class="identity">
+    <span class="avatar" aria-hidden="true">{{ nav.avatar }}</span>
+    <span class="identity-meta">
+      <span class="identity-handle">{{ nav.handle }}</span>
+      <span class="identity-note">your feeds live in your PDS</span>
+    </span>
+    <button class="btn-quiet" type="submit" form="signout">Sign out</button>
+    <form id="signout" method="post" action="/logout" hidden></form>
+  </div>
+</nav>

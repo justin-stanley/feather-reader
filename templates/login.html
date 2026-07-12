@@ -1,32 +1,46 @@
 {% extends "base.html" %}
 
-{% block title %}Log in — FeatherReader{% endblock %}
+{% block title %}Sign in — FeatherReader{% endblock %}
 
-{% block content %}
-<section class="login">
-  <h1>Log in with atproto</h1>
-  <p class="muted">
-    Your subscriptions and read-state live in <strong>your</strong> PDS, not here.
-    Log in with your handle to bring them with you.
-  </p>
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <svg class="auth-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+      <path d="M16 8 5 19"/>
+    </svg>
 
-  {% if !error.is_empty() %}
-    <p class="flash error" role="alert">{{ error }}</p>
-  {% endif %}
+    <h1 class="auth-name">FeatherReader</h1>
+    <p class="auth-tag">read, quietly</p>
 
-  <form class="login-form" method="post" action="/login">
-    <label for="handle">Handle</label>
-    <input id="handle" name="handle" type="text" placeholder="alice.bsky.social" autocomplete="username" required />
+    {% if !error.is_empty() %}
+      <p class="flash error" role="alert">{{ error }}</p>
+    {% endif %}
 
-    <button type="submit">Continue</button>
-  </form>
+    <form class="auth-form" method="post" action="/login">
+      <label for="handle">Your atproto handle</label>
+      <input class="input" id="handle" name="handle" type="text"
+             placeholder="alice.bsky.social" autocomplete="username"
+             autocapitalize="none" autocorrect="off" spellcheck="false" required />
+      <button class="btn btn-primary" type="submit">
+        Continue
+        <span class="htmx-indicator spinner" aria-hidden="true"></span>
+      </button>
+    </form>
 
-  <p class="note muted">
-    This is the real atproto <strong>OAuth</strong> flow: you'll be sent to your
-    own PDS (Bluesky or a self-hosted server) to approve access — FeatherReader
-    never sees your password. A small <code>@atproto/oauth-client</code> sidecar
-    handles the handshake (resolve → PAR → PKCE → DPoP + token refresh); this app
-    only holds a signed session keyed by your DID.
-  </p>
-</section>
+    <p class="auth-why">
+      <strong>No signup. No password. No account here at all.</strong>
+      Your atproto identity is your account — you'll approve access on your own
+      server (Bluesky, or a PDS you host) via the real atproto <strong>OAuth</strong>
+      flow, and FeatherReader never sees your password. Your subscriptions, folders,
+      stars, and read-state are stored as open-standard records in <strong>your</strong>
+      PDS, portable to any reader that speaks <code>community.lexicon.rss.*</code>.
+    </p>
+
+    <p class="auth-foot">
+      Open source · <a href="{{ repo_url }}" rel="noopener noreferrer">AGPL-3.0</a> · self-hostable
+    </p>
+  </div>
+</main>
 {% endblock %}

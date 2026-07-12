@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}About — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell" id="shell">
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">About</h1>
+    <span class="icon-btn" aria-hidden="true"></span>
+  </header>
+
+  <main class="content" id="content">
+    <div class="about">
+      <h1>FeatherReader is a calm, quiet reader — and a public experiment.</h1>
+
+      <p class="about-lede">
+        A typography-first RSS reader for people who left algorithmic feeds on
+        purpose. Read, quietly.
+      </p>
+
+      <h2>This is an experiment</h2>
+      <p>
+        FeatherReader is run as a public experiment with <strong>no service-level
+        agreement and no uptime guarantee</strong>. It may change, break, slow down,
+        or be paused at any time, without notice. Please don't rely on it as your
+        only reader — treat it as something to try, not something to depend on.
+      </p>
+
+      <h2>Your data lives in your PDS</h2>
+      <p>
+        There is no account here. You sign in with your own atproto identity, and
+        your subscriptions, folders, stars, and read-state are written as
+        open-standard <code>community.lexicon.rss.*</code> records in
+        <strong>your own PDS</strong> — not on this server. Because your data is
+        yours and portable, you can walk away at any time and take it with you.
+        OPML export is always available, because leaving must be as easy as arriving.
+      </p>
+
+      <h2>Open source &amp; self-hostable</h2>
+      <p>
+        FeatherReader is free software under the
+        <a href="{{ repo_url }}" rel="noopener noreferrer">AGPL-3.0</a>. You can read
+        the code, file issues, or run your own copy — a single static binary plus a
+        small OAuth sidecar. If you'd rather not depend on this instance, self-hosting
+        is a first-class path.
+      </p>
+
+      <h2>Support the experiment</h2>
+      <p>
+        If FeatherReader is useful to you and you'd like to help keep it running,
+        you can <a class="tip-link" href="{{ kofi_url }}" rel="noopener noreferrer">leave a tip ♥</a>.
+        It's a solo project; there's no obligation, and the reader stays free either way.
+      </p>
+    </div>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+{% endblock %}
