@@ -22,7 +22,14 @@ use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{ConnectOptions, FromRow, Row};
 use std::str::FromStr;
-use time::OffsetDateTime;
+
+use crate::config::Config;
+
+/// The SQLite connection pool type the rest of the crate refers to as
+/// [`Pool`]. A thin alias over [`SqlitePool`] so [`crate::AppState`] and the web
+/// layer name one stable type; if the backend ever changes, this is the single
+/// place to swap it.
+pub type Pool = SqlitePool;
 
 /// A cached syndication feed, shared across all DIDs that subscribe to its URL.
 ///
@@ -178,11 +185,23 @@ CREATE TABLE IF NOT EXISTS read_cursor (
 CREATE INDEX IF NOT EXISTS idx_read_cursor_dirty ON read_cursor (did, dirty);
 "#;
 
-/// RFC3339 timestamp for "now" (UTC), used as the default for `*_at` columns.
+/// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
+/// `*_at` columns. Uses `chrono` to match the shape written by [`crate::feed`]
+/// and [`crate::web`] (one timestamp format across the whole crate).
 fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Open the per-DID SQLite cache described by [`Config`] (its `db_path`), run
+/// schema creation, and return the pool.
+///
+/// This is the entrypoint `main` calls: it derives the sqlx SQLite URL from the
+/// configured filesystem path and delegates to [`init_url`]. Kept separate from
+/// [`init_url`] so tests can open an in-memory database directly.
+pub async fn init(config: &Config) -> Result<Pool> {
+    // sqlx wants a `sqlite://<path>` URL; build it from the configured path.
+    let db_url = format!("sqlite://{}", config.db_path.display());
+    init_url(&db_url).await
 }
 
 /// Open (creating if needed) the SQLite database at `db_url`, run schema
@@ -192,7 +211,7 @@ fn now_rfc3339() -> String {
 /// `sqlite::memory:` for an ephemeral in-memory database. The file is created
 /// if it does not exist; WAL journaling is enabled for on-disk databases and
 /// foreign keys are enforced on every connection.
-pub async fn init(db_url: &str) -> Result<SqlitePool> {
+pub async fn init_url(db_url: &str) -> Result<Pool> {
     let mut opts = SqliteConnectOptions::from_str(db_url)
         .with_context(|| format!("invalid sqlite url: {db_url}"))?
         .create_if_missing(true)
@@ -521,7 +540,7 @@ mod tests {
     /// Init an in-memory SQLite, insert a feed + entries, read them back.
     #[tokio::test]
     async fn init_insert_readback() -> Result<()> {
-        let pool = init("sqlite::memory:").await?;
+        let pool = init_url("sqlite::memory:").await?;
 
         // Insert a feed.
         let feed_id = upsert_feed(
