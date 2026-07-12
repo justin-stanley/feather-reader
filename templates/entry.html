@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} — FeatherReader{% endblock %}
+
+{% block content %}
+<article class="article">
+  <nav class="article-nav">
+    <a href="/" class="back">← Unread</a>
+  </nav>
+
+  <header class="article-head">
+    <h1 class="article-title">{{ title }}</h1>
+    <p class="article-meta">
+      {% if !feed_title.is_empty() %}<span class="article-feed">{{ feed_title }}</span>{% endif %}
+      {% if let Some(a) = author %}<span class="article-author">{{ a }}</span>{% endif %}
+      {% if !published.is_empty() %}<span class="article-date">{{ published }}</span>{% endif %}
+    </p>
+    {% if let Some(u) = url %}
+      <p class="article-source"><a href="{{ u }}" rel="noopener noreferrer nofollow" target="_blank">View original ↗</a></p>
+    {% endif %}
+  </header>
+
+  <div class="article-body">
+    {% if let Some(html) = content_html %}
+      {{ html|safe }}
+    {% else %}
+      <p class="muted">This entry has no stored content. Open the original above.</p>
+    {% endif %}
+  </div>
+
+  <footer class="article-foot">
+    <form
+      method="post"
+      action="/entries/{{ id }}/read"
+      hx-post="/entries/{{ id }}/read"
+      hx-target="this"
+      hx-swap="none"
+    >
+      <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
+      <button type="submit" class="mark-read">
+        {% if read %}Mark unread{% else %}Mark read{% endif %}
+      </button>
+    </form>
+    <a href="/" class="back">← Back to unread</a>
+  </footer>
+</article>
+{% endblock %}

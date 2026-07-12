@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}Log in — FeatherReader{% endblock %}
+
+{% block content %}
+<section class="login">
+  <h1>Log in with atproto</h1>
+  <p class="muted">
+    Your subscriptions and read-state live in <strong>your</strong> PDS, not here.
+    Log in with your handle to bring them with you.
+  </p>
+
+  {% if !error.is_empty() %}
+    <p class="flash error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  <form class="login-form" method="post" action="/login">
+    <label for="handle">Handle</label>
+    <input id="handle" name="handle" type="text" placeholder="alice.bsky.social" autocomplete="username" required />
+
+    <label for="app_password">App password</label>
+    <input id="app_password" name="app_password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="current-password" required />
+
+    <button type="submit">Log in</button>
+  </form>
+
+  <p class="note muted">
+    <strong>Interim auth (Phase 0):</strong> this uses an atproto
+    <em>app password</em> via <code>com.atproto.server.createSession</code>.
+    The real login is the atproto <strong>OAuth confidential-client</strong>
+    flow (handle → DID → PDS, DPoP, token refresh), handled by a small
+    <code>@atproto/oauth-client</code> sidecar — a documented TODO, not yet wired.
+    Never enter your main account password here.
+  </p>
+</section>
+{% endblock %}
