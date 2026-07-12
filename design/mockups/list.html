@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Unread — FeatherReader</title>
+  <link rel="stylesheet" href="feather.css" />
+  <script>
+    /* Mockup-only: deterministic screenshots via ?theme=dark|light,
+       ?state=empty, ?overlay=1. The real app sets data-theme server-side. */
+    (function () {
+      var q = new URLSearchParams(location.search);
+      ["theme", "state", "overlay"].forEach(function (k) {
+        var v = q.get(k);
+        if (v) document.documentElement.dataset[k] = v;
+      });
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <div class="shell" id="shell">
+
+    <!-- Mobile top bar (hidden at >=900px) -->
+    <header class="topbar">
+      <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+              aria-expanded="false" aria-controls="rail">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16"/>
+        </svg>
+      </button>
+      <h1 class="topbar-title">Unread <span class="topbar-count">24</span></h1>
+      <button class="icon-btn" aria-label="Mark all read"
+              hx-post="/entries/mark-all-read" hx-target="#content" hx-swap="innerHTML">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 13l4 4L15 9"/><path d="M9 13l4 4 8-8"/>
+        </svg>
+      </button>
+    </header>
+
+    <!-- Scrim behind the mobile drawer -->
+    <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
+
+    <!-- Rail: drawer on mobile, persistent at >=900px -->
+    <nav class="rail" id="rail" aria-label="Feeds">
+      <div class="rail-head">
+        <a class="brand" href="list.html">
+          <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+            <path d="M16 8 5 19"/>
+          </svg>
+          <span>FeatherReader</span>
+        </a>
+        <button class="icon-btn rail-close" id="rail-close" aria-label="Close navigation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+
+      <div class="rail-scroll">
+        <div class="filter" role="group" aria-label="Filter entries">
+          <a class="filter-opt" href="#">All</a>
+          <a class="filter-opt" href="#" aria-current="page">Unread</a>
+          <a class="filter-opt" href="#">Starred</a>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Tech</h2>
+          <ul class="feed-list">
+            <li>
+              <a class="feed-link has-unread" href="#">
+                <span class="feed-name">Julia Evans</span>
+                <span class="feed-count">3</span>
+              </a>
+            </li>
+            <li>
+              <a class="feed-link has-unread" href="#" aria-current="page">
+                <span class="feed-name">Simon Willison</span>
+                <span class="feed-count">7</span>
+              </a>
+            </li>
+            <li>
+              <a class="feed-link" href="#">
+                <span class="feed-name">Dan Luu</span>
+              </a>
+            </li>
+            <li>
+              <a class="feed-link has-unread" href="#">
+                <span class="feed-name">The Pragmatic Engineer</span>
+                <span class="feed-count">2</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Essays</h2>
+          <ul class="feed-list">
+            <li>
+              <a class="feed-link has-unread" href="#">
+                <span class="feed-name">Craig Mod</span>
+                <span class="feed-count">1</span>
+              </a>
+            </li>
+            <li>
+              <a class="feed-link" href="#">
+                <span class="feed-name">Robin Rendle</span>
+              </a>
+            </li>
+            <li>
+              <a class="feed-link has-unread" href="#">
+                <span class="feed-name">The Marginalian</span>
+                <span class="feed-count">11</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Feeds</h2>
+          <ul class="feed-list">
+            <li>
+              <a class="feed-link" href="#">
+                <span class="feed-name">Low-tech Magazine</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+
+        <div class="rail-tools">
+          <a class="rail-tool" href="add-feed.html">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            Manage feeds
+          </a>
+        </div>
+      </div>
+
+      <p class="kbd-hint">Press <kbd>?</kbd> for keyboard shortcuts</p>
+
+      <div class="identity">
+        <span class="avatar" aria-hidden="true">js</span>
+        <span class="identity-meta">
+          <span class="identity-handle">@justin-stanley.com</span>
+          <span class="identity-note">your feeds live in your PDS</span>
+        </span>
+        <button class="btn-quiet" type="submit" form="signout">Sign out</button>
+        <form id="signout" method="post" action="/logout" hidden></form>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="content" id="content">
+      <div class="content-head">
+        <h1 class="content-title">Unread</h1>
+        <span class="content-count">24 entries</span>
+        <span class="content-spacer"></span>
+        <button class="btn-quiet"
+                hx-post="/entries/mark-all-read" hx-target="#content" hx-swap="innerHTML">
+          Mark all read
+        </button>
+      </div>
+
+      <ul class="entry-list" id="entry-list">
+
+        <li class="entry is-cursor" id="entry-1">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">Notes on running a small, calm web service for a decade</span>
+            <span class="entry-snippet">What actually breaks over ten years isn't the code — it's certificates, disks, and your own enthusiasm. Some notes on building for the long quiet haul.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">Simon Willison</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-12T08:20:00Z">2h</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="false" aria-label="Star entry"
+                  hx-post="/entries/1/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry" id="entry-2">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">The disappearing art of the personal blogroll</span>
+            <span class="entry-snippet">Before algorithms decided what you read next, people did. A look at how blogrolls worked as a web of trust, and why the RSS revival is quietly bringing them back.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">Robin Rendle</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-12T05:41:00Z">5h</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="true" aria-label="Unstar entry"
+                  hx-post="/entries/2/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry" id="entry-3">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">Walking Tokyo's Nakasendō, one photograph at a time</span>
+            <span class="entry-snippet">Day four: rain on cedar, a kissaten with exactly three seats, and the particular silence of a post town at 6 a.m.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">Craig Mod</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-11T22:10:00Z">12h</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="false" aria-label="Star entry"
+                  hx-post="/entries/3/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry is-read" id="entry-4">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">How SQLite runs the world's quietest databases</span>
+            <span class="entry-snippet">A single file, no server, and more deployments than every other database combined. On the engineering culture behind the most boring software alive.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">Julia Evans</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-11T15:02:00Z">19h</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="false" aria-label="Star entry"
+                  hx-post="/entries/4/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry" id="entry-5">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">A solar-powered website, three years on</span>
+            <span class="entry-snippet">Our server has been offline for a cumulative nineteen days since 2023 — and that's fine. What a weather-dependent website taught us about acceptable downtime.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">Low-tech Magazine</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-11T09:30:00Z">1d</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="false" aria-label="Star entry"
+                  hx-post="/entries/5/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry is-read" id="entry-6">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">Emily Dickinson's herbarium and the taxonomy of attention</span>
+            <span class="entry-snippet">Decades before the poems, a teenage Dickinson pressed 424 flowers into a leather album — a masterclass in the art of noticing.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">The Marginalian</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-10T20:15:00Z">2d</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="true" aria-label="Unstar entry"
+                  hx-post="/entries/6/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+        <li class="entry" id="entry-7">
+          <a class="entry-main" href="reader.html">
+            <span class="entry-title">Why your feed reader should do less</span>
+            <span class="entry-snippet">Every feature is a small tax on calm. An argument for readers that subtract: no recommendations, no rules engines, no unread-count anxiety mechanics.</span>
+            <span class="entry-meta">
+              <span class="entry-feed">The Pragmatic Engineer</span>
+              <span class="sep" aria-hidden="true">·</span>
+              <time class="entry-time" datetime="2026-07-10T11:00:00Z">2d</time>
+            </span>
+          </a>
+          <button class="star-btn" aria-pressed="false" aria-label="Star entry"
+                  hx-post="/entries/7/star" hx-swap="outerHTML">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+            </svg>
+          </button>
+        </li>
+
+      </ul>
+
+      <!-- Empty state (shown when the list is empty; forced with ?state=empty) -->
+      <div class="empty">
+        <svg class="empty-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+          <path d="M16 8 5 19"/>
+        </svg>
+        <h2 class="empty-title">All caught up</h2>
+        <p class="empty-note">Nothing unread. The quiet is the point.</p>
+      </div>
+
+      <div class="list-actions">
+        <button class="btn"
+                hx-post="/entries/mark-all-read" hx-target="#content" hx-swap="innerHTML">
+          Mark all read
+          <span class="htmx-indicator spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <!-- Keyboard shortcuts overlay -->
+  <div class="kbd-overlay" id="kbd-overlay" role="dialog" aria-modal="true"
+       aria-labelledby="kbd-title">
+    <div class="kbd-card">
+      <h2 id="kbd-title">Keyboard shortcuts</h2>
+      <dl>
+        <dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Next / previous entry</dd>
+        <dt><kbd>o</kbd></dt><dd>Open entry</dd>
+        <dt><kbd>m</kbd></dt><dd>Toggle read</dd>
+        <dt><kbd>s</kbd></dt><dd>Star / unstar</dd>
+        <dt><kbd>A</kbd></dt><dd>Mark all read</dd>
+        <dt><kbd>?</kbd></dt><dd>This overlay</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close</dd>
+      </dl>
+      <button class="btn kbd-close" id="kbd-close">Close</button>
+    </div>
+  </div>
+
+  <script src="keyboard.js" defer></script>
+</body>
+</html>

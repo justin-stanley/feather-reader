@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Sign in — FeatherReader</title>
+  <link rel="stylesheet" href="feather.css" />
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      ["theme", "state", "overlay"].forEach(function (k) {
+        var v = q.get(k);
+        if (v) document.documentElement.dataset[k] = v;
+      });
+    })();
+  </script>
+</head>
+<body>
+  <main class="auth">
+    <div class="auth-card">
+      <svg class="auth-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+        <path d="M16 8 5 19"/>
+      </svg>
+
+      <h1 class="auth-name">FeatherReader</h1>
+      <p class="auth-tag">read, quietly</p>
+
+      <form class="auth-form" method="post" action="/login">
+        <label for="handle">Your atproto handle</label>
+        <input class="input" id="handle" name="handle" type="text"
+               placeholder="alice.bsky.social" autocomplete="username"
+               autocapitalize="none" autocorrect="off" spellcheck="false" required />
+        <button class="btn btn-primary" type="submit">
+          Continue
+          <span class="htmx-indicator spinner" aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <p class="auth-why">
+        <strong>No signup. No password. No account here at all.</strong>
+        Your atproto identity is your account — you'll approve access on your own
+        server (Bluesky, or a PDS you host), and FeatherReader never sees your
+        password. Your subscriptions, folders, stars, and read-state are stored as
+        open-standard records in <strong>your</strong> PDS, portable to any reader
+        that speaks <code>community.lexicon.rss.*</code>.
+      </p>
+
+      <p class="auth-foot">
+        Open source · <a href="https://github.com/justin-stanley/feather-reader"
+        rel="noopener noreferrer">AGPL-3.0</a> · self-hostable
+      </p>
+    </div>
+  </main>
+</body>
+</html>

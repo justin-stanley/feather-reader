@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Manage feeds — FeatherReader</title>
+  <link rel="stylesheet" href="feather.css" />
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      ["theme", "state", "overlay"].forEach(function (k) {
+        var v = q.get(k);
+        if (v) document.documentElement.dataset[k] = v;
+      });
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <div class="shell" id="shell">
+
+    <header class="topbar">
+      <a class="icon-btn" href="list.html" aria-label="Back to unread">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 5l-7 7 7 7"/>
+        </svg>
+      </a>
+      <h1 class="topbar-title">Manage feeds</h1>
+      <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+              aria-expanded="false" aria-controls="rail">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16"/>
+        </svg>
+      </button>
+    </header>
+
+    <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
+
+    <nav class="rail" id="rail" aria-label="Feeds">
+      <div class="rail-head">
+        <a class="brand" href="list.html">
+          <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+            <path d="M16 8 5 19"/>
+          </svg>
+          <span>FeatherReader</span>
+        </a>
+        <button class="icon-btn rail-close" id="rail-close" aria-label="Close navigation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+
+      <div class="rail-scroll">
+        <div class="filter" role="group" aria-label="Filter entries">
+          <a class="filter-opt" href="#">All</a>
+          <a class="filter-opt" href="#">Unread</a>
+          <a class="filter-opt" href="#">Starred</a>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Tech</h2>
+          <ul class="feed-list">
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">Julia Evans</span><span class="feed-count">3</span></a></li>
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">Simon Willison</span><span class="feed-count">7</span></a></li>
+            <li><a class="feed-link" href="#"><span class="feed-name">Dan Luu</span></a></li>
+          </ul>
+        </div>
+
+        <div class="folder">
+          <h2 class="folder-name">Essays</h2>
+          <ul class="feed-list">
+            <li><a class="feed-link has-unread" href="#"><span class="feed-name">Craig Mod</span><span class="feed-count">1</span></a></li>
+            <li><a class="feed-link" href="#"><span class="feed-name">Robin Rendle</span></a></li>
+          </ul>
+        </div>
+
+        <div class="rail-tools">
+          <a class="rail-tool" href="add-feed.html" aria-current="page">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            Manage feeds
+          </a>
+        </div>
+      </div>
+
+      <p class="kbd-hint">Press <kbd>?</kbd> for keyboard shortcuts</p>
+
+      <div class="identity">
+        <span class="avatar" aria-hidden="true">js</span>
+        <span class="identity-meta">
+          <span class="identity-handle">@justin-stanley.com</span>
+          <span class="identity-note">your feeds live in your PDS</span>
+        </span>
+        <button class="btn-quiet" type="submit" form="signout">Sign out</button>
+        <form id="signout" method="post" action="/logout" hidden></form>
+      </div>
+    </nav>
+
+    <main class="content" id="content">
+      <div class="manage">
+        <h1>Manage feeds</h1>
+
+        <!-- Add a feed -->
+        <section class="manage-section" aria-labelledby="add-h">
+          <h2 id="add-h">Add a feed</h2>
+          <form class="add-feed-form" method="post" action="/subscriptions/discover"
+                hx-post="/subscriptions/discover" hx-target="#discovered" hx-swap="outerHTML">
+            <label class="visually-hidden" for="feed-url">Feed or site URL</label>
+            <input class="input" id="feed-url" name="url" type="url" inputmode="url"
+                   placeholder="Paste a feed or site URL…" required />
+            <button class="btn btn-primary" type="submit">
+              Find
+              <span class="htmx-indicator spinner" aria-hidden="true"></span>
+            </button>
+          </form>
+          <p class="form-hint">A site URL works too — FeatherReader discovers the feed.</p>
+
+          <!-- Discovered result (htmx swaps this in) -->
+          <div class="discovered" id="discovered">
+            <span class="discovered-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round">
+                <path d="M5 11a8 8 0 0 1 8 8M5 5a14 14 0 0 1 14 14"/>
+                <circle cx="6" cy="18" r="1.4" fill="currentColor" stroke="none"/>
+              </svg>
+            </span>
+            <div class="discovered-meta">
+              <p class="discovered-title">Dan Luu</p>
+              <p class="discovered-url">https://danluu.com/atom.xml</p>
+            </div>
+            <div class="discovered-actions">
+              <label class="visually-hidden" for="folder-pick">Folder</label>
+              <select class="select" id="folder-pick" name="folder">
+                <option>No folder</option>
+                <option selected>Tech</option>
+                <option>Essays</option>
+              </select>
+              <button class="btn btn-primary"
+                      hx-post="/subscriptions" hx-target="#discovered" hx-swap="outerHTML">
+                Subscribe
+              </button>
+            </div>
+            <p class="pds-note">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                <path d="M12 3l7 4v5c0 4.4-3 7.4-7 9-4-1.6-7-4.6-7-9V7z"/>
+              </svg>
+              Saved to <strong>your PDS</strong> as a <code>community.lexicon.rss.subscription</code> record — portable to any reader.
+            </p>
+          </div>
+        </section>
+
+        <!-- Your feeds -->
+        <section class="manage-section" aria-labelledby="feeds-h">
+          <h2 id="feeds-h">Your feeds</h2>
+
+          <div class="manage-folder">
+            <div class="manage-folder-head">
+              <h3 class="manage-folder-name">Tech</h3>
+              <button class="btn-quiet">Rename</button>
+              <button class="btn-quiet btn-danger-quiet">Delete folder</button>
+            </div>
+            <ul class="manage-list">
+              <li class="manage-row">
+                <span class="manage-row-meta">
+                  <span class="manage-row-title">Julia Evans</span>
+                  <span class="manage-row-url">https://jvns.ca/atom.xml</span>
+                </span>
+                <button class="btn-quiet">Rename</button>
+                <button class="btn-quiet btn-danger-quiet"
+                        hx-delete="/subscriptions/1" hx-target="closest li" hx-swap="outerHTML">
+                  Unsubscribe
+                </button>
+              </li>
+              <li class="manage-row">
+                <span class="manage-row-meta">
+                  <span class="manage-row-title">Simon Willison</span>
+                  <span class="manage-row-url">https://simonwillison.net/atom/everything/</span>
+                </span>
+                <button class="btn-quiet">Rename</button>
+                <button class="btn-quiet btn-danger-quiet"
+                        hx-delete="/subscriptions/2" hx-target="closest li" hx-swap="outerHTML">
+                  Unsubscribe
+                </button>
+              </li>
+            </ul>
+          </div>
+
+          <div class="manage-folder">
+            <div class="manage-folder-head">
+              <h3 class="manage-folder-name">Essays</h3>
+              <button class="btn-quiet">Rename</button>
+              <button class="btn-quiet btn-danger-quiet">Delete folder</button>
+            </div>
+            <ul class="manage-list">
+              <li class="manage-row">
+                <span class="manage-row-meta">
+                  <span class="manage-row-title">Craig Mod</span>
+                  <span class="manage-row-url">https://craigmod.com/index.xml</span>
+                </span>
+                <button class="btn-quiet">Rename</button>
+                <button class="btn-quiet btn-danger-quiet"
+                        hx-delete="/subscriptions/3" hx-target="closest li" hx-swap="outerHTML">
+                  Unsubscribe
+                </button>
+              </li>
+              <li class="manage-row">
+                <span class="manage-row-meta">
+                  <span class="manage-row-title">The Marginalian</span>
+                  <span class="manage-row-url">https://www.themarginalian.org/feed/</span>
+                </span>
+                <button class="btn-quiet">Rename</button>
+                <button class="btn-quiet btn-danger-quiet"
+                        hx-delete="/subscriptions/4" hx-target="closest li" hx-swap="outerHTML">
+                  Unsubscribe
+                </button>
+              </li>
+            </ul>
+          </div>
+        </section>
+
+        <!-- OPML -->
+        <section class="manage-section" aria-labelledby="opml-h">
+          <h2 id="opml-h">OPML</h2>
+          <div class="opml-row">
+            <form method="post" action="/opml/import" enctype="multipart/form-data">
+              <label class="visually-hidden" for="opml-file">OPML file</label>
+              <input id="opml-file" name="opml" type="file" accept=".opml,.xml" hidden />
+              <button class="btn" type="button"
+                      onclick="document.getElementById('opml-file').click()">
+                Import OPML…
+              </button>
+            </form>
+            <a class="btn" href="/opml/export" download="featherreader.opml">Export OPML</a>
+            <p class="opml-note">
+              Import writes one subscription record per feed into your PDS.
+              Export is always available — leaving must be as easy as arriving.
+            </p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="keyboard.js" defer></script>
+</body>
+</html>
