@@ -121,9 +121,7 @@ impl AppState {
     /// [`crate::config::SidecarConfig`], and starts with an empty session
     /// registry. The binary's `main` calls this after opening the store.
     pub fn new(config: Config, db: Pool) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
         let sidecar = SidecarClient::new(
             http.clone(),
             config.sidecar.public_url.clone(),
@@ -147,5 +145,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Being a polite, identifiable client is a feed-hygiene requirement (§5 of the
 /// design): publishers ask readers to say who they are so they can be reached or
 /// rate-limited sanely rather than silently blocked.
-pub const USER_AGENT: &str =
-    concat!("featherreader/", env!("CARGO_PKG_VERSION"), " (+https://reader.justin-stanley.com)");
+pub const USER_AGENT: &str = concat!(
+    "featherreader/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://reader.justin-stanley.com)"
+);

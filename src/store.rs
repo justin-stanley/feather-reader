@@ -382,7 +382,12 @@ pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) 
 }
 
 /// Star/unstar a single entry for a DID (upsert, preserving `read`).
-pub async fn mark_starred(pool: &SqlitePool, did: &str, entry_id: i64, starred: bool) -> Result<()> {
+pub async fn mark_starred(
+    pool: &SqlitePool,
+    did: &str,
+    entry_id: i64,
+    starred: bool,
+) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
@@ -488,7 +493,12 @@ pub async fn upsert_cursor(pool: &SqlitePool, cursor: &ReadCursor) -> Result<()>
     .bind(&cursor.updated_at)
     .execute(pool)
     .await
-    .with_context(|| format!("upsert_cursor failed for {}/{}", cursor.did, cursor.feed_url))?;
+    .with_context(|| {
+        format!(
+            "upsert_cursor failed for {}/{}",
+            cursor.did, cursor.feed_url
+        )
+    })?;
     Ok(())
 }
 
@@ -512,13 +522,12 @@ pub async fn get_cursor(
 /// The flusher's hot query: every cursor with `dirty = 1` for a DID — the ones
 /// whose read-state changed since the last batched PDS flush.
 pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCursor>> {
-    let cursors = sqlx::query_as::<_, ReadCursor>(
-        "SELECT * FROM read_cursor WHERE did = ?1 AND dirty = 1",
-    )
-    .bind(did)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("dirty_cursors failed for {did}"))?;
+    let cursors =
+        sqlx::query_as::<_, ReadCursor>("SELECT * FROM read_cursor WHERE did = ?1 AND dirty = 1")
+            .bind(did)
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("dirty_cursors failed for {did}"))?;
     Ok(cursors)
 }
 
@@ -660,7 +669,10 @@ mod tests {
         let fetched = get_cursor(&pool, did, "https://example.com/feed.xml")
             .await?
             .expect("cursor should exist");
-        assert_eq!(fetched.read_through.as_deref(), Some("2026-07-11T08:00:00Z"));
+        assert_eq!(
+            fetched.read_through.as_deref(),
+            Some("2026-07-11T08:00:00Z")
+        );
         assert!(fetched.dirty);
 
         // The flusher sees exactly one dirty cursor.

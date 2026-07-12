@@ -261,10 +261,7 @@ fn display_date(published: Option<&str>) -> String {
 /// per-DID working copy. Folder grouping is modelled but empty in Phase 0 (the
 /// PDS `community.lexicon.rss.folder` records aren't projected into the cache
 /// yet), so every feed renders loose.
-async fn index(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, WebError> {
+async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
     // Logged out → send to login.
     let user = match current_session(&state, &headers) {
         Some(u) => u,
@@ -304,7 +301,9 @@ async fn index(
 
     // Build the sidebar from every cached feed with this DID's unread count.
     let now = now_rfc3339();
-    let feeds = store::due_feeds(pool, &now, i64::MAX).await.unwrap_or_default();
+    let feeds = store::due_feeds(pool, &now, i64::MAX)
+        .await
+        .unwrap_or_default();
     let mut loose_feeds = Vec::with_capacity(feeds.len());
     for f in &feeds {
         let unread_here = unread.iter().filter(|e| e.feed_id == f.id).count() as i64;
@@ -435,7 +434,10 @@ async fn mark_read(
     };
     let pool = &state.db;
 
-    let read = matches!(form.read.as_deref(), Some("true") | Some("1") | Some("on") | None);
+    let read = matches!(
+        form.read.as_deref(),
+        Some("true") | Some("1") | Some("on") | None
+    );
     store::mark_read(pool, &did, id, read).await?;
 
     let is_htmx = headers
@@ -553,7 +555,9 @@ async fn add_subscription(
     let _ = feed_id;
 
     match state.sidecar.create_subscription(&did, &sub).await {
-        Ok(res) => info!(feed = %feed_url, uri = %res.uri, %did, "wrote subscription record to PDS"),
+        Ok(res) => {
+            info!(feed = %feed_url, uri = %res.uri, %did, "wrote subscription record to PDS")
+        }
         Err(err) => {
             // Cache/poll already succeeded locally; surface the PDS write failure
             // in the log but don't lose the local subscription.
@@ -571,8 +575,8 @@ async fn add_subscription(
 /// Kept intentionally small (design bias: boring, small-dependency). A HEAD-less
 /// GET is fine here — the body is needed for autodiscovery anyway.
 async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<String> {
-    let parsed = url::Url::parse(input)
-        .map_err(|e| anyhow::anyhow!("not a valid URL {input:?}: {e}"))?;
+    let parsed =
+        url::Url::parse(input).map_err(|e| anyhow::anyhow!("not a valid URL {input:?}: {e}"))?;
 
     let client = feed::build_client()?;
     let resp = client.get(parsed.clone()).send().await?;
@@ -636,7 +640,11 @@ async fn login_form(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<LoginQuery>,
 ) -> Response {
-    if let Some(handle) = q.handle.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()) {
+    if let Some(handle) = q
+        .handle
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+    {
         return start_oauth(&state, &handle);
     }
     render(&LoginTemplate {
@@ -648,10 +656,7 @@ async fn login_form(
 }
 
 /// `POST /login` — the handle-form submit: redirect into the sidecar OAuth flow.
-async fn login_submit(
-    State(state): State<AppState>,
-    Form(form): Form<LoginForm>,
-) -> Response {
+async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let handle = form.handle.trim();
     if handle.is_empty() {
         return login_error("Enter your atproto handle.");
@@ -897,9 +902,7 @@ mod cookie {
     pub fn sign_session(did: &str, secret: &str) -> String {
         let sig = hmac_sha256_hex(secret.as_bytes(), did.as_bytes());
         let b64 = b64url_encode(did.as_bytes());
-        format!(
-            "{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
-        )
+        format!("{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
     }
 
     /// Verify the request's session cookie and return the DID it carries, or
@@ -1144,10 +1147,7 @@ mod cookie {
             // Extract just the `name=value` pair for the request-side header.
             let pair = cookie.split(';').next().unwrap().to_string();
             let mut headers = HeaderMap::new();
-            headers.insert(
-                axum::http::header::COOKIE,
-                pair.parse().unwrap(),
-            );
+            headers.insert(axum::http::header::COOKIE, pair.parse().unwrap());
             assert_eq!(
                 verify_session(&headers, secret).as_deref(),
                 Some("did:plc:abc123")
@@ -1173,10 +1173,7 @@ mod cookie {
 /// Fetch a single cached entry by id. A thin `query_as` over the store's pool;
 /// lives here (not in `store`) because it's a web-render convenience, not part of
 /// the store's read/write API surface.
-async fn get_entry_by_id(
-    pool: &store::Pool,
-    id: i64,
-) -> anyhow::Result<Option<store::Entry>> {
+async fn get_entry_by_id(pool: &store::Pool, id: i64) -> anyhow::Result<Option<store::Entry>> {
     let entry = sqlx::query_as::<_, store::Entry>("SELECT * FROM entries WHERE id = ?1")
         .bind(id)
         .fetch_optional(pool)
@@ -1186,14 +1183,13 @@ async fn get_entry_by_id(
 
 /// Whether `entry_id` is marked read for `did` (absent state row = unread).
 async fn entry_is_read(pool: &store::Pool, did: &str, entry_id: i64) -> anyhow::Result<bool> {
-    let read: Option<bool> = sqlx::query_scalar(
-        "SELECT read FROM entry_state WHERE did = ?1 AND entry_id = ?2",
-    )
-    .bind(did)
-    .bind(entry_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let read: Option<bool> =
+        sqlx::query_scalar("SELECT read FROM entry_state WHERE did = ?1 AND entry_id = ?2")
+            .bind(did)
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
     Ok(read.unwrap_or(false))
 }
 

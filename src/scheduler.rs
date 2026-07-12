@@ -75,7 +75,10 @@ const DEFAULT_FLUSH_DEBOUNCE: Duration = Duration::from_secs(60);
 
 /// Read a `Duration` (in seconds) from the environment, or fall back.
 fn env_duration_secs(key: &str, default: Duration) -> Duration {
-    match std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+    match std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
         Some(secs) if secs > 0 => Duration::from_secs(secs),
         _ => default,
     }
@@ -102,7 +105,10 @@ fn env_scalar<T: std::str::FromStr>(key: &str, default: T) -> T {
 /// other module.
 pub fn schedulers_enabled() -> bool {
     match std::env::var("FEATHERREADER_DISABLE_SCHEDULER") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => true,
     }
 }
@@ -294,7 +300,8 @@ async fn poll_and_reschedule(
 
 /// Persist a feed's `next_poll = now + delay` via the store's feed upsert.
 async fn set_next_poll(pool: &Pool, url: &str, delay: Duration) -> anyhow::Result<()> {
-    let next = Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
+    let next = Utc::now()
+        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
     let next_poll = next.to_rfc3339_opts(SecondsFormat::Secs, true);
     // upsert_feed COALESCEs unset fields, so supplying only url + next_poll bumps
     // the schedule without clobbering title/validators/last_polled.
@@ -391,7 +398,10 @@ async fn flush_all_dirty(state: &AppState) -> anyhow::Result<()> {
         debug!("read-state flusher: nothing dirty");
         return Ok(());
     }
-    debug!(dids = dids.len(), "read-state flusher: flushing dirty cursors");
+    debug!(
+        dids = dids.len(),
+        "read-state flusher: flushing dirty cursors"
+    );
 
     for did in dids {
         if let Err(err) = flush_did(state, &did).await {
@@ -533,7 +543,10 @@ async fn dids_with_dirty_cursors(pool: &Pool) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query("SELECT DISTINCT did FROM read_cursor WHERE dirty = 1")
         .fetch_all(pool)
         .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("did")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("did"))
+        .collect())
 }
 
 /// Current time as an RFC3339 string (UTC, second precision) — the shape the
@@ -554,7 +567,9 @@ mod tests {
         assert_ne!(a, read_state_rkey("https://other.example/feed.xml"));
         // Valid atproto rkey charset and length.
         assert!(a.len() <= 512 && !a.is_empty());
-        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b':')));
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b':')));
         assert!(a != "." && a != "..");
     }
 

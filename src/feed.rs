@@ -219,10 +219,7 @@ async fn touch_polled(
     // avoid clobbering them. The caller passes `None` to mean "keep current".
     let existing = store::get_feed_by_url(pool, url).await?;
     let (etag, last_modified) = match existing {
-        Some(f) => (
-            etag.or(f.etag),
-            last_modified.or(f.last_modified),
-        ),
+        Some(f) => (etag.or(f.etag), last_modified.or(f.last_modified)),
         None => (etag, last_modified),
     };
     let nf = NewFeed {
@@ -250,7 +247,12 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
                     && l.media_type.as_deref() != Some("application/rss+xml")
                     && l.media_type.as_deref() != Some("application/atom+xml"))
         })
-        .or_else(|| parsed.links.iter().find(|l| l.rel.as_deref() != Some("self")))
+        .or_else(|| {
+            parsed
+                .links
+                .iter()
+                .find(|l| l.rel.as_deref() != Some("self"))
+        })
         .or_else(|| parsed.links.first())
         .map(|l| l.href.clone());
     (title, site_url)
@@ -453,7 +455,9 @@ fn attr(tag: &str, name: &str) -> Option<String> {
             Some('"') => rest[1..].split('"').next(),
             Some('\'') => rest[1..].split('\'').next(),
             // Unquoted: read up to whitespace, '>' or '/'.
-            _ => rest.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next(),
+            _ => rest
+                .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                .next(),
         };
         return value.map(str::to_string);
     }
@@ -510,7 +514,10 @@ mod tests {
     #[test]
     fn rss_parses_and_sanitizes() {
         let parsed = feed_rs::parser::parse(RSS_SAMPLE.as_bytes()).expect("RSS should parse");
-        assert_eq!(parsed.title.as_ref().map(text_plain).as_deref(), Some("Example RSS Feed"));
+        assert_eq!(
+            parsed.title.as_ref().map(text_plain).as_deref(),
+            Some("Example RSS Feed")
+        );
         assert_eq!(parsed.entries.len(), 2);
 
         let (title, site) = feed_metadata(&parsed);
@@ -581,7 +588,8 @@ mod tests {
 
     #[test]
     fn discover_returns_none_without_feed_link() {
-        let html = r#"<head><link rel="stylesheet" href="/s.css"><link rel="icon" href="/f.ico"></head>"#;
+        let html =
+            r#"<head><link rel="stylesheet" href="/s.css"><link rel="icon" href="/f.ico"></head>"#;
         assert!(discover_feed(html, None).is_none());
     }
 
