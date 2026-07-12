@@ -1,0 +1,29 @@
+<li class="manage-row">
+  <span class="manage-row-meta">
+    <span class="manage-row-title">{{ feed.title }}</span>
+    <span class="manage-row-url">{{ feed.url }}</span>
+  </span>
+  {% if !feed.rkey.is_empty() %}
+    <details class="feed-menu">
+      <summary class="btn-quiet">Rename</summary>
+      <form method="post" action="/subscriptions/{{ feed.rkey }}/rename" class="inline-form feed-edit">
+        <input type="hidden" name="url" value="{{ feed.url }}" />
+        <label class="visually-hidden" for="title-{{ feed.rkey }}">Title</label>
+        <input class="input" id="title-{{ feed.rkey }}" type="text" name="title" value="{{ feed.title }}" />
+        {% if !folder_options.is_empty() %}
+          <label class="visually-hidden" for="folder-{{ feed.rkey }}">Folder</label>
+          <select class="select" id="folder-{{ feed.rkey }}" name="folder">
+            <option value="">No folder</option>
+            {% for f in folder_options %}
+              <option value="{{ f.uri }}">{{ f.name }}</option>
+            {% endfor %}
+          </select>
+        {% endif %}
+        <button class="btn-quiet" type="submit">Save</button>
+      </form>
+    </details>
+    <form method="post" action="/subscriptions/{{ feed.rkey }}/delete" class="inline-form">
+      <button class="btn-quiet btn-danger-quiet" type="submit">Unsubscribe</button>
+    </form>
+  {% endif %}
+</li>

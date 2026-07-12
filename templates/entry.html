@@ -2,70 +2,129 @@
 
 {% block title %}{{ title }} — FeatherReader{% endblock %}
 
-{% block content %}
-<article class="article">
-  <nav class="article-nav">
-    <a href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" class="back">← List</a>
-    <span class="article-paging">
-      {% if let Some(p) = prev_id %}
-        <a href="/entries/{{ p }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" rel="prev">← Prev</a>
-      {% endif %}
-      {% if let Some(n) = next_id %}
-        <a href="/entries/{{ n }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" rel="next">Next →</a>
-      {% endif %}
-    </span>
-  </nav>
+{% block body %}
+<div class="shell" id="shell">
 
-  <header class="article-head">
-    <h1 class="article-title">{{ title }}</h1>
-    <p class="article-meta">
-      {% if !feed_title.is_empty() %}<span class="article-feed">{{ feed_title }}</span>{% endif %}
-      {% if let Some(a) = author %}<span class="article-author">{{ a }}</span>{% endif %}
-      {% if !published.is_empty() %}<span class="article-date">{{ published }}</span>{% endif %}
-    </p>
-    {% if let Some(u) = url %}
-      <p class="article-source"><a href="{{ u }}" rel="noopener noreferrer nofollow" target="_blank">View original ↗</a></p>
-    {% endif %}
+  <header class="topbar">
+    <a class="icon-btn" href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" aria-label="Back to list">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">{% if !feed_title.is_empty() %}{{ feed_title }}{% else %}FeatherReader{% endif %}</h1>
+    <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+            aria-expanded="false" aria-controls="rail">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h16"/>
+      </svg>
+    </button>
   </header>
 
-  <div class="article-body">
-    {% if let Some(html) = content_html %}
-      {{ html|safe }}
-    {% else %}
-      <p class="muted">This entry has no stored content. Open the original above.</p>
-    {% endif %}
-  </div>
+  <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
 
-  <footer class="article-foot">
-    <div class="article-actions">
-      <form
-        class="mark-read-form"
-        method="post"
-        action="/entries/{{ id }}/read"
-        hx-post="/entries/{{ id }}/read"
-        hx-target="this"
-        hx-swap="none"
-      >
+  {% include "rail.html" %}
+
+  <main class="content" id="content">
+    <article class="article">
+      <header class="article-head">
+        <p class="article-eyebrow">
+          {% if !feed_title.is_empty() %}<span class="feed">{{ feed_title }}</span>{% endif %}
+          {% if !feed_title.is_empty() && !published.is_empty() %}<span aria-hidden="true">·</span>{% endif %}
+          {% if !published.is_empty() %}<time datetime="{{ published }}">{{ published }}</time>{% endif %}
+        </p>
+        <h1 class="article-title">{{ title }}</h1>
+        <p class="article-byline">
+          {% if let Some(a) = author %}{{ a }}{% endif %}
+          {% if let Some(u) = url %}
+            {% if let Some(a) = author %} · {% endif %}
+            <a href="{{ u }}" rel="noopener noreferrer nofollow" target="_blank">Original ↗</a>
+          {% endif %}
+        </p>
+      </header>
+
+      <div class="prose">
+        {% if let Some(html) = content_html %}
+          {{ html|safe }}
+        {% else %}
+          <p class="muted">This entry has no stored content. Open the original above.</p>
+        {% endif %}
+      </div>
+    </article>
+
+    <nav class="actionbar" aria-label="Entry actions">
+      {% if let Some(p) = prev_id %}
+        <a class="icon-btn" href="/entries/{{ p }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}"
+           rel="prev" aria-label="Previous entry (k)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+        </a>
+      {% else %}
+        <span class="icon-btn is-disabled" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+        </span>
+      {% endif %}
+
+      <form class="mark-read-form" method="post" action="/entries/{{ id }}/read"
+            hx-post="/entries/{{ id }}/read" hx-target="this" hx-swap="none">
         <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
-        <button type="submit" class="mark-read">
-          {% if read %}Mark unread{% else %}Mark read{% endif %}
+        <button type="submit" class="icon-btn actionbar-read mark-read"
+                aria-pressed="{% if read %}true{% else %}false{% endif %}"
+                aria-label="{% if read %}Mark unread (m){% else %}Mark read (m){% endif %}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"/></svg>
         </button>
       </form>
-      <form
-        class="star-form"
-        method="post"
-        action="/entries/{{ id }}/star"
-        hx-post="/entries/{{ id }}/star"
-        hx-target="this"
-        hx-swap="none"
-      >
+
+      <form class="star-form" method="post" action="/entries/{{ id }}/star"
+            hx-post="/entries/{{ id }}/star" hx-target="this" hx-swap="none">
         <input type="hidden" name="starred" value="{% if starred %}false{% else %}true{% endif %}" />
-        <button type="submit" class="star-btn{% if starred %} is-starred{% endif %}">
-          {% if starred %}★ Saved{% else %}☆ Save{% endif %}
+        <button type="submit" class="icon-btn actionbar-star star-btn"
+                aria-pressed="{% if starred %}true{% else %}false{% endif %}"
+                aria-label="{% if starred %}Unstar entry (s){% else %}Star entry (s){% endif %}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+          </svg>
         </button>
       </form>
-    </div>
-    <a href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" class="back">← Back to list</a>
-  </footer>
-</article>
+
+      {% if let Some(u) = url %}
+        <a class="icon-btn actionbar-open" href="{{ u }}" target="_blank"
+           rel="noopener noreferrer nofollow" aria-label="Open original (o)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 5h5v5M19 5l-8 8M9 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/>
+          </svg>
+        </a>
+      {% else %}
+        <span class="icon-btn is-disabled" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 5h5v5M19 5l-8 8M9 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/>
+          </svg>
+        </span>
+      {% endif %}
+
+      {% if let Some(n) = next_id %}
+        <a class="icon-btn" href="/entries/{{ n }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}"
+           rel="next" aria-label="Next entry (j)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+        </a>
+      {% else %}
+        <span class="icon-btn is-disabled" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
+        </span>
+      {% endif %}
+    </nav>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+
+{% include "overlay.html" %}
 {% endblock %}

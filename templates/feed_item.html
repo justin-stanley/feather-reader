@@ -1,31 +1,10 @@
-<li class="feed-item{% if feed.selected %} is-selected{% endif %}">
-  <a class="feed-title" href="/?feed={{ feed.url|urlencode }}&view={{ view }}">{{ feed.title }}</a>
-  {% if feed.unread > 0 %}<span class="unread-count">{{ feed.unread }}</span>{% endif %}
-  {% if !feed.rkey.is_empty() %}
-    <details class="feed-menu">
-      <summary aria-label="Feed actions">⋯</summary>
-      <div class="feed-menu-panel">
-        <form method="post" action="/subscriptions/{{ feed.rkey }}/rename" class="inline-form feed-edit">
-          <input type="hidden" name="url" value="{{ feed.url }}" />
-          <label>Title
-            <input type="text" name="title" value="{{ feed.title }}" />
-          </label>
-          {% if !folder_options.is_empty() %}
-            <label>Folder
-              <select name="folder">
-                <option value="">No folder</option>
-                {% for f in folder_options %}
-                  <option value="{{ f.uri }}">{{ f.name }}</option>
-                {% endfor %}
-              </select>
-            </label>
-          {% endif %}
-          <button type="submit">Save</button>
-        </form>
-        <form method="post" action="/subscriptions/{{ feed.rkey }}/delete" class="inline-form">
-          <button type="submit" class="danger">Unsubscribe</button>
-        </form>
-      </div>
-    </details>
-  {% endif %}
+<li>
+  <a
+    class="feed-link{% if feed.unread > 0 %} has-unread{% endif %}"
+    href="/?feed={{ feed.url|urlencode }}&view={{ nav.view }}"
+    {% if feed.selected %}aria-current="page"{% endif %}
+  >
+    <span class="feed-name">{{ feed.title }}</span>
+    {% if feed.unread > 0 %}<span class="feed-count">{{ feed.unread }}</span>{% endif %}
+  </a>
 </li>

@@ -2,142 +2,72 @@
 
 {% block title %}{{ heading }} — FeatherReader{% endblock %}
 
-{% block content %}
-<aside class="sidebar" aria-label="Subscriptions">
-  <form class="add-feed" method="post" action="/subscriptions">
-    <label class="add-feed-label" for="feed-url">Subscribe</label>
-    <div class="add-feed-row">
-      <input
-        id="feed-url"
-        name="url"
-        type="url"
-        inputmode="url"
-        placeholder="Feed or site URL…"
-        required
-      />
-      <button type="submit">Add</button>
-    </div>
-    {% if !folder_options.is_empty() %}
-      <select name="folder" class="add-feed-folder" aria-label="Folder">
-        <option value="">No folder</option>
-        {% for f in folder_options %}
-          <option value="{{ f.uri }}">{{ f.name }}</option>
-        {% endfor %}
-      </select>
-    {% endif %}
-  </form>
+{% block body %}
+<div class="shell" id="shell">
 
-  <details class="new-folder">
-    <summary>New folder</summary>
-    <form method="post" action="/folders" class="new-folder-form">
-      <input type="text" name="name" placeholder="Folder name" required />
-      <button type="submit">Create</button>
-    </form>
-  </details>
-
-  <details class="import-opml">
-    <summary>Import / export OPML</summary>
-    <form method="post" action="/opml" enctype="multipart/form-data" class="opml-file-form">
-      <label class="import-opml-label" for="opml-file">Upload an OPML file</label>
-      <input id="opml-file" name="file" type="file" accept=".opml,.xml,text/xml,text/x-opml" />
-      <button type="submit">Import file</button>
-    </form>
-    <form method="post" action="/opml" enctype="multipart/form-data" class="opml-paste-form">
-      <label class="import-opml-label" for="opml">…or paste an OPML export</label>
-      <textarea id="opml" name="opml" rows="4" placeholder="&lt;opml&gt;…&lt;/opml&gt;"></textarea>
-      <button type="submit">Import text</button>
-    </form>
-    <p class="opml-export"><a href="/opml/export">Export your subscriptions ↓</a></p>
-  </details>
-
-  {% if !flash.is_empty() %}
-    <p class="flash" role="status">{{ flash }}</p>
-  {% endif %}
-
-  <nav class="feeds">
-    <ul class="feed-list scopes">
-      <li class="feed-item{% if scope_qs.is_empty() %} is-selected{% endif %}">
-        <a class="feed-title" href="/?view={{ view }}">All feeds</a>
-      </li>
-    </ul>
-
-    {% if folders.is_empty() && loose_feeds.is_empty() %}
-      <p class="muted">No subscriptions yet. Paste a feed URL above.</p>
-    {% else %}
-      {% for folder in folders %}
-        <div class="folder{% if folder.selected %} is-selected{% endif %}">
-          <div class="folder-head">
-            <a class="folder-name" href="/?folder={{ folder.uri|urlencode }}&view={{ view }}">{{ folder.name }}</a>
-            <details class="folder-menu">
-              <summary aria-label="Folder actions">⋯</summary>
-              <div class="folder-menu-panel">
-                <form method="post" action="/folders/{{ folder.rkey }}/rename" class="inline-form">
-                  <input type="text" name="name" value="{{ folder.name }}" required />
-                  <button type="submit">Rename</button>
-                </form>
-                <form method="post" action="/folders/{{ folder.rkey }}/delete" class="inline-form">
-                  <button type="submit" class="danger">Delete folder</button>
-                </form>
-              </div>
-            </details>
-          </div>
-          <ul class="feed-list">
-            {% for feed in folder.feeds %}
-              {% include "feed_item.html" %}
-            {% endfor %}
-          </ul>
-        </div>
-      {% endfor %}
-
-      {% if !loose_feeds.is_empty() %}
-        <div class="folder">
-          <h2 class="folder-name">Feeds</h2>
-          <ul class="feed-list">
-            {% for feed in loose_feeds %}
-              {% include "feed_item.html" %}
-            {% endfor %}
-          </ul>
-        </div>
-      {% endif %}
-    {% endif %}
-  </nav>
-</aside>
-
-<section class="reader" aria-label="Articles">
-  <div class="reader-head">
-    <h1>{{ heading }}</h1>
-    <span class="count">{{ entries.len() }}</span>
-  </div>
-
-  <div class="reader-toolbar">
-    <nav class="views" aria-label="View">
-      <a href="/{% if scope_qs.is_empty() %}?view=unread{% else %}?{{ scope_qs }}&view=unread{% endif %}"
-         class="view-tab{% if view == "unread" %} is-active{% endif %}">Unread</a>
-      <a href="/{% if scope_qs.is_empty() %}?view=all{% else %}?{{ scope_qs }}&view=all{% endif %}"
-         class="view-tab{% if view == "all" %} is-active{% endif %}">All</a>
-      <a href="/{% if scope_qs.is_empty() %}?view=starred{% else %}?{{ scope_qs }}&view=starred{% endif %}"
-         class="view-tab{% if view == "starred" %} is-active{% endif %}">Starred</a>
-    </nav>
+  <header class="topbar">
+    <button class="icon-btn" id="rail-toggle" aria-label="Open navigation"
+            aria-expanded="false" aria-controls="rail">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h16"/>
+      </svg>
+    </button>
+    <h1 class="topbar-title">{{ heading }} <span class="topbar-count">{{ entries.len() }}</span></h1>
     {% if !entries.is_empty() %}
-      <form id="mark-all-form" method="post"
-            action="/read-all{% if let Some(f) = feed_scope %}?feed={{ f|urlencode }}{% endif %}"
-            class="mark-all">
-        <button type="submit" class="linkish">Mark all read</button>
-      </form>
+      <button class="icon-btn js-mark-all" type="submit" form="mark-all-form" aria-label="Mark all read">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 13l4 4L15 9"/><path d="M9 13l4 4 8-8"/>
+        </svg>
+      </button>
+    {% else %}
+      <span class="icon-btn" aria-hidden="true"></span>
     {% endif %}
-  </div>
+  </header>
 
-  {% if entries.is_empty() %}
-    <div class="empty">
-      <p>You're all caught up.</p>
-      <p class="muted">Nothing left to read. A quiet inbox is the goal.</p>
+  <button class="scrim" id="scrim" tabindex="-1" aria-hidden="true"></button>
+
+  {% include "rail.html" %}
+
+  <main class="content" id="content">
+    {% if !flash.is_empty() %}
+      <p class="flash" role="status">{{ flash }}</p>
+    {% endif %}
+
+    <div class="content-head">
+      <h1 class="content-title">{{ heading }}</h1>
+      <span class="content-count">{{ entries.len() }} entries</span>
+      <span class="content-spacer"></span>
+      {% if !entries.is_empty() %}
+        <form id="mark-all-form" method="post"
+              action="/read-all{% if let Some(f) = feed_scope %}?feed={{ f|urlencode }}{% endif %}">
+          <button class="btn-quiet js-mark-all" type="submit">Mark all read</button>
+        </form>
+      {% endif %}
     </div>
-  {% else %}
-    <ul class="entry-list" id="entry-list">
-      {% for e in entries %}
-        {% include "entry_row.html" %}
-      {% endfor %}
-    </ul>
-  {% endif %}
-</section>
+
+    {% if entries.is_empty() %}
+      <div class="empty">
+        <svg class="empty-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+          <path d="M16 8 5 19"/>
+        </svg>
+        <h2 class="empty-title">All caught up</h2>
+        <p class="empty-note">Nothing unread. The quiet is the point.</p>
+      </div>
+    {% else %}
+      <ul class="entry-list" id="entry-list">
+        {% for e in entries %}
+          {% include "entry_row.html" %}
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    {% include "footer.html" %}
+  </main>
+</div>
+
+{% include "overlay.html" %}
 {% endblock %}

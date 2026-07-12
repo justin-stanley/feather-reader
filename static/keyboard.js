@@ -1,209 +1,112 @@
-/* FeatherReader — a tiny, dependency-free keyboard handler.
+/* FeatherReader — keyboard.js
+ * Progressive enhancement only: the app is fully usable without this file.
+ * 1. Mobile drawer toggle.
+ * 2. Keyboard shortcuts: j/k move cursor, o open, m read, s star,
+ *    A mark-all-read, ? shortcuts overlay, Esc close.
  *
- * Reading is a keyboard flow (design §3): j/k move between entries, o/Enter
- * open, m toggle-read, s star, r refresh, A mark-all-read, g g / G top/bottom,
- * ? help. No framework — plain DOM. Works on both the list view (an
- * `#entry-list` of `.entry-row`s) and the single-article view (`.article`).
- *
- * The handler is intentionally conservative: it never swallows keys while the
- * user is typing in a field, and every shortcut maps onto a link or form that
- * also works by mouse / with JS disabled — this only accelerates, it is never
- * the only way to do a thing.
+ * In the real app the shortcuts drive the EXISTING htmx controls (they click
+ * the real buttons) rather than toggling demo classes, so every action goes
+ * through the same server endpoints as a mouse click.
  */
 (function () {
   "use strict";
 
-  // Don't hijack keys while typing in an input, textarea, select, or anything
-  // contenteditable — the reader must never eat what you're typing.
-  function isTyping(el) {
-    if (!el) return false;
-    var tag = (el.tagName || "").toLowerCase();
-    return (
-      tag === "input" ||
-      tag === "textarea" ||
-      tag === "select" ||
-      el.isContentEditable === true
-    );
+  /* ---- drawer -------------------------------------------------------- */
+  var shell = document.getElementById("shell");
+  var toggle = document.getElementById("rail-toggle");
+  var close = document.getElementById("rail-close");
+  var scrim = document.getElementById("scrim");
+
+  function setDrawer(open) {
+    if (!shell) return;
+    shell.classList.toggle("rail-open", open);
+    if (toggle) toggle.setAttribute("aria-expanded", String(open));
   }
+  if (toggle) toggle.addEventListener("click", function () { setDrawer(true); });
+  if (close) close.addEventListener("click", function () { setDrawer(false); });
+  if (scrim) scrim.addEventListener("click", function () { setDrawer(false); });
 
-  function rows() {
-    return Array.prototype.slice.call(
-      document.querySelectorAll("#entry-list .entry-row")
-    );
+  /* ---- shortcuts overlay ---------------------------------------------- */
+  var overlay = document.getElementById("kbd-overlay");
+  var overlayClose = document.getElementById("kbd-close");
+
+  function setOverlay(open) {
+    if (overlay) overlay.classList.toggle("is-open", open);
   }
-
-  var CURSOR_CLASS = "is-cursor";
-
-  function currentIndex(list) {
-    for (var i = 0; i < list.length; i++) {
-      if (list[i].classList.contains(CURSOR_CLASS)) return i;
-    }
-    return -1;
-  }
-
-  function focusRow(list, idx) {
-    if (!list.length) return;
-    if (idx < 0) idx = 0;
-    if (idx >= list.length) idx = list.length - 1;
-    list.forEach(function (r) {
-      r.classList.remove(CURSOR_CLASS);
-    });
-    var row = list[idx];
-    row.classList.add(CURSOR_CLASS);
-    // Keep the cursor comfortably in view without yanking the whole page.
-    var rect = row.getBoundingClientRect();
-    if (rect.top < 80 || rect.bottom > window.innerHeight - 40) {
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
-    return row;
-  }
-
-  function move(delta) {
-    var list = rows();
-    if (!list.length) return;
-    var idx = currentIndex(list);
-    if (idx === -1) {
-      idx = delta > 0 ? 0 : list.length - 1;
-    } else {
-      idx += delta;
-    }
-    focusRow(list, idx);
-  }
-
-  function activeRow() {
-    var list = rows();
-    var idx = currentIndex(list);
-    return idx === -1 ? null : list[idx];
-  }
-
-  // Open the entry under the cursor (list view) — follow its reader link.
-  function openCurrent() {
-    var row = activeRow();
-    if (!row) return;
-    var link = row.querySelector(".entry-link");
-    if (link) window.location.href = link.getAttribute("href");
-  }
-
-  // Submit a named action form (mark-read / star) on the current row, or on the
-  // article view where there is exactly one such form.
-  function submitAction(selector) {
-    var scope = activeRow();
-    if (!scope) {
-      // Article view: the whole page is the scope.
-      scope = document.querySelector(".article");
-    }
-    if (!scope) return;
-    var form = scope.querySelector(selector);
-    if (!form) return;
-    // Prefer htmx's programmatic trigger so we get the in-place swap; fall back
-    // to a native submit when htmx isn't loaded.
-    if (form.requestSubmit) {
-      form.requestSubmit();
-    } else {
-      form.submit();
-    }
-  }
-
-  function markAllRead() {
-    var form = document.querySelector("#mark-all-form");
-    if (form && form.requestSubmit) {
-      form.requestSubmit();
-    } else if (form) {
-      form.submit();
-    }
-  }
-
-  function refresh() {
-    window.location.reload();
-  }
-
-  function toggleHelp() {
-    var help = document.querySelector("#kbd-help");
-    if (help) help.toggleAttribute("open");
-  }
-
-  var lastG = 0;
-
-  document.addEventListener("keydown", function (ev) {
-    if (ev.defaultPrevented) return;
-    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
-    if (isTyping(ev.target)) return;
-
-    var k = ev.key;
-
-    // g g → top, G → bottom.
-    if (k === "g") {
-      var now = Date.now();
-      if (now - lastG < 500) {
-        var list = rows();
-        focusRow(list, 0);
-        lastG = 0;
-      } else {
-        lastG = now;
-      }
-      return;
-    }
-    if (k === "G") {
-      var all = rows();
-      focusRow(all, all.length - 1);
-      ev.preventDefault();
-      return;
-    }
-
-    switch (k) {
-      case "j":
-        move(1);
-        ev.preventDefault();
-        break;
-      case "k":
-        move(-1);
-        ev.preventDefault();
-        break;
-      case "o":
-      case "Enter":
-        // On the list, open the cursored entry. In a field this never fires.
-        if (rows().length) {
-          openCurrent();
-          ev.preventDefault();
-        }
-        break;
-      case "m":
-        submitAction(".mark-read-form");
-        ev.preventDefault();
-        break;
-      case "s":
-        submitAction(".star-form");
-        ev.preventDefault();
-        break;
-      case "A":
-        markAllRead();
-        ev.preventDefault();
-        break;
-      case "r":
-        refresh();
-        ev.preventDefault();
-        break;
-      case "u":
-        // Back to the unread list from an article.
-        if (document.querySelector(".article")) {
-          window.location.href = "/";
-          ev.preventDefault();
-        }
-        break;
-      case "?":
-        toggleHelp();
-        ev.preventDefault();
-        break;
-      default:
-        break;
-    }
+  if (overlayClose) overlayClose.addEventListener("click", function () { setOverlay(false); });
+  if (overlay) overlay.addEventListener("click", function (e) {
+    if (e.target === overlay) setOverlay(false);
   });
 
-  // Put the cursor on the first row on load so j/k has an anchor.
-  document.addEventListener("DOMContentLoaded", function () {
+  /* ---- list cursor (j / k) --------------------------------------------- */
+  function rows() {
+    return Array.prototype.slice.call(document.querySelectorAll(".entry"));
+  }
+  function cursorIndex(list) {
+    return list.findIndex(function (r) { return r.classList.contains("is-cursor"); });
+  }
+  function moveCursor(delta) {
     var list = rows();
-    if (list.length && currentIndex(list) === -1) {
-      list[0].classList.add(CURSOR_CLASS);
+    if (!list.length) return;
+    var i = cursorIndex(list);
+    var next = Math.min(list.length - 1, Math.max(0, (i === -1 ? 0 : i + delta)));
+    list.forEach(function (r) { r.classList.remove("is-cursor"); });
+    list[next].classList.add("is-cursor");
+    list[next].scrollIntoView({ block: "nearest" });
+  }
+  function cursorRow() {
+    var list = rows();
+    var i = cursorIndex(list);
+    return i === -1 ? null : list[i];
+  }
+
+  /* Click the first matching real control inside `root` (the htmx button /
+   * form submit that owns the endpoint) — never a demo class-toggle. */
+  function trigger(root, selector) {
+    if (!root) return;
+    var el = root.querySelector(selector);
+    if (el) el.click();
+  }
+
+  document.addEventListener("keydown", function (e) {
+    var t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    switch (e.key) {
+      case "j": moveCursor(1); break;
+      case "k": moveCursor(-1); break;
+      case "o":
+      case "Enter": {
+        /* Reader view: open the original. List view: open the cursored entry. */
+        var actionOpen = document.querySelector(".actionbar-open");
+        if (actionOpen) { actionOpen.click(); break; }
+        trigger(cursorRow(), ".entry-main");
+        break;
+      }
+      case "m": {
+        /* Reader action bar takes precedence; else the cursored row's
+         * mark-read control. Both POST /entries/:id/read. */
+        var actionRead = document.querySelector(".actionbar-read");
+        if (actionRead) { actionRead.click(); break; }
+        trigger(cursorRow(), ".mark-read");
+        break;
+      }
+      case "s": {
+        var actionStar = document.querySelector(".actionbar-star");
+        if (actionStar) { actionStar.click(); break; }
+        trigger(cursorRow(), ".star-btn");
+        break;
+      }
+      case "A": {
+        /* Mark all read — the header / topbar control. */
+        trigger(document, ".js-mark-all");
+        break;
+      }
+      case "?": setOverlay(!(overlay && overlay.classList.contains("is-open"))); break;
+      case "Escape": setOverlay(false); setDrawer(false); break;
+      default: return;
     }
+    e.preventDefault();
   });
 })();
