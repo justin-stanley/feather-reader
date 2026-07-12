@@ -267,11 +267,7 @@ pub async fn resolve_handle(client: &Client, resolver_base: &str, handle: &str) 
 /// The PDS endpoint is the service in the DID doc whose `id` ends with
 /// `#atproto_pds` (type `AtprotoPersonalDataServer`); its `serviceEndpoint` is
 /// the base URL for all `com.atproto.repo.*` calls.
-pub async fn resolve_did_to_pds(
-    client: &Client,
-    plc_directory: &str,
-    did: &str,
-) -> Result<String> {
+pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str) -> Result<String> {
     let doc_url = if let Some(rest) = did.strip_prefix("did:web:") {
         // did:web host may itself be percent-encoded / contain a path; the
         // common case is a bare host.
@@ -486,7 +482,12 @@ impl PdsClient {
         let pds_base = resolve_did_to_pds(&http, plc, &did).await?;
         let session = login_with_app_password(&http, &pds_base, &did, app_password).await?;
 
-        Ok(Self::new(http, pds_base, session.did.clone(), Auth::Session(session)))
+        Ok(Self::new(
+            http,
+            pds_base,
+            session.did.clone(),
+            Auth::Session(session),
+        ))
     }
 
     /// The repo DID this client targets.
@@ -552,9 +553,7 @@ impl PdsClient {
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
-        resp.json()
-            .await
-            .context("parsing listRecords response")
+        resp.json().await.context("parsing listRecords response")
     }
 
     /// Page through **all** records in a collection, following the cursor until
@@ -718,7 +717,8 @@ impl PdsClient {
     /// Upsert a single [`ReadState`] cursor at its feed-derived rkey. For a
     /// batch of dirty cursors prefer [`flush_read_states`](Self::flush_read_states).
     pub async fn put_read_state(&self, rkey: &str, state: &ReadState) -> Result<WriteResult> {
-        self.put_record(lexicon::nsid::READ_STATE, rkey, state).await
+        self.put_record(lexicon::nsid::READ_STATE, rkey, state)
+            .await
     }
 
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call —
@@ -875,7 +875,11 @@ impl SidecarClient {
     /// Resolve a one-shot `session_id` (from the sidecar's post-OAuth redirect)
     /// to the `{did, handle}` that logged in. `Ok(None)` on `404 SessionNotFound`.
     pub async fn resolve_session(&self, session_id: &str) -> Result<Option<SidecarSession>> {
-        let url = format!("{}/internal/session/{}", self.public_url, urlencode(session_id));
+        let url = format!(
+            "{}/internal/session/{}",
+            self.public_url,
+            urlencode(session_id)
+        );
         let resp = self
             .http
             .get(&url)
@@ -912,7 +916,10 @@ impl SidecarClient {
             .await?;
         let status = resp.status();
         if status.is_success() {
-            let ok: RepoOk = resp.json().await.context("parsing /internal/repo ok body")?;
+            let ok: RepoOk = resp
+                .json()
+                .await
+                .context("parsing /internal/repo ok body")?;
             return Ok(ok.data);
         }
         // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
@@ -959,11 +966,7 @@ impl SidecarClient {
     }
 
     /// Page through **all** records in a collection for `did`.
-    pub async fn list_all_records(
-        &self,
-        did: &str,
-        collection: &str,
-    ) -> Result<Vec<RecordEntry>> {
+    pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -1051,26 +1054,20 @@ impl SidecarClient {
     }
 
     /// Create a [`Subscription`] record (subscribe to a feed).
-    pub async fn create_subscription(
-        &self,
-        did: &str,
-        sub: &Subscription,
-    ) -> Result<WriteResult> {
-        self.create_record(did, lexicon::nsid::SUBSCRIPTION, sub).await
+    pub async fn create_subscription(&self, did: &str, sub: &Subscription) -> Result<WriteResult> {
+        self.create_record(did, lexicon::nsid::SUBSCRIPTION, sub)
+            .await
     }
 
     /// Delete a [`Subscription`] record by rkey (unsubscribe).
     pub async fn delete_subscription(&self, did: &str, rkey: &str) -> Result<()> {
-        self.delete_record(did, lexicon::nsid::SUBSCRIPTION, rkey).await
+        self.delete_record(did, lexicon::nsid::SUBSCRIPTION, rkey)
+            .await
     }
 
     /// Batch-create many [`Subscription`] records in one `applyWrites` — the OPML
     /// import path (one create op per feed, server-assigned rkeys).
-    pub async fn create_subscriptions_batch(
-        &self,
-        did: &str,
-        subs: &[Subscription],
-    ) -> Result<()> {
+    pub async fn create_subscriptions_batch(&self, did: &str, subs: &[Subscription]) -> Result<()> {
         let writes: Vec<WriteOp> = subs
             .iter()
             .map(|sub| {
@@ -1106,7 +1103,8 @@ impl SidecarClient {
         rkey: &str,
         state: &ReadState,
     ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state).await
+        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state)
+            .await
     }
 
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call.
@@ -1418,7 +1416,10 @@ mod tests {
             ]
         }))
         .expect("did doc");
-        assert_eq!(doc.pds_endpoint().as_deref(), Some("https://pds.example.com"));
+        assert_eq!(
+            doc.pds_endpoint().as_deref(),
+            Some("https://pds.example.com")
+        );
     }
 
     #[test]

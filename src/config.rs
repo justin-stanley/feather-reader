@@ -200,15 +200,15 @@ impl Config {
         let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| defaults.sidecar.public_url.clone());
-        let internal_secret =
-            env_opt("SIDECAR_INTERNAL_SECRET").unwrap_or_else(|| defaults.sidecar.internal_secret.clone());
+        let internal_secret = env_opt("SIDECAR_INTERNAL_SECRET")
+            .unwrap_or_else(|| defaults.sidecar.internal_secret.clone());
         let sidecar = SidecarConfig {
             public_url: sidecar_url,
             internal_secret,
         };
 
-        let cookie_secret =
-            env_opt("FEATHERREADER_COOKIE_SECRET").unwrap_or_else(|| defaults.cookie_secret.clone());
+        let cookie_secret = env_opt("FEATHERREADER_COOKIE_SECRET")
+            .unwrap_or_else(|| defaults.cookie_secret.clone());
 
         // A dev DID is opt-in: only present when explicitly configured, so a real
         // deployment never silently falls back to a shared identity.

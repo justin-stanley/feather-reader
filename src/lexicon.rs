@@ -349,7 +349,10 @@ mod tests {
         });
         let saved: Saved = serde_json::from_value(value.clone()).expect("deserialize");
         assert_eq!(saved.url, "https://example.com/post/1");
-        assert_eq!(saved.feed_url.as_deref(), Some("https://example.com/feed.xml"));
+        assert_eq!(
+            saved.feed_url.as_deref(),
+            Some("https://example.com/feed.xml")
+        );
         assert_eq!(saved.entry_id.as_deref(), Some("tag:example.com,2026:1"));
         assert_eq!(serde_json::to_value(&saved).expect("serialize"), value);
     }
