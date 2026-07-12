@@ -7,6 +7,7 @@
     <title>{% block title %}FeatherReader{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css" />
     <script src="/static/htmx.min.js" defer></script>
+    <script src="/static/keyboard.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -16,6 +17,14 @@
         <span class="brand-name">FeatherReader</span>
       </a>
       <nav class="site-nav">
+        <button
+          type="button"
+          class="linkish"
+          onclick="document.getElementById('kbd-help').toggleAttribute('open')"
+          title="Keyboard shortcuts (?)"
+        >
+          Shortcuts
+        </button>
         {% if let Some(h) = handle %}
           <span class="who" title="{{ did }}">{{ h }}</span>
           <form class="logout-form" method="post" action="/logout">
@@ -30,6 +39,31 @@
     <main id="main" class="layout">
       {% block content %}{% endblock %}
     </main>
+
+    <details id="kbd-help" class="kbd-help">
+      <summary hidden></summary>
+      <div class="kbd-help-panel" role="dialog" aria-label="Keyboard shortcuts">
+        <h2>Keyboard</h2>
+        <ul>
+          <li><kbd>j</kbd> / <kbd>k</kbd> next / previous entry</li>
+          <li><kbd>o</kbd> / <kbd>Enter</kbd> open entry</li>
+          <li><kbd>m</kbd> toggle read</li>
+          <li><kbd>s</kbd> star / save</li>
+          <li><kbd>A</kbd> mark all read</li>
+          <li><kbd>r</kbd> refresh</li>
+          <li><kbd>u</kbd> back to list (in an article)</li>
+          <li><kbd>g</kbd> <kbd>g</kbd> / <kbd>G</kbd> top / bottom</li>
+          <li><kbd>?</kbd> toggle this help</li>
+        </ul>
+        <button
+          type="button"
+          class="linkish"
+          onclick="document.getElementById('kbd-help').removeAttribute('open')"
+        >
+          Close
+        </button>
+      </div>
+    </details>
 
     <footer class="site-footer">
       <span>FeatherReader v{{ version }}</span>

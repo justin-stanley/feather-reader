@@ -5,7 +5,15 @@
 {% block content %}
 <article class="article">
   <nav class="article-nav">
-    <a href="/" class="back">← Unread</a>
+    <a href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" class="back">← List</a>
+    <span class="article-paging">
+      {% if let Some(p) = prev_id %}
+        <a href="/entries/{{ p }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" rel="prev">← Prev</a>
+      {% endif %}
+      {% if let Some(n) = next_id %}
+        <a href="/entries/{{ n }}{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" rel="next">Next →</a>
+      {% endif %}
+    </span>
   </nav>
 
   <header class="article-head">
@@ -29,19 +37,35 @@
   </div>
 
   <footer class="article-foot">
-    <form
-      method="post"
-      action="/entries/{{ id }}/read"
-      hx-post="/entries/{{ id }}/read"
-      hx-target="this"
-      hx-swap="none"
-    >
-      <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
-      <button type="submit" class="mark-read">
-        {% if read %}Mark unread{% else %}Mark read{% endif %}
-      </button>
-    </form>
-    <a href="/" class="back">← Back to unread</a>
+    <div class="article-actions">
+      <form
+        class="mark-read-form"
+        method="post"
+        action="/entries/{{ id }}/read"
+        hx-post="/entries/{{ id }}/read"
+        hx-target="this"
+        hx-swap="none"
+      >
+        <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
+        <button type="submit" class="mark-read">
+          {% if read %}Mark unread{% else %}Mark read{% endif %}
+        </button>
+      </form>
+      <form
+        class="star-form"
+        method="post"
+        action="/entries/{{ id }}/star"
+        hx-post="/entries/{{ id }}/star"
+        hx-target="this"
+        hx-swap="none"
+      >
+        <input type="hidden" name="starred" value="{% if starred %}false{% else %}true{% endif %}" />
+        <button type="submit" class="star-btn{% if starred %} is-starred{% endif %}">
+          {% if starred %}★ Saved{% else %}☆ Save{% endif %}
+        </button>
+      </form>
+    </div>
+    <a href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" class="back">← Back to list</a>
   </footer>
 </article>
 {% endblock %}

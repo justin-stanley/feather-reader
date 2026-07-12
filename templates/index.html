@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Unread — FeatherReader{% endblock %}
+{% block title %}{{ heading }} — FeatherReader{% endblock %}
 
 {% block content %}
 <aside class="sidebar" aria-label="Subscriptions">
@@ -17,23 +17,37 @@
       />
       <button type="submit">Add</button>
     </div>
+    {% if !folder_options.is_empty() %}
+      <select name="folder" class="add-feed-folder" aria-label="Folder">
+        <option value="">No folder</option>
+        {% for f in folder_options %}
+          <option value="{{ f.uri }}">{{ f.name }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
   </form>
 
-  <details class="import-opml">
-    <summary>Import OPML</summary>
-    <form method="post" action="/opml">
-      <label class="import-opml-label" for="opml">
-        Paste an OPML export to bring your feeds into your PDS.
-      </label>
-      <textarea
-        id="opml"
-        name="opml"
-        rows="4"
-        placeholder="<opml>…</opml>"
-        required
-      ></textarea>
-      <button type="submit">Import</button>
+  <details class="new-folder">
+    <summary>New folder</summary>
+    <form method="post" action="/folders" class="new-folder-form">
+      <input type="text" name="name" placeholder="Folder name" required />
+      <button type="submit">Create</button>
     </form>
+  </details>
+
+  <details class="import-opml">
+    <summary>Import / export OPML</summary>
+    <form method="post" action="/opml" enctype="multipart/form-data" class="opml-file-form">
+      <label class="import-opml-label" for="opml-file">Upload an OPML file</label>
+      <input id="opml-file" name="file" type="file" accept=".opml,.xml,text/xml,text/x-opml" />
+      <button type="submit">Import file</button>
+    </form>
+    <form method="post" action="/opml" enctype="multipart/form-data" class="opml-paste-form">
+      <label class="import-opml-label" for="opml">…or paste an OPML export</label>
+      <textarea id="opml" name="opml" rows="4" placeholder="&lt;opml&gt;…&lt;/opml&gt;"></textarea>
+      <button type="submit">Import text</button>
+    </form>
+    <p class="opml-export"><a href="/opml/export">Export your subscriptions ↓</a></p>
   </details>
 
   {% if !flash.is_empty() %}
@@ -41,18 +55,35 @@
   {% endif %}
 
   <nav class="feeds">
+    <ul class="feed-list scopes">
+      <li class="feed-item{% if scope_qs.is_empty() %} is-selected{% endif %}">
+        <a class="feed-title" href="/?view={{ view }}">All feeds</a>
+      </li>
+    </ul>
+
     {% if folders.is_empty() && loose_feeds.is_empty() %}
       <p class="muted">No subscriptions yet. Paste a feed URL above.</p>
     {% else %}
       {% for folder in folders %}
-        <div class="folder">
-          <h2 class="folder-name">{{ folder.name }}</h2>
+        <div class="folder{% if folder.selected %} is-selected{% endif %}">
+          <div class="folder-head">
+            <a class="folder-name" href="/?folder={{ folder.uri|urlencode }}&view={{ view }}">{{ folder.name }}</a>
+            <details class="folder-menu">
+              <summary aria-label="Folder actions">⋯</summary>
+              <div class="folder-menu-panel">
+                <form method="post" action="/folders/{{ folder.rkey }}/rename" class="inline-form">
+                  <input type="text" name="name" value="{{ folder.name }}" required />
+                  <button type="submit">Rename</button>
+                </form>
+                <form method="post" action="/folders/{{ folder.rkey }}/delete" class="inline-form">
+                  <button type="submit" class="danger">Delete folder</button>
+                </form>
+              </div>
+            </details>
+          </div>
           <ul class="feed-list">
             {% for feed in folder.feeds %}
-              <li class="feed-item">
-                <span class="feed-title">{{ feed.title }}</span>
-                {% if feed.unread > 0 %}<span class="unread-count">{{ feed.unread }}</span>{% endif %}
-              </li>
+              {% include "feed_item.html" %}
             {% endfor %}
           </ul>
         </div>
@@ -63,10 +94,7 @@
           <h2 class="folder-name">Feeds</h2>
           <ul class="feed-list">
             {% for feed in loose_feeds %}
-              <li class="feed-item">
-                <span class="feed-title">{{ feed.title }}</span>
-                {% if feed.unread > 0 %}<span class="unread-count">{{ feed.unread }}</span>{% endif %}
-              </li>
+              {% include "feed_item.html" %}
             {% endfor %}
           </ul>
         </div>
@@ -75,10 +103,28 @@
   </nav>
 </aside>
 
-<section class="reader" aria-label="Unread entries">
+<section class="reader" aria-label="Articles">
   <div class="reader-head">
-    <h1>Unread</h1>
+    <h1>{{ heading }}</h1>
     <span class="count">{{ entries.len() }}</span>
+  </div>
+
+  <div class="reader-toolbar">
+    <nav class="views" aria-label="View">
+      <a href="/{% if scope_qs.is_empty() %}?view=unread{% else %}?{{ scope_qs }}&view=unread{% endif %}"
+         class="view-tab{% if view == "unread" %} is-active{% endif %}">Unread</a>
+      <a href="/{% if scope_qs.is_empty() %}?view=all{% else %}?{{ scope_qs }}&view=all{% endif %}"
+         class="view-tab{% if view == "all" %} is-active{% endif %}">All</a>
+      <a href="/{% if scope_qs.is_empty() %}?view=starred{% else %}?{{ scope_qs }}&view=starred{% endif %}"
+         class="view-tab{% if view == "starred" %} is-active{% endif %}">Starred</a>
+    </nav>
+    {% if !entries.is_empty() %}
+      <form id="mark-all-form" method="post"
+            action="/read-all{% if let Some(f) = feed_scope %}?feed={{ f|urlencode }}{% endif %}"
+            class="mark-all">
+        <button type="submit" class="linkish">Mark all read</button>
+      </form>
+    {% endif %}
   </div>
 
   {% if entries.is_empty() %}

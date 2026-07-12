@@ -584,6 +584,327 @@ textarea {
   border-radius: 4px;
 }
 
+/* ---- Text-button ("linkish") --------------------------------------- */
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-family: var(--font-sans);
+  color: var(--accent);
+  cursor: pointer;
+}
+.linkish:hover {
+  color: var(--ink);
+}
+
+/* ---- Sidebar: folder / feed selects + management -------------------- */
+.add-feed-folder {
+  margin-top: 0.5rem;
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.4em 0.5em;
+}
+
+.new-folder summary,
+.import-opml summary {
+  cursor: pointer;
+  color: var(--accent);
+  margin-bottom: 0.6em;
+}
+.new-folder-form {
+  display: flex;
+  gap: 0.4rem;
+}
+.new-folder-form input {
+  flex: 1;
+}
+
+.opml-file-form,
+.opml-paste-form {
+  margin-bottom: 0.75rem;
+}
+.opml-file-form input[type="file"] {
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+.opml-export {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+}
+
+/* Scope list ("All feeds", feeds, folders) + selected state. */
+.scopes {
+  margin-bottom: 0.75rem;
+}
+.feed-item.is-selected > .feed-title,
+.folder.is-selected > .folder-head > .folder-name {
+  color: var(--ink);
+  font-weight: 600;
+}
+.feed-item {
+  position: relative;
+}
+.feed-item .feed-title {
+  text-decoration: none;
+  color: var(--ink-soft);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feed-item .feed-title:hover {
+  color: var(--accent);
+}
+
+.folder-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+a.folder-name {
+  text-decoration: none;
+}
+a.folder-name:hover {
+  color: var(--accent);
+}
+
+/* Tiny "⋯" action menus on feeds + folders. */
+.feed-menu,
+.folder-menu {
+  flex: 0 0 auto;
+}
+.feed-menu > summary,
+.folder-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 0 0.3em;
+  border-radius: 4px;
+}
+.feed-menu > summary::-webkit-details-marker,
+.folder-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.feed-menu > summary:hover,
+.folder-menu > summary:hover {
+  color: var(--ink);
+  background: var(--accent-soft);
+}
+.feed-menu-panel,
+.folder-menu-panel {
+  margin-top: 0.4rem;
+  padding: 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.inline-form {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.inline-form label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.inline-form input[type="text"],
+.inline-form select {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.35em 0.5em;
+  font-size: 0.85rem;
+}
+.inline-form button {
+  align-self: flex-start;
+}
+.danger {
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--unread);
+  padding: 0.3em 0.7em;
+  border-radius: var(--radius);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.danger:hover {
+  border-color: var(--unread);
+  filter: none;
+}
+
+/* ---- Reader toolbar: view tabs + mark-all -------------------------- */
+.reader-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.views {
+  display: inline-flex;
+  gap: 0.25rem;
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+}
+.view-tab {
+  text-decoration: none;
+  color: var(--muted);
+  padding: 0.25em 0.7em;
+  border-radius: 999px;
+}
+.view-tab:hover {
+  color: var(--ink);
+  background: var(--accent-soft);
+}
+.view-tab.is-active {
+  color: var(--ink);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.mark-all {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* ---- Entry-row actions: star + mark-read --------------------------- */
+.entry-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.entry-actions form {
+  margin: 0;
+}
+.star {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--muted);
+  padding: 0.15em 0.3em;
+}
+.star:hover {
+  color: var(--unread);
+  filter: none;
+}
+.star.is-starred {
+  color: var(--unread);
+}
+
+/* Keyboard cursor row highlight (added by keyboard.js). */
+.entry-row.is-cursor {
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+/* ---- Article: paging + star ---------------------------------------- */
+.article-nav {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.article-paging {
+  display: inline-flex;
+  gap: 1rem;
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+}
+.article-actions {
+  display: inline-flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+.article-actions form {
+  margin: 0;
+}
+.star-btn {
+  background: none;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 0.5em 1em;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.star-btn:hover {
+  color: var(--unread);
+  border-color: var(--unread);
+  filter: none;
+}
+.star-btn.is-starred {
+  color: var(--unread);
+  border-color: var(--unread);
+}
+
+/* ---- Keyboard-help overlay ----------------------------------------- */
+.kbd-help {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  margin: 0;
+}
+.kbd-help:not([open]) {
+  display: none;
+}
+.kbd-help > summary {
+  display: none;
+}
+.kbd-help-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1.5rem 1.75rem;
+  max-width: 22rem;
+  width: calc(100% - 2rem);
+  font-family: var(--font-sans);
+}
+.kbd-help-panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.1rem;
+}
+.kbd-help-panel ul {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  background: var(--accent-soft);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.05em 0.4em;
+  color: var(--ink);
+}
+
 /* ---- Motion respect ------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   * {
