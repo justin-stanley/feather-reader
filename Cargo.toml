@@ -52,6 +52,9 @@ sqlx = { version = "0.9", default-features = false, features = [
     "sqlite-bundled",
     "migrate",
     "chrono",
+    # `derive` pulls in sqlx-macros so the store's row structs can
+    # `#[derive(FromRow)]` — the derive macro, not just the `FromRow` trait.
+    "derive",
 ] }
 
 # --- HTML templating (compile-time, embedded in the binary) --------------
