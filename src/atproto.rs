@@ -27,23 +27,26 @@
 //!    types (list/create [`Subscription`]/[`Folder`]/[`Saved`], upsert
 //!    [`ReadState`], batch-flush many `ReadState` cursors).
 //!
-//! ## Auth — a scaffolded seam
+//! ## Auth — the OAuth sidecar is the live path
 //!
-//! Auth is deliberately a **trait/enum boundary** so the real mechanism can drop
-//! in later without touching call sites:
+//! Auth is a **trait/enum boundary** so the mechanism can vary without touching
+//! call sites. There are two paths:
 //!
-//! * **Phase 0 (interim, exercisable):** [`Auth::Session`] — a session obtained
-//!   from `com.atproto.server.createSession` with an **app password**. This is a
-//!   legacy but fully-working path that lets the whole client be exercised
-//!   end-to-end today (see [`login_with_app_password`]).
-//! * **TODO (the real path):** the atproto **OAuth confidential client**. Per the
-//!   design and the [gaming-SDK prior art], atproto OAuth (DPoP, PAR, token
-//!   refresh) is fiddly and should **not** be hand-rolled in Rust; it runs in a
-//!   small supported `@atproto/oauth-client` sidecar that mints DPoP-bound access
-//!   tokens the Rust server carries. The seam for that is [`Auth::Oauth`] plus
-//!   the [`TokenSource`] trait — both present and documented here, so the OAuth
-//!   sidecar wires in without changing [`PdsClient`]'s surface. It is NOT
-//!   implemented in Phase 0.
+//! * **The live path — the atproto OAuth confidential client, via [`SidecarClient`].**
+//!   Per the design and the gaming-SDK prior art, atproto OAuth (DPoP, PAR, token
+//!   refresh) is fiddly and is **not** hand-rolled in Rust: it runs in a small
+//!   supported `@atproto/oauth-client-node` sidecar. The Rust server never holds
+//!   PDS tokens — it POSTs every `com.atproto.repo.*` op to the sidecar's
+//!   `/internal/repo` endpoint (gated by a shared `X-Internal-Secret`), and the
+//!   sidecar restores the DID's OAuth session (transparent DPoP + token refresh)
+//!   and runs the matching XRPC call. [`SidecarClient`] is that client; the typed
+//!   convenience wrappers (list/create/put/delete subscriptions, batch-flush
+//!   read-state) live on it and map 1:1 to the old [`PdsClient`] surface.
+//! * **The interim path — [`Auth::Session`] (app password).** A session obtained
+//!   from `com.atproto.server.createSession`. Kept behind the [`Auth`] seam as a
+//!   fallback for local runs without the sidecar, but it is **no longer the live
+//!   path**: [`PdsClient`] and [`login_with_app_password`] remain for tests and
+//!   dev, while [`SidecarClient`] is what the web layer routes through.
 //!
 //! All network I/O is `reqwest` (rustls, no OpenSSL); every fallible path returns
 //! [`anyhow::Result`] or the typed [`AtProtoError`] — nothing panics.
@@ -763,6 +766,398 @@ impl PdsClient {
 }
 
 // ---------------------------------------------------------------------------
+// The OAuth sidecar client — the LIVE com.atproto.repo.* path
+// ---------------------------------------------------------------------------
+
+/// A client for the atproto OAuth sidecar's **internal** API.
+///
+/// This is the live path for every authed repo operation. Rather than the Rust
+/// server holding PDS tokens, it POSTs `{did, action, …}` to the sidecar's
+/// `/internal/repo` endpoint (gated by the shared `X-Internal-Secret`); the
+/// sidecar `restore(did)`s the OAuth session — transparent DPoP + token refresh —
+/// and runs the matching XRPC call via `@atproto/api`. The `did` (plus the shared
+/// secret) is what authorizes the call; there is no bearer token on the Rust side.
+///
+/// It also fronts `/internal/session/:id`, the one-shot handoff the Rust callback
+/// uses to turn a `session_id` (from the sidecar's browser redirect) into the
+/// `{did, handle}` it keys its own signed cookie by.
+///
+/// Cheap to clone (shared `reqwest::Client` + `Arc`'d config).
+#[derive(Clone)]
+pub struct SidecarClient {
+    http: Client,
+    public_url: Arc<str>,
+    internal_secret: Arc<str>,
+}
+
+/// The `{did, handle}` a session-id resolves to (the sidecar's
+/// `/internal/session/:id` body).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarSession {
+    /// The account DID that logged in.
+    pub did: String,
+    /// The account handle at login time.
+    #[serde(default)]
+    pub handle: Option<String>,
+}
+
+/// The action verbs the sidecar's `/internal/repo` endpoint dispatches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoAction {
+    /// `com.atproto.repo.listRecords`.
+    List,
+    /// `com.atproto.repo.createRecord`.
+    Create,
+    /// `com.atproto.repo.putRecord`.
+    Put,
+    /// `com.atproto.repo.deleteRecord`.
+    Delete,
+    /// `com.atproto.repo.applyWrites` (batch).
+    ApplyWrites,
+}
+
+impl RepoAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            RepoAction::List => "list",
+            RepoAction::Create => "create",
+            RepoAction::Put => "put",
+            RepoAction::Delete => "delete",
+            RepoAction::ApplyWrites => "applyWrites",
+        }
+    }
+}
+
+/// The `/internal/repo` success envelope: `{ ok:true, data:<raw XRPC JSON> }`.
+#[derive(Debug, Deserialize)]
+struct RepoOk {
+    #[serde(default)]
+    data: Value,
+}
+
+/// The `/internal/repo` error envelope: `{ ok:false, error, message, status? }`.
+#[derive(Debug, Deserialize)]
+struct RepoErr {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
+}
+
+impl SidecarClient {
+    /// Build a sidecar client from the shared [`reqwest::Client`] and the
+    /// resolved base URL + internal secret (from [`crate::config::SidecarConfig`]).
+    pub fn new(
+        http: Client,
+        public_url: impl Into<String>,
+        internal_secret: impl Into<String>,
+    ) -> Self {
+        Self {
+            http,
+            public_url: Arc::from(public_url.into().trim_end_matches('/')),
+            internal_secret: Arc::from(internal_secret.into()),
+        }
+    }
+
+    /// The sidecar's public `/login` URL for a handle, round-tripping an opaque
+    /// `return` value through OAuth state (used to bounce the browser back to a
+    /// specific place after login). The browser is redirected here.
+    pub fn login_url(&self, handle: &str, return_to: Option<&str>) -> String {
+        let mut url = format!("{}/login?handle={}", self.public_url, urlencode(handle));
+        if let Some(r) = return_to {
+            url.push_str(&format!("&return={}", urlencode(r)));
+        }
+        url
+    }
+
+    /// Resolve a one-shot `session_id` (from the sidecar's post-OAuth redirect)
+    /// to the `{did, handle}` that logged in. `Ok(None)` on `404 SessionNotFound`.
+    pub async fn resolve_session(&self, session_id: &str) -> Result<Option<SidecarSession>> {
+        let url = format!("{}/internal/session/{}", self.public_url, urlencode(session_id));
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-Internal-Secret", self.internal_secret.as_ref())
+            .send()
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(xrpc_error_from(resp).await.into());
+        }
+        let session: SidecarSession = resp
+            .json()
+            .await
+            .context("parsing /internal/session response")?;
+        Ok(Some(session))
+    }
+
+    /// POST one op to `/internal/repo` and return the raw XRPC `data` payload.
+    ///
+    /// `body` must already carry `did` + `action` + the action's required fields
+    /// (the typed wrappers below build these). Maps the sidecar's error envelope
+    /// to [`AtProtoError`]: `404 SessionNotFound` → `Xrpc{error:"SessionNotFound"}`
+    /// so callers can treat it as "re-login required".
+    async fn repo(&self, body: Value) -> Result<Value> {
+        let url = format!("{}/internal/repo", self.public_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Internal-Secret", self.internal_secret.as_ref())
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let ok: RepoOk = resp.json().await.context("parsing /internal/repo ok body")?;
+            return Ok(ok.data);
+        }
+        // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
+        let err: RepoErr = resp.json().await.unwrap_or(RepoErr {
+            error: None,
+            message: None,
+            status: None,
+        });
+        let mapped = err
+            .status
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(status);
+        Err(AtProtoError::Xrpc {
+            status: mapped,
+            error: err.error.unwrap_or_else(|| "Unknown".to_string()),
+            message: err.message,
+        }
+        .into())
+    }
+
+    // -- raw com.atproto.repo.* over the sidecar -----------------------------
+
+    /// `list` — one page of a collection's records for `did`.
+    pub async fn list_records(
+        &self,
+        did: &str,
+        collection: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<ListRecordsResponse> {
+        let mut body = json!({
+            "did": did,
+            "action": RepoAction::List.as_str(),
+            "collection": collection,
+        });
+        if let Some(limit) = limit {
+            body["limit"] = json!(limit);
+        }
+        if let Some(cursor) = cursor {
+            body["cursor"] = json!(cursor);
+        }
+        let data = self.repo(body).await?;
+        serde_json::from_value(data).context("parsing sidecar listRecords data")
+    }
+
+    /// Page through **all** records in a collection for `did`.
+    pub async fn list_all_records(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<RecordEntry>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .list_records(did, collection, Some(100), cursor.as_deref())
+                .await?;
+            let got = page.records.len();
+            out.extend(page.records);
+            match page.cursor {
+                Some(next) if got > 0 => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// `create` — create a record (server-assigned rkey). Returns its strong ref.
+    pub async fn create_record<T: Serialize>(
+        &self,
+        did: &str,
+        collection: &str,
+        record: &T,
+    ) -> Result<WriteResult> {
+        let body = json!({
+            "did": did,
+            "action": RepoAction::Create.as_str(),
+            "collection": collection,
+            "record": record,
+        });
+        let data = self.repo(body).await?;
+        serde_json::from_value(data).context("parsing sidecar createRecord data")
+    }
+
+    /// `put` — upsert a record at a known rkey. Returns its strong ref.
+    pub async fn put_record<T: Serialize>(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+        record: &T,
+    ) -> Result<WriteResult> {
+        let body = json!({
+            "did": did,
+            "action": RepoAction::Put.as_str(),
+            "collection": collection,
+            "rkey": rkey,
+            "record": record,
+        });
+        let data = self.repo(body).await?;
+        serde_json::from_value(data).context("parsing sidecar putRecord data")
+    }
+
+    /// `delete` — delete a record by collection + rkey.
+    pub async fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<()> {
+        let body = json!({
+            "did": did,
+            "action": RepoAction::Delete.as_str(),
+            "collection": collection,
+            "rkey": rkey,
+        });
+        self.repo(body).await?;
+        Ok(())
+    }
+
+    /// `applyWrites` — a batch of create/update/delete ops in one round-trip.
+    pub async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let ops: Vec<Value> = writes.iter().map(WriteOp::to_sidecar_json).collect();
+        let body = json!({
+            "did": did,
+            "action": RepoAction::ApplyWrites.as_str(),
+            "writes": ops,
+        });
+        self.repo(body).await?;
+        Ok(())
+    }
+
+    // -- typed lexicon wrappers (mirror the old PdsClient surface) ------------
+
+    /// List every [`Subscription`] record in `did`'s repo (paged fully).
+    pub async fn list_subscriptions(&self, did: &str) -> Result<Vec<(String, Subscription)>> {
+        self.list_typed(did, lexicon::nsid::SUBSCRIPTION).await
+    }
+
+    /// Create a [`Subscription`] record (subscribe to a feed).
+    pub async fn create_subscription(
+        &self,
+        did: &str,
+        sub: &Subscription,
+    ) -> Result<WriteResult> {
+        self.create_record(did, lexicon::nsid::SUBSCRIPTION, sub).await
+    }
+
+    /// Delete a [`Subscription`] record by rkey (unsubscribe).
+    pub async fn delete_subscription(&self, did: &str, rkey: &str) -> Result<()> {
+        self.delete_record(did, lexicon::nsid::SUBSCRIPTION, rkey).await
+    }
+
+    /// Batch-create many [`Subscription`] records in one `applyWrites` — the OPML
+    /// import path (one create op per feed, server-assigned rkeys).
+    pub async fn create_subscriptions_batch(
+        &self,
+        did: &str,
+        subs: &[Subscription],
+    ) -> Result<()> {
+        let writes: Vec<WriteOp> = subs
+            .iter()
+            .map(|sub| {
+                Ok(WriteOp::Create {
+                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                    rkey: None,
+                    value: serde_json::to_value(sub)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.apply_writes(did, &writes).await
+    }
+
+    /// List every [`Folder`] record in `did`'s repo.
+    pub async fn list_folders(&self, did: &str) -> Result<Vec<(String, Folder)>> {
+        self.list_typed(did, lexicon::nsid::FOLDER).await
+    }
+
+    /// List every [`Saved`] record in `did`'s repo.
+    pub async fn list_saved(&self, did: &str) -> Result<Vec<(String, Saved)>> {
+        self.list_typed(did, lexicon::nsid::SAVED).await
+    }
+
+    /// List every [`ReadState`] cursor in `did`'s repo (reconcile-on-login).
+    pub async fn list_read_states(&self, did: &str) -> Result<Vec<(String, ReadState)>> {
+        self.list_typed(did, lexicon::nsid::READ_STATE).await
+    }
+
+    /// Upsert a single [`ReadState`] cursor at its feed-derived rkey.
+    pub async fn put_read_state(
+        &self,
+        did: &str,
+        rkey: &str,
+        state: &ReadState,
+    ) -> Result<WriteResult> {
+        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state).await
+    }
+
+    /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call.
+    pub async fn flush_read_states(
+        &self,
+        did: &str,
+        cursors: &[(String, ReadState)],
+    ) -> Result<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let writes: Vec<WriteOp> = cursors
+            .iter()
+            .map(|(rkey, state)| {
+                Ok(WriteOp::Update {
+                    collection: lexicon::nsid::READ_STATE.to_string(),
+                    rkey: rkey.clone(),
+                    value: serde_json::to_value(state)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.apply_writes(did, &writes).await
+    }
+
+    /// List a collection for `did` and parse each record's value into `T`,
+    /// pairing it with its rkey. Unparseable records are skipped with a warning
+    /// (forward-compat).
+    async fn list_typed<T: DeserializeOwned>(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<(String, T)>> {
+        let records = self.list_all_records(did, collection).await?;
+        let mut out = Vec::with_capacity(records.len());
+        for rec in records {
+            let rkey = rec.rkey().unwrap_or_default().to_string();
+            match rec.parse::<T>() {
+                Ok(value) => out.push((rkey, value)),
+                Err(e) => tracing::warn!(
+                    collection,
+                    uri = %rec.uri,
+                    error = %e,
+                    "skipping unparseable record in collection"
+                ),
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // applyWrites operations
 // ---------------------------------------------------------------------------
 
@@ -830,6 +1225,44 @@ impl WriteOp {
             }),
             WriteOp::Delete { collection, rkey } => json!({
                 "$type": "com.atproto.repo.applyWrites#delete",
+                "collection": collection,
+                "rkey": rkey,
+            }),
+        }
+    }
+
+    /// Render this op in the shape the OAuth sidecar's `/internal/repo`
+    /// `applyWrites` expects: `{action, collection, rkey?, value?}` (the sidecar
+    /// maps `action` → the `com.atproto.repo.applyWrites#<kind>` union member).
+    fn to_sidecar_json(&self) -> Value {
+        match self {
+            WriteOp::Create {
+                collection,
+                rkey,
+                value,
+            } => {
+                let mut op = json!({
+                    "action": "create",
+                    "collection": collection,
+                    "value": value,
+                });
+                if let Some(rkey) = rkey {
+                    op["rkey"] = json!(rkey);
+                }
+                op
+            }
+            WriteOp::Update {
+                collection,
+                rkey,
+                value,
+            } => json!({
+                "action": "update",
+                "collection": collection,
+                "rkey": rkey,
+                "value": value,
+            }),
+            WriteOp::Delete { collection, rkey } => json!({
+                "action": "delete",
                 "collection": collection,
                 "rkey": rkey,
             }),

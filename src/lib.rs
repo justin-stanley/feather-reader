@@ -32,24 +32,111 @@ pub mod lexicon;
 pub mod store;
 pub mod web;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
+use atproto::SidecarClient;
 use config::Config;
 use store::Pool;
 
+/// One logged-in identity, resolved from the OAuth sidecar and keyed by DID.
+///
+/// The DID is the primary key for everything local; the handle is carried for
+/// display. This is what the signed session cookie resolves to.
+#[derive(Clone, Debug)]
+pub struct Session {
+    /// The account DID (the primary key for all per-user local state).
+    pub did: String,
+    /// The account handle at login time (display only).
+    pub handle: Option<String>,
+}
+
+/// In-memory session registry: DID → [`Session`].
+///
+/// The signed cookie carries the DID; this maps it back to the full session
+/// (handle, and room to grow). It is populated at the OAuth callback (after the
+/// sidecar resolves the one-shot `session_id` to `{did, handle}`) and read on
+/// every request. Being in-memory it's cleared on restart — but that's fine: the
+/// **durable** OAuth session lives in the sidecar's SQLite store, so a returning
+/// cookie whose DID isn't yet in the registry can be re-hydrated (the sidecar
+/// still has the OAuth session; only the handle needs refetching), and repo ops
+/// key off the DID + shared secret regardless.
+#[derive(Clone, Default)]
+pub struct SessionRegistry {
+    inner: Arc<RwLock<HashMap<String, Session>>>,
+}
+
+impl SessionRegistry {
+    /// A fresh, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or refresh a session, keyed by its DID.
+    pub fn insert(&self, session: Session) {
+        if let Ok(mut map) = self.inner.write() {
+            map.insert(session.did.clone(), session);
+        }
+    }
+
+    /// Look up a session by DID.
+    pub fn get(&self, did: &str) -> Option<Session> {
+        self.inner.read().ok().and_then(|m| m.get(did).cloned())
+    }
+
+    /// Drop a session (logout).
+    pub fn remove(&self, did: &str) {
+        if let Ok(mut map) = self.inner.write() {
+            map.remove(did);
+        }
+    }
+}
+
 /// Shared application state handed to every axum handler.
 ///
-/// Holds the resolved [`Config`] and the SQLite pool. It is `Clone` (cheap —
-/// the pool and config are behind `Arc`/handles) and is cloned into each
-/// request. Later phases extend this with the atproto session registry, the
-/// HTTP fetch client, and the scheduler handle. It lives in the library (not
-/// the binary) so both [`web`] and the `featherreader` binary share one type.
+/// Holds the resolved [`Config`], the SQLite pool, a shared [`reqwest::Client`]
+/// (feed fetch + sidecar calls), the [`SidecarClient`] (the live atproto
+/// `com.atproto.repo.*` path), and the in-memory [`SessionRegistry`] (DID ↔
+/// handle, resolved via the sidecar's `/internal/session`). It is `Clone` (cheap
+/// — everything is behind `Arc`/handles) and is cloned into each request. It
+/// lives in the library so both [`web`] and the `featherreader` binary share it.
 #[derive(Clone)]
 pub struct AppState {
     /// Immutable runtime configuration.
     pub config: Arc<Config>,
     /// The per-DID SQLite cache pool.
     pub db: Pool,
+    /// Shared HTTP client (feed fetch + sidecar internal API).
+    pub http: reqwest::Client,
+    /// The atproto OAuth sidecar client — the live repo-op path.
+    pub sidecar: SidecarClient,
+    /// DID ↔ handle session registry (cookie-resolved identity).
+    pub sessions: SessionRegistry,
+}
+
+impl AppState {
+    /// Assemble the shared state from config + an initialized store pool.
+    ///
+    /// Builds the shared HTTP client and the [`SidecarClient`] from the config's
+    /// [`crate::config::SidecarConfig`], and starts with an empty session
+    /// registry. The binary's `main` calls this after opening the store.
+    pub fn new(config: Config, db: Pool) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()?;
+        let sidecar = SidecarClient::new(
+            http.clone(),
+            config.sidecar.public_url.clone(),
+            config.sidecar.internal_secret.clone(),
+        );
+        Ok(Self {
+            config: Arc::new(config),
+            db,
+            http,
+            sidecar,
+            sessions: SessionRegistry::new(),
+        })
+    }
 }
 
 /// The crate version — surfaced for the server's `--version` / health output.
