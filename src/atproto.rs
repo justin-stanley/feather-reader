@@ -446,6 +446,23 @@ pub struct WriteResult {
     pub cid: Option<String>,
 }
 
+impl WriteResult {
+    /// The record key — the last `/`-segment of the `at://` URI.
+    ///
+    /// The reader-facing `add_*` wrappers return this so the web layer can
+    /// address the freshly-created record (delete/rename) without a re-list.
+    pub fn rkey(&self) -> Option<&str> {
+        self.uri.rsplit('/').next()
+    }
+
+    /// The record key as an owned `String`, or the empty string if the URI is
+    /// somehow segment-less (never in practice — a PDS always returns an
+    /// `at://did/collection/rkey`). Convenience for the `-> rkey` wrappers.
+    pub fn into_rkey(self) -> String {
+        self.rkey().unwrap_or_default().to_string()
+    }
+}
+
 impl PdsClient {
     /// Construct a client against an already-resolved PDS base + DID + auth.
     pub fn new(
@@ -1129,6 +1146,167 @@ impl SidecarClient {
         self.apply_writes(did, &writes).await
     }
 
+    // -- reader-facing record CRUD (the surface the web layer calls) ----------
+    //
+    // These are the typed convenience methods `web.rs` uses to manage a user's
+    // feeds/folders/saved items *as records in their PDS*. They mirror the
+    // Phase-1 create/list surface above but use the reader vocabulary
+    // (add/remove/rename) and, for the `add_*` verbs, return the server-assigned
+    // rkey so the caller can address the new record without a re-list. Ordering
+    // is made deterministic where it matters (see [`list_subscriptions_sorted`]
+    // etc.) so the server-rendered HTML is stable between reads.
+
+    // -- subscriptions -------------------------------------------------------
+
+    /// Add a subscription (subscribe to a feed) — `createRecord`, server-assigned
+    /// `tid` rkey. Returns the new record's **rkey** so the web layer can offer
+    /// unsubscribe/rename immediately.
+    pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
+        Ok(self.create_subscription(did, sub).await?.into_rkey())
+    }
+
+    /// Remove a subscription (unsubscribe) by rkey — `deleteRecord`. Alias of
+    /// [`delete_subscription`](Self::delete_subscription) in the reader vocabulary.
+    pub async fn remove_subscription(&self, did: &str, rkey: &str) -> Result<()> {
+        self.delete_subscription(did, rkey).await
+    }
+
+    /// Update / rename a subscription in place at a known rkey — `putRecord`.
+    ///
+    /// The whole record is replaced (retitle, move to a folder, change the
+    /// fetch hint …). Upsert semantics: it also creates the record if the rkey
+    /// is somehow absent, so it is safe as a general "write this exact record".
+    pub async fn update_subscription(
+        &self,
+        did: &str,
+        rkey: &str,
+        sub: &Subscription,
+    ) -> Result<WriteResult> {
+        self.put_record(did, lexicon::nsid::SUBSCRIPTION, rkey, sub)
+            .await
+    }
+
+    /// List every subscription, **sorted deterministically** — by display title
+    /// (case-insensitive), then feed URL, then rkey as the final tiebreaker — so
+    /// the rendered feed list is stable across reads regardless of PDS return
+    /// order. Untitled feeds sort by their URL.
+    pub async fn list_subscriptions_sorted(
+        &self,
+        did: &str,
+    ) -> Result<Vec<(String, Subscription)>> {
+        let mut subs = self.list_subscriptions(did).await?;
+        subs.sort_by(|(a_key, a), (b_key, b)| {
+            let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
+            let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
+            a_title
+                .cmp(&b_title)
+                .then_with(|| a.url.cmp(&b.url))
+                .then_with(|| a_key.cmp(b_key))
+        });
+        Ok(subs)
+    }
+
+    /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
+    ///
+    /// Each feed becomes one `create` op. Client-side monotonic [`tid`](tid)
+    /// rkeys are assigned so the batch is deterministic and the imported feeds
+    /// keep OPML order (server-assigned tids would also be monotonic, but pinning
+    /// them here makes the whole import reproducible and testable offline).
+    /// Returns the assigned rkeys in input order.
+    pub async fn add_subscriptions_bulk(
+        &self,
+        did: &str,
+        subs: &[Subscription],
+    ) -> Result<Vec<String>> {
+        let mut gen = TidGenerator::new();
+        let mut rkeys = Vec::with_capacity(subs.len());
+        let mut writes = Vec::with_capacity(subs.len());
+        for sub in subs {
+            let rkey = gen.next();
+            writes.push(WriteOp::Create {
+                collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                rkey: Some(rkey.clone()),
+                value: serde_json::to_value(sub)?,
+            });
+            rkeys.push(rkey);
+        }
+        self.apply_writes(did, &writes).await?;
+        Ok(rkeys)
+    }
+
+    // -- folders -------------------------------------------------------------
+
+    /// Add a folder — `createRecord`, server-assigned `tid` rkey. Returns the
+    /// new folder's rkey (subscriptions reference it by its `at://` URI).
+    pub async fn add_folder(&self, did: &str, folder: &Folder) -> Result<String> {
+        Ok(self
+            .create_record(did, lexicon::nsid::FOLDER, folder)
+            .await?
+            .into_rkey())
+    }
+
+    /// Remove a folder by rkey — `deleteRecord`. (Subscriptions referencing it
+    /// are left untouched; a dangling `folder` ref reads as "unfiled".)
+    pub async fn remove_folder(&self, did: &str, rkey: &str) -> Result<()> {
+        self.delete_record(did, lexicon::nsid::FOLDER, rkey).await
+    }
+
+    /// Rename / update a folder in place at a known rkey — `putRecord`
+    /// (rename, or change its `position` sort hint).
+    pub async fn rename_folder(
+        &self,
+        did: &str,
+        rkey: &str,
+        folder: &Folder,
+    ) -> Result<WriteResult> {
+        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder)
+            .await
+    }
+
+    /// List every folder, **sorted deterministically** — by `position` (the
+    /// lexicon's sort hint; unset sorts last), then name (case-insensitive),
+    /// then rkey — so the sidebar order is stable.
+    pub async fn list_folders_sorted(&self, did: &str) -> Result<Vec<(String, Folder)>> {
+        let mut folders = self.list_folders(did).await?;
+        folders.sort_by(|(a_key, a), (b_key, b)| {
+            a.position
+                .unwrap_or(u64::MAX)
+                .cmp(&b.position.unwrap_or(u64::MAX))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a_key.cmp(b_key))
+        });
+        Ok(folders)
+    }
+
+    // -- saved / starred -----------------------------------------------------
+
+    /// Add a saved (starred / save-for-later) entry — `createRecord`,
+    /// server-assigned `tid` rkey. Returns the new record's rkey.
+    pub async fn add_saved(&self, did: &str, saved: &Saved) -> Result<String> {
+        Ok(self
+            .create_record(did, lexicon::nsid::SAVED, saved)
+            .await?
+            .into_rkey())
+    }
+
+    /// Remove a saved entry by rkey — `deleteRecord` (un-star).
+    pub async fn remove_saved(&self, did: &str, rkey: &str) -> Result<()> {
+        self.delete_record(did, lexicon::nsid::SAVED, rkey).await
+    }
+
+    /// List every saved entry, **sorted deterministically** — newest first by
+    /// `createdAt` (RFC-3339 sorts lexicographically), then rkey — so the
+    /// "saved for later" list reads most-recent-first and is stable.
+    pub async fn list_saved_sorted(&self, did: &str) -> Result<Vec<(String, Saved)>> {
+        let mut saved = self.list_saved(did).await?;
+        saved.sort_by(|(a_key, a), (b_key, b)| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a_key.cmp(b_key))
+        });
+        Ok(saved)
+    }
+
     /// List a collection for `did` and parse each record's value into `T`,
     /// pairing it with its rkey. Unparseable records are skipped with a warning
     /// (forward-compat).
@@ -1266,6 +1444,79 @@ impl WriteOp {
             }),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// TID rkeys (client-assigned, sortable, deterministic within a batch)
+// ---------------------------------------------------------------------------
+
+/// The atproto base32-sortable alphabet (`s32`) — the digits/letters, minus the
+/// ambiguous set, in **ascending** order so a bytewise string compare of two
+/// TIDs matches their timestamp order.
+const S32_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
+
+/// A monotonic generator of atproto **TID** record keys.
+///
+/// A TID is a 13-char `s32`-encoded 64-bit integer: a 53-bit microsecond
+/// timestamp in the high bits and a 10-bit "clock id" in the low bits (the top
+/// bit is always 0). Encoded in the ascending `s32` alphabet, TIDs sort
+/// lexicographically in creation order — which is exactly what we want for a
+/// batched OPML import: assigning the rkeys ourselves keeps the imported feeds
+/// in input order and makes [`add_subscriptions_bulk`](SidecarClient::add_subscriptions_bulk)
+/// fully reproducible/testable without a live PDS.
+///
+/// Monotonicity within one generator is guaranteed by tracking the last value
+/// and bumping to `last + 1` if the clock hasn't advanced — so a burst of
+/// same-microsecond calls still yields strictly increasing, ordered rkeys.
+struct TidGenerator {
+    /// The last raw 64-bit TID value emitted (0 = none yet).
+    last: u64,
+    /// The low-10-bit clock id, randomized once per generator to avoid
+    /// cross-instance collisions on the same microsecond.
+    clock_id: u64,
+}
+
+impl TidGenerator {
+    /// A fresh generator with a per-instance clock id derived from the current
+    /// nanosecond clock (no extra deps; uniqueness only needs to hold within a
+    /// single import batch, and the timestamp bits carry the ordering).
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        Self {
+            last: 0,
+            clock_id: nanos & 0x3ff,
+        }
+    }
+
+    /// The next monotonic TID rkey (13 `s32` chars).
+    fn next(&mut self) -> String {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        // Timestamp in bits 63..10 (top bit stays 0), clock id in bits 9..0.
+        let mut raw = ((micros & 0x001f_ffff_ffff_ffff) << 10) | self.clock_id;
+        if raw <= self.last {
+            raw = self.last + 1;
+        }
+        self.last = raw;
+        encode_s32_tid(raw)
+    }
+}
+
+/// Encode a 64-bit TID value as a 13-char big-endian `s32` string.
+fn encode_s32_tid(mut v: u64) -> String {
+    let mut buf = [0u8; 13];
+    for slot in buf.iter_mut().rev() {
+        *slot = S32_ALPHABET[(v & 0x1f) as usize];
+        v >>= 5;
+    }
+    // 13 * 5 = 65 bits cover the 64-bit value; the leading char holds the top
+    // (always-0) bit, so it is always the alphabet's first symbol.
+    String::from_utf8(buf.to_vec()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,5 +1762,213 @@ mod tests {
             message: Some("Could not locate record".to_string()),
         };
         assert!(err.is_record_not_found());
+    }
+
+    // -- reader-facing CRUD: rkey extraction --------------------------------
+
+    #[test]
+    fn write_result_extracts_rkey_from_uri() {
+        let wr: WriteResult = serde_json::from_value(json!({
+            "uri": "at://did:plc:abc123/community.lexicon.rss.subscription/3ksubnew",
+            "cid": "bafyreinew"
+        }))
+        .expect("write result");
+        assert_eq!(wr.rkey(), Some("3ksubnew"));
+        assert_eq!(wr.into_rkey(), "3ksubnew");
+    }
+
+    // -- reader-facing CRUD: deterministic sort orders ----------------------
+    //
+    // The `list_*_sorted` wrappers only add an ordering on top of the network
+    // `list_*` read, so we exercise the *comparator* here on representative
+    // data (parsed from a listRecords-shaped envelope) with no network.
+
+    fn parse_all<T: DeserializeOwned>(v: Value) -> Vec<(String, T)> {
+        let resp: ListRecordsResponse = serde_json::from_value(v).expect("envelope");
+        resp.records
+            .into_iter()
+            .map(|r| {
+                let rkey = r.rkey().unwrap_or_default().to_string();
+                (rkey, r.parse::<T>().expect("parse"))
+            })
+            .collect()
+    }
+
+    fn sort_subscriptions(subs: &mut [(String, Subscription)]) {
+        subs.sort_by(|(a_key, a), (b_key, b)| {
+            let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
+            let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
+            a_title
+                .cmp(&b_title)
+                .then_with(|| a.url.cmp(&b.url))
+                .then_with(|| a_key.cmp(b_key))
+        });
+    }
+
+    #[test]
+    fn subscriptions_sort_by_title_then_url_then_rkey() {
+        let mut subs: Vec<(String, Subscription)> = parse_all(json!({
+            "records": [
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-zebra",
+                    "value": { "url": "https://z.example/feed", "title": "Zebra News",
+                               "createdAt": "2026-07-12T00:00:00.000Z" }
+                },
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-untitled",
+                    "value": { "url": "https://aaa.example/feed",
+                               "createdAt": "2026-07-12T00:00:00.000Z" }
+                },
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-apple",
+                    "value": { "url": "https://apple.example/feed", "title": "apple blog",
+                               "createdAt": "2026-07-12T00:00:00.000Z" }
+                }
+            ]
+        }));
+        sort_subscriptions(&mut subs);
+        // Case-insensitive by the display key (title, or URL when untitled):
+        // "apple blog" < "https://aaa.example/feed" < "zebra news".
+        let order: Vec<&str> = subs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(order, vec!["rk-apple", "rk-untitled", "rk-zebra"]);
+    }
+
+    #[test]
+    fn folders_sort_by_position_then_name_then_rkey() {
+        let mut folders: Vec<(String, Folder)> = parse_all(json!({
+            "records": [
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-nopos",
+                    "value": { "name": "Aardvark", "createdAt": "2026-07-12T00:00:00.000Z" }
+                },
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-pos2",
+                    "value": { "name": "Tech", "position": 2, "createdAt": "2026-07-12T00:00:00.000Z" }
+                },
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-pos0",
+                    "value": { "name": "News", "position": 0, "createdAt": "2026-07-12T00:00:00.000Z" }
+                }
+            ]
+        }));
+        folders.sort_by(|(a_key, a), (b_key, b)| {
+            a.position
+                .unwrap_or(u64::MAX)
+                .cmp(&b.position.unwrap_or(u64::MAX))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a_key.cmp(b_key))
+        });
+        let order: Vec<&str> = folders.iter().map(|(k, _)| k.as_str()).collect();
+        // position 0, then 2, then the unset (sorts last despite name "Aardvark").
+        assert_eq!(order, vec!["rk-pos0", "rk-pos2", "rk-nopos"]);
+    }
+
+    #[test]
+    fn saved_sort_newest_first_by_created_at() {
+        let mut saved: Vec<(String, Saved)> = parse_all(json!({
+            "records": [
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.saved/rk-old",
+                    "value": { "url": "https://e.example/1", "createdAt": "2026-07-10T00:00:00.000Z" }
+                },
+                {
+                    "uri": "at://did:plc:x/community.lexicon.rss.saved/rk-new",
+                    "value": { "url": "https://e.example/2", "createdAt": "2026-07-12T00:00:00.000Z" }
+                }
+            ]
+        }));
+        saved.sort_by(|(a_key, a), (b_key, b)| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a_key.cmp(b_key))
+        });
+        assert_eq!(saved[0].0, "rk-new");
+        assert_eq!(saved[1].0, "rk-old");
+    }
+
+    // -- reader-facing CRUD: bulk applyWrites shape (OPML import) ------------
+
+    #[test]
+    fn bulk_subscription_creates_render_sidecar_applywrites_ops() {
+        // Mirror what `add_subscriptions_bulk` builds: one create op per feed,
+        // each with a client-assigned rkey, in the sidecar's `applyWrites` shape.
+        let subs = [
+            Subscription::new("https://a.example/feed", "2026-07-12T00:00:00.000Z"),
+            Subscription::new("https://b.example/feed", "2026-07-12T00:00:00.000Z"),
+        ];
+        let mut gen = TidGenerator::new();
+        let ops: Vec<Value> = subs
+            .iter()
+            .map(|sub| {
+                WriteOp::Create {
+                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                    rkey: Some(gen.next()),
+                    value: serde_json::to_value(sub).expect("value"),
+                }
+                .to_sidecar_json()
+            })
+            .collect();
+
+        assert_eq!(ops.len(), 2);
+        for op in &ops {
+            assert_eq!(op["action"], json!("create"));
+            assert_eq!(
+                op["collection"],
+                json!("community.lexicon.rss.subscription")
+            );
+            assert!(op["rkey"].is_string(), "bulk import pins client-side rkeys");
+            assert_eq!(
+                op["value"]["$type"],
+                json!("community.lexicon.rss.subscription")
+            );
+        }
+        // Distinct, ascending rkeys keep OPML order deterministic.
+        let k0 = ops[0]["rkey"].as_str().unwrap();
+        let k1 = ops[1]["rkey"].as_str().unwrap();
+        assert!(k0 < k1, "bulk rkeys must sort in input order ({k0} < {k1})");
+    }
+
+    // -- TID rkeys ----------------------------------------------------------
+
+    #[test]
+    fn tid_rkeys_are_13_char_s32_and_monotonic() {
+        let mut gen = TidGenerator::new();
+        let mut prev: Option<String> = None;
+        for _ in 0..1000 {
+            let tid = gen.next();
+            assert_eq!(tid.len(), 13, "a TID is 13 s32 chars");
+            assert!(
+                tid.bytes().all(|b| S32_ALPHABET.contains(&b)),
+                "TID {tid} uses only the s32 alphabet"
+            );
+            if let Some(p) = &prev {
+                assert!(*p < tid, "TIDs must be strictly increasing ({p} < {tid})");
+            }
+            prev = Some(tid);
+        }
+    }
+
+    #[test]
+    fn tid_rkeys_are_valid_atproto_record_keys() {
+        // atproto rkey charset: [A-Za-z0-9._~:-], length 1..=512, not "."/"..".
+        let mut gen = TidGenerator::new();
+        let tid = gen.next();
+        assert!(!tid.is_empty() && tid.len() <= 512);
+        assert!(tid != "." && tid != "..");
+        assert!(tid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b':' | b'-')));
+    }
+
+    #[test]
+    fn s32_encoding_is_ascending_for_ascending_values() {
+        // The whole point of s32: numeric order == lexicographic string order.
+        assert!(encode_s32_tid(1) < encode_s32_tid(2));
+        assert!(encode_s32_tid(31) < encode_s32_tid(32));
+        assert!(encode_s32_tid(1_000_000) < encode_s32_tid(1_000_001));
+        // Ordering holds all the way to the largest real TID value (a 53-bit
+        // microsecond timestamp shifted into bits 63..10, plus the clock id).
+        let max_tid = (0x001f_ffff_ffff_ffffu64 << 10) | 0x3ff;
+        assert!(encode_s32_tid(max_tid - 1) < encode_s32_tid(max_tid));
     }
 }
