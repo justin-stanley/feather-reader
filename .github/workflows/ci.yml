@@ -16,7 +16,7 @@ env:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
 
   sidecar:
     name: OAuth sidecar
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
     defaults:
       run:
         working-directory: oauth-sidecar

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Opt-in local-CI gate. Enable once with:  git config core.hooksPath .githooks
+# Runs the full CI check-set locally before every push — no GitHub minutes.
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh"
