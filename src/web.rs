@@ -42,15 +42,22 @@
 //! write needs a real OAuth session, but the full write path is built and unit-
 //! tested to the sidecar boundary.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use askama::Template;
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
 };
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -69,6 +76,19 @@ mod opml;
 
 /// The name of the signed session cookie.
 const SESSION_COOKIE: &str = "fr_session";
+
+/// The name of the short-lived signed **invite** cookie.
+///
+/// Set by `POST /beta/redeem` on a valid, capacity-ok code and consumed by the
+/// OAuth callback. It reserves *intent* to redeem a specific code before the
+/// visitor ever starts the OAuth handshake, so a non-invited visitor can't burn
+/// a sidecar handshake (pre-handshake gate). It carries the invite code, HMAC-
+/// signed with the same key as the session cookie.
+const INVITE_COOKIE: &str = "fr_invite";
+
+/// TTL (seconds) for a minted invite code and for the reserving invite cookie.
+/// Short enough that a reserved-but-unclaimed seat frees quickly.
+const INVITE_TTL_SECS: i64 = 1800;
 
 /// The canonical AGPL-3.0 source repository — surfaced in the footer, the
 /// sign-in pitch, and `/about` (design §4.6, cloud plan public-experiment UI).
@@ -123,40 +143,49 @@ struct CurrentUser {
 ///
 /// The cookie carries an opaque server-minted session id (not the DID). We
 /// verify its HMAC, look the id up in the registry, and — crucially —
-/// **re-check the DID against the instance allow-list on every request**, not
-/// just at the OAuth callback, so revoking a DID from `ALLOWED_DIDS` takes
-/// effect immediately for already-issued cookies.
-fn current_session(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
+/// **re-check the DID against the closed-beta gate on every request**
+/// ([`store::has_beta_access`]), not just at the OAuth callback, so revoking a
+/// DID's beta seat takes effect immediately for already-issued cookies. (The
+/// gate replaced the old static `ALLOWED_DIDS` check; `ALLOWED_DIDS` remains the
+/// admin-bootstrap seed, granted a seat at startup via `ensure_seed`.)
+async fn current_session(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
     if let Some(sid) = cookie::verify_session(headers, &state.config.cookie_secret) {
         if let Some(session) = state.sessions.get(&sid) {
-            if state.config.did_allowed(&session.did) {
+            if store::has_beta_access(&state.db, &session.did)
+                .await
+                .unwrap_or(false)
+            {
                 return Some(CurrentUser {
                     did: session.did,
                     handle: session.handle,
                     sid: Some(sid),
                 });
             }
-            // DID no longer permitted: treat as logged out (and drop the stale
-            // server-side session so the dead cookie can't linger).
+            // DID no longer holds a beta seat: treat as logged out (and drop the
+            // stale server-side session so the dead cookie can't linger).
             state.sessions.remove(&sid);
         }
     }
-    // No valid cookie: dev fallback only if explicitly configured *and* allowed.
-    state
-        .config
-        .dev_did
-        .clone()
-        .filter(|did| state.config.did_allowed(did))
-        .map(|did| CurrentUser {
-            did,
-            handle: None,
-            sid: None,
-        })
+    // No valid cookie: dev fallback only if explicitly configured *and* still
+    // inside the beta gate (seeded via ensure_seed / a redeemed code).
+    if let Some(did) = state.config.dev_did.clone() {
+        if store::has_beta_access(&state.db, &did)
+            .await
+            .unwrap_or(false)
+        {
+            return Some(CurrentUser {
+                did,
+                handle: None,
+                sid: None,
+            });
+        }
+    }
+    None
 }
 
 /// The current request's DID, or `None` when logged out (no cookie, no dev DID).
-fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    current_session(state, headers).map(|u| u.did)
+async fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    current_session(state, headers).await.map(|u| u.did)
 }
 
 /// Build the application router over shared [`AppState`].
@@ -165,6 +194,11 @@ fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
 /// (the stylesheet, vendored htmx, and the keyboard handler, served from
 /// `static/` via [`ServeDir`]). A [`TraceLayer`] gives per-request tracing.
 pub fn router(state: AppState) -> Router {
+    // The shared per-IP rate limiter for the abuse-prone paths (login, redeem,
+    // and the write endpoints). One instance is cloned into the state closure of
+    // the `rate_limit` middleware.
+    let limiter = RateLimiter::shared();
+
     Router::new()
         .route("/health", get(health))
         .route("/about", get(about))
@@ -180,12 +214,30 @@ pub fn router(state: AppState) -> Router {
         .route("/folders", post(create_folder))
         .route("/folders/{rkey}/rename", post(rename_folder))
         .route("/folders/{rkey}/delete", post(delete_folder))
-        .route("/opml", post(import_opml))
+        // OPML import takes untrusted uploads: cap the body so a huge upload
+        // can't OOM (residual body-cap), on top of the streamed feed-fetch cap.
+        .route(
+            "/opml",
+            post(import_opml).layer(DefaultBodyLimit::max(OPML_BODY_LIMIT)),
+        )
         .route("/opml/export", get(export_opml))
         .route("/login", get(login_form).post(login_submit))
+        .route(
+            "/beta/redeem",
+            get(beta_redeem_form).post(beta_redeem_submit),
+        )
+        .route("/admin/invites", post(admin_mint_invites))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
         .nest_service("/static", ServeDir::new("static"))
+        // Cache-Control (viral/CDN plan): `public, max-age=300` on the cacheable
+        // logged-out landing + static assets, `no-store` on anything that
+        // rendered a session's private view. Runs *inside* the security layers so
+        // the CSP/nosniff/frame headers are untouched.
+        .layer(middleware::from_fn(cache_control))
+        // Per-IP rate limit on the abuse-prone paths (429 over the limit). Runs
+        // as a middleware so it sees the matched path + the peer IP.
+        .layer(middleware::from_fn_with_state(limiter, rate_limit))
         .layer(TraceLayer::new_for_http())
         // Baseline security headers on *every* response (F4). The CSP is the
         // backstop that neutralises any XSS that slips past sanitization; the
@@ -203,6 +255,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Body-size ceiling for the OPML import upload (~2 MiB). Large enough for any
+/// realistic subscription list, small enough to make an OOM upload impossible.
+const OPML_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 /// A response-header layer that sets `name: value` on every response, overriding
 /// any existing header of that name. `name`/`value` must be valid static header
 /// tokens (they are, for our fixed security headers).
@@ -214,6 +270,165 @@ fn static_header_layer(
         header::HeaderName::from_static(name),
         header::HeaderValue::from_static(value),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP rate limiting (token bucket, self-contained — no extra crate)
+// ---------------------------------------------------------------------------
+
+/// The abuse-prone paths the rate limiter guards (429 over the limit): the OAuth
+/// kick-off, the invite redeem, the mutating write endpoints, and mark-read/star
+/// /mark-all. Read-only navigation is intentionally *not* limited.
+fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
+    use axum::http::Method;
+    if method != Method::POST && !(method == Method::GET && path == "/login") {
+        return false;
+    }
+    match path {
+        "/login" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all" | "/admin/invites" => {
+            true
+        }
+        // /entries/{id}/read and /entries/{id}/star — the star/mark-read taps.
+        p => p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")),
+    }
+}
+
+/// A tiny per-IP token-bucket rate limiter. Each IP gets [`RATE_BURST`] tokens
+/// that refill at [`RATE_REFILL_PER_SEC`]/sec; a request costs one token and is
+/// rejected (429) when the bucket is empty. Self-contained (no `tower_governor`
+/// dependency → no network fetch at build, deterministic offline CI).
+#[derive(Clone)]
+struct RateLimiter {
+    inner: std::sync::Arc<Mutex<HashMap<IpAddr, Bucket>>>,
+}
+
+/// One IP's token bucket: a fractional token count + the last-refill instant.
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// Burst capacity per IP — how many requests can arrive back-to-back.
+const RATE_BURST: f64 = 20.0;
+/// Steady-state refill rate (tokens/sec) once the burst is spent.
+const RATE_REFILL_PER_SEC: f64 = 1.0;
+/// Evict idle buckets older than this so the map can't grow unbounded.
+const RATE_IDLE_EVICT: Duration = Duration::from_secs(3600);
+
+impl RateLimiter {
+    /// A fresh, shared limiter (cloned into the middleware state).
+    fn shared() -> Self {
+        Self {
+            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Charge one token for `ip`; returns `true` if allowed, `false` if the
+    /// bucket is empty (→ 429).
+    fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut map = match self.inner.lock() {
+            Ok(m) => m,
+            // A poisoned lock shouldn't take the site down — fail open.
+            Err(p) => p.into_inner(),
+        };
+        // Opportunistic eviction of long-idle buckets (cheap, amortised).
+        map.retain(|_, b| now.duration_since(b.last) < RATE_IDLE_EVICT);
+
+        let bucket = map.entry(ip).or_insert(Bucket {
+            tokens: RATE_BURST,
+            last: now,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * RATE_REFILL_PER_SEC).min(RATE_BURST);
+        bucket.last = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The peer IP for a request: prefer the reverse-proxy's `X-Forwarded-For`
+/// (left-most hop) since the app runs behind CF Tunnel / a proxy, falling back
+/// to the direct `ConnectInfo` socket. Returns `None` only if neither is present
+/// (then the limiter fails open for that request).
+fn client_ip(headers: &HeaderMap, conn: Option<&SocketAddr>) -> Option<IpAddr> {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    conn.map(|s| s.ip())
+}
+
+/// Rate-limit middleware: 429 on the abuse-prone paths once an IP's bucket is
+/// empty; every other request (and every non-guarded path) passes through. The
+/// peer `SocketAddr` is read from the request extension `ConnectInfo` sets (via
+/// `into_make_service_with_connect_info`), preferring `X-Forwarded-For`.
+async fn rate_limit(
+    State(limiter): State<RateLimiter>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    if is_rate_limited_path(&path, &method) {
+        let conn = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        let ip = client_ip(req.headers(), conn.as_ref());
+        if let Some(ip) = ip {
+            if !limiter.check(ip) {
+                warn!(%ip, %path, "rate limit exceeded");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "1")],
+                    "rate limit exceeded\n",
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Cache-Control (viral / CDN vs. private authenticated views)
+// ---------------------------------------------------------------------------
+
+/// Cache-Control middleware. Emits `public, max-age=300` on the cacheable
+/// logged-out surfaces (the `/login` landing without a handle, `/about`, and the
+/// `/static/*` assets) and `no-store` on the authenticated app pages, so a CDN /
+/// browser can hold the viral landing while never caching a signed-in user's
+/// private view. Never overrides a handler that already set Cache-Control.
+async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    // The logged-out landing is only cacheable when it's the bare form — a
+    // `?handle=` GET kicks off OAuth (a redirect), which must not be cached.
+    let is_login_landing = path == "/login"
+        && req.method() == axum::http::Method::GET
+        && !req.uri().query().unwrap_or("").contains("handle=");
+    let public = is_login_landing || path == "/about" || path.starts_with("/static/");
+
+    let mut resp = next.run(req).await;
+    if resp.headers().contains_key(header::CACHE_CONTROL) {
+        return resp;
+    }
+    let value = if public {
+        "public, max-age=300"
+    } else {
+        "no-store"
+    };
+    if let Ok(hv) = header::HeaderValue::from_str(value) {
+        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +601,17 @@ struct EntryRowTemplate {
 struct LoginTemplate {
     repo_url: &'static str,
     error: String,
+}
+
+/// The closed-beta invite-redeem page (`GET /beta/redeem`).
+#[derive(Template)]
+#[template(path = "beta_redeem.html")]
+struct BetaRedeemTemplate {
+    repo_url: &'static str,
+    error: String,
+    /// When true the seat cap is full: hide the form and show the "capacity
+    /// full — try self-hosting" message instead.
+    capacity_full: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +804,7 @@ async fn index(
     headers: HeaderMap,
     Query(q): Query<IndexQuery>,
 ) -> Result<Response, WebError> {
-    let user = match current_session(&state, &headers) {
+    let user = match current_session(&state, &headers).await {
         Some(u) => u,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -773,7 +999,7 @@ async fn manage(
     headers: HeaderMap,
     Query(q): Query<ManageQuery>,
 ) -> Result<Response, WebError> {
-    let user = match current_session(&state, &headers) {
+    let user = match current_session(&state, &headers).await {
         Some(u) => u,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -980,7 +1206,7 @@ async fn entry_view(
     Path(id): Path<i64>,
     Query(q): Query<EntryQuery>,
 ) -> Result<Response, WebError> {
-    let user = match current_session(&state, &headers) {
+    let user = match current_session(&state, &headers).await {
         Some(u) => u,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1161,7 +1387,7 @@ async fn mark_read(
     headers: HeaderMap,
     Form(form): Form<ReadForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1206,7 +1432,7 @@ async fn toggle_star(
     headers: HeaderMap,
     Form(form): Form<StarForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1286,7 +1512,7 @@ async fn mark_all_read(
     headers: HeaderMap,
     Query(q): Query<ReadAllQuery>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1326,7 +1552,7 @@ async fn add_subscription(
     headers: HeaderMap,
     Form(form): Form<SubscribeForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1392,7 +1618,7 @@ async fn delete_subscription(
     headers: HeaderMap,
     Path(rkey): Path<String>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1423,7 +1649,7 @@ async fn rename_subscription(
     Path(rkey): Path<String>,
     Form(form): Form<RenameSubForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1476,7 +1702,7 @@ async fn create_folder(
     headers: HeaderMap,
     Form(form): Form<FolderForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1499,7 +1725,7 @@ async fn rename_folder(
     Path(rkey): Path<String>,
     Form(form): Form<FolderForm>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1522,7 +1748,7 @@ async fn delete_folder(
     headers: HeaderMap,
     Path(rkey): Path<String>,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1593,12 +1819,24 @@ struct LoginQuery {
 }
 
 /// `GET /login` — start the atproto OAuth flow, or render the handle form.
-async fn login_form(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
+///
+/// **Pre-handshake gate:** starting OAuth (a `?handle=` GET) is refused unless
+/// the visitor already holds beta access *or* presents a valid reserving invite
+/// cookie — otherwise a non-invited visitor could burn a sidecar handshake.
+/// Refusal redirects to `/beta/redeem`. The bare form (no handle) always renders.
+async fn login_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
     if let Some(handle) = q
         .handle
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
     {
+        if !may_start_oauth(&state, &headers).await {
+            return Redirect::to("/beta/redeem").into_response();
+        }
         return start_oauth(&state, &handle);
     }
     render(&LoginTemplate {
@@ -1608,12 +1846,39 @@ async fn login_form(State(state): State<AppState>, Query(q): Query<LoginQuery>) 
 }
 
 /// `POST /login` — the handle-form submit: redirect into the sidecar OAuth flow.
-async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+/// Subject to the same pre-handshake invite gate as `GET /login?handle=`.
+async fn login_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let handle = form.handle.trim();
     if handle.is_empty() {
         return login_error("Enter your atproto handle.");
     }
+    if !may_start_oauth(&state, &headers).await {
+        return Redirect::to("/beta/redeem").into_response();
+    }
     start_oauth(&state, handle)
+}
+
+/// Whether this visitor is allowed to *start* the OAuth handshake: either an
+/// existing beta member (cookie session whose DID already holds a seat) or a
+/// fresh visitor carrying a valid reserving invite cookie. This is the
+/// pre-handshake guard that stops non-invited visitors from burning a sidecar
+/// handshake.
+async fn may_start_oauth(state: &AppState, headers: &HeaderMap) -> bool {
+    // An already-beta'd session may re-auth freely.
+    if let Some(did) = current_did(state, headers).await {
+        if store::has_beta_access(&state.db, &did)
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    // Otherwise require a valid reserving invite cookie.
+    invite_cookie_code(headers, &state.config.cookie_secret).is_some()
 }
 
 /// Redirect the browser to the sidecar's public `/login` for `handle`.
@@ -1641,7 +1906,16 @@ struct CallbackQuery {
 }
 
 /// `GET /oauth/callback` — establish the cookie session.
-async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQuery>) -> Response {
+///
+/// **Invite gate:** the verified DID must hold beta access. If it already does
+/// (existing member / seeded admin) it's admitted directly. Otherwise we bind
+/// the DID to the reserved invite cookie: `redeem_code` atomically consumes the
+/// code and grants the seat. A DID with neither is bounced to `/beta/redeem`.
+async fn oauth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
     if let Some(err) = q.error {
         let desc = q.error_description.unwrap_or_default();
         warn!(error = %err, desc = %desc, "OAuth callback returned an error");
@@ -1665,9 +1939,46 @@ async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQ
         }
     };
 
-    if !state.config.did_allowed(&session.did) {
-        warn!(did = %session.did, "login rejected: DID not on the instance allow-list");
-        return login_error("This instance's allow-list does not permit that account.");
+    // Bind the verified DID to the invite gate. Returns a response only on the
+    // (rare) failure paths; `Ok(())` means the DID now holds beta access.
+    let mut clear_invite = false;
+    if !store::has_beta_access(&state.db, &session.did)
+        .await
+        .unwrap_or(false)
+    {
+        // Not yet a member: consume the reserved invite code, if any.
+        let code = match invite_cookie_code(&headers, &state.config.cookie_secret) {
+            Some(c) => c,
+            None => {
+                warn!(did = %session.did, "OAuth callback with no beta access and no invite cookie");
+                return Redirect::to("/beta/redeem").into_response();
+            }
+        };
+        match store::redeem_code(
+            &state.db,
+            &code,
+            &session.did,
+            session.handle.as_deref(),
+            state.config.beta_cap,
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                clear_invite = true;
+                info!(did = %session.did, "invite code redeemed at OAuth callback; beta access granted");
+            }
+            Ok(Err(policy)) => {
+                warn!(did = %session.did, ?policy, "invite redeem failed at callback");
+                let mut resp = redeem_bounce(&policy).into_response();
+                // The reservation is spent/invalid — drop the stale invite cookie.
+                clear_invite_cookie(&mut resp);
+                return resp;
+            }
+            Err(err) => {
+                warn!(%err, did = %session.did, "invite redeem infra error at callback");
+                return login_error("Login failed while confirming your invite.");
+            }
+        }
     }
 
     // Mint an opaque, random server-side session id and store the identity under
@@ -1681,12 +1992,15 @@ async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQ
 
     let mut resp = Redirect::to("/").into_response();
     set_cookie(&mut resp, &cookie);
+    if clear_invite {
+        clear_invite_cookie(&mut resp);
+    }
     resp
 }
 
 /// `POST /logout` — clear the session cookie + drop the in-memory session.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(user) = current_session(&state, &headers) {
+    if let Some(user) = current_session(&state, &headers).await {
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
         }
@@ -1708,6 +2022,192 @@ fn login_error(msg: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Closed-beta invite gate (self-serve redeem + admin mint)
+// ---------------------------------------------------------------------------
+
+/// Form body for `POST /beta/redeem`.
+#[derive(Debug, Deserialize)]
+struct RedeemForm {
+    code: String,
+}
+
+/// `GET /beta/redeem` — render the invite-redeem page. If the seat cap is
+/// already full we render the "capacity full" variant (no form).
+async fn beta_redeem_form(State(state): State<AppState>) -> Response {
+    let full = store::count_beta_access(&state.db)
+        .await
+        .map(|n| n >= state.config.beta_cap)
+        .unwrap_or(false);
+    render(&BetaRedeemTemplate {
+        repo_url: REPO_URL,
+        error: String::new(),
+        capacity_full: full,
+    })
+}
+
+/// `POST /beta/redeem` — the **pre-handshake** reservation.
+///
+/// Validates the pasted code is *redeemable right now* (exists, active,
+/// unexpired, and a seat is free) WITHOUT consuming it or binding a DID — the
+/// visitor has no DID yet. On success it sets a short-lived signed invite cookie
+/// reserving intent to redeem this code, then sends the visitor to `/login`. The
+/// OAuth callback later binds the verified DID and atomically consumes the code
+/// (`store::redeem_code`). This ordering means a non-invited visitor can never
+/// start OAuth (and burn a sidecar handshake).
+async fn beta_redeem_submit(
+    State(state): State<AppState>,
+    Form(form): Form<RedeemForm>,
+) -> Response {
+    let code = form.code.trim().to_uppercase();
+    if code.is_empty() {
+        return render(&BetaRedeemTemplate {
+            repo_url: REPO_URL,
+            error: "Enter your invite code.".to_string(),
+            capacity_full: false,
+        });
+    }
+
+    match preflight_code(&state, &code).await {
+        Ok(()) => {
+            let cookie = sign_invite(&code, &state.config.cookie_secret);
+            let mut resp = Redirect::to("/login").into_response();
+            set_cookie(&mut resp, &cookie);
+            info!("invite code preflight OK; reserving intent + redirecting to /login");
+            resp
+        }
+        Err(policy) => {
+            warn!(?policy, "invite code preflight rejected");
+            redeem_bounce(&policy)
+        }
+    }
+}
+
+/// Read-only preflight of an invite code for the pre-handshake reservation:
+/// verify it exists, is active, is not past `expires_at`, and that a seat is
+/// free — mirroring the checks `store::redeem_code` will re-run atomically at
+/// callback time. Does NOT consume the code or grant a seat. Returns the same
+/// typed [`store::RedeemError`] variants so the two paths share one message map.
+async fn preflight_code(state: &AppState, code: &str) -> Result<(), store::RedeemError> {
+    // Cap check first: a clear "capacity full" beats "code invalid" when both.
+    let count = store::count_beta_access(&state.db).await.unwrap_or(0);
+    if count >= state.config.beta_cap {
+        return Err(store::RedeemError::CapacityFull);
+    }
+    // Look up the code's current status + expiry (read-only).
+    let row = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, expires_at FROM invite_codes WHERE code = ?1",
+    )
+    .bind(code)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let (status, expires_at) = match row {
+        Some(r) => r,
+        None => return Err(store::RedeemError::NotFound),
+    };
+    let now = chrono::Utc::now().timestamp();
+    match status.as_str() {
+        "active" if expires_at >= now => Ok(()),
+        "active" => Err(store::RedeemError::Expired),
+        "expired" => Err(store::RedeemError::Expired),
+        // "redeemed" or anything else non-active.
+        _ => Err(store::RedeemError::AlreadyRedeemed),
+    }
+}
+
+/// Map a [`store::RedeemError`] to the invite page with the right message. Used
+/// by both the preflight (`POST /beta/redeem`) and the callback bind path.
+fn redeem_bounce(policy: &store::RedeemError) -> Response {
+    use store::RedeemError::*;
+    let (msg, capacity_full) = match policy {
+        NotFound => ("That invite code isn't valid.", false),
+        Expired => ("That invite code has expired.", false),
+        AlreadyRedeemed => ("That invite code has already been used.", false),
+        CapacityFull => ("", true),
+    };
+    render(&BetaRedeemTemplate {
+        repo_url: REPO_URL,
+        error: msg.to_string(),
+        capacity_full,
+    })
+}
+
+/// Query for `POST /admin/invites` — how many codes to mint (`?n=`, default 1).
+#[derive(Debug, Deserialize, Default)]
+struct MintQuery {
+    #[serde(default)]
+    n: Option<u32>,
+}
+
+/// `POST /admin/invites?n=N` — mint N invite codes.
+///
+/// Authorized ONLY for a live session whose DID is in the `ALLOWED_DIDS` admin
+/// seed (`config.admin_seed_dids`). Returns the freshly-minted codes as
+/// newline-separated `text/plain`. Deliberately minimal (no HTML UI).
+async fn admin_mint_invites(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MintQuery>,
+) -> Response {
+    // Require a real, current session (not just a DID string) whose DID is an
+    // admin-seed DID. `current_did` already re-checks the beta gate.
+    let did = match current_did(&state, &headers).await {
+        Some(d) => d,
+        None => return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response(),
+    };
+    if !state.config.admin_seed_dids().iter().any(|d| d == &did) {
+        warn!(%did, "admin mint denied: not an admin-seed DID");
+        return (StatusCode::FORBIDDEN, "not an admin\n").into_response();
+    }
+
+    let n = q.n.unwrap_or(1).clamp(1, 100);
+    let mut codes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        match store::mint_code(&state.db, &did, INVITE_TTL_SECS).await {
+            Ok(code) => codes.push(code),
+            Err(err) => {
+                warn!(%err, %did, "admin mint_code failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+            }
+        }
+    }
+    info!(%did, count = codes.len(), "admin minted invite codes");
+    let mut body = codes.join("\n");
+    body.push('\n');
+    (StatusCode::OK, body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Signed, short-lived invite cookie (reuses the session-cookie HMAC helper)
+// ---------------------------------------------------------------------------
+
+/// Sign the reserved invite `code` into a short-lived `Set-Cookie` value. Reuses
+/// the same HMAC-SHA256 helper as the session cookie; the payload is the code
+/// itself (base64url) rather than an opaque sid, since the code IS the reserved
+/// intent the callback consumes.
+fn sign_invite(code: &str, secret: &str) -> String {
+    cookie::sign_value(INVITE_COOKIE, code, secret, INVITE_TTL_SECS)
+}
+
+/// Verify + read the reserved invite code out of the request's invite cookie
+/// (`None` if absent, tampered, or forged). No expiry is enforced here beyond
+/// the cookie's own `Max-Age`; the atomic `redeem_code` at the callback is the
+/// authority on the code's live status.
+fn invite_cookie_code(headers: &HeaderMap, secret: &str) -> Option<String> {
+    cookie::verify_value(headers, INVITE_COOKIE, secret)
+}
+
+/// Clear the invite cookie on a response (after a successful bind, or when the
+/// reservation turned out to be stale).
+fn clear_invite_cookie(resp: &mut Response) {
+    set_cookie(
+        resp,
+        &format!("{INVITE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // OPML import + export
 // ---------------------------------------------------------------------------
 
@@ -1724,7 +2224,7 @@ async fn import_opml(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1829,7 +2329,7 @@ async fn export_opml(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
-    let did = match current_did(&state, &headers) {
+    let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
@@ -1894,22 +2394,35 @@ mod cookie {
 
     /// Sign a session id into a `Set-Cookie` header value: `fr_session=<sid>.<sig>`.
     pub fn sign_session(sid: &str, secret: &str) -> String {
-        let sig = hmac_sha256_hex(secret.as_bytes(), sid.as_bytes());
-        let b64 = b64url_encode(sid.as_bytes());
-        format!(
-            "{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
-        )
+        sign_value(SESSION_COOKIE, sid, secret, 2_592_000)
     }
 
     /// Verify the request's session cookie and return the session id it carries.
     pub fn verify_session(headers: &HeaderMap, secret: &str) -> Option<String> {
-        let raw = cookie_value(headers, SESSION_COOKIE)?;
+        verify_value(headers, SESSION_COOKIE, secret)
+    }
+
+    /// Sign an arbitrary string `value` into a `Set-Cookie` header for `name`,
+    /// HMAC-SHA256 over the value: `name=<b64url(value)>.<sig>`. The generic form
+    /// behind both the session cookie and the short-lived invite cookie.
+    pub fn sign_value(name: &str, value: &str, secret: &str, max_age_secs: i64) -> String {
+        let sig = hmac_sha256_hex(secret.as_bytes(), value.as_bytes());
+        let b64 = b64url_encode(value.as_bytes());
+        format!(
+            "{name}={b64}.{sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_secs}"
+        )
+    }
+
+    /// Verify + read a value out of the named signed cookie (`None` on absent /
+    /// tampered / forged). The generic form behind both cookie readers.
+    pub fn verify_value(headers: &HeaderMap, name: &str, secret: &str) -> Option<String> {
+        let raw = cookie_value(headers, name)?;
         let (b64, sig) = raw.split_once('.')?;
-        let sid_bytes = b64url_decode(b64)?;
-        let sid = String::from_utf8(sid_bytes).ok()?;
-        let expected = hmac_sha256_hex(secret.as_bytes(), sid.as_bytes());
+        let bytes = b64url_decode(b64)?;
+        let value = String::from_utf8(bytes).ok()?;
+        let expected = hmac_sha256_hex(secret.as_bytes(), value.as_bytes());
         if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
-            Some(sid)
+            Some(value)
         } else {
             None
         }
@@ -2315,5 +2828,378 @@ mod tests {
             view: Some("unread".to_string()),
         };
         assert_eq!(scope_query(&q2), "");
+    }
+
+    // -- closed-beta invite gate + rate-limit + cache-control ------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Build an [`AppState`] over a fresh in-memory DB, seeding the given admin
+    /// DIDs (via ALLOWED_DIDS → ensure_seed) and a fixed cookie secret so tests
+    /// can forge matching cookies.
+    async fn test_state(allowed: &[&str]) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let dids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        store::ensure_seed(&db, &dids).await.unwrap();
+        let config = Config {
+            allowed_dids: dids,
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            ..Config::default()
+        };
+        AppState::new(config, db).unwrap()
+    }
+
+    /// A `Cookie` header carrying a valid signed session for `sid` (the sid is
+    /// looked up in the registry, so create the session first).
+    fn session_cookie(state: &AppState, did: &str, handle: Option<&str>) -> String {
+        let sid = state.sessions.create(Session {
+            did: did.to_string(),
+            handle: handle.map(str::to_string),
+        });
+        let sc = cookie::sign_session(&sid, &state.config.cookie_secret);
+        sc.split(';').next().unwrap().to_string()
+    }
+
+    #[test]
+    fn rate_limited_paths_match_expected() {
+        use axum::http::Method;
+        assert!(is_rate_limited_path("/login", &Method::GET));
+        assert!(is_rate_limited_path("/login", &Method::POST));
+        assert!(is_rate_limited_path("/beta/redeem", &Method::POST));
+        assert!(is_rate_limited_path("/subscriptions", &Method::POST));
+        assert!(is_rate_limited_path("/opml", &Method::POST));
+        assert!(is_rate_limited_path("/read-all", &Method::POST));
+        assert!(is_rate_limited_path("/admin/invites", &Method::POST));
+        assert!(is_rate_limited_path("/entries/42/read", &Method::POST));
+        assert!(is_rate_limited_path("/entries/42/star", &Method::POST));
+        // Read-only navigation is NOT limited.
+        assert!(!is_rate_limited_path("/", &Method::GET));
+        assert!(!is_rate_limited_path("/about", &Method::GET));
+        assert!(!is_rate_limited_path("/entries/42", &Method::GET));
+        assert!(!is_rate_limited_path("/login", &Method::HEAD));
+    }
+
+    #[test]
+    fn rate_limiter_allows_burst_then_429s() {
+        let rl = RateLimiter::shared();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        // The full burst passes.
+        for _ in 0..(RATE_BURST as usize) {
+            assert!(rl.check(ip));
+        }
+        // The next one (no time elapsed → no refill) is rejected.
+        assert!(!rl.check(ip));
+        // A different IP has its own bucket.
+        let ip2: IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(rl.check(ip2));
+    }
+
+    #[test]
+    fn client_ip_prefers_xforwarded_for() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.9, 10.0.0.1".parse().unwrap());
+        let sock: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(
+            client_ip(&h, Some(&sock)),
+            Some("198.51.100.9".parse().unwrap())
+        );
+        // No XFF → fall back to the socket peer.
+        let h2 = HeaderMap::new();
+        assert_eq!(
+            client_ip(&h2, Some(&sock)),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn invite_cookie_round_trips_and_rejects_tamper() {
+        let secret = "test-cookie-secret-000";
+        let sc = sign_invite("FEATHER-ABCDWXYZ", secret);
+        let pair = sc.split(';').next().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, pair.parse().unwrap());
+        assert_eq!(
+            invite_cookie_code(&h, secret).as_deref(),
+            Some("FEATHER-ABCDWXYZ")
+        );
+        // Wrong secret → rejected.
+        assert!(invite_cookie_code(&h, "other").is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_valid_expired_and_full() {
+        let state = test_state(&["did:plc:admin"]).await;
+        // A minted, active code preflights OK.
+        let code = store::mint_code(&state.db, "did:plc:admin", 3600)
+            .await
+            .unwrap();
+        assert!(preflight_code(&state, &code).await.is_ok());
+
+        // A code whose expiry is in the past preflights as Expired. (mint_code
+        // clamps negative ttl to 0, so back-date the row directly for a
+        // deterministic past expiry.)
+        let expired = store::mint_code(&state.db, "did:plc:admin", 3600)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE invite_codes SET expires_at = ?1 WHERE code = ?2")
+            .bind(chrono::Utc::now().timestamp() - 3600)
+            .bind(&expired)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight_code(&state, &expired).await,
+            Err(store::RedeemError::Expired)
+        );
+
+        // Unknown code → NotFound.
+        assert_eq!(
+            preflight_code(&state, "FEATHER-NOPENOPE").await,
+            Err(store::RedeemError::NotFound)
+        );
+
+        // Fill to cap (cap=3; the admin seed already took 1 seat) then preflight
+        // must report CapacityFull.
+        store::grant_access(&state.db, "did:plc:b", None, "admin", None)
+            .await
+            .unwrap();
+        store::grant_access(&state.db, "did:plc:c", None, "admin", None)
+            .await
+            .unwrap();
+        assert_eq!(store::count_beta_access(&state.db).await.unwrap(), 3);
+        assert_eq!(
+            preflight_code(&state, &code).await,
+            Err(store::RedeemError::CapacityFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn login_without_invite_redirects_to_beta_redeem() {
+        // No allow-list seed, no invite cookie: starting OAuth must be refused.
+        let state = test_state(&[]).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("handle=alice.bsky.social"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/beta/redeem"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_with_valid_invite_cookie_starts_oauth() {
+        let state = test_state(&[]).await;
+        let cookie = sign_invite("FEATHER-ABCDWXYZ", &state.config.cookie_secret);
+        let cookie = cookie.split(';').next().unwrap().to_string();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from("handle=alice.bsky.social"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Redirects into the sidecar login (not to /beta/redeem).
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.contains("/login"), "loc = {loc}");
+        assert_ne!(loc, "/beta/redeem");
+    }
+
+    #[tokio::test]
+    async fn admin_mint_requires_admin_seed_did() {
+        let state = test_state(&["did:plc:admin"]).await;
+        // A non-admin (but beta'd) session is forbidden.
+        store::grant_access(&state.db, "did:plc:rando", None, "test", None)
+            .await
+            .unwrap();
+        let rando_cookie = session_cookie(&state, "did:plc:rando", None);
+        // An admin session is allowed.
+        let admin_cookie = session_cookie(&state, "did:plc:admin", None);
+        let app = router(state);
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/invites?n=2")
+                    .header(header::COOKIE, rando_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/invites?n=2")
+                    .header(header::COOKIE, admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(ok.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let minted: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(minted.len(), 2);
+        assert!(minted.iter().all(|c| c.starts_with("FEATHER-")));
+    }
+
+    #[tokio::test]
+    async fn admin_mint_unauthenticated_is_401() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/invites")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cache_control_public_on_about_no_store_on_authed() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let admin_cookie = session_cookie(&state, "did:plc:admin", None);
+        let app = router(state);
+
+        // /about → public, cacheable.
+        let about = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            about.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300"
+        );
+        // The security headers are still intact.
+        assert!(about.headers().contains_key("content-security-policy"));
+        assert_eq!(about.headers().get("x-frame-options").unwrap(), "DENY");
+
+        // The bare /login landing → public, cacheable.
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            login.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300"
+        );
+
+        // An authenticated page → no-store.
+        let home = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            home.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+    }
+
+    #[tokio::test]
+    async fn beta_redeem_page_renders() {
+        let state = test_state(&[]).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/beta/redeem")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("Invite code"));
+        assert!(html.contains("/beta/redeem"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_after_burst() {
+        let state = test_state(&[]).await;
+        let app = router(state);
+        // Hammer POST /beta/redeem past the burst from a single IP. The handler
+        // itself returns 200 (re-render) on a bad code; the limiter is what
+        // eventually yields 429.
+        let mut saw_429 = false;
+        for _ in 0..(RATE_BURST as usize + 5) {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/beta/redeem")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("x-forwarded-for", "203.0.113.200")
+                        .body(Body::from("code=FEATHER-NOPENOPE"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(saw_429, "expected a 429 after exhausting the burst");
     }
 }

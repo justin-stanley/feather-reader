@@ -87,3 +87,10 @@ url = "2"
 # Already in the dependency tree transitively; pinned here as a direct dep so
 # the session-id minting reads from the OS CSPRNG rather than a home-rolled RNG.
 getrandom = "0.4"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the axum router through a single request in the
+# web-layer tests (cache-control headers, rate-limit 429, the pre-handshake
+# login refusal, admin-mint authz). Already in the lock transitively; the `util`
+# feature exposes `oneshot`.
+tower = { version = "0.5", features = ["util"] }

@@ -47,6 +47,18 @@ async fn main() -> Result<()> {
         .await
         .context("initializing the SQLite store")?;
 
+    // Seed the closed-beta admin bootstrap: every DID on the ALLOWED_DIDS
+    // admin seed gets a beta_access seat so a fresh instance always has its
+    // operator(s) inside the invite gate and able to mint codes. Idempotent.
+    match store::ensure_seed(&db, config.admin_seed_dids()).await {
+        Ok(new_seats) => {
+            if new_seats > 0 {
+                info!(new_seats, "seeded admin DIDs into beta_access");
+            }
+        }
+        Err(err) => return Err(err).context("seeding admin beta_access DIDs"),
+    }
+
     // 4. Shared application state — pool + HTTP client + atproto sidecar +
     //    session registry.
     let bind = config.bind;
@@ -73,10 +85,15 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding to {bind}"))?;
     info!(addr = %bind, "listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await
-        .context("HTTP server error")?;
+    // `into_make_service_with_connect_info` exposes the peer `SocketAddr` to the
+    // per-IP rate-limit middleware via `ConnectInfo<SocketAddr>`.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+    .await
+    .context("HTTP server error")?;
 
     // Give the background tasks a moment to drain (the flusher's final flush) so
     // shutdown doesn't race the process exit.
