@@ -214,7 +214,7 @@ impl Config {
         // deployment never silently falls back to a shared identity.
         let dev_did = env_opt("FEATHERREADER_DEV_DID");
 
-        Ok(Self {
+        let config = Self {
             bind,
             db_path,
             public_url,
@@ -225,13 +225,97 @@ impl Config {
             sidecar,
             cookie_secret,
             dev_did,
-        })
+        };
+
+        // FAIL LOUD: a non-loopback (public) instance must never fall back to the
+        // repo-published dev secrets — those are known to any attacker, who could
+        // then forge a session cookie offline. Refuse to boot instead.
+        config.validate_secrets()?;
+
+        Ok(config)
+    }
+
+    /// Whether this instance is "production-like" and therefore MUST have strong,
+    /// non-default secrets. True when `FEATHERREADER_ENV=prod`, or when either the
+    /// bind address or the public URL points at a non-loopback host — i.e. the
+    /// server is reachable by someone other than the local operator.
+    fn is_prod_like(&self) -> bool {
+        if env_opt("FEATHERREADER_ENV")
+            .map(|v| v.eq_ignore_ascii_case("prod") || v.eq_ignore_ascii_case("production"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // A non-loopback bind (incl. 0.0.0.0, reachable off-box) is public; so is
+        // a public_url that resolves to a non-loopback host.
+        !self.bind.ip().is_loopback() || public_url_is_non_loopback(&self.public_url)
+    }
+
+    /// Enforce the secret policy for a production-like instance. On a
+    /// loopback/dev instance the dev fallbacks are kept for convenience; on a
+    /// public one each secret must be explicitly set, not equal to its published
+    /// dev constant, and at least 32 bytes. Returns `Err` (refuse boot) otherwise.
+    fn validate_secrets(&self) -> Result<()> {
+        if !self.is_prod_like() {
+            return Ok(());
+        }
+        check_secret(
+            "FEATHERREADER_COOKIE_SECRET",
+            &self.cookie_secret,
+            DEV_COOKIE_SECRET,
+        )?;
+        check_secret(
+            "SIDECAR_INTERNAL_SECRET",
+            &self.sidecar.internal_secret,
+            DEV_INTERNAL_SECRET,
+        )?;
+        Ok(())
     }
 
     /// Whether the given atproto DID is permitted to log in. When no allow-list
     /// is configured the instance is open, so every DID is allowed.
     pub fn did_allowed(&self, did: &str) -> bool {
         self.allowed_dids.is_empty() || self.allowed_dids.iter().any(|d| d == did)
+    }
+}
+
+/// Minimum length (in bytes) for a production secret. 32 bytes = 256 bits, the
+/// floor for an HMAC-SHA256 key with a full-strength security margin.
+const MIN_SECRET_BYTES: usize = 32;
+
+/// Enforce that a production secret is set, not the published dev constant, and
+/// long enough. Returns a fail-loud `Err` naming the offending variable.
+fn check_secret(var: &str, value: &str, dev_constant: &str) -> Result<()> {
+    if value.is_empty() || value == dev_constant {
+        anyhow::bail!(
+            "{var} is unset or still the published dev default on a non-loopback (production) \
+             instance; refusing to boot. Set {var} to a random secret of at least \
+             {MIN_SECRET_BYTES} bytes."
+        );
+    }
+    if value.len() < MIN_SECRET_BYTES {
+        anyhow::bail!(
+            "{var} is too short ({} bytes) for a production instance; it must be at least \
+             {MIN_SECRET_BYTES} bytes.",
+            value.len()
+        );
+    }
+    Ok(())
+}
+
+/// Whether a `public_url` points at a non-loopback host. A parse failure or a
+/// missing host is treated as non-loopback (fail closed toward "public").
+fn public_url_is_non_loopback(public_url: &str) -> bool {
+    match url::Url::parse(public_url) {
+        Ok(u) => match u.host() {
+            Some(url::Host::Domain(d)) => {
+                !(d.eq_ignore_ascii_case("localhost") || d.eq_ignore_ascii_case("localhost."))
+            }
+            Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+            None => true,
+        },
+        Err(_) => true,
     }
 }
 
@@ -288,5 +372,74 @@ mod tests {
         assert!(parse_bool("Yes").unwrap());
         assert!(!parse_bool("OFF").unwrap());
         assert!(parse_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn loopback_instance_keeps_dev_fallback_secrets() {
+        // Default config is loopback + dev secrets: must be allowed to boot.
+        let c = Config::default();
+        assert!(!c.is_prod_like());
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_bind_with_dev_cookie_secret_refuses_boot() {
+        let c = Config {
+            bind: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            ..Config::default()
+        };
+        assert!(c.is_prod_like());
+        // Still carries the published dev cookie secret → must fail loud.
+        let err = c.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("FEATHERREADER_COOKIE_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn public_bind_with_short_secret_refuses_boot() {
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "too-short".to_string(),
+            ..Config::default()
+        };
+        assert!(c.is_prod_like());
+        assert!(c.validate_secrets().is_err());
+    }
+
+    #[test]
+    fn public_bind_with_dev_sidecar_secret_refuses_boot() {
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            // Strong cookie secret, but sidecar secret still the dev default.
+            cookie_secret: "x".repeat(48),
+            ..Config::default()
+        };
+        let err = c.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("SIDECAR_INTERNAL_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn public_bind_with_strong_secrets_boots() {
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            ..Config::default()
+        };
+        assert!(c.is_prod_like());
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_url_non_loopback_detection() {
+        assert!(!public_url_is_non_loopback("http://localhost:8080"));
+        assert!(!public_url_is_non_loopback("http://127.0.0.1:8080"));
+        assert!(!public_url_is_non_loopback("http://[::1]:8080"));
+        assert!(public_url_is_non_loopback(
+            "https://reader.justin-stanley.com"
+        ));
+        assert!(public_url_is_non_loopback("http://203.0.113.5"));
     }
 }

@@ -29,6 +29,7 @@ pub mod atproto;
 pub mod config;
 pub mod feed;
 pub mod lexicon;
+pub mod net;
 pub mod store;
 pub mod web;
 
@@ -51,16 +52,15 @@ pub struct Session {
     pub handle: Option<String>,
 }
 
-/// In-memory session registry: DID → [`Session`].
+/// In-memory session registry: **opaque random session-id → [`Session`]**.
 ///
-/// The signed cookie carries the DID; this maps it back to the full session
-/// (handle, and room to grow). It is populated at the OAuth callback (after the
-/// sidecar resolves the one-shot `session_id` to `{did, handle}`) and read on
-/// every request. Being in-memory it's cleared on restart — but that's fine: the
-/// **durable** OAuth session lives in the sidecar's SQLite store, so a returning
-/// cookie whose DID isn't yet in the registry can be re-hydrated (the sidecar
-/// still has the OAuth session; only the handle needs refetching), and repo ops
-/// key off the DID + shared secret regardless.
+/// The signed cookie carries a random, server-minted session id (`sid`), *not*
+/// the DID: the DID is never attacker-supplied, so a session cookie cannot be
+/// forged by resolving a victim's DID — an attacker would need both the server's
+/// HMAC secret *and* to guess a 256-bit random sid that only exists server-side.
+/// Sessions are therefore also **revocable** (drop the sid → the cookie is dead)
+/// and are cleared on restart (every client re-logs in; the durable OAuth
+/// session still lives in the sidecar's store).
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     inner: Arc<RwLock<HashMap<String, Session>>>,
@@ -72,24 +72,59 @@ impl SessionRegistry {
         Self::default()
     }
 
-    /// Insert or refresh a session, keyed by its DID.
-    pub fn insert(&self, session: Session) {
+    /// Create a new session for `session`, returning its freshly-minted random
+    /// session id (the value the signed cookie carries).
+    pub fn create(&self, session: Session) -> String {
+        let sid = new_session_id();
         if let Ok(mut map) = self.inner.write() {
-            map.insert(session.did.clone(), session);
+            map.insert(sid.clone(), session);
         }
+        sid
     }
 
-    /// Look up a session by DID.
-    pub fn get(&self, did: &str) -> Option<Session> {
-        self.inner.read().ok().and_then(|m| m.get(did).cloned())
+    /// Look up a session by its opaque session id.
+    pub fn get(&self, sid: &str) -> Option<Session> {
+        self.inner.read().ok().and_then(|m| m.get(sid).cloned())
     }
 
-    /// Drop a session (logout).
-    pub fn remove(&self, did: &str) {
+    /// Drop a session by its session id (logout / revoke).
+    pub fn remove(&self, sid: &str) {
         if let Ok(mut map) = self.inner.write() {
-            map.remove(did);
+            map.remove(sid);
         }
     }
+}
+
+/// Mint a fresh, unguessable session id: 32 random bytes (256 bits) as URL-safe
+/// hex. Sourced from the OS CSPRNG via `getrandom` (pulled in transitively);
+/// falls back to a time+address-seeded mix only if the OS RNG is unavailable,
+/// which never happens on the supported platforms.
+fn new_session_id() -> String {
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Extremely defensive fallback: mix a few entropy-ish sources. Not used
+        // on any supported platform (getrandom uses the OS CSPRNG).
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seed = nanos as u64 ^ (&bytes as *const _ as u64);
+        let mut x = seed | 1;
+        for b in bytes.iter_mut() {
+            // xorshift64 — placeholder only.
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+    }
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Shared application state handed to every axum handler.

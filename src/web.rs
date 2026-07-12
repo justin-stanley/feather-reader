@@ -52,6 +52,7 @@ use axum::{
 };
 use serde::Deserialize;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -76,29 +77,81 @@ const REPO_URL: &str = "https://github.com/justin-stanley/feather-reader";
 /// The tip / support link (cloud plan public-experiment UI).
 const KOFI_URL: &str = "https://ko-fi.com/justinstanley";
 
+/// The Content-Security-Policy applied to every response.
+///
+/// Tuned to keep the app fully working while neutralising injected script:
+/// * `default-src 'self'` — same-origin baseline.
+/// * `script-src 'self'` — only our vendored `htmx.min.js` + `keyboard.js` from
+///   `/static`; **no** `'unsafe-inline'`, so an injected `<script>` or a
+///   `javascript:` href (F4) cannot execute. (The design's templates carry no
+///   inline event handlers — every control is wired in `keyboard.js`.)
+/// * `style-src 'self' 'unsafe-inline'` — the linked stylesheet plus the small
+///   inline styles htmx toggles for its request indicators.
+/// * `img-src 'self' https: data:` — feed content routinely embeds remote
+///   images; allow https + data URIs but not other schemes.
+/// * `form-action 'self'`, `base-uri 'self'`, `frame-ancestors 'none'` — lock
+///   down form posts, `<base>` hijacking, and clickjacking.
+/// * `object-src 'none'` — no plugins.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; \
+     img-src 'self' https: data:; \
+     font-src 'self'; \
+     connect-src 'self'; \
+     form-action 'self'; \
+     base-uri 'self'; \
+     frame-ancestors 'none'; \
+     object-src 'none'";
+
 /// The resolved identity for the current request.
 ///
 /// `did` is the primary key for all per-user local state; `handle` is display
-/// only. Sourced from the signed cookie (real login) or, if none, the configured
-/// dev DID fallback.
+/// only; `sid` is the opaque server-side session id the cookie carried (needed
+/// so logout can revoke exactly this session). Sourced from the signed cookie
+/// (real login) or, if none, the configured dev DID fallback.
 #[derive(Clone, Debug)]
 struct CurrentUser {
     did: String,
     handle: Option<String>,
+    /// The opaque session id, if this identity came from a real cookie session
+    /// (absent for the dev-DID fallback, which has no server-side session row).
+    sid: Option<String>,
 }
 
 /// Resolve the current request's session from the signed cookie, falling back to
 /// the configured dev DID (env `FEATHERREADER_DEV_DID`) for local runs.
+///
+/// The cookie carries an opaque server-minted session id (not the DID). We
+/// verify its HMAC, look the id up in the registry, and — crucially —
+/// **re-check the DID against the instance allow-list on every request**, not
+/// just at the OAuth callback, so revoking a DID from `ALLOWED_DIDS` takes
+/// effect immediately for already-issued cookies.
 fn current_session(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
-    if let Some(did) = cookie::verify_session(headers, &state.config.cookie_secret) {
-        let handle = state.sessions.get(&did).and_then(|s| s.handle);
-        return Some(CurrentUser { did, handle });
+    if let Some(sid) = cookie::verify_session(headers, &state.config.cookie_secret) {
+        if let Some(session) = state.sessions.get(&sid) {
+            if state.config.did_allowed(&session.did) {
+                return Some(CurrentUser {
+                    did: session.did,
+                    handle: session.handle,
+                    sid: Some(sid),
+                });
+            }
+            // DID no longer permitted: treat as logged out (and drop the stale
+            // server-side session so the dead cookie can't linger).
+            state.sessions.remove(&sid);
+        }
     }
-    // No valid cookie: dev fallback only if explicitly configured.
-    state.config.dev_did.clone().map(|did| {
-        let handle = state.sessions.get(&did).and_then(|s| s.handle);
-        CurrentUser { did, handle }
-    })
+    // No valid cookie: dev fallback only if explicitly configured *and* allowed.
+    state
+        .config
+        .dev_did
+        .clone()
+        .filter(|did| state.config.did_allowed(did))
+        .map(|did| CurrentUser {
+            did,
+            handle: None,
+            sid: None,
+        })
 }
 
 /// The current request's DID, or `None` when logged out (no cookie, no dev DID).
@@ -134,7 +187,33 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .nest_service("/static", ServeDir::new("static"))
         .layer(TraceLayer::new_for_http())
+        // Baseline security headers on *every* response (F4). The CSP is the
+        // backstop that neutralises any XSS that slips past sanitization; the
+        // others harden sniffing, framing, and referrer leakage.
+        .layer(static_header_layer(
+            "content-security-policy",
+            CONTENT_SECURITY_POLICY,
+        ))
+        .layer(static_header_layer("x-content-type-options", "nosniff"))
+        .layer(static_header_layer(
+            "referrer-policy",
+            "strict-origin-when-cross-origin",
+        ))
+        .layer(static_header_layer("x-frame-options", "DENY"))
         .with_state(state)
+}
+
+/// A response-header layer that sets `name: value` on every response, overriding
+/// any existing header of that name. `name`/`value` must be valid static header
+/// tokens (they are, for our fixed security headers).
+fn static_header_layer(
+    name: &'static str,
+    value: &'static str,
+) -> SetResponseHeaderLayer<header::HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        header::HeaderName::from_static(name),
+        header::HeaderValue::from_static(value),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,7 +1541,10 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
         url::Url::parse(input).map_err(|e| anyhow::anyhow!("not a valid URL {input:?}: {e}"))?;
 
     let client = feed::build_client()?;
-    let resp = client.get(parsed.clone()).send().await?;
+    // Fetch through the SSRF guard: scheme + resolved-IP checks on the URL and
+    // every redirect hop, so a user-pasted URL can't reach cloud metadata /
+    // loopback / private hosts.
+    let resp = crate::net::guarded_get(&client, parsed.as_str(), &[]).await?;
     let final_url = resp.url().clone();
     let content_type = resp
         .headers()
@@ -1470,7 +1552,10 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let body = resp.text().await?;
+    // Cap the body (streamed, aborts over 8 MiB) — never trust Content-Length,
+    // gzip strips it, and this response is reflected into the UI.
+    let raw = crate::net::read_capped(resp).await?;
+    let body = String::from_utf8_lossy(&raw).into_owned();
 
     let looks_like_feed = content_type.contains("xml")
         || content_type.contains("rss")
@@ -1585,11 +1670,13 @@ async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQ
         return login_error("This instance's allow-list does not permit that account.");
     }
 
-    state.sessions.insert(Session {
+    // Mint an opaque, random server-side session id and store the identity under
+    // it; the cookie carries the (HMAC-signed) sid, never the DID.
+    let sid = state.sessions.create(Session {
         did: session.did.clone(),
         handle: session.handle.clone(),
     });
-    let cookie = cookie::sign_session(&session.did, &state.config.cookie_secret);
+    let cookie = cookie::sign_session(&sid, &state.config.cookie_secret);
     info!(did = %session.did, handle = ?session.handle, "OAuth login OK; session cookie set");
 
     let mut resp = Redirect::to("/").into_response();
@@ -1599,13 +1686,15 @@ async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQ
 
 /// `POST /logout` — clear the session cookie + drop the in-memory session.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(did) = current_did(&state, &headers) {
-        state.sessions.remove(&did);
+    if let Some(user) = current_session(&state, &headers) {
+        if let Some(sid) = user.sid {
+            state.sessions.remove(&sid);
+        }
     }
     let mut resp = Redirect::to("/login").into_response();
     set_cookie(
         &mut resp,
-        &format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        &format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
     );
     resp
 }
@@ -1796,26 +1885,31 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
 }
 
-/// A tiny, self-contained signed-cookie layer: HMAC-SHA256 over the DID.
+/// A tiny, self-contained signed-cookie layer: HMAC-SHA256 over an opaque,
+/// server-minted **session id** (never the DID — so the cookie can't be forged
+/// from a resolved victim DID; forging it needs the HMAC secret *and* a live
+/// server-side session id).
 mod cookie {
     use super::{HeaderMap, SESSION_COOKIE};
 
-    /// Sign a DID into a `Set-Cookie` header value: `fr_session=<did>.<sig>`.
-    pub fn sign_session(did: &str, secret: &str) -> String {
-        let sig = hmac_sha256_hex(secret.as_bytes(), did.as_bytes());
-        let b64 = b64url_encode(did.as_bytes());
-        format!("{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+    /// Sign a session id into a `Set-Cookie` header value: `fr_session=<sid>.<sig>`.
+    pub fn sign_session(sid: &str, secret: &str) -> String {
+        let sig = hmac_sha256_hex(secret.as_bytes(), sid.as_bytes());
+        let b64 = b64url_encode(sid.as_bytes());
+        format!(
+            "{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
+        )
     }
 
-    /// Verify the request's session cookie and return the DID it carries.
+    /// Verify the request's session cookie and return the session id it carries.
     pub fn verify_session(headers: &HeaderMap, secret: &str) -> Option<String> {
         let raw = cookie_value(headers, SESSION_COOKIE)?;
         let (b64, sig) = raw.split_once('.')?;
-        let did_bytes = b64url_decode(b64)?;
-        let did = String::from_utf8(did_bytes).ok()?;
-        let expected = hmac_sha256_hex(secret.as_bytes(), did.as_bytes());
+        let sid_bytes = b64url_decode(b64)?;
+        let sid = String::from_utf8(sid_bytes).ok()?;
+        let expected = hmac_sha256_hex(secret.as_bytes(), sid.as_bytes());
         if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
-            Some(did)
+            Some(sid)
         } else {
             None
         }
@@ -2040,15 +2134,44 @@ mod cookie {
         #[test]
         fn sign_verify_round_trips() {
             let secret = "test-secret";
-            let cookie = sign_session("did:plc:abc123", secret);
+            let sid = "9f2c-opaque-session-id";
+            let cookie = sign_session(sid, secret);
             let pair = cookie.split(';').next().unwrap().to_string();
             let mut headers = HeaderMap::new();
             headers.insert(axum::http::header::COOKIE, pair.parse().unwrap());
-            assert_eq!(
-                verify_session(&headers, secret).as_deref(),
-                Some("did:plc:abc123")
-            );
+            assert_eq!(verify_session(&headers, secret).as_deref(), Some(sid));
+            // Wrong secret → rejected (an attacker without the HMAC key can't forge).
             assert!(verify_session(&headers, "other-secret").is_none());
+        }
+
+        #[test]
+        fn forged_and_tampered_cookies_are_rejected() {
+            let secret = "test-secret";
+
+            // 1. A fully forged cookie: attacker knows a victim's DID/sid but not
+            //    the secret, so an arbitrary signature must not verify.
+            let forged = format!(
+                "{SESSION_COOKIE}={}.{}",
+                b64url_encode(b"attacker-chosen-sid"),
+                "deadbeef".repeat(8) // 64 hex chars, wrong sig
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::COOKIE, forged.parse().unwrap());
+            assert!(verify_session(&headers, secret).is_none());
+
+            // 2. A tampered cookie: take a VALID cookie and mutate the sid while
+            //    keeping the original signature — must not verify.
+            let cookie = sign_session("real-sid", secret);
+            let pair = cookie.split(';').next().unwrap();
+            let (_b64, sig) = pair.split_once('=').unwrap().1.split_once('.').unwrap();
+            let tampered = format!(
+                "{SESSION_COOKIE}={}.{}",
+                b64url_encode(b"different-sid"),
+                sig
+            );
+            let mut headers2 = HeaderMap::new();
+            headers2.insert(axum::http::header::COOKIE, tampered.parse().unwrap());
+            assert!(verify_session(&headers2, secret).is_none());
         }
 
         #[test]

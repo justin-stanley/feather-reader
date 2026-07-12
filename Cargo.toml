@@ -28,8 +28,9 @@ tokio = { version = "1.45", features = ["full"] }
 # --- web framework + middleware -----------------------------------------
 # `multipart` powers the OPML file-upload import (POST /opml).
 axum = { version = "0.8", features = ["multipart"] }
-# fs = ServeDir/ServeFile for embedded/static assets; trace = request tracing layer.
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+# fs = ServeDir/ServeFile for embedded/static assets; trace = request tracing
+# layer; set-header = the global security-header layer (CSP + friends).
+tower-http = { version = "0.6", features = ["fs", "trace", "set-header"] }
 
 # --- HTTP client (feed fetch) -------------------------------------------
 # default-features off to drop the OpenSSL/native-tls path; rustls keeps the
@@ -81,3 +82,8 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # --- URL parsing (feed autodiscovery, canonicalization) ------------------
 url = "2"
+
+# --- CSPRNG (opaque, unguessable session ids) ----------------------------
+# Already in the dependency tree transitively; pinned here as a direct dep so
+# the session-id minting reads from the OS CSPRNG rather than a home-rolled RNG.
+getrandom = "0.4"

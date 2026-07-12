@@ -628,6 +628,7 @@ dependencies = [
  "axum",
  "chrono",
  "feed-rs",
+ "getrandom 0.4.3",
  "reqwest",
  "serde",
  "serde_json",

@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use feed_rs::model::{Entry as RawEntry, Feed as RawFeed, Text};
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT as UA};
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 use url::Url;
@@ -37,9 +37,9 @@ use crate::store::{self, Feed, NewEntry, NewFeed};
 /// How long a single feed fetch may take before we give up.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Cap on how many bytes we will read from a feed body, to bound memory against
-/// a hostile or runaway response. 8 MiB is comfortably above any sane feed.
-const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
+/// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
+/// that trickles bytes forever can't tie up a fetch under the total timeout.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Base backoff applied after a failed poll; the caller multiplies this by the
 /// feed's consecutive-error count (with a ceiling) to space out retries.
@@ -62,17 +62,24 @@ pub enum PollOutcome {
     Failed { backoff: Duration },
 }
 
-/// Build a `reqwest::Client` configured for polite feed fetching.
+/// Build a `reqwest::Client` configured for polite **and safe** feed fetching.
 ///
 /// Callers should build this **once** and share it (connection pooling), then
 /// hand a reference to [`poll_feed`]. Kept here so the fetch policy (UA,
 /// timeout, redirect behaviour) lives with the code that depends on it.
+///
+/// Auto-redirect is **disabled** on purpose: feed URLs are untrusted, so
+/// redirects are followed manually by [`crate::net::guarded_get`], which
+/// re-validates the scheme + resolved IP of every hop (SSRF defence). A client
+/// that silently followed redirects could be bounced onto `169.254.169.254` or
+/// `127.0.0.1` between the guard's check and the connect.
 pub fn build_client() -> Result<Client> {
     Client::builder()
         .user_agent(crate::USER_AGENT)
         .timeout(FETCH_TIMEOUT)
-        // Follow a bounded number of redirects; publishers move feeds around.
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .read_timeout(READ_TIMEOUT)
+        // No auto-redirect: net::guarded_get follows + re-validates each hop.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build feed HTTP client")
 }
@@ -104,19 +111,27 @@ fn backoff_for(consecutive_errors: u32) -> Duration {
 /// `Err` is reserved for *store* failures (a broken local DB is a real error the
 /// caller should see), not for feed misbehaviour.
 pub async fn poll_feed(pool: &SqlitePool, client: &Client, feed: &Feed) -> Result<PollOutcome> {
-    // --- conditional GET -----------------------------------------------------
-    let mut req = client.get(&feed.url).header(UA, crate::USER_AGENT);
+    // --- conditional GET (through the SSRF guard) ----------------------------
+    // The guard re-validates the scheme + resolved IP of the target and of every
+    // redirect hop, so a subscribed feed can't bounce the poller onto an
+    // internal address (cloud metadata / loopback). Conditional-GET validators
+    // ride along as extra headers.
+    let mut extra: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> = Vec::new();
     if let Some(etag) = feed.etag.as_deref() {
-        req = req.header(IF_NONE_MATCH, etag);
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(etag) {
+            extra.push((IF_NONE_MATCH, v));
+        }
     }
     if let Some(lm) = feed.last_modified.as_deref() {
-        req = req.header(IF_MODIFIED_SINCE, lm);
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(lm) {
+            extra.push((IF_MODIFIED_SINCE, v));
+        }
     }
 
-    let resp = match req.send().await {
+    let resp = match crate::net::guarded_get(client, &feed.url, &extra).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(feed = %feed.url, error = %e, "feed fetch failed");
+            tracing::warn!(feed = %feed.url, error = %e, "feed fetch failed (or blocked by SSRF guard)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
             });
@@ -143,26 +158,13 @@ pub async fn poll_feed(pool: &SqlitePool, client: &Client, feed: &Feed) -> Resul
     let new_etag = header_str(resp.headers().get(ETAG));
     let new_last_modified = header_str(resp.headers().get(LAST_MODIFIED));
 
-    // Bound the body size against a hostile/runaway response.
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            tracing::warn!(feed = %feed.url, len, "feed body too large; skipping");
-            return Ok(PollOutcome::Failed {
-                backoff: backoff_for(1),
-            });
-        }
-    }
-
-    let body = match resp.bytes().await {
-        Ok(b) if (b.len() as u64) <= MAX_BODY_BYTES => b,
-        Ok(b) => {
-            tracing::warn!(feed = %feed.url, len = b.len(), "feed body exceeded cap; skipping");
-            return Ok(PollOutcome::Failed {
-                backoff: backoff_for(1),
-            });
-        }
+    // Stream the body with a hard byte cap, aborting mid-stream if it exceeds
+    // it. We never trust Content-Length: reqwest's gzip layer strips it, so a
+    // small gzip bomb could otherwise inflate to GBs before any size check.
+    let body = match crate::net::read_capped(resp).await {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!(feed = %feed.url, error = %e, "reading feed body failed");
+            tracing::warn!(feed = %feed.url, error = %e, "feed body rejected (too large / read error)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
             });
@@ -273,10 +275,12 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
         .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
         .map(sanitize_html);
 
+    // GUID may use the raw link (dedup key only, never rendered), so prefer the
+    // entry's first raw link for identity even when it's not a safe href.
     let guid = if !e.id.trim().is_empty() {
         e.id.trim().to_string()
-    } else if let Some(link) = url.as_deref() {
-        link.to_string()
+    } else if let Some(link) = raw_entry_link(e) {
+        link
     } else {
         // Last resort: derive a stable id so re-fetches dedup rather than dupe.
         stable_guid(e)
@@ -293,14 +297,24 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
     }
 }
 
-/// The best display/permalink URL for an entry: prefer `rel="alternate"` or a
-/// no-rel link, else the first link.
-fn entry_link(e: &RawEntry) -> Option<String> {
+/// The raw best-permalink URL for an entry (no scheme filtering) — used only as
+/// a dedup GUID, never rendered as an href.
+fn raw_entry_link(e: &RawEntry) -> Option<String> {
     e.links
         .iter()
         .find(|l| l.rel.as_deref() == Some("alternate") || l.rel.is_none())
         .or_else(|| e.links.first())
         .map(|l| l.href.clone())
+}
+
+/// The best display/permalink URL for an entry, **scheme-allow-listed** so it is
+/// safe to render as an `href`: prefer `rel="alternate"` or a no-rel link, else
+/// the first link — but only if it is an `http`/`https` URL. A `javascript:` or
+/// `data:` permalink (a stored-XSS vector that survives HTML escaping, since it
+/// carries no HTML-special characters) is dropped here at ingest, before it can
+/// ever reach the store or a template.
+fn entry_link(e: &RawEntry) -> Option<String> {
+    raw_entry_link(e).and_then(|href| crate::net::safe_link(&href))
 }
 
 /// First author name, if any.
@@ -609,6 +623,43 @@ mod tests {
         let g2 = normalize_entry(&parsed.entries[0]).guid;
         assert_eq!(g1, g2);
         assert!(g1.starts_with("featherreader:synthetic:"));
+    }
+
+    #[test]
+    fn entry_link_scheme_allowlist_neutralizes_javascript() {
+        // An entry whose only link is a javascript: URL must yield no href.
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+            <title>t</title>
+            <item>
+              <title>evil</title>
+              <link>javascript:alert(document.domain)</link>
+              <guid>evil-1</guid>
+            </item>
+        </channel></rss>"#;
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).expect("parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        // url is dropped (not a safe http(s) link)…
+        assert_eq!(e.url, None);
+        // …but the entry still dedups (guid preserved from <guid>).
+        assert_eq!(e.guid, "evil-1");
+
+        // A data: URL is likewise dropped.
+        let xml2 = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+            <title>t</title>
+            <item><title>d</title><link>data:text/html,<script>1</script></link><guid>d1</guid></item>
+        </channel></rss>"#;
+        let parsed2 = feed_rs::parser::parse(xml2.as_bytes()).expect("parse");
+        let e2 = normalize_entry(&parsed2.entries[0]);
+        assert_eq!(e2.url, None);
+
+        // A normal https link survives.
+        let xml3 = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+            <title>t</title>
+            <item><title>ok</title><link>https://ok.example/post</link><guid>ok1</guid></item>
+        </channel></rss>"#;
+        let parsed3 = feed_rs::parser::parse(xml3.as_bytes()).expect("parse");
+        let e3 = normalize_entry(&parsed3.entries[0]);
+        assert_eq!(e3.url.as_deref(), Some("https://ok.example/post"));
     }
 
     #[test]
