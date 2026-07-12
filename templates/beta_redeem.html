@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Redeem an invite — FeatherReader{% endblock %}
+
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <svg class="auth-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+      <path d="M16 8 5 19"/>
+    </svg>
+
+    <h1 class="auth-name">FeatherReader</h1>
+    <p class="auth-tag">invite-only, for now</p>
+
+    {% if !error.is_empty() %}
+      <p class="flash error" role="alert">{{ error }}</p>
+    {% endif %}
+
+    {% if capacity_full %}
+      <p class="auth-why">
+        <strong>FeatherReader is an invite-only, experimental beta — and it's
+        currently at capacity.</strong> No new seats are available right now.
+        You're welcome to <a href="{{ repo_url }}" rel="noopener noreferrer">run your
+        own copy</a> in the meantime — it's free software and self-hosting is a
+        first-class path.
+      </p>
+    {% else %}
+      <form class="auth-form" method="post" action="/beta/redeem">
+        <label for="code">Invite code</label>
+        <input class="input" id="code" name="code" type="text"
+               placeholder="FEATHER-XXXXXXXX" autocomplete="off"
+               autocapitalize="characters" autocorrect="off" spellcheck="false" required />
+        <button class="btn btn-primary" type="submit">
+          Redeem
+          <span class="htmx-indicator spinner" aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <p class="auth-why">
+        <strong>FeatherReader is an invite-only, experimental beta.</strong>
+        Redeem a code to reserve a seat, then you'll sign in with your own atproto
+        identity. Your subscriptions, folders, stars, and read-state are stored as
+        open-standard records in <strong>your</strong> PDS, portable to any reader
+        that speaks <code>community.lexicon.rss.*</code>.
+      </p>
+    {% endif %}
+
+    <p class="auth-foot">
+      Open source · <a href="{{ repo_url }}" rel="noopener noreferrer">AGPL-3.0</a> · self-hostable
+    </p>
+  </div>
+</main>
+{% endblock %}
