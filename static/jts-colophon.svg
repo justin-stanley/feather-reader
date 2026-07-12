@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-9.60 -150.55 232.24 232.24" role="img" aria-label="JTS monogram" fill="currentColor" color="#6f6959">
+  <title>JTS monogram - J and S at cap height, the T lowered below the shared baseline</title>
+  <style>
+    /* Loaded via img the SVG cannot inherit the page ink, so it carries its
+       own muted default (the app's muted token) plus a dark-scheme swap.
+       Inlined or via use, currentColor still lets the page take over. */
+    :root { color: #6f6959; }
+    @media (prefers-color-scheme: dark) { :root { color: #9c947f; } }
+  </style>
+  <!--
+    JTS lowered-T monogram, re-cut for FeatherReader's colophon.
+    Glyph outlines extracted (fontTools) from Playfair Display Bold (wght 700),
+    (c) 2017 The Playfair Display Project Authors, licensed under the
+    SIL Open Font License 1.1 (https://openfontlicense.org). Embedding outlines
+    in a document is permitted by the OFL; "Playfair" is a Reserved Font Name
+    and is deliberately not used in this asset's filename.
+    Composition: J and S share the cap band; the T is set smaller with its
+    crossbar dropped to the J/S mid-line and its stem descending below the
+    shared baseline (the wink). Single ink via currentColor; a small same-ink
+    stroke floor (paint-order: stroke) keeps hairlines legible at ~40-48px.
+  -->
+  <path d="M0.00 26.55V23.73Q5.65 23.16 9.60 20.41Q13.56 17.66 15.68 11.02Q17.80 4.38 17.80 -7.63V-85.03Q17.80 -90.25 17.02 -92.73Q16.24 -95.20 13.98 -96.12Q11.72 -97.03 7.20 -97.18V-100.00Q10.73 -99.86 16.45 -99.72Q22.18 -99.58 28.53 -99.58Q34.89 -99.58 40.89 -99.72Q46.89 -99.86 50.85 -100.00V-97.18Q46.47 -97.03 44.14 -96.12Q41.81 -95.20 41.03 -92.73Q40.25 -90.25 40.25 -85.03V-33.33Q40.25 -27.54 40.25 -20.83Q40.25 -14.12 39.76 -7.77Q39.27 -1.41 37.85 3.53Q35.03 13.28 25.64 19.92Q16.24 26.55 0.00 26.55Z M133.51 -36.30Q133.06 -30.51 132.89 -25.17Q132.72 -19.83 132.72 -16.99Q132.72 -14.50 132.83 -12.23Q132.95 -9.95 133.06 -8.36H130.45Q128.63 -17.90 125.85 -23.47Q123.07 -29.03 119.21 -31.36Q115.34 -33.69 110.12 -33.69H107.51V31.15Q107.51 35.70 108.47 37.97Q109.44 40.24 112.05 40.98Q114.66 41.72 119.66 41.83V44.10Q116.14 43.99 110.29 43.87Q104.44 43.76 98.08 43.76Q91.84 43.76 86.27 43.87Q80.71 43.99 77.30 44.10V41.83Q82.41 41.72 85.02 40.98Q87.64 40.24 88.54 37.97Q89.45 35.70 89.45 31.15V-33.69H86.95Q81.73 -33.69 77.87 -31.36Q74.01 -29.03 71.28 -23.52Q68.56 -18.02 66.51 -8.36H63.90Q64.13 -9.95 64.19 -12.23Q64.24 -14.50 64.24 -16.99Q64.24 -19.83 64.07 -25.17Q63.90 -30.51 63.45 -36.30Q68.67 -36.19 74.86 -36.07Q81.05 -35.96 87.29 -35.96Q93.54 -35.96 98.54 -35.96Q103.65 -35.96 109.84 -35.96Q116.03 -35.96 122.27 -36.07Q128.52 -36.19 133.51 -36.30Z M178.46 -101.84Q186.79 -101.84 191.31 -100.07Q195.83 -98.31 199.08 -96.33Q200.77 -95.34 201.83 -94.84Q202.89 -94.35 203.88 -94.35Q205.29 -94.35 205.93 -95.90Q206.57 -97.46 206.99 -100.56H210.24Q210.10 -97.88 209.88 -94.14Q209.67 -90.40 209.60 -84.32Q209.53 -78.25 209.53 -68.36H206.28Q205.72 -75.71 202.89 -82.63Q200.07 -89.55 194.91 -94.00Q189.76 -98.45 182.27 -98.45Q175.49 -98.45 171.11 -94.63Q166.74 -90.82 166.74 -84.04Q166.74 -78.39 169.56 -74.36Q172.38 -70.34 177.82 -66.53Q183.26 -62.71 191.03 -57.34Q197.81 -52.97 203.18 -48.59Q208.54 -44.21 211.79 -38.70Q215.04 -33.19 215.04 -25.56Q215.04 -16.24 210.17 -10.17Q205.29 -4.10 197.38 -1.06Q189.48 1.98 180.01 1.98Q171.25 1.98 166.03 0.28Q160.80 -1.41 157.27 -3.25Q154.16 -5.23 152.47 -5.23Q151.06 -5.23 150.42 -3.67Q149.79 -2.12 149.36 0.99H146.11Q146.40 -2.40 146.47 -6.92Q146.54 -11.44 146.61 -18.71Q146.68 -25.99 146.68 -37.15H149.93Q150.49 -27.82 153.11 -19.70Q155.72 -11.58 161.16 -6.64Q166.59 -1.69 175.63 -1.69Q180.58 -1.69 184.46 -3.46Q188.35 -5.23 190.75 -8.76Q193.15 -12.29 193.15 -17.51Q193.15 -23.45 190.39 -27.82Q187.64 -32.20 182.91 -36.02Q178.18 -39.83 171.96 -43.79Q165.32 -48.16 159.53 -52.54Q153.74 -56.92 150.28 -62.57Q146.82 -68.22 146.82 -75.99Q146.82 -84.89 151.27 -90.61Q155.72 -96.33 162.99 -99.08Q170.27 -101.84 178.46 -101.84Z" stroke="currentColor" stroke-width="3" paint-order="stroke"/>
+</svg>

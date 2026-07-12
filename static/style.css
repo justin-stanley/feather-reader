@@ -1850,3 +1850,41 @@ html[data-overlay="1"] .kbd-overlay {
 .add-feed-form .select {
   flex: none;
 }
+
+/* --------------------------------------------------------------------------
+   Colophon — the quiet maker's mark at the foot of /about. Muted ink only
+   (never the accent: accent is reserved for interactive elements); the mark
+   itself is an external SVG that carries its own muted default ink.
+   -------------------------------------------------------------------------- */
+.colophon {
+  max-width: calc(var(--measure) + 2 * var(--s5));
+  margin: 0 auto;
+  padding: 0 var(--s5) var(--s5);
+  text-align: center;
+}
+
+.colophon img {
+  display: block;
+  width: 2.75rem;  /* 44px */
+  height: 2.75rem;
+  margin: 0 auto var(--s2);
+  opacity: 0.85;
+}
+
+.colophon p {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.colophon a {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 2px;
+}
+
+.colophon a:hover {
+  color: var(--ink-soft);
+  text-decoration-color: currentColor;
+}
