@@ -19,6 +19,23 @@
     </div>
   </form>
 
+  <details class="import-opml">
+    <summary>Import OPML</summary>
+    <form method="post" action="/opml">
+      <label class="import-opml-label" for="opml">
+        Paste an OPML export to bring your feeds into your PDS.
+      </label>
+      <textarea
+        id="opml"
+        name="opml"
+        rows="4"
+        placeholder="<opml>…</opml>"
+        required
+      ></textarea>
+      <button type="submit">Import</button>
+    </form>
+  </details>
+
   {% if !flash.is_empty() %}
     <p class="flash" role="status">{{ flash }}</p>
   {% endif %}

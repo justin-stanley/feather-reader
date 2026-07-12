@@ -18,19 +18,15 @@
     <label for="handle">Handle</label>
     <input id="handle" name="handle" type="text" placeholder="alice.bsky.social" autocomplete="username" required />
 
-    <label for="app_password">App password</label>
-    <input id="app_password" name="app_password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="current-password" required />
-
-    <button type="submit">Log in</button>
+    <button type="submit">Continue</button>
   </form>
 
   <p class="note muted">
-    <strong>Interim auth (Phase 0):</strong> this uses an atproto
-    <em>app password</em> via <code>com.atproto.server.createSession</code>.
-    The real login is the atproto <strong>OAuth confidential-client</strong>
-    flow (handle → DID → PDS, DPoP, token refresh), handled by a small
-    <code>@atproto/oauth-client</code> sidecar — a documented TODO, not yet wired.
-    Never enter your main account password here.
+    This is the real atproto <strong>OAuth</strong> flow: you'll be sent to your
+    own PDS (Bluesky or a self-hosted server) to approve access — FeatherReader
+    never sees your password. A small <code>@atproto/oauth-client</code> sidecar
+    handles the handshake (resolve → PAR → PKCE → DPoP + token refresh); this app
+    only holds a signed session keyed by your DID.
   </p>
 </section>
 {% endblock %}

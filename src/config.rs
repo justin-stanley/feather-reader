@@ -15,6 +15,17 @@
 //! | `FEATHERREADER_RETENTION_DAYS`| `90`                    | Prune read, unstarred entries older than this. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //!
+//! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
+//! second small block — the base URL the Rust server reaches it on and the shared
+//! secret gating its internal API (see [`SidecarConfig`]):
+//!
+//! | Variable                       | Default                   | Meaning |
+//! |--------------------------------|---------------------------|---------|
+//! | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`   | Base URL of the OAuth sidecar (its public `/login` + internal API). |
+//! | `SIDECAR_INTERNAL_SECRET`      | *(dev fallback)*          | Shared `X-Internal-Secret` for the sidecar's `/internal/*` API. |
+//! | `FEATHERREADER_COOKIE_SECRET`  | *(dev fallback)*          | HMAC key used to sign the session cookie. |
+//! | `FEATHERREADER_DEV_DID`        | *(unset)*                 | When set, a request with no session cookie acts as this DID (local runs without the sidecar). |
+//!
 //! `FEATHERREADER_BIND` also accepts the design's `FEATHERREADER_ADDR` spelling
 //! as a fallback for compatibility.
 
@@ -44,6 +55,68 @@ pub struct Config {
     pub retention_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
+    /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
+    pub sidecar: SidecarConfig,
+    /// HMAC key used to sign the session cookie. In production this MUST be set
+    /// (`FEATHERREADER_COOKIE_SECRET`); a stable dev fallback is used otherwise
+    /// so local runs work without configuration.
+    pub cookie_secret: String,
+    /// Optional dev-only DID: when set, a request with no valid session cookie
+    /// is served as this DID (local runs without the OAuth sidecar). Unset in a
+    /// real deployment — no session then means "logged out".
+    pub dev_did: Option<String>,
+}
+
+/// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
+///
+/// The Rust server drives the sidecar over two surfaces:
+/// * the **public** `${public_url}/login` URL the browser is redirected to, and
+/// * the **internal** `${public_url}/internal/*` API (session lookup + the authed
+///   `com.atproto.repo.*` proxy), gated by the shared [`internal_secret`] sent as
+///   the `X-Internal-Secret` header.
+#[derive(Debug, Clone)]
+pub struct SidecarConfig {
+    /// Base URL of the sidecar (no trailing slash), e.g. `http://127.0.0.1:8081`.
+    pub public_url: String,
+    /// Shared secret for the sidecar's internal API (`X-Internal-Secret`).
+    pub internal_secret: String,
+}
+
+/// The sidecar's own dev fallback for the shared secret (matches the sidecar's
+/// `dev-internal-secret-change-me`) so a fully-local dev stack works untouched.
+const DEV_INTERNAL_SECRET: &str = "dev-internal-secret-change-me";
+
+/// The default sidecar base URL — loopback, matching the sidecar's own default.
+const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8081";
+
+/// A stable, clearly-marked dev cookie key. Overridden by
+/// `FEATHERREADER_COOKIE_SECRET` in any real deployment.
+const DEV_COOKIE_SECRET: &str = "featherreader-dev-cookie-secret-change-me";
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            public_url: DEFAULT_SIDECAR_URL.to_string(),
+            internal_secret: DEV_INTERNAL_SECRET.to_string(),
+        }
+    }
+}
+
+impl SidecarConfig {
+    /// The sidecar's public `/login` URL (the browser redirect target).
+    pub fn login_url(&self) -> String {
+        format!("{}/login", self.public_url)
+    }
+
+    /// The sidecar's `/internal/session/:id` URL.
+    pub fn session_url(&self, session_id: &str) -> String {
+        format!("{}/internal/session/{}", self.public_url, session_id)
+    }
+
+    /// The sidecar's `/internal/repo` URL (the authed `com.atproto.repo.*` proxy).
+    pub fn repo_url(&self) -> String {
+        format!("{}/internal/repo", self.public_url)
+    }
 }
 
 impl Default for Config {
@@ -58,6 +131,9 @@ impl Default for Config {
             poll_interval: Duration::from_secs(3600),
             retention_days: 90,
             proxy_images: false,
+            sidecar: SidecarConfig::default(),
+            cookie_secret: DEV_COOKIE_SECRET.to_string(),
+            dev_did: None,
         }
     }
 }
@@ -120,6 +196,24 @@ impl Config {
             None => defaults.proxy_images,
         };
 
+        // --- atproto OAuth sidecar --------------------------------------
+        let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
+            .map(|u| u.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| defaults.sidecar.public_url.clone());
+        let internal_secret =
+            env_opt("SIDECAR_INTERNAL_SECRET").unwrap_or_else(|| defaults.sidecar.internal_secret.clone());
+        let sidecar = SidecarConfig {
+            public_url: sidecar_url,
+            internal_secret,
+        };
+
+        let cookie_secret =
+            env_opt("FEATHERREADER_COOKIE_SECRET").unwrap_or_else(|| defaults.cookie_secret.clone());
+
+        // A dev DID is opt-in: only present when explicitly configured, so a real
+        // deployment never silently falls back to a shared identity.
+        let dev_did = env_opt("FEATHERREADER_DEV_DID");
+
         Ok(Self {
             bind,
             db_path,
@@ -128,6 +222,9 @@ impl Config {
             poll_interval,
             retention_days,
             proxy_images,
+            sidecar,
+            cookie_secret,
+            dev_did,
         })
     }
 
