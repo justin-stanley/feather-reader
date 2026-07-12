@@ -1,0 +1,22 @@
+<li class="entry-row{% if e.read %} is-read{% endif %}" id="entry-{{ e.id }}">
+  <a class="entry-link" href="/entries/{{ e.id }}">
+    <span class="entry-title">{{ e.title }}</span>
+    <span class="entry-meta">
+      {% if !e.feed_title.is_empty() %}<span class="entry-feed">{{ e.feed_title }}</span>{% endif %}
+      {% if !e.published.is_empty() %}<span class="entry-date">{{ e.published }}</span>{% endif %}
+    </span>
+  </a>
+  <form
+    class="entry-actions"
+    method="post"
+    action="/entries/{{ e.id }}/read"
+    hx-post="/entries/{{ e.id }}/read"
+    hx-target="#entry-{{ e.id }}"
+    hx-swap="outerHTML"
+  >
+    <input type="hidden" name="read" value="{% if e.read %}false{% else %}true{% endif %}" />
+    <button type="submit" class="mark-read">
+      {% if e.read %}Mark unread{% else %}Mark read{% endif %}
+    </button>
+  </form>
+</li>

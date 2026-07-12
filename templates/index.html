@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}Unread — FeatherReader{% endblock %}
+
+{% block content %}
+<aside class="sidebar" aria-label="Subscriptions">
+  <form class="add-feed" method="post" action="/subscriptions">
+    <label class="add-feed-label" for="feed-url">Subscribe</label>
+    <div class="add-feed-row">
+      <input
+        id="feed-url"
+        name="url"
+        type="url"
+        inputmode="url"
+        placeholder="Feed or site URL…"
+        required
+      />
+      <button type="submit">Add</button>
+    </div>
+  </form>
+
+  {% if !flash.is_empty() %}
+    <p class="flash" role="status">{{ flash }}</p>
+  {% endif %}
+
+  <nav class="feeds">
+    {% if folders.is_empty() && loose_feeds.is_empty() %}
+      <p class="muted">No subscriptions yet. Paste a feed URL above.</p>
+    {% else %}
+      {% for folder in folders %}
+        <div class="folder">
+          <h2 class="folder-name">{{ folder.name }}</h2>
+          <ul class="feed-list">
+            {% for feed in folder.feeds %}
+              <li class="feed-item">
+                <span class="feed-title">{{ feed.title }}</span>
+                {% if feed.unread > 0 %}<span class="unread-count">{{ feed.unread }}</span>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endfor %}
+
+      {% if !loose_feeds.is_empty() %}
+        <div class="folder">
+          <h2 class="folder-name">Feeds</h2>
+          <ul class="feed-list">
+            {% for feed in loose_feeds %}
+              <li class="feed-item">
+                <span class="feed-title">{{ feed.title }}</span>
+                {% if feed.unread > 0 %}<span class="unread-count">{{ feed.unread }}</span>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    {% endif %}
+  </nav>
+</aside>
+
+<section class="reader" aria-label="Unread entries">
+  <div class="reader-head">
+    <h1>Unread</h1>
+    <span class="count">{{ entries.len() }}</span>
+  </div>
+
+  {% if entries.is_empty() %}
+    <div class="empty">
+      <p>You're all caught up.</p>
+      <p class="muted">Nothing left to read. A quiet inbox is the goal.</p>
+    </div>
+  {% else %}
+    <ul class="entry-list" id="entry-list">
+      {% for e in entries %}
+        {% include "entry_row.html" %}
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}
