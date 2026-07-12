@@ -2,7 +2,7 @@
 name = "feather-reader"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 description = "A minimalist, atproto-native RSS/Atom reader in Rust — your feed subscriptions live in your own PDS."
 authors = ["Justin Stanley"]
 license = "AGPL-3.0-only"
@@ -12,4 +12,68 @@ readme = "README.md"
 keywords = ["rss", "atom", "atproto", "feed", "reader"]
 categories = ["web-programming"]
 
+# The crate ships a small library (shared types + module seams) and the server binary.
+[lib]
+name = "feather_reader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "featherreader"
+path = "src/main.rs"
+
 [dependencies]
+# --- async runtime -------------------------------------------------------
+tokio = { version = "1.45", features = ["full"] }
+
+# --- web framework + middleware -----------------------------------------
+axum = "0.8"
+# fs = ServeDir/ServeFile for embedded/static assets; trace = request tracing layer.
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+# --- HTTP client (feed fetch) -------------------------------------------
+# default-features off to drop the OpenSSL/native-tls path; rustls keeps the
+# static-binary story clean. gzip for polite/compressed feed fetches.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "json"] }
+
+# --- feed parsing --------------------------------------------------------
+feed-rs = "2.4"
+
+# --- HTML sanitization (feeds are hostile input) -------------------------
+ammonia = "4"
+
+# --- local per-DID SQLite cache -----------------------------------------
+# RUNTIME queries only (no compile-time `query!` macros, so no DATABASE_URL at
+# build). sqlx 0.9 splits the old `runtime-tokio-rustls` feature into
+# `runtime-tokio` + `tls-rustls-ring`. `sqlite-bundled` links SQLite into the
+# binary for the single-file deploy story; `migrate` runs embedded migrations.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "sqlite-bundled",
+    "migrate",
+    "chrono",
+] }
+
+# --- HTML templating (compile-time, embedded in the binary) --------------
+# askama 0.16 dropped the separate `askama_axum` integration crate (deprecated,
+# pinned to askama <0.13). `askama_web` provides the axum IntoResponse glue.
+askama = "0.14"
+askama_web = { version = "0.14", features = ["axum-0.8"] }
+
+# --- serde ---------------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- error handling ------------------------------------------------------
+anyhow = "1"
+thiserror = "2"
+
+# --- tracing -------------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- time / dates --------------------------------------------------------
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- URL parsing (feed autodiscovery, canonicalization) ------------------
+url = "2"
