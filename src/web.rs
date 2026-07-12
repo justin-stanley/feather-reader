@@ -4,38 +4,48 @@
 //! the shared [`AppState`], wiring the store, feed, atproto, and config seams into
 //! a small set of typography-first, dark-mode-ready views rendered with
 //! [`askama`] templates (under `templates/`). Progressive enhancement is a single
-//! vendored `htmx` script; every interaction also works as a plain HTML form POST,
-//! so the reader is fully usable with JavaScript disabled (design §4).
+//! vendored `htmx` script plus a tiny keyboard handler (`static/keyboard.js`);
+//! every interaction also works as a plain HTML form POST, so the reader is fully
+//! usable with JavaScript disabled (design §3).
 //!
-//! ## Phase 0 scope
+//! ## Reading surface (Phase 2)
 //!
 //! * `GET  /health` — liveness + version, as `text/plain`.
-//! * `GET  /` — the reader: the current user's folders/feeds plus their unread
-//!   entries, pulled from the [`crate::store`] cache.
-//! * `GET  /entries/:id` — the clean, distraction-free reader view for one entry.
-//! * `POST /subscriptions` — subscribe by URL: fetch/autodiscover the feed, poll
-//!   it once into the cache, and write a `community.lexicon.rss.subscription`
-//!   record to the user's PDS (scaffolded behind the auth seam, see below).
-//! * `POST /entries/:id/read` — mark an entry read/unread via the store; returns
-//!   the swapped entry row for htmx (and redirects back for the no-JS path).
-//! * `GET /login` + `POST /login` — the atproto auth seam. Phase 0 exercises the
-//!   **interim app-password** path (`com.atproto.server.createSession`); the real
-//!   **OAuth confidential-client** flow is a documented TODO (see [`login`]).
+//! * `GET  /` — the reader: a folders/feeds sidebar (from the PDS records layer)
+//!   plus the main article list. Query params pick the scope (`?feed=…` /
+//!   `?folder=…` / all) and the view (`?view=unread|all|starred`).
+//! * `GET  /entries/{id}` — the clean, distraction-free reader for one entry,
+//!   with prev/next within the current list.
+//! * `POST /entries/{id}/read` — mark an entry read/unread (htmx row swap).
+//! * `POST /entries/{id}/star` — star/unstar; writes a
+//!   `community.lexicon.rss.saved` record to the user's PDS.
+//! * `POST /read-all` — mark-all-read (per feed via `?feed=…`, else everything).
+//! * `POST /subscriptions` — subscribe by URL (autodiscover → PDS record).
+//! * `POST /subscriptions/{rkey}/delete` — unsubscribe (delete the PDS record).
+//! * `POST /subscriptions/{rkey}/rename` — retitle / move a feed to a folder.
+//! * `POST /folders` — create a folder record.
+//! * `POST /folders/{rkey}/rename` — rename a folder record.
+//! * `POST /folders/{rkey}/delete` — delete a folder record.
+//! * `POST /opml` — OPML import (multipart upload *or* pasted textarea) → bulk
+//!   subscription records in the PDS.
+//! * `GET  /opml/export` — OPML export (records → a downloadable document).
+//! * `GET /login` + `POST /login` + `/oauth/callback` + `/logout` — the atproto
+//!   OAuth seam (unchanged from Phase 1).
 //!
 //! ## Identity — a cookie-resolved atproto session
 //!
 //! Per-request identity comes from a **signed session cookie** (`fr_session`)
-//! keyed by the logged-in DID. The cookie is set by [`oauth_callback`] once the
-//! OAuth sidecar resolves a one-shot `session_id` to `{did, handle}`, and read on
-//! every request by [`current_session`] / [`current_did`]. For local runs without
-//! the sidecar, [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a
-//! fallback identity when no valid cookie is present; unset (the default) means
-//! "no session → logged out".
+//! keyed by the logged-in DID, set by [`oauth_callback`] and read by
+//! [`current_session`] / [`current_did`]. For local runs without the sidecar,
+//! [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a fallback identity.
+//! All PDS writes route through the [`crate::atproto::SidecarClient`]; a live-PDS
+//! write needs a real OAuth session, but the full write path is built and unit-
+//! tested to the sidecar boundary.
 
 use askama::Template;
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Multipart, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
@@ -46,8 +56,15 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::lexicon::Subscription;
+use crate::lexicon::{self, Folder, Saved, Subscription};
 use crate::{feed, store, AppState, Session, VERSION};
+
+// The OPML import/export module lives at `src/opml.rs` but isn't declared in the
+// crate root (`lib.rs`), which is outside this phase's edit surface. Wire it in
+// here via an explicit path so the reader's OPML routes can use the canonical
+// `parse_opml` / `to_opml` (design §4) without duplicating that logic.
+#[path = "opml.rs"]
+mod opml;
 
 /// The name of the signed session cookie.
 const SESSION_COOKIE: &str = "fr_session";
@@ -65,10 +82,6 @@ struct CurrentUser {
 
 /// Resolve the current request's session from the signed cookie, falling back to
 /// the configured dev DID (env `FEATHERREADER_DEV_DID`) for local runs.
-///
-/// Verifies the cookie's HMAC signature against [`Config::cookie_secret`] and
-/// looks the DID up in the [`crate::SessionRegistry`] for its handle. Returns
-/// `None` when there is neither a valid cookie nor a dev fallback (logged out).
 fn current_session(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
     if let Some(did) = cookie::verify_session(headers, &state.config.cookie_secret) {
         let handle = state.sessions.get(&did).and_then(|s| s.handle);
@@ -89,17 +102,24 @@ fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
 /// Build the application router over shared [`AppState`].
 ///
 /// Wires the reader routes, the health check, and the `/static` asset mount
-/// (the one stylesheet + vendored htmx, served from `static/` via
-/// [`ServeDir`]). A [`TraceLayer`] gives per-request tracing. `main` binds and
-/// serves the returned router.
+/// (the stylesheet, vendored htmx, and the keyboard handler, served from
+/// `static/` via [`ServeDir`]). A [`TraceLayer`] gives per-request tracing.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/", get(index))
         .route("/entries/{id}", get(entry_view))
         .route("/entries/{id}/read", post(mark_read))
+        .route("/entries/{id}/star", post(toggle_star))
+        .route("/read-all", post(mark_all_read))
         .route("/subscriptions", post(add_subscription))
+        .route("/subscriptions/{rkey}/delete", post(delete_subscription))
+        .route("/subscriptions/{rkey}/rename", post(rename_subscription))
+        .route("/folders", post(create_folder))
+        .route("/folders/{rkey}/rename", post(rename_folder))
+        .route("/folders/{rkey}/delete", post(delete_folder))
         .route("/opml", post(import_opml))
+        .route("/opml/export", get(export_opml))
         .route("/login", get(login_form).post(login_submit))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
@@ -121,27 +141,48 @@ async fn health() -> impl IntoResponse {
 // View models
 // ---------------------------------------------------------------------------
 
-/// A feed as shown in the sidebar (title + its unread count).
+/// A feed as shown in the sidebar (title + its unread count + a stable scope key
+/// and the PDS subscription rkey for management actions).
 struct FeedView {
+    /// PDS subscription rkey — addresses the record for rename/unsubscribe.
+    rkey: String,
+    /// Canonical feed URL — the sidebar filter key (`?feed=<url>`).
+    url: String,
     title: String,
     unread: i64,
+    /// Whether this feed is the currently-selected scope.
+    selected: bool,
 }
 
-/// A folder grouping in the sidebar. Phase 0 has no folder records wired to the
-/// cache yet, so the reader renders every feed loose; the shape is here so the
-/// PDS-folder wiring drops in without a template change.
+/// A folder grouping in the sidebar, sourced from the PDS `folder` records.
 struct FolderView {
+    /// PDS folder rkey — addresses the record for rename/delete.
+    rkey: String,
+    /// The folder's `at://` URI — the sidebar filter key (`?folder=<uri>`).
+    uri: String,
     name: String,
     feeds: Vec<FeedView>,
+    /// Whether this folder is the currently-selected scope.
+    selected: bool,
 }
 
-/// One entry as shown in the unread list / after an htmx mark-read swap.
+/// One entry as shown in the article list / after an htmx swap.
 struct EntryRow {
     id: i64,
     title: String,
     feed_title: String,
     published: String,
     read: bool,
+    starred: bool,
+    /// The reader link href, already carrying the scope/view query so opening an
+    /// entry and paging back stays within the list it came from.
+    link: String,
+}
+
+/// A folder as an option in the "move feed to folder" select.
+struct FolderOption {
+    uri: String,
+    name: String,
 }
 
 /// The reader index (`GET /`).
@@ -152,9 +193,22 @@ struct IndexTemplate {
     did: String,
     handle: Option<String>,
     flash: String,
+    /// Sidebar: folders (each with its feeds) then un-foldered feeds.
     folders: Vec<FolderView>,
     loose_feeds: Vec<FeedView>,
+    /// All folders as move-targets for the per-feed folder select.
+    folder_options: Vec<FolderOption>,
+    /// The article list for the selected scope + view.
     entries: Vec<EntryRow>,
+    /// The list heading (the selected view/feed/folder name).
+    heading: String,
+    /// The active view: `"unread" | "all" | "starred"`.
+    view: String,
+    /// The active scope query string suffix to preserve across links/forms,
+    /// e.g. `feed=https%3A%2F%2F…` or `folder=at%3A%2F%2F…`, empty for "all".
+    scope_qs: String,
+    /// Whether a feed scope is active (enables per-feed mark-all-read).
+    feed_scope: Option<String>,
 }
 
 /// The single-entry reader view (`GET /entries/:id`).
@@ -172,6 +226,12 @@ struct EntryTemplate {
     url: Option<String>,
     content_html: Option<String>,
     read: bool,
+    starred: bool,
+    /// The query string to carry the reading context back to the list.
+    back_qs: String,
+    /// Prev/next entry ids within the current list, for keyboard/paging nav.
+    prev_id: Option<i64>,
+    next_id: Option<i64>,
 }
 
 /// The htmx swap fragment for a single entry row (`entry_row.html`).
@@ -208,8 +268,7 @@ fn render<T: Template>(tmpl: &T) -> Response {
 }
 
 /// A minimal web error type so handlers can `?`-propagate `anyhow` failures and
-/// still return an `impl IntoResponse`. Renders as a `500` with a short message;
-/// the detail goes to the log, not the user.
+/// still return an `impl IntoResponse`. Renders as a `500` with a short message.
 struct WebError(anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for WebError {
@@ -250,19 +309,110 @@ fn display_date(published: Option<&str>) -> String {
     }
 }
 
+/// Percent-encode a value for use in a query string (RFC 3986 unreserved kept).
+/// Small and dependency-free — the `url` crate's form-encoding isn't exposed for
+/// a bare value, and this keeps the scope-preserving links honest.
+fn qenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Reader: index
 // ---------------------------------------------------------------------------
 
-/// `GET /` — the reader. Lists the current DID's cached feeds (with per-feed
-/// unread counts) alongside the flat unread-entry timeline, newest first.
-///
-/// Feeds/entries come from the shared [`crate::store`] cache; read-state is the
-/// per-DID working copy. Folder grouping is modelled but empty in Phase 0 (the
-/// PDS `community.lexicon.rss.folder` records aren't projected into the cache
-/// yet), so every feed renders loose.
-async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
-    // Logged out → send to login.
+/// Query for `GET /` — the scope + view selector.
+#[derive(Debug, Deserialize, Default)]
+struct IndexQuery {
+    /// Filter to a single feed by its canonical URL.
+    #[serde(default)]
+    feed: Option<String>,
+    /// Filter to a folder by its `at://` URI (shows every feed in the folder).
+    #[serde(default)]
+    folder: Option<String>,
+    /// `unread` (default) | `all` | `starred`.
+    #[serde(default)]
+    view: Option<String>,
+    /// Optional flash message (e.g. after an action redirect).
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+/// A subscription resolved against the local cache: the PDS record + its
+/// (possibly-missing) cached feed row.
+struct ResolvedSub {
+    rkey: String,
+    sub: Subscription,
+    feed: Option<store::Feed>,
+}
+
+/// Pull the user's subscriptions (source of truth = PDS), ensure each has a
+/// local cache row so unread counts work, and return them resolved. Best-effort
+/// on the sidecar: a failure falls back to the local cache alone.
+async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> {
+    let pool = &state.db;
+    let subs = match state.sidecar.list_subscriptions_sorted(did).await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(%err, %did, "could not list PDS subscriptions; showing local cache only");
+            // Fall back: synthesize subs from every cached feed.
+            let feeds = store::due_feeds(pool, &now_rfc3339(), i64::MAX)
+                .await
+                .unwrap_or_default();
+            return feeds
+                .into_iter()
+                .map(|f| ResolvedSub {
+                    rkey: String::new(),
+                    sub: Subscription::new(f.url.clone(), now_rfc3339()),
+                    feed: Some(f),
+                })
+                .collect();
+        }
+    };
+
+    let mut out = Vec::with_capacity(subs.len());
+    for (rkey, sub) in subs {
+        let feed = match store::get_feed_by_url(pool, &sub.url).await {
+            Ok(Some(f)) => Some(f),
+            Ok(None) => {
+                // Upsert a cache row so the sidebar reflects the real follow-list.
+                let _ = store::upsert_feed(
+                    pool,
+                    &store::NewFeed {
+                        url: sub.url.clone(),
+                        title: sub.title.clone(),
+                        site_url: sub.site_url.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                store::get_feed_by_url(pool, &sub.url).await.ok().flatten()
+            }
+            Err(err) => {
+                warn!(%err, url = %sub.url, "get_feed_by_url failed");
+                None
+            }
+        };
+        out.push(ResolvedSub { rkey, sub, feed });
+    }
+    out
+}
+
+/// `GET /` — the reader. Renders the sidebar (folders + feeds from the PDS
+/// records layer) and the article list for the selected scope + view.
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<IndexQuery>,
+) -> Result<Response, WebError> {
     let user = match current_session(&state, &headers) {
         Some(u) => u,
         None => return Ok(Redirect::to("/login").into_response()),
@@ -270,95 +420,294 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
     let did = user.did.clone();
     let pool = &state.db;
 
-    // Reconcile the user's ACTUAL subscriptions (source of truth = their PDS)
-    // with the local cache: for any subscription record present in the PDS but
-    // not yet cached, upsert the feed row so the sidebar reflects the real
-    // follow-list even on a fresh cache. Best-effort — if the sidecar is
-    // unreachable we fall back to whatever the local cache already holds.
-    match state.sidecar.list_subscriptions(&did).await {
-        Ok(subs) => {
-            for (_rkey, sub) in &subs {
-                if let Ok(None) = store::get_feed_by_url(pool, &sub.url).await {
-                    let _ = store::upsert_feed(
-                        pool,
-                        &store::NewFeed {
-                            url: sub.url.clone(),
-                            title: sub.title.clone(),
-                            site_url: sub.site_url.clone(),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                }
-            }
-        }
-        Err(err) => warn!(%err, %did, "could not list PDS subscriptions; showing local cache only"),
-    }
-
-    // Unread entries for this DID (newest-published first), plus their feed
-    // titles for the list rows.
-    let unread = store::get_unread_for_did(pool, &did).await?;
-
-    // Build the sidebar from every cached feed with this DID's unread count.
-    let now = now_rfc3339();
-    let feeds = store::due_feeds(pool, &now, i64::MAX)
+    let subs = resolve_subscriptions(&state, &did).await;
+    let folders = state
+        .sidecar
+        .list_folders_sorted(&did)
         .await
         .unwrap_or_default();
-    let mut loose_feeds = Vec::with_capacity(feeds.len());
-    for f in &feeds {
-        let unread_here = unread.iter().filter(|e| e.feed_id == f.id).count() as i64;
-        loose_feeds.push(FeedView {
-            title: display_title(f.title.as_deref(), &f.url),
-            unread: unread_here,
-        });
-    }
 
-    // Map entries to rows, resolving each feed's display title once.
-    let mut entries = Vec::with_capacity(unread.len());
-    for e in &unread {
-        let feed_title = feeds
+    // Per-DID working sets, once.
+    let unread = store::get_unread_for_did(pool, &did).await?;
+    let starred = store::get_starred_for_did(pool, &did).await?;
+    let starred_ids: std::collections::HashSet<i64> = starred.iter().map(|e| e.id).collect();
+
+    // View: unread (default) | all | starred.
+    let view = match q.view.as_deref() {
+        Some("all") => "all",
+        Some("starred") => "starred",
+        _ => "unread",
+    }
+    .to_string();
+
+    // Which feed URLs are in scope?
+    let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
+
+    // Resolve feed_id → url once for row rendering + scope filtering.
+    let feed_url_by_id = |id: i64| -> Option<String> {
+        subs.iter()
+            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
+            .map(|s| s.sub.url.clone())
+    };
+    let feed_title_by_id = |id: i64| -> String {
+        subs.iter()
+            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
+            .map(|s| {
+                display_title(
+                    s.sub
+                        .title
+                        .as_deref()
+                        .or(s.feed.as_ref().and_then(|f| f.title.as_deref())),
+                    &s.sub.url,
+                )
+            })
+            .unwrap_or_default()
+    };
+
+    let in_scope = |feed_id: i64| -> bool {
+        match &scope_urls {
+            None => true,
+            Some(urls) => feed_url_by_id(feed_id)
+                .map(|u| urls.contains(&u))
+                .unwrap_or(false),
+        }
+    };
+
+    // The source list for the chosen view.
+    let source = match view.as_str() {
+        "all" => {
+            // All entries across in-scope feeds, newest first.
+            let mut all = Vec::new();
+            for s in &subs {
+                if let Some(f) = &s.feed {
+                    if in_scope(f.id) {
+                        let mut es = store::entries_for_feed(pool, f.id)
+                            .await
+                            .unwrap_or_default();
+                        all.append(&mut es);
+                    }
+                }
+            }
+            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
+            all
+        }
+        "starred" => starred
             .iter()
-            .find(|f| f.id == e.feed_id)
-            .map(|f| display_title(f.title.as_deref(), &f.url))
-            .unwrap_or_default();
-        entries.push(EntryRow {
+            .filter(|e| in_scope(e.feed_id))
+            .cloned()
+            .collect(),
+        _ => unread
+            .iter()
+            .filter(|e| in_scope(e.feed_id))
+            .cloned()
+            .collect(),
+    };
+
+    // The scope/view suffix carried onto every entry link (built once).
+    let entry_scope_qs = {
+        let mut parts = Vec::new();
+        if let Some(f) = q.feed.as_deref() {
+            parts.push(format!("feed={}", qenc(f)));
+        }
+        if let Some(f) = q.folder.as_deref() {
+            parts.push(format!("folder={}", qenc(f)));
+        }
+        if view != "unread" {
+            parts.push(format!("view={}", qenc(&view)));
+        }
+        parts.join("&")
+    };
+    let entry_link = |id: i64| -> String {
+        if entry_scope_qs.is_empty() {
+            format!("/entries/{id}")
+        } else {
+            format!("/entries/{id}?{entry_scope_qs}")
+        }
+    };
+
+    let entries: Vec<EntryRow> = source
+        .iter()
+        .map(|e| EntryRow {
             id: e.id,
             title: e
                 .title
                 .clone()
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "(untitled)".to_string()),
-            feed_title,
+            feed_title: feed_title_by_id(e.feed_id),
             published: display_date(e.published.as_deref()),
-            read: false,
+            read: view != "unread" && !unread.iter().any(|u| u.id == e.id),
+            starred: starred_ids.contains(&e.id),
+            link: entry_link(e.id),
+        })
+        .collect();
+
+    // Build the sidebar. Unread count per feed uses the unread working set.
+    let unread_count = |feed_id: Option<i64>| -> i64 {
+        match feed_id {
+            Some(id) => unread.iter().filter(|e| e.feed_id == id).count() as i64,
+            None => 0,
+        }
+    };
+
+    let selected_feed = q.feed.as_deref();
+    let selected_folder = q.folder.as_deref();
+
+    let mk_feed_view = |s: &ResolvedSub| FeedView {
+        rkey: s.rkey.clone(),
+        url: s.sub.url.clone(),
+        title: display_title(
+            s.sub
+                .title
+                .as_deref()
+                .or(s.feed.as_ref().and_then(|f| f.title.as_deref())),
+            &s.sub.url,
+        ),
+        unread: unread_count(s.feed.as_ref().map(|f| f.id)),
+        selected: selected_feed == Some(s.sub.url.as_str()),
+    };
+
+    let mut folder_views = Vec::with_capacity(folders.len());
+    for (rkey, folder) in &folders {
+        let uri = folder_uri(&did, rkey);
+        let feeds: Vec<FeedView> = subs
+            .iter()
+            .filter(|s| s.sub.folder.as_deref() == Some(uri.as_str()))
+            .map(mk_feed_view)
+            .collect();
+        folder_views.push(FolderView {
+            rkey: rkey.clone(),
+            uri: uri.clone(),
+            name: folder.name.clone(),
+            feeds,
+            selected: selected_folder == Some(uri.as_str()),
         });
     }
+
+    // Un-foldered feeds: those whose `folder` ref is None or unknown.
+    let known_uris: std::collections::HashSet<String> =
+        folders.iter().map(|(r, _)| folder_uri(&did, r)).collect();
+    let loose_feeds: Vec<FeedView> = subs
+        .iter()
+        .filter(|s| {
+            s.sub
+                .folder
+                .as_deref()
+                .map(|f| !known_uris.contains(f))
+                .unwrap_or(true)
+        })
+        .map(mk_feed_view)
+        .collect();
+
+    let folder_options: Vec<FolderOption> = folders
+        .iter()
+        .map(|(rkey, folder)| {
+            let uri = folder_uri(&did, rkey);
+            FolderOption {
+                name: folder.name.clone(),
+                uri,
+            }
+        })
+        .collect();
+
+    // Heading + scope query-string suffix.
+    let (heading, scope_qs) = if let Some(feed_url) = selected_feed {
+        let name = subs
+            .iter()
+            .find(|s| s.sub.url == feed_url)
+            .map(|s| {
+                display_title(
+                    s.sub
+                        .title
+                        .as_deref()
+                        .or(s.feed.as_ref().and_then(|f| f.title.as_deref())),
+                    &s.sub.url,
+                )
+            })
+            .unwrap_or_else(|| display_title(None, feed_url));
+        (name, format!("feed={}", qenc(feed_url)))
+    } else if let Some(folder_uri) = selected_folder {
+        let name = folder_views
+            .iter()
+            .find(|f| f.uri == folder_uri)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "Folder".to_string());
+        (name, format!("folder={}", qenc(folder_uri)))
+    } else {
+        let h = match view.as_str() {
+            "all" => "All",
+            "starred" => "Starred",
+            _ => "Unread",
+        };
+        (h.to_string(), String::new())
+    };
 
     let tmpl = IndexTemplate {
         version: VERSION,
         did,
         handle: user.handle,
-        flash: String::new(),
-        folders: Vec::<FolderView>::new(),
+        flash: q.flash.unwrap_or_default(),
+        folders: folder_views,
         loose_feeds,
+        folder_options,
         entries,
+        heading,
+        feed_scope: selected_feed.map(str::to_string),
+        view,
+        scope_qs,
     };
     Ok(render(&tmpl))
+}
+
+/// The set of feed URLs a scope covers: `Some([one url])` for a single-feed
+/// scope, `Some([urls…])` for a folder (its member feeds), or `None` for the
+/// unscoped "everything" view. A folder scope takes the feed scope when both are
+/// somehow present (feed wins, matching the query precedence elsewhere).
+fn scope_urls_for(
+    subs: &[ResolvedSub],
+    feed: Option<&str>,
+    folder: Option<&str>,
+) -> Option<Vec<String>> {
+    if let Some(feed_url) = feed {
+        Some(vec![feed_url.to_string()])
+    } else {
+        folder.map(|folder_uri| {
+            subs.iter()
+                .filter(|s| s.sub.folder.as_deref() == Some(folder_uri))
+                .map(|s| s.sub.url.clone())
+                .collect()
+        })
+    }
+}
+
+/// The `at://` URI for a folder record given the owner DID + rkey.
+fn folder_uri(did: &str, rkey: &str) -> String {
+    format!("at://{did}/{}/{rkey}", lexicon::nsid::FOLDER)
 }
 
 // ---------------------------------------------------------------------------
 // Reader: single entry
 // ---------------------------------------------------------------------------
 
-/// `GET /entries/:id` — the clean reader view for one entry.
-///
-/// Renders just title, source, date, and the (already-sanitized) body — the
-/// distraction-free reading surface that is the product (design §6). Reading an
-/// entry does **not** auto-mark it read in Phase 0; that's an explicit action.
+/// Query for `GET /entries/:id` — carries the reading context (scope + view) so
+/// prev/next and "back" stay within the list the reader came from.
+#[derive(Debug, Deserialize, Default)]
+struct EntryQuery {
+    #[serde(default)]
+    feed: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    view: Option<String>,
+}
+
+/// `GET /entries/:id` — the clean reader view for one entry, with prev/next
+/// within the current reading list.
 async fn entry_view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
+    Query(q): Query<EntryQuery>,
 ) -> Result<Response, WebError> {
     let user = match current_session(&state, &headers) {
         Some(u) => u,
@@ -372,16 +721,16 @@ async fn entry_view(
         None => return Ok((StatusCode::NOT_FOUND, "entry not found").into_response()),
     };
 
-    // Feed title for the byline.
-    let feed_title = store::due_feeds(pool, &now_rfc3339(), i64::MAX)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .find(|f| f.id == entry.feed_id)
-        .map(|f| display_title(f.title.as_deref(), &f.url))
-        .unwrap_or_default();
+    let feed_title = feed_title_by_entry(pool, entry.feed_id).await;
 
     let read = entry_is_read(pool, &did, id).await?;
+    let starred = entry_is_starred(pool, &did, id).await?;
+
+    // Reconstruct the current list to compute prev/next, so paging in the reader
+    // matches what the list showed.
+    let (prev_id, next_id) = neighbors_in_scope(&state, &did, &q, id).await;
+
+    let back_qs = scope_query(&q);
 
     let tmpl = EntryTemplate {
         version: VERSION,
@@ -399,8 +748,109 @@ async fn entry_view(
         url: entry.url.clone().filter(|u| !u.trim().is_empty()),
         content_html: entry.content_html.clone(),
         read,
+        starred,
+        back_qs,
+        prev_id,
+        next_id,
     };
     Ok(render(&tmpl))
+}
+
+/// Compute the prev/next entry ids around `current` within the reader's current
+/// scope + view, so the reader view can offer keyboard/paging navigation.
+async fn neighbors_in_scope(
+    state: &AppState,
+    did: &str,
+    q: &EntryQuery,
+    current: i64,
+) -> (Option<i64>, Option<i64>) {
+    let idx_q = IndexQuery {
+        feed: q.feed.clone(),
+        folder: q.folder.clone(),
+        view: q.view.clone(),
+        flash: None,
+    };
+    let ids = list_entry_ids(state, did, &idx_q).await;
+    let pos = ids.iter().position(|&x| x == current);
+    match pos {
+        Some(p) => {
+            let prev = if p > 0 { Some(ids[p - 1]) } else { None };
+            let next = ids.get(p + 1).copied();
+            (prev, next)
+        }
+        None => (None, None),
+    }
+}
+
+/// The ordered entry ids for a scope + view — the same ordering `index` renders,
+/// used for reader prev/next. Best-effort; PDS failures degrade to local cache.
+async fn list_entry_ids(state: &AppState, did: &str, q: &IndexQuery) -> Vec<i64> {
+    let pool = &state.db;
+    let subs = resolve_subscriptions(state, did).await;
+
+    let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
+    let feed_url_by_id = |id: i64| -> Option<String> {
+        subs.iter()
+            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
+            .map(|s| s.sub.url.clone())
+    };
+    let in_scope = |feed_id: i64| -> bool {
+        match &scope_urls {
+            None => true,
+            Some(urls) => feed_url_by_id(feed_id)
+                .map(|u| urls.contains(&u))
+                .unwrap_or(false),
+        }
+    };
+
+    let view = q.view.as_deref().unwrap_or("unread");
+    let entries = match view {
+        "all" => {
+            let mut all = Vec::new();
+            for s in &subs {
+                if let Some(f) = &s.feed {
+                    if in_scope(f.id) {
+                        let mut es = store::entries_for_feed(pool, f.id)
+                            .await
+                            .unwrap_or_default();
+                        all.append(&mut es);
+                    }
+                }
+            }
+            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
+            all
+        }
+        "starred" => store::get_starred_for_did(pool, did)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| in_scope(e.feed_id))
+            .collect(),
+        _ => store::get_unread_for_did(pool, did)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| in_scope(e.feed_id))
+            .collect(),
+    };
+    entries.into_iter().map(|e| e.id).collect()
+}
+
+/// Build a `?…` query string that preserves the reading scope + view for links.
+fn scope_query(q: &EntryQuery) -> String {
+    let mut parts = Vec::new();
+    if let Some(f) = q.feed.as_deref() {
+        parts.push(format!("feed={}", qenc(f)));
+    }
+    if let Some(f) = q.folder.as_deref() {
+        parts.push(format!("folder={}", qenc(f)));
+    }
+    if let Some(v) = q.view.as_deref() {
+        if v != "unread" {
+            parts.push(format!("view={}", qenc(v)));
+        }
+    }
+    parts.join("&")
 }
 
 // ---------------------------------------------------------------------------
@@ -410,18 +860,11 @@ async fn entry_view(
 /// Form body for `POST /entries/:id/read`.
 #[derive(Debug, Deserialize)]
 struct ReadForm {
-    /// Desired read state as a string (`"true"` / `"false"`) — plain HTML forms
-    /// can't send a real bool. Defaults to marking read when absent.
     #[serde(default)]
     read: Option<String>,
 }
 
 /// `POST /entries/:id/read` — toggle an entry's read-state for the current DID.
-///
-/// Writes through [`store::mark_read`] (the fast local working copy the v1.1
-/// batched flusher later syncs to the PDS). For an htmx request (`HX-Request`
-/// header) it returns the re-rendered entry row so the list updates in place;
-/// for a plain form POST it redirects back to the reader.
 async fn mark_read(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -440,41 +883,138 @@ async fn mark_read(
     );
     store::mark_read(pool, &did, id, read).await?;
 
-    let is_htmx = headers
-        .get("HX-Request")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"));
-
-    if !is_htmx {
+    if !is_htmx(&headers) {
         return Ok(Redirect::to("/").into_response());
     }
 
-    // Re-render just this row so htmx can swap it (outerHTML).
-    let entry = match get_entry_by_id(pool, id).await? {
-        Some(e) => e,
-        None => return Ok((StatusCode::NOT_FOUND, "entry not found").into_response()),
-    };
-    let feed_title = store::due_feeds(pool, &now_rfc3339(), i64::MAX)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .find(|f| f.id == entry.feed_id)
-        .map(|f| display_title(f.title.as_deref(), &f.url))
-        .unwrap_or_default();
+    let row = build_entry_row(pool, &did, id, Some(read)).await?;
+    match row {
+        Some(r) => Ok(render(&EntryRowTemplate { e: r })),
+        None => Ok((StatusCode::NOT_FOUND, "entry not found").into_response()),
+    }
+}
 
-    let row = EntryRowTemplate {
-        e: EntryRow {
-            id: entry.id,
-            title: entry
-                .title
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| "(untitled)".to_string()),
-            feed_title,
-            published: display_date(entry.published.as_deref()),
-            read,
-        },
+// ---------------------------------------------------------------------------
+// Star / save
+// ---------------------------------------------------------------------------
+
+/// Form body for `POST /entries/:id/star`.
+#[derive(Debug, Deserialize)]
+struct StarForm {
+    #[serde(default)]
+    starred: Option<String>,
+}
+
+/// `POST /entries/:id/star` — star/unstar an entry.
+///
+/// Sets the local `starred` bit (fast working copy) and writes/removes a
+/// `community.lexicon.rss.saved` record in the user's PDS (design §3: stars are
+/// worth owning). The PDS write is best-effort — the local star still lands.
+async fn toggle_star(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<StarForm>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
     };
-    Ok(render(&row))
+    let pool = &state.db;
+
+    let starred = matches!(
+        form.starred.as_deref(),
+        Some("true") | Some("1") | Some("on") | None
+    );
+    store::mark_starred(pool, &did, id, starred).await?;
+
+    // Reflect into the PDS saved-records collection.
+    if let Ok(Some(entry)) = get_entry_by_id(pool, id).await {
+        let entry_url = entry.url.clone().unwrap_or_default();
+        if !entry_url.is_empty() {
+            if starred {
+                let mut saved = Saved::new(entry_url.clone(), now_rfc3339());
+                saved.title = entry.title.clone();
+                saved.feed_url = feed_url_for_id(pool, entry.feed_id).await;
+                saved.entry_id = Some(entry.guid.clone());
+                match state.sidecar.add_saved(&did, &saved).await {
+                    Ok(rkey) => info!(%did, url = %entry_url, %rkey, "wrote saved record to PDS"),
+                    Err(err) => warn!(%err, %did, "PDS saved write failed (starred locally)"),
+                }
+            } else {
+                // Un-star: find and delete the matching saved record by URL.
+                match state.sidecar.list_saved(&did).await {
+                    Ok(records) => {
+                        for (rkey, _rec) in records.iter().filter(|(_, r)| r.url == entry_url) {
+                            if let Err(err) = state.sidecar.remove_saved(&did, rkey).await {
+                                warn!(%err, %did, %rkey, "PDS saved delete failed");
+                            }
+                        }
+                    }
+                    Err(err) => warn!(%err, %did, "could not list saved records to un-star"),
+                }
+            }
+        }
+    }
+
+    if !is_htmx(&headers) {
+        return Ok(Redirect::to("/").into_response());
+    }
+    let row = build_entry_row(pool, &did, id, None).await?;
+    match row {
+        Some(r) => Ok(render(&EntryRowTemplate { e: r })),
+        None => Ok((StatusCode::NOT_FOUND, "entry not found").into_response()),
+    }
+}
+
+/// The feed URL for a cached feed id, if the row exists.
+async fn feed_url_for_id(pool: &store::Pool, feed_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT url FROM feeds WHERE id = ?1")
+        .bind(feed_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// Mark-all-read
+// ---------------------------------------------------------------------------
+
+/// Query for `POST /read-all` — an optional `?feed=<url>` scopes it to one feed;
+/// absent means mark everything read.
+#[derive(Debug, Deserialize, Default)]
+struct ReadAllQuery {
+    #[serde(default)]
+    feed: Option<String>,
+}
+
+/// `POST /read-all` — mark every entry read for the current DID, optionally
+/// scoped to one feed (design §3: mark-all-read per feed / global).
+async fn mark_all_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReadAllQuery>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let pool = &state.db;
+
+    if let Some(feed_url) = q.feed.as_deref() {
+        if let Ok(Some(feed)) = store::get_feed_by_url(pool, feed_url).await {
+            store::mark_feed_read(pool, &did, feed.id, true).await?;
+        }
+        return Ok(Redirect::to(&format!("/?feed={}", qenc(feed_url))).into_response());
+    }
+
+    // Global: mark every currently-unread entry read.
+    let unread = store::get_unread_for_did(pool, &did).await?;
+    for e in &unread {
+        store::mark_read(pool, &did, e.id, true).await?;
+    }
+    Ok(Redirect::to("/").into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -484,23 +1024,13 @@ async fn mark_read(
 /// Form body for `POST /subscriptions`.
 #[derive(Debug, Deserialize)]
 struct SubscribeForm {
-    /// A feed URL *or* a site URL (autodiscovery finds the feed).
     url: String,
+    /// Optional folder `at://` URI to file the new feed under.
+    #[serde(default)]
+    folder: Option<String>,
 }
 
 /// `POST /subscriptions` — subscribe by URL.
-///
-/// The flow (design §3/§5): (1) resolve the input to a real feed URL — if the
-/// pasted page is HTML, run [`feed::discover_feed`] to find its
-/// `<link rel="alternate">` feed; (2) upsert the feed into the shared cache and
-/// [`feed::poll_feed`] it once so entries show immediately; (3) write a
-/// `community.lexicon.rss.subscription` record to the user's PDS — the source of
-/// truth for the follow-list.
-///
-/// Step (3) is the live path: the [`crate::atproto::SidecarClient`] POSTs a
-/// `create` op to the sidecar's `/internal/repo` for the current DID, which
-/// restores the OAuth session and writes the record to the user's own PDS. The
-/// PDS is the source of truth; the local cache/poll is just the fast working copy.
 async fn add_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -516,17 +1046,19 @@ async fn add_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
-    // Resolve input → canonical feed URL (autodiscovery if it's a site page).
     let feed_url = match resolve_feed_url(&state.config, &input).await {
         Ok(u) => u,
         Err(err) => {
             warn!(%err, url = %input, "could not resolve a feed from the given URL");
-            return Ok(Redirect::to("/").into_response());
+            return Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("Couldn't find a feed at that URL")
+            ))
+            .into_response());
         }
     };
 
-    // Cache the feed row, then poll it once so entries appear immediately.
-    let feed_id = store::upsert_feed(
+    store::upsert_feed(
         pool,
         &store::NewFeed {
             url: feed_url.clone(),
@@ -544,36 +1076,176 @@ async fn add_subscription(
         }
     }
 
-    // Write the subscription record to the user's PDS (the source of truth) via
-    // the OAuth sidecar. Enrich the record with the feed's own title/site once
-    // the initial poll has populated the cache row.
     let mut sub = Subscription::new(feed_url.clone(), now_rfc3339());
     if let Ok(Some(feed_row)) = store::get_feed_by_url(pool, &feed_url).await {
         sub.title = feed_row.title.clone();
         sub.site_url = feed_row.site_url.clone();
     }
-    let _ = feed_id;
+    sub.folder = form
+        .folder
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
 
-    match state.sidecar.create_subscription(&did, &sub).await {
-        Ok(res) => {
-            info!(feed = %feed_url, uri = %res.uri, %did, "wrote subscription record to PDS")
-        }
+    match state.sidecar.add_subscription(&did, &sub).await {
+        Ok(rkey) => info!(feed = %feed_url, %rkey, %did, "wrote subscription record to PDS"),
         Err(err) => {
-            // Cache/poll already succeeded locally; surface the PDS write failure
-            // in the log but don't lose the local subscription.
-            warn!(%err, feed = %feed_url, %did, "PDS subscription write failed (cached locally)");
+            warn!(%err, feed = %feed_url, %did, "PDS subscription write failed (cached locally)")
         }
     }
 
     Ok(Redirect::to("/").into_response())
 }
 
+/// `POST /subscriptions/:rkey/delete` — unsubscribe (delete the PDS record).
+async fn delete_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    match state.sidecar.remove_subscription(&did, &rkey).await {
+        Ok(()) => info!(%did, %rkey, "unsubscribed (deleted PDS subscription record)"),
+        Err(err) => warn!(%err, %did, %rkey, "PDS unsubscribe failed"),
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
+/// Form body for `POST /subscriptions/:rkey/rename`.
+#[derive(Debug, Deserialize)]
+struct RenameSubForm {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    site_url: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+/// `POST /subscriptions/:rkey/rename` — retitle a feed and/or move it to a
+/// folder, rewriting the whole subscription record via `putRecord`.
+async fn rename_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+    Form(form): Form<RenameSubForm>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let mut sub = Subscription::new(form.url.trim().to_string(), now_rfc3339());
+    sub.title = form
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    sub.site_url = form
+        .site_url
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    sub.folder = form
+        .folder
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+
+    // Keep the local cache title in step for the loose-feed fallback path.
+    let _ = store::upsert_feed(
+        &state.db,
+        &store::NewFeed {
+            url: sub.url.clone(),
+            title: sub.title.clone(),
+            site_url: sub.site_url.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    match state.sidecar.update_subscription(&did, &rkey, &sub).await {
+        Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription"),
+        Err(err) => warn!(%err, %did, %rkey, "PDS subscription update failed"),
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Folders
+// ---------------------------------------------------------------------------
+
+/// Form body for `POST /folders`.
+#[derive(Debug, Deserialize)]
+struct FolderForm {
+    name: String,
+}
+
+/// `POST /folders` — create a folder record.
+async fn create_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<FolderForm>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+    let folder = Folder::new(name.to_string(), now_rfc3339());
+    match state.sidecar.add_folder(&did, &folder).await {
+        Ok(rkey) => info!(%did, %rkey, name, "created folder record"),
+        Err(err) => warn!(%err, %did, "PDS folder create failed"),
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
+/// `POST /folders/:rkey/rename` — rename a folder record.
+async fn rename_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+    Form(form): Form<FolderForm>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+    let folder = Folder::new(name.to_string(), now_rfc3339());
+    match state.sidecar.rename_folder(&did, &rkey, &folder).await {
+        Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed folder"),
+        Err(err) => warn!(%err, %did, %rkey, "PDS folder rename failed"),
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
+/// `POST /folders/:rkey/delete` — delete a folder record (feeds referencing it
+/// simply become un-foldered).
+async fn delete_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    match state.sidecar.remove_folder(&did, &rkey).await {
+        Ok(()) => info!(%did, %rkey, "deleted folder record"),
+        Err(err) => warn!(%err, %did, %rkey, "PDS folder delete failed"),
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
 /// Resolve a user-pasted URL to a canonical feed URL: if fetching it yields a
 /// feed document we take it as-is; if it yields an HTML page we run
 /// autodiscovery over its `<link rel="alternate">` tags.
-///
-/// Kept intentionally small (design bias: boring, small-dependency). A HEAD-less
-/// GET is fine here — the body is needed for autodiscovery anyway.
 async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<String> {
     let parsed =
         url::Url::parse(input).map_err(|e| anyhow::anyhow!("not a valid URL {input:?}: {e}"))?;
@@ -589,8 +1261,6 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
         .to_ascii_lowercase();
     let body = resp.text().await?;
 
-    // If it smells like a feed already (by content-type or a leading XML/JSON
-    // feed marker), use the URL as-is.
     let looks_like_feed = content_type.contains("xml")
         || content_type.contains("rss")
         || content_type.contains("atom")
@@ -607,7 +1277,6 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
         return Ok(final_url.to_string());
     }
 
-    // Otherwise treat it as HTML and autodiscover.
     match feed::discover_feed(&body, Some(&final_url)) {
         Some(u) => Ok(u.to_string()),
         None => anyhow::bail!("no feed found at {input} (no autodiscovery link)"),
@@ -621,25 +1290,14 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
 /// Query for `GET /login`.
 #[derive(Debug, Deserialize, Default)]
 struct LoginQuery {
-    /// Optional handle: when present we redirect straight to the sidecar's OAuth
-    /// flow. Absent → render the handle-entry form.
     #[serde(default)]
     handle: Option<String>,
-    /// Optional error banner (e.g. bounced back from the callback on failure).
     #[serde(default)]
     error: Option<String>,
 }
 
 /// `GET /login` — start the atproto OAuth flow, or render the handle form.
-///
-/// With a `?handle=…`, redirect the browser straight to the sidecar's
-/// `/login?handle=…` endpoint (resolve → PAR → PKCE → the PDS authorize page).
-/// Without one, render the handle-entry form. The sidecar ultimately bounces the
-/// browser back to this app's [`oauth_callback`].
-async fn login_form(
-    State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<LoginQuery>,
-) -> Response {
+async fn login_form(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
     if let Some(handle) = q
         .handle
         .map(|h| h.trim().to_string())
@@ -671,16 +1329,13 @@ fn start_oauth(state: &AppState, handle: &str) -> Response {
     Redirect::to(&url).into_response()
 }
 
-/// Form body for `POST /login` (just the handle — no password; OAuth happens at
-/// the PDS, not here).
+/// Form body for `POST /login`.
 #[derive(Debug, Deserialize)]
 struct LoginForm {
     handle: String,
 }
 
-/// Query for `GET /oauth/callback` — the app's OWN callback the sidecar bounces
-/// the browser to after the OAuth dance (distinct from the sidecar's PDS-facing
-/// `/callback`). Carries either a one-shot `session_id` or an error.
+/// Query for `GET /oauth/callback`.
 #[derive(Debug, Deserialize, Default)]
 struct CallbackQuery {
     #[serde(default)]
@@ -692,15 +1347,7 @@ struct CallbackQuery {
 }
 
 /// `GET /oauth/callback` — establish the cookie session.
-///
-/// The sidecar has completed OAuth and redirected here with a one-shot
-/// `session_id`. We resolve it via the sidecar's `/internal/session/:id` to
-/// `{did, handle}`, enforce the instance allow-list, register the session, and
-/// set a signed cookie keyed by the DID. Subsequent requests act as that DID.
-async fn oauth_callback(
-    State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<CallbackQuery>,
-) -> Response {
+async fn oauth_callback(State(state): State<AppState>, Query(q): Query<CallbackQuery>) -> Response {
     if let Some(err) = q.error {
         let desc = q.error_description.unwrap_or_default();
         warn!(error = %err, desc = %desc, "OAuth callback returned an error");
@@ -729,7 +1376,6 @@ async fn oauth_callback(
         return login_error("This instance's allow-list does not permit that account.");
     }
 
-    // Register the session (DID → handle) and set the signed cookie.
     state.sessions.insert(Session {
         did: session.did.clone(),
         handle: session.handle.clone(),
@@ -748,7 +1394,6 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         state.sessions.remove(&did);
     }
     let mut resp = Redirect::to("/login").into_response();
-    // An expired, empty cookie clears it in the browser.
     set_cookie(
         &mut resp,
         &format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
@@ -767,28 +1412,21 @@ fn login_error(msg: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// OPML import
+// OPML import + export
 // ---------------------------------------------------------------------------
-
-/// Form body for `POST /opml` — a pasted OPML document (the migration on-ramp).
-#[derive(Debug, Deserialize)]
-struct OpmlForm {
-    /// The raw OPML XML (from a textarea or an uploaded file's contents).
-    opml: String,
-}
 
 /// `POST /opml` — import subscriptions from an OPML document.
 ///
-/// Extracts every `xmlUrl` feed URL from the OPML `<outline>` tree and creates a
-/// `community.lexicon.rss.subscription` record per feed in the user's PDS in a
-/// single **batched `applyWrites`** round-trip (design §3: "OPML import creates a
-/// subscription record per feed in the user's PDS"). Feeds are also upserted into
-/// the local cache so they show immediately; the initial poll is left to the
-/// background poller / a subsequent visit.
+/// Accepts either a multipart file upload (field `file`) or a pasted textarea
+/// (field `opml`). The parsed feeds each become a `community.lexicon.rss.folder`
+/// (for any named folders) + a `community.lexicon.rss.subscription` record in the
+/// user's PDS via the records layer's bulk-add (`add_subscriptions_bulk`, one
+/// `applyWrites` round-trip). Feeds are also upserted into the local cache so
+/// they show immediately; polling is left to the background poller.
 async fn import_opml(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<OpmlForm>,
+    mut multipart: Multipart,
 ) -> Result<Response, WebError> {
     let did = match current_did(&state, &headers) {
         Some(d) => d,
@@ -796,87 +1434,140 @@ async fn import_opml(
     };
     let pool = &state.db;
 
-    let feeds = parse_opml(&form.opml);
-    if feeds.is_empty() {
-        info!(%did, "OPML import found no feeds");
-        return Ok(Redirect::to("/").into_response());
+    // Collect the OPML text from whichever field carried it.
+    let mut opml_text = String::new();
+    while let Some(field) = multipart.next_field().await? {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "opml" || name == "file" {
+            let bytes = field.bytes().await?;
+            if !bytes.is_empty() {
+                opml_text = String::from_utf8_lossy(&bytes).into_owned();
+                if name == "file" {
+                    break;
+                }
+            }
+        }
     }
 
-    // Build one subscription record per feed and upsert the local cache row.
+    let feeds = opml::parse_opml(&opml_text).unwrap_or_default();
+    if feeds.is_empty() {
+        info!(%did, "OPML import found no feeds");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc("No feeds found in that OPML")))
+                .into_response(),
+        );
+    }
+
+    // Create any named folders first, mapping folder name → at:// URI so
+    // subscriptions can reference them.
     let now = now_rfc3339();
+    let mut folder_uris: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Reuse existing folders where the name already exists.
+    if let Ok(existing) = state.sidecar.list_folders_sorted(&did).await {
+        for (rkey, folder) in existing {
+            folder_uris
+                .entry(folder.name.clone())
+                .or_insert_with(|| folder_uri(&did, &rkey));
+        }
+    }
+    let mut wanted_folders: Vec<String> = feeds
+        .iter()
+        .filter_map(|f| f.folder.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+    wanted_folders.sort();
+    wanted_folders.dedup();
+    for name in wanted_folders {
+        if folder_uris.contains_key(&name) {
+            continue;
+        }
+        let folder = Folder::new(name.clone(), now.clone());
+        match state.sidecar.add_folder(&did, &folder).await {
+            Ok(rkey) => {
+                folder_uris.insert(name, folder_uri(&did, &rkey));
+            }
+            Err(err) => warn!(%err, %did, "OPML folder create failed"),
+        }
+    }
+
+    // Build one subscription record per feed + upsert the local cache row.
     let mut subs = Vec::with_capacity(feeds.len());
-    for (url, title, site) in &feeds {
-        let mut sub = Subscription::new(url.clone(), now.clone());
-        sub.title = title.clone();
-        sub.site_url = site.clone();
+    for f in &feeds {
+        let mut sub = Subscription::new(f.feed_url.clone(), now.clone());
+        sub.title = f.title.clone();
+        sub.site_url = f.site_url.clone();
+        sub.folder = f
+            .folder
+            .as_ref()
+            .and_then(|name| folder_uris.get(name).cloned());
         subs.push(sub);
         let _ = store::upsert_feed(
             pool,
             &store::NewFeed {
-                url: url.clone(),
-                title: title.clone(),
-                site_url: site.clone(),
+                url: f.feed_url.clone(),
+                title: f.title.clone(),
+                site_url: f.site_url.clone(),
                 ..Default::default()
             },
         )
         .await;
     }
 
-    match state.sidecar.create_subscriptions_batch(&did, &subs).await {
-        Ok(()) => info!(%did, count = subs.len(), "imported OPML subscriptions to PDS (batched)"),
+    match state.sidecar.add_subscriptions_bulk(&did, &subs).await {
+        Ok(rkeys) => {
+            info!(%did, count = rkeys.len(), "imported OPML subscriptions to PDS (batched)")
+        }
         Err(err) => warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)"),
     }
 
-    Ok(Redirect::to("/").into_response())
+    Ok(Redirect::to(&format!(
+        "/?flash={}",
+        qenc(&format!("Imported {} feeds", subs.len()))
+    ))
+    .into_response())
 }
 
-/// Extract `(xmlUrl, title, htmlUrl)` triples from an OPML document.
-///
-/// A deliberately small, dependency-free scan of the `<outline …>` elements'
-/// attributes (OPML feed outlines carry `xmlUrl`; `title`/`text` and `htmlUrl`
-/// are optional). Robust enough for the common exports (Feedly, Inoreader,
-/// NetNewsWire) without pulling in a full XML parser.
-fn parse_opml(xml: &str) -> Vec<(String, Option<String>, Option<String>)> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<outline") {
-        rest = &rest[start + "<outline".len()..];
-        // The attribute run ends at the tag close.
-        let end = rest.find('>').unwrap_or(rest.len());
-        let attrs = &rest[..end];
-        rest = &rest[end..];
-        if let Some(xml_url) = opml_attr(attrs, "xmlUrl") {
-            if xml_url.is_empty() {
-                continue;
-            }
-            let title = opml_attr(attrs, "title")
-                .or_else(|| opml_attr(attrs, "text"))
-                .filter(|s| !s.is_empty());
-            let site = opml_attr(attrs, "htmlUrl").filter(|s| !s.is_empty());
-            out.push((xml_url, title, site));
-        }
-    }
-    out
-}
+/// `GET /opml/export` — export the user's subscriptions + folders as OPML.
+async fn export_opml(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
+    let did = match current_did(&state, &headers) {
+        Some(d) => d,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
 
-/// Read one double-quoted attribute value out of an OPML `<outline>` attribute
-/// run, un-escaping the handful of XML entities feed exporters emit.
-fn opml_attr(attrs: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let idx = attrs.find(&needle)? + needle.len();
-    let tail = &attrs[idx..];
-    let close = tail.find('"')?;
-    Some(unescape_xml(&tail[..close]))
-}
+    let subs = state
+        .sidecar
+        .list_subscriptions_sorted(&did)
+        .await
+        .unwrap_or_default();
+    let folders = state
+        .sidecar
+        .list_folders_sorted(&did)
+        .await
+        .unwrap_or_default();
+    // The exporter matches a subscription's `folder` at-uri against the folder's
+    // pair key; our folder pairs are keyed by rkey, so rebuild them as at-uris.
+    let folder_pairs: Vec<(String, Folder)> = folders
+        .into_iter()
+        .map(|(rkey, f)| (folder_uri(&did, &rkey), f))
+        .collect();
 
-/// Minimal XML entity un-escaping for OPML attribute values.
-fn unescape_xml(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
+    let body = opml::to_opml(&subs, &folder_pairs);
+    let mut resp = (StatusCode::OK, body).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "text/x-opml; charset=utf-8".parse().unwrap(),
+    );
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=\"featherreader-subscriptions.opml\""
+            .parse()
+            .unwrap(),
+    );
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -891,10 +1582,14 @@ fn set_cookie(resp: &mut Response, cookie: &str) {
     }
 }
 
-/// A tiny, self-contained signed-cookie layer: HMAC-SHA256 over the DID, so a
-/// tampered cookie is rejected. No external crypto dependency — SHA-256 + HMAC
-/// are implemented here against std only (the DID + a signature is all we store;
-/// no secrets ride in the cookie).
+/// Whether the request came from htmx (the `HX-Request` header).
+fn is_htmx(headers: &HeaderMap) -> bool {
+    headers
+        .get("HX-Request")
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+}
+
+/// A tiny, self-contained signed-cookie layer: HMAC-SHA256 over the DID.
 mod cookie {
     use super::{HeaderMap, SESSION_COOKIE};
 
@@ -905,8 +1600,7 @@ mod cookie {
         format!("{SESSION_COOKIE}={b64}.{sig}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
     }
 
-    /// Verify the request's session cookie and return the DID it carries, or
-    /// `None` if the cookie is absent, malformed, or the signature doesn't match.
+    /// Verify the request's session cookie and return the DID it carries.
     pub fn verify_session(headers: &HeaderMap, secret: &str) -> Option<String> {
         let raw = cookie_value(headers, SESSION_COOKIE)?;
         let (b64, sig) = raw.split_once('.')?;
@@ -1007,7 +1701,6 @@ mod cookie {
     /// HMAC-SHA256(key, msg) as lowercase hex.
     fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
         const BLOCK: usize = 64;
-        // Normalize the key to one block.
         let mut k = [0u8; BLOCK];
         if key.len() > BLOCK {
             let d = sha256(key);
@@ -1055,7 +1748,6 @@ mod cookie {
             0x5be0cd19,
         ];
 
-        // Pad.
         let bit_len = (data.len() as u64) * 8;
         let mut msg = data.to_vec();
         msg.push(0x80);
@@ -1121,7 +1813,6 @@ mod cookie {
 
         #[test]
         fn sha256_known_vector() {
-            // SHA-256("abc") — the FIPS 180-4 example.
             let d = sha256(b"abc");
             let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(
@@ -1132,7 +1823,6 @@ mod cookie {
 
         #[test]
         fn hmac_known_vector() {
-            // RFC 4231 test case 2: key="Jefe", data="what do ya want for nothing?".
             let mac = hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?");
             assert_eq!(
                 mac,
@@ -1144,7 +1834,6 @@ mod cookie {
         fn sign_verify_round_trips() {
             let secret = "test-secret";
             let cookie = sign_session("did:plc:abc123", secret);
-            // Extract just the `name=value` pair for the request-side header.
             let pair = cookie.split(';').next().unwrap().to_string();
             let mut headers = HeaderMap::new();
             headers.insert(axum::http::header::COOKIE, pair.parse().unwrap());
@@ -1152,7 +1841,6 @@ mod cookie {
                 verify_session(&headers, secret).as_deref(),
                 Some("did:plc:abc123")
             );
-            // Wrong secret → rejected.
             assert!(verify_session(&headers, "other-secret").is_none());
         }
 
@@ -1170,9 +1858,7 @@ mod cookie {
 // Small store helpers local to the web layer
 // ---------------------------------------------------------------------------
 
-/// Fetch a single cached entry by id. A thin `query_as` over the store's pool;
-/// lives here (not in `store`) because it's a web-render convenience, not part of
-/// the store's read/write API surface.
+/// Fetch a single cached entry by id.
 async fn get_entry_by_id(pool: &store::Pool, id: i64) -> anyhow::Result<Option<store::Entry>> {
     let entry = sqlx::query_as::<_, store::Entry>("SELECT * FROM entries WHERE id = ?1")
         .bind(id)
@@ -1193,7 +1879,111 @@ async fn entry_is_read(pool: &store::Pool, did: &str, entry_id: i64) -> anyhow::
     Ok(read.unwrap_or(false))
 }
 
+/// Whether `entry_id` is starred for `did` (absent state row = not starred).
+async fn entry_is_starred(pool: &store::Pool, did: &str, entry_id: i64) -> anyhow::Result<bool> {
+    let starred: Option<bool> =
+        sqlx::query_scalar("SELECT starred FROM entry_state WHERE did = ?1 AND entry_id = ?2")
+            .bind(did)
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    Ok(starred.unwrap_or(false))
+}
+
+/// Feed display title for one entry's feed id (via a single lookup).
+async fn feed_title_by_entry(pool: &store::Pool, feed_id: i64) -> String {
+    match sqlx::query_as::<_, store::Feed>("SELECT * FROM feeds WHERE id = ?1")
+        .bind(feed_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(f)) => display_title(f.title.as_deref(), &f.url),
+        _ => String::new(),
+    }
+}
+
+/// Rebuild an [`EntryRow`] for an htmx swap after a read/star toggle. `read` may
+/// be forced (mark-read path) or looked up (`None` — star path).
+async fn build_entry_row(
+    pool: &store::Pool,
+    did: &str,
+    id: i64,
+    read: Option<bool>,
+) -> anyhow::Result<Option<EntryRow>> {
+    let entry = match get_entry_by_id(pool, id).await? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let read = match read {
+        Some(r) => r,
+        None => entry_is_read(pool, did, id).await?,
+    };
+    let starred = entry_is_starred(pool, did, id).await?;
+    Ok(Some(EntryRow {
+        id: entry.id,
+        title: entry
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "(untitled)".to_string()),
+        feed_title: feed_title_by_entry(pool, entry.feed_id).await,
+        published: display_date(entry.published.as_deref()),
+        read,
+        starred,
+        link: format!("/entries/{id}"),
+    }))
+}
+
 /// RFC3339 "now" (UTC) — shared by handlers that stamp/compare timestamps.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qenc_encodes_reserved() {
+        assert_eq!(qenc("a b"), "a%20b");
+        assert_eq!(
+            qenc("https://example.com/feed.xml"),
+            "https%3A%2F%2Fexample.com%2Ffeed.xml"
+        );
+        assert_eq!(
+            qenc("at://did:plc:x/c/r"),
+            "at%3A%2F%2Fdid%3Aplc%3Ax%2Fc%2Fr"
+        );
+        // Unreserved chars pass through untouched.
+        assert_eq!(qenc("A-Za-z0-9-_.~"), "A-Za-z0-9-_.~");
+    }
+
+    #[test]
+    fn folder_uri_shape() {
+        assert_eq!(
+            folder_uri("did:plc:abc", "3kfolder"),
+            "at://did:plc:abc/community.lexicon.rss.folder/3kfolder"
+        );
+    }
+
+    #[test]
+    fn scope_query_preserves_context() {
+        let q = EntryQuery {
+            feed: Some("https://example.com/feed.xml".to_string()),
+            folder: None,
+            view: Some("all".to_string()),
+        };
+        let s = scope_query(&q);
+        assert!(s.contains("feed=https%3A%2F%2Fexample.com%2Ffeed.xml"));
+        assert!(s.contains("view=all"));
+
+        // Default view is omitted.
+        let q2 = EntryQuery {
+            feed: None,
+            folder: None,
+            view: Some("unread".to_string()),
+        };
+        assert_eq!(scope_query(&q2), "");
+    }
 }
