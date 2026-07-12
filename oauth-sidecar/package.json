@@ -1,0 +1,30 @@
+{
+  "name": "featherreader-oauth-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "atproto OAuth confidential-client sidecar for FeatherReader — owns the OAuth handshake (PAR/PKCE/DPoP/token-refresh) so the Rust server never touches it. Exposes login/callback + an internal shared-secret-guarded authed com.atproto.repo.* API.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5 <27"
+  },
+  "bin": {
+    "featherreader-oauth-sidecar": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "node --loader ts-node/esm src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.15.0",
+    "@atproto/oauth-client-node": "^0.4.8",
+    "fastify": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}
