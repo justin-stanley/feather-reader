@@ -64,6 +64,33 @@ pub enum FetchHint {
 /// (RSS / Atom / JSON Feed). Record key: `tid`.
 ///
 /// `url` + `createdAt` are required; everything else is optional.
+///
+/// ## The `private` marker and the withheld-URL contract
+///
+/// atproto PDS records are **public**: anyone can read them via unauthenticated
+/// `getRecord` / `listRecords` and off the firehose, and they are retained even
+/// after `deleteRecord`. That is fine for a normal feed, but a **private feed**
+/// (a Substack `…/feed/private/<token>`, a Patreon `?auth=…` feed, a Ghost
+/// members feed, or any URL that carries a secret token / key / auth credential)
+/// has its *secret in the URL*. Writing that URL to the PDS would leak paid /
+/// members-only content access to the entire network.
+///
+/// So for a private subscription the record is written **redacted**: [`private`]
+/// is set to `true`, the real secret-bearing feed URL is **intentionally
+/// withheld** (see [`url`] — a redacted record carries the public publication
+/// origin, e.g. `https://author.substack.com/`, NOT the secret feed path), and
+/// the secret stays **owner-held locally** (in FeatherReader's SQLite, never on
+/// the PDS). `private: true` therefore means "the canonical feed URL for this
+/// subscription is deliberately absent from this record; the owner holds it".
+///
+/// This is a **STOPGAP**. It is Option 1 (local-only secret) until atproto ships
+/// **permissioned data / permission-sets** (early-proposal stage as of mid-2026,
+/// bluesky-social/proposals#94, realistically late-2026+), at which point the
+/// secret feed URL migrates out of local-only storage into an **owner-scoped,
+/// permission-gated private collection** on the PDS and the record here can carry
+/// a reference to it instead of withholding it outright. The [`private`] marker
+/// is the forward-compatible seam for that migration and is part of the
+/// community-lexicon design, not a FeatherReader-only field.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Subscription {
     /// The `$type` NSID discriminator; always [`nsid::SUBSCRIPTION`].
@@ -71,6 +98,12 @@ pub struct Subscription {
     pub r#type: String,
 
     /// Canonical feed URL (the RSS/Atom/JSON Feed document). Required.
+    ///
+    /// For a **private** subscription ([`private`] `== Some(true)`) this is NOT
+    /// the real secret-bearing feed URL — that is withheld (see the type-level
+    /// docs). Instead it carries the feed's **public publication origin** (scheme
+    /// + host, or the feed's `<link>` site URL) so the record is still a usable,
+    /// human-recognisable pointer without leaking the secret.
     pub url: String,
 
     /// Display title; a reader MAY override from feed metadata.
@@ -88,6 +121,19 @@ pub struct Subscription {
     /// Optional polling-cadence hint; readers MAY honor or ignore it.
     #[serde(rename = "fetchHint", skip_serializing_if = "Option::is_none", default)]
     pub fetch_hint: Option<FetchHint>,
+
+    /// Whether this is a **private** subscription whose real feed URL is
+    /// intentionally withheld from this (public) PDS record.
+    ///
+    /// `Some(true)` means the secret-bearing feed URL is deliberately NOT in this
+    /// record — it is held only in the owner's local store — because PDS records
+    /// are public (unauth `getRecord`/`listRecords` + firehose, retained after
+    /// delete). See the type-level docs: this is a **stopgap** until atproto
+    /// permissioned-data / permission-sets, at which point the secret migrates to
+    /// an owner-scoped private collection. Omitted (`None`) for ordinary public
+    /// feeds so existing records are byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub private: Option<bool>,
 
     /// Record creation time (ISO-8601 datetime). Required.
     #[serde(rename = "createdAt")]
@@ -108,6 +154,7 @@ impl Subscription {
             site_url: None,
             folder: None,
             fetch_hint: None,
+            private: None,
             created_at: created_at.into(),
         }
     }
@@ -305,6 +352,34 @@ mod tests {
                 "createdAt": "2026-07-12T00:00:00.000Z"
             })
         );
+    }
+
+    #[test]
+    fn subscription_private_marker_round_trips_and_omits_when_none() {
+        // A redacted private record: `private: true`, `url` is the PUBLIC origin
+        // (no secret), and it carries no secret-bearing feed path anywhere.
+        let mut sub = Subscription::new("https://author.substack.com/", "2026-07-12T00:00:00.000Z");
+        sub.title = Some("Author (private)".to_string());
+        sub.site_url = Some("https://author.substack.com/".to_string());
+        sub.private = Some(true);
+
+        let back = serde_json::to_value(&sub).expect("serialize");
+        assert_eq!(back["private"], serde_json::json!(true));
+        // The serialized body carries the public origin only — no secret token.
+        let body = serde_json::to_string(&sub).expect("serialize str");
+        assert!(!body.contains("/feed/private/"));
+        assert!(!body.contains("secret-token"));
+
+        // Round-trips back to the same value.
+        let parsed: Subscription = serde_json::from_value(back).expect("deserialize");
+        assert_eq!(parsed.private, Some(true));
+        assert_eq!(parsed.url, "https://author.substack.com/");
+
+        // A public subscription omits `private` entirely (regression: existing
+        // records are byte-for-byte unchanged).
+        let public = Subscription::new("https://example.com/feed.xml", "2026-07-12T00:00:00.000Z");
+        let public_body = serde_json::to_value(&public).expect("serialize");
+        assert!(public_body.get("private").is_none());
     }
 
     #[test]

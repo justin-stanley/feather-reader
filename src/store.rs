@@ -70,6 +70,16 @@ pub struct Feed {
     pub last_polled: Option<String>,
     /// When this feed is next due to be polled (RFC3339), or `None`.
     pub next_poll: Option<String>,
+    /// Whether this feed's `url` is a **secret-bearing private feed URL**
+    /// (Substack `…/feed/private/<token>`, Patreon `?auth=…`, Ghost members, …).
+    ///
+    /// The secret URL is retained here in LOCAL SQLite so the poller can still
+    /// fetch it (via the SSRF-guarded `guarded_get` — private hosts like
+    /// `substack.com` are ordinary public hosts, so the guard allows them), but
+    /// it is deliberately **withheld from the public PDS record**
+    /// (see [`crate::lexicon::Subscription`]'s `private` marker). This is a
+    /// stopgap until atproto permissioned-data ships. Defaults to `false`.
+    pub private: bool,
 }
 
 /// A cached article/item belonging to a [`Feed`]. Shared cache (not per-DID).
@@ -132,6 +142,9 @@ pub struct NewFeed {
     pub last_modified: Option<String>,
     pub last_polled: Option<String>,
     pub next_poll: Option<String>,
+    /// Whether the feed `url` is a secret-bearing private feed URL (kept local,
+    /// withheld from the PDS record). Defaults to `false` via [`Default`].
+    pub private: bool,
 }
 
 /// New-entry payload for [`insert_entries`] (id is assigned by SQLite,
@@ -165,7 +178,12 @@ CREATE TABLE IF NOT EXISTS feeds (
     etag          TEXT,
     last_modified TEXT,
     last_polled   TEXT,
-    next_poll     TEXT
+    next_poll     TEXT,
+    -- Whether `url` is a secret-bearing private feed URL, kept LOCAL-ONLY and
+    -- withheld from the (public) PDS subscription record. Stopgap until atproto
+    -- permissioned-data. For a fresh DB the column is created here; for an
+    -- existing DB it is added by the idempotent ALTER migration in init_schema.
+    private       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
 
@@ -293,7 +311,40 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to create schema")?;
+    run_migrations(pool).await?;
     Ok(())
+}
+
+/// Idempotent in-place migrations for databases created before a column existed.
+///
+/// `CREATE TABLE IF NOT EXISTS` does NOT add new columns to an already-existing
+/// table, so any column added after the initial release needs an explicit
+/// (idempotent) `ALTER TABLE … ADD COLUMN`. SQLite has no `ADD COLUMN IF NOT
+/// EXISTS`, so we detect presence via `PRAGMA table_info` first and skip if the
+/// column is already there. Safe to run on every startup.
+async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    // feeds.private — the private-feed flag (see NewFeed::private / Feed::private).
+    if !column_exists(pool, "feeds", "private").await? {
+        sqlx::query("ALTER TABLE feeds ADD COLUMN private INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await
+            .context("migration: add feeds.private column")?;
+    }
+    Ok(())
+}
+
+/// Whether `table` already has a column named `column` (via `PRAGMA table_info`).
+async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> Result<bool> {
+    // `PRAGMA table_info` takes an identifier, which cannot be bound as a `?`
+    // parameter, so the table name is interpolated. `table` here is always a
+    // hardcoded literal from THIS module (never user input), so this is safe;
+    // `AssertSqlSafe` documents that audit to sqlx 0.9's SqlSafeStr guard.
+    use sqlx::AssertSqlSafe;
+    let rows = sqlx::query(AssertSqlSafe(format!("PRAGMA table_info({table})")))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("PRAGMA table_info({table}) failed"))?;
+    Ok(rows.iter().any(|r| r.get::<String, _>("name") == column))
 }
 
 /// Insert a feed by URL, or update its metadata if the URL already exists.
@@ -301,15 +352,20 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
 pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     let row = sqlx::query(
         r#"
-        INSERT INTO feeds (url, title, site_url, etag, last_modified, last_polled, next_poll)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO feeds (url, title, site_url, etag, last_modified, last_polled, next_poll, private)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ON CONFLICT (url) DO UPDATE SET
             title         = COALESCE(excluded.title, feeds.title),
             site_url      = COALESCE(excluded.site_url, feeds.site_url),
             etag          = excluded.etag,
             last_modified = excluded.last_modified,
             last_polled   = COALESCE(excluded.last_polled, feeds.last_polled),
-            next_poll     = COALESCE(excluded.next_poll, feeds.next_poll)
+            next_poll     = COALESCE(excluded.next_poll, feeds.next_poll),
+            -- Once a feed is marked private it STAYS private: OR the flags so the
+            -- poller (which builds a NewFeed with private=false, not knowing the
+            -- classification) can never clobber a private feed back to public.
+            -- The subscribe path sets private=true explicitly.
+            private       = feeds.private | excluded.private
         RETURNING id
         "#,
     )
@@ -320,6 +376,7 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     .bind(&feed.last_modified)
     .bind(&feed.last_polled)
     .bind(&feed.next_poll)
+    .bind(feed.private)
     .fetch_one(pool)
     .await
     .with_context(|| format!("upsert_feed failed for {}", feed.url))?;
@@ -335,6 +392,36 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
         .await
         .with_context(|| format!("get_feed_by_url failed for {url}"))?;
     Ok(feed)
+}
+
+/// Mark (or unmark) a feed as **private** — its `url` is a secret-bearing feed
+/// URL kept local-only and withheld from the public PDS record.
+///
+/// The feed row must already exist (created by the subscribe path via
+/// [`upsert_feed`]). Returns the number of rows changed (0 if no such feed URL).
+/// The subscribe path calls this right after inserting the feed so the secret
+/// URL and its private flag ride together in local SQLite.
+pub async fn mark_feed_private(pool: &SqlitePool, url: &str, private: bool) -> Result<u64> {
+    let res = sqlx::query("UPDATE feeds SET private = ?2 WHERE url = ?1")
+        .bind(url)
+        .bind(private)
+        .execute(pool)
+        .await
+        .with_context(|| format!("mark_feed_private failed for {url}"))?;
+    Ok(res.rows_affected())
+}
+
+/// Query whether a feed URL is flagged private. `Ok(false)` if the feed is
+/// public OR not present. The web layer uses this to decide whether to write a
+/// redacted PDS record; the poller doesn't need it (it just fetches the local
+/// secret URL either way).
+pub async fn is_feed_private(pool: &SqlitePool, url: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT private FROM feeds WHERE url = ?1")
+        .bind(url)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("is_feed_private failed for {url}"))?;
+    Ok(row.map(|r| r.get::<bool, _>("private")).unwrap_or(false))
 }
 
 /// The scheduler's hot query: feeds whose `next_poll` is due (`<= as_of`, or
@@ -1005,6 +1092,84 @@ mod tests {
         clear_cursor_dirty(&pool, did, "https://example.com/feed.xml").await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
 
+        Ok(())
+    }
+
+    /// A private feed's secret URL is retained locally with its `private` flag,
+    /// and the flag survives a subsequent poller upsert that doesn't know the
+    /// classification (it must never clobber private → public).
+    #[tokio::test]
+    async fn private_flag_persists_and_is_not_clobbered_by_poller() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let secret_url = "https://author.substack.com/feed/private/deadbeefcafe123456";
+
+        // Subscribe path: insert the feed and mark it private.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: secret_url.to_string(),
+                title: Some("Private Author".to_string()),
+                private: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(is_feed_private(&pool, secret_url).await?);
+
+        // The secret URL is retained verbatim in local SQLite.
+        let feed = get_feed_by_url(&pool, secret_url)
+            .await?
+            .expect("feed exists");
+        assert_eq!(feed.url, secret_url);
+        assert!(feed.private);
+
+        // Poller re-upserts with private=false (it doesn't classify) — the flag
+        // must stay set (OR semantics), so the feed is never leaked later.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: secret_url.to_string(),
+                title: Some("Private Author (refreshed)".to_string()),
+                private: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            is_feed_private(&pool, secret_url).await?,
+            "poller upsert must not clobber the private flag"
+        );
+
+        // A normal public feed stays public; mark/unmark round-trips.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(!is_feed_private(&pool, "https://example.com/feed.xml").await?);
+        assert_eq!(
+            mark_feed_private(&pool, "https://example.com/feed.xml", true).await?,
+            1
+        );
+        assert!(is_feed_private(&pool, "https://example.com/feed.xml").await?);
+
+        // Unknown URL => not private, no panic.
+        assert!(!is_feed_private(&pool, "https://nope.example/x").await?);
+        Ok(())
+    }
+
+    /// The migration is idempotent: adding feeds.private twice is a no-op, and a
+    /// pre-existing table without the column is upgraded in place.
+    #[tokio::test]
+    async fn private_column_migration_is_idempotent() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // Re-running the whole schema+migration path must not error.
+        init_schema(&pool).await?;
+        init_schema(&pool).await?;
+        assert!(column_exists(&pool, "feeds", "private").await?);
         Ok(())
     }
 
