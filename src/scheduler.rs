@@ -73,6 +73,12 @@ const DEFAULT_POLL_STAGGER: Duration = Duration::from_millis(250);
 /// `FEATHERREADER_FLUSH_DEBOUNCE_SECS`.
 const DEFAULT_FLUSH_DEBOUNCE: Duration = Duration::from_secs(60);
 
+/// How often the invite-code TTL sweep runs, expiring `active` codes past their
+/// `expires_at`. Hourly is plenty — expiry is coarse-grained and `redeem_code`
+/// already rejects a past-expiry code at redeem time regardless of this sweep, so
+/// this is just housekeeping. Overridable via `FEATHERREADER_CODE_SWEEP_SECS`.
+const DEFAULT_CODE_SWEEP: Duration = Duration::from_secs(3600);
+
 /// Read a `Duration` (in seconds) from the environment, or fall back.
 fn env_duration_secs(key: &str, default: Duration) -> Duration {
     match std::env::var(key)
@@ -141,9 +147,14 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_poller(state, shutdown).await })
     };
+    let sweeper = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_code_sweeper(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, flusher]
+    vec![poller, sweeper, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -350,6 +361,41 @@ fn cadence_from_hint(hint: &str, default_interval: Duration) -> Duration {
         "daily" => Duration::from_secs(24 * 60 * 60),
         "weekly" => Duration::from_secs(7 * 24 * 60 * 60),
         _ => default_interval,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invite-code TTL sweeper
+// ---------------------------------------------------------------------------
+
+/// The invite-code TTL sweep loop. On a periodic tick (hourly by default) it
+/// flips every `active` invite code past its `expires_at` to `expired`
+/// ([`store::expire_old_codes`]), keeping the closed-beta table tidy. Returns
+/// when `shutdown` resolves. Failures are logged and never kill the loop — a
+/// missed sweep is harmless because `redeem_code` re-checks expiry itself.
+pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = env_duration_secs("FEATHERREADER_CODE_SWEEP_SECS", DEFAULT_CODE_SWEEP);
+    info!(?period, "invite-code TTL sweeper started");
+
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first `tick()` fires immediately — do an initial sweep on startup so a
+    // long-stale set of codes gets cleaned up promptly rather than after a full
+    // period.
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("invite-code TTL sweeper: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => {
+                match store::expire_old_codes(&state.db).await {
+                    Ok(0) => debug!("invite-code TTL sweeper: nothing to expire"),
+                    Ok(n) => info!(expired = n, "invite-code TTL sweeper: expired codes"),
+                    Err(err) => error!(%err, "invite-code TTL sweeper: sweep failed"),
+                }
+            }
+        }
     }
 }
 

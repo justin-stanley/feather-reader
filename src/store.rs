@@ -25,6 +25,27 @@ use std::str::FromStr;
 
 use crate::config::Config;
 
+/// Typed failure modes for [`redeem_code`]. Distinct variants so the web layer
+/// can map each to the right user-facing message / HTTP status without string
+/// matching. Everything else (a real SQLite error) still propagates as
+/// [`anyhow::Error`] out of the `Result`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RedeemError {
+    /// No invite code with that value exists.
+    #[error("invite code not found")]
+    NotFound,
+    /// The code exists but is past its `expires_at` (or already flipped to
+    /// `expired`).
+    #[error("invite code expired")]
+    Expired,
+    /// The code has already been redeemed (or is otherwise not `active`).
+    #[error("invite code already redeemed")]
+    AlreadyRedeemed,
+    /// The closed-beta seat cap ([`Config`]'s `FEATHERREADER_BETA_CAP`) is full.
+    #[error("beta is at capacity")]
+    CapacityFull,
+}
+
 /// The SQLite connection pool type the rest of the crate refers to as
 /// [`Pool`]. A thin alias over [`SqlitePool`] so [`crate::AppState`] and the web
 /// layer name one stable type; if the backend ever changes, this is the single
@@ -183,6 +204,25 @@ CREATE TABLE IF NOT EXISTS read_cursor (
     PRIMARY KEY (did, feed_url)
 );
 CREATE INDEX IF NOT EXISTS idx_read_cursor_dirty ON read_cursor (did, dirty);
+
+CREATE TABLE IF NOT EXISTS beta_access (
+    did              TEXT PRIMARY KEY,
+    handle           TEXT,
+    granted_by       TEXT NOT NULL,
+    granted_at       INTEGER NOT NULL,
+    invite_code_used TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invite_codes (
+    code        TEXT PRIMARY KEY,
+    creator_did TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    invitee_did TEXT,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    redeemed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_invite_codes_status ON invite_codes (status, expires_at);
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
@@ -220,6 +260,15 @@ pub async fn init_url(db_url: &str) -> Result<Pool> {
     if !db_url.contains(":memory:") {
         opts = opts.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
     }
+    // Under a concurrent write burst (the poller's insert_entries tx racing the
+    // web layer's mark_read / redeem_code tx) SQLite would otherwise return
+    // SQLITE_BUSY the instant a writer holds the lock. `busy_timeout` makes a
+    // blocked connection WAIT (retry) for up to this long before erroring, so
+    // short lock contention resolves transparently instead of surfacing a
+    // spurious failure. Mirrors the OAuth sidecar's `stores.ts`
+    // (`PRAGMA busy_timeout = 5000`). 5 s is comfortably above any single
+    // FeatherReader transaction.
+    opts = opts.busy_timeout(std::time::Duration::from_millis(5000));
     // Quiet sqlx's per-statement query logging.
     opts = opts.log_statements(tracing::log::LevelFilter::Debug);
 
@@ -542,6 +591,279 @@ pub async fn clear_cursor_dirty(pool: &SqlitePool, did: &str, feed_url: &str) ->
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Closed-beta invite gate (beta_access + invite_codes)
+// ---------------------------------------------------------------------------
+//
+// Ported in SHAPE from the-path `internal/beta` (RedeemCode / CreateInviteCode /
+// code_gen) but deliberately trimmed for FeatherReader's before-public
+// experiment: NO viral invite-budget tree, NO generation cap, NO waitlist /
+// invite-request table, and SQLite instead of Mongo. A code is minted by an
+// existing member (or admin), and redeeming it grants a seat while seats remain
+// under the configured cap.
+
+/// Unix-epoch seconds for "now" — the integer time base for the beta tables.
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The invite-code alphabet: uppercase letters + digits with the
+/// visually-ambiguous glyphs removed (`I`, `O`, `0`, `1`) so a code read aloud
+/// or copied by hand is unambiguous. Mirrors the-path `code_gen.go`.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Human-facing prefix so a FeatherReader invite code is recognisable at a
+/// glance (the-path used `TAVERN-`).
+const CODE_PREFIX: &str = "FEATHER-";
+
+/// Number of random characters after the prefix.
+const CODE_BODY_LEN: usize = 8;
+
+/// Generate a random, unguessable invite code of the form `FEATHER-XXXXXXXX`.
+///
+/// Draws from the OS CSPRNG (`getrandom`) and maps each byte onto
+/// [`CODE_ALPHABET`] via rejection sampling so the alphabet distribution is
+/// uniform (no modulo bias). Infallible in practice; a `getrandom` failure
+/// (no entropy source) propagates as an error rather than a weak code.
+pub fn generate_invite_code() -> Result<String> {
+    let n = CODE_ALPHABET.len() as u16; // 31
+                                        // Largest multiple of `n` that fits in a byte; bytes at or above it are
+                                        // rejected so every accepted byte maps uniformly onto the alphabet.
+    let limit = 256 / n * n; // 256 - (256 % n)
+    let mut out = String::with_capacity(CODE_PREFIX.len() + CODE_BODY_LEN);
+    out.push_str(CODE_PREFIX);
+    let mut got = 0;
+    let mut buf = [0u8; 1];
+    while got < CODE_BODY_LEN {
+        getrandom::fill(&mut buf).context("getrandom failed while minting invite code")?;
+        let b = buf[0] as u16;
+        if b < limit {
+            out.push(CODE_ALPHABET[(b % n) as usize] as char);
+            got += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a DID currently holds a beta seat.
+pub async fn has_beta_access(pool: &SqlitePool, did: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM beta_access WHERE did = ?1")
+        .bind(did)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("has_beta_access failed for {did}"))?;
+    Ok(row.is_some())
+}
+
+/// Count the beta seats currently granted — the numerator checked against the
+/// configured cap on redeem.
+pub async fn count_beta_access(pool: &SqlitePool) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM beta_access")
+        .fetch_one(pool)
+        .await
+        .context("count_beta_access failed")?;
+    Ok(row.get::<i64, _>("n"))
+}
+
+/// Grant a beta seat directly (admin / seed path — no code consumed). Idempotent
+/// on `did` (re-granting updates the row rather than erroring).
+pub async fn grant_access(
+    pool: &SqlitePool,
+    did: &str,
+    handle: Option<&str>,
+    granted_by: &str,
+    invite_code_used: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO beta_access (did, handle, granted_by, granted_at, invite_code_used)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT (did) DO UPDATE SET
+            handle           = COALESCE(excluded.handle, beta_access.handle),
+            granted_by       = excluded.granted_by,
+            invite_code_used = COALESCE(excluded.invite_code_used, beta_access.invite_code_used)
+        "#,
+    )
+    .bind(did)
+    .bind(handle)
+    .bind(granted_by)
+    .bind(now_unix())
+    .bind(invite_code_used)
+    .execute(pool)
+    .await
+    .with_context(|| format!("grant_access failed for {did}"))?;
+    Ok(())
+}
+
+/// Mint a new `active` invite code owned by `creator_did`, expiring `ttl_secs`
+/// from now. Returns the generated code string.
+pub async fn mint_code(pool: &SqlitePool, creator_did: &str, ttl_secs: i64) -> Result<String> {
+    let code = generate_invite_code()?;
+    let now = now_unix();
+    let expires_at = now.saturating_add(ttl_secs.max(0));
+    sqlx::query(
+        r#"
+        INSERT INTO invite_codes
+            (code, creator_did, status, invitee_did, created_at, expires_at, redeemed_at)
+        VALUES (?1, ?2, 'active', NULL, ?3, ?4, NULL)
+        "#,
+    )
+    .bind(&code)
+    .bind(creator_did)
+    .bind(now)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .with_context(|| format!("mint_code failed for creator {creator_did}"))?;
+    Ok(code)
+}
+
+/// Atomically redeem an invite code for `did`, granting a beta seat.
+///
+/// Runs entirely in one transaction so the capacity check and the seat grant
+/// cannot race (two redeems can't both slip past a `cap - 1` count). Steps:
+/// 1. verify the code exists, is `active`, and is not past `expires_at`;
+/// 2. verify the current seat count is `< cap`;
+/// 3. flip the code `active`→`redeemed` (stamping `invitee_did` + `redeemed_at`);
+/// 4. insert the `beta_access` row.
+///
+/// On a policy failure returns the matching [`RedeemError`] (the tx rolls back);
+/// a real SQLite error propagates as the outer [`anyhow::Error`].
+pub async fn redeem_code(
+    pool: &SqlitePool,
+    code: &str,
+    did: &str,
+    handle: Option<&str>,
+    cap: i64,
+) -> Result<std::result::Result<(), RedeemError>> {
+    let now = now_unix();
+    let mut tx = pool.begin().await.context("begin redeem_code tx")?;
+
+    // 1. Look the code up.
+    let row = sqlx::query("SELECT status, expires_at FROM invite_codes WHERE code = ?1")
+        .bind(code)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("redeem_code: lookup")?;
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(Err(RedeemError::NotFound)),
+    };
+    let status: String = row.get("status");
+    let expires_at: i64 = row.get("expires_at");
+
+    // Status gate: only an `active` code is redeemable. Anything already
+    // redeemed/revoked is "already redeemed" from the redeemer's view; an
+    // `expired` status (or a past expiry) is "expired".
+    if status == "expired" || now > expires_at {
+        return Ok(Err(RedeemError::Expired));
+    }
+    if status != "active" {
+        return Ok(Err(RedeemError::AlreadyRedeemed));
+    }
+
+    // 2. Capacity gate (inside the tx so it can't race a concurrent redeem).
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM beta_access")
+        .fetch_one(&mut *tx)
+        .await
+        .context("redeem_code: count")?
+        .get("n");
+    if count >= cap {
+        return Ok(Err(RedeemError::CapacityFull));
+    }
+
+    // 3. Flip the code active→redeemed. The `status = 'active'` guard in the
+    // WHERE makes this a compare-and-swap: if a concurrent tx already flipped it
+    // (despite the read above), zero rows change and we treat it as redeemed.
+    let flipped = sqlx::query(
+        r#"
+        UPDATE invite_codes
+        SET status = 'redeemed', invitee_did = ?2, redeemed_at = ?3
+        WHERE code = ?1 AND status = 'active'
+        "#,
+    )
+    .bind(code)
+    .bind(did)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("redeem_code: flip")?;
+    if flipped.rows_affected() == 0 {
+        return Ok(Err(RedeemError::AlreadyRedeemed));
+    }
+
+    // 4. Grant the seat.
+    sqlx::query(
+        r#"
+        INSERT INTO beta_access (did, handle, granted_by, granted_at, invite_code_used)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT (did) DO UPDATE SET
+            handle           = COALESCE(excluded.handle, beta_access.handle),
+            invite_code_used = excluded.invite_code_used
+        "#,
+    )
+    .bind(did)
+    .bind(handle)
+    // granted_by is the code's creator; look it up in-tx to keep provenance.
+    .bind(
+        sqlx::query("SELECT creator_did FROM invite_codes WHERE code = ?1")
+            .bind(code)
+            .fetch_one(&mut *tx)
+            .await
+            .context("redeem_code: creator lookup")?
+            .get::<String, _>("creator_did"),
+    )
+    .bind(now)
+    .bind(code)
+    .execute(&mut *tx)
+    .await
+    .context("redeem_code: grant")?;
+
+    tx.commit().await.context("commit redeem_code tx")?;
+    Ok(Ok(()))
+}
+
+/// Sweep: flip every `active` code whose `expires_at` is in the past to
+/// `expired`. Returns the number of codes expired. Called periodically by the
+/// scheduler.
+pub async fn expire_old_codes(pool: &SqlitePool) -> Result<u64> {
+    let now = now_unix();
+    let res = sqlx::query(
+        "UPDATE invite_codes SET status = 'expired' WHERE status = 'active' AND expires_at < ?1",
+    )
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("expire_old_codes failed")?;
+    Ok(res.rows_affected())
+}
+
+/// Seed the admin-bootstrap DIDs: for each, insert a `beta_access` row
+/// (`granted_by = 'admin'`) if one does not already exist. Idempotent — an
+/// existing seat is left untouched. Returns how many new seats were created.
+pub async fn ensure_seed(pool: &SqlitePool, dids: &[String]) -> Result<u64> {
+    let mut tx = pool.begin().await.context("begin ensure_seed tx")?;
+    let now = now_unix();
+    let mut created = 0u64;
+    for did in dids {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO beta_access (did, handle, granted_by, granted_at, invite_code_used)
+            VALUES (?1, NULL, 'admin', ?2, NULL)
+            ON CONFLICT (did) DO NOTHING
+            "#,
+        )
+        .bind(did)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("ensure_seed insert failed for {did}"))?;
+        created += res.rows_affected();
+    }
+    tx.commit().await.context("commit ensure_seed tx")?;
+    Ok(created)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +1005,153 @@ mod tests {
         clear_cursor_dirty(&pool, did, "https://example.com/feed.xml").await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Closed-beta invite gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn code_gen_shape_and_alphabet() {
+        for _ in 0..200 {
+            let code = generate_invite_code().unwrap();
+            assert!(code.starts_with("FEATHER-"), "bad prefix: {code}");
+            let body = &code["FEATHER-".len()..];
+            assert_eq!(body.len(), CODE_BODY_LEN, "bad body length: {code}");
+            // Every body char must be from the ambiguity-free alphabet — in
+            // particular NEVER I/O/0/1.
+            for c in body.chars() {
+                assert!(
+                    CODE_ALPHABET.contains(&(c as u8)),
+                    "char {c:?} not in alphabet ({code})"
+                );
+                assert!(
+                    !matches!(c, 'I' | 'O' | '0' | '1'),
+                    "ambiguous char {c:?} leaked into {code}"
+                );
+            }
+        }
+        // Two codes in a row must differ (unguessable / random).
+        assert_ne!(
+            generate_invite_code().unwrap(),
+            generate_invite_code().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_timeout_is_applied() -> Result<()> {
+        // Opening an on-disk DB and reading back the PRAGMA proves the pool
+        // carries busy_timeout = 5000 ms.
+        let dir = std::env::temp_dir().join(format!("fr-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("busy.db");
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+        let row = sqlx::query("PRAGMA busy_timeout").fetch_one(&pool).await?;
+        let timeout: i64 = row.get(0);
+        assert_eq!(timeout, 5000, "busy_timeout should be 5000 ms");
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeem_valid_grants_seat() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let code = mint_code(&pool, "did:plc:creator", 3600).await?;
+        assert!(!has_beta_access(&pool, "did:plc:new").await?);
+
+        let out = redeem_code(&pool, &code, "did:plc:new", Some("new.bsky"), 100).await?;
+        assert_eq!(out, Ok(()));
+        assert!(has_beta_access(&pool, "did:plc:new").await?);
+        assert_eq!(count_beta_access(&pool).await?, 1);
+
+        // The code is now spent — a second redeem is AlreadyRedeemed.
+        let again = redeem_code(&pool, &code, "did:plc:other", None, 100).await?;
+        assert_eq!(again, Err(RedeemError::AlreadyRedeemed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeem_not_found() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let out = redeem_code(&pool, "FEATHER-NOPENOPE", "did:plc:x", None, 100).await?;
+        assert_eq!(out, Err(RedeemError::NotFound));
+        Ok(())
+    }
+
+    /// Insert an already-expired `active` code directly (mint_code clamps a
+    /// negative ttl to 0, so the past-expiry case is set up by hand).
+    async fn insert_expired_code(pool: &SqlitePool, code: &str, creator: &str) -> Result<()> {
+        let now = now_unix();
+        sqlx::query(
+            r#"INSERT INTO invite_codes
+               (code, creator_did, status, invitee_did, created_at, expires_at, redeemed_at)
+               VALUES (?1, ?2, 'active', NULL, ?3, ?4, NULL)"#,
+        )
+        .bind(code)
+        .bind(creator)
+        .bind(now - 100)
+        .bind(now - 10) // expires_at in the past
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeem_expired() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        insert_expired_code(&pool, "FEATHER-EXPIRED0", "did:plc:creator").await?;
+        let out = redeem_code(&pool, "FEATHER-EXPIRED0", "did:plc:new", None, 100).await?;
+        assert_eq!(out, Err(RedeemError::Expired));
+        // No seat granted.
+        assert_eq!(count_beta_access(&pool).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeem_capacity_full() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // Cap of 1, one seat already taken by an admin seed.
+        ensure_seed(&pool, &["did:plc:admin".to_string()]).await?;
+        assert_eq!(count_beta_access(&pool).await?, 1);
+
+        let code = mint_code(&pool, "did:plc:admin", 3600).await?;
+        let out = redeem_code(&pool, &code, "did:plc:new", None, 1).await?;
+        assert_eq!(out, Err(RedeemError::CapacityFull));
+        // Seat NOT granted and the code NOT consumed (tx rolled back).
+        assert!(!has_beta_access(&pool, "did:plc:new").await?);
+        // Raising the cap lets the same code redeem.
+        let ok = redeem_code(&pool, &code, "did:plc:new", None, 2).await?;
+        assert_eq!(ok, Ok(()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expire_and_seed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // An already-expired code is swept to `expired`.
+        insert_expired_code(&pool, "FEATHER-EXPIRED1", "did:plc:creator").await?;
+        let live = mint_code(&pool, "did:plc:creator", 3600).await?;
+        let n = expire_old_codes(&pool).await?;
+        assert_eq!(n, 1, "exactly the past-expiry code should flip");
+        // The live code still redeems.
+        assert_eq!(
+            redeem_code(&pool, &live, "did:plc:new", None, 100).await?,
+            Ok(())
+        );
+
+        // ensure_seed is idempotent.
+        let created = ensure_seed(
+            &pool,
+            &["did:plc:seed1".to_string(), "did:plc:seed2".to_string()],
+        )
+        .await?;
+        assert_eq!(created, 2);
+        let created2 = ensure_seed(&pool, &["did:plc:seed1".to_string()]).await?;
+        assert_eq!(created2, 0, "re-seeding an existing DID is a no-op");
+        assert!(has_beta_access(&pool, "did:plc:seed1").await?);
         Ok(())
     }
 }
