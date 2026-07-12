@@ -55,6 +55,10 @@ pub struct Config {
     pub retention_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
+    /// Closed-beta seat cap: the maximum number of DIDs that may hold beta
+    /// access at once (redeeming an invite fails with `CapacityFull` past this).
+    /// From `FEATHERREADER_BETA_CAP`, default 100.
+    pub beta_cap: i64,
     /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
     pub sidecar: SidecarConfig,
     /// HMAC key used to sign the session cookie. In production this MUST be set
@@ -131,6 +135,7 @@ impl Default for Config {
             poll_interval: Duration::from_secs(3600),
             retention_days: 90,
             proxy_images: false,
+            beta_cap: 100,
             sidecar: SidecarConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             dev_did: None,
@@ -196,6 +201,13 @@ impl Config {
             None => defaults.proxy_images,
         };
 
+        let beta_cap = match env_opt("FEATHERREADER_BETA_CAP") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_BETA_CAP: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.beta_cap,
+        };
+
         // --- atproto OAuth sidecar --------------------------------------
         let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
             .map(|u| u.trim_end_matches('/').to_string())
@@ -222,6 +234,7 @@ impl Config {
             poll_interval,
             retention_days,
             proxy_images,
+            beta_cap,
             sidecar,
             cookie_secret,
             dev_did,
@@ -276,6 +289,19 @@ impl Config {
     /// is configured the instance is open, so every DID is allowed.
     pub fn did_allowed(&self, did: &str) -> bool {
         self.allowed_dids.is_empty() || self.allowed_dids.iter().any(|d| d == did)
+    }
+
+    /// The admin-bootstrap seed for the closed-beta gate: the DIDs that get a
+    /// `beta_access` seat automatically (via [`crate::store::ensure_seed`]) so a
+    /// fresh instance always has at least the operator(s) inside the gate and
+    /// able to mint invite codes.
+    ///
+    /// Reuses `ALLOWED_DIDS` as the seed source — the same "these are the people
+    /// I trust on this instance" concept — so operators don't configure the list
+    /// twice. Returns a borrowed slice (empty when the instance is open / no
+    /// allow-list is set, in which case there is nothing to seed).
+    pub fn admin_seed_dids(&self) -> &[String] {
+        &self.allowed_dids
     }
 }
 
@@ -349,6 +375,18 @@ mod tests {
         assert_eq!(c.retention_days, 90);
         assert!(!c.proxy_images);
         assert!(c.allowed_dids.is_empty());
+        assert_eq!(c.beta_cap, 100);
+    }
+
+    #[test]
+    fn admin_seed_reuses_allowed_dids() {
+        let open = Config::default();
+        assert!(open.admin_seed_dids().is_empty());
+        let gated = Config {
+            allowed_dids: vec!["did:plc:me".to_string(), "did:plc:you".to_string()],
+            ..Config::default()
+        };
+        assert_eq!(gated.admin_seed_dids(), &["did:plc:me", "did:plc:you"]);
     }
 
     #[test]

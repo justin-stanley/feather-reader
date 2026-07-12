@@ -22,11 +22,14 @@
 //!    materialise gigabytes before a post-hoc size check (a Content-Length
 //!    guard is useless once gzip strips the header).
 //!
-//! Resolution happens immediately before each request, which bounds (though a
-//! narrow DNS-rebinding TOCTOU window remains) the gap between the check and the
-//! connect; the finding explicitly accepts re-resolve-just-before-connect.
+//! Resolution happens immediately before each request. The vetted IP is then
+//! **pinned** onto the connection (reqwest `.resolve(host, addr)`), so `connect`
+//! reuses the exact address that passed [`is_forbidden_ip`] rather than doing an
+//! independent second DNS lookup. That closes the DNS-rebinding TOCTOU window: an
+//! attacker-controlled resolver cannot answer "public IP" for the check and
+//! "127.0.0.1" for the connect, because there is no second resolution.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -91,12 +94,16 @@ fn check_scheme(url: &Url) -> Result<()> {
     }
 }
 
-/// Resolve a URL's host to socket addresses and reject if *any* resolved IP is a
-/// forbidden (SSRF) target. Returns the vetted `host:port` on success.
+/// Resolve a URL's host to socket addresses, reject if *any* resolved IP is a
+/// forbidden (SSRF) target, and return the **vetted** `SocketAddr` to pin the
+/// connection to.
 ///
 /// An IP literal host is checked directly (no DNS); a named host is resolved via
-/// the async resolver and every answer must pass.
-async fn resolve_and_check(url: &Url) -> Result<()> {
+/// the async resolver and *every* answer must pass — but the returned address is
+/// the specific one `connect` must use, so no independent second resolution can
+/// slip a rebound IP past the check (DNS-rebinding TOCTOU). Handles both IPv4 and
+/// IPv6 answers.
+async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
     let host = url.host().context("URL has no host")?;
     let port = url
         .port_or_known_default()
@@ -107,36 +114,62 @@ async fn resolve_and_check(url: &Url) -> Result<()> {
             if is_forbidden_ip(&IpAddr::V4(ip)) {
                 bail!("refusing to fetch forbidden (internal) address {ip}");
             }
+            Ok(SocketAddr::new(IpAddr::V4(ip), port))
         }
         Host::Ipv6(ip) => {
             if is_forbidden_ip(&IpAddr::V6(ip)) {
                 bail!("refusing to fetch forbidden (internal) address {ip}");
             }
+            Ok(SocketAddr::new(IpAddr::V6(ip), port))
         }
         Host::Domain(name) => {
-            let mut any = false;
+            let mut vetted: Option<SocketAddr> = None;
             let addrs = tokio::net::lookup_host((name, port))
                 .await
                 .with_context(|| format!("resolving host {name:?}"))?;
             for sa in addrs {
-                any = true;
                 let ip = sa.ip();
                 if is_forbidden_ip(&ip) {
                     bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
                 }
+                // Keep the FIRST vetted answer as the address to pin the connect
+                // to. Every answer is still checked (loop continues), so a mixed
+                // A/AAAA record set with any forbidden entry is rejected wholesale.
+                if vetted.is_none() {
+                    vetted = Some(sa);
+                }
             }
-            if !any {
-                bail!("host {name:?} did not resolve to any address");
-            }
+            vetted.ok_or_else(|| anyhow::anyhow!("host {name:?} did not resolve to any address"))
         }
     }
-    Ok(())
+}
+
+/// Build a per-hop client that **pins** DNS for `host` to the already-vetted
+/// `addr`, so reqwest's `connect` reuses the exact IP that passed the SSRF check
+/// instead of doing its own second resolution (the DNS-rebinding fix). The pin is
+/// scoped to `host`, keyed to the address family of `addr` (works for both IPv4
+/// and IPv6). Mirrors [`crate::feed::build_client`]'s policy (auto-redirect off —
+/// [`guarded_get`] follows + re-validates each hop itself).
+fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+    Client::builder()
+        .user_agent(crate::USER_AGENT)
+        // Override reqwest's resolver for this host only: connect goes straight
+        // to the vetted socket address — no independent re-resolution.
+        .resolve(host, addr)
+        // No auto-redirect: guarded_get follows + re-validates each hop.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build IP-pinned fetch client")
 }
 
 /// Fetch a user-supplied URL through the full SSRF guard: scheme + IP checks on
-/// the initial URL and on **every** redirect hop, following redirects manually
-/// (the passed `client` MUST be built with auto-redirect disabled, e.g. via
-/// [`crate::feed::build_client`]).
+/// the initial URL and on **every** redirect hop, following redirects manually.
+///
+/// The passed `client` is used only as a policy reference; each hop is actually
+/// sent through a freshly-built [`pinned_client`] whose DNS for the target host
+/// is pinned to the exact IP that just passed [`resolve_and_check`] — so the
+/// connect can't be rebound onto an internal address between the check and the
+/// TCP handshake.
 ///
 /// `extra_headers` are applied to every hop (e.g. the conditional-GET
 /// `If-None-Match` / `If-Modified-Since` validators). Returns the final
@@ -148,13 +181,22 @@ pub async fn guarded_get(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
+    // `client` is retained in the signature for API stability + as the policy
+    // template; the actual send goes through a per-hop IP-pinned client.
+    let _ = client;
     let mut current = Url::parse(url).with_context(|| format!("not a valid URL {url:?}"))?;
 
     for _ in 0..=MAX_REDIRECTS {
         check_scheme(&current)?;
-        resolve_and_check(&current).await?;
+        // Re-validate on EVERY hop and capture the vetted address to pin to.
+        let vetted = resolve_and_check(&current).await?;
+        let host = current
+            .host_str()
+            .context("URL lost its host between hops")?
+            .to_string();
+        let hop_client = pinned_client(&host, vetted)?;
 
-        let mut req = client.get(current.clone());
+        let mut req = hop_client.get(current.clone());
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -286,7 +328,28 @@ mod tests {
     #[tokio::test]
     async fn resolve_and_check_allows_public_ip_literal() {
         let u = Url::parse("http://1.1.1.1/").unwrap();
-        assert!(resolve_and_check(&u).await.is_ok());
+        let addr = resolve_and_check(&u).await.unwrap();
+        // The vetted address is pinned back verbatim (IP literal, no DNS).
+        assert_eq!(addr, "1.1.1.1:80".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_check_pins_public_ipv6_literal() {
+        let u = Url::parse("http://[2606:4700:4700::1111]:443/").unwrap();
+        let addr = resolve_and_check(&u).await.unwrap();
+        assert_eq!(
+            addr,
+            "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn pinned_client_builds_for_both_families() {
+        // Both address families must produce a usable pinned client.
+        assert!(pinned_client("example.com", "93.184.216.34:80".parse().unwrap()).is_ok());
+        assert!(
+            pinned_client("example.com", "[2606:4700:4700::1111]:443".parse().unwrap()).is_ok()
+        );
     }
 
     #[test]
