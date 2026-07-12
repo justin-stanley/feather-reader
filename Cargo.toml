@@ -26,7 +26,8 @@ path = "src/main.rs"
 tokio = { version = "1.45", features = ["full"] }
 
 # --- web framework + middleware -----------------------------------------
-axum = "0.8"
+# `multipart` powers the OPML file-upload import (POST /opml).
+axum = { version = "0.8", features = ["multipart"] }
 # fs = ServeDir/ServeFile for embedded/static assets; trace = request tracing layer.
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 
