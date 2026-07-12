@@ -1161,8 +1161,54 @@ impl SidecarClient {
     /// Add a subscription (subscribe to a feed) — `createRecord`, server-assigned
     /// `tid` rkey. Returns the new record's **rkey** so the web layer can offer
     /// unsubscribe/rename immediately.
+    ///
+    /// **The feed URL is written to the PDS VERBATIM.** Use this only for a
+    /// PUBLIC feed. For a private (secret-bearing) feed the caller MUST use
+    /// [`add_subscription_private`](Self::add_subscription_private), which writes
+    /// a redacted record with the secret URL withheld. When in doubt, route
+    /// through [`add_subscription_classified`](Self::add_subscription_classified),
+    /// which picks the right path from a [`crate::feed::FeedPrivacy`].
     pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
         Ok(self.create_subscription(did, sub).await?.into_rkey())
+    }
+
+    /// Add a **private** subscription — write a REDACTED record to the PDS that
+    /// OMITS the secret feed URL.
+    ///
+    /// atproto PDS records are public (unauth `getRecord`/`listRecords` +
+    /// firehose, retained after delete), so a secret-bearing feed URL (Substack
+    /// `…/feed/private/<token>`, Patreon `?auth=…`, …) must NEVER be written to
+    /// the PDS. This builds the redacted record via
+    /// [`build_subscription_record`] (`private: true`, `url`/`siteUrl` reduced to
+    /// the public publication origin, secret path/query stripped) and writes
+    /// that. The secret URL stays owner-held in local SQLite (see
+    /// [`crate::store::mark_feed_private`]). Returns the new record's rkey.
+    ///
+    /// Stopgap until atproto permissioned-data / permission-sets ship, at which
+    /// point the secret migrates to an owner-scoped private collection.
+    pub async fn add_subscription_private(&self, did: &str, sub: &Subscription) -> Result<String> {
+        let redacted = build_subscription_record(sub, true);
+        Ok(self.create_subscription(did, &redacted).await?.into_rkey())
+    }
+
+    /// Add a subscription, choosing the public or redacted-private write path
+    /// from a [`crate::feed::FeedPrivacy`] classification.
+    ///
+    /// This is the one-call seam for the web layer: pass the raw (possibly
+    /// secret-bearing) [`Subscription`] plus the result of
+    /// [`crate::feed::classify_feed_privacy`], and the secret is guaranteed to
+    /// stay off the PDS whenever the feed is private.
+    pub async fn add_subscription_classified(
+        &self,
+        did: &str,
+        sub: &Subscription,
+        privacy: &crate::feed::FeedPrivacy,
+    ) -> Result<String> {
+        if privacy.is_private() {
+            self.add_subscription_private(did, sub).await
+        } else {
+            self.add_subscription(did, sub).await
+        }
     }
 
     /// Remove a subscription (unsubscribe) by rkey — `deleteRecord`. Alias of
@@ -1569,6 +1615,77 @@ async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
 }
 
 // ---------------------------------------------------------------------------
+// Redacted subscription-record builder (private-feed handling)
+// ---------------------------------------------------------------------------
+
+/// Build the [`Subscription`] record to actually WRITE to the (public) PDS from a
+/// caller-supplied subscription and a `private` flag.
+///
+/// * `private == false` — returns the subscription **unchanged**: the feed URL is
+///   written verbatim, exactly as before (regression-safe for public feeds).
+/// * `private == true` — returns a **redacted** copy: the secret-bearing feed URL
+///   is REMOVED and replaced with the feed's **public publication origin** (the
+///   URL's scheme + host, e.g. `https://author.substack.com/`, or the existing
+///   `siteUrl` if one is already set), `private` is set to `Some(true)`, and no
+///   secret path/query survives in `url` or `siteUrl`. The secret is never sent
+///   to the sidecar/PDS — it stays owner-held in local SQLite.
+///
+/// This is the single choke point that guarantees a private feed's secret never
+/// reaches the PDS. Stopgap until atproto permissioned-data (see
+/// [`crate::lexicon::Subscription`]).
+pub fn build_subscription_record(sub: &Subscription, private: bool) -> Subscription {
+    if !private {
+        // Public feed: write verbatim. Defensively clear any stray `private`
+        // marker so a public record is byte-for-byte what it always was.
+        let mut out = sub.clone();
+        out.private = None;
+        return out;
+    }
+
+    // Private feed: derive the public origin, then strip the secret everywhere.
+    // Prefer an already-set siteUrl (it's meant to be the public site) but reduce
+    // even that to scheme+host so a secret can't hide in its path/query. Fall
+    // back to the origin of the (secret) feed url — origin() discards path/query,
+    // so the token is dropped.
+    let public_origin = sub
+        .site_url
+        .as_deref()
+        .and_then(public_origin)
+        .or_else(|| public_origin(&sub.url))
+        // Last resort: if neither parses, withhold entirely rather than leak.
+        .unwrap_or_default();
+
+    Subscription {
+        r#type: sub.r#type.clone(),
+        url: public_origin.clone(),
+        title: sub.title.clone(),
+        // siteUrl is the public origin too (never the secret path).
+        site_url: if public_origin.is_empty() {
+            None
+        } else {
+            Some(public_origin)
+        },
+        folder: sub.folder.clone(),
+        fetch_hint: sub.fetch_hint.clone(),
+        private: Some(true),
+        created_at: sub.created_at.clone(),
+    }
+}
+
+/// Reduce a URL to its public origin string (`scheme://host[:port]/`), discarding
+/// path, query, and fragment — where any secret token lives. Returns `None` if
+/// the input doesn't parse as an absolute URL with a host.
+fn public_origin(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let scheme = parsed.scheme();
+    match parsed.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}/")),
+        None => Some(format!("{scheme}://{host}/")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — record (de)serialization against a repo listRecords response shape.
 // No network.
 // ---------------------------------------------------------------------------
@@ -1576,6 +1693,75 @@ async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_subscription_record_omits_secret_and_sets_private() {
+        // A Substack private feed: the secret token is in the path.
+        let secret = "https://author.substack.com/feed/private/deadbeefcafe123456token";
+        let mut sub = Subscription::new(secret, "2026-07-12T00:00:00.000Z");
+        sub.title = Some("Paid Author".to_string());
+
+        let redacted = build_subscription_record(&sub, true);
+
+        // private: true, and the secret is GONE from url + siteUrl.
+        assert_eq!(redacted.private, Some(true));
+        assert_eq!(redacted.url, "https://author.substack.com/");
+        assert_eq!(
+            redacted.site_url.as_deref(),
+            Some("https://author.substack.com/")
+        );
+        assert_eq!(redacted.title.as_deref(), Some("Paid Author"));
+
+        // The actual createRecord body (what goes to the sidecar/PDS) contains
+        // NO secret token anywhere and carries private:true.
+        let body = serde_json::to_string(&redacted).expect("serialize");
+        assert!(!body.contains("deadbeefcafe123456token"));
+        assert!(!body.contains("/feed/private/"));
+        assert!(body.contains("\"private\":true"));
+
+        let value = serde_json::to_value(&redacted).expect("serialize");
+        assert_eq!(value["private"], json!(true));
+        // Round-trips.
+        let parsed: Subscription = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.private, Some(true));
+        assert!(!parsed.url.contains("private"));
+    }
+
+    #[test]
+    fn public_subscription_record_is_unchanged_regression() {
+        let mut sub = Subscription::new("https://example.com/feed.xml", "2026-07-12T00:00:00.000Z");
+        sub.title = Some("Example".to_string());
+        sub.site_url = Some("https://example.com/".to_string());
+
+        let built = build_subscription_record(&sub, false);
+        // Verbatim: url preserved, no `private` field serialized.
+        assert_eq!(built.url, "https://example.com/feed.xml");
+        assert_eq!(built.private, None);
+        let value = serde_json::to_value(&built).expect("serialize");
+        assert!(value.get("private").is_none());
+        assert_eq!(value["url"], json!("https://example.com/feed.xml"));
+    }
+
+    #[test]
+    fn private_record_strips_secret_hiding_in_query_and_sitepath() {
+        // Patreon-style ?auth= secret, plus a siteUrl that itself carries a path:
+        // even the siteUrl must be reduced to the bare public origin.
+        let mut sub = Subscription::new(
+            "https://www.patreon.com/rss/author?auth=SECRETTOKEN",
+            "2026-07-12T00:00:00.000Z",
+        );
+        sub.site_url = Some("https://www.patreon.com/private/author?auth=SECRETTOKEN".to_string());
+
+        let redacted = build_subscription_record(&sub, true);
+        let body = serde_json::to_string(&redacted).expect("serialize");
+        assert!(!body.contains("SECRETTOKEN"));
+        assert!(!body.contains("auth="));
+        assert_eq!(redacted.url, "https://www.patreon.com/");
+        assert_eq!(
+            redacted.site_url.as_deref(),
+            Some("https://www.patreon.com/")
+        );
+    }
 
     /// A realistic `com.atproto.repo.listRecords` response for the subscription
     /// collection, as a PDS returns it — the envelope wraps each record in
