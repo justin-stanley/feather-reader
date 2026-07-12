@@ -631,20 +631,52 @@ fn render<T: Template>(tmpl: &T) -> Response {
 }
 
 /// A minimal web error type so handlers can `?`-propagate `anyhow` failures and
-/// still return an `impl IntoResponse`. Renders as a `500` with a short message.
-struct WebError(anyhow::Error);
+/// still return an `impl IntoResponse`. Renders as a `500` with a short message
+/// by default; a handler may override the status (e.g. `413` for an over-cap
+/// upload) via [`WebError::with_status`].
+struct WebError {
+    err: anyhow::Error,
+    status: StatusCode,
+}
 
 impl<E: Into<anyhow::Error>> From<E> for WebError {
     fn from(err: E) -> Self {
-        WebError(err.into())
+        WebError {
+            err: err.into(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl WebError {
+    /// Attach an explicit HTTP status to render instead of the default `500`.
+    fn with_status(err: impl Into<anyhow::Error>, status: StatusCode) -> Self {
+        WebError {
+            err: err.into(),
+            status,
+        }
     }
 }
 
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
-        warn!(error = %self.0, "request failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        warn!(error = %self.err, status = %self.status, "request failed");
+        let body = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            "internal error"
+        } else {
+            self.status.canonical_reason().unwrap_or("error")
+        };
+        (self.status, body).into_response()
     }
+}
+
+/// Map an axum [`MultipartError`] to a [`WebError`] that preserves the error's
+/// own HTTP status. When a request exceeds the route's `DefaultBodyLimit` the
+/// multipart extractor reports `413 Payload Too Large`; a malformed body reports
+/// `400`. Either way this avoids collapsing the failure into a generic `500`.
+fn multipart_response(err: axum::extract::multipart::MultipartError) -> WebError {
+    let status = err.status();
+    WebError::with_status(err, status)
 }
 
 /// A short, human display of a feed/site title for the sidebar/list, falling
@@ -2230,12 +2262,16 @@ async fn import_opml(
     };
     let pool = &state.db;
 
-    // Collect the OPML text from whichever field carried it.
+    // Collect the OPML text from whichever field carried it. Multipart errors
+    // are mapped to their axum-native response so that an over-cap upload (the
+    // `DefaultBodyLimit` on this route, see `OPML_BODY_LIMIT`) surfaces as
+    // `413 Payload Too Large` rather than being swallowed by the blanket
+    // `WebError` → `500` conversion.
     let mut opml_text = String::new();
-    while let Some(field) = multipart.next_field().await? {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_response)? {
         let name = field.name().unwrap_or("").to_string();
         if name == "opml" || name == "file" {
-            let bytes = field.bytes().await?;
+            let bytes = field.bytes().await.map_err(multipart_response)?;
             if !bytes.is_empty() {
                 opml_text = String::from_utf8_lossy(&bytes).into_owned();
                 if name == "file" {
@@ -3201,5 +3237,109 @@ mod tests {
             }
         }
         assert!(saw_429, "expected a 429 after exhausting the burst");
+    }
+
+    // -- OPML import body cap (DefaultBodyLimit → 413) -------------------------
+
+    /// Build a `multipart/form-data` body carrying a single `file` field whose
+    /// contents are `payload`, returning `(content_type, body_bytes)`.
+    fn opml_multipart(payload: &[u8]) -> (String, Vec<u8>) {
+        let boundary = "----featherreadertestboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"feeds.opml\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: text/x-opml\r\n\r\n");
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={boundary}"), body)
+    }
+
+    #[tokio::test]
+    async fn opml_import_oversize_upload_returns_413() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let cookie = session_cookie(&state, "did:plc:admin", None);
+        let app = router(state);
+
+        // A payload comfortably above the 2 MiB route cap.
+        let payload = vec![b'a'; OPML_BODY_LIMIT + 1024];
+        let (content_type, body) = opml_multipart(&payload);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header("content-type", content_type)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an over-cap OPML upload must be rejected with 413, not collapsed to 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn opml_import_under_limit_upload_is_not_413() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let cookie = session_cookie(&state, "did:plc:admin", None);
+        let app = router(state);
+
+        // A small, valid OPML well under the cap: must be accepted (the handler
+        // redirects to `/` or a flash), i.e. never 413.
+        let opml = br#"<?xml version="1.0"?>
+<opml version="2.0"><body>
+  <outline text="Example" type="rss" xmlUrl="https://example.com/feed.xml"/>
+</body></opml>"#;
+        let (content_type, body) = opml_multipart(opml);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header("content-type", content_type)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an under-cap OPML upload must not be rejected as too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn opml_import_logged_out_redirects_to_login() {
+        // Logged-out callers are redirected before the body is consumed; assert
+        // the auth short-circuit rather than a body-cap rejection.
+        let state = test_state(&["did:plc:admin"]).await;
+        let app = router(state);
+
+        let opml = b"<opml version=\"2.0\"><body></body></opml>";
+        let (content_type, body) = opml_multipart(opml);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
     }
 }
