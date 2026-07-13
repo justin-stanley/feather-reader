@@ -234,6 +234,7 @@ pub fn router(state: AppState) -> Router {
             get(beta_redeem_form).post(beta_redeem_submit),
         )
         .route("/admin/invites", post(admin_mint_invites))
+        .route("/account/delete", post(account_delete))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
         .nest_service("/static", ServeDir::new("static"))
@@ -292,9 +293,8 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
         return false;
     }
     match path {
-        "/login" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all" | "/admin/invites" => {
-            true
-        }
+        "/login" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all" | "/admin/invites"
+        | "/account/delete" => true,
         // /entries/{id}/read and /entries/{id}/star — the star/mark-read taps.
         p => p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")),
     }
@@ -643,6 +643,9 @@ struct EntryRowTemplate {
 struct LoginTemplate {
     repo_url: &'static str,
     error: String,
+    /// A neutral/success banner (e.g. the post-delete "signed out" confirmation),
+    /// distinct from `error`. Empty renders nothing.
+    flash: String,
 }
 
 /// The closed-beta invite-redeem page (`GET /beta/redeem`).
@@ -2021,6 +2024,8 @@ struct LoginQuery {
     handle: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    flash: Option<String>,
 }
 
 /// `GET /login` — start the atproto OAuth flow, or render the handle form.
@@ -2047,6 +2052,7 @@ async fn login_form(
     render(&LoginTemplate {
         repo_url: REPO_URL,
         error: q.error.unwrap_or_default(),
+        flash: q.flash.unwrap_or_default(),
     })
 }
 
@@ -2203,11 +2209,29 @@ async fn oauth_callback(
     resp
 }
 
-/// `POST /logout` — clear the session cookie + drop the in-memory session.
+/// `POST /logout` — end the session everywhere, not just in this browser.
+///
+/// Clearing the cookie only stops *this* device from presenting the session;
+/// the sidecar still holds live OAuth tokens for the DID. So logout now also
+/// calls the sidecar `POST /internal/revoke {did}`, which revokes the refresh +
+/// access tokens at the PDS and drops the sidecar's session rows. The local
+/// registry entry is dropped and the cookie cleared regardless of whether the
+/// revoke round-trip succeeds (best-effort — a network blip must not trap the
+/// user in a half-logged-out state).
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(user) = current_session(&state, &headers).await {
+        // Only a real cookie session (`sid` present) has sidecar-held tokens to
+        // revoke; the dev-DID fallback never handshook the sidecar.
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
+            match state.sidecar.revoke_session(&user.did).await {
+                Ok(res) => {
+                    info!(did = %user.did, revoked = res.revoked, "logout: sidecar session revoked");
+                }
+                Err(err) => {
+                    warn!(did = %user.did, %err, "logout: sidecar revoke failed; clearing cookie anyway");
+                }
+            }
         }
     }
     let mut resp = Redirect::to("/login").into_response();
@@ -2218,11 +2242,95 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     resp
 }
 
+/// Form body for `POST /account/delete` — the confirm-gate. The user must type
+/// `DELETE` into this field for the purge to run.
+#[derive(Debug, Deserialize)]
+struct DeleteAccountForm {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// The literal a user must type to confirm the destructive delete.
+const DELETE_CONFIRM_PHRASE: &str = "DELETE";
+
+/// `POST /account/delete` (authed) — the "delete my data" endpoint.
+///
+/// Confirm-gated: the form must carry `confirm=DELETE` or we bounce back to
+/// `/manage` with an explanatory flash and touch nothing. On confirmation it:
+///   1. purges **every** local row owned by the caller DID (`entry_state`,
+///      `read_cursor`, `sub_ref`, `beta_access` seat, and any invite codes the
+///      DID created) via [`store::purge_did_data`], then
+///   2. calls the sidecar `POST /internal/revoke {did}` so the OAuth tokens are
+///      revoked at the PDS and the sidecar's session rows are dropped, then
+///   3. drops the in-memory session and clears the cookie, signing the user out.
+///
+/// The subscription/folder/saved *records* in the user's own PDS are
+/// intentionally left alone — they are the user's data on their own server; the
+/// `/about` copy and this page's UI both say so, and export stays available.
+async fn account_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteAccountForm>,
+) -> Result<Response, WebError> {
+    let user = match current_session(&state, &headers).await {
+        Some(u) => u,
+        None => return Ok(Redirect::to("/login").into_response()),
+    };
+    let did = user.did.clone();
+
+    // Confirm-gate: require the exact typed phrase before doing anything.
+    if form.confirm.trim() != DELETE_CONFIRM_PHRASE {
+        return Ok(Redirect::to(&format!(
+            "/manage?flash={}",
+            qenc("Type DELETE to confirm — nothing was deleted.")
+        ))
+        .into_response());
+    }
+
+    // 1. Purge every local row this DID owns (single transaction).
+    let counts = store::purge_did_data(&state.db, &did).await?;
+    info!(
+        %did,
+        total = counts.total(),
+        entry_state = counts.entry_state,
+        read_cursor = counts.read_cursor,
+        sub_ref = counts.sub_ref,
+        beta_access = counts.beta_access,
+        invite_codes = counts.invite_codes,
+        "account/delete: local rows purged"
+    );
+
+    // 2. Revoke the OAuth session at the sidecar/PDS (best-effort — the local
+    //    rows are already gone; a network blip must not block the sign-out).
+    match state.sidecar.revoke_session(&did).await {
+        Ok(res) => info!(%did, revoked = res.revoked, "account/delete: sidecar session revoked"),
+        Err(err) => {
+            warn!(%did, %err, "account/delete: sidecar revoke failed; local data already purged")
+        }
+    }
+
+    // 3. Drop the in-memory session and clear the cookie: sign the user out.
+    if let Some(sid) = user.sid {
+        state.sessions.remove(&sid);
+    }
+    let mut resp = Redirect::to(&format!(
+        "/login?flash={}",
+        qenc("Your data was deleted and you've been signed out. Thanks for trying FeatherReader.")
+    ))
+    .into_response();
+    set_cookie(
+        &mut resp,
+        &format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+    );
+    Ok(resp)
+}
+
 /// Re-render the login form with an error banner.
 fn login_error(msg: &str) -> Response {
     render(&LoginTemplate {
         repo_url: REPO_URL,
         error: msg.to_string(),
+        flash: String::new(),
     })
 }
 
@@ -3727,5 +3835,166 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    // -- delete-my-data (POST /account/delete) --------------------------------
+
+    /// A one-shot mock sidecar: binds a loopback port, answers exactly one
+    /// `POST /internal/revoke` with `{ok:true,…}`, and reports (via the returned
+    /// channel) the DID it was asked to revoke. Enough to prove the delete
+    /// handler triggers the sidecar revoke without pulling in an HTTP-mock crate.
+    async fn spawn_revoke_sidecar() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Pull the DID out of the JSON body (last line of the request).
+            let did = req
+                .split("\r\n\r\n")
+                .nth(1)
+                .and_then(|body| {
+                    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+                    v.get("did")?.as_str().map(str::to_string)
+                })
+                .unwrap_or_default();
+            let is_revoke = req.starts_with("POST /internal/revoke");
+            let body = serde_json::json!({
+                "ok": true, "did": did, "revoked": true, "hadSession": true
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            let _ = tx.send(if is_revoke { did } else { String::new() });
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Build an [`AppState`] whose sidecar points at `sidecar_url`.
+    async fn test_state_with_sidecar(allowed: &[&str], sidecar_url: &str) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let dids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        store::ensure_seed(&db, &dids).await.unwrap();
+        let mut config = Config {
+            allowed_dids: dids,
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            ..Config::default()
+        };
+        config.sidecar.public_url = sidecar_url.to_string();
+        AppState::new(config, db).unwrap()
+    }
+
+    /// A confirmed `POST /account/delete` purges the caller's local rows, calls
+    /// the sidecar revoke for that DID, and clears the session cookie.
+    #[tokio::test]
+    async fn account_delete_purges_rows_and_triggers_revoke() {
+        let (sidecar_url, revoke_rx) = spawn_revoke_sidecar().await;
+        let did = "did:plc:leaver";
+        let state = test_state_with_sidecar(&[], &sidecar_url).await;
+
+        // Seed the DID with local rows across the per-DID tables.
+        store::grant_access(&state.db, did, Some("leaver.example"), "test", None)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, did, &[]).await.unwrap();
+        store::mint_code(&state.db, did, 3600).await.unwrap();
+        assert!(store::has_beta_access(&state.db, did).await.unwrap());
+
+        let cookie = session_cookie(&state, did, Some("leaver.example"));
+        let app = router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/account/delete")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Signed out: redirect to /login with the cookie cleared.
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/login"));
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains("Max-Age=0"), "cookie must be cleared");
+
+        // The sidecar revoke was called for exactly this DID.
+        let revoked_did = revoke_rx.await.unwrap();
+        assert_eq!(
+            revoked_did, did,
+            "sidecar revoke must fire for the caller DID"
+        );
+
+        // Local rows are gone.
+        assert!(!store::has_beta_access(&state.db, did).await.unwrap());
+        let codes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE creator_did = ?1")
+                .bind(did)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(codes, 0);
+    }
+
+    /// An UN-confirmed `POST /account/delete` (wrong/blank `confirm`) deletes
+    /// nothing and bounces back to /manage.
+    #[tokio::test]
+    async fn account_delete_without_confirm_is_a_noop() {
+        let did = "did:plc:staying";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/account/delete")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/manage"));
+        // Nothing deleted.
+        assert!(store::has_beta_access(&state.db, did).await.unwrap());
     }
 }

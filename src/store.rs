@@ -1045,6 +1045,89 @@ pub async fn ensure_seed(pool: &SqlitePool, dids: &[String]) -> Result<u64> {
     Ok(created)
 }
 
+/// The row counts purged by [`purge_did_data`], for a confirmable success
+/// message and for assertions in tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeCounts {
+    /// `entry_state` rows removed (per-DID read/star flags).
+    pub entry_state: u64,
+    /// `read_cursor` rows removed (per-DID per-feed read cursors).
+    pub read_cursor: u64,
+    /// `sub_ref` rows removed (the DID's subscription projection).
+    pub sub_ref: u64,
+    /// `beta_access` rows removed (the DID's closed-beta seat: 0 or 1).
+    pub beta_access: u64,
+    /// `invite_codes` rows removed (codes this DID *created*).
+    pub invite_codes: u64,
+}
+
+impl PurgeCounts {
+    /// Total rows removed across every per-DID table.
+    pub fn total(&self) -> u64 {
+        self.entry_state + self.read_cursor + self.sub_ref + self.beta_access + self.invite_codes
+    }
+}
+
+/// Delete **all** local rows owned by `did` in a single transaction: the
+/// per-DID read/star state (`entry_state`), per-feed read cursors
+/// (`read_cursor`), the subscription projection (`sub_ref`), the closed-beta
+/// seat (`beta_access`), and any invite codes this DID *created*
+/// (`invite_codes`). The shared `feeds`/`entries` cache is intentionally left
+/// intact — it is deduped and not owned by any single DID.
+///
+/// This is the local half of "delete my data": the caller pairs it with a
+/// sidecar `POST /internal/revoke` so the OAuth tokens + sidecar session rows
+/// are dropped too. Idempotent — deleting a DID with no rows returns all-zero
+/// counts.
+pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts> {
+    let mut tx = pool.begin().await.context("begin purge_did_data tx")?;
+
+    let entry_state = sqlx::query("DELETE FROM entry_state WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge entry_state for {did}"))?
+        .rows_affected();
+
+    let read_cursor = sqlx::query("DELETE FROM read_cursor WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge read_cursor for {did}"))?
+        .rows_affected();
+
+    let sub_ref = sqlx::query("DELETE FROM sub_ref WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge sub_ref for {did}"))?
+        .rows_affected();
+
+    let beta_access = sqlx::query("DELETE FROM beta_access WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge beta_access for {did}"))?
+        .rows_affected();
+
+    let invite_codes = sqlx::query("DELETE FROM invite_codes WHERE creator_did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge invite_codes for {did}"))?
+        .rows_affected();
+
+    tx.commit().await.context("commit purge_did_data tx")?;
+
+    Ok(PurgeCounts {
+        entry_state,
+        read_cursor,
+        sub_ref,
+        beta_access,
+        invite_codes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,6 +1621,125 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         let before = db_size_bytes(&pool).await?;
         assert!(before > 0, "a schema-initialised DB has a non-zero size");
+        Ok(())
+    }
+
+    /// `purge_did_data` removes every per-DID row the caller owns (read/star
+    /// state, cursors, sub_ref projection, beta seat, created invite codes) —
+    /// and touches no other DID's rows nor the shared feeds/entries cache.
+    #[tokio::test]
+    async fn purge_did_data_removes_only_the_callers_rows() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        // A shared feed + entry both DIDs can subscribe to.
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/feed.xml".to_string(),
+                title: Some("Example".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "g-1".to_string(),
+                url: Some("https://example.com/a".to_string()),
+                title: Some("First".to_string()),
+                published: Some("2026-07-10T08:00:00Z".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let entry_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'g-1'")
+            .fetch_one(&pool)
+            .await?;
+
+        let victim = "did:plc:victim";
+        let bystander = "did:plc:bystander";
+
+        // Seed BOTH DIDs with a full spread of per-DID rows.
+        for did in [victim, bystander] {
+            replace_sub_refs(&pool, did, &[feed_id]).await?;
+            assert!(mark_read(&pool, did, entry_id, true).await?);
+            assert!(mark_starred(&pool, did, entry_id, true).await?);
+            upsert_cursor(
+                &pool,
+                &ReadCursor {
+                    did: did.to_string(),
+                    feed_url: "https://example.com/feed.xml".to_string(),
+                    read_through: Some("2026-07-10T08:00:00Z".to_string()),
+                    read_ids: "[]".to_string(),
+                    unread_ids: "[]".to_string(),
+                    dirty: false,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            grant_access(&pool, did, Some("h.example"), "admin", None).await?;
+            mint_code(&pool, did, 3600).await?;
+        }
+
+        // Purge only the victim.
+        let counts = purge_did_data(&pool, victim).await?;
+        assert_eq!(
+            counts.entry_state, 1,
+            "one entry_state row (read+star merge)"
+        );
+        assert_eq!(counts.read_cursor, 1);
+        assert_eq!(counts.sub_ref, 1);
+        assert_eq!(counts.beta_access, 1);
+        assert_eq!(counts.invite_codes, 1);
+        assert_eq!(counts.total(), 5);
+
+        // The victim has zero rows left in every per-DID table.
+        let es: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1")
+            .bind(victim)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(es, 0, "victim still had entry_state rows");
+        let rc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM read_cursor WHERE did = ?1")
+            .bind(victim)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(rc, 0, "victim still had read_cursor rows");
+        let sr: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_ref WHERE did = ?1")
+            .bind(victim)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(sr, 0, "victim still had sub_ref rows");
+        assert!(
+            !has_beta_access(&pool, victim).await?,
+            "victim still had a beta seat"
+        );
+        let victim_codes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE creator_did = ?1")
+                .bind(victim)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(victim_codes, 0);
+
+        // The bystander is untouched.
+        assert!(has_beta_access(&pool, bystander).await?);
+        let bystander_subs = count_subscriptions_for_did(&pool, bystander).await?;
+        assert_eq!(bystander_subs, 1, "bystander's sub_ref survived");
+        let bystander_codes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE creator_did = ?1")
+                .bind(bystander)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(bystander_codes, 1);
+
+        // The shared cache is intact.
+        assert_eq!(count_feeds(&pool).await?, 1);
+
+        // Idempotent: purging again removes nothing.
+        let again = purge_did_data(&pool, victim).await?;
+        assert_eq!(again.total(), 0);
+
         Ok(())
     }
 }

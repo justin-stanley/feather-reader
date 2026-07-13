@@ -156,6 +156,30 @@
           </form>
         </details>
       </section>
+
+      <!-- Delete my data -->
+      <section class="manage-section danger" aria-labelledby="delete-h">
+        <h2 id="delete-h">Delete my data</h2>
+        <p class="opml-note">
+          FeatherReader is an experiment and may pause at any time. You can wipe
+          everything this app stores about you right now: your read/star state,
+          read cursors, cached subscription list, and beta seat are deleted, and
+          your OAuth session is revoked at your PDS (you'll be signed out).
+          Your subscription records live in <strong>your own PDS</strong> — this
+          does not touch them; export your OPML first if you want a copy.
+        </p>
+        <details class="opml-paste">
+          <summary class="btn-quiet">Delete my data…</summary>
+          <form method="post" action="/account/delete" class="opml-paste-form">
+            <label for="confirm">
+              Type <code>DELETE</code> to confirm. This cannot be undone.
+            </label>
+            <input class="input" id="confirm" name="confirm" type="text"
+                   autocomplete="off" placeholder="DELETE" />
+            <button class="btn btn-danger" type="submit">Delete my data &amp; sign out</button>
+          </form>
+        </details>
+      </section>
     </div>
 
     {% include "footer.html" %}
