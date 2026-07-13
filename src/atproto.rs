@@ -838,6 +838,23 @@ pub struct SidecarSession {
     pub handle: Option<String>,
 }
 
+/// The sidecar's `/internal/revoke` response body:
+/// `{ ok:true, did, revoked, hadSession }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevokeResult {
+    /// The DID that was revoked.
+    #[serde(default)]
+    pub did: String,
+    /// Whether the OAuth token revocation at the PDS succeeded. `false` means
+    /// the local rows were still purged (best-effort), but the PDS-side tokens
+    /// may not have been invalidated (network failure).
+    #[serde(default)]
+    pub revoked: bool,
+    /// Whether the sidecar actually had a stored session for the DID.
+    #[serde(default, rename = "hadSession")]
+    pub had_session: bool,
+}
+
 /// The action verbs the sidecar's `/internal/repo` endpoint dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoAction {
@@ -934,6 +951,32 @@ impl SidecarClient {
             .await
             .context("parsing /internal/session response")?;
         Ok(Some(session))
+    }
+
+    /// Revoke a DID's OAuth session at the sidecar: `POST /internal/revoke`.
+    ///
+    /// This revokes the refresh + access tokens at the PDS **and** purges the
+    /// sidecar's stored `oauth_session` + `app_session` rows for the DID. It is
+    /// idempotent — revoking a DID with no live session returns
+    /// `had_session: false`. Called on `/logout` (so the cookie clear isn't the
+    /// only thing that ends the session) and on `/account/delete`.
+    pub async fn revoke_session(&self, did: &str) -> Result<RevokeResult> {
+        let url = format!("{}/internal/revoke", self.public_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Internal-Secret", self.internal_secret.as_ref())
+            .json(&json!({ "did": did }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(xrpc_error_from(resp).await.into());
+        }
+        let result: RevokeResult = resp
+            .json()
+            .await
+            .context("parsing /internal/revoke response")?;
+        Ok(result)
     }
 
     /// POST one op to `/internal/repo` and return the raw XRPC `data` payload.

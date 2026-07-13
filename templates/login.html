@@ -17,6 +17,9 @@
     {% if !error.is_empty() %}
       <p class="flash error" role="alert">{{ error }}</p>
     {% endif %}
+    {% if !flash.is_empty() %}
+      <p class="flash" role="status">{{ flash }}</p>
+    {% endif %}
 
     <form class="auth-form" method="post" action="/login">
       <label for="handle">Your atproto handle</label>
