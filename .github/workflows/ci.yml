@@ -13,7 +13,13 @@ on:
   workflow_dispatch:  # allow manual runs from the Actions tab / gh CLI
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # One in-flight CI run per ref. With a SINGLE self-hosted runner and 13+ open
+  # Dependabot PRs, every superseded push would otherwise queue a full 5-job run
+  # behind the others. Keying on the PR number (falling back to the ref for
+  # push/dispatch) and cancelling in-progress runs means a new push to a PR
+  # kills its own stale run instead of piling up. Distinct PRs still run
+  # serially on the one runner, but no PR wastes the queue on outdated commits.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -47,21 +53,30 @@ jobs:
         run: cargo fmt --all --check
 
   cargo-deny:
-    name: cargo deny (licenses + bans + advisories + sources)
+    name: cargo deny (licenses + bans + sources)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
     steps:
       - uses: actions/checkout@v4
-      # EmbarkStudios' action installs a pinned cargo-deny and runs `check`.
-      # Config is deny.toml at the repo root. This gate enforces the
-      # AGPL-compatible license allowlist, forbids unvetted crate sources, and
-      # (belt-and-suspenders with the cargo-audit job) checks the RustSec DB.
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+
+      # Install a pinned cargo-deny binary directly instead of using
+      # EmbarkStudios/cargo-deny-action@v2. The action wraps its own RustSec
+      # advisory-DB fetch, which failed on this network-restricted, tailnet-only
+      # self-hosted CI VM and broke the gate on every run. Running the binary
+      # ourselves lets us scope this job to the OFFLINE gates and skip the
+      # network entirely (`--offline` below). Config is deny.toml at the repo
+      # root; feature evaluation is set there (`[graph] all-features = true`).
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          # Runs all four checks (advisories, bans, licenses, sources). Feature
-          # evaluation is set in deny.toml (`[graph] all-features = true`), so no
-          # extra CLI args are needed here.
-          command: check
+          tool: cargo-deny@0.20.2
+
+      # We deliberately DO NOT run the `advisories` check here: it needs the
+      # RustSec advisory DB over the network, which the dedicated `cargo audit`
+      # job below already covers (same DB, same fail-on-vuln semantics). This
+      # job enforces the AGPL-compatible license allowlist, duplicate/ban
+      # hygiene, and the crates.io-only source policy — all fully offline.
+      - name: cargo-deny (licenses + bans + sources)
+        run: cargo deny --offline check bans licenses sources
 
   cargo-audit:
     name: cargo audit (RustSec)
@@ -132,15 +147,32 @@ jobs:
   secrets:
     name: Secret scan (gitleaks)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — scans fine here now
+    env:
+      GITLEAKS_VERSION: 8.28.0
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # full history so gitleaks can scan past commits too
 
-      # gitleaks scans the working tree AND git history for committed secrets.
-      # Config: .gitleaks.toml at the repo root. The OSS action needs no license
-      # key (the paid license input only unlocks org-level features).
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_CONFIG: .gitleaks.toml
+      # Run the gitleaks BINARY directly rather than gitleaks/gitleaks-action@v2.
+      # The action gates on a GITLEAKS_LICENSE (required for any repo owned by a
+      # GitHub *org*/account it deems non-free) and does GITHUB_TOKEN-scoped PR
+      # bookkeeping — both of which trip on a personal-account private repo and
+      # failed the job regardless of findings. The binary is licence-free for
+      # this use and has none of that PR/org coupling.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          install -m 0755 /tmp/gitleaks "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Scan the full git history (checkout above sets fetch-depth: 0). Config is
+      # .gitleaks.toml at the repo root (extends the default ruleset + allowlists
+      # the documented test fixtures/placeholders). --redact keeps any match out
+      # of the logs; a non-zero exit (leak found) fails the job.
+      - name: gitleaks (history + tree)
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --redact --exit-code 1
