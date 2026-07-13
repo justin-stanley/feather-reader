@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-test/
 *.db
 *.db-shm
 *.db-wal
