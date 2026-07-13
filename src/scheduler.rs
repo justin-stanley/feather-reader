@@ -27,9 +27,10 @@
 //! `com.atproto.repo.applyWrites` batch via
 //! `SidecarClient::flush_read_states`, and — only on success — clears the
 //! `dirty` flag ([`store::clear_cursor_dirty`]). Dozens of articles read in one
-//! sitting collapse into one `putRecord` per feed, and several feeds' cursors
-//! ride one round-trip. It also flushes **once more on graceful shutdown** so a
-//! Ctrl-C never strands unsynced read-state (§4 of the design).
+//! sitting collapse into one write per feed (one record per feed, keyed by a
+//! feed-derived rkey), and several feeds' cursors ride one round-trip. It also
+//! flushes **once more on graceful shutdown** so a Ctrl-C never strands unsynced
+//! read-state.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -356,10 +357,10 @@ async fn set_next_poll(pool: &Pool, url: &str, delay: Duration) -> anyhow::Resul
 /// carries one; otherwise the configured default interval.
 ///
 /// The `fetchHint` cadence hint (`realtime`/`hourly`/`daily`/`weekly`) lives on
-/// the PDS-side `subscription` record, projected onto the feed. The [`Feed`] row
-/// in Phase 1 does not yet carry the hint column, so this maps the known values
-/// when present and falls back to the config default — the seam is here so wiring
-/// the projected hint later is a one-line change.
+/// the PDS-side `subscription` record. It is not yet projected onto the local
+/// [`Feed`] row, so this maps the known values when present and otherwise falls
+/// back to the config default — the mapping is factored out so wiring the
+/// projected hint later is a one-line change.
 fn cadence_for(feed: &Feed, default_interval: Duration) -> Duration {
     // `fetchHint` is not yet projected onto the local `feeds` row, so there is no
     // hint to read yet — this resolves to the configured default. The mapping is
@@ -372,9 +373,9 @@ fn cadence_for(feed: &Feed, default_interval: Duration) -> Duration {
     }
 }
 
-/// The feed's `fetchHint`, if the local row carries one. Phase 1's `feeds` row
-/// does not yet project the PDS-side hint, so this is always `None` for now — the
-/// single place to change when the hint column lands.
+/// The feed's `fetchHint`, if the local row carries one. The local `feeds` row
+/// does not yet project the PDS-side hint, so this currently always returns
+/// `None` — the single place to change when the hint column lands.
 fn feed_fetch_hint(_feed: &Feed) -> Option<&str> {
     None
 }
@@ -536,10 +537,16 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
 ///
 /// The store keeps `read_ids` / `unread_ids` as JSON arrays of ids; the lexicon
 /// wants string arrays. `read_through` is optional locally (a brand-new cursor
-/// may have none) but required in the record — an unset water-mark maps to the
-/// cursor's `updated_at` (i.e. "nothing above this time is implicitly read"),
-/// which is the conservative choice. Both id-sets are capped at
-/// [`ReadState::MAX_IDS`] to respect the lexicon bound.
+/// may have none) but required in the record, so an unset water-mark falls back
+/// to the cursor's `updated_at`. Both id-sets are capped at [`ReadState::MAX_IDS`]
+/// to respect the lexicon bound.
+///
+// Known limitation: `read_through` is a "everything older than this timestamp is
+// implicitly read" water-mark. Falling back to `updated_at` (≈ now) for a cursor
+// that has none means entries published before now would be treated as read on
+// the next reconcile — which is not conservative. A safer fallback would be a
+// zero/epoch timestamp (implies "nothing is implicitly read"). Left as-is for a
+// separate fix pass; flagged here so the behaviour isn't mistaken for intent.
 fn read_state_record(cursor: &ReadCursor) -> ReadState {
     let read_ids = parse_id_array(&cursor.read_ids);
     let unread_ids = parse_id_array(&cursor.unread_ids);
@@ -577,9 +584,10 @@ fn parse_id_array(raw: &str) -> Vec<String> {
     }
 }
 
-/// Truncate a set to `max`, keeping the most recent (tail) ids. The exception
-/// sets are meant to stay small; a real compaction (folding covered ids into the
-/// water-mark) is the reconciler's job — here we just enforce the hard cap.
+/// Truncate a set to `max`, keeping the most recent (tail) ids. This only
+/// enforces the lexicon's hard cap; it does not fold covered ids into the
+/// `read_through` water-mark (there is no compaction step yet — the exception
+/// sets are expected to stay well under the cap in normal use).
 fn cap(mut ids: Vec<String>, max: usize) -> Vec<String> {
     if ids.len() > max {
         let drop = ids.len() - max;
@@ -589,14 +597,20 @@ fn cap(mut ids: Vec<String>, max: usize) -> Vec<String> {
 }
 
 /// Derive the deterministic, stable rkey for a feed's read-state record from its
-/// URL — so the record is a **stable upsert target** (one record per feed, not a
-/// fresh tid per flush), per the design.
+/// URL, so there is exactly **one record per feed** (a fixed key, not a fresh tid
+/// per flush).
 ///
 /// atproto record keys must match `[A-Za-z0-9._~:-]{1,512}` (and not be `.`/`..`).
 /// A lowercase-hex FNV-1a-64 digest of the feed URL satisfies that, is stable
 /// across restarts and instances, and collides only on genuine hash collision
 /// (astronomically unlikely at feed scale; the flusher additionally dedups by
 /// rkey within a batch as a belt-and-braces guard).
+///
+// Known limitation: the flusher writes these records with `applyWrites#update`
+// (see `read_state_record` / `SidecarClient::flush_read_states`), which requires
+// the record to already exist. The first flush for a feed has no record to
+// update yet. The rkey being stable is what a create-then-update (or `putRecord`
+// upsert) fix would rely on, but that create step is not implemented here.
 pub fn read_state_rkey(feed_url: &str) -> String {
     format!("rs-{:016x}", fnv1a_64(feed_url.as_bytes()))
 }

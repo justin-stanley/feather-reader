@@ -6,9 +6,9 @@
 //! [`askama`] templates (under `templates/`). Progressive enhancement is a single
 //! vendored `htmx` script plus a tiny keyboard handler (`static/keyboard.js`);
 //! every interaction also works as a plain HTML form POST, so the reader is fully
-//! usable with JavaScript disabled (design §3).
+//! usable with JavaScript disabled.
 //!
-//! ## Reading surface (Phase 2)
+//! ## HTTP surface
 //!
 //! * `GET  /health` — liveness + version, as `text/plain`.
 //! * `GET  /` — the reader: a folders/feeds sidebar (from the PDS records layer)
@@ -30,7 +30,7 @@
 //!   subscription records in the PDS.
 //! * `GET  /opml/export` — OPML export (records → a downloadable document).
 //! * `GET /login` + `POST /login` + `/oauth/callback` + `/logout` — the atproto
-//!   OAuth seam (unchanged from Phase 1).
+//!   OAuth sign-in flow (routed through the sidecar).
 //!
 //! ## Identity — a cookie-resolved atproto session
 //!
@@ -70,7 +70,7 @@ use crate::{feed, store, AppState, Session, VERSION};
 // The OPML import/export module lives at `src/opml.rs` but isn't declared in the
 // crate root (`lib.rs`), which is outside this phase's edit surface. Wire it in
 // here via an explicit path so the reader's OPML routes can use the canonical
-// `parse_opml` / `to_opml` (design §4) without duplicating that logic.
+// `parse_opml` / `to_opml` without duplicating that logic.
 #[path = "opml.rs"]
 mod opml;
 
@@ -91,7 +91,7 @@ const INVITE_COOKIE: &str = "fr_invite";
 const INVITE_TTL_SECS: i64 = 1800;
 
 /// The canonical AGPL-3.0 source repository — surfaced in the footer, the
-/// sign-in pitch, and `/about` (design §4.6, cloud plan public-experiment UI).
+/// sign-in pitch, and `/about`.
 const REPO_URL: &str = "https://github.com/justin-stanley/feather-reader";
 
 /// The tip / support link (cloud plan public-experiment UI).
@@ -546,7 +546,7 @@ struct FolderOption {
     name: String,
 }
 
-/// The shared navigation "rail" model (design §4.1): the same DOM element is the
+/// The shared navigation "rail" model: the same DOM element is the
 /// mobile drawer and the desktop sidebar, so every chrome page (list / reader /
 /// manage) renders it from this one struct. Feed management lives on `/manage`,
 /// not here — the rail is navigation only.
@@ -769,7 +769,7 @@ fn display_handle(handle: Option<&str>, did: &str) -> String {
     }
 }
 
-/// Two-letter, lowercase avatar initials from a handle/DID (design §4.1).
+/// Two-letter, lowercase avatar initials from a handle/DID.
 fn avatar_initials(handle: Option<&str>, did: &str) -> String {
     let source = handle
         .map(|h| h.trim().trim_start_matches('@'))
@@ -1108,10 +1108,10 @@ struct ManageQuery {
     flash: Option<String>,
 }
 
-/// `GET /manage` — the feed-management page (design §4.5). Renders the rail plus
-/// the subscribe / your-feeds / OPML surfaces; the forms POST to the existing
-/// Phase-2 routes unchanged (`/subscriptions`, `/folders`, `/opml`, …). A
-/// read/render route only — no new mutation logic.
+/// `GET /manage` — the feed-management page. Renders the rail plus the subscribe
+/// / your-feeds / OPML surfaces; the forms POST to the existing routes
+/// (`/subscriptions`, `/folders`, `/opml`, …). A read/render route only — no
+/// mutation logic of its own.
 async fn manage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1569,8 +1569,8 @@ struct StarForm {
 /// `POST /entries/:id/star` — star/unstar an entry.
 ///
 /// Sets the local `starred` bit (fast working copy) and writes/removes a
-/// `community.lexicon.rss.saved` record in the user's PDS (design §3: stars are
-/// worth owning). The PDS write is best-effort — the local star still lands.
+/// `community.lexicon.rss.saved` record in the user's PDS (stars are worth
+/// owning). The PDS write is best-effort — the local star still lands.
 async fn toggle_star(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1671,7 +1671,7 @@ struct ReadAllQuery {
 }
 
 /// `POST /read-all` — mark every entry read for the current DID, optionally
-/// scoped to one feed (design §3: mark-all-read per feed / global).
+/// scoped to one feed (mark-all-read per feed or globally).
 async fn mark_all_read(
     State(state): State<AppState>,
     headers: HeaderMap,
