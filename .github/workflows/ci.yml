@@ -25,20 +25,33 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: every job only checks out the tree and hits package registries
+# — none push, tag, comment, or upload — so trim the default GITHUB_TOKEN to read.
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: Rust
+    # FORK-PR GUARD (applied to every job): never run untrusted fork code on the
+    # self-hosted, tailnet-connected runner — a slipped-in build.rs / proc-macro /
+    # npm lifecycle script would be RCE on the homelab. Same-repo PRs + push /
+    # dispatch only. Fork PRs get NO CI here; add a hosted ubuntu-latest lane if
+    # they should. Harmless while private (all PRs are same-repo); closes the hole
+    # before the public flip.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install stable toolchain (clippy + rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: stable  # required — SHA-pinned, so the @ref no longer selects the toolchain
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build
         run: cargo build --all-targets --locked
@@ -54,15 +67,18 @@ jobs:
 
   cargo-deny:
     name: cargo deny (licenses + bans + sources)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       # cargo-deny shells out to `cargo metadata` to build the crate graph, so
       # this job needs a Rust toolchain (cargo on PATH) even though it only runs
       # the license/ban/source gates.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable  # required — SHA-pinned ref no longer selects the toolchain
 
       # Install a pinned cargo-deny binary directly (rather than
       # EmbarkStudios/cargo-deny-action@v2, whose bundled RustSec advisory-DB
@@ -70,7 +86,7 @@ jobs:
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -85,15 +101,18 @@ jobs:
 
   cargo-audit:
     name: cargo audit (RustSec)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable  # required — SHA-pinned ref no longer selects the toolchain
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Dedicated RustSec scan of Cargo.lock. Fails the build on any known
       # vulnerability. Un-actionable transitive advisories (no fixed release, or
@@ -109,15 +128,16 @@ jobs:
 
   sidecar:
     name: OAuth sidecar
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
     defaults:
       run:
         working-directory: oauth-sidecar
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
           cache: npm
@@ -151,11 +171,12 @@ jobs:
 
   secrets:
     name: Secret scan (gitleaks)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — scans fine here now
     env:
       GITLEAKS_VERSION: 8.28.0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0  # full history so gitleaks can scan past commits too
 
