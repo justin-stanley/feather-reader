@@ -270,12 +270,19 @@ pub async fn init(config: &Config) -> Result<Pool> {
 /// if it does not exist; WAL journaling is enabled for on-disk databases and
 /// foreign keys are enforced on every connection.
 pub async fn init_url(db_url: &str) -> Result<Pool> {
+    // An in-memory DB must run on a SINGLE connection: each `:memory:` connection
+    // is a *separate* database, and a multi-connection in-memory pool can also
+    // deadlock a writer against an idle pooled connection's shared-cache table
+    // read-lock (SQLITE_LOCKED, code 262 — which `busy_timeout` does NOT retry;
+    // seen as a Linux-only flaky failure in redeem_code's UPDATE). On-disk uses
+    // WAL + a 5-connection pool as normal.
+    let is_memory = db_url.contains(":memory:");
     let mut opts = SqliteConnectOptions::from_str(db_url)
         .with_context(|| format!("invalid sqlite url: {db_url}"))?
         .create_if_missing(true)
         .foreign_keys(true);
     // WAL is a no-op / unsupported for :memory:, so only request it on-disk.
-    if !db_url.contains(":memory:") {
+    if !is_memory {
         opts = opts.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
     }
     // Under a concurrent write burst (the poller's insert_entries tx racing the
@@ -294,7 +301,7 @@ pub async fn init_url(db_url: &str) -> Result<Pool> {
         // Keep at least one connection alive so an in-memory DB isn't dropped
         // (each `:memory:` connection is a *separate* database otherwise).
         .min_connections(1)
-        .max_connections(5)
+        .max_connections(if is_memory { 1 } else { 5 })
         .connect_with(opts)
         .await
         .with_context(|| format!("failed to open sqlite pool: {db_url}"))?;
