@@ -1,5 +1,10 @@
-#!/bin/sh
+#!/bin/bash
 # FeatherReader in-container supervisor.
+#
+# Runs under bash (installed in the image) — NOT the Debian default /bin/sh
+# (dash), because the first-child-exit wait below uses bash's `wait -n`, which
+# dash does not support (it errors "Illegal option -n" and returns immediately,
+# which would tear the container down on boot).
 #
 # Two-phase startup:
 #   PHASE 1 (ROOT): fix ownership of the /data volume. A fresh Fly volume mounts
