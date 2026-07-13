@@ -646,8 +646,165 @@ pub async fn insert_entries(
         .with_context(|| format!("trimming feed {feed_id} to {max_entries_per_feed} entries"))?;
     }
 
+    // Per-feed trim above may have DELETEd entries; their ids can linger in the
+    // read_cursor exception sets (read_ids/unread_ids have no FK to entries), so
+    // scrub the orphaned ids out of THIS feed's cursors in the same transaction.
+    // Bounds id-set growth and keeps the flushed PDS record from referencing
+    // entries that no longer exist. Scoped to the one feed for cheapness.
+    if max_entries_per_feed > 0 {
+        prune_orphan_cursor_ids_tx(&mut tx, Some(feed_id)).await?;
+    }
+
     tx.commit().await.context("commit insert_entries tx")?;
     Ok(count)
+}
+
+/// Delete entries whose age exceeds the retention window — the shared cache's
+/// **rolling window**. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
+/// entry falls back to when it was fetched (never NULL) rather than being treated
+/// as infinitely old. `entry_state` cascades via its `ON DELETE CASCADE` FK.
+///
+/// After the delete, orphaned entry ids are scrubbed out of every affected feed's
+/// `read_cursor` exception sets (which have no FK to `entries`) so the id-sets do
+/// not grow without bound and the flushed PDS record never references a vanished
+/// entry. The caller (the retention sweep) should follow a non-zero return with
+/// [`reclaim`] so freed pages return to the OS. `days == 0` is a no-op (retention
+/// disabled). Returns the number of entry rows deleted.
+pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
+    if days <= 0 {
+        return Ok(0);
+    }
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
+    let res = sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
+        .bind(&cutoff)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
+    let deleted = res.rows_affected();
+
+    // Only touch cursors when rows actually went away.
+    if deleted > 0 {
+        prune_orphan_cursor_ids_tx(&mut tx, None).await?;
+    }
+
+    tx.commit().await.context("commit prune_old_entries tx")?;
+    Ok(deleted)
+}
+
+/// Scrub entry ids that no longer exist out of `read_cursor.read_ids` /
+/// `unread_ids`. `read_cursor` is keyed by `(did, feed_url)` and its id-sets have
+/// NO foreign key to `entries`, so a prune/trim that deletes entries would
+/// otherwise leave dangling ids that (a) grow the sets without bound and (b) get
+/// flushed to the PDS as references to vanished entries.
+///
+/// When `feed_id` is `Some`, only that feed's cursors are examined (the cheap
+/// path used right after a per-feed trim); `None` scans every cursor (the
+/// retention sweep, which can delete across many feeds at once). A cursor whose
+/// sets actually change is rewritten and marked `dirty` so the flusher resyncs
+/// it; unchanged cursors are left untouched (no spurious dirtying / PDS writes).
+/// Returns the number of cursor rows modified.
+async fn prune_orphan_cursor_ids_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_id: Option<i64>,
+) -> Result<u64> {
+    // The set of live entry ids we prune against. Scope to the feed's URL when a
+    // feed_id is given so we filter only that feed's cursors against that feed's
+    // entries; otherwise consider all cursors / all entries.
+    let feed_url = match feed_id {
+        Some(fid) => match feed_url_for_id_tx(tx, fid).await? {
+            Some(u) => Some(u),
+            None => return Ok(0), // feed vanished mid-tx; nothing to prune
+        },
+        None => None,
+    };
+
+    // Load the (did, feed_url, read_ids, unread_ids) of the candidate cursors.
+    let cursors: Vec<(String, String, String, String)> = match &feed_url {
+        Some(url) => sqlx::query(
+            "SELECT did, feed_url, read_ids, unread_ids FROM read_cursor WHERE feed_url = ?1",
+        )
+        .bind(url)
+        .fetch_all(&mut **tx)
+        .await
+        .context("prune_orphan_cursor_ids: load feed cursors")?,
+        None => sqlx::query("SELECT did, feed_url, read_ids, unread_ids FROM read_cursor")
+            .fetch_all(&mut **tx)
+            .await
+            .context("prune_orphan_cursor_ids: load all cursors")?,
+    }
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<String, _>("did"),
+            r.get::<String, _>("feed_url"),
+            r.get::<String, _>("read_ids"),
+            r.get::<String, _>("unread_ids"),
+        )
+    })
+    .collect();
+
+    if cursors.is_empty() {
+        return Ok(0);
+    }
+
+    let now = now_rfc3339();
+    let mut changed: u64 = 0;
+    for (did, curl, read_ids, unread_ids) in cursors {
+        // The live entry ids for THIS cursor's feed (join by URL — the cursor key).
+        let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
+            "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE f.url = ?1",
+        )
+        .bind(&curl)
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("prune_orphan_cursor_ids: live ids for {curl}"))?
+        .into_iter()
+        .collect();
+
+        let new_read = filter_id_set_to_live(&read_ids, &live);
+        let new_unread = filter_id_set_to_live(&unread_ids, &live);
+        if new_read == read_ids && new_unread == unread_ids {
+            continue; // nothing orphaned — leave the cursor (and its dirty flag) alone
+        }
+        sqlx::query(
+            "UPDATE read_cursor SET read_ids = ?3, unread_ids = ?4, dirty = 1, updated_at = ?5 \
+             WHERE did = ?1 AND feed_url = ?2",
+        )
+        .bind(&did)
+        .bind(&curl)
+        .bind(&new_read)
+        .bind(&new_unread)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("prune_orphan_cursor_ids: rewrite cursor {did}/{curl}"))?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Filter a JSON id-array string down to only ids present in `live`, returning
+/// the canonical JSON-array-of-strings form (matching [`json_id_set_toggle`]). A
+/// malformed input yields `[]`.
+fn filter_id_set_to_live(raw: &str, live: &std::collections::HashSet<i64>) -> String {
+    let ids: Vec<i64> = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .ok()
+        .map(|vals| {
+            vals.into_iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
+                .filter(|id| live.contains(id))
+                .collect()
+        })
+        .unwrap_or_default();
+    let as_strings: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    serde_json::to_string(&as_strings).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Replace the per-DID subscription projection (`sub_ref`) for `did` with
@@ -2822,6 +2979,294 @@ mod tests {
         mark_cursor_pds_created(&pool, did, feed_url).await?;
         let c = get_cursor(&pool, did, feed_url).await?.unwrap();
         assert!(c.pds_created);
+        Ok(())
+    }
+
+    // -- STORAGE HYGIENE: retention prune + orphan-id scrub -------------------
+
+    /// Count entries currently in the cache.
+    async fn count_entries(pool: &SqlitePool) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM entries")
+            .fetch_one(pool)
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn prune_old_entries_deletes_only_old_and_cascades_entry_state() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://ret.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let recent = now_rfc3339();
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // One fresh (published now), one ancient (published a year ago), and one
+        // UNDATED-but-freshly-fetched (published NULL, fetched_at now) — the last
+        // must survive because COALESCE falls back to fetched_at, not to "old".
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "fresh".into(),
+                    published: Some(recent.clone()),
+                    fetched_at: Some(recent.clone()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "ancient".into(),
+                    published: Some(ancient.clone()),
+                    fetched_at: Some(ancient.clone()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "undated-fresh".into(),
+                    published: None,
+                    fetched_at: Some(recent.clone()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        assert_eq!(count_entries(&pool).await?, 3);
+        // Subscribe so mark_read is authorized to write an entry_state row.
+        replace_sub_refs(&pool, "did:plc:reader", &[feed_id]).await?;
+
+        // Give the ancient entry an entry_state row so we can prove the FK cascade.
+        let ancient_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'ancient'")
+            .fetch_one(&pool)
+            .await?;
+        let wrote = mark_read(&pool, "did:plc:reader", ancient_id, true).await?;
+        assert!(wrote, "mark_read must write with a sub_ref in place");
+        let state_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE entry_id = ?1")
+                .bind(ancient_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(state_before, 1);
+
+        // Prune at a 90-day window: only the ancient entry is old.
+        let deleted = prune_old_entries(&pool, 90).await?;
+        assert_eq!(deleted, 1, "only the year-old entry should be pruned");
+        assert_eq!(
+            count_entries(&pool).await?,
+            2,
+            "fresh + undated-fresh survive"
+        );
+
+        // The surviving guids are exactly the two fresh ones.
+        let surviving: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(surviving, vec!["fresh", "undated-fresh"]);
+
+        // entry_state for the deleted entry cascaded away via the FK.
+        let state_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE entry_id = ?1")
+                .bind(ancient_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(state_after, 0, "entry_state must cascade on entry delete");
+
+        // days == 0 disables retention (no-op).
+        assert_eq!(prune_old_entries(&pool, 0).await?, 0);
+        assert_eq!(count_entries(&pool).await?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_removes_orphan_ids_from_read_cursor() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:reader";
+        let feed_url = "https://orphan.example/feed.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // Caller subscribes so mark-read is authorized to project into the cursor.
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let recent = now_rfc3339();
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "old".into(),
+                    published: Some(ancient.clone()),
+                    fetched_at: Some(ancient.clone()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "new".into(),
+                    published: Some(recent.clone()),
+                    fetched_at: Some(recent.clone()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        let old_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'old'")
+            .fetch_one(&pool)
+            .await?;
+        let new_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'new'")
+            .fetch_one(&pool)
+            .await?;
+
+        // Mark BOTH read — the cursor's read_ids now references both entry ids.
+        mark_read(&pool, did, old_id, true).await?;
+        mark_read(&pool, did, new_id, true).await?;
+        let before = get_cursor(&pool, did, feed_url).await?.unwrap();
+        let ids_before: Vec<String> = serde_json::from_str(&before.read_ids)?;
+        assert!(ids_before.contains(&old_id.to_string()));
+        assert!(ids_before.contains(&new_id.to_string()));
+
+        // Prune the old entry — its id must be scrubbed from the cursor's id-set.
+        let deleted = prune_old_entries(&pool, 90).await?;
+        assert_eq!(deleted, 1);
+        let after = get_cursor(&pool, did, feed_url).await?.unwrap();
+        let ids_after: Vec<String> = serde_json::from_str(&after.read_ids)?;
+        assert_eq!(
+            ids_after,
+            vec![new_id.to_string()],
+            "orphaned (deleted) entry id must be removed; live id kept"
+        );
+        // The scrub re-dirties the cursor so the flusher resyncs the PDS record.
+        assert!(
+            after.dirty,
+            "cursor must be marked dirty after orphan scrub"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_entries_trim_scrubs_orphan_cursor_ids() -> Result<()> {
+        // The per-feed max_entries trim path must ALSO scrub orphaned cursor ids.
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:reader";
+        let feed_url = "https://trim.example/feed.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        // Two entries, cap of 2 for now (no trim yet).
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "a".into(),
+                    published: Some("2026-01-01T00:00:00Z".into()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "b".into(),
+                    published: Some("2026-01-02T00:00:00Z".into()),
+                    ..Default::default()
+                },
+            ],
+            2,
+        )
+        .await?;
+        let a_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'a'")
+            .fetch_one(&pool)
+            .await?;
+        mark_read(&pool, did, a_id, true).await?;
+
+        // Insert a newer entry with cap=1 → the oldest ('a') is trimmed away.
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "c".into(),
+                published: Some("2026-01-03T00:00:00Z".into()),
+                ..Default::default()
+            }],
+            1,
+        )
+        .await?;
+        // 'a' is gone.
+        let a_still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE guid = 'a'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(a_still, 0, "oldest entry trimmed by the per-feed cap");
+
+        // The cursor no longer references the trimmed id.
+        let cursor = get_cursor(&pool, did, feed_url).await?.unwrap();
+        let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
+        assert!(
+            !ids.contains(&a_id.to_string()),
+            "trimmed entry id must be scrubbed from the cursor"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_and_reclaim_drops_db_size() -> Result<()> {
+        // On-disk DB so VACUUM has a file to shrink.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-prune-{}.db", std::process::id()));
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://bulk.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let entries: Vec<NewEntry> = (0..2000)
+            .map(|i| NewEntry {
+                guid: format!("guid-{i}"),
+                content_html: Some("<p>".to_string() + &"x".repeat(400) + "</p>"),
+                published: Some(ancient.clone()),
+                fetched_at: Some(ancient.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        let full = db_size_bytes(&pool).await?;
+        assert!(full > 0);
+
+        // A retention sweep prunes every (year-old) entry, then reclaim shrinks.
+        let deleted = prune_old_entries(&pool, 90).await?;
+        assert_eq!(deleted, 2000);
+        reclaim(&pool).await?;
+        let after = db_size_bytes(&pool).await?;
+        assert!(
+            after < full,
+            "prune + reclaim must shrink db_size_bytes: {after} !< {full}"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         Ok(())
     }
 }

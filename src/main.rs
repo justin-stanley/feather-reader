@@ -47,6 +47,12 @@ async fn main() -> Result<()> {
         .await
         .context("initializing the SQLite store")?;
 
+    // Startup safety: surface the effective DB-size watermark and warn the
+    // operator if it can't actually protect the volume (watermark >= free space
+    // means the disk fills before the poller ever pauses). Best-effort; never
+    // fatal.
+    check_watermark_vs_disk(&config);
+
     // Seed the closed-beta admin bootstrap: every DID on the ALLOWED_DIDS
     // admin seed gets a beta_access seat so a fresh instance always has its
     // operator(s) inside the invite gate and able to mint codes. Idempotent.
@@ -103,6 +109,88 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Startup safety check for the DB-size watermark vs. the actual DB volume.
+///
+/// The watermark (`FEATHERREADER_DB_SIZE_WATERMARK_BYTES`, default 2 GiB) is what
+/// pauses new polling before the disk fills. But its default is bigger than a
+/// common small volume (a 1 GB box fills first), so on such a box the watermark
+/// never trips and can't protect the disk. This logs the effective watermark at
+/// startup and, on unix, best-effort `statvfs(3)`s the DB's filesystem and WARNS
+/// when the watermark is at/above the available space — telling the operator to
+/// set it below the volume size. It never changes the default (the deploy runbook
+/// sets it per-volume) and never fails startup.
+fn check_watermark_vs_disk(config: &Config) {
+    let watermark = config.db_size_watermark_bytes;
+    if watermark <= 0 {
+        info!("DB-size watermark disabled (0): the poller will not pause on disk pressure");
+        return;
+    }
+    info!(
+        watermark_bytes = watermark,
+        db = %config.db_path.display(),
+        "DB-size watermark effective (poller pauses new fetches at/above this)"
+    );
+
+    match available_disk_bytes(&config.db_path) {
+        Some(avail) if watermark as u64 >= avail => {
+            tracing::warn!(
+                watermark_bytes = watermark,
+                available_bytes = avail,
+                db = %config.db_path.display(),
+                "DB-size watermark is >= free space on its volume: it cannot protect the disk \
+                 (the volume fills before the poller pauses). Set \
+                 FEATHERREADER_DB_SIZE_WATERMARK_BYTES BELOW the volume size."
+            );
+        }
+        Some(avail) => info!(
+            available_bytes = avail,
+            "DB volume free space checked; watermark below it"
+        ),
+        None => debug_no_statvfs(),
+    }
+}
+
+/// Log that the disk-headroom check was skipped (no `statvfs`, or a non-unix
+/// target). The effective watermark was already logged, which is the minimum the
+/// task requires when `statvfs` is unavailable.
+fn debug_no_statvfs() {
+    info!(
+        "could not read DB volume free space (statvfs unavailable); watermark value logged above"
+    );
+}
+
+/// Best-effort available bytes on the filesystem holding `path`, via `statvfs(3)`.
+/// `None` when the platform has no `statvfs` or the call fails. Uses the parent
+/// directory when `path` (the DB file) may not exist yet.
+#[cfg(unix)]
+fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    // statvfs the DB file's directory — it exists even before the DB file is
+    // created, and reports the same filesystem.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let target = dir.unwrap_or_else(|| std::path::Path::new("."));
+    let cstr = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `stat` is written by statvfs on success; we only read it after a 0
+    // return. `cstr` is a valid NUL-terminated C string for the duration.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cstr.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    // Available blocks to a non-root process * fragment size. Cast through u128 to
+    // avoid overflow on 32-bit `f_frsize`/`f_bavail` widths, then clamp.
+    let frsize = stat.f_frsize as u128;
+    let bavail = stat.f_bavail as u128;
+    Some((frsize.saturating_mul(bavail)).min(u64::MAX as u128) as u64)
+}
+
+/// Non-unix fallback: no portable `statvfs`, so the headroom comparison is
+/// skipped (the effective watermark is still logged by the caller).
+#[cfg(not(unix))]
+fn available_disk_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 /// Install the tracing subscriber. `RUST_LOG` overrides the default `info`

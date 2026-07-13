@@ -80,6 +80,12 @@ const DEFAULT_FLUSH_DEBOUNCE: Duration = Duration::from_secs(60);
 /// this is just housekeeping. Overridable via `FEATHERREADER_CODE_SWEEP_SECS`.
 const DEFAULT_CODE_SWEEP: Duration = Duration::from_secs(3600);
 
+/// How often the retention sweep runs, deleting shared-cache entries older than
+/// `config.retention_days`. Daily is plenty — the window is coarse (days) and the
+/// per-feed `max_entries_per_feed` trim already bounds any single feed on every
+/// poll. Overridable via `FEATHERREADER_RETENTION_SWEEP_SECS`.
+const DEFAULT_RETENTION_SWEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Read a `Duration` (in seconds) from the environment, or fall back.
 fn env_duration_secs(key: &str, default: Duration) -> Duration {
     match std::env::var(key)
@@ -153,9 +159,14 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_code_sweeper(state, shutdown).await })
     };
+    let retention = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_retention_sweeper(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, sweeper, flusher]
+    vec![poller, sweeper, retention, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -448,6 +459,62 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
                     Ok(0) => debug!("invite-code TTL sweeper: nothing to expire"),
                     Ok(n) => info!(expired = n, "invite-code TTL sweeper: expired codes"),
                     Err(err) => error!(%err, "invite-code TTL sweeper: sweep failed"),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retention sweeper
+// ---------------------------------------------------------------------------
+
+/// The retention sweep loop. On a periodic tick (daily by default) it deletes
+/// shared-cache entries older than `config.retention_days`
+/// ([`store::prune_old_entries`]) — the mechanism that makes the README/wiki
+/// "90-day rolling window" claim TRUE — and, after a sweep that actually deleted
+/// rows, calls [`store::reclaim`] so the freed pages return to the OS (otherwise
+/// the file never shrinks and the DB-size watermark can stay latched). Orphaned
+/// entry ids are scrubbed from the affected `read_cursor` id-sets inside the
+/// prune itself.
+///
+/// `retention_days == 0` disables retention entirely: the loop logs once and
+/// returns, spawning no ticker. Failures are logged and never kill the loop — a
+/// missed sweep just means the window is enforced on the next tick.
+pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let days = state.config.retention_days as i64;
+    if days <= 0 {
+        info!("retention sweeper: retention_days=0, retention disabled (no rolling window)");
+        return;
+    }
+    let period = env_duration_secs(
+        "FEATHERREADER_RETENTION_SWEEP_SECS",
+        DEFAULT_RETENTION_SWEEP,
+    );
+    info!(retention_days = days, ?period, "retention sweeper started");
+
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first `tick()` fires immediately — sweep on startup so a long-stale
+    // cache is trimmed promptly rather than after a full period.
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("retention sweeper: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => {
+                match store::prune_old_entries(&state.db, days).await {
+                    Ok(0) => debug!("retention sweeper: nothing past the retention window"),
+                    Ok(n) => {
+                        info!(pruned = n, retention_days = days, "retention sweeper: pruned old entries");
+                        // Return the freed pages to the OS so the file actually
+                        // shrinks and the DB-size watermark can fall back.
+                        if let Err(err) = store::reclaim(&state.db).await {
+                            warn!(%err, "retention sweeper: reclaim after prune failed");
+                        }
+                    }
+                    Err(err) => error!(%err, "retention sweeper: prune failed"),
                 }
             }
         }
