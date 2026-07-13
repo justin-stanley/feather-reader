@@ -63,7 +63,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 # askama 0.16 dropped the separate `askama_axum` integration crate (deprecated,
 # pinned to askama <0.13). `askama_web` provides the axum IntoResponse glue.
 askama = "0.16"
-askama_web = { version = "0.14", features = ["axum-0.8"] }
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 
 # --- serde ---------------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
