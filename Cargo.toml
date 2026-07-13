@@ -30,7 +30,7 @@ tokio = { version = "1.45", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }
 # fs = ServeDir/ServeFile for embedded/static assets; trace = request tracing
 # layer; set-header = the global security-header layer (CSP + friends).
-tower-http = { version = "0.6", features = ["fs", "trace", "set-header"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "set-header"] }
 
 # --- HTTP client (feed fetch) -------------------------------------------
 # default-features off to drop the OpenSSL/native-tls path; rustls keeps the
