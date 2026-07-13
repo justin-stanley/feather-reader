@@ -248,8 +248,12 @@ impl Saved {
 /// feed (a hash of the feed URL), so there is one record per feed with a stable
 /// key, NOT one record per article.
 ///
-/// `feedUrl` + `readThrough` + `updatedAt` are required; the two capped id-sets
-/// carry out-of-order reads and explicit mark-unread exceptions.
+/// `feedUrl` + `updatedAt` are required; `readThrough` is OPTIONAL — it is a
+/// water-mark ("every entry seen/published `<=` this is read"), so it is written
+/// only once a real high-water-mark exists. Omitting it (rather than synthesizing
+/// a flush-time value) means a brand-new cursor asserts nothing about the backlog:
+/// only the explicit `readIds` mark entries read. The two capped id-sets carry
+/// out-of-order reads and explicit mark-unread exceptions.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ReadState {
     /// The `$type` NSID discriminator; always [`nsid::READ_STATE`].
@@ -261,9 +265,14 @@ pub struct ReadState {
     pub feed_url: String,
 
     /// High-water-mark: every entry with seen/published time <= this is READ.
-    /// Required.
-    #[serde(rename = "readThrough")]
-    pub read_through: String,
+    /// **Optional** — omitted from the record when no local high-water-mark
+    /// exists yet, so a fresh cursor never implicitly marks the backlog read.
+    #[serde(
+        rename = "readThrough",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub read_through: Option<String>,
 
     /// Entries newer than `readThrough` that are ALSO read (out-of-order reads).
     /// Capped at 1000 by the lexicon; empty sets are omitted from the record.
@@ -293,15 +302,19 @@ impl ReadState {
     pub const MAX_IDS: usize = 1000;
 
     /// Construct a minimal read cursor with only the required fields.
+    ///
+    /// `read_through` is optional: pass `None` for a cursor that has no local
+    /// high-water-mark yet, so the record omits `readThrough` entirely rather than
+    /// synthesizing a flush-time value that would mark the backlog read.
     pub fn new(
         feed_url: impl Into<String>,
-        read_through: impl Into<String>,
+        read_through: Option<String>,
         updated_at: impl Into<String>,
     ) -> Self {
         Self {
             r#type: nsid::READ_STATE.to_string(),
             feed_url: feed_url.into(),
-            read_through: read_through.into(),
+            read_through,
             read_ids: Vec::new(),
             unread_ids: Vec::new(),
             updated_at: updated_at.into(),
@@ -435,7 +448,7 @@ mod tests {
         });
         let rs: ReadState = serde_json::from_value(value.clone()).expect("deserialize");
         assert_eq!(rs.feed_url, "https://example.com/feed.xml");
-        assert_eq!(rs.read_through, "2026-07-12T00:00:00.000Z");
+        assert_eq!(rs.read_through.as_deref(), Some("2026-07-12T00:00:00.000Z"));
         assert_eq!(rs.read_ids, vec!["entry-a", "entry-b"]);
         assert_eq!(rs.unread_ids, vec!["entry-c"]);
         assert_eq!(serde_json::to_value(&rs).expect("serialize"), value);
@@ -445,7 +458,7 @@ mod tests {
     fn read_state_minimal_omits_empty_id_sets() {
         let rs = ReadState::new(
             "https://example.com/feed.xml",
-            "2026-07-12T00:00:00.000Z",
+            Some("2026-07-12T00:00:00.000Z".to_string()),
             "2026-07-12T01:00:00.000Z",
         );
         let back = serde_json::to_value(&rs).expect("serialize");
@@ -458,5 +471,29 @@ mod tests {
                 "updatedAt": "2026-07-12T01:00:00.000Z"
             })
         );
+    }
+
+    #[test]
+    fn read_state_omits_read_through_when_none() {
+        // A brand-new cursor with no high-water-mark must NOT synthesize one:
+        // `readThrough` is absent entirely so the backlog is not implicitly read.
+        let rs = ReadState::new(
+            "https://example.com/feed.xml",
+            None,
+            "2026-07-12T01:00:00.000Z",
+        );
+        let back = serde_json::to_value(&rs).expect("serialize");
+        assert!(back.get("readThrough").is_none());
+        assert_eq!(
+            back,
+            json!({
+                "$type": "community.lexicon.rss.readState",
+                "feedUrl": "https://example.com/feed.xml",
+                "updatedAt": "2026-07-12T01:00:00.000Z"
+            })
+        );
+        // And a record without readThrough round-trips back to None.
+        let parsed: ReadState = serde_json::from_value(back).expect("deserialize");
+        assert_eq!(parsed.read_through, None);
     }
 }
