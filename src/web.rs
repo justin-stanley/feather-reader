@@ -830,12 +830,15 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
     let subs = match state.sidecar.list_subscriptions_sorted(did).await {
         Ok(s) => s,
         Err(err) => {
-            warn!(%err, %did, "could not list PDS subscriptions; showing local cache only");
-            // Fall back: synthesize subs from every cached feed.
-            let feeds = store::due_feeds(pool, &now_rfc3339(), i64::MAX)
-                .await
-                .unwrap_or_default();
-            let out: Vec<ResolvedSub> = feeds
+            warn!(%err, %did, "could not list PDS subscriptions; showing this DID's cached subscriptions only");
+            // Fail CLOSED: the PDS is the source of truth for what this DID
+            // follows. When it is unreachable we must NOT widen the caller's
+            // authorization surface. Serve from the DID's OWN last-known
+            // `sub_ref` projection (its own feeds, possibly stale) and leave
+            // `sub_ref` untouched — never synthesize from every cached feed,
+            // which would grant cross-tenant read+mutate during any outage.
+            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_default();
+            return feeds
                 .into_iter()
                 .map(|f| ResolvedSub {
                     rkey: String::new(),
@@ -843,10 +846,6 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                     feed: Some(f),
                 })
                 .collect();
-            // Sync the per-DID subscription projection so the scoped reads
-            // still work when the PDS is unreachable (degrade to cache).
-            sync_sub_refs(pool, did, &out).await;
-            return out;
         }
     };
 
@@ -2623,6 +2622,21 @@ async fn import_opml(
     };
     let mut trimmed_over_cap: usize = 0;
 
+    // Global feeds ceiling: an OPML import must not blow past the shared cache
+    // ceiling any more than the single-add path may. Seed the remaining global
+    // headroom (cap − current feeds) once, and only a BRAND-NEW feed URL (one
+    // not already cached) consumes it. Existing/duplicate URLs add no row and
+    // are always allowed. Feeds past the ceiling are TRIMMED and reported.
+    // `<= 0` disables the ceiling.
+    let feeds_cap = state.config.max_feeds_global;
+    let mut global_headroom: Option<i64> = if feeds_cap > 0 {
+        let existing = store::count_feeds(pool).await.unwrap_or(0);
+        Some((feeds_cap - existing).max(0))
+    } else {
+        None
+    };
+    let mut trimmed_over_global: usize = 0;
+
     let mut subs = Vec::with_capacity(feeds.len());
     let mut skipped_private: Vec<String> = Vec::new();
     for f in &feeds {
@@ -2645,6 +2659,34 @@ async fn import_opml(
                 trimmed_over_cap += 1;
                 continue;
             }
+        }
+
+        // Global ceiling: a brand-new feed URL consumes global headroom. Once
+        // it's exhausted, refuse to cache further NEW feeds (existing URLs are
+        // free — they add no row). Checked before decrementing the per-DID
+        // headroom so a dropped feed doesn't burn the caller's own quota.
+        let is_new = match store::get_feed_by_url(pool, &f.feed_url).await {
+            Ok(existing) => existing.is_none(),
+            // On a lookup error, treat as existing (don't consume global
+            // headroom) but still allow the upsert to proceed.
+            Err(err) => {
+                warn!(%err, feed = %f.feed_url, "get_feed_by_url failed during OPML global-cap check");
+                false
+            }
+        };
+        if is_new {
+            if let Some(g) = global_headroom.as_mut() {
+                if *g <= 0 {
+                    trimmed_over_global += 1;
+                    continue;
+                }
+                *g -= 1;
+            }
+        }
+
+        // Passed both caps: consume the per-DID headroom now that the feed is
+        // actually being imported.
+        if let Some(h) = headroom.as_mut() {
             *h -= 1;
         }
 
@@ -2680,6 +2722,11 @@ async fn import_opml(
     if trimmed_over_cap > 0 {
         flash.push_str(&format!(
             ". {trimmed_over_cap} feed(s) not imported: your subscription limit ({sub_cap}) was reached."
+        ));
+    }
+    if trimmed_over_global > 0 {
+        flash.push_str(&format!(
+            ". {trimmed_over_global} feed(s) not imported: this instance is at its feed capacity right now."
         ));
     }
     if !skipped_private.is_empty() {
@@ -3996,5 +4043,298 @@ mod tests {
             .starts_with("/manage"));
         // Nothing deleted.
         assert!(store::has_beta_access(&state.db, did).await.unwrap());
+    }
+
+    /// PDS-outage authorization: when the sidecar is unreachable (as it is in
+    /// this harness — the default sidecar URL is not served), a DID must STILL
+    /// be unable to read or mutate an entry in a feed it does not subscribe to.
+    /// This guards the `resolve_subscriptions` fallback: it must fail CLOSED
+    /// (serve only the DID's own `sub_ref`), never widen the caller's surface to
+    /// every cached feed.
+    #[tokio::test]
+    async fn pds_outage_does_not_widen_cross_did_access() {
+        let did_a = "did:plc:aaaa";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did_a, None, "test", None)
+            .await
+            .unwrap();
+
+        // Shared cache: feed_a (A subscribes) + feed_b (A does NOT). An entry
+        // lives in feed_b — the one A must never touch during the outage.
+        let feed_a = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://a.example/feed.xml".to_string(),
+                title: Some("A".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed_b = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://b.example/feed.xml".to_string(),
+                title: Some("B".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_b,
+            &[store::NewEntry {
+                guid: "b-1".to_string(),
+                url: Some("https://b.example/1".to_string()),
+                title: Some("B one".to_string()),
+                published: Some("2026-07-11T00:00:00Z".to_string()),
+                content_html: Some("<p>secret B body</p>".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        // A subscribes ONLY to feed_a.
+        store::replace_sub_refs(&state.db, did_a, &[feed_a])
+            .await
+            .unwrap();
+        // Read B's entry id via a transient sub_ref, then drop it so only the
+        // shared cache holds B's entry (no DID subscribes to feed_b anymore).
+        store::replace_sub_refs(&state.db, "did:plc:bbbb", &[feed_b])
+            .await
+            .unwrap();
+        let b_entry_id = store::entries_for_feed(&state.db, "did:plc:bbbb", feed_b)
+            .await
+            .unwrap()[0]
+            .id;
+        store::replace_sub_refs(&state.db, "did:plc:bbbb", &[])
+            .await
+            .unwrap();
+
+        let cookie = session_cookie(&state, did_a, None);
+        let app = router(state.clone());
+
+        // GET /entries/{b} as A → 404 even during the outage.
+        let get_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/entries/{b_entry_id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get_b.status(),
+            StatusCode::NOT_FOUND,
+            "A must not read B's entry during a PDS outage"
+        );
+
+        // POST /entries/{b}/read as A → 404, and no entry_state row is written.
+        let read_b = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{b_entry_id}/read"))
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("read=true"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_b.status(),
+            StatusCode::NOT_FOUND,
+            "A must not mark B's entry read during a PDS outage"
+        );
+
+        // The fallback must NOT have widened A's sub_ref to feed_b.
+        let a_feed_ids: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM sub_ref WHERE did = ?1")
+            .bind(did_a)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_feed_ids,
+            vec![feed_a],
+            "outage fallback must not add feeds A never subscribed to"
+        );
+        // And B's entry has zero read-state (A's attempt did not mutate).
+        let es_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND entry_id = ?2")
+                .bind(did_a)
+                .bind(b_entry_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
+    }
+
+    /// Build an [`AppState`] over a fresh in-memory DB with explicit feed caps,
+    /// seeding `did` a beta seat + session-capable state.
+    async fn test_state_with_caps(
+        did: &str,
+        max_subs_per_did: i64,
+        max_feeds_global: i64,
+    ) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let config = Config {
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 100,
+            max_subs_per_did,
+            max_feeds_global,
+            ..Config::default()
+        };
+        store::grant_access(&db, did, None, "test", None)
+            .await
+            .unwrap();
+        AppState::new(config, db).unwrap()
+    }
+
+    /// An OPML document with `n` distinct public feeds.
+    fn opml_with_feeds(n: usize) -> String {
+        let mut outlines = String::new();
+        for i in 0..n {
+            outlines.push_str(&format!(
+                "<outline type=\"rss\" text=\"F{i}\" xmlUrl=\"https://f{i}.example/feed.xml\"/>\n"
+            ));
+        }
+        format!(
+            "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n{outlines}</body></opml>"
+        )
+    }
+
+    /// OPML bulk import must honour the GLOBAL feeds ceiling: importing more
+    /// distinct new feeds than the shared cache can hold caches only up to the
+    /// ceiling — the rest are trimmed. (Regression: the import loop previously
+    /// bypassed `max_feeds_global` entirely.)
+    #[tokio::test]
+    async fn opml_import_enforces_global_feeds_ceiling() {
+        let did = "did:plc:importer";
+        // Cap the shared cache at 3 feeds; import 10 distinct new ones.
+        let state = test_state_with_caps(did, 0, 3).await;
+        let cookie = session_cookie(&state, did, None);
+        let (ct, body) = opml_multipart(opml_with_feeds(10).as_bytes());
+        let app = router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let feeds = store::count_feeds(&state.db).await.unwrap();
+        assert!(
+            feeds <= 3,
+            "OPML import blew past the global ceiling: {feeds} feeds cached with cap=3"
+        );
+    }
+
+    /// OPML bulk import must honour the PER-DID subscription cap: a DID at its
+    /// cap imports zero new feeds.
+    #[tokio::test]
+    async fn opml_import_enforces_per_did_cap() {
+        let did = "did:plc:capped";
+        // Per-DID cap 2, global unlimited. Pre-seed the DID at its cap.
+        let state = test_state_with_caps(did, 2, 0).await;
+        let existing_a = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://have-a.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let existing_b = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://have-b.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[existing_a, existing_b])
+            .await
+            .unwrap();
+        let before = store::count_feeds(&state.db).await.unwrap();
+
+        let cookie = session_cookie(&state, did, None);
+        let (ct, body) = opml_multipart(opml_with_feeds(10).as_bytes());
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        // Headroom was 0 → no new feeds imported into the shared cache.
+        let after = store::count_feeds(&state.db).await.unwrap();
+        assert_eq!(after, before, "over-cap DID imported new feeds anyway");
+    }
+
+    /// Single-add per-DID cap: a DID at its subscription cap is refused before
+    /// any fetch, with the limit flash.
+    #[tokio::test]
+    async fn single_add_enforces_per_did_cap() {
+        let did = "did:plc:subcapped";
+        let state = test_state_with_caps(did, 1, 0).await;
+        let f = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://have.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[f]).await.unwrap();
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("url=https://another.example/feed.xml"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("Subscription%20limit%20reached"),
+            "expected sub-limit flash, got {loc}"
+        );
     }
 }
