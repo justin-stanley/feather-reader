@@ -2228,6 +2228,70 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: an UNDATED entry (NULL `published`) that was fetched most
+    /// recently must NOT be evicted in favour of an older *dated* entry. The
+    /// trim orders by `COALESCE(published, fetched_at) DESC`; under the old
+    /// `ORDER BY published DESC` a NULL-published row sorts LAST and is dropped
+    /// first even when it is the freshest thing in the feed.
+    #[tokio::test]
+    async fn insert_entries_trims_keeps_fresh_undated_over_stale_dated() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://undated.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Two OLD dated entries (fetched long ago), plus one UNDATED entry
+        // fetched most recently. Cap = 2, so exactly one row must be evicted.
+        let batch = vec![
+            NewEntry {
+                guid: "old-dated-1".to_string(),
+                title: Some("Old A".to_string()),
+                published: Some("2026-07-01T00:00:00Z".to_string()),
+                fetched_at: Some("2026-07-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+            NewEntry {
+                guid: "old-dated-2".to_string(),
+                title: Some("Old B".to_string()),
+                published: Some("2026-07-02T00:00:00Z".to_string()),
+                fetched_at: Some("2026-07-02T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+            NewEntry {
+                guid: "fresh-undated".to_string(),
+                title: Some("Fresh undated".to_string()),
+                published: None,
+                fetched_at: Some("2026-07-11T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        ];
+        insert_entries(&pool, feed_id, &batch, 2).await?;
+
+        let did = "did:plc:undated";
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let kept = entries_for_feed(&pool, did, feed_id).await?;
+        assert_eq!(kept.len(), 2, "over-cap feed trimmed to 2 entries");
+        let guids: Vec<&str> = kept.iter().map(|e| e.guid.as_str()).collect();
+        assert!(
+            guids.contains(&"fresh-undated"),
+            "the freshly-fetched undated entry must survive the trim, kept: {guids:?}"
+        );
+        assert!(
+            guids.contains(&"old-dated-2"),
+            "the newer dated entry survives; the OLDEST dated entry is the one evicted, kept: {guids:?}"
+        );
+        assert!(
+            !guids.contains(&"old-dated-1"),
+            "the oldest dated entry is the one that should be evicted, kept: {guids:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn db_size_is_positive_and_grows() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;

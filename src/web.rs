@@ -4430,4 +4430,416 @@ mod tests {
             "expected sub-limit flash, got {loc}"
         );
     }
+
+    /// Reader-view mark-read (a request tagged `X-FR-Reader: 1`) must return the
+    /// out-of-band action-bar fragment with FRESHLY re-read state so a second
+    /// keypress reverses the toggle: `hx-swap-oob="outerHTML"` is present, and
+    /// the hidden `read` input + `aria-pressed` reflect the NEW state. The list
+    /// view (no reader header) instead swaps the row. This guards the reader OOB
+    /// toggle wiring, which had no test.
+    #[tokio::test]
+    async fn reader_mark_read_returns_oob_actionbar_with_flipped_state() {
+        let did = "did:plc:reader";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://reader.example/feed.xml".to_string(),
+                title: Some("Reader".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed,
+            &[store::NewEntry {
+                guid: "r-1".to_string(),
+                url: Some("https://reader.example/1".to_string()),
+                title: Some("Article".to_string()),
+                published: Some("2026-07-11T00:00:00Z".to_string()),
+                content_html: Some("<p>body</p>".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        let entry_id = store::entries_for_feed(&state.db, did, feed).await.unwrap()[0].id;
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+
+        // Reader-tagged mark-read → OOB action-bar fragment, entry now READ.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{entry_id}/read"))
+                    .header(header::COOKIE, cookie.clone())
+                    .header("HX-Request", "true")
+                    .header("X-FR-Reader", "1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("read=true"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            html.contains("hx-swap-oob=\"outerHTML\""),
+            "reader response must be an OOB swap: {html}"
+        );
+        assert!(
+            html.contains(r#"id="entry-actionbar""#),
+            "reader response must be the action-bar fragment: {html}"
+        );
+        // Now READ: the read button reflects it (aria-pressed=true) and the
+        // hidden value flips to `false` so the next tap marks it UNREAD.
+        assert!(
+            html.contains(r#"aria-pressed="true""#),
+            "read button must show pressed after marking read: {html}"
+        );
+        assert!(
+            html.contains(r#"name="read" value="false""#),
+            "hidden read value must flip to false so a second tap reverses: {html}"
+        );
+
+        // A second reader mark-read (submitting the flipped `read=false`) marks
+        // it UNREAD again — the toggle reverses.
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{entry_id}/read"))
+                    .header(header::COOKIE, cookie)
+                    .header("HX-Request", "true")
+                    .header("X-FR-Reader", "1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("read=false"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let bytes2 = axum::body::to_bytes(resp2.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html2 = String::from_utf8(bytes2.to_vec()).unwrap();
+        assert!(
+            html2.contains(r#"aria-pressed="false""#),
+            "read button must show un-pressed after reversing: {html2}"
+        );
+        assert!(
+            html2.contains(r#"name="read" value="true""#),
+            "hidden read value must flip back to true: {html2}"
+        );
+    }
+
+    /// The LIST view (no `X-FR-Reader` header) swaps the row, not the OOB
+    /// action-bar — the counterpart to the reader-OOB test above.
+    #[tokio::test]
+    async fn list_mark_read_returns_row_not_oob_actionbar() {
+        let did = "did:plc:listv";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://list.example/feed.xml".to_string(),
+                title: Some("List".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed,
+            &[store::NewEntry {
+                guid: "l-1".to_string(),
+                url: Some("https://list.example/1".to_string()),
+                title: Some("Article".to_string()),
+                published: Some("2026-07-11T00:00:00Z".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        let entry_id = store::entries_for_feed(&state.db, did, feed).await.unwrap()[0].id;
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{entry_id}/read"))
+                    .header(header::COOKIE, cookie)
+                    .header("HX-Request", "true")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("read=true"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !html.contains("hx-swap-oob"),
+            "list-view response must NOT be an OOB swap: {html}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename parity (POST /subscriptions/{rkey}/rename)
+    // -----------------------------------------------------------------------
+
+    /// A rename that points at a BRAND-NEW feed URL while the shared cache is at
+    /// its global ceiling must be refused (capacity flash) and must NOT insert a
+    /// new `feeds` row — parity with add_subscription's global-cap guard, so a
+    /// rename loop can't inflate the shared cache past the cap.
+    #[tokio::test]
+    async fn rename_to_new_url_refused_at_global_feeds_cap() {
+        let did = "did:plc:renamer";
+        // Global cap 1; pre-fill it with one feed so headroom is 0.
+        let state = test_state_with_caps(did, 0, 1).await;
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://existing.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let before = store::count_feeds(&state.db).await.unwrap();
+        assert_eq!(before, 1);
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rkey123/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // A URL not in the cache → would be a NEW feeds row.
+                    .body(Body::from(
+                        "url=https://brand-new.example/feed.xml&title=Renamed",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("feed%20capacity"),
+            "expected the feed-capacity flash, got {loc}"
+        );
+        // No new feeds row was inserted.
+        let after = store::count_feeds(&state.db).await.unwrap();
+        assert_eq!(
+            after, before,
+            "rename inflated the shared cache past the cap"
+        );
+    }
+
+    /// A rename to an EXISTING URL adds no row, so it is allowed even at the
+    /// global cap (only new URLs are gated) — the other half of the guard.
+    #[tokio::test]
+    async fn rename_to_existing_url_allowed_at_global_feeds_cap() {
+        let did = "did:plc:renamer2";
+        let state = test_state_with_caps(did, 0, 1).await;
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://existing.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let before = store::count_feeds(&state.db).await.unwrap();
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rkey123/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https://existing.example/feed.xml&title=Retitled",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            loc, "/",
+            "retitle of an existing feed must succeed, got {loc}"
+        );
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            before,
+            "retitle must not add a feeds row"
+        );
+    }
+
+    /// A rename with a blank/empty `url` must write NOTHING — no `feeds` row and
+    /// no PDS update — and just redirect home. Guards the empty-URL early return.
+    #[tokio::test]
+    async fn rename_with_blank_url_writes_nothing() {
+        let did = "did:plc:renamer3";
+        let state = test_state_with_caps(did, 0, 0).await;
+        let before = store::count_feeds(&state.db).await.unwrap();
+        assert_eq!(before, 0);
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rkey123/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // Whitespace-only URL trims to empty.
+                    .body(Body::from("url=%20%20&title=Nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/",
+        );
+        // Nothing was cached.
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            0,
+            "blank-URL rename wrote a junk feeds row"
+        );
+    }
+
+    /// Folder pre-selection regression: the manage rename row must mark the
+    /// feed's CURRENT folder `<option>` as `selected`, so an untouched Save
+    /// re-submits the current folder instead of silently un-foldering the feed.
+    /// A loose (un-foldered) feed must mark "No folder" selected instead. Renders
+    /// `ManageTemplate` directly so no PDS/sidecar round-trip is needed.
+    #[test]
+    fn manage_rename_row_preselects_current_folder() {
+        let nav = Nav {
+            handle: "@reader.example".to_string(),
+            avatar: "RE".to_string(),
+            view: "unread".to_string(),
+            scope_qs: String::new(),
+            folders: Vec::new(),
+            loose_feeds: Vec::new(),
+            manage_active: true,
+        };
+        let folder_options = vec![
+            FolderOption {
+                uri: "at://did:plc:x/app.folder/work".to_string(),
+                name: "Work".to_string(),
+            },
+            FolderOption {
+                uri: "at://did:plc:x/app.folder/fun".to_string(),
+                name: "Fun".to_string(),
+            },
+        ];
+        // A foldered feed (in "Work") and a loose feed (no folder), each with a
+        // non-empty rkey so the rename form renders.
+        let foldered = FeedView {
+            rkey: "sub-foldered".to_string(),
+            url: "https://work.example/feed.xml".to_string(),
+            title: "Work Feed".to_string(),
+            unread: 0,
+            selected: false,
+            folder: Some("at://did:plc:x/app.folder/work".to_string()),
+        };
+        let loose = FeedView {
+            rkey: "sub-loose".to_string(),
+            url: "https://loose.example/feed.xml".to_string(),
+            title: "Loose Feed".to_string(),
+            unread: 0,
+            selected: false,
+            folder: None,
+        };
+        let tmpl = ManageTemplate {
+            version: VERSION,
+            repo_url: REPO_URL,
+            kofi_url: KOFI_URL,
+            flash: String::new(),
+            nav,
+            folder_options,
+            folders: vec![FolderView {
+                rkey: "folder-work".to_string(),
+                uri: "at://did:plc:x/app.folder/work".to_string(),
+                name: "Work".to_string(),
+                feeds: vec![foldered],
+                selected: false,
+            }],
+            loose_feeds: vec![loose],
+        };
+        let html = tmpl.render().unwrap();
+
+        // The foldered feed's "Work" option is pre-selected.
+        assert!(
+            html.contains(
+                r#"<option value="at://did:plc:x/app.folder/work" selected>Work</option>"#
+            ),
+            "foldered feed must pre-select its current folder: {html}"
+        );
+        // The loose feed's "No folder" option is pre-selected (appears for the
+        // loose row, which has folder=None).
+        assert!(
+            html.contains(r#"<option value="" selected>No folder</option>"#),
+            "loose feed must pre-select 'No folder': {html}"
+        );
+    }
 }
