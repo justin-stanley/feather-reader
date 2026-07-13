@@ -23,6 +23,12 @@ permissions:
 jobs:
   dependency-review:
     name: Dependency review
+    # The Dependency Graph API this action calls needs GitHub Advanced Security
+    # on a PRIVATE repo (it errors "Dependency review is not supported on this
+    # repository" otherwise). Skip while private so it neither fails every PR
+    # nor burns Actions minutes; it auto-activates at the public flip, where the
+    # dependency graph is always-on + free. Mirrors the gate in scorecard.yml.
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-latest  # GitHub-hosted; free once public
     steps:
       - uses: actions/checkout@v4
