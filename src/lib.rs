@@ -21,7 +21,7 @@
 //!   OAuth confidential-client sidecar ([`atproto::SidecarClient`]).
 //! - [`web`]     — the axum router + askama server-rendered views.
 //!
-//! **Status:** experimental / pre-1.0. See <https://reader.justin-stanley.com>.
+//! **Status:** experimental / pre-1.0. See <https://feather-reader.com>.
 
 // The module tree; the layout owns the wiring between subsystems.
 pub mod atproto;
@@ -182,5 +182,5 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const USER_AGENT: &str = concat!(
     "featherreader/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://reader.justin-stanley.com)"
+    " (+https://feather-reader.com)"
 );

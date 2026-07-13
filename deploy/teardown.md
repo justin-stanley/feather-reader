@@ -102,7 +102,7 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
    ```
 
 5. **Take down the edge** (optional but recommended for a real pause): stop the
-   reverse proxy / DNS record for `reader.justin-stanley.com` so nobody hits a
+   reverse proxy / DNS record for `feather-reader.com` so nobody hits a
    half-torn-down instance. `client-metadata.json` / `jwks.json` no longer need to
    be reachable once every session is revoked.
 

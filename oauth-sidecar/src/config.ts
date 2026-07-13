@@ -10,7 +10,7 @@
  * |--------------------------------|-------------------------------------------|---------|
  * | `SIDECAR_PORT`                 | `8081`                                    | TCP port the sidecar binds (loopback). |
  * | `SIDECAR_HOST`                 | `127.0.0.1`                               | Bind host. |
- * | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`                   | The sidecar's own externally-reachable base URL. In prod: `https://reader.justin-stanley.com/oauth` if fronted at that path, else its own subdomain. Determines `client_id`, `redirect_uri`, `client-metadata.json` location. |
+ * | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`                   | The sidecar's own externally-reachable base URL. In prod: `https://feather-reader.com/oauth` if fronted at that path, else its own subdomain. Determines `client_id`, `redirect_uri`, `client-metadata.json` location. |
  * | `SIDECAR_DB`                   | `oauth-sidecar.db`                        | SQLite file for the OAuth state + session stores. |
  * | `SIDECAR_INTERNAL_SECRET`     | *(required in prod; dev default warned)*  | Shared secret the Rust server sends as `X-Internal-Secret` on `/internal/*`. |
  * | `SIDECAR_APP_CALLBACK_URL`     | `http://localhost:8080/oauth/callback`    | The Rust app's callback the sidecar redirects the browser back to after a successful login, with `?session_id=…` (or `?error=…`). |
