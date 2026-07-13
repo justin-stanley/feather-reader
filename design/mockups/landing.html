@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="description" content="FeatherReader — a minimalist, atproto-native RSS reader. Your subscriptions live in your own PDS." />
+  <link rel="canonical" href="https://feather-reader.com/" />
+  <title>FeatherReader — read, quietly</title>
+  <script>
+    /* Mockup-only screenshot plumbing (same as the other mockups):
+       ?theme=light|dark forces a scheme. The page needs no JS to work. */
+    (function () {
+      var v = new URLSearchParams(location.search).get("theme");
+      if (v) document.documentElement.dataset.theme = v;
+    })();
+  </script>
+  <style>
+    /* ======================================================================
+       FeatherReader landing — tokens lifted verbatim from feather.css
+       (design/mockups/feather.css). One file, no build step, no webfonts.
+       ====================================================================== */
+    :root {
+      color-scheme: light dark;
+
+      --font-serif: "Charter", "Iowan Old Style", "Palatino Linotype", Palatino,
+        Georgia, "Times New Roman", serif;
+      --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+        Arial, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+        "Liberation Mono", monospace;
+
+      --text-xs: 0.75rem;
+      --text-sm: 0.8125rem;
+      --text-base: 0.9375rem;
+      --text-md: 1.0625rem;
+      --text-lg: 1.25rem;
+      --text-xl: 1.5625rem;
+      --text-2xl: 1.9375rem;
+
+      --s1: 0.25rem;
+      --s2: 0.5rem;
+      --s3: 0.75rem;
+      --s4: 1rem;
+      --s5: 1.5rem;
+      --s6: 2rem;
+      --s7: 3rem;
+      --s8: 4rem;
+
+      --r-sm: 6px;
+      --r-md: 10px;
+      --r-lg: 16px;
+      --r-full: 999px;
+
+      --shadow-1: 0 1px 2px rgba(31, 27, 20, 0.05), 0 1px 6px rgba(31, 27, 20, 0.04);
+      --shadow-2: 0 2px 8px rgba(31, 27, 20, 0.08), 0 8px 28px rgba(31, 27, 20, 0.10);
+
+      --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+      --dur-1: 120ms;
+      --dur-2: 220ms;
+
+      --tap: 2.75rem;
+
+      /* Light: warm paper + ink + one spruce accent */
+      --bg: #faf8f3;
+      --surface: #ffffff;
+      --surface-2: #f3f0e8;
+      --ink: #2a2723;
+      --ink-soft: #5c564b;
+      --muted: #6f6959;
+      --line: #e8e3d7;
+      --line-soft: #f0ece2;
+      --accent: #3e6459;
+      --accent-deep: #395d53;
+      --accent-soft: #e9efec;
+      --on-accent: #ffffff;
+      --star: #8a6a14;
+      --danger: #9d3b2d;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: #191714;
+        --surface: #211e1a;
+        --surface-2: #14120f;
+        --ink: #ede8dd;
+        --ink-soft: #bab2a3;
+        --muted: #9c947f;
+        --line: #35312a;
+        --line-soft: #2a2721;
+        --accent: #93bfb2;
+        --accent-deep: #a8cdc1;
+        --accent-soft: #24312c;
+        --on-accent: #14211d;
+        --star: #d2ac4b;
+        --danger: #d98374;
+        --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 6px rgba(0, 0, 0, 0.3);
+        --shadow-2: 0 2px 8px rgba(0, 0, 0, 0.45), 0 10px 32px rgba(0, 0, 0, 0.5);
+      }
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #191714;
+      --surface: #211e1a;
+      --surface-2: #14120f;
+      --ink: #ede8dd;
+      --ink-soft: #bab2a3;
+      --muted: #9c947f;
+      --line: #35312a;
+      --line-soft: #2a2721;
+      --accent: #93bfb2;
+      --accent-deep: #a8cdc1;
+      --accent-soft: #24312c;
+      --on-accent: #14211d;
+      --star: #d2ac4b;
+      --danger: #d98374;
+      --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 6px rgba(0, 0, 0, 0.3);
+      --shadow-2: 0 2px 8px rgba(0, 0, 0, 0.45), 0 10px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    /* -- Base ------------------------------------------------------------ */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--font-ui);
+      font-size: var(--text-base);
+      line-height: 1.55;
+      color: var(--ink);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    img {
+      max-width: 100%;
+      height: auto;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      color: var(--accent-deep);
+      text-decoration: underline;
+      text-underline-offset: 0.2em;
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      overflow-wrap: anywhere;
+    }
+
+    kbd {
+      display: inline-block;
+      min-width: 1.5em;
+      padding: 0.1em 0.45em;
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      text-align: center;
+      color: var(--ink-soft);
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: var(--r-sm);
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: var(--r-sm);
+    }
+
+    ::selection {
+      background: var(--accent-soft);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    .skip-link {
+      position: absolute;
+      left: var(--s3);
+      top: -3rem;
+      z-index: 100;
+      padding: var(--s2) var(--s3);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--r-sm);
+      box-shadow: var(--shadow-1);
+      transition: top var(--dur-1) var(--ease);
+    }
+
+    .skip-link:focus {
+      top: var(--s3);
+    }
+
+    /* -- Buttons (shared chrome, from feather.css) ------------------------ */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--s2);
+      min-height: var(--tap);
+      padding: var(--s2) var(--s4);
+      font-size: var(--text-base);
+      font-weight: 500;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--r-md);
+      cursor: pointer;
+      text-decoration: none;
+      transition: border-color var(--dur-1) var(--ease),
+        background-color var(--dur-1) var(--ease);
+    }
+
+    .btn:hover {
+      border-color: var(--muted);
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      color: var(--on-accent);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .btn-primary:hover {
+      color: var(--on-accent);
+      background: var(--accent-deep);
+      border-color: var(--accent-deep);
+    }
+
+    /* -- Landing layout — mobile-first (390px baseline) -------------------- */
+    .landing {
+      max-width: 40rem;
+      margin: 0 auto;
+      padding: 0 var(--s5) calc(var(--s5) + env(safe-area-inset-bottom, 0px));
+    }
+
+    /* Hero */
+    .hero {
+      padding: var(--s8) 0 var(--s6);
+      text-align: center;
+    }
+
+    .hero-mark {
+      width: 3rem;
+      height: 3rem;
+      margin: 0 auto var(--s4);
+      color: var(--accent);
+      display: block;
+    }
+
+    .hero-name {
+      margin: 0 0 var(--s1);
+      font-family: var(--font-serif);
+      font-size: var(--text-xl);
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      line-height: 1.15;
+    }
+
+    .hero-tag {
+      margin: 0 0 var(--s5);
+      font-size: var(--text-base);
+      color: var(--muted);
+    }
+
+    .hero-lede {
+      max-width: 30rem;
+      margin: 0 auto var(--s6);
+      font-family: var(--font-serif);
+      font-size: var(--text-md);
+      line-height: 1.6;
+      color: var(--ink-soft);
+      text-wrap: balance;
+    }
+
+    .hero-lede strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .hero-cta {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--s3);
+    }
+
+    .hero-cta .btn-primary {
+      width: 100%;
+      max-width: 18rem;
+    }
+
+    .hero-note {
+      margin: 0;
+      font-size: var(--text-sm);
+      color: var(--muted);
+    }
+
+    /* Secondary links: quiet, dot-separated (footer-links pattern) */
+    .alt-links {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      align-items: center;
+      gap: var(--s2);
+      margin: var(--s4) 0 0;
+      font-size: var(--text-sm);
+    }
+
+    .alt-links .sep {
+      color: var(--line);
+    }
+
+    /* Screenshot — one, framed like a resting card */
+    .shot {
+      margin: var(--s6) auto;
+      max-width: 20rem;
+    }
+
+    .shot img {
+      display: block;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: var(--r-lg);
+      box-shadow: var(--shadow-2);
+    }
+
+    /* Light/dark screenshot swap follows the same two-pronged pattern as the
+       color tokens: system scheme unless <html data-theme> forces one. */
+    .shot .shot-dark {
+      display: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) .shot-light { display: none; }
+      :root:not([data-theme="light"]) .shot-dark { display: block; }
+    }
+
+    :root[data-theme="dark"] .shot-light { display: none; }
+    :root[data-theme="dark"] .shot-dark { display: block; }
+
+    .shot figcaption {
+      margin-top: var(--s3);
+      font-size: var(--text-sm);
+      color: var(--muted);
+      text-align: center;
+    }
+
+    /* Value points — whitespace first, hairlines second */
+    .points {
+      margin: var(--s7) 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: var(--s5);
+    }
+
+    .point {
+      padding-top: var(--s5);
+      border-top: 1px solid var(--line-soft);
+    }
+
+    .point h2 {
+      margin: 0 0 var(--s2);
+      font-family: var(--font-serif);
+      font-size: var(--text-md);
+      font-weight: 600;
+      letter-spacing: -0.005em;
+    }
+
+    .point p {
+      margin: 0;
+      font-size: var(--text-sm);
+      line-height: 1.6;
+      color: var(--ink-soft);
+    }
+
+    /* Experiment disclaimer — the honest strip, muted like the app footer */
+    .experiment {
+      margin: var(--s7) 0 0;
+      padding-top: var(--s5);
+      border-top: 1px solid var(--line-soft);
+      font-size: var(--text-sm);
+      line-height: 1.6;
+      color: var(--muted);
+    }
+
+    .experiment p {
+      margin: 0;
+    }
+
+    .experiment strong {
+      color: var(--ink-soft);
+    }
+
+    .tip-link {
+      font-weight: 600;
+    }
+
+    /* Footer + colophon */
+    .site-footer {
+      margin: var(--s7) 0 0;
+      padding-top: var(--s5);
+      border-top: 1px solid var(--line-soft);
+      text-align: center;
+      font-size: var(--text-sm);
+      color: var(--muted);
+    }
+
+    .site-footer p {
+      margin: 0 0 var(--s2);
+    }
+
+    .site-footer a {
+      color: var(--muted);
+      text-decoration: underline;
+      text-decoration-color: var(--line);
+      text-underline-offset: 2px;
+    }
+
+    .site-footer a:hover {
+      color: var(--ink-soft);
+      text-decoration-color: currentColor;
+    }
+
+    .colophon-mark {
+      display: block;
+      width: 2.75rem;
+      height: 2.75rem;
+      margin: 0 auto var(--s2);
+      color: var(--muted);
+      opacity: 0.85;
+    }
+
+    /* -- Enhance upward ----------------------------------------------------- */
+    @media (min-width: 43.75em) {
+      .hero {
+        padding-top: calc(var(--s8) + var(--s5));
+      }
+
+      .hero-name {
+        font-size: var(--text-2xl);
+      }
+
+      .hero-lede {
+        font-size: var(--text-lg);
+      }
+    }
+
+    @media (min-width: 56.25em) {
+      .landing {
+        max-width: 52rem;
+      }
+
+      .points {
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: var(--s5);
+      }
+
+      .shot {
+        margin-top: var(--s7);
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <main class="landing" id="main">
+    <header class="hero">
+      <svg class="hero-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+        <path d="M16 8 5 19"/>
+      </svg>
+
+      <h1 class="hero-name">FeatherReader</h1>
+      <p class="hero-tag">read, quietly</p>
+
+      <p class="hero-lede">
+        A minimalist, atproto-native RSS reader — your subscriptions live in
+        <strong>your own PDS</strong>.
+      </p>
+
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="/login">Sign in</a>
+        <p class="hero-note">
+          No signup, no password — you approve access on your own atproto server.
+        </p>
+      </div>
+
+      <nav class="alt-links" aria-label="Project links">
+        <a href="https://github.com/justin-stanley/feather-reader"
+           rel="noopener noreferrer">View on GitHub</a>
+        <span class="sep" aria-hidden="true">·</span>
+        <a href="https://crates.io/crates/feather-reader"
+           rel="noopener noreferrer">crates.io</a>
+        <span class="sep" aria-hidden="true">·</span>
+        <a href="https://github.com/justin-stanley/feather-reader#self-hosting"
+           rel="noopener noreferrer">Self-host</a>
+      </nav>
+    </header>
+
+    <figure class="shot">
+      <img class="shot-light" src="../screenshots/list-mobile-light.png"
+           width="390" height="844" loading="lazy" decoding="async"
+           alt="FeatherReader on a phone: a calm article list with serif headlines, quiet unread dots, and a single star" />
+      <img class="shot-dark" src="../screenshots/list-mobile-dark.png"
+           width="390" height="844" loading="lazy" decoding="async"
+           alt="FeatherReader on a phone, in dark mode: a calm article list with serif headlines, quiet unread dots, and a single star" />
+      <figcaption>The whole interface. That's the point.</figcaption>
+    </figure>
+
+    <ul class="points">
+      <li class="point">
+        <h2>Own your data</h2>
+        <p>
+          Subscriptions, folders, stars, and read-state are written as
+          open-standard <code>community.lexicon.rss.*</code> records in
+          <em>your</em> atproto PDS — portable to any reader that speaks the
+          lexicon. Leaving is as easy as arriving.
+        </p>
+      </li>
+      <li class="point">
+        <h2>Fast, quiet, keyboard-driven</h2>
+        <p>
+          Server-rendered pages, system fonts, <kbd>j</kbd>/<kbd>k</kbd>
+          shortcuts. No tracking, no analytics, no algorithm — just your feeds,
+          in order.
+        </p>
+      </li>
+      <li class="point">
+        <h2>Open source &amp; self-hostable</h2>
+        <p>
+          Free software under the AGPL-3.0: read the code, file issues, or run
+          your own copy. Self-hosting is a first-class path, not an afterthought.
+        </p>
+      </li>
+    </ul>
+
+    <aside class="experiment" aria-label="Service disclaimer">
+      <p>
+        <strong>An experiment.</strong> FeatherReader is a free public experiment
+        run by one person — no uptime guarantees; it may change, break, or pause
+        at any time. Your data lives in your PDS, not here, so you can always
+        walk away with it. If you like it, a
+        <a class="tip-link" href="https://ko-fi.com/justinstanley"
+           rel="noopener noreferrer">tip helps keep it running&nbsp;♥</a>
+      </p>
+    </aside>
+
+    <footer class="site-footer">
+      <svg class="colophon-mark" viewBox="-9.60 -150.55 232.24 232.24" role="img"
+           aria-label="JTS monogram" fill="currentColor">
+        <path d="M0.00 26.55V23.73Q5.65 23.16 9.60 20.41Q13.56 17.66 15.68 11.02Q17.80 4.38 17.80 -7.63V-85.03Q17.80 -90.25 17.02 -92.73Q16.24 -95.20 13.98 -96.12Q11.72 -97.03 7.20 -97.18V-100.00Q10.73 -99.86 16.45 -99.72Q22.18 -99.58 28.53 -99.58Q34.89 -99.58 40.89 -99.72Q46.89 -99.86 50.85 -100.00V-97.18Q46.47 -97.03 44.14 -96.12Q41.81 -95.20 41.03 -92.73Q40.25 -90.25 40.25 -85.03V-33.33Q40.25 -27.54 40.25 -20.83Q40.25 -14.12 39.76 -7.77Q39.27 -1.41 37.85 3.53Q35.03 13.28 25.64 19.92Q16.24 26.55 0.00 26.55Z M133.51 -36.30Q133.06 -30.51 132.89 -25.17Q132.72 -19.83 132.72 -16.99Q132.72 -14.50 132.83 -12.23Q132.95 -9.95 133.06 -8.36H130.45Q128.63 -17.90 125.85 -23.47Q123.07 -29.03 119.21 -31.36Q115.34 -33.69 110.12 -33.69H107.51V31.15Q107.51 35.70 108.47 37.97Q109.44 40.24 112.05 40.98Q114.66 41.72 119.66 41.83V44.10Q116.14 43.99 110.29 43.87Q104.44 43.76 98.08 43.76Q91.84 43.76 86.27 43.87Q80.71 43.99 77.30 44.10V41.83Q82.41 41.72 85.02 40.98Q87.64 40.24 88.54 37.97Q89.45 35.70 89.45 31.15V-33.69H86.95Q81.73 -33.69 77.87 -31.36Q74.01 -29.03 71.28 -23.52Q68.56 -18.02 66.51 -8.36H63.90Q64.13 -9.95 64.19 -12.23Q64.24 -14.50 64.24 -16.99Q64.24 -19.83 64.07 -25.17Q63.90 -30.51 63.45 -36.30Q68.67 -36.19 74.86 -36.07Q81.05 -35.96 87.29 -35.96Q93.54 -35.96 98.54 -35.96Q103.65 -35.96 109.84 -35.96Q116.03 -35.96 122.27 -36.07Q128.52 -36.19 133.51 -36.30Z M178.46 -101.84Q186.79 -101.84 191.31 -100.07Q195.83 -98.31 199.08 -96.33Q200.77 -95.34 201.83 -94.84Q202.89 -94.35 203.88 -94.35Q205.29 -94.35 205.93 -95.90Q206.57 -97.46 206.99 -100.56H210.24Q210.10 -97.88 209.88 -94.14Q209.67 -90.40 209.60 -84.32Q209.53 -78.25 209.53 -68.36H206.28Q205.72 -75.71 202.89 -82.63Q200.07 -89.55 194.91 -94.00Q189.76 -98.45 182.27 -98.45Q175.49 -98.45 171.11 -94.63Q166.74 -90.82 166.74 -84.04Q166.74 -78.39 169.56 -74.36Q172.38 -70.34 177.82 -66.53Q183.26 -62.71 191.03 -57.34Q197.81 -52.97 203.18 -48.59Q208.54 -44.21 211.79 -38.70Q215.04 -33.19 215.04 -25.56Q215.04 -16.24 210.17 -10.17Q205.29 -4.10 197.38 -1.06Q189.48 1.98 180.01 1.98Q171.25 1.98 166.03 0.28Q160.80 -1.41 157.27 -3.25Q154.16 -5.23 152.47 -5.23Q151.06 -5.23 150.42 -3.67Q149.79 -2.12 149.36 0.99H146.11Q146.40 -2.40 146.47 -6.92Q146.54 -11.44 146.61 -18.71Q146.68 -25.99 146.68 -37.15H149.93Q150.49 -27.82 153.11 -19.70Q155.72 -11.58 161.16 -6.64Q166.59 -1.69 175.63 -1.69Q180.58 -1.69 184.46 -3.46Q188.35 -5.23 190.75 -8.76Q193.15 -12.29 193.15 -17.51Q193.15 -23.45 190.39 -27.82Q187.64 -32.20 182.91 -36.02Q178.18 -39.83 171.96 -43.79Q165.32 -48.16 159.53 -52.54Q153.74 -56.92 150.28 -62.57Q146.82 -68.22 146.82 -75.99Q146.82 -84.89 151.27 -90.61Q155.72 -96.33 162.99 -99.08Q170.27 -101.84 178.46 -101.84Z"
+              stroke="currentColor" stroke-width="3" paint-order="stroke"/>
+      </svg>
+      <p>Built by <a href="https://justin-stanley.com"
+         rel="noopener noreferrer">Justin Stanley</a></p>
+      <p>Open source ·
+        <a href="https://github.com/justin-stanley/feather-reader/blob/main/LICENSE"
+           rel="noopener noreferrer">AGPL-3.0</a> · self-hostable</p>
+    </footer>
+  </main>
+</body>
+</html>

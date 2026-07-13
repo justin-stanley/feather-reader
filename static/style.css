@@ -1888,3 +1888,201 @@ html[data-overlay="1"] .kbd-overlay {
   color: var(--ink-soft);
   text-decoration-color: currentColor;
 }
+
+/* ==========================================================================
+   Landing page (GET / when signed out). Layout only — tokens, .btn/.btn-primary,
+   .tip-link, and .colophon all come from the shared system above. Mobile-first.
+   ========================================================================== */
+.landing {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 0 var(--s5) calc(var(--s5) + env(safe-area-inset-bottom, 0px));
+}
+
+.hero {
+  padding: var(--s8) 0 var(--s6);
+  text-align: center;
+}
+
+.hero-mark {
+  display: block;
+  width: 3rem;
+  height: 3rem;
+  margin: 0 auto var(--s4);
+  color: var(--accent);
+}
+
+.hero-name {
+  margin: 0 0 var(--s1);
+  font-family: var(--font-serif);
+  font-size: var(--text-xl);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.hero-tag {
+  margin: 0 0 var(--s5);
+  font-size: var(--text-base);
+  color: var(--muted);
+}
+
+.hero-lede {
+  max-width: 30rem;
+  margin: 0 auto var(--s6);
+  font-family: var(--font-serif);
+  font-size: var(--text-md);
+  line-height: 1.6;
+  color: var(--ink-soft);
+  text-wrap: balance;
+}
+
+.hero-lede strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.hero-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s3);
+}
+
+.hero-cta .btn-primary {
+  width: 100%;
+  max-width: 18rem;
+}
+
+.hero-note {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.alt-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: var(--s2);
+  margin: var(--s4) 0 0;
+  font-size: var(--text-sm);
+}
+
+.alt-links .sep {
+  color: var(--line);
+}
+
+.shot {
+  max-width: 20rem;
+  margin: var(--s6) auto;
+}
+
+.shot img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+}
+
+/* Light/dark screenshot swap — mirrors the token theme logic: system scheme
+   unless <html data-theme> forces one. */
+.shot .shot-dark {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .shot-light {
+    display: none;
+  }
+  :root:not([data-theme="light"]) .shot-dark {
+    display: block;
+  }
+}
+
+:root[data-theme="dark"] .shot-light {
+  display: none;
+}
+
+:root[data-theme="dark"] .shot-dark {
+  display: block;
+}
+
+.shot figcaption {
+  margin-top: var(--s3);
+  font-size: var(--text-sm);
+  color: var(--muted);
+  text-align: center;
+}
+
+.points {
+  margin: var(--s7) 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--s5);
+}
+
+.point {
+  padding-top: var(--s5);
+  border-top: 1px solid var(--line-soft);
+}
+
+.point h2 {
+  margin: 0 0 var(--s2);
+  font-family: var(--font-serif);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.point p {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.experiment {
+  margin: var(--s7) 0 var(--s6);
+  padding-top: var(--s5);
+  border-top: 1px solid var(--line-soft);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.experiment p {
+  margin: 0;
+}
+
+.experiment strong {
+  color: var(--ink-soft);
+}
+
+@media (min-width: 43.75em) {
+  .hero {
+    padding-top: calc(var(--s8) + var(--s5));
+  }
+  .hero-name {
+    font-size: var(--text-2xl);
+  }
+  .hero-lede {
+    font-size: var(--text-lg);
+  }
+}
+
+@media (min-width: 56.25em) {
+  .landing {
+    max-width: 52rem;
+  }
+  .points {
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: var(--s5);
+  }
+  .shot {
+    margin-top: var(--s7);
+  }
+}
