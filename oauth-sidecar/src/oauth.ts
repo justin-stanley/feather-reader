@@ -25,21 +25,35 @@ import { NodeOAuthClient, type OAuthClientMetadataInput } from '@atproto/oauth-c
 import { JoseKey } from '@atproto/jwk-jose';
 import type { SidecarConfig } from './config.js';
 import type { SqliteStores } from './stores.js';
+import { Aead, type Codec } from './crypto.js';
 
 /** Where the persisted signing key lives (prod only). */
 function keyPath(cfg: SidecarConfig): string {
   return `${cfg.dbPath}.jwk.json`;
 }
 
-/** Load or generate the confidential-client signing key (persisted to disk). */
-async function loadOrCreateKey(cfg: SidecarConfig): Promise<JoseKey> {
+/**
+ * Load or generate the confidential-client signing key, persisted to disk
+ * AEAD-encrypted at rest. The signing JWK is a long-lived private key; a raw
+ * volume/snapshot read of `<db>.jwk.json` is useless without `SIDECAR_ENC_KEY`.
+ *
+ * Migrate-on-read: an existing plaintext JWK file (written before encryption
+ * was enabled) is loaded via `codec.maybeDecrypt` and re-written encrypted.
+ */
+async function loadOrCreateKey(cfg: SidecarConfig, codec: Codec): Promise<JoseKey> {
   const path = keyPath(cfg);
   if (existsSync(path)) {
-    const jwk = JSON.parse(readFileSync(path, 'utf8'));
-    return JoseKey.fromJWK(jwk);
+    const raw = readFileSync(path, 'utf8');
+    const plaintext = codec.maybeDecrypt(raw.trim());
+    const key = await JoseKey.fromJWK(JSON.parse(plaintext));
+    // Upgrade a legacy plaintext file to ciphertext in place.
+    if (!Aead.isCiphertext(raw.trim())) {
+      writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), { mode: 0o600 });
+    }
+    return key;
   }
   const key = await JoseKey.generate(['ES256'], 'featherreader-oauth-1');
-  writeFileSync(path, JSON.stringify(key.privateJwk), { mode: 0o600 });
+  writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), { mode: 0o600 });
   return key;
 }
 
@@ -99,6 +113,7 @@ export interface BuiltClient {
 export async function buildOAuthClient(
   cfg: SidecarConfig,
   stores: SqliteStores,
+  codec: Codec,
 ): Promise<BuiltClient> {
   const metadata = buildClientMetadata(cfg);
 
@@ -118,7 +133,7 @@ export async function buildOAuthClient(
     return { client, metadata, jwks: null };
   }
 
-  const key = await loadOrCreateKey(cfg);
+  const key = await loadOrCreateKey(cfg, codec);
   const client = new NodeOAuthClient({ ...common, keyset: [key] });
   return { client, metadata, jwks: { keys: [key.publicJwk] } };
 }

@@ -37,6 +37,17 @@
  *    Resolve a session id to who is logged in. (The Rust app calls this to learn
  *    the DID behind a cookie it holds.)
  *
+ *  POST /internal/revoke        → 200 {ok:true, did, revoked, hadSession}
+ *    Body: { did }. Revokes the DID's tokens at the PDS (`oauthClient.revoke`)
+ *    AND purges the local oauth_session + app_session rows. Idempotent.
+ *
+ * Every `com.atproto.repo.*` write/list is bounded to the `community.lexicon.rss.*`
+ * namespace (see `collections.ts`) — a compromised app/secret can only touch RSS
+ * records, not the user's whole PDS. Out-of-namespace ops return 403
+ * `CollectionNotAllowed`. Stored tokens/state + the signing JWK are AEAD-encrypted
+ * at rest (AES-256-GCM, key from `SIDECAR_ENC_KEY`; see `crypto.ts`). Sessions
+ * past their absolute/idle TTL are swept by a periodic reaper.
+ *
  *  POST /internal/repo          → the authed PDS-op API.
  *    Body: {
  *      did:        string,                 // whose repo (must have a live session)
@@ -79,12 +90,19 @@ import { randomBytes } from 'node:crypto';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
-import { SqliteStores } from './stores.js';
+import { SqliteStores, type SessionTtls } from './stores.js';
 import { buildOAuthClient } from './oauth.js';
+import { Aead, NullCodec, type Codec } from './crypto.js';
+import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
 
 const cfg = loadConfig();
-const stores = new SqliteStores(cfg.dbPath);
-const { client: oauthClient, metadata, jwks } = await buildOAuthClient(cfg, stores);
+// At-rest AEAD for stored tokens/state/JWK. In dev with no key set we use the
+// pass-through NullCodec (config.ts has already warned); prod always has a key.
+const codec: Codec = cfg.encKey ? new Aead(cfg.encKey) : new NullCodec();
+const stores = new SqliteStores(cfg.dbPath, codec);
+const { client: oauthClient, metadata, jwks } = await buildOAuthClient(cfg, stores, codec);
+
+const ttls: SessionTtls = { absoluteMs: cfg.sessionAbsoluteTtlMs, idleMs: cfg.sessionIdleTtlMs };
 
 const app = Fastify({ logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' } });
 
@@ -223,6 +241,30 @@ app.get('/internal/session/:id', async (req: FastifyRequest, reply: FastifyReply
   return { did: row.did, handle: row.handle };
 });
 
+// ─── Internal: revoke a DID's session (logout / account teardown) ─────────────
+
+app.post('/internal/revoke', async (req: FastifyRequest, reply: FastifyReply) => {
+  if (!requireSecret(req, reply)) return;
+  const body = (req.body ?? {}) as { did?: string };
+  const did = body.did;
+  if (!did) {
+    reply.code(400);
+    return { ok: false, error: 'BadRequest', message: 'did is required' };
+  }
+  // Best-effort token revocation at the PDS (revokes refresh + access tokens and
+  // deletes the library-managed session row). Then purge our own rows so nothing
+  // lingers even if the network call failed.
+  let revoked = false;
+  try {
+    await oauthClient.revoke(did);
+    revoked = true;
+  } catch (err) {
+    req.log.warn({ err, did }, 'oauth revoke failed; purging local rows anyway');
+  }
+  const hadSession = stores.purgeDid(did);
+  return { ok: true, did, revoked, hadSession };
+});
+
 // ─── Internal: authed com.atproto.repo.* ─────────────────────────────────────
 
 interface RepoBody {
@@ -271,6 +313,7 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
     switch (action) {
       case 'list': {
         if (!body.collection) return badReq(reply, 'collection required for list');
+        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
         const res = await agent.com.atproto.repo.listRecords({
           repo: did,
           collection: body.collection,
@@ -281,6 +324,7 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
       }
       case 'create': {
         if (!body.collection) return badReq(reply, 'collection required for create');
+        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
         if (!body.record) return badReq(reply, 'record required for create');
         const res = await agent.com.atproto.repo.createRecord({
           repo: did,
@@ -292,6 +336,7 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
       }
       case 'put': {
         if (!body.collection) return badReq(reply, 'collection required for put');
+        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
         if (!body.rkey) return badReq(reply, 'rkey required for put');
         if (!body.record) return badReq(reply, 'record required for put');
         const res = await agent.com.atproto.repo.putRecord({
@@ -304,6 +349,7 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
       }
       case 'delete': {
         if (!body.collection) return badReq(reply, 'collection required for delete');
+        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
         if (!body.rkey) return badReq(reply, 'rkey required for delete');
         const res = await agent.com.atproto.repo.deleteRecord({
           repo: did,
@@ -315,6 +361,11 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
       case 'applyWrites': {
         if (!Array.isArray(body.writes) || body.writes.length === 0) {
           return badReq(reply, 'writes[] required for applyWrites');
+        }
+        // Allow-list EVERY write's collection before touching the PDS — one
+        // out-of-namespace write fails the whole batch (applyWrites is atomic).
+        for (const w of body.writes) {
+          if (!isAllowedCollection(w.collection)) return collectionDenied(reply, w.collection);
         }
         const writes = body.writes.map((w) => {
           const kind = w.action ?? w.$type?.split('#')[1];
@@ -369,6 +420,20 @@ function badReq(reply: FastifyReply, message: string) {
   return { ok: false, error: 'BadRequest', message };
 }
 
+/**
+ * Hard server-side rejection of any write/list outside `community.lexicon.rss.*`.
+ * 403 (not 400): this is an authorization bound, not a malformed request — even a
+ * compromised app/secret cannot reach the user's other collections through here.
+ */
+function collectionDenied(reply: FastifyReply, collection: unknown) {
+  reply.code(403);
+  return {
+    ok: false,
+    error: 'CollectionNotAllowed',
+    message: `collection ${JSON.stringify(collection)} is outside the allowed namespace ${ALLOWED_COLLECTION_ROOT}.*`,
+  };
+}
+
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 try {
@@ -379,6 +444,9 @@ try {
       dev: cfg.dev,
       appCallbackUrl: cfg.appCallbackUrl,
       clientId: metadata.client_id,
+      encAtRest: cfg.encKey ? 'aes-256-gcm' : 'PLAINTEXT(dev)',
+      sessionAbsoluteTtlMs: cfg.sessionAbsoluteTtlMs,
+      sessionIdleTtlMs: cfg.sessionIdleTtlMs,
     },
     'featherreader-oauth-sidecar listening',
   );
@@ -387,9 +455,31 @@ try {
   process.exit(1);
 }
 
+// ─── TTL reaper ───────────────────────────────────────────────────────────────
+// Periodically sweep sessions past their absolute/idle TTL so dormant refresh
+// tokens don't accumulate forever. Each expired DID is revoked at the PDS
+// (best-effort) then purged locally. `unref()` so the timer never keeps the
+// process alive on its own.
+const reaperTimer = setInterval(() => {
+  void stores
+    .reap(ttls, async (did) => {
+      try {
+        await oauthClient.revoke(did);
+      } catch (err) {
+        app.log.warn({ err, did }, 'reaper: token revocation failed');
+      }
+    })
+    .then((dids) => {
+      if (dids.length > 0) app.log.info({ count: dids.length, dids }, 'reaper: purged expired sessions');
+    })
+    .catch((err) => app.log.error({ err }, 'reaper sweep failed'));
+}, cfg.reaperIntervalMs);
+reaperTimer.unref();
+
 // Graceful shutdown flushes the WAL / closes the DB.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, async () => {
+    clearInterval(reaperTimer);
     try {
       await app.close();
     } finally {

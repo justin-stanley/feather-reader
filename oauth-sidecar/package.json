@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "dev": "node --loader ts-node/esm src/server.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
   },
   "dependencies": {
     "@atproto/api": "^0.15.0",

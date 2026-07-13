@@ -42,7 +42,23 @@ export interface SidecarConfig {
   dev: boolean;
   /** The OAuth scope requested. FeatherReader needs generic read+write of its own repo records. */
   scope: string;
+  /**
+   * Raw `SIDECAR_ENC_KEY` value used to derive the at-rest AEAD key. `undefined`
+   * only in dev (stores fall back to plaintext); required + length-guarded in prod.
+   */
+  encKey: string | undefined;
+  /** Absolute session lifetime (ms): a session older than this is reaped even if used. */
+  sessionAbsoluteTtlMs: number;
+  /** Idle session lifetime (ms): a session untouched for this long is reaped. */
+  sessionIdleTtlMs: number;
+  /** How often (ms) the TTL reaper sweeps expired sessions. */
+  reaperIntervalMs: number;
 }
+
+/** The insecure dev default for the internal secret (must never boot in prod). */
+export const DEV_INTERNAL_SECRET = 'dev-internal-secret-change-me';
+/** Minimum accepted length (bytes) for prod secrets/keys. */
+export const MIN_SECRET_BYTES = 32;
 
 function envStr(key: string, fallback: string): string {
   const v = process.env[key];
@@ -52,6 +68,21 @@ function envStr(key: string, fallback: string): string {
 function envOpt(key: string): string | undefined {
   const v = process.env[key];
   return v !== undefined && v.trim() !== '' ? v.trim() : undefined;
+}
+
+function envIntMs(key: string, fallback: number): number {
+  const v = envOpt(key);
+  if (v === undefined) return fallback;
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${key}: expected a positive integer (ms), got ${JSON.stringify(v)}`);
+  }
+  return n;
+}
+
+/** Byte length of a UTF-8 string (what "≥32 bytes" is measured against). */
+function byteLen(s: string): number {
+  return Buffer.byteLength(s, 'utf8');
 }
 
 function stripSlash(u: string): string {
@@ -80,24 +111,86 @@ export function loadConfig(): SidecarConfig {
   const plcDirectory = envStr('SIDECAR_PLC_DIRECTORY', 'https://plc.directory');
   const scope = envStr('SIDECAR_SCOPE', 'atproto transition:generic');
 
+  // `dev` here drives ONLY the atproto client shape (localhost dev-client vs.
+  // published confidential client / PKI). It is intentionally still allowed to
+  // be inferred from a localhost PUBLIC_URL — that inference does not relax any
+  // security guard.
   const devForced = envOpt('SIDECAR_DEV');
   const dev =
     devForced !== undefined ? /^(1|true|yes|on)$/i.test(devForced) : isLocalhostUrl(publicUrl);
 
-  // The shared secret. Required for any real deployment; in dev we allow a
-  // loud default so the sidecar boots for manual testing.
-  let internalSecret = envOpt('SIDECAR_INTERNAL_SECRET') ?? '';
-  if (internalSecret === '') {
-    if (dev) {
-      internalSecret = 'dev-internal-secret-change-me';
+  // `securityDev` drives the FAIL-LOUD secret/key guards below. Unlike `dev`,
+  // it is NOT inferred from a localhost PUBLIC_URL: a dev bypass must be an
+  // explicit `SIDECAR_DEV` opt-in, so a misconfigured prod box that happens to
+  // have a loopback PUBLIC_URL still refuses insecure secrets.
+  const securityDev = devForced !== undefined && /^(1|true|yes|on)$/i.test(devForced);
+
+  // --- shared internal secret (fail-loud in prod) -------------------------
+  const rawSecret = envOpt('SIDECAR_INTERNAL_SECRET');
+  let internalSecret: string;
+  if (rawSecret === undefined) {
+    if (securityDev) {
+      internalSecret = DEV_INTERNAL_SECRET;
       // eslint-disable-next-line no-console
       console.warn(
-        '[config] SIDECAR_INTERNAL_SECRET unset — using an insecure dev default. Set it before any real deploy.',
+        '[config] SIDECAR_INTERNAL_SECRET unset — using an insecure dev default (SIDECAR_DEV set). NEVER do this in prod.',
       );
     } else {
-      throw new Error('SIDECAR_INTERNAL_SECRET is required (no default outside dev/localhost mode)');
+      throw new Error(
+        'SIDECAR_INTERNAL_SECRET is required in production. Set a random value ≥32 bytes ' +
+          '(or set SIDECAR_DEV=true for an explicit local dev stack).',
+      );
     }
+  } else if (!securityDev) {
+    // Prod: refuse the dev default and refuse anything too short/weak.
+    if (rawSecret === DEV_INTERNAL_SECRET) {
+      throw new Error(
+        'SIDECAR_INTERNAL_SECRET is the insecure dev default — refusing to boot in production. ' +
+          'Set a random value ≥32 bytes.',
+      );
+    }
+    if (byteLen(rawSecret) < MIN_SECRET_BYTES) {
+      throw new Error(
+        `SIDECAR_INTERNAL_SECRET is too short (${byteLen(rawSecret)} bytes; need ≥${MIN_SECRET_BYTES}). ` +
+          'Refusing to boot in production.',
+      );
+    }
+    internalSecret = rawSecret;
+  } else {
+    internalSecret = rawSecret;
   }
+
+  // --- at-rest encryption key (fail-loud in prod) -------------------------
+  const rawEncKey = envOpt('SIDECAR_ENC_KEY');
+  let encKey: string | undefined;
+  if (rawEncKey === undefined) {
+    if (securityDev) {
+      encKey = undefined; // stores fall back to plaintext for a local dev stack
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[config] SIDECAR_ENC_KEY unset — persisting OAuth tokens/JWK in PLAINTEXT (SIDECAR_DEV set). ' +
+          'Set SIDECAR_ENC_KEY (via fly secrets) before any real deploy.',
+      );
+    } else {
+      throw new Error(
+        'SIDECAR_ENC_KEY is required in production (at-rest token/JWK encryption). ' +
+          'Deliver a random value ≥32 bytes via fly secrets; never write it to the volume. ' +
+          '(Or set SIDECAR_DEV=true for an explicit local dev stack.)',
+      );
+    }
+  } else if (!securityDev && byteLen(rawEncKey) < MIN_SECRET_BYTES) {
+    throw new Error(
+      `SIDECAR_ENC_KEY is too short (${byteLen(rawEncKey)} bytes; need ≥${MIN_SECRET_BYTES}). ` +
+        'Refusing to boot in production.',
+    );
+  } else {
+    encKey = rawEncKey;
+  }
+
+  // --- session TTLs + reaper cadence --------------------------------------
+  const sessionAbsoluteTtlMs = envIntMs('SIDECAR_SESSION_ABS_TTL_MS', 90 * 24 * 60 * 60 * 1000); // 90d
+  const sessionIdleTtlMs = envIntMs('SIDECAR_SESSION_IDLE_TTL_MS', 30 * 24 * 60 * 60 * 1000); // 30d
+  const reaperIntervalMs = envIntMs('SIDECAR_REAPER_INTERVAL_MS', 60 * 60 * 1000); // 1h
 
   return {
     host,
@@ -110,5 +203,9 @@ export function loadConfig(): SidecarConfig {
     plcDirectory,
     dev,
     scope,
+    encKey,
+    sessionAbsoluteTtlMs,
+    sessionIdleTtlMs,
+    reaperIntervalMs,
   };
 }
