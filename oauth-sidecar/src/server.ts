@@ -81,9 +81,10 @@
  *     sets its own signed cookie keyed by that DID.
  *  4. For every PDS read/write the Rust app calls `POST /internal/repo`
  *     with `{did, action, …}` and the secret.
- * The `session_id` is a bearer handoff token — it is only ever transmitted app↔
- * sidecar (both loopback / same tunnel) and resolved once; it does not itself
- * authenticate PDS calls (those go by `did` + the secret).
+ * The `session_id` is a bearer handoff token — it is SINGLE-USE (deleted on the
+ * first successful `GET /internal/session/:id`) and TTL-bounded (rejected after
+ * HANDOFF_TTL_MS), so a leaked callback URL cannot be replayed; it does not
+ * itself authenticate PDS calls (those go by `did` + the secret).
  */
 
 import { randomBytes } from 'node:crypto';
@@ -103,6 +104,12 @@ const stores = new SqliteStores(cfg.dbPath, codec);
 const { client: oauthClient, metadata, jwks } = await buildOAuthClient(cfg, stores, codec);
 
 const ttls: SessionTtls = { absoluteMs: cfg.sessionAbsoluteTtlMs, idleMs: cfg.sessionIdleTtlMs };
+
+// Freshness bound for the one-shot session-id handoff. The browser round-trips
+// sidecar redirect -> app callback -> `GET /internal/session/:id` in well under
+// a second; 2 minutes is generous headroom for a slow client while keeping a
+// leaked callback URL useless almost immediately.
+const HANDOFF_TTL_MS = 120_000;
 
 const app = Fastify({ logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' } });
 
@@ -237,6 +244,16 @@ app.get('/internal/session/:id', async (req: FastifyRequest, reply: FastifyReply
   if (!row) {
     reply.code(404);
     return { error: 'SessionNotFound', message: 'no such session id' };
+  }
+  // The handoff token is SINGLE-USE and short-lived. Consume it on the first
+  // successful resolve, and reject a stale row, so a `session_id` that leaks via
+  // the callback URL (browser history, proxy/tunnel access logs) is useless
+  // after the one legitimate resolve or after HANDOFF_TTL_MS. Delete first, then
+  // check freshness, so an expired id is also consumed (can't be retried).
+  stores.deleteAppSession(id);
+  if (Date.now() - row.createdAt > HANDOFF_TTL_MS) {
+    reply.code(404);
+    return { error: 'SessionExpired', message: 'session id expired' };
   }
   return { did: row.did, handle: row.handle };
 });
