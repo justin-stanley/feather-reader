@@ -377,6 +377,25 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
+/// The feeds a `did` currently subscribes to, per its `sub_ref` projection.
+/// Used by the PDS-unreachable fallback in `resolve_subscriptions` to render
+/// the sidebar from the caller's OWN last-known subscriptions (fail closed)
+/// rather than every cached feed.
+pub async fn feeds_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Feed>> {
+    let feeds = sqlx::query_as::<_, Feed>(
+        r#"
+        SELECT f.* FROM feeds f
+        JOIN sub_ref sr ON sr.feed_id = f.id AND sr.did = ?1
+        ORDER BY f.title IS NULL, f.title, f.url
+        "#,
+    )
+    .bind(did)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("feeds_for_did failed for {did}"))?;
+    Ok(feeds)
+}
+
 /// The number of feeds a `did` currently subscribes to (its `sub_ref` rows).
 /// Backs the per-DID subscription cap enforced at the add/import paths.
 pub async fn count_subscriptions_for_did(pool: &SqlitePool, did: &str) -> Result<i64> {
@@ -1059,14 +1078,27 @@ pub struct PurgeCounts {
     pub beta_access: u64,
     /// `invite_codes` rows removed (codes this DID *created*).
     pub invite_codes: u64,
+    /// `invite_codes` rows *scrubbed* (the code this DID *redeemed* to join —
+    /// its `invitee_did` back-reference cleared to NULL, row kept).
+    pub invitee_scrubbed: u64,
+    /// `beta_access` rows *scrubbed* (seats this DID *granted* to others — the
+    /// `granted_by` back-reference redacted to a sentinel, row kept).
+    pub granted_by_scrubbed: u64,
 }
 
 impl PurgeCounts {
-    /// Total rows removed across every per-DID table.
+    /// Total rows removed across every per-DID table. (Scrub counts are tracked
+    /// separately — those rows belong to *other* DIDs and are redacted, not
+    /// deleted — so they are excluded from the delete total.)
     pub fn total(&self) -> u64 {
         self.entry_state + self.read_cursor + self.sub_ref + self.beta_access + self.invite_codes
     }
 }
+
+/// Sentinel written into `beta_access.granted_by` when the granting DID deletes
+/// its data: the column is `NOT NULL`, so we redact rather than NULL it. Keeps
+/// the grantee's seat valid while removing the departed DID's back-reference.
+pub const REDACTED_DID: &str = "__redacted__";
 
 /// Delete **all** local rows owned by `did` in a single transaction: the
 /// per-DID read/star state (`entry_state`), per-feed read cursors
@@ -1117,6 +1149,30 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
         .with_context(|| format!("purge invite_codes for {did}"))?
         .rows_affected();
 
+    // Scrub the DID's back-references from rows that belong to OTHER DIDs so no
+    // per-DID residue survives the delete:
+    //   * the invite code this DID *redeemed* to join lives on the inviter's
+    //     row (`invitee_did`) — NULL it out (column is nullable).
+    //   * seats this DID *granted* to others carry `granted_by = <this did>` —
+    //     redact to a sentinel (column is NOT NULL) so the grantee keeps access
+    //     without retaining the departed DID.
+    let invitee_scrubbed =
+        sqlx::query("UPDATE invite_codes SET invitee_did = NULL WHERE invitee_did = ?1")
+            .bind(did)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("scrub invitee_did for {did}"))?
+            .rows_affected();
+
+    let granted_by_scrubbed =
+        sqlx::query("UPDATE beta_access SET granted_by = ?2 WHERE granted_by = ?1")
+            .bind(did)
+            .bind(REDACTED_DID)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("scrub granted_by for {did}"))?
+            .rows_affected();
+
     tx.commit().await.context("commit purge_did_data tx")?;
 
     Ok(PurgeCounts {
@@ -1125,6 +1181,8 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
         sub_ref,
         beta_access,
         invite_codes,
+        invitee_scrubbed,
+        granted_by_scrubbed,
     })
 }
 
@@ -1393,11 +1451,24 @@ mod tests {
         // B's star never leaks into A's starred list.
         assert!(get_starred_for_did(&pool, did_a).await?.is_empty());
 
+        // --- feeds_for_did is scoped to the DID's OWN sub_ref ----------------
+        // This is the PDS-unreachable fallback's projection: it must NEVER
+        // widen a DID's surface to feeds it does not subscribe to. A sees only
+        // feed_a; B (still subscribed to feed_b here) sees only feed_b.
+        let a_feeds = feeds_for_did(&pool, did_a).await?;
+        assert_eq!(a_feeds.len(), 1);
+        assert_eq!(a_feeds[0].id, feed_a);
+        let b_feeds = feeds_for_did(&pool, did_b).await?;
+        assert_eq!(b_feeds.len(), 1);
+        assert_eq!(b_feeds[0].id, feed_b);
+
         // --- resync drops a feed from the surface when the sub goes away ------
         replace_sub_refs(&pool, did_b, &[]).await?;
         assert!(get_unread_for_did(&pool, did_b).await?.is_empty());
         assert!(get_starred_for_did(&pool, did_b).await?.is_empty());
         assert!(entries_for_feed(&pool, did_b, feed_b).await?.is_empty());
+        // And the fallback projection is empty too — fail CLOSED, not open.
+        assert!(feeds_for_did(&pool, did_b).await?.is_empty());
 
         Ok(())
     }
@@ -1739,6 +1810,95 @@ mod tests {
         // Idempotent: purging again removes nothing.
         let again = purge_did_data(&pool, victim).await?;
         assert_eq!(again.total(), 0);
+
+        Ok(())
+    }
+
+    /// A departing DID leaves back-references on rows that belong to OTHER DIDs:
+    ///   * the invite code it *redeemed* to join (inviter's row: `invitee_did`);
+    ///   * seats it *granted* to others (`beta_access.granted_by`).
+    /// `purge_did_data` must scrub both so no per-DID residue survives, while
+    /// leaving those other DIDs' rows otherwise intact (their access is kept).
+    #[tokio::test]
+    async fn purge_did_data_scrubs_cross_did_back_references() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        let inviter = "did:plc:inviter";
+        let leaver = "did:plc:leaver";
+        let friend = "did:plc:friend";
+
+        // inviter mints a code; leaver redeems it to join (stamps invitee_did).
+        let inviter_code = mint_code(&pool, inviter, 3600).await?;
+        grant_access(&pool, inviter, None, "admin", None).await?;
+        assert_eq!(
+            redeem_code(&pool, &inviter_code, leaver, Some("leaver.bsky"), 100).await?,
+            Ok(())
+        );
+
+        // leaver mints a code; friend redeems it (stamps friend's granted_by).
+        let leaver_code = mint_code(&pool, leaver, 3600).await?;
+        assert_eq!(
+            redeem_code(&pool, &leaver_code, friend, Some("friend.bsky"), 100).await?,
+            Ok(())
+        );
+
+        // Precondition: the leaver DID is present in both back-reference columns.
+        let invitee_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE invitee_did = ?1")
+                .bind(leaver)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            invitee_before, 1,
+            "leaver should be an invitee before purge"
+        );
+        let granted_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM beta_access WHERE granted_by = ?1")
+                .bind(leaver)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(granted_before, 1, "leaver should be a granter before purge");
+
+        // Purge the leaver.
+        let counts = purge_did_data(&pool, leaver).await?;
+        assert_eq!(
+            counts.invitee_scrubbed, 1,
+            "the redeemed code's invitee_did"
+        );
+        assert_eq!(counts.granted_by_scrubbed, 1, "the seat leaver granted");
+
+        // No residue: the leaver DID appears in NEITHER back-reference column.
+        let invitee_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE invitee_did = ?1")
+                .bind(leaver)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(invitee_after, 0, "leaver survived in invitee_did");
+        let granted_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM beta_access WHERE granted_by = ?1")
+                .bind(leaver)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(granted_after, 0, "leaver survived in granted_by");
+
+        // The other DIDs' rows are kept: the friend still has a seat (redacted
+        // granter), and the inviter's code row still exists (invitee NULLed).
+        assert!(
+            has_beta_access(&pool, friend).await?,
+            "friend's seat must survive the leaver's scrub"
+        );
+        let friend_granted_by: String =
+            sqlx::query_scalar("SELECT granted_by FROM beta_access WHERE did = ?1")
+                .bind(friend)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(friend_granted_by, REDACTED_DID);
+        let inviter_code_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invite_codes WHERE creator_did = ?1")
+                .bind(inviter)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(inviter_code_rows, 1, "inviter's code row must survive");
 
         Ok(())
     }
