@@ -58,25 +58,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Install a pinned cargo-deny binary directly instead of using
-      # EmbarkStudios/cargo-deny-action@v2. The action wraps its own RustSec
-      # advisory-DB fetch, which failed on this network-restricted, tailnet-only
-      # self-hosted CI VM and broke the gate on every run. Running the binary
-      # ourselves lets us scope this job to the OFFLINE gates and skip the
-      # network entirely (`--offline` below). Config is deny.toml at the repo
-      # root; feature evaluation is set there (`[graph] all-features = true`).
+      # cargo-deny shells out to `cargo metadata` to build the crate graph, so
+      # this job needs a Rust toolchain (cargo on PATH) even though it only runs
+      # the license/ban/source gates.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Install a pinned cargo-deny binary directly (rather than
+      # EmbarkStudios/cargo-deny-action@v2, whose bundled RustSec advisory-DB
+      # fetch failed on this self-hosted runner and broke the gate every run).
+      # Config is deny.toml at the repo root; feature evaluation is set there
+      # (`[graph] all-features = true`).
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2
 
       # We deliberately DO NOT run the `advisories` check here: it needs the
-      # RustSec advisory DB over the network, which the dedicated `cargo audit`
-      # job below already covers (same DB, same fail-on-vuln semantics). This
-      # job enforces the AGPL-compatible license allowlist, duplicate/ban
-      # hygiene, and the crates.io-only source policy — all fully offline.
+      # RustSec advisory DB, which the dedicated `cargo audit` job below already
+      # covers (same DB, same fail-on-vuln semantics). This job enforces the
+      # AGPL-compatible license allowlist, duplicate/ban hygiene, and the
+      # crates.io-only source policy. (Not `--offline`: `cargo metadata` needs
+      # the registry index to resolve the dependency graph.)
       - name: cargo-deny (licenses + bans + sources)
-        run: cargo-deny --offline check bans licenses sources
+        run: cargo-deny check bans licenses sources
 
   cargo-audit:
     name: cargo audit (RustSec)
