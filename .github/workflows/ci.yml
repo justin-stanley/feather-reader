@@ -76,7 +76,7 @@ jobs:
       # job enforces the AGPL-compatible license allowlist, duplicate/ban
       # hygiene, and the crates.io-only source policy — all fully offline.
       - name: cargo-deny (licenses + bans + sources)
-        run: cargo deny --offline check bans licenses sources
+        run: cargo-deny --offline check bans licenses sources
 
   cargo-audit:
     name: cargo audit (RustSec)
