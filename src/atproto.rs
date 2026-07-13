@@ -235,7 +235,11 @@ pub async fn resolve_handle(client: &Client, resolver_base: &str, handle: &str) 
         did: String,
     }
 
-    let resp = client.get(&url).send().await?;
+    // Route through the SSRF guard: `resolver_base` can be a user-influenced PDS
+    // host (from a prior DID-doc resolution), so a hostile endpoint must not be
+    // able to target loopback / link-local / metadata. Feed-privacy is NOT
+    // applied here (this is a legitimate atproto XRPC call, not a feed fetch).
+    let resp = crate::net::guarded_get_no_privacy(client, &url, &[]).await?;
     if !resp.status().is_success() {
         // Surface the XRPC envelope but map the common "not found" to the typed
         // handle-resolution error so callers get a clean signal.
@@ -283,7 +287,12 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         .into());
     };
 
-    let resp = client.get(&doc_url).send().await?;
+    // SSRF guard: `doc_url` is attacker-controllable for `did:web:<host>` (the
+    // host comes straight from the DID) — a hostile `did:web:169.254.169.254`
+    // or `did:web:localhost` would otherwise make the server fetch an internal
+    // target and reflect its body. Route through the IP/scheme guard (no
+    // feed-privacy layer — this is a DID document, not a feed).
+    let resp = crate::net::guarded_get_no_privacy(client, &doc_url, &[]).await?;
     if !resp.status().is_success() {
         return Err(AtProtoError::DidResolution {
             did: did.to_string(),
@@ -293,13 +302,24 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
     }
 
     let doc: DidDocument = resp.json().await.context("parsing DID document")?;
-    doc.pds_endpoint().ok_or_else(|| {
-        AtProtoError::DidResolution {
+    let endpoint = doc
+        .pds_endpoint()
+        .ok_or_else(|| AtProtoError::DidResolution {
             did: did.to_string(),
             reason: "DID document has no #atproto_pds service endpoint".to_string(),
-        }
-        .into()
-    })
+        })?;
+
+    // SSRF guard on the RESOLVED endpoint: the `serviceEndpoint` is fully
+    // attacker-controlled (it's whatever the DID document says) and is handed to
+    // XRPC clients that fetch it directly. Reject a private/loopback/metadata
+    // target here so a hostile DID doc can't point the PDS at an internal host.
+    crate::net::assert_public_target(&endpoint)
+        .await
+        .map_err(|e| AtProtoError::DidResolution {
+            did: did.to_string(),
+            reason: format!("PDS serviceEndpoint is not a public target: {e}"),
+        })?;
+    Ok(endpoint)
 }
 
 /// The subset of a DID document FeatherReader needs: its services, so it can
@@ -1641,6 +1661,77 @@ mod tests {
         let minimal: Subscription = resp.records[1].parse().expect("parse minimal sub");
         assert_eq!(minimal.url, "https://blog.example.org/atom.xml");
         assert!(minimal.title.is_none());
+    }
+
+    fn ssrf_test_client() -> Client {
+        Client::builder()
+            .user_agent(crate::USER_AGENT)
+            .build()
+            .unwrap()
+    }
+
+    /// A hostile `did:web` whose host is the cloud-metadata address must be
+    /// REFUSED before any request leaves the box — the DID-document fetch now
+    /// routes through the SSRF guard (`guarded_get_no_privacy`), which rejects
+    /// link-local / metadata targets.
+    #[tokio::test]
+    async fn resolve_did_web_blocks_metadata_host() {
+        let client = ssrf_test_client();
+        let err = resolve_did_to_pds(&client, "https://plc.directory", "did:web:169.254.169.254")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("forbidden") || err.contains("internal"),
+            "expected an SSRF refusal, got: {err}"
+        );
+    }
+
+    /// A `did:web` pointing at loopback is likewise blocked (internal service
+    /// reflection).
+    #[tokio::test]
+    async fn resolve_did_web_blocks_loopback_host() {
+        let client = ssrf_test_client();
+        let err = resolve_did_to_pds(&client, "https://plc.directory", "did:web:127.0.0.1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("forbidden") || err.contains("internal"),
+            "expected an SSRF refusal, got: {err}"
+        );
+    }
+
+    /// `resolve_handle` against a metadata/loopback resolver base is also guarded
+    /// (the base can come from a prior hostile DID-doc resolution).
+    #[tokio::test]
+    async fn resolve_handle_blocks_metadata_resolver_base() {
+        let client = ssrf_test_client();
+        let err = resolve_handle(&client, "http://169.254.169.254", "alice.example.com")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("forbidden") || err.contains("internal"),
+            "expected an SSRF refusal, got: {err}"
+        );
+    }
+
+    /// A resolved `serviceEndpoint` that targets an internal host is rejected at
+    /// resolve time via [`crate::net::assert_public_target`], so it can never be
+    /// handed to a raw XRPC client.
+    #[tokio::test]
+    async fn service_endpoint_internal_target_rejected() {
+        assert!(crate::net::assert_public_target("http://169.254.169.254/")
+            .await
+            .is_err());
+        assert!(crate::net::assert_public_target("http://127.0.0.1:3000/")
+            .await
+            .is_err());
+        // A public endpoint literal passes.
+        assert!(crate::net::assert_public_target("https://1.1.1.1/")
+            .await
+            .is_ok());
     }
 
     #[test]
