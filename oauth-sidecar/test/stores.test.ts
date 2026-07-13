@@ -90,6 +90,29 @@ test('purgeDid removes oauth_session + app_session rows', async () => {
   }
 });
 
+test('deleteAppSession consumes one handoff id without touching others', () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    stores.putAppSession('sid-1', 'did:plc:carol', 'carol.example');
+    stores.putAppSession('sid-2', 'did:plc:dave', 'dave.example');
+
+    // A resolve of sid-1 must be single-use: after delete it's gone...
+    assert.ok(stores.getAppSession('sid-1'));
+    stores.deleteAppSession('sid-1');
+    assert.equal(stores.getAppSession('sid-1'), undefined);
+    // ...while an unrelated handoff id is untouched.
+    assert.ok(stores.getAppSession('sid-2'));
+
+    // getAppSession exposes createdAt so the handler can enforce a freshness TTL.
+    const row = stores.getAppSession('sid-2');
+    assert.equal(typeof row?.createdAt, 'number');
+    stores.close();
+  } finally {
+    cleanup();
+  }
+});
+
 test('reaper: expires by absolute and idle TTL, calls onReap, preserves fresh', async () => {
   const { path, cleanup } = tmpDb();
   try {
