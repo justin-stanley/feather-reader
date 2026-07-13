@@ -47,9 +47,9 @@ The exact request/response JSON shapes are documented at the top of
 
 ## Production
 
-Set `SIDECAR_PUBLIC_URL=https://reader.justin-stanley.com/oauth` (or a dedicated
+Set `SIDECAR_PUBLIC_URL=https://feather-reader.com/oauth` (or a dedicated
 subdomain), a strong `SIDECAR_INTERNAL_SECRET`, and
-`SIDECAR_APP_CALLBACK_URL=https://reader.justin-stanley.com/oauth/callback`. The
+`SIDECAR_APP_CALLBACK_URL=https://feather-reader.com/oauth/callback`. The
 confidential-client signing key is generated once and persisted to
 `${SIDECAR_DB}.jwk.json` (keep it with the DB volume); `/jwks.json` serves its
 public half. `client-metadata.json` and `jwks.json` must be reachable at the edge.

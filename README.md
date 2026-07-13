@@ -9,7 +9,7 @@ PDS** — not in the app's database. You sign in with your atproto identity, and
 your reading list follows you across *any* reader that speaks the same open
 lexicon. You own your data; the app just holds a cache and a login session.
 
-Hosted at **[reader.justin-stanley.com](https://reader.justin-stanley.com)**, and
+Hosted at **[feather-reader.com](https://feather-reader.com)**, and
 trivial to self-host.
 
 > **Status: experimental / pre-1.0.** The core is built and usable, but the

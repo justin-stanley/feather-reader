@@ -557,7 +557,7 @@ mod tests {
         assert!(!public_url_is_non_loopback("http://127.0.0.1:8080"));
         assert!(!public_url_is_non_loopback("http://[::1]:8080"));
         assert!(public_url_is_non_loopback(
-            "https://reader.justin-stanley.com"
+            "https://feather-reader.com"
         ));
         assert!(public_url_is_non_loopback("http://203.0.113.5"));
     }
