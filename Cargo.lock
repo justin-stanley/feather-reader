@@ -629,6 +629,7 @@ dependencies = [
  "chrono",
  "feed-rs",
  "getrandom 0.4.3",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

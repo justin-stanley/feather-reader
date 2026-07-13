@@ -88,6 +88,14 @@ url = "2"
 # the session-id minting reads from the OS CSPRNG rather than a home-rolled RNG.
 getrandom = "0.4"
 
+# --- filesystem stat (startup disk-headroom check) -----------------------
+# Already in the tree transitively; pinned as a direct dep so the startup
+# watermark-vs-disk safety check can call `statvfs(3)` on unix to compare the
+# configured DB-size watermark against the DB volume's actual free space. Unix
+# only — the target deploys are Linux/Fly and the check no-ops elsewhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the axum router through a single request in the
 # web-layer tests (cache-control headers, rate-limit 429, the pre-handshake
