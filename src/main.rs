@@ -14,9 +14,9 @@
 //! 6. Build the axum [`Router`] via [`web::router`] and serve until shutdown.
 //!
 //! Shutdown is broadcast to *both* the server and the background tasks via a
-//! `tokio::sync::watch` channel, so a single Ctrl-C drains the HTTP server, the
-//! poller, and the flusher (the flusher does one final read-state flush) before
-//! the process exits.
+//! `tokio::sync::watch` channel, so a single SIGINT/SIGTERM drains the HTTP
+//! server, the poller, and the flusher (the flusher does one final read-state
+//! flush) before the process exits.
 
 use anyhow::{Context, Result};
 use feather_reader::config::Config;
@@ -70,11 +70,11 @@ async fn main() -> Result<()> {
     let bind = config.bind;
     let state = AppState::new(config, db).context("building application state")?;
 
-    // 5. Shutdown fan-out. A single Ctrl-C flips this watch channel; the HTTP
-    //    server and both background tasks each hold a receiver and stop.
+    // 5. Shutdown fan-out. SIGINT (Ctrl-C) or SIGTERM flips this watch channel;
+    //    the HTTP server and both background tasks each hold a receiver and stop.
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(async move {
-        signal_ctrl_c().await;
+        shutdown_signal().await;
         // Send is best-effort: if every receiver has already dropped we are
         // already shutting down.
         let _ = shutdown_tx.send(());
@@ -203,12 +203,42 @@ fn init_tracing() {
         .init();
 }
 
-/// Resolve when the process receives Ctrl-C (SIGINT).
-async fn signal_ctrl_c() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        tracing::error!(%err, "failed to install Ctrl-C handler");
+/// Resolve when the process receives a shutdown signal: SIGINT (Ctrl-C) or, on
+/// unix, SIGTERM. Container runtimes (Fly, Docker, `kill`) stop a process with
+/// SIGTERM, whose default disposition is immediate termination — which would
+/// skip the graceful-shutdown fan-out and the flusher's final read-state flush,
+/// and tear down SQLite abruptly. Handling it drives the same clean drain as
+/// Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => {
+                        if let Err(err) = r {
+                            tracing::error!(%err, "failed to install Ctrl-C handler");
+                        }
+                    }
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                // Fall back to SIGINT-only rather than never shutting down.
+                tracing::error!(%err, "failed to install SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        info!("shutdown signal received");
     }
-    info!("shutdown signal received");
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(%err, "failed to install Ctrl-C handler");
+        }
+        info!("shutdown signal received");
+    }
 }
 
 /// A clonable-per-call shutdown future: resolves the first time the `watch`
