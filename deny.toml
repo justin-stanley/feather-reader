@@ -1,0 +1,81 @@
+# cargo-deny configuration for feather-reader.
+#
+# Run locally with:  cargo deny check
+# Runs in CI (see .github/workflows/ci.yml, job `cargo-deny`).
+#
+# Four independent gates:
+#   * advisories — RustSec vuln/unmaintained/yanked check (belt-and-suspenders
+#     alongside `cargo audit`; deny.toml covers licenses+bans that audit can't).
+#   * licenses   — every crate in the tree must carry an AGPL-3.0-compatible,
+#     OSI-approved license (this crate ships AGPL-3.0-only).
+#   * bans       — duplicate-version hygiene + an explicit deny list.
+#   * sources    — only crates.io (no unvetted git/registry sources).
+
+[graph]
+# Evaluate all target platforms so a Linux-only advisory on a Windows-only crate
+# doesn't silently pass on the dev Mac. all-features keeps the graph honest.
+all-features = true
+
+[advisories]
+# Uses the default RustSec advisory DB (https://github.com/rustsec/advisory-db).
+# `version = 2` is the current schema: unmaintained/yanked default to "warn",
+# and any actual vulnerability is an error (build-breaking).
+version = 2
+# --- un-actionable transitive advisory escape hatch ---------------------------
+# When a RustSec advisory fires on a *transitive* dep with no fixed release yet
+# (or the fix is a semver-major bump we can't take), add its RUSTSEC id here with
+# a one-line justification + a link, rather than pinning the whole DB open.
+# Keep this list SHORT and revisit on every Dependabot bump. Example:
+#   ignore = [
+#     # RUSTSEC-YYYY-NNNN: <crate> — <why un-actionable> — <tracking link>
+#   ]
+ignore = []
+
+[licenses]
+# version 2: `allow` is the allowlist; anything not listed is an error. We only
+# admit OSI-approved / public-domain-equivalent licenses that are compatible
+# with distributing this crate under AGPL-3.0-only. (No copyleft stronger than
+# MPL-2.0's file-level copyleft appears in the tree.)
+version = 2
+allow = [
+    "AGPL-3.0-only",   # this crate
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",         # ryu — permissive, AGPL-compatible
+    "0BSD",
+    "CC0-1.0",         # public-domain dedication
+    "Unlicense",       # public-domain dedication
+    "Zlib",
+    "MPL-2.0",         # cssparser, dtoa-short — file-level copyleft, compatible
+    "Unicode-3.0",     # ICU crates
+    "CDLA-Permissive-2.0", # webpki-roots — permissive data license
+]
+# `confidence-threshold` 0.9 keeps license-file heuristics strict.
+confidence-threshold = 0.9
+# Per-crate clarifications for crates whose SPDX expression cargo-deny can't
+# resolve on its own would go here. None needed for the current tree.
+
+[bans]
+# Duplicate *major* versions are a warning (transitive churn is normal in a
+# large async tree); flip to "deny" once the tree stabilizes pre-1.0-release.
+multiple-versions = "warn"
+# Prefer the highest semver-compatible version when the graph could pick either.
+wildcards = "deny"       # no `foo = "*"` dependencies
+allow-wildcard-paths = true  # path deps (none today) may omit versions
+deny = [
+    # Add crates we never want pulled in, e.g. an accidental native-tls/openssl
+    # path (this crate is deliberately rustls-only):
+    #   { name = "openssl-sys" },
+]
+
+[sources]
+# Only crates.io. Any git or alternative-registry source is an error — no
+# unvetted supply-chain inputs.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

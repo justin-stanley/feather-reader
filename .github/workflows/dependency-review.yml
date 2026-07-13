@@ -1,0 +1,41 @@
+name: Dependency review
+
+# On every PR: diff the dependency manifests/lockfiles and BLOCK the PR if it
+# introduces a dependency with a known vulnerability or a disallowed license.
+# Complements Dependabot (which fixes vulns) by gating them at PR time.
+#
+# ── RUNNER / COST ─────────────────────────────────────────────────────────────
+# `dependency-review-action` calls the GitHub Dependency Graph API, which
+# requires the dependency graph feature. That feature is:
+#   * always on + FREE for PUBLIC repos (the OSS steady state),
+#   * available on private repos only with GitHub Advanced Security.
+# So on this repo the workflow becomes fully effective once PUBLIC. It runs on
+# `ubuntu-latest` (the action ships there); it's a tiny job.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # so the action can post its summary comment
+
+jobs:
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest  # GitHub-hosted; free once public
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Block on high+ severity vulns; summarise everything on the PR.
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+          # Keep license policy aligned with deny.toml (AGPL-compatible set).
+          # Strong copyleft that this AGPL project can't absorb from a *dependency*
+          # is denied so a surprise GPL/SSPL dep can't slip in. (AGPL itself is
+          # NOT denied — it's this project's own license.)
+          deny-licenses: >-
+            GPL-2.0-only, GPL-3.0-only, LGPL-3.0-only, SSPL-1.0

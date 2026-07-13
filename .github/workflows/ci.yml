@@ -1,5 +1,10 @@
 name: CI
 
+# Build / test / lint / audit gate. Runs entirely on the SELF-HOSTED runner
+# (`ci-geekom-feather-reader`) to spend zero GitHub-hosted Actions minutes.
+# CodeQL, dependency-review, and OSSF Scorecard live in their own workflows
+# (they are designed for GitHub-hosted runners — see those files + the README).
+
 on:
   push:
     branches: [main]
@@ -41,6 +46,47 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all --check
 
+  cargo-deny:
+    name: cargo deny (licenses + bans + advisories + sources)
+    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
+    steps:
+      - uses: actions/checkout@v4
+      # EmbarkStudios' action installs a pinned cargo-deny and runs `check`.
+      # Config is deny.toml at the repo root. This gate enforces the
+      # AGPL-compatible license allowlist, forbids unvetted crate sources, and
+      # (belt-and-suspenders with the cargo-audit job) checks the RustSec DB.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Runs all four checks (advisories, bans, licenses, sources). Feature
+          # evaluation is set in deny.toml (`[graph] all-features = true`), so no
+          # extra CLI args are needed here.
+          command: check
+
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Dedicated RustSec scan of Cargo.lock. Fails the build on any known
+      # vulnerability. Un-actionable transitive advisories (no fixed release, or
+      # a fix that needs a semver-major bump) are whitelisted in deny.toml's
+      # `[advisories] ignore = [...]`; mirror any such id here as an explicit
+      # `--ignore RUSTSEC-YYYY-NNNN` flag. Keep the list SHORT and documented.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: cargo audit
+        # `-D warnings` promotes unmaintained/unsound advisories to failures too.
+        run: cargo audit -D warnings
+
   sidecar:
     name: OAuth sidecar
     runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
@@ -65,3 +111,36 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Lint (ESLint, --max-warnings 0)
+        run: npm run lint
+
+      - name: Format check (Prettier)
+        # Scoped to the tooling/config files the CI pipeline owns. The hand-
+        # authored src/ + test/ predate Prettier and are enforced for
+        # CORRECTNESS by ESLint above; a repo-wide `prettier --write` is left as
+        # a deliberate one-time follow-up (`npm run format:write`) so this gate
+        # never fights the code-fix workflows over whitespace. See
+        # .github/workflows/README.md.
+        run: npm run format:check
+
+      - name: npm audit (prod deps, high+)
+        # Sidecar runtime deps only (--omit=dev); dev tooling churn shouldn't
+        # break CI. Fails on high/critical advisories.
+        run: npm audit --omit=dev --audit-level=high
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — scans fine here now
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks can scan past commits too
+
+      # gitleaks scans the working tree AND git history for committed secrets.
+      # Config: .gitleaks.toml at the repo root. The OSS action needs no license
+      # key (the paid license input only unlocks org-level features).
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
