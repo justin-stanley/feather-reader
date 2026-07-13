@@ -790,7 +790,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
             let feeds = store::due_feeds(pool, &now_rfc3339(), i64::MAX)
                 .await
                 .unwrap_or_default();
-            return feeds
+            let out: Vec<ResolvedSub> = feeds
                 .into_iter()
                 .map(|f| ResolvedSub {
                     rkey: String::new(),
@@ -798,6 +798,10 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                     feed: Some(f),
                 })
                 .collect();
+            // Sync the per-DID subscription projection so the scoped reads
+            // still work when the PDS is unreachable (degrade to cache).
+            sync_sub_refs(pool, did, &out).await;
+            return out;
         }
     };
 
@@ -826,7 +830,24 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
         };
         out.push(ResolvedSub { rkey, sub, feed });
     }
+    // Mirror the caller's resolved subscription set into `sub_ref`, so every
+    // scoped entry/feed read + read/star mutation authorizes against exactly
+    // the feeds this DID follows right now. This is THE per-DID isolation hook.
+    sync_sub_refs(pool, did, &out).await;
     out
+}
+
+/// Refresh the `sub_ref` projection for `did` to exactly the feed ids present
+/// in `subs`. Best-effort: a failure here only degrades the scoped reads (they
+/// fail closed / show fewer rows), never leaks another user's entries.
+async fn sync_sub_refs(pool: &store::Pool, did: &str, subs: &[ResolvedSub]) {
+    let feed_ids: Vec<i64> = subs
+        .iter()
+        .filter_map(|s| s.feed.as_ref().map(|f| f.id))
+        .collect();
+    if let Err(err) = store::replace_sub_refs(pool, did, &feed_ids).await {
+        warn!(%err, %did, "failed to sync sub_ref projection");
+    }
 }
 
 /// `GET /` — the reader. Renders the sidebar (folders + feeds from the PDS
@@ -899,7 +920,7 @@ async fn index(
             for s in &subs {
                 if let Some(f) = &s.feed {
                     if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, f.id)
+                        let mut es = store::entries_for_feed(pool, &did, f.id)
                             .await
                             .unwrap_or_default();
                         all.append(&mut es);
@@ -1245,7 +1266,12 @@ async fn entry_view(
     let did = user.did.clone();
     let pool = &state.db;
 
-    let entry = match get_entry_by_id(pool, id).await? {
+    // Resolve subscriptions FIRST: this refreshes the `sub_ref` projection so
+    // the per-DID entry gate below authorizes against the caller's current PDS
+    // subscription set (not another user's cached feeds).
+    let subs = resolve_subscriptions(&state, &did).await;
+
+    let entry = match get_entry_by_id(pool, &did, id).await? {
         Some(e) => e,
         None => return Ok((StatusCode::NOT_FOUND, "entry not found").into_response()),
     };
@@ -1261,8 +1287,6 @@ async fn entry_view(
 
     let back_qs = scope_query(&q);
 
-    // Rail: the same navigation as the list, in the reader's scope.
-    let subs = resolve_subscriptions(&state, &did).await;
     let (folder_views, loose_feeds, _) =
         build_sidebar(&state, &did, &subs, q.feed.as_deref(), q.folder.as_deref()).await;
     let nav_view = match q.view.as_deref() {
@@ -1358,7 +1382,7 @@ async fn list_entry_ids(state: &AppState, did: &str, q: &IndexQuery) -> Vec<i64>
             for s in &subs {
                 if let Some(f) = &s.feed {
                     if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, f.id)
+                        let mut es = store::entries_for_feed(pool, did, f.id)
                             .await
                             .unwrap_or_default();
                         all.append(&mut es);
@@ -1429,7 +1453,15 @@ async fn mark_read(
         form.read.as_deref(),
         Some("true") | Some("1") | Some("on") | None
     );
-    store::mark_read(pool, &did, id, read).await?;
+
+    // Refresh the caller's `sub_ref` projection, then apply the AUTHORIZED
+    // mutation: `mark_read` only writes when `did` subscribes to the entry's
+    // feed. A non-subscriber gets a 404, never a mutation of someone else's
+    // (or the shared cache's) state.
+    resolve_subscriptions(&state, &did).await;
+    if !store::mark_read(pool, &did, id, read).await? {
+        return Ok((StatusCode::NOT_FOUND, "entry not found").into_response());
+    }
 
     if !is_htmx(&headers) {
         return Ok(Redirect::to("/").into_response());
@@ -1474,10 +1506,18 @@ async fn toggle_star(
         form.starred.as_deref(),
         Some("true") | Some("1") | Some("on") | None
     );
-    store::mark_starred(pool, &did, id, starred).await?;
 
-    // Reflect into the PDS saved-records collection.
-    if let Ok(Some(entry)) = get_entry_by_id(pool, id).await {
+    // Refresh the caller's `sub_ref` projection, then apply the AUTHORIZED
+    // mutation: `mark_starred` only writes when `did` subscribes to the entry's
+    // feed. A non-subscriber gets a 404, never a mutation.
+    resolve_subscriptions(&state, &did).await;
+    if !store::mark_starred(pool, &did, id, starred).await? {
+        return Ok((StatusCode::NOT_FOUND, "entry not found").into_response());
+    }
+
+    // Reflect into the PDS saved-records collection. `get_entry_by_id` is scoped
+    // to the caller's subscriptions, so this only ever acts on the caller's feed.
+    if let Ok(Some(entry)) = get_entry_by_id(pool, &did, id).await {
         let entry_url = entry.url.clone().unwrap_or_default();
         if !entry_url.is_empty() {
             if starred {
@@ -1549,6 +1589,10 @@ async fn mark_all_read(
         None => return Ok(Redirect::to("/login").into_response()),
     };
     let pool = &state.db;
+
+    // Refresh the caller's `sub_ref` projection so the scoped mark-read writes
+    // only ever touch feeds this DID actually subscribes to.
+    resolve_subscriptions(&state, &did).await;
 
     if let Some(feed_url) = q.feed.as_deref() {
         if let Ok(Some(feed)) = store::get_feed_by_url(pool, feed_url).await {
@@ -2813,11 +2857,31 @@ mod cookie {
 // ---------------------------------------------------------------------------
 
 /// Fetch a single cached entry by id.
-async fn get_entry_by_id(pool: &store::Pool, id: i64) -> anyhow::Result<Option<store::Entry>> {
-    let entry = sqlx::query_as::<_, store::Entry>("SELECT * FROM entries WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+/// Fetch a single cached entry by id — SCOPED to `did`'s subscriptions.
+///
+/// Returns `None` (→ 404 at the handler) if the entry does not exist OR if
+/// `did` does not subscribe to its feed. This is the per-DID read gate for the
+/// `GET /entries/:id` reader and the htmx row rebuild: the shared cache is
+/// deduped by URL, but no DID can read another DID's cached article.
+async fn get_entry_by_id(
+    pool: &store::Pool,
+    did: &str,
+    id: i64,
+) -> anyhow::Result<Option<store::Entry>> {
+    let entry = sqlx::query_as::<_, store::Entry>(
+        r#"
+        SELECT e.* FROM entries e
+        WHERE e.id = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
+        "#,
+    )
+    .bind(did)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(entry)
 }
 
@@ -2865,7 +2929,7 @@ async fn build_entry_row(
     id: i64,
     read: Option<bool>,
 ) -> anyhow::Result<Option<EntryRow>> {
-    let entry = match get_entry_by_id(pool, id).await? {
+    let entry = match get_entry_by_id(pool, did, id).await? {
         Some(e) => e,
         None => return Ok(None),
     };
