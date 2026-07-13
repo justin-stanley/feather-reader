@@ -67,29 +67,7 @@
         </span>
       {% endif %}
 
-      <form class="mark-read-form" method="post" action="/entries/{{ id }}/read"
-            hx-post="/entries/{{ id }}/read" hx-target="this" hx-swap="none">
-        <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
-        <button type="submit" class="icon-btn actionbar-read mark-read"
-                aria-pressed="{% if read %}true{% else %}false{% endif %}"
-                aria-label="{% if read %}Mark unread (m){% else %}Mark read (m){% endif %}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"/></svg>
-        </button>
-      </form>
-
-      <form class="star-form" method="post" action="/entries/{{ id }}/star"
-            hx-post="/entries/{{ id }}/star" hx-target="this" hx-swap="none">
-        <input type="hidden" name="starred" value="{% if starred %}false{% else %}true{% endif %}" />
-        <button type="submit" class="icon-btn actionbar-star star-btn"
-                aria-pressed="{% if starred %}true{% else %}false{% endif %}"
-                aria-label="{% if starred %}Unstar entry (s){% else %}Star entry (s){% endif %}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-               stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
-          </svg>
-        </button>
-      </form>
+      {% include "entry_actionbar.html" %}
 
       {% if let Some(u) = url %}
         <a class="icon-btn actionbar-open" href="{{ u }}" target="_blank"

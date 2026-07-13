@@ -479,9 +479,12 @@ pub async fn insert_entries(
     }
 
     // Entries-per-feed cap: keep only the newest `max_entries_per_feed` rows for
-    // this feed (by published date, id as tiebreak), deleting the overflow in the
-    // same transaction. This bounds a single firehose/misbehaving feed's storage
-    // footprint independent of the global retention sweep. `<= 0` disables it.
+    // this feed, deleting the overflow in the same transaction. "Newest" is
+    // COALESCE(published, fetched_at) so an UNDATED entry (NULL published) sorts
+    // by when we fetched it (NOT NULL) rather than always sorting LAST and being
+    // evicted first — otherwise a feed of undated items would trim its freshest
+    // rows. This bounds a single firehose/misbehaving feed's storage footprint
+    // independent of the global retention sweep. `<= 0` disables it.
     if max_entries_per_feed > 0 {
         sqlx::query(
             r#"
@@ -490,7 +493,7 @@ pub async fn insert_entries(
               AND id NOT IN (
                   SELECT id FROM entries
                   WHERE feed_id = ?1
-                  ORDER BY published DESC, id DESC
+                  ORDER BY COALESCE(published, fetched_at) DESC, id DESC
                   LIMIT ?2
               )
             "#,
@@ -575,13 +578,18 @@ pub async fn entries_for_feed(pool: &SqlitePool, did: &str, feed_id: i64) -> Res
 }
 
 /// Mark a single entry read/unread for a DID, upserting the per-DID state row
-/// and stamping `updated_at`. Preserves any existing `starred` bit.
+/// and stamping `updated_at`. Preserves any existing `starred` bit. Also
+/// projects the change into the per-`(did, feed_url)` [`ReadCursor`] and marks
+/// it `dirty` so the batched flusher pushes it to the PDS (see
+/// [`project_entry_into_cursor`]).
 ///
 /// AUTHORIZED per-DID: the upsert only touches an entry the caller subscribes
 /// to (`sub_ref`). Returns `true` if a row was written, `false` if `did` does
 /// not subscribe to the entry's feed (the web layer maps that to a 404 —
 /// a non-subscriber can never mutate another user's state).
 pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) -> Result<bool> {
+    let now = now_rfc3339();
+    let mut tx = pool.begin().await.context("begin mark_read tx")?;
     let res = sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
@@ -600,11 +608,24 @@ pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) 
     .bind(did)
     .bind(entry_id)
     .bind(read)
-    .bind(now_rfc3339())
-    .execute(pool)
+    .bind(&now)
+    .execute(&mut *tx)
     .await
     .with_context(|| format!("mark_read failed for {did}/{entry_id}"))?;
-    Ok(res.rows_affected() > 0)
+
+    if res.rows_affected() == 0 {
+        // Not authorized (no `sub_ref`) — nothing written, no cursor to dirty.
+        tx.rollback().await.ok();
+        return Ok(false);
+    }
+
+    // Project the read/unread into this feed's read cursor (dirty=1) so the
+    // flusher syncs it to the PDS. Same tx as the state write so a crash can't
+    // leave the two out of step.
+    project_entry_into_cursor(&mut tx, did, entry_id, read, &now).await?;
+
+    tx.commit().await.context("commit mark_read tx")?;
+    Ok(true)
 }
 
 /// Star/unstar a single entry for a DID (upsert, preserving `read`).
@@ -644,9 +665,12 @@ pub async fn mark_starred(
 }
 
 /// Mark every entry of a feed read (or unread) for a DID in one statement —
-/// backs the "mark-all-read (per feed)" action.
+/// backs the "mark-all-read (per feed)" action. Also projects the change into
+/// the feed's per-DID [`ReadCursor`] (dirty=1) so the batched flusher syncs the
+/// new read-state to the PDS.
 pub async fn mark_feed_read(pool: &SqlitePool, did: &str, feed_id: i64, read: bool) -> Result<u64> {
     let now = now_rfc3339();
+    let mut tx = pool.begin().await.context("begin mark_feed_read tx")?;
     let res = sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
@@ -665,10 +689,229 @@ pub async fn mark_feed_read(pool: &SqlitePool, did: &str, feed_id: i64, read: bo
     .bind(read)
     .bind(&now)
     .bind(feed_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .with_context(|| format!("mark_feed_read failed for {did}/feed {feed_id}"))?;
+
+    if res.rows_affected() > 0 {
+        // Project every affected entry into this feed's read cursor. `feed_id`
+        // maps to exactly one feed URL, so this is a single per-feed cursor —
+        // batched, not per-article. Only runs when the caller was authorized
+        // (some rows changed), so an unsubscribed feed leaves no cursor behind.
+        project_feed_into_cursor(&mut tx, did, feed_id, read, &now).await?;
+    }
+
+    tx.commit().await.context("commit mark_feed_read tx")?;
     Ok(res.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// Read-cursor projection (wires the local read/unread mutation into the
+// PDS-bound `read_cursor`, so the batched flusher actually pushes read-state)
+// ---------------------------------------------------------------------------
+
+/// Add or remove an entry id from a JSON id-array string, returning the new JSON.
+/// Membership is set-like (no duplicates) and order-stable (append on add). A
+/// malformed input is treated as empty so a cosmetic parse issue never blocks a
+/// projection.
+fn json_id_set_toggle(raw: &str, id: i64, present: bool) -> String {
+    let mut ids: Vec<i64> = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .ok()
+        .map(|vals| {
+            vals.into_iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if present {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    } else {
+        ids.retain(|&x| x != id);
+    }
+    // Serialize as a JSON array of strings (the shape the flusher / lexicon
+    // expect — `community.lexicon.rss.readState.readIds` is a string array).
+    let as_strings: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    serde_json::to_string(&as_strings).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The feed URL owning `feed_id`, if the row exists (cursors are keyed by URL,
+/// not feed id — they mirror the PDS-side `readState.feedUrl`).
+async fn feed_url_for_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_id: i64,
+) -> Result<Option<String>> {
+    let url: Option<String> = sqlx::query_scalar("SELECT url FROM feeds WHERE id = ?1")
+        .bind(feed_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("feed_url_for_id_tx failed for feed {feed_id}"))?;
+    Ok(url)
+}
+
+/// Fetch the (read_through, read_ids, unread_ids) of an existing cursor, or the
+/// empty defaults if there is none yet.
+async fn cursor_sets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    did: &str,
+    feed_url: &str,
+) -> Result<(Option<String>, String, String)> {
+    let row = sqlx::query(
+        "SELECT read_through, read_ids, unread_ids FROM read_cursor \
+         WHERE did = ?1 AND feed_url = ?2",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .fetch_optional(&mut **tx)
+    .await
+    .with_context(|| format!("cursor_sets failed for {did}/{feed_url}"))?;
+    Ok(match row {
+        Some(r) => (
+            r.get::<Option<String>, _>("read_through"),
+            r.get::<String, _>("read_ids"),
+            r.get::<String, _>("unread_ids"),
+        ),
+        None => (None, "[]".to_string(), "[]".to_string()),
+    })
+}
+
+/// Upsert the cursor row for `(did, feed_url)` with the given exception sets,
+/// stamping `updated_at` and marking it `dirty` so `dirty_cursors` returns it.
+async fn write_cursor_sets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    did: &str,
+    feed_url: &str,
+    read_through: Option<&str>,
+    read_ids: &str,
+    unread_ids: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO read_cursor
+            (did, feed_url, read_through, read_ids, unread_ids, dirty, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+        ON CONFLICT (did, feed_url) DO UPDATE SET
+            read_through = excluded.read_through,
+            read_ids     = excluded.read_ids,
+            unread_ids   = excluded.unread_ids,
+            dirty        = 1,
+            updated_at   = excluded.updated_at
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(read_through)
+    .bind(read_ids)
+    .bind(unread_ids)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("write_cursor_sets failed for {did}/{feed_url}"))?;
+    Ok(())
+}
+
+/// Project a single entry's read/unread flip into its feed's read cursor.
+///
+/// The cursor mirrors `community.lexicon.rss.readState`: a `read_through`
+/// high-water-mark plus two bounded exception sets. A per-article flip is
+/// recorded in those sets (`read_ids` when read, `unread_ids` when unread), the
+/// opposite set is cleared of the id, and the cursor is stamped + marked dirty.
+/// The reconciler later folds covered ids into `read_through`; here we keep it
+/// batched by touching only the ONE per-feed cursor.
+async fn project_entry_into_cursor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    did: &str,
+    entry_id: i64,
+    read: bool,
+    now: &str,
+) -> Result<()> {
+    // The entry's feed id → feed URL (the cursor key).
+    let feed_id: Option<i64> = sqlx::query_scalar("SELECT feed_id FROM entries WHERE id = ?1")
+        .bind(entry_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("project_entry_into_cursor: feed_id for entry {entry_id}"))?;
+    let feed_id = match feed_id {
+        Some(f) => f,
+        None => return Ok(()), // entry vanished mid-tx; nothing to project
+    };
+    let feed_url = match feed_url_for_id_tx(tx, feed_id).await? {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+
+    let (read_through, read_ids, unread_ids) = cursor_sets(tx, did, &feed_url).await?;
+    // read=true: id joins read_ids, leaves unread_ids. read=false: the inverse.
+    let read_ids = json_id_set_toggle(&read_ids, entry_id, read);
+    let unread_ids = json_id_set_toggle(&unread_ids, entry_id, !read);
+    write_cursor_sets(
+        tx,
+        did,
+        &feed_url,
+        read_through.as_deref(),
+        &read_ids,
+        &unread_ids,
+        now,
+    )
+    .await
+}
+
+/// Project a mark-all-feed-read/unread into that feed's single read cursor.
+///
+/// Every entry the caller subscribes to on `feed_id` is folded into the cursor
+/// in one write: on mark-all-READ each id joins `read_ids` (and leaves
+/// `unread_ids`); on mark-all-UNREAD the inverse. Still ONE per-feed cursor row
+/// (batched), stamped + dirtied for the flusher.
+async fn project_feed_into_cursor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    did: &str,
+    feed_id: i64,
+    read: bool,
+    now: &str,
+) -> Result<()> {
+    let feed_url = match feed_url_for_id_tx(tx, feed_id).await? {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+
+    // The entry ids on this feed the caller is authorized for (subscribes to).
+    let ids: Vec<i64> = sqlx::query_scalar(
+        r#"
+        SELECT e.id FROM entries e
+        WHERE e.feed_id = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
+        "#,
+    )
+    .bind(did)
+    .bind(feed_id)
+    .fetch_all(&mut **tx)
+    .await
+    .with_context(|| format!("project_feed_into_cursor: entry ids for {did}/feed {feed_id}"))?;
+
+    let (read_through, mut read_ids, mut unread_ids) = cursor_sets(tx, did, &feed_url).await?;
+    for id in ids {
+        read_ids = json_id_set_toggle(&read_ids, id, read);
+        unread_ids = json_id_set_toggle(&unread_ids, id, !read);
+    }
+    write_cursor_sets(
+        tx,
+        did,
+        &feed_url,
+        read_through.as_deref(),
+        &read_ids,
+        &unread_ids,
+        now,
+    )
+    .await
 }
 
 /// Unread entries for a DID: entries with no `entry_state` row for that DID, or
@@ -780,14 +1023,32 @@ pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
     Ok(cursors)
 }
 
-/// Clear the `dirty` flag on a cursor after a successful PDS flush.
-pub async fn clear_cursor_dirty(pool: &SqlitePool, did: &str, feed_url: &str) -> Result<()> {
-    sqlx::query("UPDATE read_cursor SET dirty = 0 WHERE did = ?1 AND feed_url = ?2")
-        .bind(did)
-        .bind(feed_url)
-        .execute(pool)
-        .await
-        .context("clear_cursor_dirty failed")?;
+/// Clear the `dirty` flag on a cursor after a successful PDS flush — but ONLY if
+/// the row still carries the exact `flushed_updated_at` snapshot we flushed.
+///
+/// The flusher reads a cursor, sends it to the PDS (a network round-trip), then
+/// clears `dirty`. A concurrent [`upsert_cursor`] (a fresh mark-read) can land
+/// DURING that in-flight write, bumping `updated_at` and re-setting `dirty = 1`
+/// for reads that were NOT in the flushed snapshot. An unconditional
+/// `SET dirty = 0` would silently drop those reads. Guarding on the snapshot's
+/// `updated_at` makes this a compare-and-swap: if `updated_at` changed under us,
+/// zero rows update, the row stays dirty, and it re-flushes next round.
+pub async fn clear_cursor_dirty(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    flushed_updated_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE read_cursor SET dirty = 0 \
+         WHERE did = ?1 AND feed_url = ?2 AND updated_at = ?3",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(flushed_updated_at)
+    .execute(pool)
+    .await
+    .context("clear_cursor_dirty failed")?;
     Ok(())
 }
 
@@ -1328,12 +1589,135 @@ mod tests {
         // The flusher sees exactly one dirty cursor.
         let dirty = dirty_cursors(&pool, did).await?;
         assert_eq!(dirty.len(), 1);
+        let flushed_at = dirty[0].updated_at.clone();
 
-        // After a flush, clearing dirty removes it from the flusher's view.
-        clear_cursor_dirty(&pool, did, "https://example.com/feed.xml").await?;
+        // After a flush, clearing dirty (with the flushed snapshot's updated_at)
+        // removes it from the flusher's view.
+        clear_cursor_dirty(&pool, did, "https://example.com/feed.xml", &flushed_at).await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-state PDS sync wiring: marking read/unread must project into the
+    // per-feed `read_cursor` and mark it dirty so the batched flusher pushes it.
+    // Before this wiring `mark_read` touched only `entry_state`; nothing dirtied
+    // a cursor, so the flusher never synced read-state to the PDS.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mark_read_dirties_the_feed_cursor() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_url = "https://example.com/feed.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                title: Some("Example".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "g1".to_string(),
+                    published: Some("2026-07-10T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "g2".to_string(),
+                    published: Some("2026-07-11T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        let did = "did:plc:reader";
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        // No cursor exists yet.
+        assert!(get_cursor(&pool, did, feed_url).await?.is_none());
+        assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
+
+        // Mark one entry read → the feed's read_cursor row now exists, dirty=1,
+        // and dirty_cursors returns it (the exact assertion the fix requires).
+        let e1 = entries_for_feed(&pool, did, feed_id).await?[0].id;
+        assert!(mark_read(&pool, did, e1, true).await?);
+
+        let cursor = get_cursor(&pool, did, feed_url)
+            .await?
+            .expect("mark_read must create the feed's read_cursor");
+        assert!(cursor.dirty, "cursor must be dirty after mark_read");
+        assert!(
+            cursor.read_ids.contains(&e1.to_string()),
+            "the read entry id must be in read_ids: {}",
+            cursor.read_ids
+        );
+        let dirty = dirty_cursors(&pool, did).await?;
+        assert_eq!(dirty.len(), 1, "flusher must see the newly dirty cursor");
+        assert_eq!(dirty[0].feed_url, feed_url);
+
+        // Marking it unread again moves the id to unread_ids and keeps it dirty.
+        assert!(mark_read(&pool, did, e1, false).await?);
+        let cursor = get_cursor(&pool, did, feed_url).await?.unwrap();
+        assert!(cursor.dirty);
+        assert!(
+            cursor.unread_ids.contains(&e1.to_string()),
+            "unread id must be in unread_ids: {}",
+            cursor.unread_ids
+        );
+        assert!(
+            !cursor.read_ids.contains(&e1.to_string()),
+            "id must have left read_ids: {}",
+            cursor.read_ids
+        );
+
+        // mark_feed_read dirties the one per-feed cursor too (batched, not
+        // per-article).
+        assert!(mark_feed_read(&pool, did, feed_id, true).await? > 0);
+        let cursor = get_cursor(&pool, did, feed_url).await?.unwrap();
+        assert!(cursor.dirty);
+        assert_eq!(dirty_cursors(&pool, did).await?.len(), 1);
+
+        // A non-subscriber's mark_read is a no-op and dirties NO cursor.
+        let outsider = "did:plc:outsider";
+        assert!(!mark_read(&pool, outsider, e1, true).await?);
+        assert_eq!(dirty_cursors(&pool, outsider).await?.len(), 0);
+
+        // The conditional clear only clears when updated_at matches the snapshot.
+        let snap = dirty_cursors(&pool, did).await?[0].clone();
+        // A stale updated_at must NOT clear (models a concurrent re-dirty).
+        clear_cursor_dirty(&pool, did, feed_url, "1999-01-01T00:00:00Z").await?;
+        assert_eq!(
+            dirty_cursors(&pool, did).await?.len(),
+            1,
+            "stale-snapshot clear must be a no-op"
+        );
+        // The matching updated_at clears it.
+        clear_cursor_dirty(&pool, did, feed_url, &snap.updated_at).await?;
+        assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn json_id_set_toggle_is_set_like() {
+        // Add is idempotent, remove drops, output is a JSON string array.
+        let s = json_id_set_toggle("[]", 5, true);
+        assert_eq!(s, r#"["5"]"#);
+        assert_eq!(json_id_set_toggle(&s, 5, true), r#"["5"]"#); // no dup
+        let s = json_id_set_toggle(&s, 7, true);
+        assert_eq!(s, r#"["5","7"]"#);
+        let s = json_id_set_toggle(&s, 5, false);
+        assert_eq!(s, r#"["7"]"#);
+        // Tolerates numeric-array input and malformed input.
+        assert_eq!(json_id_set_toggle("[1,2]", 3, true), r#"["1","2","3"]"#);
+        assert_eq!(json_id_set_toggle("garbage", 1, true), r#"["1"]"#);
     }
 
     // -----------------------------------------------------------------------

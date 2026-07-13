@@ -513,9 +513,15 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
     // ONE applyWrites round-trip for all of this DID's dirty feeds.
     state.sidecar.flush_read_states(did, &ops).await?;
 
-    // Success — clear dirty on each flushed cursor.
+    // Success — clear dirty on each flushed cursor, but ONLY if its `updated_at`
+    // still matches the snapshot we just flushed. A mark-read that landed DURING
+    // the in-flight PDS write bumped `updated_at` and re-dirtied the row; the
+    // conditional clear leaves that row dirty so its new reads re-flush next
+    // round instead of being silently dropped.
     for (_rkey, (_record, cursor)) in batch {
-        if let Err(err) = store::clear_cursor_dirty(&state.db, did, &cursor.feed_url).await {
+        if let Err(err) =
+            store::clear_cursor_dirty(&state.db, did, &cursor.feed_url, &cursor.updated_at).await
+        {
             // The PDS write already landed; a failure to clear the local flag
             // just means we harmlessly re-flush this cursor next round.
             warn!(%did, feed = %cursor.feed_url, %err, "failed to clear cursor dirty flag");

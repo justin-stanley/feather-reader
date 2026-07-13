@@ -508,6 +508,11 @@ struct FeedView {
     unread: i64,
     /// Whether this feed is the currently-selected scope.
     selected: bool,
+    /// The feed's current folder `at://` URI (from its subscription record), or
+    /// `None` if un-foldered. Drives the pre-selected `<option>` in the manage
+    /// rename row so an untouched folder dropdown does not silently un-folder the
+    /// feed on save.
+    folder: Option<String>,
 }
 
 /// A folder grouping in the sidebar, sourced from the PDS `folder` records.
@@ -628,6 +633,8 @@ struct EntryTemplate {
     /// Prev/next entry ids within the current list, for keyboard/paging nav.
     prev_id: Option<i64>,
     next_id: Option<i64>,
+    /// Rendered inline (not an out-of-band swap fragment): always `false` here.
+    oob: bool,
 }
 
 /// The htmx swap fragment for a single entry row (`entry_row.html`).
@@ -635,6 +642,20 @@ struct EntryTemplate {
 #[template(path = "entry_row.html")]
 struct EntryRowTemplate {
     e: EntryRow,
+}
+
+/// The reader's action-bar fragment (`entry_actionbar.html`) returned as an
+/// out-of-band swap after a mark-read / star toggle FROM THE READER, so the
+/// button's hidden value + `aria-pressed` update in place (the reader `<li>`
+/// isn't in the DOM to swap, unlike the list view's `entry_row.html`).
+#[derive(Template)]
+#[template(path = "entry_actionbar.html")]
+struct EntryActionBarTemplate {
+    id: i64,
+    read: bool,
+    starred: bool,
+    /// Emit the `hx-swap-oob` attribute: `true` for the handler's OOB response.
+    oob: bool,
 }
 
 /// The login stub (`GET /login`).
@@ -1138,6 +1159,7 @@ fn clone_feed_view(f: &FeedView) -> FeedView {
         title: f.title.clone(),
         unread: f.unread,
         selected: f.selected,
+        folder: f.folder.clone(),
     }
 }
 
@@ -1215,6 +1237,7 @@ async fn build_sidebar(
         ),
         unread: unread_count(s.feed.as_ref().map(|f| f.id)),
         selected: selected_feed == Some(s.sub.url.as_str()),
+        folder: s.sub.folder.clone(),
     };
 
     let mut folder_views = Vec::with_capacity(folders.len());
@@ -1368,6 +1391,7 @@ async fn entry_view(
         back_qs,
         prev_id,
         next_id,
+        oob: false,
     };
     Ok(render(&tmpl))
 }
@@ -1511,6 +1535,19 @@ async fn mark_read(
         return Ok(Redirect::to("/").into_response());
     }
 
+    // The reader view swaps an out-of-band action-bar fragment (its `<li>` isn't
+    // in the DOM), so its button's hidden value + aria-pressed update in place
+    // and a second keypress can reverse the toggle. The list view swaps the row.
+    if is_reader_request(&headers) {
+        let starred = entry_is_starred(pool, &did, id).await?;
+        return Ok(render(&EntryActionBarTemplate {
+            id,
+            read,
+            starred,
+            oob: true,
+        }));
+    }
+
     let row = build_entry_row(pool, &did, id, Some(read)).await?;
     match row {
         Some(r) => Ok(render(&EntryRowTemplate { e: r })),
@@ -1592,6 +1629,18 @@ async fn toggle_star(
     if !is_htmx(&headers) {
         return Ok(Redirect::to("/").into_response());
     }
+
+    // Reader → out-of-band action-bar fragment; list → the row (see mark_read).
+    if is_reader_request(&headers) {
+        let read = entry_is_read(pool, &did, id).await?;
+        return Ok(render(&EntryActionBarTemplate {
+            id,
+            read,
+            starred,
+            oob: true,
+        }));
+    }
+
     let row = build_entry_row(pool, &did, id, None).await?;
     match row {
         Some(r) => Ok(render(&EntryRowTemplate { e: r })),
@@ -1848,6 +1897,13 @@ async fn rename_subscription(
     };
     let feed_url = form.url.trim().to_string();
 
+    // Reject an empty/blank resolved URL — a rename with no usable URL must not
+    // write a junk row to the cache or a malformed subscription record to the
+    // PDS (add_subscription refuses an empty input the same way).
+    if feed_url.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+
     // Block private/paid feeds on rename too. `url` is attacker-controllable, and
     // rename both upserts it to the local cache AND rewrites the PDS subscription
     // record (a public `putRecord`), so without this guard a crafted rename could
@@ -1858,6 +1914,32 @@ async fn rename_subscription(
         return Ok(
             Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
         );
+    }
+
+    // Global feeds ceiling parity with add_subscription: a rename can point at a
+    // brand-new feed URL (not just retitle an existing one), which would insert a
+    // NEW `feeds` row. Refuse that when the shared cache is at capacity (an
+    // existing/duplicate URL adds no row and is always fine). `<= 0` disables.
+    let feeds_cap = state.config.max_feeds_global;
+    if feeds_cap > 0
+        && store::get_feed_by_url(&state.db, &feed_url)
+            .await?
+            .is_none()
+    {
+        match store::count_feeds(&state.db).await {
+            Ok(n) if n >= feeds_cap => {
+                warn!(%did, %rkey, feeds = n, cap = feeds_cap, feed = %feed_url, "refused rename: global feeds ceiling reached");
+                return Ok(Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc(
+                        "This instance is at its feed capacity right now. Please try again later."
+                    )
+                ))
+                .into_response());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
+        }
     }
 
     let mut sub = Subscription::new(feed_url, now_rfc3339());
@@ -2807,6 +2889,17 @@ fn is_htmx(headers: &HeaderMap) -> bool {
     headers
         .get("HX-Request")
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+}
+
+/// Whether a mark-read / star request originated from the single-entry READER
+/// (as opposed to the list view). The reader's forms tag themselves with
+/// `X-FR-Reader: 1` via `hx-headers`; the list view's do not. This selects the
+/// swap fragment: the reader gets an out-of-band action-bar update (its `<li>`
+/// isn't in the DOM), the list gets the row (`entry_row.html`).
+fn is_reader_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-FR-Reader")
+        .is_some_and(|v| v.as_bytes() == b"1")
 }
 
 /// A tiny, self-contained signed-cookie layer: HMAC-SHA256 over an opaque,

@@ -30,6 +30,7 @@
 //! "127.0.0.1" for the connect, because there is no second resolution.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -40,6 +41,17 @@ use url::{Host, Url};
 /// comfortably above any sane feed; a body that exceeds it is aborted mid-stream
 /// (never fully buffered), which is what defeats a gzip decompression bomb.
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Total per-request timeout for a guarded fetch. Matches
+/// [`crate::feed::build_client`]'s `FETCH_TIMEOUT` so the poller's per-hop
+/// pinned client is bounded the same way the feed client is — an unattended
+/// poll can't hang forever on a slow/silent upstream.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
+/// that trickles bytes forever (slowloris) can't tie up a fetch under the total
+/// timeout. Matches [`crate::feed::build_client`]'s `READ_TIMEOUT`.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum number of redirect hops we will follow (each re-validated).
 const MAX_REDIRECTS: usize = 5;
@@ -148,11 +160,21 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
 /// `addr`, so reqwest's `connect` reuses the exact IP that passed the SSRF check
 /// instead of doing its own second resolution (the DNS-rebinding fix). The pin is
 /// scoped to `host`, keyed to the address family of `addr` (works for both IPv4
-/// and IPv6). Mirrors [`crate::feed::build_client`]'s policy (auto-redirect off —
-/// [`guarded_get`] follows + re-validates each hop itself).
+/// and IPv6). Mirrors [`crate::feed::build_client`]'s policy: the same total
+/// [`FETCH_TIMEOUT`] + per-read [`READ_TIMEOUT`] (so the unattended poller keeps
+/// its slowloris / slow-upstream defence even though each hop is a freshly built
+/// client), and auto-redirect off — [`guarded_get`] follows + re-validates each
+/// hop itself.
 fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
     Client::builder()
         .user_agent(crate::USER_AGENT)
+        // Bound each hop the same way the feed client is bounded: a total
+        // request timeout plus a per-read idle timeout. Without these the
+        // per-hop client the poller actually connects through had NO timeouts,
+        // leaving the unattended poll with no defence against a slowloris /
+        // never-finishing upstream.
+        .timeout(FETCH_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         // Override reqwest's resolver for this host only: connect goes straight
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
