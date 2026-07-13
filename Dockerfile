@@ -102,10 +102,11 @@ FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26c
 # ca-certificates for outbound HTTPS (feed fetch + atproto — rustls ships its own
 # TLS stack but still needs the system trust roots to validate feed hosts);
 # gosu to drop from root to `app` AFTER the entrypoint fixes the mounted-volume
-# ownership (see below).
+# ownership (see below); bash because the entrypoint supervisor uses `wait -n`
+# (first-child-exit), which the Debian default /bin/sh (dash) does not support.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends tini ca-certificates gosu; \
+    apt-get install -y --no-install-recommends tini ca-certificates gosu bash; \
     rm -rf /var/lib/apt/lists/*
 
 # Caddy (single static binary). Smoke-test it at build time so a future non-static
