@@ -97,6 +97,9 @@ const REPO_URL: &str = "https://github.com/justin-stanley/feather-reader";
 /// The tip / support link (cloud plan public-experiment UI).
 const KOFI_URL: &str = "https://ko-fi.com/justinstanley";
 
+/// The published crate on crates.io — surfaced on the signed-out landing page.
+const CRATES_URL: &str = "https://crates.io/crates/feather-reader";
+
 /// The Content-Security-Policy applied to every response.
 ///
 /// Tuned to keep the app fully working while neutralising injected script:
@@ -611,6 +614,17 @@ struct AboutTemplate {
     kofi_url: &'static str,
 }
 
+/// The signed-out landing page (`GET /` with no session) — the public front
+/// door at feather-reader.com. A static render, no session required.
+#[derive(Template)]
+#[template(path = "landing.html")]
+struct LandingTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    crates_url: &'static str,
+    kofi_url: &'static str,
+}
+
 /// The single-entry reader view (`GET /entries/:id`).
 #[derive(Template)]
 #[template(path = "entry.html")]
@@ -924,7 +938,16 @@ async fn index(
 ) -> Result<Response, WebError> {
     let user = match current_session(&state, &headers).await {
         Some(u) => u,
-        None => return Ok(Redirect::to("/login").into_response()),
+        // Signed out: serve the public landing page rather than bouncing to
+        // /login. /login remains the entry point for the actual OAuth sign-in.
+        None => {
+            return Ok(render(&LandingTemplate {
+                version: VERSION,
+                repo_url: REPO_URL,
+                crates_url: CRATES_URL,
+                kofi_url: KOFI_URL,
+            }))
+        }
     };
     let did = user.did.clone();
     let pool = &state.db;
