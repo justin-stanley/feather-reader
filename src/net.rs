@@ -355,7 +355,7 @@ mod tests {
             "192.168.1.1",
             "0.0.0.0",
             "255.255.255.255",
-            "100.87.39.108", // 100.64/10 CGNAT range
+            "100.64.0.1", // 100.64/10 CGNAT range (also overlay VPNs)
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} should be forbidden");

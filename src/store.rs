@@ -1369,7 +1369,7 @@ pub async fn clear_cursor_dirty(
 // Closed-beta invite gate (beta_access + invite_codes)
 // ---------------------------------------------------------------------------
 //
-// Ported in SHAPE from the-path `internal/beta` (RedeemCode / CreateInviteCode /
+// Ported in SHAPE from a prior Go beta-gate (RedeemCode / CreateInviteCode /
 // code_gen) but deliberately trimmed for FeatherReader's before-public
 // experiment: NO viral invite-budget tree, NO generation cap, NO waitlist /
 // invite-request table, and SQLite instead of Mongo. A code is minted by an
@@ -1383,11 +1383,11 @@ fn now_unix() -> i64 {
 
 /// The invite-code alphabet: uppercase letters + digits with the
 /// visually-ambiguous glyphs removed (`I`, `O`, `0`, `1`) so a code read aloud
-/// or copied by hand is unambiguous. Mirrors the-path `code_gen.go`.
+/// or copied by hand is unambiguous.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// Human-facing prefix so a FeatherReader invite code is recognisable at a
-/// glance (the-path used `TAVERN-`).
+/// glance.
 const CODE_PREFIX: &str = "FEATHER-";
 
 /// Number of random characters after the prefix.

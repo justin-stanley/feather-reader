@@ -2,7 +2,7 @@
 
 This directory holds FeatherReader's CI + security pipeline. The guiding
 principle is **spend zero GitHub-hosted Actions minutes for the everyday
-build/test/lint gate** (that runs on the self-hosted `ci-geekom-feather-reader`
+build/test/lint gate** (that runs on a self-hosted `linux/x64`
 runner), while using **GitHub-hosted runners only for the tools that require
 them** — CodeQL, dependency review, and OSSF Scorecard. Those three are **free
 once the repo is public** (this repo is flipping public); until then they cost a

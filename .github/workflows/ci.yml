@@ -1,7 +1,7 @@
 name: CI
 
-# Build / test / lint / audit gate. Runs entirely on the SELF-HOSTED runner
-# (`ci-geekom-feather-reader`) to spend zero GitHub-hosted Actions minutes.
+# Build / test / lint / audit gate. Runs entirely on a SELF-HOSTED runner
+# (labelled `self-hosted, linux, x64`) to spend zero GitHub-hosted Actions minutes.
 # CodeQL, dependency-review, and OSSF Scorecard live in their own workflows
 # (they are designed for GitHub-hosted runners — see those files + the README).
 
