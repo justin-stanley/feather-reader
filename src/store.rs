@@ -70,6 +70,10 @@ pub struct Feed {
     pub last_polled: Option<String>,
     /// When this feed is next due to be polled (RFC3339), or `None`.
     pub next_poll: Option<String>,
+    /// Count of consecutive poll FAILURES since the last success/304. Drives the
+    /// exponential poll backoff (reset to 0 on any success or 304).
+    #[sqlx(default)]
+    pub consecutive_errors: i64,
 }
 
 /// A cached article/item belonging to a [`Feed`]. Shared cache (not per-DID).
@@ -119,6 +123,13 @@ pub struct ReadCursor {
     pub unread_ids: String,
     /// Set when `entry_state` changed since the last flush (debounce trigger).
     pub dirty: bool,
+    /// Whether this cursor's `readState` record has been CREATED in the PDS yet.
+    /// The first flush of a feed must emit an `applyWrites#create` (an `#update`
+    /// errors on a record that does not pre-exist, and applyWrites is atomic
+    /// per-repo, so one not-yet-created cursor would drop the whole DID batch).
+    /// Flipped to `true` on the flush that creates it.
+    #[sqlx(default)]
+    pub pds_created: bool,
     pub updated_at: String,
 }
 
@@ -158,14 +169,15 @@ const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS feeds (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    url           TEXT NOT NULL UNIQUE,
-    title         TEXT,
-    site_url      TEXT,
-    etag          TEXT,
-    last_modified TEXT,
-    last_polled   TEXT,
-    next_poll     TEXT
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    url                TEXT NOT NULL UNIQUE,
+    title              TEXT,
+    site_url           TEXT,
+    etag               TEXT,
+    last_modified      TEXT,
+    last_polled        TEXT,
+    next_poll          TEXT,
+    consecutive_errors INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
 
@@ -214,6 +226,7 @@ CREATE TABLE IF NOT EXISTS read_cursor (
     read_ids     TEXT NOT NULL DEFAULT '[]',
     unread_ids   TEXT NOT NULL DEFAULT '[]',
     dirty        INTEGER NOT NULL DEFAULT 0,
+    pds_created  INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL,
     PRIMARY KEY (did, feed_url)
 );
@@ -314,6 +327,58 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to create schema")?;
+    apply_migrations(pool).await?;
+    Ok(())
+}
+
+/// Apply additive, idempotent migrations to bring an EXISTING database up to the
+/// current [`SCHEMA`]. `CREATE TABLE IF NOT EXISTS` never alters a table that
+/// already exists, so a column added to a shipped table must be back-filled here
+/// (SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe `table_info` first).
+async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
+    // feeds.consecutive_errors — drives the exponential poll backoff. Older DBs
+    // predate the column; add it (defaulting to 0) if it is missing.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "consecutive_errors",
+        "ALTER TABLE feeds ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    // read_cursor.pds_created — tracks whether a feed's readState record has been
+    // created in the PDS, so the first flush emits a `create` (not a bare
+    // `update`, which errors on a not-yet-existing record). Older DBs predate it.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(read_cursor)",
+        "pds_created",
+        "ALTER TABLE read_cursor ADD COLUMN pds_created INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    Ok(())
+}
+
+/// Add a column via `alter_sql` iff `info_sql` (a `PRAGMA table_info(<table>)`)
+/// does not already report `column`. All three SQL args are hard-coded internal
+/// literals (never user input), so they are safe `&'static str`s — the table name
+/// can't be a bind parameter in `PRAGMA`, which is why they're passed whole.
+async fn ensure_column(
+    pool: &SqlitePool,
+    info_sql: &'static str,
+    column: &str,
+    alter_sql: &'static str,
+) -> Result<()> {
+    let rows = sqlx::query(info_sql)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("{info_sql} failed"))?;
+    let present = rows.iter().any(|r| r.get::<String, _>("name") == column);
+    if !present {
+        sqlx::query(alter_sql)
+            .execute(pool)
+            .await
+            .with_context(|| format!("adding column {column} via {alter_sql}"))?;
+    }
     Ok(())
 }
 
@@ -377,6 +442,37 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
+/// Record a poll FAILURE for a feed: bump its `consecutive_errors` by one and
+/// return the NEW count. The count drives the exponential poll backoff, so a
+/// persistently-failing feed spaces its retries out toward the ceiling instead of
+/// hammering the 5-minute floor forever. Reset to 0 by [`reset_feed_errors`] on
+/// any success/304.
+pub async fn bump_feed_errors(pool: &SqlitePool, url: &str) -> Result<i64> {
+    let row = sqlx::query(
+        "UPDATE feeds SET consecutive_errors = consecutive_errors + 1 \
+         WHERE url = ?1 RETURNING consecutive_errors",
+    )
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("bump_feed_errors failed for {url}"))?;
+    // If the feed row somehow vanished, treat it as the first error.
+    Ok(row
+        .map(|r| r.get::<i64, _>("consecutive_errors"))
+        .unwrap_or(1))
+}
+
+/// Reset a feed's `consecutive_errors` to 0 after a successful poll (or a 304).
+/// A no-op UPDATE if the row is missing.
+pub async fn reset_feed_errors(pool: &SqlitePool, url: &str) -> Result<()> {
+    sqlx::query("UPDATE feeds SET consecutive_errors = 0 WHERE url = ?1")
+        .bind(url)
+        .execute(pool)
+        .await
+        .with_context(|| format!("reset_feed_errors failed for {url}"))?;
+    Ok(())
+}
+
 /// The feeds a `did` currently subscribes to, per its `sub_ref` projection.
 /// Used by the PDS-unreachable fallback in `resolve_subscriptions` to render
 /// the sidebar from the caller's OWN last-known subscriptions (fail closed)
@@ -417,19 +513,64 @@ pub async fn count_feeds(pool: &SqlitePool) -> Result<i64> {
     Ok(n)
 }
 
-/// The on-disk (or in-page) size of the SQLite database, in bytes, computed as
-/// `page_count * page_size`. Backs the DB-size watermark that disables new
-/// polling. Cheap (two `PRAGMA` reads); works for both file and `:memory:`.
+/// The **used** size of the SQLite database, in bytes, computed as
+/// `(page_count - freelist_count) * page_size`. Backs the DB-size watermark that
+/// disables new polling.
+///
+/// Subtracting the freelist is what keeps the watermark from latching the poller
+/// off: `page_count` counts pages the file has *allocated*, including ones freed
+/// by a `DELETE` but not yet returned to the OS (SQLite keeps them on a freelist
+/// for reuse and never shrinks the file without a VACUUM). Counting only the
+/// live pages means a retention prune (which frees pages, see [`reclaim`]) is
+/// actually reflected here, so the watermark can drop back below its threshold
+/// and polling resumes. Cheap (three `PRAGMA` reads); works for file + `:memory:`.
 pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(pool)
         .await
         .context("PRAGMA page_count failed")?;
+    let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await
+        .context("PRAGMA freelist_count failed")?;
     let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
         .fetch_one(pool)
         .await
         .context("PRAGMA page_size failed")?;
-    Ok(page_count.saturating_mul(page_size))
+    let used_pages = page_count.saturating_sub(freelist_count).max(0);
+    Ok(used_pages.saturating_mul(page_size))
+}
+
+/// Reclaim freed pages so the database file (and its used-page accounting) can
+/// actually shrink after a retention/prune sweep DELETEs rows.
+///
+/// Without this, a `DELETE` moves pages onto the freelist but never shrinks the
+/// file — so once the DB-size watermark trips and retention deletes rows,
+/// `page_count` stays put and [`db_size_bytes`] (well, its raw `page_count`
+/// form) would never fall back below the watermark, latching the poller off
+/// forever. Call this AFTER a prune. It uses incremental vacuum when the database
+/// is in `auto_vacuum = INCREMENTAL` mode (cheap, no full rewrite), and otherwise
+/// falls back to a full `VACUUM`.
+pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
+    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(pool)
+        .await
+        .context("PRAGMA auto_vacuum failed")?;
+    // auto_vacuum: 0 = NONE, 1 = FULL, 2 = INCREMENTAL. `incremental_vacuum` only
+    // does anything in INCREMENTAL mode; in NONE mode a full VACUUM is required to
+    // return freed pages to the OS.
+    if auto_vacuum == 2 {
+        sqlx::query("PRAGMA incremental_vacuum")
+            .execute(pool)
+            .await
+            .context("PRAGMA incremental_vacuum failed")?;
+    } else {
+        sqlx::query("VACUUM")
+            .execute(pool)
+            .await
+            .context("VACUUM failed")?;
+    }
+    Ok(())
 }
 
 /// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`, then
@@ -1025,6 +1166,19 @@ pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
     Ok(cursors)
 }
 
+/// Mark a cursor's PDS `readState` record as CREATED after the flush that first
+/// created it, so subsequent flushes emit an `update` instead of another
+/// `create`. Idempotent; a no-op if the row is gone.
+pub async fn mark_cursor_pds_created(pool: &SqlitePool, did: &str, feed_url: &str) -> Result<()> {
+    sqlx::query("UPDATE read_cursor SET pds_created = 1 WHERE did = ?1 AND feed_url = ?2")
+        .bind(did)
+        .bind(feed_url)
+        .execute(pool)
+        .await
+        .with_context(|| format!("mark_cursor_pds_created failed for {did}/{feed_url}"))?;
+    Ok(())
+}
+
 /// Clear the `dirty` flag on a cursor after a successful PDS flush — but ONLY if
 /// the row still carries the exact `flushed_updated_at` snapshot we flushed.
 ///
@@ -1575,6 +1729,7 @@ mod tests {
             read_ids: "[]".to_string(),
             unread_ids: "[]".to_string(),
             dirty: true,
+            pds_created: false,
             updated_at: now_rfc3339(),
         };
         upsert_cursor(&pool, &cursor).await?;
@@ -2353,6 +2508,7 @@ mod tests {
                     read_ids: "[]".to_string(),
                     unread_ids: "[]".to_string(),
                     dirty: false,
+                    pds_created: false,
                     updated_at: now_rfc3339(),
                 },
             )
@@ -2507,6 +2663,165 @@ mod tests {
                 .await?;
         assert_eq!(inviter_code_rows, 1, "inviter's code row must survive");
 
+        Ok(())
+    }
+
+    // -- F2: consecutive-error count drives the poll backoff -----------------
+
+    #[tokio::test]
+    async fn feed_error_count_bumps_and_resets() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://broken.example/feed.xml";
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // A fresh feed starts at 0 errors.
+        let feed = get_feed_by_url(&pool, url).await?.expect("feed exists");
+        assert_eq!(feed.consecutive_errors, 0);
+
+        // N consecutive failures grow the count 1,2,3, and — fed through
+        // `backoff_for` — the backoff grows with it (never latched at the floor).
+        let mut last = std::time::Duration::ZERO;
+        for expected in 1..=3 {
+            let count = bump_feed_errors(&pool, url).await?;
+            assert_eq!(count, expected, "bump returns the new count");
+            let backoff = crate::feed::backoff_for(count as u32);
+            assert!(
+                backoff >= last,
+                "backoff must not shrink as errors accumulate"
+            );
+            last = backoff;
+        }
+        // Growth actually happened (2 errors backs off longer than 1).
+        assert!(crate::feed::backoff_for(2) > crate::feed::backoff_for(1));
+        assert_eq!(
+            get_feed_by_url(&pool, url)
+                .await?
+                .unwrap()
+                .consecutive_errors,
+            3
+        );
+
+        // A success resets the streak to 0 (back to the normal cadence).
+        reset_feed_errors(&pool, url).await?;
+        assert_eq!(
+            get_feed_by_url(&pool, url)
+                .await?
+                .unwrap()
+                .consecutive_errors,
+            0
+        );
+        Ok(())
+    }
+
+    // -- F3: db_size_bytes ignores freed pages and drops after reclaim -------
+
+    #[tokio::test]
+    async fn db_size_drops_after_prune_and_reclaim() -> Result<()> {
+        // On-disk DB so VACUUM has a file to shrink (in-memory has no freelist to
+        // speak of the same way). Temp path, cleaned up at the end.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-reclaim-{}.db", std::process::id()));
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://bulk.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Insert a large batch so the file allocates real pages.
+        let entries: Vec<NewEntry> = (0..2000)
+            .map(|i| NewEntry {
+                guid: format!("guid-{i}"),
+                title: Some(format!("Entry number {i} with some padding text")),
+                content_html: Some("<p>".to_string() + &"x".repeat(400) + "</p>"),
+                published: Some("2026-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        let full = db_size_bytes(&pool).await?;
+        assert!(full > 0);
+
+        // Prune: delete every entry (the retention sweep's effect). This frees
+        // pages onto the freelist but does NOT shrink the file yet.
+        sqlx::query("DELETE FROM entries WHERE feed_id = ?1")
+            .bind(feed_id)
+            .execute(&pool)
+            .await?;
+
+        // Because db_size_bytes subtracts freelist pages, the USED size already
+        // reflects the delete even before the file shrinks.
+        let after_delete = db_size_bytes(&pool).await?;
+        assert!(
+            after_delete < full,
+            "used size must drop once rows are deleted (freed pages excluded): \
+             {after_delete} !< {full}"
+        );
+
+        // Reclaim returns the freed pages to the OS; used size stays low (and the
+        // file itself shrinks). The key property F3 needs: the watermark can now
+        // fall back below its threshold instead of latching polling off.
+        reclaim(&pool).await?;
+        let after_reclaim = db_size_bytes(&pool).await?;
+        assert!(
+            after_reclaim <= after_delete,
+            "reclaim must not grow used size: {after_reclaim} !<= {after_delete}"
+        );
+        assert!(
+            after_reclaim < full,
+            "after prune+reclaim the DB is smaller than when full: \
+             {after_reclaim} !< {full}"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
+
+    // -- F4 support: pds_created flag round-trips + flips ---------------------
+
+    #[tokio::test]
+    async fn cursor_pds_created_defaults_false_and_flips() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:f4";
+        let feed_url = "https://example.com/feed.xml";
+        upsert_cursor(
+            &pool,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: feed_url.to_string(),
+                read_through: None,
+                read_ids: r#"["1"]"#.to_string(),
+                unread_ids: "[]".to_string(),
+                dirty: true,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+
+        // A brand-new cursor's PDS record does NOT yet exist.
+        let c = get_cursor(&pool, did, feed_url).await?.unwrap();
+        assert!(!c.pds_created, "first flush must emit a create, not update");
+
+        // After the create-flush lands, the flag flips so future flushes update.
+        mark_cursor_pds_created(&pool, did, feed_url).await?;
+        let c = get_cursor(&pool, did, feed_url).await?.unwrap();
+        assert!(c.pds_created);
         Ok(())
     }
 }

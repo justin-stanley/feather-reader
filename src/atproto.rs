@@ -763,24 +763,15 @@ impl PdsClient {
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call —
     /// the debounced read-state flusher's coalesced write.
     ///
-    /// Each `(rkey, state)` becomes an `update` op at the feed-derived rkey (one
-    /// record per feed). Note that `applyWrites#update` targets an existing
-    /// record; a feed with no read-state record yet is not created by this call
-    /// (see [`put_read_state`](Self::put_read_state) for the upsert path).
-    pub async fn flush_read_states(&self, cursors: &[(String, ReadState)]) -> Result<()> {
+    /// Each `(rkey, state, pds_created)` becomes a `create` op at the feed-derived
+    /// rkey when the record does not yet exist, and an `update` when it does — so a
+    /// feed's FIRST flush succeeds (an `#update` on a missing record errors, and
+    /// `applyWrites` is atomic per-repo). Both kinds ride the same batch.
+    pub async fn flush_read_states(&self, cursors: &[(String, ReadState, bool)]) -> Result<()> {
         if cursors.is_empty() {
             return Ok(());
         }
-        let writes: Vec<WriteOp> = cursors
-            .iter()
-            .map(|(rkey, state)| {
-                Ok(WriteOp::Update {
-                    collection: lexicon::nsid::READ_STATE.to_string(),
-                    rkey: rkey.clone(),
-                    value: serde_json::to_value(state)?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let writes = read_state_write_ops(cursors)?;
         self.apply_writes(&writes).await
     }
 
@@ -1194,27 +1185,22 @@ impl SidecarClient {
 
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call.
     ///
-    /// Each cursor becomes an `update` op at its feed-derived rkey. As with
-    /// [`PdsClient::flush_read_states`], `applyWrites#update` targets an existing
-    /// record and does not create a feed's first read-state record.
+    /// Each `(rkey, state, pds_created)` becomes a `create` op at the feed-derived
+    /// rkey when the record does NOT yet exist (`pds_created == false`), and an
+    /// `update` op when it does. This is what makes the FIRST flush of a feed
+    /// succeed: `applyWrites#update` errors on a record that does not pre-exist,
+    /// and `applyWrites` is atomic per-repo, so a single not-yet-created cursor
+    /// would otherwise drop the whole DID batch. Both kinds ride the SAME
+    /// `applyWrites` batch so batching is preserved.
     pub async fn flush_read_states(
         &self,
         did: &str,
-        cursors: &[(String, ReadState)],
+        cursors: &[(String, ReadState, bool)],
     ) -> Result<()> {
         if cursors.is_empty() {
             return Ok(());
         }
-        let writes: Vec<WriteOp> = cursors
-            .iter()
-            .map(|(rkey, state)| {
-                Ok(WriteOp::Update {
-                    collection: lexicon::nsid::READ_STATE.to_string(),
-                    rkey: rkey.clone(),
-                    value: serde_json::to_value(state)?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let writes = read_state_write_ops(cursors)?;
         self.apply_writes(did, &writes).await
     }
 
@@ -1408,6 +1394,37 @@ impl SidecarClient {
 // ---------------------------------------------------------------------------
 // applyWrites operations
 // ---------------------------------------------------------------------------
+
+/// Build the `applyWrites` ops for a batch of dirty read-state cursors.
+///
+/// Each `(rkey, state, pds_created)` becomes a `#create` op (at the stable
+/// feed-derived rkey) when the PDS record does NOT yet exist, and a `#update`
+/// when it does. This is the crux of the first-flush fix: an `#update` on a
+/// missing record errors, and `applyWrites` is atomic per-repo, so a single
+/// not-yet-created cursor in the batch would drop the whole DID's flush. Emitting
+/// a `create` for those makes a feed's first flush succeed while keeping every
+/// op in ONE batch. Shared by both the sidecar and direct-PDS flush paths.
+fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
+    cursors
+        .iter()
+        .map(|(rkey, state, pds_created)| {
+            let value = serde_json::to_value(state)?;
+            Ok(if *pds_created {
+                WriteOp::Update {
+                    collection: lexicon::nsid::READ_STATE.to_string(),
+                    rkey: rkey.clone(),
+                    value,
+                }
+            } else {
+                WriteOp::Create {
+                    collection: lexicon::nsid::READ_STATE.to_string(),
+                    rkey: Some(rkey.clone()),
+                    value,
+                }
+            })
+        })
+        .collect()
+}
 
 /// One operation in a [`PdsClient::apply_writes`] batch.
 ///
@@ -1885,6 +1902,54 @@ mod tests {
             json!("com.atproto.repo.applyWrites#delete")
         );
         assert_eq!(delete.to_json()["rkey"], json!("3ksaved01"));
+    }
+
+    #[test]
+    fn read_state_flush_creates_first_then_updates() {
+        // A cursor whose PDS record does NOT yet exist (pds_created = false) must
+        // become a CREATE op at its stable rkey — NOT a bare update, which would
+        // error on the missing record and (applyWrites being atomic per-repo) drop
+        // the whole batch on a feed's first flush.
+        let fresh = (
+            "rs-fresh".to_string(),
+            ReadState::new("https://a.example/feed.xml", None, "2026-07-12T00:00:00Z"),
+            false,
+        );
+        // An already-created cursor updates in place.
+        let existing = (
+            "rs-existing".to_string(),
+            ReadState::new(
+                "https://b.example/feed.xml",
+                Some("2026-07-11T00:00:00Z".to_string()),
+                "2026-07-12T00:00:00Z",
+            ),
+            true,
+        );
+
+        let ops = read_state_write_ops(&[fresh, existing]).expect("build ops");
+        assert_eq!(ops.len(), 2);
+
+        // First op: a create carrying the stable rkey (put/create, not update).
+        let create = ops[0].to_json();
+        assert_eq!(
+            create["$type"],
+            json!("com.atproto.repo.applyWrites#create"),
+            "first flush of a new feed must CREATE its readState record"
+        );
+        assert_eq!(create["rkey"], json!("rs-fresh"));
+        // The created record omits readThrough (F1): backlog not implicitly read.
+        assert!(create["value"].get("readThrough").is_none());
+
+        // Second op: an update for the already-created record.
+        let update = ops[1].to_json();
+        assert_eq!(
+            update["$type"],
+            json!("com.atproto.repo.applyWrites#update")
+        );
+        assert_eq!(update["rkey"], json!("rs-existing"));
+
+        // Both ride the SAME batch — batching is preserved.
+        assert_eq!(ops.len(), 2);
     }
 
     #[test]

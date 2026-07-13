@@ -245,6 +245,12 @@ async fn poll_due_once(
                     watermark_bytes = watermark,
                     "DB size at/above watermark: pausing new polling until it drops (retention/prune)"
                 );
+                // Reclaim freed pages so any prior retention/prune deletions
+                // actually shrink the file — otherwise freed-but-not-returned
+                // pages keep the watermark tripped and latch polling off forever.
+                if let Err(err) = store::reclaim(&state.db).await {
+                    warn!(%err, "reclaim after watermark trip failed");
+                }
                 return Ok(());
             }
             Ok(_) => {}
@@ -315,13 +321,33 @@ async fn poll_and_reschedule(
     let next_delay = match feed::poll_feed(pool, client, feed, max_entries_per_feed).await {
         Ok(PollOutcome::Updated { new_entries }) => {
             debug!(feed = %feed.url, new_entries, "polled: updated");
+            // A successful poll clears the consecutive-error streak so a
+            // previously-broken feed returns to its normal cadence.
+            if let Err(err) = store::reset_feed_errors(pool, &feed.url).await {
+                warn!(feed = %feed.url, %err, "failed to reset feed error count");
+            }
             cadence_for(feed, default_interval)
         }
         Ok(PollOutcome::NotModified) => {
             debug!(feed = %feed.url, "polled: not modified");
+            // 304 is a healthy poll too — reset the error streak.
+            if let Err(err) = store::reset_feed_errors(pool, &feed.url).await {
+                warn!(feed = %feed.url, %err, "failed to reset feed error count");
+            }
             cadence_for(feed, default_interval)
         }
         Ok(PollOutcome::Failed { backoff }) => {
+            // Record the failure and recompute the backoff from the feed's REAL
+            // consecutive-error count so a persistently-broken feed climbs toward
+            // the ceiling instead of retrying at the 5-min floor forever. If the
+            // bump fails (store hiccup) fall back to the outcome's floor backoff.
+            let backoff = match store::bump_feed_errors(pool, &feed.url).await {
+                Ok(count) => feed::backoff_for(count.max(1) as u32),
+                Err(err) => {
+                    warn!(feed = %feed.url, %err, "failed to bump feed error count; using floor backoff");
+                    backoff
+                }
+            };
             warn!(feed = %feed.url, ?backoff, "polled: failed, backing off");
             backoff
         }
@@ -506,20 +532,34 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         batch.insert(rkey, (record, cursor));
     }
 
-    let ops: Vec<(String, ReadState)> = batch
+    // Each op carries whether its PDS record already exists: a not-yet-created
+    // cursor becomes an applyWrites#create (not an #update, which would error and,
+    // since applyWrites is atomic-per-repo, drop the whole DID batch on a feed's
+    // first flush). All create + update ops ride ONE batch.
+    let ops: Vec<(String, ReadState, bool)> = batch
         .iter()
-        .map(|(rkey, (record, _))| (rkey.clone(), record.clone()))
+        .map(|(rkey, (record, cursor))| (rkey.clone(), record.clone(), cursor.pds_created))
         .collect();
 
     // ONE applyWrites round-trip for all of this DID's dirty feeds.
     state.sidecar.flush_read_states(did, &ops).await?;
 
-    // Success — clear dirty on each flushed cursor, but ONLY if its `updated_at`
+    // Success — for each flushed cursor: mark its PDS record as created (so future
+    // flushes emit an update), then clear `dirty` but ONLY if its `updated_at`
     // still matches the snapshot we just flushed. A mark-read that landed DURING
     // the in-flight PDS write bumped `updated_at` and re-dirtied the row; the
     // conditional clear leaves that row dirty so its new reads re-flush next
     // round instead of being silently dropped.
+    let flushed = ops.len();
     for (_rkey, (_record, cursor)) in batch {
+        // Flip the created flag first: the record now exists in the PDS regardless
+        // of whether the dirty-clear below is a no-op due to a concurrent bump.
+        if !cursor.pds_created {
+            if let Err(err) = store::mark_cursor_pds_created(&state.db, did, &cursor.feed_url).await
+            {
+                warn!(%did, feed = %cursor.feed_url, %err, "failed to mark cursor pds_created");
+            }
+        }
         if let Err(err) =
             store::clear_cursor_dirty(&state.db, did, &cursor.feed_url, &cursor.updated_at).await
         {
@@ -529,33 +569,33 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         }
     }
 
-    info!(%did, feeds = ops.len(), "read-state flusher: flushed dirty cursors");
+    info!(%did, feeds = flushed, "read-state flusher: flushed dirty cursors");
     Ok(())
 }
 
 /// Turn a local [`ReadCursor`] row into the PDS [`ReadState`] lexicon record.
 ///
 /// The store keeps `read_ids` / `unread_ids` as JSON arrays of ids; the lexicon
-/// wants string arrays. `read_through` is optional locally (a brand-new cursor
-/// may have none) but required in the record, so an unset water-mark falls back
-/// to the cursor's `updated_at`. Both id-sets are capped at [`ReadState::MAX_IDS`]
+/// wants string arrays. `read_through` is optional both locally AND in the
+/// record: when the cursor has no local high-water-mark we pass `None` so the
+/// record OMITS `readThrough` entirely. This is the conservative behaviour —
+/// `readThrough` is a "everything seen/published `<=` this is read" water-mark,
+/// so synthesizing a flush-time (`≈ now`) value for a cursor that has none would
+/// assert the whole unread backlog is read. With `None` only the explicit
+/// `read_ids` mark entries read. Both id-sets are capped at [`ReadState::MAX_IDS`]
 /// to respect the lexicon bound.
-///
-// Known limitation: `read_through` is a "everything older than this timestamp is
-// implicitly read" water-mark. Falling back to `updated_at` (≈ now) for a cursor
-// that has none means entries published before now would be treated as read on
-// the next reconcile — which is not conservative. A safer fallback would be a
-// zero/epoch timestamp (implies "nothing is implicitly read"). Left as-is for a
-// separate fix pass; flagged here so the behaviour isn't mistaken for intent.
 fn read_state_record(cursor: &ReadCursor) -> ReadState {
     let read_ids = parse_id_array(&cursor.read_ids);
     let unread_ids = parse_id_array(&cursor.unread_ids);
-    let read_through = cursor
-        .read_through
-        .clone()
-        .unwrap_or_else(|| cursor.updated_at.clone());
 
-    let mut record = ReadState::new(&cursor.feed_url, read_through, &cursor.updated_at);
+    // Do NOT synthesize a water-mark from `updated_at`: an unset local
+    // `read_through` means "no high-water-mark", which the record represents by
+    // omitting `readThrough` (None), not by back-dating it to flush time.
+    let mut record = ReadState::new(
+        &cursor.feed_url,
+        cursor.read_through.clone(),
+        &cursor.updated_at,
+    );
     record.read_ids = cap(read_ids, ReadState::MAX_IDS);
     record.unread_ids = cap(unread_ids, ReadState::MAX_IDS);
     record
@@ -606,11 +646,10 @@ fn cap(mut ids: Vec<String>, max: usize) -> Vec<String> {
 /// (astronomically unlikely at feed scale; the flusher additionally dedups by
 /// rkey within a batch as a belt-and-braces guard).
 ///
-// Known limitation: the flusher writes these records with `applyWrites#update`
-// (see `read_state_record` / `SidecarClient::flush_read_states`), which requires
-// the record to already exist. The first flush for a feed has no record to
-// update yet. The rkey being stable is what a create-then-update (or `putRecord`
-// upsert) fix would rely on, but that create step is not implemented here.
+/// The stable rkey is what makes create-then-update work: a feed's FIRST flush
+/// emits an `applyWrites#create` at this key (tracked by `read_cursor.pds_created`)
+/// and every subsequent flush an `#update` at the same key, so there is exactly
+/// one record per feed and the first flush never fails on a missing record.
 pub fn read_state_rkey(feed_url: &str) -> String {
     format!("rs-{:016x}", fnv1a_64(feed_url.as_bytes()))
 }
@@ -692,29 +731,82 @@ mod tests {
             read_ids: r#"["10","11"]"#.into(),
             unread_ids: "[]".into(),
             dirty: true,
+            pds_created: false,
             updated_at: "2026-07-12T01:00:00Z".into(),
         };
         let rec = read_state_record(&cursor);
         assert_eq!(rec.feed_url, "https://example.com/feed.xml");
-        assert_eq!(rec.read_through, "2026-07-12T00:00:00Z");
+        assert_eq!(rec.read_through.as_deref(), Some("2026-07-12T00:00:00Z"));
         assert_eq!(rec.read_ids, vec!["10", "11"]);
         assert!(rec.unread_ids.is_empty());
         assert_eq!(rec.updated_at, "2026-07-12T01:00:00Z");
     }
 
     #[test]
-    fn read_through_defaults_to_updated_at_when_unset() {
+    fn read_through_omitted_when_local_unset() {
+        // A cursor with no local high-water-mark must NOT synthesize one from
+        // `updated_at` (≈ now) — doing so would mark the whole backlog read. The
+        // record omits `readThrough` (None) so only explicit read_ids apply.
         let cursor = ReadCursor {
             did: "did:plc:abc".into(),
             feed_url: "https://example.com/feed.xml".into(),
             read_through: None,
-            read_ids: "[]".into(),
+            read_ids: r#"["42"]"#.into(),
             unread_ids: "[]".into(),
             dirty: true,
+            pds_created: false,
             updated_at: "2026-07-12T01:00:00Z".into(),
         };
         let rec = read_state_record(&cursor);
-        assert_eq!(rec.read_through, "2026-07-12T01:00:00Z");
+        assert_eq!(
+            rec.read_through, None,
+            "no local water-mark => readThrough absent (backlog not implicitly read)"
+        );
+        // The explicit read_ids still carry through.
+        assert_eq!(rec.read_ids, vec!["42"]);
+        // Serialized form must not carry a readThrough field at all.
+        let json = serde_json::to_value(&rec).expect("serialize");
+        assert!(json.get("readThrough").is_none());
+    }
+
+    #[test]
+    fn read_through_present_when_local_high_water_mark_exists() {
+        // A real high-water-mark IS written through unchanged.
+        let cursor = ReadCursor {
+            did: "did:plc:abc".into(),
+            feed_url: "https://example.com/feed.xml".into(),
+            read_through: Some("2026-07-11T00:00:00Z".into()),
+            read_ids: "[]".into(),
+            unread_ids: "[]".into(),
+            dirty: true,
+            pds_created: false,
+            updated_at: "2026-07-12T01:00:00Z".into(),
+        };
+        let rec = read_state_record(&cursor);
+        assert_eq!(rec.read_through.as_deref(), Some("2026-07-11T00:00:00Z"));
+    }
+
+    #[test]
+    fn flush_with_only_read_ids_sets_no_read_through() {
+        // The core F1 guarantee: a flush whose cursor carries only explicit
+        // read_ids (and no water-mark) emits a record WITHOUT readThrough, so the
+        // user's PDS never asserts the backlog is read.
+        let cursor = ReadCursor {
+            did: "did:plc:abc".into(),
+            feed_url: "https://example.com/feed.xml".into(),
+            read_through: None,
+            read_ids: r#"["100","101","102"]"#.into(),
+            unread_ids: "[]".into(),
+            dirty: true,
+            pds_created: false,
+            updated_at: "2026-07-12T02:00:00Z".into(),
+        };
+        let rec = read_state_record(&cursor);
+        assert_eq!(rec.read_through, None);
+        assert_eq!(rec.read_ids, vec!["100", "101", "102"]);
+        let json = serde_json::to_value(&rec).expect("serialize");
+        assert!(json.get("readThrough").is_none());
+        assert_eq!(json["readIds"], serde_json::json!(["100", "101", "102"]));
     }
 
     #[test]

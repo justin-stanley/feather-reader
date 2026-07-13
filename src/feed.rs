@@ -548,7 +548,11 @@ pub fn build_client() -> Result<Client> {
 /// Compute the backoff for the `n`th consecutive failure (1-based), clamped to
 /// [`BACKOFF_MAX`]. Exponential in the error count so transient blips retry soon
 /// while a durably-broken feed backs off toward daily.
-fn backoff_for(consecutive_errors: u32) -> Duration {
+///
+/// The scheduler passes the feed's persisted `consecutive_errors` count (see
+/// [`crate::store::bump_feed_errors`]) so a feed that keeps failing actually
+/// climbs toward [`BACKOFF_MAX`] instead of retrying at the floor forever.
+pub fn backoff_for(consecutive_errors: u32) -> Duration {
     let n = consecutive_errors.max(1);
     // Saturating shift: base * 2^(n-1), capped. Avoids overflow for large n.
     let factor = 1u64.checked_shl(n.saturating_sub(1)).unwrap_or(u64::MAX);
