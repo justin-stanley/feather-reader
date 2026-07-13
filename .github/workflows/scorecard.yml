@@ -1,0 +1,50 @@
+name: OSSF Scorecard
+
+# OpenSSF Scorecard — automated supply-chain / security-posture scoring
+# (branch protection, pinned actions, token permissions, dangerous workflows,
+# dependency-update tooling, etc.). Results publish to the Security tab and,
+# optionally, the public Scorecard API for an OSS "security score" badge.
+#
+# ── RUNNER / COST / VISIBILITY ────────────────────────────────────────────────
+# Scorecard is built for GitHub-hosted runners and is most useful on a PUBLIC
+# repo (many checks — e.g. branch-protection introspection, the public results
+# badge — assume public + a repo `read` token). It runs on `ubuntu-latest`.
+# `publish_results: true` only takes effect once the repo is public. While
+# private this consumes a small amount of Actions minutes weekly; disable the
+# schedule if that matters until the public flip.
+
+on:
+  branch_protection_rule:  # re-score when branch protection changes
+  schedule:
+    - cron: "18 5 * * 1"   # Mondays 05:18 UTC
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest  # GitHub-hosted; free once public
+    permissions:
+      security-events: write  # upload SARIF to the Security tab
+      id-token: write         # publish results to the Scorecard API (public)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishes to the public OSSF Scorecard API + enables the badge.
+          # No-op while private; effective once public.
+          publish_results: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

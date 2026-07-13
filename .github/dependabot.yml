@@ -1,0 +1,57 @@
+# Dependabot — automated dependency-update PRs.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+#
+# Weekly cadence, minor+patch grouped into a single PR per ecosystem to cut PR
+# noise (majors stay separate so breaking bumps get individual review).
+version: 2
+updates:
+  # --- Rust (root Cargo.toml / Cargo.lock) ---------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # --- OAuth sidecar (Node/npm) --------------------------------------------
+  - package-ecosystem: npm
+    directory: "/oauth-sidecar"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # --- GitHub Actions (workflow `uses:` pins) ------------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  # --- Docker (deploy/) ----------------------------------------------------
+  # ENABLE ONCE a Dockerfile lands under deploy/ (there is only teardown.sh
+  # today). Uncomment and point `directory` at the Dockerfile's dir. Left in as
+  # a documented placeholder so the wiring is one uncomment away.
+  # - package-ecosystem: docker
+  #   directory: "/deploy"
+  #   schedule:
+  #     interval: weekly
+  #   open-pull-requests-limit: 3
+  #   commit-message:
+  #     prefix: "deps(docker)"
+  #   groups:
+  #     docker-minor-patch:
+  #       update-types: [minor, patch]

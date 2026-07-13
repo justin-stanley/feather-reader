@@ -1,0 +1,68 @@
+name: CodeQL
+
+# GitHub's semantic code-scanning (SAST). Results land in the Security tab.
+#
+# ── RUNNER / COST TRADEOFF ────────────────────────────────────────────────────
+# CodeQL is DESIGNED FOR GITHUB-HOSTED runners (the Actions bundle ships the
+# CodeQL CLI + query packs; the self-hosted CI VM does not). So this workflow
+# uses `ubuntu-latest`, NOT the self-hosted runner.
+#
+#   * While the repo is PRIVATE, GitHub-hosted runs consume Actions minutes.
+#   * Once the repo is PUBLIC, GitHub-hosted Actions (and code scanning) are
+#     FREE — this is the intended steady state for the OSS release.
+#
+# To bound private-repo spend we DON'T run on every PR: it runs on push to the
+# default branch (`main`) and on a weekly schedule. Flip to `pull_request:` for
+# per-PR scanning once public (it's free then). See .github/workflows/README.md.
+#
+# ── LANGUAGES ─────────────────────────────────────────────────────────────────
+#   * javascript-typescript — the OAuth sidecar (oauth-sidecar/).
+#   * rust — the axum server. CodeQL Rust support is in public beta; if the Rust
+#     pack is unavailable on the runner the matrix leg will fail loudly rather
+#     than silently skip. If that happens, drop the `rust` matrix entry until
+#     GitHub GA's the Rust pack (tracking: github/codeql "Rust" support).
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "27 4 * * 1"  # Mondays 04:27 UTC — weekly deep scan
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest  # GitHub-hosted: free once public; see header note
+    permissions:
+      actions: read
+      contents: read
+      security-events: write  # upload SARIF to the Security tab
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `security-and-quality` = the broader query suite (security + code
+          # quality), a good default for a new OSS project.
+          queries: security-and-quality
+
+      # Rust + TypeScript are both no-build (CodeQL extracts from source /
+      # autobuilds). If the Rust extractor ever needs a real build, replace this
+      # with an explicit `cargo build` step guarded on matrix.language == rust.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

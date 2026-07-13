@@ -1,0 +1,38 @@
+# gitleaks configuration for feather-reader.
+#   gitleaks detect --source . --config .gitleaks.toml   # working tree + history
+#
+# Extends the maintained default ruleset (AWS keys, GitHub/Slack/Stripe tokens,
+# private keys, generic high-entropy secrets, etc.) and layers on repo-specific
+# allowlisting so the CI `secrets` job is GREEN on the current tree.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "feather-reader false-positive allowlist"
+
+# Paths that legitimately contain secret-SHAPED but non-secret material:
+#   * lockfiles carry integrity hashes / long base64 that trip entropy rules
+#   * *.example / *.env.example ship placeholder values by design
+#   * the AGPL LICENSE text is large and static
+paths = [
+  '''Cargo\.lock''',
+  '''oauth-sidecar/package-lock\.json''',
+  '''.*\.example$''',
+  '''.*\.env\.example$''',
+  '''LICENSE''',
+]
+
+# Placeholder / documented-dev-default tokens that appear in docs + config
+# examples. These are NOT real credentials (the sidecar refuses the dev default
+# in production — see oauth-sidecar/src/config.ts). Extend deliberately, with a
+# comment, if a new intentional placeholder trips a rule.
+regexes = [
+  '''SIDECAR_INTERNAL_SECRET''',
+  '''SIDECAR_ENC_KEY''',
+  '''change[-_]?me''',
+  '''your[-_]?secret[-_]?here''',
+  # Test fixture: base64("foobarsecrettoken") — appears in src/web.rs +
+  # src/feed.rs unit tests that assert private-feed-URL credential REDACTION
+  # (?auth=/?token= query params). Not a real credential.
+  '''Zm9vYmFyc2VjcmV0dG9rZW4''',
+]
