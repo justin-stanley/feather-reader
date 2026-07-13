@@ -1,0 +1,68 @@
+name: Release crate (crates.io)
+
+# Publishes feather-reader to crates.io on a version tag using crates.io
+# TRUSTED PUBLISHING (OIDC) — no long-lived API token stored in the repo. This
+# workflow exchanges a short-lived GitHub OIDC token for a temporary, scoped
+# crates.io token via rust-lang/crates-io-auth-action, then runs `cargo publish`.
+#
+# ── ONE-TIME SETUP (Justin) ───────────────────────────────────────────────────
+#   1. crates.io → the `feather-reader` crate → Settings → Trusted Publishing →
+#      add a GitHub publisher:  owner `justin-stanley`, repo `feather-reader`,
+#      workflow `release-crate.yml` (environment optional).
+#   2. Once the first OIDC publish succeeds, REVOKE the manually-created API
+#      token that claimed v0.1.0 — it's no longer needed.
+#
+# ── RELEASING ─────────────────────────────────────────────────────────────────
+#   Bump `version` in Cargo.toml, commit, then push a matching tag:
+#     git tag v0.2.0 && git push origin v0.2.0
+#   The tag must equal Cargo.toml's version (enforced below) so a mistagged push
+#   can't publish the wrong version.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # REQUIRED: mint the OIDC token for crates.io Trusted Publishing
+
+concurrency:
+  group: release-crate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: cargo publish (OIDC)
+    # GitHub-hosted: OIDC needs GitHub's token endpoint, and hosted Actions are
+    # free once the repo is public. Skip while private so a stray tag can't burn
+    # minutes / fail before Trusted Publishing is configured.
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "tag=v$tag  Cargo.toml=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Authenticate to crates.io (Trusted Publishing / OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
