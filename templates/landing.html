@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+
+{% block title %}FeatherReader — read, quietly{% endblock %}
+
+{% block body %}
+<main class="landing" id="content">
+  <header class="hero">
+    <svg class="hero-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20.2 4.6c-2.3-2.3-7.2-1.4-10 1.4C7.4 8.8 4 17 4 20c3 0 11.2-3.4 14-6.2 2.8-2.8 4.5-6.9 2.2-9.2z"/>
+      <path d="M16 8 5 19"/>
+    </svg>
+
+    <h1 class="hero-name">FeatherReader</h1>
+    <p class="hero-tag">read, quietly</p>
+
+    <p class="hero-lede">
+      A minimalist, atproto-native RSS reader — your subscriptions live in
+      <strong>your own PDS</strong>.
+    </p>
+
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="/login">Sign in</a>
+      <p class="hero-note">
+        No signup, no password — you approve access on your own atproto server.
+      </p>
+    </div>
+
+    <nav class="alt-links" aria-label="Project links">
+      <a href="{{ repo_url }}" rel="noopener noreferrer">View on GitHub</a>
+      <span class="sep" aria-hidden="true">·</span>
+      <a href="{{ crates_url }}" rel="noopener noreferrer">crates.io</a>
+      <span class="sep" aria-hidden="true">·</span>
+      <a href="{{ repo_url }}#self-hosting" rel="noopener noreferrer">Self-host</a>
+      <span class="sep" aria-hidden="true">·</span>
+      <a href="/about">About</a>
+    </nav>
+  </header>
+
+  <figure class="shot">
+    <img class="shot-light" src="/static/shot-list-light.png"
+         width="390" height="844" loading="lazy" decoding="async"
+         alt="FeatherReader on a phone: a calm article list with serif headlines, quiet unread dots, and a single star" />
+    <img class="shot-dark" src="/static/shot-list-dark.png"
+         width="390" height="844" loading="lazy" decoding="async"
+         alt="FeatherReader on a phone, in dark mode: a calm article list with serif headlines, quiet unread dots, and a single star" />
+    <figcaption>The whole interface. That's the point.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li class="point">
+      <h2>Own your data</h2>
+      <p>
+        Subscriptions, folders, stars, and read-state are written as
+        open-standard <code>community.lexicon.rss.*</code> records in
+        <em>your</em> atproto PDS — portable to any reader that speaks the
+        lexicon. Leaving is as easy as arriving.
+      </p>
+    </li>
+    <li class="point">
+      <h2>Fast, quiet, keyboard-driven</h2>
+      <p>
+        Server-rendered pages, system fonts, <kbd>j</kbd>/<kbd>k</kbd>
+        shortcuts. No tracking, no analytics, no algorithm — just your feeds,
+        in order.
+      </p>
+    </li>
+    <li class="point">
+      <h2>Open source &amp; self-hostable</h2>
+      <p>
+        Free software under the AGPL-3.0: read the code, file issues, or run
+        your own copy. Self-hosting is a first-class path, not an afterthought.
+      </p>
+    </li>
+  </ul>
+
+  <aside class="experiment" aria-label="Service disclaimer">
+    <p>
+      <strong>An experiment.</strong> FeatherReader is a free public experiment
+      run by one person — no uptime guarantees; it may change, break, or pause
+      at any time. Your data lives in your PDS, not here, so you can always walk
+      away with it. If you like it, a
+      <a class="tip-link" href="{{ kofi_url }}" rel="noopener noreferrer">tip helps keep it running&nbsp;♥</a>
+    </p>
+  </aside>
+
+  <div class="colophon">
+    <img src="/static/jts-colophon.svg" alt="JTS" width="44" height="44" />
+    <p>Built by <a href="https://justin-stanley.com" rel="noopener noreferrer">Justin Stanley</a></p>
+    <p>Open source · <a href="{{ repo_url }}/blob/main/LICENSE" rel="noopener noreferrer">AGPL-3.0</a> · self-hostable · v{{ version }}</p>
+  </div>
+</main>
+{% endblock %}
