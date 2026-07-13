@@ -231,6 +231,10 @@ CREATE TABLE IF NOT EXISTS read_cursor (
     PRIMARY KEY (did, feed_url)
 );
 CREATE INDEX IF NOT EXISTS idx_read_cursor_dirty ON read_cursor (did, dirty);
+-- The (did, feed_url) PRIMARY KEY can't serve a feed_url-only lookup (did is the
+-- leading column). The retention path's orphan-cursor cleanup filters cursors by
+-- feed_url alone, so give it an index.
+CREATE INDEX IF NOT EXISTS idx_read_cursor_feed_url ON read_cursor (feed_url);
 
 CREATE TABLE IF NOT EXISTS beta_access (
     did              TEXT PRIMARY KEY,
@@ -490,6 +494,19 @@ pub async fn feeds_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Feed>> {
     .await
     .with_context(|| format!("feeds_for_did failed for {did}"))?;
     Ok(feeds)
+}
+
+/// The feed ids a `did` currently subscribes to (its `sub_ref` rows). Bounded by
+/// the per-DID subscription cap, so callers can safely iterate it — e.g. the
+/// global "mark all read" path fans out over feeds (bounded) rather than over
+/// unread entries (unbounded).
+pub async fn subscribed_feed_ids(pool: &SqlitePool, did: &str) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM sub_ref WHERE did = ?1")
+        .bind(did)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("subscribed_feed_ids failed for {did}"))?;
+    Ok(ids)
 }
 
 /// The number of feeds a `did` currently subscribes to (its `sub_ref` rows).
@@ -1512,6 +1529,22 @@ pub async fn redeem_code(
 ) -> Result<std::result::Result<(), RedeemError>> {
     let now = now_unix();
     let mut tx = pool.begin().await.context("begin redeem_code tx")?;
+
+    // Take the write lock at the START of the transaction. sqlx issues a plain
+    // deferred BEGIN, so without this the capacity SELECT below runs under a read
+    // snapshot: two concurrent redeems could both pass the gate, and the loser's
+    // later UPDATE would fail with SQLITE_BUSY_SNAPSHOT (which busy_timeout does
+    // NOT retry) — an opaque error instead of a clean CapacityFull. A leading
+    // no-op write against the target row acquires the RESERVED lock immediately
+    // (SQLite locks on any write statement, even one matching zero rows), so the
+    // second redeem blocks on the first, then reads the post-commit seat count
+    // and returns CapacityFull. (The cap already held via snapshot isolation;
+    // this upgrades the failure mode from a hard error to the right one.)
+    sqlx::query("UPDATE invite_codes SET status = status WHERE code = ?1")
+        .bind(code)
+        .execute(&mut *tx)
+        .await
+        .context("redeem_code: acquire write lock")?;
 
     // 1. Look the code up.
     let row = sqlx::query("SELECT status, expires_at FROM invite_codes WHERE code = ?1")

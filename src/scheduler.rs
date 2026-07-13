@@ -256,12 +256,16 @@ async fn poll_due_once(
                     watermark_bytes = watermark,
                     "DB size at/above watermark: pausing new polling until it drops (retention/prune)"
                 );
-                // Reclaim freed pages so any prior retention/prune deletions
-                // actually shrink the file — otherwise freed-but-not-returned
-                // pages keep the watermark tripped and latch polling off forever.
-                if let Err(err) = store::reclaim(&state.db).await {
-                    warn!(%err, "reclaim after watermark trip failed");
-                }
+                // No VACUUM here. `db_size_bytes` is already freelist-aware
+                // (page_count - freelist_count), so the daily retention sweep's
+                // DELETE lowers the measured size and lifts the watermark WITHOUT
+                // a full-file rewrite — and the sweeper reclaims after it prunes
+                // (see `run_retention_sweeper`). Running VACUUM on every poll tick
+                // while over the watermark was both redundant (freelist accounting
+                // already reflects freed pages) and dangerous: a full VACUUM needs
+                // free disk ~= the live DB size to write the new file, which is
+                // exactly what's scarce under the disk pressure that tripped the
+                // watermark.
                 return Ok(());
             }
             Ok(_) => {}

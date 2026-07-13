@@ -39,6 +39,22 @@ env:
   ENABLE_SBOM: "0"
 
 jobs:
+  # Always-run visibility guard. The build job is gated to public repos, and a
+  # skipped job leaves the run looking green — so on a private repo a pushed tag
+  # would silently build/push NOTHING. This job runs unconditionally and emits a
+  # loud warning annotation so the no-op is obvious in the run summary.
+  gate:
+    name: release gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report release gate
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "::warning title=release-image skipped::Repo is PRIVATE — no image was built or pushed. Flip the repo public to enable tag releases."
+          else
+            echo "Repo is public — the build/push/attest job runs."
+          fi
+
   build-push-attest:
     name: build, push, attest
     runs-on: ubuntu-latest

@@ -374,6 +374,25 @@ impl Config {
             &self.sidecar.internal_secret,
             DEV_INTERNAL_SECRET,
         )?;
+        // Split-deploy footgun: on a production-like instance, if the sidecar's
+        // INTERNAL base equals its PUBLIC base and that base is non-loopback, the
+        // Rust server would send the `X-Internal-Secret` + all session/repo
+        // traffic to the PUBLIC edge URL over the network (SIDECAR_INTERNAL_URL
+        // was left unset and fell back to SIDECAR_PUBLIC_URL). The canonical
+        // container bakes SIDECAR_INTERNAL_URL to loopback; a bare-binary deploy
+        // must set it explicitly. Refuse to boot rather than leak the secret.
+        if self.sidecar.internal_url == self.sidecar.public_url
+            && public_url_is_non_loopback(&self.sidecar.public_url)
+        {
+            anyhow::bail!(
+                "SIDECAR_INTERNAL_URL is unset (defaulting to the public \
+                 SIDECAR_PUBLIC_URL '{}') on a production-like instance: the internal \
+                 API secret and all session/repo traffic would traverse the public \
+                 network. Set SIDECAR_INTERNAL_URL to the sidecar's loopback/private \
+                 address (e.g. http://127.0.0.1:8081).",
+                self.sidecar.public_url
+            );
+        }
         Ok(())
     }
 
@@ -566,6 +585,40 @@ mod tests {
             ..Config::default()
         };
         assert!(c.is_prod_like());
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_sidecar_url_without_internal_url_refuses_boot() {
+        // Strong secrets, but the sidecar internal URL fell back to a
+        // non-loopback public URL → the internal secret would go over the wire.
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: "https://feather-reader.com/oauth".to_string(),
+                internal_url: "https://feather-reader.com/oauth".to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            ..Config::default()
+        };
+        let err = c.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("SIDECAR_INTERNAL_URL"), "{err}");
+    }
+
+    #[test]
+    fn public_sidecar_url_with_loopback_internal_url_boots() {
+        // Same public sidecar URL, but an explicit loopback internal URL: safe.
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: "https://feather-reader.com/oauth".to_string(),
+                internal_url: "http://127.0.0.1:8081".to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            ..Config::default()
+        };
         assert!(c.validate_secrets().is_ok());
     }
 
