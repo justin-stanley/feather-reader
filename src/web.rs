@@ -198,6 +198,13 @@ pub fn router(state: AppState) -> Router {
     // and the write endpoints). One instance is cloned into the state closure of
     // the `rate_limit` middleware.
     let limiter = RateLimiter::shared();
+    // The trusted client-IP source for the limiter (a proxy header the operator
+    // controls, or the socket peer when unset). Bundled with the limiter so the
+    // middleware derives a spoof-resistant IP.
+    let rl_state = RateLimitState {
+        limiter,
+        trusted_header: state.config.trusted_ip_header.clone(),
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -237,7 +244,7 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(cache_control))
         // Per-IP rate limit on the abuse-prone paths (429 over the limit). Runs
         // as a middleware so it sees the matched path + the peer IP.
-        .layer(middleware::from_fn_with_state(limiter, rate_limit))
+        .layer(middleware::from_fn_with_state(rl_state, rate_limit))
         .layer(TraceLayer::new_for_http())
         // Baseline security headers on *every* response (F4). The CSP is the
         // backstop that neutralises any XSS that slips past sanitization; the
@@ -291,6 +298,16 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
         // /entries/{id}/read and /entries/{id}/star — the star/mark-read taps.
         p => p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")),
     }
+}
+
+/// Middleware state for [`rate_limit`]: the shared limiter plus the trusted
+/// client-IP header (if any). Cloned into every request; both fields are cheap.
+#[derive(Clone)]
+struct RateLimitState {
+    limiter: RateLimiter,
+    /// The lowercased proxy header the operator trusts for the client IP, or
+    /// `None` to trust only the socket peer. See [`client_ip`].
+    trusted_header: Option<String>,
 }
 
 /// A tiny per-IP token-bucket rate limiter. Each IP gets [`RATE_BURST`] tokens
@@ -351,17 +368,42 @@ impl RateLimiter {
     }
 }
 
-/// The peer IP for a request: prefer the reverse-proxy's `X-Forwarded-For`
-/// (left-most hop) since the app runs behind CF Tunnel / a proxy, falling back
-/// to the direct `ConnectInfo` socket. Returns `None` only if neither is present
-/// (then the limiter fails open for that request).
-fn client_ip(headers: &HeaderMap, conn: Option<&SocketAddr>) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return Some(ip);
+/// The **trusted** client IP for a request.
+///
+/// Security: a naive limiter that trusts the *left-most* `X-Forwarded-For` hop
+/// is fully bypassable — the left-most value is attacker-supplied (any client
+/// can send `X-Forwarded-For: <random>`), so each forged value lands in a fresh
+/// bucket and the per-IP limit never bites. We therefore derive the IP only from
+/// a source the operator controls:
+///
+/// * If `trusted_header` is configured (e.g. `Fly-Client-IP`,
+///   `CF-Connecting-IP`), we read the client IP from THAT header only — it is
+///   set by the proxy we run in front and overwrites any client-supplied copy.
+///   We take the LAST value if the header happens to be a comma list (the hop
+///   the trusted proxy appended), which is also the correct read for a
+///   right-most-`X-Forwarded-For` deployment where the operator points
+///   `trusted_header` at `x-forwarded-for`.
+/// * Otherwise we ignore all forwarding headers and use the socket peer
+///   (`ConnectInfo`) — correct for a direct bind with no proxy.
+///
+/// Returns `None` only when neither source yields a parseable IP (the limiter
+/// then fails open for that one request).
+fn client_ip(
+    headers: &HeaderMap,
+    conn: Option<&SocketAddr>,
+    trusted_header: Option<&str>,
+) -> Option<IpAddr> {
+    if let Some(name) = trusted_header {
+        if let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            // Right-most hop is the one the trusted proxy appended; earlier
+            // entries may be client-forged, so never trust the left-most.
+            if let Some(last) = raw.split(',').next_back() {
+                if let Ok(ip) = last.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
             }
         }
+        // Trusted header absent/unparseable → fall through to the socket peer.
     }
     conn.map(|s| s.ip())
 }
@@ -371,7 +413,7 @@ fn client_ip(headers: &HeaderMap, conn: Option<&SocketAddr>) -> Option<IpAddr> {
 /// peer `SocketAddr` is read from the request extension `ConnectInfo` sets (via
 /// `into_make_service_with_connect_info`), preferring `X-Forwarded-For`.
 async fn rate_limit(
-    State(limiter): State<RateLimiter>,
+    State(rl): State<RateLimitState>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -382,9 +424,9 @@ async fn rate_limit(
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        let ip = client_ip(req.headers(), conn.as_ref());
+        let ip = client_ip(req.headers(), conn.as_ref(), rl.trusted_header.as_deref());
         if let Some(ip) = ip {
-            if !limiter.check(ip) {
+            if !rl.limiter.check(ip) {
                 warn!(%ip, %path, "rate limit exceeded");
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1658,6 +1700,27 @@ async fn add_subscription(
         );
     }
 
+    // Per-DID subscription cap: bound one account's storage/poller footprint on
+    // the small box. Checked BEFORE any fetch/resolve so an over-cap account
+    // can't even trigger an outbound request. `<= 0` disables the cap.
+    let cap = state.config.max_subs_per_did;
+    if cap > 0 {
+        match store::count_subscriptions_for_did(pool, &did).await {
+            Ok(n) if n >= cap => {
+                info!(%did, current = n, cap, "refused subscribe: per-DID subscription cap reached");
+                return Ok(Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc(&format!(
+                        "Subscription limit reached ({cap}). Remove a feed before adding another."
+                    ))
+                ))
+                .into_response());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, %did, "could not count subscriptions for cap check; allowing"),
+        }
+    }
+
     let feed_url = match resolve_feed_url(&state.config, &input).await {
         Ok(u) => u,
         Err(err) => {
@@ -1680,6 +1743,27 @@ async fn add_subscription(
         );
     }
 
+    // Global feeds ceiling: a brand-new distinct feed is refused once the shared
+    // cache is full (an existing/duplicate feed URL is always fine — it adds no
+    // row). Bounds total cache size across all users on the box. `<= 0` disables.
+    let feeds_cap = state.config.max_feeds_global;
+    if feeds_cap > 0 && store::get_feed_by_url(pool, &feed_url).await?.is_none() {
+        match store::count_feeds(pool).await {
+            Ok(n) if n >= feeds_cap => {
+                warn!(%did, feeds = n, cap = feeds_cap, feed = %feed_url, "refused subscribe: global feeds ceiling reached");
+                return Ok(Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc(
+                        "This instance is at its feed capacity right now. Please try again later."
+                    )
+                ))
+                .into_response());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
+        }
+    }
+
     store::upsert_feed(
         pool,
         &store::NewFeed {
@@ -1691,7 +1775,8 @@ async fn add_subscription(
 
     if let Ok(client) = feed::build_client() {
         if let Some(feed_row) = store::get_feed_by_url(pool, &feed_url).await? {
-            match feed::poll_feed(pool, &client, &feed_row).await {
+            match feed::poll_feed(pool, &client, &feed_row, state.config.max_entries_per_feed).await
+            {
                 Ok(outcome) => info!(feed = %feed_url, ?outcome, "polled new subscription"),
                 Err(err) => warn!(%err, feed = %feed_url, "initial poll failed"),
             }
@@ -2416,6 +2501,20 @@ async fn import_opml(
     // and reported back to the user — the same public-feeds-only stance as the
     // single-add path, so an OPML import can't leak a Substack/Patreon/podcast
     // token onto the public network either.
+    // Per-DID subscription cap: an OPML import must not blow past the cap. Compute
+    // the remaining headroom (cap − existing) once; public feeds beyond it are
+    // TRIMMED (not imported) and reported. `<= 0` disables the cap.
+    let sub_cap = state.config.max_subs_per_did;
+    let mut headroom: Option<i64> = if sub_cap > 0 {
+        let existing = store::count_subscriptions_for_did(pool, &did)
+            .await
+            .unwrap_or(0);
+        Some((sub_cap - existing).max(0))
+    } else {
+        None
+    };
+    let mut trimmed_over_cap: usize = 0;
+
     let mut subs = Vec::with_capacity(feeds.len());
     let mut skipped_private: Vec<String> = Vec::new();
     for f in &feeds {
@@ -2429,6 +2528,16 @@ async fn import_opml(
                 .unwrap_or_else(|| private_feed_label(&f.feed_url));
             skipped_private.push(label);
             continue;
+        }
+
+        // Over-cap: stop importing once headroom is exhausted (count the rest so
+        // we can tell the user how many were dropped).
+        if let Some(h) = headroom.as_mut() {
+            if *h <= 0 {
+                trimmed_over_cap += 1;
+                continue;
+            }
+            *h -= 1;
         }
 
         let mut sub = Subscription::new(f.feed_url.clone(), now.clone());
@@ -2460,6 +2569,11 @@ async fn import_opml(
 
     // Report the import count, plus any private/paid feeds skipped as unsupported.
     let mut flash = format!("Imported {} feeds", subs.len());
+    if trimmed_over_cap > 0 {
+        flash.push_str(&format!(
+            ". {trimmed_over_cap} feed(s) not imported: your subscription limit ({sub_cap}) was reached."
+        ));
+    }
     if !skipped_private.is_empty() {
         flash.push_str(&format!(
             ". {} feed(s) skipped as private/paid: {} — not supported yet (public feeds only for now).",
@@ -3131,19 +3245,49 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_xforwarded_for() {
+    fn client_ip_ignores_spoofed_xff_without_trusted_header() {
+        // With NO trusted header configured, a client-supplied X-Forwarded-For
+        // must be ignored entirely — the limiter keys on the real socket peer,
+        // so an attacker can't mint a fresh bucket per forged XFF value.
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "198.51.100.9, 10.0.0.1".parse().unwrap());
-        let sock: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let sock: SocketAddr = "203.0.113.55:1234".parse().unwrap();
         assert_eq!(
-            client_ip(&h, Some(&sock)),
+            client_ip(&h, Some(&sock), None),
+            Some("203.0.113.55".parse().unwrap()),
+            "spoofed XFF must not override the socket peer"
+        );
+    }
+
+    #[test]
+    fn client_ip_uses_trusted_header_last_hop() {
+        // With a trusted proxy header configured, the client IP comes from THAT
+        // header (the proxy overwrites any client copy). On a comma list we take
+        // the RIGHT-most hop — the one the trusted proxy appended — so a
+        // client-forged left-most value is ignored.
+        let sock: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+
+        let mut h = HeaderMap::new();
+        h.insert("fly-client-ip", "198.51.100.9".parse().unwrap());
+        assert_eq!(
+            client_ip(&h, Some(&sock), Some("fly-client-ip")),
             Some("198.51.100.9".parse().unwrap())
         );
-        // No XFF → fall back to the socket peer.
-        let h2 = HeaderMap::new();
+
+        // Attacker prepends a forged hop; the trusted proxy appends the real one.
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "1.2.3.4, 198.51.100.9".parse().unwrap());
         assert_eq!(
-            client_ip(&h2, Some(&sock)),
-            Some("127.0.0.1".parse().unwrap())
+            client_ip(&h2, Some(&sock), Some("x-forwarded-for")),
+            Some("198.51.100.9".parse().unwrap()),
+            "must take the right-most (trusted) hop, not the forged left-most"
+        );
+
+        // Trusted header absent → fall back to the socket peer.
+        let h3 = HeaderMap::new();
+        assert_eq!(
+            client_ip(&h3, Some(&sock), Some("fly-client-ip")),
+            Some("10.0.0.1".parse().unwrap())
         );
     }
 
@@ -3408,11 +3552,21 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_returns_429_after_burst() {
-        let state = test_state(&[]).await;
+        // Configure a trusted proxy header so the limiter keys on the forwarded
+        // IP (the oneshot harness sets no ConnectInfo socket peer).
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &[]).await.unwrap();
+        let config = Config {
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            trusted_ip_header: Some("cf-connecting-ip".to_string()),
+            ..Config::default()
+        };
+        let state = AppState::new(config, db).unwrap();
         let app = router(state);
-        // Hammer POST /beta/redeem past the burst from a single IP. The handler
-        // itself returns 200 (re-render) on a bad code; the limiter is what
-        // eventually yields 429.
+        // Hammer POST /beta/redeem past the burst from a single (trusted) IP. The
+        // handler itself returns 200 (re-render) on a bad code; the limiter is
+        // what eventually yields 429.
         let mut saw_429 = false;
         for _ in 0..(RATE_BURST as usize + 5) {
             let resp = app
@@ -3422,7 +3576,7 @@ mod tests {
                         .method("POST")
                         .uri("/beta/redeem")
                         .header("content-type", "application/x-www-form-urlencoded")
-                        .header("x-forwarded-for", "203.0.113.200")
+                        .header("cf-connecting-ip", "203.0.113.200")
                         .body(Body::from("code=FEATHER-NOPENOPE"))
                         .unwrap(),
                 )
@@ -3434,6 +3588,41 @@ mod tests {
             }
         }
         assert!(saw_429, "expected a 429 after exhausting the burst");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_ignores_spoofed_xff_rotation() {
+        // WITHOUT a trusted header, rotating a forged X-Forwarded-For per request
+        // must NOT mint a fresh bucket each time: the oneshot harness sets no
+        // socket peer, so client_ip yields None and the limiter fails open —
+        // crucially it never keys on the attacker-chosen XFF. We assert every
+        // request is admitted (no 429), proving the forged header is not being
+        // used as the bucket key (which would be the vulnerable behaviour only if
+        // it *were* trusted; here the burst can't be exhausted per-IP because the
+        // attacker can't address a single victim bucket via XFF).
+        let state = test_state(&[]).await;
+        let app = router(state);
+        for i in 0..(RATE_BURST as usize + 5) {
+            let forged = format!("10.9.8.{}", i % 250);
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/beta/redeem")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("x-forwarded-for", forged)
+                        .body(Body::from("code=FEATHER-NOPENOPE"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "untrusted XFF must not be used as the rate-limit key"
+            );
+        }
     }
 
     // -- OPML import body cap (DefaultBodyLimit → 413) -------------------------

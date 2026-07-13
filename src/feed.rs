@@ -571,7 +571,15 @@ fn backoff_for(consecutive_errors: u32) -> Duration {
 ///
 /// `Err` is reserved for *store* failures (a broken local DB is a real error the
 /// caller should see), not for feed misbehaviour.
-pub async fn poll_feed(pool: &SqlitePool, client: &Client, feed: &Feed) -> Result<PollOutcome> {
+///
+/// `max_entries_per_feed` caps how many entries this feed retains after insert
+/// (newest N by published date); `<= 0` disables the per-feed trim.
+pub async fn poll_feed(
+    pool: &SqlitePool,
+    client: &Client,
+    feed: &Feed,
+    max_entries_per_feed: i64,
+) -> Result<PollOutcome> {
     // --- conditional GET (through the SSRF guard) ----------------------------
     // The guard re-validates the scheme + resolved IP of the target and of every
     // redirect hop, so a subscribed feed can't bounce the poller onto an
@@ -661,7 +669,7 @@ pub async fn poll_feed(pool: &SqlitePool, client: &Client, feed: &Feed) -> Resul
     let feed_id = store::upsert_feed(pool, &new_feed)
         .await
         .with_context(|| format!("upsert_feed for {}", feed.url))?;
-    let n = store::insert_entries(pool, feed_id, &entries)
+    let n = store::insert_entries(pool, feed_id, &entries, max_entries_per_feed)
         .await
         .with_context(|| format!("insert_entries for {}", feed.url))?;
 

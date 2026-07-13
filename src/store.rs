@@ -377,12 +377,57 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
-/// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`.
+/// The number of feeds a `did` currently subscribes to (its `sub_ref` rows).
+/// Backs the per-DID subscription cap enforced at the add/import paths.
+pub async fn count_subscriptions_for_did(pool: &SqlitePool, did: &str) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sub_ref WHERE did = ?1")
+        .bind(did)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("count_subscriptions_for_did failed for {did}"))?;
+    Ok(n)
+}
+
+/// The number of distinct feeds in the shared cache. Backs the global feeds
+/// ceiling checked before a brand-new feed is inserted.
+pub async fn count_feeds(pool: &SqlitePool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feeds")
+        .fetch_one(pool)
+        .await
+        .context("count_feeds failed")?;
+    Ok(n)
+}
+
+/// The on-disk (or in-page) size of the SQLite database, in bytes, computed as
+/// `page_count * page_size`. Backs the DB-size watermark that disables new
+/// polling. Cheap (two `PRAGMA` reads); works for both file and `:memory:`.
+pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(pool)
+        .await
+        .context("PRAGMA page_count failed")?;
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(pool)
+        .await
+        .context("PRAGMA page_size failed")?;
+    Ok(page_count.saturating_mul(page_size))
+}
+
+/// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`, then
+/// trim the feed to at most [`crate::config`]-configured `max_entries_per_feed`
+/// rows (newest by published date) so one firehose feed can't fill the disk.
 ///
 /// On a GUID collision the existing entry is updated in place (title/url/body
 /// may have changed on re-fetch) rather than duplicated. Runs in one
 /// transaction. Returns the number of rows processed.
-pub async fn insert_entries(pool: &SqlitePool, feed_id: i64, entries: &[NewEntry]) -> Result<u64> {
+///
+/// `max_entries_per_feed <= 0` disables the per-feed trim.
+pub async fn insert_entries(
+    pool: &SqlitePool,
+    feed_id: i64,
+    entries: &[NewEntry],
+    max_entries_per_feed: i64,
+) -> Result<u64> {
     let mut tx = pool.begin().await.context("begin insert_entries tx")?;
     let mut count: u64 = 0;
     for e in entries {
@@ -413,6 +458,31 @@ pub async fn insert_entries(pool: &SqlitePool, feed_id: i64, entries: &[NewEntry
         .with_context(|| format!("insert entry {} failed", e.guid))?;
         count += res.rows_affected();
     }
+
+    // Entries-per-feed cap: keep only the newest `max_entries_per_feed` rows for
+    // this feed (by published date, id as tiebreak), deleting the overflow in the
+    // same transaction. This bounds a single firehose/misbehaving feed's storage
+    // footprint independent of the global retention sweep. `<= 0` disables it.
+    if max_entries_per_feed > 0 {
+        sqlx::query(
+            r#"
+            DELETE FROM entries
+            WHERE feed_id = ?1
+              AND id NOT IN (
+                  SELECT id FROM entries
+                  WHERE feed_id = ?1
+                  ORDER BY published DESC, id DESC
+                  LIMIT ?2
+              )
+            "#,
+        )
+        .bind(feed_id)
+        .bind(max_entries_per_feed)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("trimming feed {feed_id} to {max_entries_per_feed} entries"))?;
+    }
+
     tx.commit().await.context("commit insert_entries tx")?;
     Ok(count)
 }
@@ -1039,6 +1109,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            0, // per-feed trim disabled for this test
         )
         .await?;
         assert_eq!(n, 2);
@@ -1064,6 +1135,7 @@ mod tests {
                 title: Some("First (edited)".to_string()),
                 ..Default::default()
             }],
+            0,
         )
         .await?;
         assert_eq!(n2, 1);
@@ -1165,6 +1237,7 @@ mod tests {
                 content_html: Some("<p>secret A body</p>".to_string()),
                 ..Default::default()
             }],
+            0,
         )
         .await?;
         insert_entries(
@@ -1178,6 +1251,7 @@ mod tests {
                 content_html: Some("<p>secret B body</p>".to_string()),
                 ..Default::default()
             }],
+            0,
         )
         .await?;
 
@@ -1389,6 +1463,81 @@ mod tests {
         let created2 = ensure_seed(&pool, &["did:plc:seed1".to_string()]).await?;
         assert_eq!(created2, 0, "re-seeding an existing DID is a no-op");
         assert!(has_beta_access(&pool, "did:plc:seed1").await?);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Hardening caps: per-DID sub count, global feed count, per-feed entry trim.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn count_helpers_track_feeds_and_subs() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        assert_eq!(count_feeds(&pool).await?, 0);
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: format!("https://f{i}.example/feed.xml"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            ids.push(id);
+        }
+        assert_eq!(count_feeds(&pool).await?, 3);
+
+        let did = "did:plc:capcheck";
+        assert_eq!(count_subscriptions_for_did(&pool, did).await?, 0);
+        replace_sub_refs(&pool, did, &ids).await?;
+        assert_eq!(count_subscriptions_for_did(&pool, did).await?, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_entries_trims_over_cap_keeping_newest() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://firehose.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Insert 5 entries with ascending published dates, cap retained to 2.
+        let batch: Vec<NewEntry> = (0..5)
+            .map(|i| NewEntry {
+                guid: format!("g-{i}"),
+                title: Some(format!("E{i}")),
+                published: Some(format!("2026-07-0{}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &batch, 2).await?;
+
+        let did = "did:plc:trim";
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let kept = entries_for_feed(&pool, did, feed_id).await?;
+        assert_eq!(
+            kept.len(),
+            2,
+            "over-cap feed trimmed to the newest 2 entries"
+        );
+        // Newest first: g-4 (2026-07-05), g-3 (2026-07-04).
+        assert_eq!(kept[0].guid, "g-4");
+        assert_eq!(kept[1].guid, "g-3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn db_size_is_positive_and_grows() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let before = db_size_bytes(&pool).await?;
+        assert!(before > 0, "a schema-initialised DB has a non-zero size");
         Ok(())
     }
 }

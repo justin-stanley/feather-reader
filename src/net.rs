@@ -181,6 +181,34 @@ pub async fn guarded_get(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
+    guarded_get_inner(client, url, extra_headers, true).await
+}
+
+/// The SSRF core of [`guarded_get`] **without** the feed-privacy layer: scheme +
+/// IP allow-list, connect-pinning, and per-hop re-validation, but no
+/// `classify_feed_privacy` check.
+///
+/// This is the entry point for **non-feed** fetches of *user-influenced* URLs —
+/// notably atproto identity resolution (a handle's PDS host, a `did:web`
+/// well-known document, and a DID document's `serviceEndpoint`). Those are
+/// legitimate atproto XRPC / DID-doc requests, so the feed-privacy heuristic
+/// (which flags Substack/Patreon-style token URLs) must not apply — but the SSRF
+/// guard absolutely must, since a hostile `did:web` or `serviceEndpoint` can
+/// otherwise point the server at `169.254.169.254`, loopback, or a tailnet host.
+pub async fn guarded_get_no_privacy(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<Response> {
+    guarded_get_inner(client, url, extra_headers, false).await
+}
+
+async fn guarded_get_inner(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    check_privacy: bool,
+) -> Result<Response> {
     // `client` is retained in the signature for API stability + as the policy
     // template; the actual send goes through a per-hop IP-pinned client.
     let _ = client;
@@ -194,10 +222,14 @@ pub async fn guarded_get(
         // reflected into the UI — before storage is refused, violating the
         // "never fetched" half of the public-feeds-only guarantee. Classify the
         // resolved target BEFORE the request and abort the whole fetch if private.
-        if let crate::feed::FeedPrivacy::Private(reason) =
-            crate::feed::classify_feed_privacy(current.as_str())
-        {
-            bail!("refusing to fetch private/paid feed URL (redirect target): {reason}");
+        // (Skipped for non-feed atproto identity fetches — see
+        // [`guarded_get_no_privacy`].)
+        if check_privacy {
+            if let crate::feed::FeedPrivacy::Private(reason) =
+                crate::feed::classify_feed_privacy(current.as_str())
+            {
+                bail!("refusing to fetch private/paid feed URL (redirect target): {reason}");
+            }
         }
         // Re-validate on EVERY hop and capture the vetted address to pin to.
         let vetted = resolve_and_check(&current).await?;
@@ -252,6 +284,23 @@ pub async fn read_capped(mut resp: Response) -> Result<Vec<u8>> {
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Validate that a URL is safe to use as an outbound target: `http`/`https`
+/// scheme AND every resolved IP passes the SSRF allow-list. Returns `Ok(())` for
+/// a public target, `Err` for a forbidden one (loopback / link-local / private /
+/// ULA / CGNAT / metadata) or a bad scheme.
+///
+/// Use this to vet a URL *before* it is stashed and later fetched by a client
+/// that does not itself route through [`guarded_get`] — notably an atproto PDS
+/// `serviceEndpoint` resolved out of a (hostile-controllable) DID document, so a
+/// `serviceEndpoint: "http://169.254.169.254/"` is rejected at resolve time
+/// rather than reaching a raw XRPC client.
+pub async fn assert_public_target(url: &str) -> Result<()> {
+    let parsed = Url::parse(url).with_context(|| format!("not a valid URL {url:?}"))?;
+    check_scheme(&parsed)?;
+    resolve_and_check(&parsed).await?;
+    Ok(())
 }
 
 /// Scheme-allow-list a URL destined to be rendered as an `href` (an entry's

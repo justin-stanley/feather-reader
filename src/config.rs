@@ -14,6 +14,11 @@
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `90`                    | Prune read, unstarred entries older than this. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
+//! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
+//! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |
+//! | `FEATHERREADER_MAX_FEEDS`    | `10000`                  | Global distinct-feed ceiling. |
+//! | `FEATHERREADER_MAX_ENTRIES_PER_FEED` | `2000`           | Per-feed retained-entry cap (newest N). |
+//! | `FEATHERREADER_DB_SIZE_WATERMARK_BYTES` | `2 GiB`       | Above this the poller stops fetching new content (0 disables). |
 //!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
@@ -59,6 +64,33 @@ pub struct Config {
     /// access at once (redeeming an invite fails with `CapacityFull` past this).
     /// From `FEATHERREADER_BETA_CAP`, default 100.
     pub beta_cap: i64,
+    /// The reverse-proxy header the rate limiter TRUSTS for the real client IP,
+    /// e.g. `Fly-Client-IP` (bare Fly) or `CF-Connecting-IP` (Cloudflare). When
+    /// set, ONLY this header is consulted — never the spoofable multi-hop
+    /// `X-Forwarded-For` chain — and it falls back to the socket peer if the
+    /// header is absent/unparseable. Unset (the default) trusts the socket peer
+    /// only, which is correct for a direct bind with no proxy in front.
+    /// From `FEATHERREADER_TRUSTED_IP_HEADER`.
+    pub trusted_ip_header: Option<String>,
+    /// Per-DID subscription cap. A DID may hold at most this many subscriptions;
+    /// `add_subscription` rejects over it and `import_opml` trims to it. Bounds
+    /// the storage/poller blast radius of one account on a small box.
+    /// From `FEATHERREADER_MAX_SUBS_PER_DID`, default 500.
+    pub max_subs_per_did: i64,
+    /// Global ceiling on distinct feeds in the shared cache. A new feed is
+    /// refused once the `feeds` table holds this many rows (existing feeds still
+    /// poll). From `FEATHERREADER_MAX_FEEDS`, default 10_000.
+    pub max_feeds_global: i64,
+    /// Cap on how many entries are retained per feed on insert — the newest N by
+    /// published date; older rows are pruned in the same transaction so one
+    /// firehose feed can't fill the disk. From `FEATHERREADER_MAX_ENTRIES_PER_FEED`,
+    /// default 2_000.
+    pub max_entries_per_feed: i64,
+    /// DB-size watermark, in bytes. Above it the background poller stops fetching
+    /// new content (and logs an alert) so the `$3.50 box` can't be filled to a
+    /// crash. `0` disables the watermark. From `FEATHERREADER_DB_SIZE_WATERMARK_BYTES`,
+    /// default 2 GiB.
+    pub db_size_watermark_bytes: i64,
     /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
     pub sidecar: SidecarConfig,
     /// HMAC key used to sign the session cookie. In production this MUST be set
@@ -136,6 +168,11 @@ impl Default for Config {
             retention_days: 90,
             proxy_images: false,
             beta_cap: 100,
+            trusted_ip_header: None,
+            max_subs_per_did: 500,
+            max_feeds_global: 10_000,
+            max_entries_per_feed: 2_000,
+            db_size_watermark_bytes: 2 * 1024 * 1024 * 1024,
             sidecar: SidecarConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             dev_did: None,
@@ -208,6 +245,39 @@ impl Config {
             None => defaults.beta_cap,
         };
 
+        // Trusted client-IP header for the rate limiter. Normalized to lowercase
+        // (header lookup is case-insensitive); unset => trust only the socket peer.
+        let trusted_ip_header =
+            env_opt("FEATHERREADER_TRUSTED_IP_HEADER").map(|h| h.trim().to_ascii_lowercase());
+
+        let max_subs_per_did = match env_opt("FEATHERREADER_MAX_SUBS_PER_DID") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_MAX_SUBS_PER_DID: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.max_subs_per_did,
+        };
+
+        let max_feeds_global = match env_opt("FEATHERREADER_MAX_FEEDS") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_MAX_FEEDS: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.max_feeds_global,
+        };
+
+        let max_entries_per_feed = match env_opt("FEATHERREADER_MAX_ENTRIES_PER_FEED") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_MAX_ENTRIES_PER_FEED: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.max_entries_per_feed,
+        };
+
+        let db_size_watermark_bytes = match env_opt("FEATHERREADER_DB_SIZE_WATERMARK_BYTES") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_DB_SIZE_WATERMARK_BYTES: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.db_size_watermark_bytes,
+        };
+
         // --- atproto OAuth sidecar --------------------------------------
         let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
             .map(|u| u.trim_end_matches('/').to_string())
@@ -235,6 +305,11 @@ impl Config {
             retention_days,
             proxy_images,
             beta_cap,
+            trusted_ip_header,
+            max_subs_per_did,
+            max_feeds_global,
+            max_entries_per_feed,
+            db_size_watermark_bytes,
             sidecar,
             cookie_secret,
             dev_did,
@@ -376,6 +451,12 @@ mod tests {
         assert!(!c.proxy_images);
         assert!(c.allowed_dids.is_empty());
         assert_eq!(c.beta_cap, 100);
+        // Hardening caps default to safe, non-zero bounds; no trusted proxy header.
+        assert!(c.trusted_ip_header.is_none());
+        assert_eq!(c.max_subs_per_did, 500);
+        assert_eq!(c.max_feeds_global, 10_000);
+        assert_eq!(c.max_entries_per_feed, 2_000);
+        assert_eq!(c.db_size_watermark_bytes, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]

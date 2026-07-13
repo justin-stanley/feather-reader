@@ -232,6 +232,25 @@ async fn poll_due_once(
     batch: i64,
     stagger: Duration,
 ) -> anyhow::Result<()> {
+    // DB-size watermark: above it, stop pulling NEW content so a small box can't
+    // be filled to a crash by the poller. Reads/serving continue; only fetching
+    // is paused. `<= 0` disables the watermark.
+    let watermark = state.config.db_size_watermark_bytes;
+    if watermark > 0 {
+        match store::db_size_bytes(&state.db).await {
+            Ok(size) if size >= watermark => {
+                warn!(
+                    db_size_bytes = size,
+                    watermark_bytes = watermark,
+                    "DB size at/above watermark: pausing new polling until it drops (retention/prune)"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, "could not read DB size for watermark check; polling anyway"),
+        }
+    }
+
     let now = now_rfc3339();
     let due = store::due_feeds(&state.db, &now, batch).await?;
     if due.is_empty() {
@@ -251,9 +270,17 @@ async fn poll_due_once(
         let pool = state.db.clone();
         let client = client.clone();
         let default_interval = state.config.poll_interval;
+        let max_entries_per_feed = state.config.max_entries_per_feed;
         handles.push(tokio::spawn(async move {
             let _permit = permit; // held for the duration of this poll
-            poll_and_reschedule(&pool, &client, &feed, default_interval).await;
+            poll_and_reschedule(
+                &pool,
+                &client,
+                &feed,
+                default_interval,
+                max_entries_per_feed,
+            )
+            .await;
         }));
         // Stagger launches so a batch doesn't fire in one instant.
         if !stagger.is_zero() {
@@ -282,8 +309,9 @@ async fn poll_and_reschedule(
     client: &reqwest::Client,
     feed: &Feed,
     default_interval: Duration,
+    max_entries_per_feed: i64,
 ) {
-    let next_delay = match feed::poll_feed(pool, client, feed).await {
+    let next_delay = match feed::poll_feed(pool, client, feed, max_entries_per_feed).await {
         Ok(PollOutcome::Updated { new_entries }) => {
             debug!(feed = %feed.url, new_entries, "polled: updated");
             cadence_for(feed, default_interval)
