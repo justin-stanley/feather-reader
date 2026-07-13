@@ -6,7 +6,7 @@
 //! rather than in the app's database — portable across any reader that adopts
 //! the standard, not merely across FeatherReader instances.
 //!
-//! These types mirror the schemas defined in the design doc exactly, authored in
+//! These types mirror the `community.lexicon.rss.*` schemas, authored in
 //! the Lexicon Community idiom (`createdAt`/`updatedAt` as ISO-8601 datetimes,
 //! `url`/`siteUrl`/`feedUrl` as URIs, `folder` as an `at://` strong ref). Each
 //! record carries its `$type` NSID so it round-trips against the atproto record
@@ -18,8 +18,9 @@
 //! - [`Folder`] — a lightweight named grouping (a feed lives in one folder).
 //! - [`Saved`] — a starred / save-for-later entry.
 //! - [`ReadState`] — the **batched** per-feed read cursor (one record per feed,
-//!   upserted via `putRecord` with a feed-derived rkey — never one record per
-//!   article).
+//!   at a feed-derived rkey — never one record per article). Written by the
+//!   read-state flusher; see the caveats on that flush path in
+//!   [`crate::atproto`].
 
 use serde::{Deserialize, Serialize};
 
@@ -243,9 +244,9 @@ impl Saved {
 }
 
 /// `community.lexicon.rss.readState` — a batched read high-water-mark for a
-/// single feed. Record key: `any` (rkey is derived deterministically from the
-/// feed, e.g. a hash of the feed URL, so it is a stable **upsert** target —
-/// one `putRecord` per feed, NOT one record per article).
+/// single feed. Record key: `any`; the rkey is derived deterministically from the
+/// feed (a hash of the feed URL), so there is one record per feed with a stable
+/// key, NOT one record per article.
 ///
 /// `feedUrl` + `readThrough` + `updatedAt` are required; the two capped id-sets
 /// carry out-of-order reads and explicit mark-unread exceptions.
@@ -274,8 +275,9 @@ pub struct ReadState {
     #[serde(rename = "unreadIds", skip_serializing_if = "Vec::is_empty", default)]
     pub unread_ids: Vec<String>,
 
-    /// Last time this cursor was flushed (ISO-8601 datetime); the reconcile
-    /// tie-breaker (newest-`updatedAt`-wins-for-unread). Required.
+    /// Last time this cursor was flushed (ISO-8601 datetime). Required. Intended
+    /// as the tie-breaker for cross-device merges (newest `updatedAt` wins);
+    /// a login-time reconcile that uses it is not implemented yet.
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
 }
@@ -286,8 +288,8 @@ fn read_state_type() -> String {
 
 impl ReadState {
     /// Maximum length of the `readIds` / `unreadIds` exception sets, per the
-    /// lexicon. The flusher must re-cap and compact into `readThrough` before
-    /// writing.
+    /// lexicon. The flusher enforces this cap before writing (see
+    /// `scheduler::cap`).
     pub const MAX_IDS: usize = 1000;
 
     /// Construct a minimal read cursor with only the required fields.

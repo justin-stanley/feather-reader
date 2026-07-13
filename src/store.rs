@@ -1,8 +1,8 @@
 //! SQLite persistence layer (via `sqlx`, runtime queries).
 //!
 //! FeatherReader keeps the source of truth for *what a user follows* and *their
-//! read-position* in the user's own atproto PDS (see the design doc,
-//! `community.lexicon.rss.*`). This module is the **local per-DID cache + debounce
+//! read-position* in the user's own atproto PDS (as `community.lexicon.rss.*`
+//! records). This module is the **local per-DID cache + debounce
 //! buffer**: a single SQLite file that holds
 //!
 //! * `feeds` + `entries` — a shared cache of feed metadata and articles, keyed by
@@ -822,8 +822,9 @@ async fn write_cursor_sets(
 /// high-water-mark plus two bounded exception sets. A per-article flip is
 /// recorded in those sets (`read_ids` when read, `unread_ids` when unread), the
 /// opposite set is cleared of the id, and the cursor is stamped + marked dirty.
-/// The reconciler later folds covered ids into `read_through`; here we keep it
-/// batched by touching only the ONE per-feed cursor.
+/// This keeps the write batched by touching only the ONE per-feed cursor. (Note:
+/// there is no compaction step yet that folds covered ids back into
+/// `read_through`; the exception sets are expected to stay well under the cap.)
 async fn project_entry_into_cursor(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     did: &str,
@@ -961,7 +962,8 @@ pub async fn get_starred_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Ent
 }
 
 /// Insert or update a per-`(did, feed_url)` read cursor, stamping `updated_at`.
-/// Used both by the local mark-read path and by reconcile-on-login.
+/// The write path for local mark-read updates (and the seam a login-time PDS
+/// merge would use, once that is wired).
 pub async fn upsert_cursor(pool: &SqlitePool, cursor: &ReadCursor) -> Result<()> {
     sqlx::query(
         r#"

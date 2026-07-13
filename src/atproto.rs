@@ -1,6 +1,6 @@
 //! The atproto identity + PDS record layer.
 //!
-//! FeatherReader's defining bet ([§4](reader design doc)) is that a user's feed
+//! FeatherReader's defining bet is that a user's feed
 //! subscriptions, folders, saved items, and batched read-state live as records
 //! in the user's **own** atproto PDS under the open `community.lexicon.rss.*`
 //! community lexicon — not in the app's database. This module is the client that
@@ -21,10 +21,10 @@
 //!    [`put_record`](PdsClient::put_record),
 //!    [`delete_record`](PdsClient::delete_record), and
 //!    [`apply_writes`](PdsClient::apply_writes) (the **batch** call the
-//!    read-state flusher uses to coalesce many per-feed cursor upserts into one
+//!    read-state flusher uses to coalesce many per-feed cursor writes into one
 //!    round-trip).
 //! 3. **Typed convenience wrappers** wired to the [`crate::lexicon`] record
-//!    types (list/create [`Subscription`]/[`Folder`]/[`Saved`], upsert
+//!    types (list/create [`Subscription`]/[`Folder`]/[`Saved`], put
 //!    [`ReadState`], batch-flush many `ReadState` cursors).
 //!
 //! ## Auth — the OAuth sidecar is the live path
@@ -33,9 +33,9 @@
 //! call sites. There are two paths:
 //!
 //! * **The live path — the atproto OAuth confidential client, via [`SidecarClient`].**
-//!   Per the design and the gaming-SDK prior art, atproto OAuth (DPoP, PAR, token
-//!   refresh) is fiddly and is **not** hand-rolled in Rust: it runs in a small
-//!   supported `@atproto/oauth-client-node` sidecar. The Rust server never holds
+//!   atproto OAuth (DPoP, PAR, token refresh) is fiddly and is **not** hand-rolled
+//!   in Rust: it runs in a small, supported `@atproto/oauth-client-node` sidecar.
+//!   The Rust server never holds
 //!   PDS tokens — it POSTs every `com.atproto.repo.*` op to the sidecar's
 //!   `/internal/repo` endpoint (gated by a shared `X-Internal-Secret`), and the
 //!   sidecar restores the DID's OAuth session (transparent DPoP + token refresh)
@@ -126,17 +126,15 @@ impl AtProtoError {
 }
 
 // ---------------------------------------------------------------------------
-// Auth — the scaffolded seam
+// Auth — the direct-PDS path (dev / tests)
 // ---------------------------------------------------------------------------
 
 /// A source of atproto access tokens.
 ///
-/// This is the **seam** the OAuth confidential-client sidecar drops into. Phase
-/// 0 ships only the session-token implementation ([`Auth`] carries a static
-/// bearer). The real OAuth path implements this trait over the
-/// `@atproto/oauth-client` sidecar (returning fresh DPoP-bound access tokens and
-/// refreshing them out of band), and [`PdsClient`] can hold a `dyn TokenSource`
-/// instead of a static [`Auth`] without any call-site change.
+/// This trait abstracts over token acquisition for the direct [`PdsClient`]
+/// (used by local runs and tests). A [`PdsClient`] can hold a `dyn TokenSource`
+/// instead of a static [`Auth`] without any call-site change, so a token source
+/// that refreshes out of band can be dropped in later.
 ///
 /// It is async + `Send + Sync` so a background refresh can live behind it.
 #[allow(async_fn_in_trait)]
@@ -147,36 +145,37 @@ pub trait TokenSource: Send + Sync {
 
 /// The auth material a [`PdsClient`] carries.
 ///
-/// A small enum rather than a bare string so the OAuth variant has a home today
-/// (even though it's unimplemented), making the seam explicit and the match
-/// exhaustive when OAuth lands.
+/// A small enum rather than a bare string, so the match stays exhaustive if a
+/// second direct-auth mechanism is added alongside app-password sessions.
 #[derive(Clone)]
 pub enum Auth {
-    /// **Phase 0 interim:** a bearer access token from a legacy
-    /// `com.atproto.server.createSession` (app-password) session. Fully working;
-    /// lets the client be exercised end-to-end today.
+    /// A bearer access token from a `com.atproto.server.createSession`
+    /// (app-password) session. This is the direct-PDS auth used by local runs
+    /// and tests; the live web path authenticates via the OAuth sidecar instead
+    /// (see [`SidecarClient`]).
     Session(SessionAuth),
 
-    /// **TODO (documented seam, not implemented in Phase 0):** the atproto OAuth
-    /// confidential-client path. The token is minted + DPoP-bound + refreshed by
-    /// the `@atproto/oauth-client` sidecar (see the module docs / gaming-SDK
-    /// prior art); the Rust side only carries and presents it.
+    /// The atproto OAuth confidential-client path is handled entirely by the
+    /// `@atproto/oauth-client` sidecar ([`SidecarClient`]), which mints, DPoP-binds,
+    /// and refreshes tokens. The direct [`PdsClient`] does not carry OAuth tokens;
+    /// this variant is a placeholder so the `Auth` enum documents that the OAuth
+    /// path lives elsewhere.
     Oauth(OauthPlaceholder),
 }
 
 impl Auth {
     /// The bearer access token to present on `com.atproto.repo.*` calls.
     ///
-    /// For [`Auth::Session`] this is the session's `accessJwt`. For
-    /// [`Auth::Oauth`] this is unimplemented in Phase 0 and returns an error
-    /// pointing at the sidecar seam.
+    /// Only [`Auth::Session`] carries a token (the session's `accessJwt`).
+    /// [`Auth::Oauth`] carries none — the sidecar owns the OAuth path — so it
+    /// returns an error pointing callers at [`SidecarClient`].
     pub fn bearer(&self) -> Result<&str> {
         match self {
             Auth::Session(s) => Ok(&s.access_jwt),
             Auth::Oauth(_) => anyhow::bail!(
-                "atproto OAuth confidential-client auth is not wired in Phase 0 — \
-                 it is a documented seam handled by the @atproto/oauth-client sidecar; \
-                 use Auth::Session (app-password) for now"
+                "the direct PdsClient does not carry OAuth tokens — atproto OAuth is \
+                 handled by the @atproto/oauth-client sidecar (SidecarClient); \
+                 use Auth::Session (app-password) for the direct-PDS path"
             ),
         }
     }
@@ -194,17 +193,19 @@ pub struct SessionAuth {
     /// The bearer access token presented on authed XRPC calls.
     #[serde(rename = "accessJwt")]
     pub access_jwt: String,
-    /// The refresh token, exchanged via `com.atproto.server.refreshSession`
-    /// (refresh flow itself is out of Phase-0 scope).
+    /// The refresh token, exchanged via `com.atproto.server.refreshSession`.
+    /// The direct-PDS refresh flow is not implemented here; the live web path
+    /// refreshes via the OAuth sidecar instead.
     #[serde(rename = "refreshJwt", default)]
     pub refresh_jwt: Option<String>,
 }
 
-/// Placeholder for the OAuth session material.
+/// Placeholder for the OAuth variant of [`Auth`].
 ///
-/// Intentionally empty in Phase 0 — it exists only so [`Auth::Oauth`] is a real
-/// variant and the OAuth seam is visible in the type system. The sidecar will
-/// fill this with the DPoP key handle + token references it manages.
+/// Intentionally empty: the OAuth session material (DPoP key handle, token
+/// references) is held entirely by the sidecar, not by the direct [`PdsClient`].
+/// This type exists only so [`Auth::Oauth`] is a real variant and the split is
+/// visible in the type system.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct OauthPlaceholder {}
@@ -219,7 +220,7 @@ pub struct OauthPlaceholder {}
 /// that implements it; [`DEFAULT_RESOLVER_HOST`] is a safe bootstrap). A fuller
 /// implementation would also try the DNS `_atproto` TXT record and the
 /// `https://<handle>/.well-known/atproto-did` fallback; the XRPC path is the
-/// common case and is what Phase 0 exercises.
+/// common case and the one implemented here.
 pub async fn resolve_handle(client: &Client, resolver_base: &str, handle: &str) -> Result<String> {
     // Build the query manually rather than via reqwest's `.query()` so we don't
     // depend on the optional `query`/`url` reqwest feature (the declared feature
@@ -358,14 +359,14 @@ impl DidDocument {
 }
 
 // ---------------------------------------------------------------------------
-// Interim auth: app-password session
+// Direct-PDS auth: app-password session
 // ---------------------------------------------------------------------------
 
-/// Create an interim session with an **app password** via
-/// `com.atproto.server.createSession` (Phase-0 auth).
+/// Create a session with an **app password** via
+/// `com.atproto.server.createSession`.
 ///
-/// This is the legacy-but-working path that makes [`PdsClient`] exercisable
-/// today without the OAuth sidecar. `pds_base` is the account's PDS (resolve it
+/// This is the direct-PDS path that makes [`PdsClient`] usable without the OAuth
+/// sidecar (local runs and tests). `pds_base` is the account's PDS (resolve it
 /// first with [`resolve_handle`] + [`resolve_did_to_pds`], or pass the entryway
 /// like `https://bsky.social`, which will service-proxy). `identifier` is a
 /// handle or DID; `app_password` is an app-password (never the main password).
@@ -412,7 +413,7 @@ pub struct PdsClient {
     pds_base: Arc<str>,
     /// The repo DID all calls target.
     did: Arc<str>,
-    /// The auth material (Phase-0 session bearer; OAuth seam for later).
+    /// The auth material (an app-password session bearer for the direct path).
     auth: Auth,
 }
 
@@ -499,9 +500,9 @@ impl PdsClient {
         }
     }
 
-    /// Resolve `handle` → DID → PDS, obtain an interim app-password session, and
-    /// build a ready-to-use client. The Phase-0 convenience constructor that
-    /// exercises the whole stack end-to-end.
+    /// Resolve `handle` → DID → PDS, obtain an app-password session, and build a
+    /// ready-to-use client. A convenience constructor for the direct-PDS path
+    /// that exercises the whole stack end-to-end.
     ///
     /// `resolver_base` / `plc_directory` default to [`DEFAULT_RESOLVER_HOST`] /
     /// [`DEFAULT_PLC_DIRECTORY`] when passed `None`.
@@ -746,7 +747,8 @@ impl PdsClient {
         self.create_record(lexicon::nsid::SAVED, saved).await
     }
 
-    /// List every [`ReadState`] cursor in the user's repo (reconcile-on-login).
+    /// List every [`ReadState`] cursor in the user's repo (the read side a
+    /// login-time read-state merge would consume).
     pub async fn list_read_states(&self) -> Result<Vec<(String, ReadState)>> {
         self.list_typed(lexicon::nsid::READ_STATE).await
     }
@@ -761,8 +763,10 @@ impl PdsClient {
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call —
     /// the debounced read-state flusher's coalesced write.
     ///
-    /// Each `(rkey, state)` becomes an `update` op at the feed-derived rkey, so
-    /// the whole batch is idempotent (one record per feed).
+    /// Each `(rkey, state)` becomes an `update` op at the feed-derived rkey (one
+    /// record per feed). Note that `applyWrites#update` targets an existing
+    /// record; a feed with no read-state record yet is not created by this call
+    /// (see [`put_read_state`](Self::put_read_state) for the upsert path).
     pub async fn flush_read_states(&self, cursors: &[(String, ReadState)]) -> Result<()> {
         if cursors.is_empty() {
             return Ok(());
@@ -1171,7 +1175,8 @@ impl SidecarClient {
         self.list_typed(did, lexicon::nsid::SAVED).await
     }
 
-    /// List every [`ReadState`] cursor in `did`'s repo (reconcile-on-login).
+    /// List every [`ReadState`] cursor in `did`'s repo (the read side a
+    /// login-time read-state merge would consume).
     pub async fn list_read_states(&self, did: &str) -> Result<Vec<(String, ReadState)>> {
         self.list_typed(did, lexicon::nsid::READ_STATE).await
     }
@@ -1188,6 +1193,10 @@ impl SidecarClient {
     }
 
     /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call.
+    ///
+    /// Each cursor becomes an `update` op at its feed-derived rkey. As with
+    /// [`PdsClient::flush_read_states`], `applyWrites#update` targets an existing
+    /// record and does not create a feed's first read-state record.
     pub async fn flush_read_states(
         &self,
         did: &str,
@@ -1213,7 +1222,7 @@ impl SidecarClient {
     //
     // These are the typed convenience methods `web.rs` uses to manage a user's
     // feeds/folders/saved items *as records in their PDS*. They mirror the
-    // Phase-1 create/list surface above but use the reader vocabulary
+    // create/list surface above but use the reader vocabulary
     // (add/remove/rename) and, for the `add_*` verbs, return the server-assigned
     // rkey so the caller can address the new record without a re-list. Ordering
     // is made deterministic where it matters (see [`list_subscriptions_sorted`]
@@ -1833,11 +1842,11 @@ mod tests {
     }
 
     #[test]
-    fn oauth_auth_is_a_documented_unimplemented_seam() {
+    fn oauth_variant_carries_no_direct_bearer() {
         let auth = Auth::Oauth(OauthPlaceholder::default());
         assert!(
             auth.bearer().is_err(),
-            "OAuth bearer must remain an unimplemented seam in Phase 0"
+            "Auth::Oauth carries no direct bearer — the sidecar owns the OAuth path"
         );
     }
 

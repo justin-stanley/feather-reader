@@ -1,4 +1,4 @@
-//! OPML import + export — the migration on-ramp and off-ramp (design §3).
+//! OPML import + export — the migration on-ramp and off-ramp.
 //!
 //! FeatherReader stores subscriptions and folders as records in the user's own
 //! atproto PDS; OPML is how people *arrive* (from Miniflux / Feedly / Inoreader /

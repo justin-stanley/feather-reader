@@ -17,14 +17,13 @@
 //! - [`feed`]    — polite fetching (conditional GET, backoff), feed-rs parsing,
 //!   and ammonia sanitization.
 //! - [`atproto`] — the atproto identity + PDS record layer (subscriptions,
-//!   folders, saved, batched read-state sync). Phase 0 ships a scaffolded auth
-//!   seam; the full OAuth confidential-client sidecar is a documented TODO.
+//!   folders, saved, batched read-state sync). Live repo writes go through the
+//!   OAuth confidential-client sidecar ([`atproto::SidecarClient`]).
 //! - [`web`]     — the axum router + askama server-rendered views.
 //!
-//! **Status:** early. This `0.1.0` is a compiling Phase-0 skeleton with the real
-//! core seams present. See <https://reader.justin-stanley.com>.
+//! **Status:** experimental / pre-1.0. See <https://reader.justin-stanley.com>.
 
-// The Phase-0 module tree. Siblings fill these in; the layout owns the wiring.
+// The module tree; the layout owns the wiring between subsystems.
 pub mod atproto;
 pub mod config;
 pub mod feed;
@@ -112,7 +111,7 @@ fn new_session_id() -> String {
         let seed = nanos as u64 ^ (&bytes as *const _ as u64);
         let mut x = seed | 1;
         for b in bytes.iter_mut() {
-            // xorshift64 — placeholder only.
+            // xorshift64 — only reached if the OS CSPRNG is unavailable.
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;

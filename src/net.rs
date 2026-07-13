@@ -76,7 +76,7 @@ fn is_forbidden_v4(ip: &Ipv4Addr) -> bool {
         // Carrier-grade NAT / "this-host" / benchmarking ranges — not routable
         // to a legitimate public feed, but reachable internally.
         || matches!(ip.octets(), [0, ..])
-        || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b)) // 100.64/10 CGNAT (Tailscale!)
+        || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b)) // 100.64/10 CGNAT (also used by overlay VPNs)
         || matches!(ip.octets(), [192, 0, 0, _])
         || matches!(ip.octets(), [198, 18..=19, _, _])
 }
@@ -216,7 +216,7 @@ pub async fn guarded_get(
 /// legitimate atproto XRPC / DID-doc requests, so the feed-privacy heuristic
 /// (which flags Substack/Patreon-style token URLs) must not apply — but the SSRF
 /// guard absolutely must, since a hostile `did:web` or `serviceEndpoint` can
-/// otherwise point the server at `169.254.169.254`, loopback, or a tailnet host.
+/// otherwise point the server at `169.254.169.254`, loopback, or a private host.
 pub async fn guarded_get_no_privacy(
     client: &Client,
     url: &str,
@@ -355,7 +355,7 @@ mod tests {
             "192.168.1.1",
             "0.0.0.0",
             "255.255.255.255",
-            "100.87.39.108", // CGNAT / tailnet
+            "100.87.39.108", // 100.64/10 CGNAT range
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} should be forbidden");

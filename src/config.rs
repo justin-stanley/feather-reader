@@ -1,8 +1,8 @@
 //! Runtime configuration for the FeatherReader server.
 //!
 //! Everything is env-driven with a sane default for every knob, so a bare
-//! `./featherreader` boots and works — no config file required (the OSS
-//! "trivial to self-host" promise, §7 of the design). The environment variables
+//! `./featherreader` boots and works — no config file required (the
+//! "trivial to self-host" promise). The environment variables
 //! all share the `FEATHERREADER_*` prefix:
 //!
 //! | Variable                     | Default                  | Meaning |

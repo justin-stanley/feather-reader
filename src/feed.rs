@@ -840,8 +840,8 @@ fn header_str(v: Option<&reqwest::header::HeaderValue>) -> Option<String> {
 ///
 /// Returns the first RSS/Atom autodiscovery link found, resolved against the
 /// page URL if the `href` is relative. This is what lets a user paste a *site*
-/// URL and have FeatherReader find the actual feed (design §3, "Subscribe by
-/// URL"). Returns `None` if the HTML carries no autodiscovery link.
+/// URL and have FeatherReader find the actual feed ("subscribe by URL").
+/// Returns `None` if the HTML carries no autodiscovery link.
 ///
 /// The `base` is the URL the HTML was fetched from, used to resolve relative
 /// `href`s. Pass `None` to only accept absolute hrefs.
