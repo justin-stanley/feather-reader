@@ -193,6 +193,20 @@ CREATE TABLE IF NOT EXISTS entry_state (
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state_did_read ON entry_state (did, read);
 
+-- Per-DID subscription projection. The shared `feeds`/`entries` cache is
+-- deduped by URL and NOT owned by any single DID; `sub_ref` records which
+-- feeds a given DID actually subscribes to (mirrored from the caller's PDS
+-- subscription set on every resolve/sync). Every entry/feed READ and every
+-- read/star MUTATION is scoped through this table so one user can never read
+-- or mutate another user's cached articles. Rows are refreshed by
+-- `replace_sub_refs`.
+CREATE TABLE IF NOT EXISTS sub_ref (
+    did     TEXT NOT NULL,
+    feed_id INTEGER NOT NULL REFERENCES feeds (id) ON DELETE CASCADE,
+    PRIMARY KEY (did, feed_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sub_ref_feed ON sub_ref (feed_id);
+
 CREATE TABLE IF NOT EXISTS read_cursor (
     did          TEXT NOT NULL,
     feed_url     TEXT NOT NULL,
@@ -403,11 +417,67 @@ pub async fn insert_entries(pool: &SqlitePool, feed_id: i64, entries: &[NewEntry
     Ok(count)
 }
 
-/// All entries for a feed, newest-published first.
-pub async fn entries_for_feed(pool: &SqlitePool, feed_id: i64) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        "SELECT * FROM entries WHERE feed_id = ?1 ORDER BY published DESC, id DESC",
+/// Replace the per-DID subscription projection (`sub_ref`) for `did` with
+/// exactly `feed_ids`, in one transaction.
+///
+/// Called from the web layer's subscription-resolve/sync path so `sub_ref`
+/// always mirrors the caller's *current* PDS subscription set. This is the
+/// authority every scoped read/mutation checks against — a feed the caller no
+/// longer subscribes to drops out of their read surface immediately.
+pub async fn replace_sub_refs(pool: &SqlitePool, did: &str, feed_ids: &[i64]) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin replace_sub_refs tx")?;
+    sqlx::query("DELETE FROM sub_ref WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("clear sub_ref for {did}"))?;
+    for &feed_id in feed_ids {
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(did)
+            .bind(feed_id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("insert sub_ref {did}/{feed_id}"))?;
+    }
+    tx.commit().await.context("commit replace_sub_refs tx")?;
+    Ok(())
+}
+
+/// Whether `did` currently subscribes to the feed `feed_id` owns
+/// (i.e. a `sub_ref` row exists). The authorization primitive behind every
+/// per-DID scoped read/mutation.
+pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT 1
+        FROM entries e
+        JOIN sub_ref sr ON sr.feed_id = e.feed_id AND sr.did = ?1
+        WHERE e.id = ?2
+        "#,
     )
+    .bind(did)
+    .bind(entry_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("did_subscribes_to_entry failed for {did}/{entry_id}"))?;
+    Ok(found.is_some())
+}
+
+/// All entries for a feed, newest-published first — scoped to `did`'s
+/// subscriptions. Returns an empty vec if `did` does not subscribe to the feed.
+pub async fn entries_for_feed(pool: &SqlitePool, did: &str, feed_id: i64) -> Result<Vec<Entry>> {
+    let entries = sqlx::query_as::<_, Entry>(
+        r#"
+        SELECT e.* FROM entries e
+        WHERE e.feed_id = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
+        ORDER BY e.published DESC, e.id DESC
+        "#,
+    )
+    .bind(did)
     .bind(feed_id)
     .fetch_all(pool)
     .await
@@ -417,11 +487,22 @@ pub async fn entries_for_feed(pool: &SqlitePool, feed_id: i64) -> Result<Vec<Ent
 
 /// Mark a single entry read/unread for a DID, upserting the per-DID state row
 /// and stamping `updated_at`. Preserves any existing `starred` bit.
-pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) -> Result<()> {
-    sqlx::query(
+///
+/// AUTHORIZED per-DID: the upsert only touches an entry the caller subscribes
+/// to (`sub_ref`). Returns `true` if a row was written, `false` if `did` does
+/// not subscribe to the entry's feed (the web layer maps that to a 404 —
+/// a non-subscriber can never mutate another user's state).
+pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) -> Result<bool> {
+    let res = sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-        VALUES (?1, ?2, ?3, 0, ?4)
+        SELECT ?1, e.id, ?3, 0, ?4
+        FROM entries e
+        WHERE e.id = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
         ON CONFLICT (did, entry_id) DO UPDATE SET
             read       = excluded.read,
             updated_at = excluded.updated_at
@@ -434,20 +515,30 @@ pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) 
     .execute(pool)
     .await
     .with_context(|| format!("mark_read failed for {did}/{entry_id}"))?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 /// Star/unstar a single entry for a DID (upsert, preserving `read`).
+///
+/// AUTHORIZED per-DID like [`mark_read`]: only touches an entry the caller
+/// subscribes to. Returns `true` if a row was written, `false` if `did` does
+/// not subscribe (→ 404 at the web layer).
 pub async fn mark_starred(
     pool: &SqlitePool,
     did: &str,
     entry_id: i64,
     starred: bool,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let res = sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-        VALUES (?1, ?2, 0, ?3, ?4)
+        SELECT ?1, e.id, 0, ?3, ?4
+        FROM entries e
+        WHERE e.id = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
         ON CONFLICT (did, entry_id) DO UPDATE SET
             starred    = excluded.starred,
             updated_at = excluded.updated_at
@@ -460,7 +551,7 @@ pub async fn mark_starred(
     .execute(pool)
     .await
     .with_context(|| format!("mark_starred failed for {did}/{entry_id}"))?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 /// Mark every entry of a feed read (or unread) for a DID in one statement —
@@ -470,7 +561,12 @@ pub async fn mark_feed_read(pool: &SqlitePool, did: &str, feed_id: i64, read: bo
     let res = sqlx::query(
         r#"
         INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-        SELECT ?1, e.id, ?2, 0, ?3 FROM entries e WHERE e.feed_id = ?4
+        SELECT ?1, e.id, ?2, 0, ?3 FROM entries e
+        WHERE e.feed_id = ?4
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
         ON CONFLICT (did, entry_id) DO UPDATE SET
             read       = excluded.read,
             updated_at = excluded.updated_at
@@ -496,6 +592,10 @@ pub async fn get_unread_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Entr
         FROM entries e
         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
         WHERE COALESCE(s.read, 0) = 0
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
         ORDER BY e.published DESC, e.id DESC
         "#,
     )
@@ -514,6 +614,10 @@ pub async fn get_starred_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Ent
         FROM entries e
         JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
         WHERE s.starred = 1
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+          )
         ORDER BY e.published DESC, e.id DESC
         "#,
     )
@@ -939,8 +1043,13 @@ mod tests {
         .await?;
         assert_eq!(n, 2);
 
+        // The reader must subscribe to the feed for the scoped reads to return
+        // its entries (per-DID isolation projection).
+        let did = "did:plc:abc123";
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
         // Read entries back (newest-published first).
-        let entries = entries_for_feed(&pool, feed_id).await?;
+        let entries = entries_for_feed(&pool, did, feed_id).await?;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].guid, "guid-2");
         assert_eq!(entries[1].guid, "guid-1");
@@ -958,10 +1067,9 @@ mod tests {
         )
         .await?;
         assert_eq!(n2, 1);
-        assert_eq!(entries_for_feed(&pool, feed_id).await?.len(), 2);
+        assert_eq!(entries_for_feed(&pool, did, feed_id).await?.len(), 2);
 
         // --- per-DID read state ---
-        let did = "did:plc:abc123";
         let e1 = entries.iter().find(|e| e.guid == "guid-1").unwrap().id;
 
         // Both entries start unread.
@@ -1011,6 +1119,128 @@ mod tests {
         // After a flush, clearing dirty removes it from the flusher's view.
         clear_cursor_dirty(&pool, did, "https://example.com/feed.xml").await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-DID isolation: the shared cache is one row per URL, but the READ
+    // SURFACE (entries/unread/starred) and the read/star MUTATIONS are scoped
+    // to the caller's own subscriptions (`sub_ref`). User A must never see or
+    // mutate user B's entries.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn per_did_isolation_scopes_reads_and_mutations() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        // Two feeds in the SHARED cache; A subscribes to feed_a, B to feed_b.
+        let feed_a = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://a.example/feed.xml".to_string(),
+                title: Some("A".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let feed_b = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://b.example/feed.xml".to_string(),
+                title: Some("B".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        insert_entries(
+            &pool,
+            feed_a,
+            &[NewEntry {
+                guid: "a-1".to_string(),
+                url: Some("https://a.example/1".to_string()),
+                title: Some("A one".to_string()),
+                published: Some("2026-07-10T00:00:00Z".to_string()),
+                content_html: Some("<p>secret A body</p>".to_string()),
+                ..Default::default()
+            }],
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_b,
+            &[NewEntry {
+                guid: "b-1".to_string(),
+                url: Some("https://b.example/1".to_string()),
+                title: Some("B one".to_string()),
+                published: Some("2026-07-11T00:00:00Z".to_string()),
+                content_html: Some("<p>secret B body</p>".to_string()),
+                ..Default::default()
+            }],
+        )
+        .await?;
+
+        let did_a = "did:plc:aaaa";
+        let did_b = "did:plc:bbbb";
+        replace_sub_refs(&pool, did_a, &[feed_a]).await?;
+        replace_sub_refs(&pool, did_b, &[feed_b]).await?;
+
+        // The id of B's only entry (the one A must not be able to touch).
+        let b_entry_id = entries_for_feed(&pool, did_b, feed_b).await?[0].id;
+
+        // --- entries_for_feed is scoped: A sees A's feed, not B's ------------
+        assert_eq!(entries_for_feed(&pool, did_a, feed_a).await?.len(), 1);
+        assert!(
+            entries_for_feed(&pool, did_a, feed_b).await?.is_empty(),
+            "A must not read entries of a feed it does not subscribe to"
+        );
+
+        // --- unread list is scoped -------------------------------------------
+        let unread_a = get_unread_for_did(&pool, did_a).await?;
+        assert_eq!(unread_a.len(), 1);
+        assert_eq!(unread_a[0].guid, "a-1");
+        let unread_b = get_unread_for_did(&pool, did_b).await?;
+        assert_eq!(unread_b.len(), 1);
+        assert_eq!(unread_b[0].guid, "b-1");
+
+        // --- did_subscribes_to_entry authorizes correctly --------------------
+        assert!(did_subscribes_to_entry(&pool, did_b, b_entry_id).await?);
+        assert!(
+            !did_subscribes_to_entry(&pool, did_a, b_entry_id).await?,
+            "A does not subscribe to B's feed"
+        );
+
+        // --- mark_read is authorized: A CANNOT mark B's entry ----------------
+        assert!(
+            !mark_read(&pool, did_a, b_entry_id, true).await?,
+            "non-subscriber mark_read must be a no-op (→ 404), never a mutation"
+        );
+        // B's unread list is untouched by A's attempt.
+        assert_eq!(get_unread_for_did(&pool, did_b).await?.len(), 1);
+        // A subscriber CAN mark it.
+        assert!(mark_read(&pool, did_b, b_entry_id, true).await?);
+        assert_eq!(get_unread_for_did(&pool, did_b).await?.len(), 0);
+
+        // --- toggle_star is authorized the same way --------------------------
+        assert!(
+            !mark_starred(&pool, did_a, b_entry_id, true).await?,
+            "non-subscriber mark_starred must be a no-op (→ 404)"
+        );
+        assert!(
+            get_starred_for_did(&pool, did_a).await?.is_empty(),
+            "A's starred list stays empty after the rejected attempt"
+        );
+        assert!(mark_starred(&pool, did_b, b_entry_id, true).await?);
+        assert_eq!(get_starred_for_did(&pool, did_b).await?.len(), 1);
+        // B's star never leaks into A's starred list.
+        assert!(get_starred_for_did(&pool, did_a).await?.is_empty());
+
+        // --- resync drops a feed from the surface when the sub goes away ------
+        replace_sub_refs(&pool, did_b, &[]).await?;
+        assert!(get_unread_for_did(&pool, did_b).await?.is_empty());
+        assert!(get_starred_for_did(&pool, did_b).await?.is_empty());
+        assert!(entries_for_feed(&pool, did_b, feed_b).await?.is_empty());
 
         Ok(())
     }
