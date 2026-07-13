@@ -1,0 +1,45 @@
+# --- VCS / CI internals ---------------------------------------------------
+.git
+.gitignore
+.githooks
+.github
+
+# --- Rust build output (rebuilt inside the image) -------------------------
+target
+**/target
+
+# --- Node build output + deps (rebuilt inside the image) ------------------
+oauth-sidecar/node_modules
+oauth-sidecar/dist
+oauth-sidecar/dist-test
+
+# --- Test-only sources (not copied into any image stage) ------------------
+oauth-sidecar/test
+oauth-sidecar/tsconfig.test.json
+
+# --- Secrets / env: NEVER copy these into a layer -------------------------
+*.env
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+secrets
+**/secrets
+*.pem
+*.key
+
+# --- Local runtime state (SQLite DBs + the sidecar signing JWK) -----------
+*.db
+*.db-wal
+*.db-shm
+*.jwk.json
+
+# --- Docs / design / editor cruft -----------------------------------------
+design
+deploy/teardown.*
+**/*.md
+!README.md
+.DS_Store
+**/.DS_Store
+

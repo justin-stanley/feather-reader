@@ -1,0 +1,100 @@
+# fly.toml — FeatherReader (feather-reader.com)
+#
+# Single always-on machine. The background feed poller + read-state flusher
+# (src/scheduler.rs) run in-process and cannot scale to zero, so the machine is
+# pinned running. Cloudflare (Full-strict) fronts Fly; Fly still forces HTTPS.
+#
+# One 1GB volume at /data holds ALL persistent state:
+#   * FEATHERREADER_DB   (/data/featherreader.db)  — the Rust app's SQLite cache
+#   * SIDECAR_DB         (/data/oauth-sidecar.db)  — the OAuth token/session store
+#   * the sidecar signing JWK (/data/oauth-sidecar.db.jwk.json) — persisted BESIDE
+#     the sidecar DB by oauth-sidecar/src/oauth.ts (see deploy/teardown.md).
+# The container entrypoint chowns /data to the app uid on first boot (a fresh Fly
+# volume is root:root), so the non-root app can create these files.
+#
+# DEPLOY BY DIGEST (not by tag). The release workflow publishes signed provenance
+# bound to the image DIGEST; deploying a mutable tag (or :latest) can silently
+# roll prod backward or bypass the attestation. The runbook resolves the tag to a
+# digest, runs `gh attestation verify oci://...@<digest>` (fail-closed), then
+# `fly deploy -i ghcr.io/justin-stanley/feather-reader@<digest>`. See [build] below.
+#
+# REQUIRED SECRETS (set once, NEVER in this file or the image):
+#   fly secrets set \
+#     FEATHERREADER_COOKIE_SECRET="$(openssl rand -base64 48)" \
+#     SIDECAR_INTERNAL_SECRET="$(openssl rand -base64 48)" \
+#     SIDECAR_ENC_KEY="$(openssl rand -base64 32)" \
+#     FEATHERREADER_PUBLIC_URL="https://feather-reader.com" \
+#     SIDECAR_PUBLIC_URL="https://feather-reader.com/oauth" \
+#     SIDECAR_APP_CALLBACK_URL="https://feather-reader.com/oauth/callback" \
+#     FEATHERREADER_ALLOWED_DIDS="did:plc:..."
+# SIDECAR_PUBLIC_URL is the BROWSER-facing value (client_id/redirect_uri). The
+# server-to-server SIDECAR_INTERNAL_URL is a NON-secret loopback value baked into
+# the image + set in [env] below, so /internal/* calls never egress the edge.
+# config.rs::validate_secrets() and the sidecar config FAIL LOUD at boot if the
+# cookie / internal / enc secrets are missing or weak on this (public) instance.
+
+app = "featherreader"
+primary_region = "sea"
+
+[build]
+  # Image is built + pushed by .github/workflows/release-image.yml to GHCR with
+  # SLSA build-provenance (and optional SBOM) attestations bound to the DIGEST.
+  # This tag is a convenience default ONLY; production deploys resolve to and
+  # deploy the immutable DIGEST after `gh attestation verify` (see header + the
+  # deploy runbook). GHCR package visibility must be public OR Fly must hold GHCR
+  # pull creds (see MANUAL STEPS) or the pull will fail.
+  image = "ghcr.io/justin-stanley/feather-reader:latest"
+
+[env]
+  # Non-secret runtime wiring. In-container ports: Caddy 8080 (public), Rust app
+  # 127.0.0.1:8082, sidecar 127.0.0.1:8081.
+  FEATHERREADER_BIND = "127.0.0.1:8082"
+  FEATHERREADER_DB = "/data/featherreader.db"
+  FEATHERREADER_ENV = "prod"
+  # Cloudflare fronts Fly, so the real client IP is CF-Connecting-IP. This is
+  # authoritative ONLY if the origin is locked to Cloudflare (see Caddyfile note
+  # + MANUAL STEP: CF-only origin allowlist).
+  FEATHERREADER_TRUSTED_IP_HEADER = "cf-connecting-ip"
+  # Keep the poller from filling a 1GB volume: pause new fetches below the volume
+  # size (see the startup watermark-vs-disk check in src/main.rs).
+  FEATHERREADER_DB_SIZE_WATERMARK_BYTES = "805306368"  # 768 MiB (< 1GB volume)
+  SIDECAR_HOST = "127.0.0.1"
+  SIDECAR_PORT = "8081"
+  # Loopback base the Rust app uses for the sidecar's /internal/* API. DISTINCT
+  # from the (secret) browser-facing SIDECAR_PUBLIC_URL; keeps server-to-server
+  # calls inside the container.
+  SIDECAR_INTERNAL_URL = "http://127.0.0.1:8081"
+  SIDECAR_DB = "/data/oauth-sidecar.db"
+  RUST_LOG = "info"
+
+[[mounts]]
+  source = "featherreader_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080          # Caddy — the only off-loopback listener
+  force_https = true
+  auto_stop_machines = "off"    # the poller cannot scale to zero
+  auto_start_machines = false
+  min_machines_running = 1      # always exactly one machine
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  # Liveness: the Rust app's /health returns `200 ok featherreader/<ver>`,
+  # reached through Caddy (so this also proves the edge + app path is up).
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1
+

@@ -1,0 +1,112 @@
+# FeatherReader — in-container Caddy edge.
+#
+# This is the ONLY listener bound off-loopback (it is the Fly internal_port).
+# TLS is terminated by Cloudflare (Full-strict) + Fly's force_https in front, so
+# Caddy itself serves plain HTTP on :8080 with automatic HTTPS turned off.
+#
+# Routing (grounded in the source):
+#   * The sidecar's PUBLIC OAuth endpoints live at its ROOT (/login, /callback,
+#     /client-metadata.json, /jwks.json). In prod SIDECAR_PUBLIC_URL is
+#     https://feather-reader.com/oauth, so client_id/redirect_uri are under
+#     /oauth/* — Caddy proxies /oauth/* to the sidecar with the /oauth prefix
+#     STRIPPED.
+#   * The Rust app owns everything else (the htmx UI, /health, /static/*, and its
+#     OWN post-login callback route /oauth/callback).
+#   * COLLISION: both the sidecar's atproto redirect_uri and the Rust app's
+#     callback are the literal path /oauth/callback. They are disambiguated by
+#     query param (grounded in oauth-sidecar/src/server.ts):
+#       - PDS  -> SIDECAR (/callback):  code=&state=  (success)  OR  error=&state=
+#         (user denied / OAuth error). NEITHER carries session_id or
+#         error_description. This MUST reach the sidecar — only it holds the
+#         per-request PKCE/state row and can call oauthClient.callback().
+#       - SIDECAR -> RUST APP:  ?session_id=<id>  on success (server.ts:196), or
+#         ?error=OAuthCallbackFailed&error_description=<msg>  on the sidecar's own
+#         failure hand-off (server.ts:200-204). Both are app-bound.
+#     So we route /oauth/callback to the APP when it carries `session_id` OR
+#     `error_description` (the sidecar->app hop markers), and let everything else
+#     under /oauth/callback (crucially the PDS's `?error=&state=` deny path) fall
+#     through to the sidecar. Handled BEFORE the generic /oauth/* rule.
+#   * /internal/* is the sidecar's shared-secret server-to-server API and MUST
+#     NOT be publicly reachable. In this topology the Rust app reaches it over
+#     loopback (SIDECAR_INTERNAL_URL=http://127.0.0.1:8081), so it never needs to
+#     be edge-routable. We block BOTH the bare /internal/* AND the prefixed
+#     /oauth/internal/* (which would otherwise fall through handle_path /oauth/*
+#     and reach the sidecar's /internal/* after prefix strip). Combined with the
+#     sidecar binding loopback-only and its own X-Internal-Secret guard, the
+#     internal API is genuinely unreachable from outside the container.
+
+{
+	# Cloudflare + Fly terminate TLS; no ACME here.
+	auto_https off
+	# Trust the loopback proxy chain only; the real client IP arrives as a header
+	# that we re-assert below (the Rust app validates it via
+	# FEATHERREADER_TRUSTED_IP_HEADER=cf-connecting-ip).
+	servers {
+		trusted_proxies static private_ranges
+	}
+	admin off
+}
+
+:8080 {
+	log {
+		output stdout
+		format console
+	}
+
+	# --- Hard block: the sidecar's internal API is never edge-routable --------
+	# Matches the bare path AND the /oauth-prefixed path (the latter would else
+	# fall through handle_path /oauth/* -> sidecar /internal/*). This block is
+	# placed FIRST so nothing below can route to it.
+	@internal path /internal /internal/* /oauth/internal /oauth/internal/*
+	handle @internal {
+		respond 404
+	}
+
+	# --- The Rust app's own post-login callback -------------------------------
+	# Must be matched BEFORE the generic /oauth/* -> sidecar rule below. The
+	# sidecar->app hop is the ONLY /oauth/callback that carries session_id (success)
+	# or error_description (the sidecar's own failure hand-off). The PDS->sidecar
+	# hop (?code=&state= or ?error=&state=) has neither and correctly falls through.
+	@app_callback_ok {
+		path /oauth/callback
+		query session_id=*
+	}
+	handle @app_callback_ok {
+		reverse_proxy 127.0.0.1:8082
+	}
+	@app_callback_err {
+		path /oauth/callback
+		query error_description=*
+	}
+	handle @app_callback_err {
+		reverse_proxy 127.0.0.1:8082
+	}
+
+	# --- Sidecar PUBLIC OAuth endpoints: /oauth/* -> :8081 (prefix stripped) ---
+	# e.g. /oauth/client-metadata.json -> /client-metadata.json,
+	#      /oauth/callback?code=... (PDS success) -> /callback,
+	#      /oauth/callback?error=access_denied&state=... (PDS deny) -> /callback,
+	#      /oauth/login, /oauth/jwks.json, etc.
+	handle_path /oauth/* {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# --- Everything else: the Rust featherreader app --------------------------
+	# The UI, /health, and /static/* all live here.
+	#
+	# CLIENT-IP TRUST MODEL (important): the app reads the real visitor IP from
+	# Cf-Connecting-Ip (FEATHERREADER_TRUSTED_IP_HEADER). Cloudflare sets that
+	# header to the true visitor and STRIPS any client-supplied copy — so the
+	# header is authoritative ONLY when every request provably transits CF. We do
+	# NOT overwrite it here (that would replace the real visitor IP with the CF
+	# edge IP and defeat the whole point). The required backstop is network-level:
+	# the Fly app MUST be reachable ONLY via Cloudflare (Fly private networking /
+	# a CF-IP allowlist), so a direct-to-origin request cannot forge the header.
+	# See MANUAL STEP: lock origin to Cloudflare. Per src/web.rs this header only
+	# keys the rate limiter (not auth), so the residual risk if the lockdown lapses
+	# is rate-limit-bucket spoofing, not an auth bypass — but do the lockdown.
+	handle {
+		reverse_proxy 127.0.0.1:8082
+	}
+}
+
