@@ -141,6 +141,6 @@ jobs:
       # Config: .gitleaks.toml at the repo root. The OSS action needs no license
       # key (the paid license input only unlocks org-level features).
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITLEAKS_CONFIG: .gitleaks.toml
