@@ -101,9 +101,9 @@ pub struct Subscription {
     ///
     /// For a **private** subscription ([`private`] `== Some(true)`) this is NOT
     /// the real secret-bearing feed URL — that is withheld (see the type-level
-    /// docs). Instead it carries the feed's **public publication origin** (scheme
-    /// + host, or the feed's `<link>` site URL) so the record is still a usable,
-    /// human-recognisable pointer without leaking the secret.
+    /// docs). Instead it carries the feed's **public publication origin**
+    /// (scheme and host, or the feed's `<link>` site URL) so the record is still
+    /// a usable and human-recognisable pointer without leaking the secret.
     pub url: String,
 
     /// Display title; a reader MAY override from feed metadata.

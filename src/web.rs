@@ -1569,6 +1569,47 @@ async fn mark_all_read(
 // Subscribe by URL
 // ---------------------------------------------------------------------------
 
+/// The warning shown after a *private* feed is added — its secret URL is kept
+/// device-local and deliberately NOT mirrored to the (public) PDS.
+///
+/// Rendered through the existing `.flash` notice block (CSP-safe, no inline
+/// styles). Kept as a constant so the add-feed and OPML-import paths surface the
+/// identical message and the boot-smoke can assert on it.
+const PRIVATE_FEED_WARNING: &str = "This looks like a private feed. Its secret URL \
+    stays on this device only and will not sync to your PDS (which is public) — it \
+    won't appear on your other devices or in other readers. If you added a private \
+    feed before, regenerate its private URL (the network retains public records).";
+
+/// Decide the privacy of a feed being added, combining automatic detection with
+/// an explicit user override.
+///
+/// * `url` — the resolved feed URL (may carry a secret token/key/auth).
+/// * `manual_private` — the "keep this feed private" checkbox on the add form;
+///   lets a user force local-only even when detection missed the secret.
+///
+/// Returns a [`FeedPrivacy`]: `Private` (with a reason) if *either* the URL was
+/// detected as secret-bearing *or* the user ticked the box, else `Public`. This
+/// is the single decision point shared by `POST /subscriptions` and the OPML
+/// import so both keep secrets off the PDS identically.
+fn decide_feed_privacy(url: &str, manual_private: bool) -> feed::FeedPrivacy {
+    match feed::classify_feed_privacy(url) {
+        p @ feed::FeedPrivacy::Private(_) => p,
+        feed::FeedPrivacy::Public if manual_private => {
+            feed::FeedPrivacy::Private("marked private by user".to_string())
+        }
+        public => public,
+    }
+}
+
+/// Parse the value an HTML checkbox submits (`on`, `true`, `1`, `yes`) into a
+/// bool. An unchecked box submits no field at all (so `None`/absent ⇒ `false`).
+fn checkbox_on(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("on" | "true" | "1" | "yes")
+    )
+}
+
 /// Form body for `POST /subscriptions`.
 #[derive(Debug, Deserialize)]
 struct SubscribeForm {
@@ -1576,6 +1617,10 @@ struct SubscribeForm {
     /// Optional folder `at://` URI to file the new feed under.
     #[serde(default)]
     folder: Option<String>,
+    /// The "keep this feed private (local-only)" checkbox. An unchecked box
+    /// submits nothing, so this is `None` unless the user opted in.
+    #[serde(default)]
+    private: Option<String>,
 }
 
 /// `POST /subscriptions` — subscribe by URL.
@@ -1606,10 +1651,22 @@ async fn add_subscription(
         }
     };
 
+    // Classify the feed's privacy (detection + the manual override checkbox). A
+    // private feed's secret URL is kept device-local; the PDS record is redacted.
+    let manual_private = checkbox_on(form.private.as_deref());
+    let privacy = decide_feed_privacy(&feed_url, manual_private);
+    let is_private = privacy.is_private();
+    if let feed::FeedPrivacy::Private(reason) = &privacy {
+        info!(feed = %feed_url, %reason, %did, "feed classified private — secret kept local-only");
+    }
+
+    // Persist locally with the private flag set. `upsert_feed` ORs the flag, so a
+    // private feed can never be silently downgraded by the (unaware) poller.
     store::upsert_feed(
         pool,
         &store::NewFeed {
             url: feed_url.clone(),
+            private: is_private,
             ..Default::default()
         },
     )
@@ -1634,13 +1691,27 @@ async fn add_subscription(
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
 
-    match state.sidecar.add_subscription(&did, &sub).await {
-        Ok(rkey) => info!(feed = %feed_url, %rkey, %did, "wrote subscription record to PDS"),
+    // Route through the classified seam: a private feed writes a REDACTED record
+    // (secret withheld); a public feed writes verbatim as before.
+    match state
+        .sidecar
+        .add_subscription_classified(&did, &sub, &privacy)
+        .await
+    {
+        Ok(rkey) => {
+            info!(feed = %feed_url, %rkey, %did, private = is_private, "wrote subscription record to PDS")
+        }
         Err(err) => {
             warn!(%err, feed = %feed_url, %did, "PDS subscription write failed (cached locally)")
         }
     }
 
+    // A detected/marked-private feed gets a clear notice (device-local stopgap).
+    if is_private {
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_WARNING))).into_response(),
+        );
+    }
     Ok(Redirect::to("/").into_response())
 }
 
@@ -2323,9 +2394,21 @@ async fn import_opml(
         }
     }
 
-    // Build one subscription record per feed + upsert the local cache row.
+    // Build one subscription record per feed + upsert the local cache row. Each
+    // imported feed is classified for privacy: a private (secret-bearing) feed is
+    // stored local-only and its PDS record is REDACTED via the same choke point
+    // the single-add path uses, so an OPML import can't leak a Substack/Patreon
+    // token onto the public network either.
     let mut subs = Vec::with_capacity(feeds.len());
+    let mut private_count = 0usize;
     for f in &feeds {
+        let privacy = feed::classify_feed_privacy(&f.feed_url);
+        let is_private = privacy.is_private();
+        if let feed::FeedPrivacy::Private(reason) = &privacy {
+            private_count += 1;
+            info!(feed = %f.feed_url, %reason, %did, "OPML feed classified private — secret kept local-only");
+        }
+
         let mut sub = Subscription::new(f.feed_url.clone(), now.clone());
         sub.title = f.title.clone();
         sub.site_url = f.site_url.clone();
@@ -2333,13 +2416,17 @@ async fn import_opml(
             .folder
             .as_ref()
             .and_then(|name| folder_uris.get(name).cloned());
-        subs.push(sub);
+        // Redact the record BEFORE it enters the batch — a private feed's secret
+        // URL/siteUrl is reduced to the public origin and `private: true` set.
+        subs.push(crate::atproto::build_subscription_record(&sub, is_private));
+
         let _ = store::upsert_feed(
             pool,
             &store::NewFeed {
                 url: f.feed_url.clone(),
                 title: f.title.clone(),
                 site_url: f.site_url.clone(),
+                private: is_private,
                 ..Default::default()
             },
         )
@@ -2348,16 +2435,19 @@ async fn import_opml(
 
     match state.sidecar.add_subscriptions_bulk(&did, &subs).await {
         Ok(rkeys) => {
-            info!(%did, count = rkeys.len(), "imported OPML subscriptions to PDS (batched)")
+            info!(%did, count = rkeys.len(), private = private_count, "imported OPML subscriptions to PDS (batched)")
         }
         Err(err) => warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)"),
     }
 
-    Ok(Redirect::to(&format!(
-        "/?flash={}",
-        qenc(&format!("Imported {} feeds", subs.len()))
-    ))
-    .into_response())
+    // Surface the count, plus the private-feed notice when any secret-bearing
+    // feed was kept local-only (device-local stopgap).
+    let mut flash = format!("Imported {} feeds", subs.len());
+    if private_count > 0 {
+        flash.push_str(". ");
+        flash.push_str(PRIVATE_FEED_WARNING);
+    }
+    Ok(Redirect::to(&format!("/?flash={}", qenc(&flash))).into_response())
 }
 
 /// `GET /opml/export` — export the user's subscriptions + folders as OPML.
@@ -2836,6 +2926,112 @@ mod tests {
         );
         // Unreserved chars pass through untouched.
         assert_eq!(qenc("A-Za-z0-9-_.~"), "A-Za-z0-9-_.~");
+    }
+
+    // -- private-feed handling (add + OPML import seam) ------------------------
+
+    #[test]
+    fn checkbox_on_parses_html_checkbox_values() {
+        assert!(checkbox_on(Some("on")));
+        assert!(checkbox_on(Some("On")));
+        assert!(checkbox_on(Some("true")));
+        assert!(checkbox_on(Some("1")));
+        assert!(checkbox_on(Some("yes")));
+        // Absent (unchecked box submits nothing) or empty ⇒ not private.
+        assert!(!checkbox_on(None));
+        assert!(!checkbox_on(Some("")));
+        assert!(!checkbox_on(Some("off")));
+        assert!(!checkbox_on(Some("false")));
+    }
+
+    #[test]
+    fn decide_feed_privacy_detects_and_honors_override() {
+        // Detected private regardless of the checkbox.
+        assert!(decide_feed_privacy(
+            "https://author.substack.com/feed/private/deadbeefcafe123456token",
+            false,
+        )
+        .is_private());
+        // Public URL + manual override ⇒ private (detection missed it).
+        assert!(decide_feed_privacy("https://example.com/feed.xml", true).is_private());
+        // Public URL + no override ⇒ public.
+        assert!(!decide_feed_privacy("https://example.com/feed.xml", false).is_private());
+    }
+
+    /// The core guarantee: for a detected-private feed the record that would be
+    /// written to the PDS carries NO secret (the token is stripped, `private:
+    /// true` is set), while a public feed's record is written verbatim. This
+    /// exercises the exact seam both the add-feed and OPML paths route through.
+    #[test]
+    fn private_feed_pds_record_carries_no_secret() {
+        let secret_token = "deadbeefcafe123456token";
+        let secret_url = format!("https://author.substack.com/feed/private/{secret_token}");
+
+        // Add-feed / OPML decision → Private.
+        let privacy = decide_feed_privacy(&secret_url, false);
+        assert!(privacy.is_private());
+
+        // The redacted record the sidecar would receive.
+        let mut sub = Subscription::new(secret_url.clone(), now_rfc3339());
+        sub.title = Some("Paid Author".to_string());
+        let record = crate::atproto::build_subscription_record(&sub, privacy.is_private());
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains(secret_token),
+            "the secret token must never reach the PDS record: {json}"
+        );
+        assert!(!record.url.contains(secret_token));
+        assert!(record
+            .site_url
+            .as_deref()
+            .map(|s| !s.contains(secret_token))
+            .unwrap_or(true));
+        assert_eq!(record.private, Some(true));
+
+        // A public feed is written verbatim (no redaction, no private marker).
+        let pub_url = "https://example.com/feed.xml";
+        let pub_privacy = decide_feed_privacy(pub_url, false);
+        assert!(!pub_privacy.is_private());
+        let pub_sub = Subscription::new(pub_url.to_string(), now_rfc3339());
+        let pub_record =
+            crate::atproto::build_subscription_record(&pub_sub, pub_privacy.is_private());
+        assert_eq!(pub_record.url, pub_url);
+        assert_eq!(pub_record.private, None);
+    }
+
+    #[tokio::test]
+    async fn add_private_feed_stores_local_flag_private() {
+        // The add path marks the local row private; the poller (which upserts with
+        // private=false) can never clobber it back to public.
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let secret_url = "https://author.substack.com/feed/private/deadbeefcafe123456token";
+        let privacy = decide_feed_privacy(secret_url, false);
+        store::upsert_feed(
+            &db,
+            &store::NewFeed {
+                url: secret_url.to_string(),
+                private: privacy.is_private(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(store::is_feed_private(&db, secret_url).await.unwrap());
+
+        // A normal public feed stays public.
+        let pub_url = "https://example.com/feed.xml";
+        store::upsert_feed(
+            &db,
+            &store::NewFeed {
+                url: pub_url.to_string(),
+                private: decide_feed_privacy(pub_url, false).is_private(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!store::is_feed_private(&db, pub_url).await.unwrap());
     }
 
     #[test]
