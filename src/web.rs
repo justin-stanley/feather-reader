@@ -297,9 +297,14 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
     }
     match path {
         "/login" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all" | "/admin/invites"
-        | "/account/delete" => true,
-        // /entries/{id}/read and /entries/{id}/star — the star/mark-read taps.
-        p => p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")),
+        | "/account/delete" | "/folders" => true,
+        // Every per-record subscription/folder mutation (delete/rename) and the
+        // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
+        p => {
+            (p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")))
+                || p.starts_with("/subscriptions/")
+                || p.starts_with("/folders/")
+        }
     }
 }
 
@@ -428,9 +433,25 @@ async fn rate_limit(
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
         let ip = client_ip(req.headers(), conn.as_ref(), rl.trusted_header.as_deref());
-        if let Some(ip) = ip {
-            if !rl.limiter.check(ip) {
-                warn!(%ip, %path, "rate limit exceeded");
+        match ip {
+            Some(ip) => {
+                if !rl.limiter.check(ip) {
+                    warn!(%ip, %path, "rate limit exceeded");
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "1")],
+                        "rate limit exceeded\n",
+                    )
+                        .into_response();
+                }
+            }
+            // Fail CLOSED: a rate-limited path we can't attribute to any client IP
+            // is refused rather than bypassing the limiter. In the deployed
+            // topology `ConnectInfo` always yields the socket peer, so this only
+            // fires on a genuinely unattributable request (e.g. a misconfigured
+            // trusted header with no peer info).
+            None => {
+                warn!(%path, "rate-limited path with no derivable client IP; refusing");
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     [(header::RETRY_AFTER, "1")],
@@ -1717,10 +1738,12 @@ async fn mark_all_read(
         return Ok(Redirect::to(&format!("/?feed={}", qenc(feed_url))).into_response());
     }
 
-    // Global: mark every currently-unread entry read.
-    let unread = store::get_unread_for_did(pool, &did).await?;
-    for e in &unread {
-        store::mark_read(pool, &did, e.id, true).await?;
+    // Global: mark every subscribed feed read. Fan out over the DID's feeds
+    // (bounded by the per-DID subscription cap) using the batched per-feed path,
+    // rather than one UPDATE round-trip per unread entry (unbounded) — same end
+    // state, but O(feeds) statements instead of O(unread entries).
+    for feed_id in store::subscribed_feed_ids(pool, &did).await? {
+        store::mark_feed_read(pool, &did, feed_id, true).await?;
     }
     Ok(Redirect::to("/").into_response())
 }
@@ -2942,11 +2965,26 @@ mod cookie {
         verify_value(headers, SESSION_COOKIE, secret)
     }
 
+    /// The HMAC message binding the cookie NAME to its value (`name || 0x00 ||
+    /// value`), so a signature minted for one cookie can't verify under another —
+    /// e.g. a value validly signed as `fr_invite` is not accepted as `fr_session`.
+    /// The NUL separator can't appear in a cookie name, so the encoding is
+    /// unambiguous.
+    fn cookie_hmac_msg(name: &str, value: &str) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(name.len() + 1 + value.len());
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(value.as_bytes());
+        msg
+    }
+
     /// Sign an arbitrary string `value` into a `Set-Cookie` header for `name`,
-    /// HMAC-SHA256 over the value: `name=<b64url(value)>.<sig>`. The generic form
-    /// behind both the session cookie and the short-lived invite cookie.
+    /// HMAC-SHA256 over `name || 0x00 || value`: `name=<b64url(value)>.<sig>`. The
+    /// generic form behind both the session cookie and the short-lived invite
+    /// cookie; domain-separating by name keeps a signature valid only for the
+    /// cookie it was minted for.
     pub fn sign_value(name: &str, value: &str, secret: &str, max_age_secs: i64) -> String {
-        let sig = hmac_sha256_hex(secret.as_bytes(), value.as_bytes());
+        let sig = hmac_sha256_hex(secret.as_bytes(), &cookie_hmac_msg(name, value));
         let b64 = b64url_encode(value.as_bytes());
         format!(
             "{name}={b64}.{sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_secs}"
@@ -2954,13 +2992,13 @@ mod cookie {
     }
 
     /// Verify + read a value out of the named signed cookie (`None` on absent /
-    /// tampered / forged). The generic form behind both cookie readers.
+    /// tampered / forged / cross-cookie). The generic form behind both readers.
     pub fn verify_value(headers: &HeaderMap, name: &str, secret: &str) -> Option<String> {
         let raw = cookie_value(headers, name)?;
         let (b64, sig) = raw.split_once('.')?;
         let bytes = b64url_decode(b64)?;
         let value = String::from_utf8(bytes).ok()?;
-        let expected = hmac_sha256_hex(secret.as_bytes(), value.as_bytes());
+        let expected = hmac_sha256_hex(secret.as_bytes(), &cookie_hmac_msg(name, &value));
         if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
             Some(value)
         } else {
