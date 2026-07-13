@@ -17,10 +17,10 @@ name: CodeQL
 #
 # ── LANGUAGES ─────────────────────────────────────────────────────────────────
 #   * javascript-typescript — the OAuth sidecar (oauth-sidecar/).
-#   * rust — the axum server. CodeQL Rust support is in public beta; if the Rust
-#     pack is unavailable on the runner the matrix leg will fail loudly rather
-#     than silently skip. If that happens, drop the `rust` matrix entry until
-#     GitHub GA's the Rust pack (tracking: github/codeql "Rust" support).
+#   * rust — DROPPED: CodeQL's Rust extractor (public beta) errored on ALL source
+#     files here (0 extracted OK / 11 with errors), producing no usable analysis.
+#     Rust is covered by clippy (-D warnings) + cargo-deny + cargo-audit. Re-add
+#     the `rust` matrix entry once GitHub GA's a working Rust pack.
 
 on:
   push:
@@ -36,6 +36,9 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # Code scanning needs GitHub Advanced Security on a PRIVATE repo, so the SARIF
+    # upload fails while private. Skip until the repo is public (free + enabled then).
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-latest  # GitHub-hosted: free once public; see header note
     permissions:
       actions: read
@@ -44,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript, rust]
+        language: [javascript-typescript]  # rust dropped — see header (extractor beta errors on all files)
     steps:
       - uses: actions/checkout@v7
 
