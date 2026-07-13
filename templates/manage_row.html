@@ -13,9 +13,9 @@
         {% if !folder_options.is_empty() %}
           <label class="visually-hidden" for="folder-{{ feed.rkey }}">Folder</label>
           <select class="select" id="folder-{{ feed.rkey }}" name="folder">
-            <option value="">No folder</option>
+            <option value=""{% if feed.folder.is_none() %} selected{% endif %}>No folder</option>
             {% for f in folder_options %}
-              <option value="{{ f.uri }}">{{ f.name }}</option>
+              <option value="{{ f.uri }}"{% if feed.folder.as_deref() == Some(f.uri.as_str()) %} selected{% endif %}>{{ f.name }}</option>
             {% endfor %}
           </select>
         {% endif %}
