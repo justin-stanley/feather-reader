@@ -267,6 +267,18 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     let query_lower = parsed.query().unwrap_or("").to_ascii_lowercase();
     let host_lower = parsed.host_str().unwrap_or("").to_ascii_lowercase();
 
+    // (0) Public-feed allowlist. A handful of large, fully-public feed shapes
+    // carry a high-entropy-looking id in the query that would otherwise trip the
+    // generic entropy heuristic. YouTube channel/playlist RSS
+    // (`youtube.com/feeds/videos.xml?channel_id=UC…` / `?playlist_id=PL…`) is the
+    // canonical way any reader subscribes to a channel — the id is a PUBLIC
+    // handle, not a secret. Allowlist it before the generic checks so we don't
+    // false-block it. (Userinfo / known-provider markers are checked below and
+    // still apply, so this can't be used to smuggle a credential.)
+    if is_public_youtube_feed(&host_lower, &path_lower, &parsed) {
+        return FeedPrivacy::Public;
+    }
+
     // (5) Known-provider precision layer (checked early so its specific reason
     // wins over a generic one). Host substring + optional path/query marker.
     for kp in KNOWN_PROVIDERS {
@@ -301,8 +313,13 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
 
     // (4) High-entropy opaque token segments (an embedded key/token with no
     // telltale name): hex ≥ 16, base64url ≥ 16, or a UUID, in path or query.
+    // The dominant real-world private-podcast shape delivers the token as a
+    // *filename* (`<token>.rss` / `<token>.xml`) or affixed inside a larger
+    // segment (`feed-<uuid>`), so [`segment_hides_secret`] strips a trailing feed
+    // extension AND scans dot/underscore/hyphen-delimited sub-parts, not just the
+    // whole segment.
     for seg in parsed.path().split('/').filter(|s| !s.is_empty()) {
-        if looks_like_embedded_secret(seg) {
+        if segment_hides_secret(seg) {
             return FeedPrivacy::Private("high-entropy token in path".to_string());
         }
     }
@@ -356,10 +373,12 @@ fn looks_like_embedded_secret(s: &str) -> bool {
     if separators >= 3 {
         return false;
     }
-    // Must be plausibly token-charset: base64url alphabet only.
+    // Must be plausibly token-charset: base64url alphabet only. `=` is accepted
+    // as base64 padding (it only ever appears trailing on a real blob, so a
+    // padded base64url token like `…dnc=` still counts).
     let token_chars = s
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '='))
         .count();
     if token_chars < s.chars().count() {
         return false;
@@ -378,6 +397,89 @@ fn looks_like_embedded_secret(s: &str) -> bool {
         seen.insert(c.to_ascii_lowercase());
     }
     seen.len() >= 10
+}
+
+/// Known feed/file extensions a token filename may wear (`<token>.rss`,
+/// `<token>.xml`, …). Stripped before the whole-segment secret test so a
+/// tokened *filename* — the dominant private-podcast URL shape — is still caught.
+const FEED_EXTENSIONS: &[&str] = &["rss", "xml", "atom", "json", "rss20"];
+
+/// Whether a single path segment hides an embedded secret. Beyond the plain
+/// whole-segment [`looks_like_embedded_secret`] test, this also catches the two
+/// real-world shapes that wrap a token so the whole segment is no longer a clean
+/// blob:
+///
+/// 1. **Token-as-filename** — `<token>.rss` / `<token>.xml`: strip a trailing
+///    feed extension and re-test the stem.
+/// 2. **Token affixed inside a larger segment** — `feed-<uuid>`, `<token>.xml`,
+///    `pod_<hex32>`: split on `.`/`_`/`-` and test each sub-part, so a
+///    high-entropy blob delimited by an affix is still found.
+fn segment_hides_secret(seg: &str) -> bool {
+    if looks_like_embedded_secret(seg) {
+        return true;
+    }
+    // (1) Strip a trailing known feed extension and re-test the stem.
+    if let Some((stem, ext)) = seg.rsplit_once('.') {
+        if FEED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+            && looks_like_embedded_secret(stem)
+        {
+            return true;
+        }
+    }
+    // (2) A UUID embedded with an affix (`feed-<uuid>`, `<uuid>-audio`) — the
+    // `-` delimiters inside the UUID mean a naive split can't see it, so scan for
+    // a canonical UUID substring directly.
+    if contains_uuid(seg) {
+        return true;
+    }
+    // (3) Scan `.`/`_`/`-`-delimited sub-parts for a high-entropy blob affixed to
+    // an ordinary word (`pod_<hex32>`, `<hex32>.mp3`). Only fires on multi-part
+    // segments (a single-part segment was already covered by the whole-segment
+    // test above), so a plain `my-normal-post-slug` — whose parts are short
+    // dictionary words — can't trip it.
+    if seg.contains(['.', '_', '-']) {
+        for part in seg.split(['.', '_', '-']).filter(|p| !p.is_empty()) {
+            if looks_like_embedded_secret(part) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `s` contains a canonical 8-4-4-4-12 UUID as a substring (allowing an
+/// affix on either side, e.g. `feed-<uuid>` or `<uuid>-audio`). Slides a 36-char
+/// window over the string and tests each with [`is_uuid`].
+fn contains_uuid(s: &str) -> bool {
+    const UUID_LEN: usize = 36; // 8+4+4+4+12 + 4 hyphens.
+    let bytes = s.as_bytes();
+    if bytes.len() < UUID_LEN {
+        return false;
+    }
+    // ASCII-only window: a UUID is pure ASCII hex/hyphen, so byte indexing is
+    // safe here (a multi-byte char in the window just fails is_uuid).
+    (0..=bytes.len() - UUID_LEN).any(|i| s.get(i..i + UUID_LEN).map(is_uuid).unwrap_or(false))
+}
+
+/// Whether this is a PUBLIC YouTube channel/playlist RSS feed
+/// (`www.youtube.com/feeds/videos.xml?channel_id=UC…` or `?playlist_id=PL…`).
+/// The channel/playlist id is a public handle, not a credential, so these feeds
+/// must NOT be flagged by the generic entropy heuristic. We require the exact
+/// public host + feeds path + one of the two public id keys, so this narrow
+/// allowlist can't be abused to smuggle a `?token=` past classification.
+fn is_public_youtube_feed(host_lower: &str, path_lower: &str, parsed: &Url) -> bool {
+    let host_ok = host_lower == "youtube.com"
+        || host_lower == "www.youtube.com"
+        || host_lower.ends_with(".youtube.com");
+    if !host_ok || !path_lower.starts_with("/feeds/videos.xml") {
+        return false;
+    }
+    // Only the public id keys may appear; a `token`/`auth`/… key means treat it
+    // as a normal (potentially private) URL and let the checks below run.
+    parsed.query_pairs().all(|(k, _)| {
+        let k = k.as_ref().to_ascii_lowercase();
+        k == "channel_id" || k == "playlist_id" || k == "user"
+    })
 }
 
 /// Whether `s` is a canonical 8-4-4-4-12 hyphenated UUID (any hex case).
@@ -1078,6 +1180,80 @@ mod tests {
         .is_private());
     }
 
+    /// The dominant real-world private-podcast shape delivers the token as a
+    /// FILENAME (`<token>.rss` / `<token>.xml`) or affixed inside a larger
+    /// segment (`feed-<uuid>`). Named providers are caught by their host rule;
+    /// these are UNKNOWN-provider CDNs that must still be caught by the generic
+    /// backstop, so the secret is never fetched or stored.
+    #[test]
+    fn classify_privacy_catches_tokened_filenames_on_unknown_hosts() {
+        // hex-32 token as an .xml filename.
+        assert!(classify_feed_privacy(
+            "https://cdn.somepod.io/f/a1b2c3d4e5f60718293a4b5c6d7e8f90.xml"
+        )
+        .is_private());
+        // hex-32 token as a .rss filename on an unknown CDN.
+        assert!(classify_feed_privacy(
+            "https://dcs.megaphone.example/network/a1b2c3d4e5f60718293a4b5c6d7e8f90.rss"
+        )
+        .is_private());
+        // UUID + .xml filename.
+        assert!(classify_feed_privacy(
+            "https://brandnew.example/feed/1f2e3d4c-5b6a-7089-90ab-cdef01234567.xml"
+        )
+        .is_private());
+        // UUID affixed with a prefix (`feed-<uuid>`) — split can't see it, the
+        // UUID-substring scan must.
+        assert!(classify_feed_privacy(
+            "https://x.example/feed-1f2e3d4c-5b6a-7089-90ab-cdef01234567"
+        )
+        .is_private());
+        // UUID + .rss suffix.
+        assert!(classify_feed_privacy(
+            "https://x.example/1f2e3d4c-5b6a-7089-90ab-cdef01234567.rss"
+        )
+        .is_private());
+        // hex-16 token as an .xml filename.
+        assert!(classify_feed_privacy("https://x.example/feed/9f8e7d6c5b4a3928.xml").is_private());
+        // A base64url token with `=` padding as a clean path segment.
+        assert!(
+            classify_feed_privacy("https://cdn.pod.io/f/YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnc=")
+                .is_private()
+        );
+    }
+
+    /// YouTube channel/playlist RSS feeds are FULLY PUBLIC (the id is a public
+    /// handle, not a secret) and are the standard way to subscribe to a channel —
+    /// they must NOT be false-blocked by the generic entropy heuristic.
+    #[test]
+    fn classify_privacy_allows_public_youtube_feeds() {
+        assert_eq!(
+            classify_feed_privacy(
+                "https://www.youtube.com/feeds/videos.xml?channel_id=UC-lHJZR3Gqxm24_Vd_AJ5Yw"
+            ),
+            FeedPrivacy::Public
+        );
+        assert_eq!(
+            classify_feed_privacy(
+                "https://www.youtube.com/feeds/videos.xml?playlist_id=PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"
+            ),
+            FeedPrivacy::Public
+        );
+        // Bare host form too.
+        assert_eq!(
+            classify_feed_privacy(
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-lHJZR3Gqxm24_Vd_AJ5Yw"
+            ),
+            FeedPrivacy::Public
+        );
+        // The allowlist is narrow: a `token=` on the YouTube feeds path still
+        // classifies private (can't smuggle a credential through the allowlist).
+        assert!(classify_feed_privacy(
+            "https://www.youtube.com/feeds/videos.xml?token=Zm9vYmFyc2VjcmV0dG9rZW4"
+        )
+        .is_private());
+    }
+
     #[test]
     fn classify_privacy_leaves_normal_public_feeds_public() {
         // Plain feed documents.
@@ -1126,6 +1302,22 @@ mod tests {
         // An empty credential value is not a secret.
         assert_eq!(
             classify_feed_privacy("https://example.com/feed?token="),
+            FeedPrivacy::Public
+        );
+        // A hyphenated slug ending in a feed extension must NOT be seen as a
+        // tokened filename (the stem is short dictionary words, not a blob).
+        assert_eq!(
+            classify_feed_privacy("https://example.com/my-first-long-blog-post.xml"),
+            FeedPrivacy::Public
+        );
+        // A short hex episode id in an .xml filename (< 16 chars) is not a secret.
+        assert_eq!(
+            classify_feed_privacy("https://example.com/episodes/ab12cd.xml"),
+            FeedPrivacy::Public
+        );
+        // A dotted host-style filename slug stays public.
+        assert_eq!(
+            classify_feed_privacy("https://example.com/category/tech-news/feed.xml"),
             FeedPrivacy::Public
         );
         // Unparseable URL: treated as Public (add path rejects it downstream).
