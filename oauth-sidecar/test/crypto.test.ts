@@ -15,6 +15,21 @@ test('deriveKey: 64-char hex used directly', () => {
   assert.ok(deriveKey(raw).equals(Buffer.from(raw, 'hex')));
 });
 
+test('deriveKey: 32-byte base64url (with url chars) used directly', () => {
+  const key = Buffer.alloc(32, 0xfb); // base64url of 0xFB… contains - and _
+  const raw = key.toString('base64url');
+  assert.ok(raw.includes('-') || raw.includes('_'));
+  assert.ok(deriveKey(raw).equals(key));
+});
+
+test('deriveKey: a human passphrase is hashed, not used as a raw key', () => {
+  // Not canonical hex/base64 of a 32-byte key → treated as a passphrase (hashed
+  // to 32 bytes), never used as raw key bytes.
+  const pass = 'correct horse battery staple pad!';
+  assert.equal(deriveKey(pass).length, 32);
+  assert.ok(!deriveKey(pass).equals(Buffer.from(pass, 'base64')));
+});
+
 test('deriveKey: passphrase is hashed to 32 bytes and is deterministic', () => {
   const a = deriveKey('some-long-passphrase-value');
   const b = deriveKey('some-long-passphrase-value');

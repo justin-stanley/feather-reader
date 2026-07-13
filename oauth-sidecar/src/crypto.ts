@@ -50,26 +50,39 @@ function b64urlDecode(s: string): Buffer {
 }
 
 /**
- * Derive the 32-byte AES key from the raw `SIDECAR_ENC_KEY` value.
- *
- * If the value decodes (base64url/base64/hex) to exactly 32 bytes we use it
- * directly; otherwise we hash it with a domain-separated SHA-256 so any
- * sufficiently-long passphrase yields a valid key. This is deterministic — the
- * same env value always maps to the same key, so restarts and rolling deploys
- * decrypt existing rows.
+ * If `raw` is EXACTLY a 32-byte key encoded as hex or base64/base64url, return
+ * those raw bytes; otherwise `null`. `Buffer.from(_, 'base64')` decodes
+ * leniently (it silently drops invalid chars), so a passphrase that merely
+ * happens to be base64-shaped could decode to 32 bytes — we guard against that
+ * by requiring the decoded bytes to RE-ENCODE back to the input, i.e. it really
+ * was a canonical 32-byte key, not a coincidence.
  */
-export function deriveKey(raw: string): Buffer {
-  // Try base64url / base64.
-  try {
-    const b = Buffer.from(raw, 'base64');
-    if (b.length === KEY_LEN) return b;
-  } catch {
-    /* not base64 */
-  }
-  // Try hex.
+function decodeExactKey(raw: string): Buffer | null {
   if (/^[0-9a-fA-F]{64}$/.test(raw)) {
     return Buffer.from(raw, 'hex');
   }
+  const b = Buffer.from(raw, 'base64');
+  if (b.length !== KEY_LEN) return null;
+  // Round-trip check: accept standard base64 (with or without trailing padding)
+  // and base64url. A lenient-but-non-canonical string fails all three.
+  const std = b.toString('base64');
+  if (raw === std || raw === std.replace(/=+$/, '') || raw === b.toString('base64url')) {
+    return b;
+  }
+  return null;
+}
+
+/**
+ * Derive the 32-byte AES key from the raw `SIDECAR_ENC_KEY` value.
+ *
+ * A value that is EXACTLY a 32-byte key (hex or canonical base64/base64url) is
+ * used directly; anything else is treated as a passphrase and hashed with a
+ * domain-separated SHA-256. Deterministic — the same env value always maps to
+ * the same key, so restarts and rolling deploys decrypt existing rows.
+ */
+export function deriveKey(raw: string): Buffer {
+  const exact = decodeExactKey(raw);
+  if (exact) return exact;
   // Fall back to a domain-separated hash of the passphrase.
   return createHash('sha256').update('featherreader-sidecar-enc:v1:').update(raw, 'utf8').digest();
 }

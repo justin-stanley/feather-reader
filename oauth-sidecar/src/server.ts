@@ -159,11 +159,14 @@ app.get('/login', async (req: FastifyRequest, reply: FastifyReply) => {
     });
     reply.redirect(url.toString());
   } catch (err) {
+    // Keep the library's detail server-side only; return a fixed slug so we don't
+    // reflect internal error strings (which can embed request/token context) to
+    // the browser.
     req.log.error({ err }, 'authorize failed');
     reply.code(400);
     return {
       error: 'AuthorizeFailed',
-      message: err instanceof Error ? err.message : String(err),
+      message: 'could not start login for that handle',
     };
   }
 });
@@ -204,10 +207,13 @@ app.get('/callback', async (req: FastifyRequest, reply: FastifyReply) => {
     );
     reply.redirect(target);
   } catch (err) {
+    // Detail stays in the server log; the user-facing redirect carries a fixed
+    // slug, not the library's raw error string (which can embed token/request
+    // context).
     req.log.error({ err }, 'callback failed');
     const target = withQuery(cfg.appCallbackUrl, {
       error: 'OAuthCallbackFailed',
-      error_description: err instanceof Error ? err.message : String(err),
+      error_description: 'login could not be completed',
     });
     reply.redirect(target);
   }
