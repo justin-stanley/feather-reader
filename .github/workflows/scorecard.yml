@@ -25,6 +25,10 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
+    # Scorecard is only meaningful on a PUBLIC repo (publish + branch-protection
+    # checks). Skip while private so it neither burns Actions minutes nor fails;
+    # it auto-activates at the public flip.
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-latest  # GitHub-hosted; free once public
     permissions:
       security-events: write  # upload SARIF to the Security tab
@@ -36,7 +40,7 @@ jobs:
           persist-credentials: false
 
       - name: Run Scorecard
-        uses: ossf/scorecard-action@v2
+        uses: ossf/scorecard-action@v2.4.3
         with:
           results_file: results.sarif
           results_format: sarif
