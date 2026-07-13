@@ -433,25 +433,14 @@ async fn rate_limit(
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
         let ip = client_ip(req.headers(), conn.as_ref(), rl.trusted_header.as_deref());
-        match ip {
-            Some(ip) => {
-                if !rl.limiter.check(ip) {
-                    warn!(%ip, %path, "rate limit exceeded");
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        [(header::RETRY_AFTER, "1")],
-                        "rate limit exceeded\n",
-                    )
-                        .into_response();
-                }
-            }
-            // Fail CLOSED: a rate-limited path we can't attribute to any client IP
-            // is refused rather than bypassing the limiter. In the deployed
-            // topology `ConnectInfo` always yields the socket peer, so this only
-            // fires on a genuinely unattributable request (e.g. a misconfigured
-            // trusted header with no peer info).
-            None => {
-                warn!(%path, "rate-limited path with no derivable client IP; refusing");
+        // Deliberately fail OPEN when no client IP is derivable (no trusted
+        // header / no socket peer): there is no per-IP key to enforce, and a
+        // blanket 429 would self-DoS every guarded path (incl. /login). This is
+        // safe precisely because we never key on an attacker-forged XFF — see
+        // `rate_limit_ignores_spoofed_xff_rotation`.
+        if let Some(ip) = ip {
+            if !rl.limiter.check(ip) {
+                warn!(%ip, %path, "rate limit exceeded");
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     [(header::RETRY_AFTER, "1")],
