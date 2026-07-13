@@ -38,21 +38,27 @@ use crate::store::{self, Feed, NewEntry, NewFeed};
 /// [`classify_feed_privacy`].
 ///
 /// A **private** feed carries a secret (a token / key / auth credential) *in the
-/// URL itself* (Substack `…/feed/private/<token>`, Patreon `?auth=…`, Ghost
-/// members, etc.). Because atproto PDS records are **public** (unauth
-/// `getRecord`/`listRecords` + firehose, retained after delete), writing such a
-/// URL to the PDS would leak paid / members-only access to the whole network. So
-/// the data layer keeps the secret URL **local-only** and writes a *redacted*
-/// PDS record. See [`crate::lexicon::Subscription`]'s `private` marker for the
-/// full contract and the stopgap→permissioned-data migration note.
+/// URL itself* — a Substack `…/feed/private/<token>`, a Patreon `?auth=…` feed,
+/// a Ghost members `?uuid=` feed, a private-podcast token feed (Supercast,
+/// Supporting Cast, tokened Megaphone/Acast+), and so on. FeatherReader stores a
+/// user's subscriptions as records in their **public PDS** (unauthenticated
+/// `getRecord` / `listRecords` + the firehose, retained even after delete), so
+/// writing such a URL anywhere — the PDS *or* the server's own store — would risk
+/// leaking paid / members-only access.
+///
+/// **Decision (stopgap until atproto permissioned data ships): FeatherReader
+/// supports PUBLIC feeds only.** A feed classified [`FeedPrivacy::Private`] is
+/// *refused* at the add / import boundary — never fetched, never stored, never
+/// written to the PDS. There is no local-secret fallback and no override: the
+/// server holds NO private secret, ever, which keeps "your data lives in your
+/// public PDS" 100% honest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedPrivacy {
-    /// No secret detected in the URL; safe to store the URL in a public PDS
-    /// record verbatim.
+    /// No secret detected in the URL; safe to add as a public feed.
     Public,
     /// A secret was detected in the URL. The `String` is a short, human-readable
-    /// reason (for logging / UI), e.g. `"substack private feed path"`. The secret
-    /// URL must be kept local-only and the PDS record must be redacted.
+    /// reason (for logging / the skip report), e.g. `"substack private feed
+    /// path"`. The feed is refused — not fetched, stored, or written anywhere.
     Private(String),
 }
 
@@ -63,100 +69,283 @@ impl FeedPrivacy {
     }
 }
 
-/// Query-parameter *keys* that, when present, mark a URL as carrying a secret.
-/// Conservative and lowercase-compared; these are the credential markers used by
-/// Patreon (`auth`), token-in-query feeds (`token`/`key`/`k`), and the generic
-/// `secret`. Matched as a whole key (case-insensitive) so a benign `keyword=`
-/// does NOT trip `key`.
-const SECRET_QUERY_KEYS: &[&str] = &["token", "key", "k", "auth", "secret", "apikey", "api_key"];
+/// Query-parameter *keys* that, when present with a long/opaque value, mark a URL
+/// as carrying a secret. Conservative and lowercase-compared; matched as a whole
+/// key (case-insensitive) so a benign `keyword=` does NOT trip `key`. This is the
+/// generic, provider-agnostic credential-in-query defence — it catches paid
+/// feeds from providers we've never heard of. Covers Patreon (`auth`), Ghost
+/// members (`uuid`), token-in-query feeds (`token`/`key`/`k`/`sig`/`hash`), and
+/// the long tail (`access`/`apikey`/`private`/`password`/`u`/`s`/`p`/…).
+const SECRET_QUERY_KEYS: &[&str] = &[
+    "token", "key", "auth", "secret", "k", "sig", "hash", "access", "apikey", "api_key", "uuid",
+    "id", "u", "s", "p", "private", "password", "pw",
+];
+
+/// Path *segments* / fragments that mark a private-feed URL shape. Matched as a
+/// case-insensitive substring of the (lowercased) path so `/feed/private/<tok>`,
+/// `/members/…`, `/subscriber/…` etc. all trip regardless of the token that
+/// follows. Provider-agnostic: many paid providers expose members-only feeds
+/// under one of these path conventions.
+const PRIVATE_PATH_MARKERS: &[&str] = &[
+    "/private/",
+    "/feed/private/",
+    "/rss/private/",
+    "/private-feed/",
+    "/members/",
+    "/member/",
+    "/subscriber/",
+];
+
+/// A KNOWN paid/private feed provider, matched by host substring + (optionally) a
+/// path/query marker specific to that provider. This is the **secondary**,
+/// precision layer on top of the generic heuristic — it names providers so the
+/// skip report can say *why* and so we catch provider-specific shapes that the
+/// generic pass might rate as borderline. Data-driven and easy to extend: add a
+/// row, don't touch the matcher.
+struct KnownProvider {
+    /// Substring that must appear in the URL host (lowercased), e.g.
+    /// `substack.com`.
+    host_contains: &'static str,
+    /// Optional lowercased substring that must appear in the path-or-query for a
+    /// match (a provider's private-feed marker). `None` = the host alone is
+    /// enough (used for hosts that ONLY serve private/tokened feeds).
+    marker: Option<&'static str>,
+    /// Human-readable reason for the skip report.
+    reason: &'static str,
+}
+
+/// The known-provider table. Covers paid NEWSLETTERS and private PODCASTS — an
+/// RSS reader ingests both. Kept intentionally verbose/commented so it's obvious
+/// what each row targets and safe to extend.
+const KNOWN_PROVIDERS: &[KnownProvider] = &[
+    // --- Paid newsletters -------------------------------------------------
+    // Substack private feed: author.substack.com/feed/private/<token>.
+    KnownProvider {
+        host_contains: "substack.com",
+        marker: Some("/feed/private/"),
+        reason: "Substack private feed",
+    },
+    // Patreon RSS carries the member token as ?auth=.
+    KnownProvider {
+        host_contains: "patreon.com",
+        marker: Some("auth="),
+        reason: "Patreon member feed",
+    },
+    // Ghost members feed: ?uuid=<member-uuid> (or a members token path).
+    KnownProvider {
+        host_contains: "ghost.io",
+        marker: Some("uuid="),
+        reason: "Ghost members feed",
+    },
+    // Buttondown paid RSS uses a per-subscriber token in the path/query.
+    KnownProvider {
+        host_contains: "buttondown.email",
+        marker: Some("token"),
+        reason: "Buttondown premium feed",
+    },
+    KnownProvider {
+        host_contains: "buttondown.com",
+        marker: Some("token"),
+        reason: "Buttondown premium feed",
+    },
+    // Beehiiv premium RSS carries a subscriber token.
+    KnownProvider {
+        host_contains: "beehiiv.com",
+        marker: Some("token"),
+        reason: "Beehiiv premium feed",
+    },
+    // Memberful-gated feeds (host or ?auth token).
+    KnownProvider {
+        host_contains: "memberful.com",
+        marker: None,
+        reason: "Memberful members feed",
+    },
+    // Pico / Steady member feeds.
+    KnownProvider {
+        host_contains: "pico.link",
+        marker: None,
+        reason: "Pico member feed",
+    },
+    KnownProvider {
+        host_contains: "steadyhq.com",
+        marker: None,
+        reason: "Steady member feed",
+    },
+    // --- Private podcasts -------------------------------------------------
+    // Supercast private podcast feeds (host serves tokened member feeds only).
+    KnownProvider {
+        host_contains: "supercast.com",
+        marker: None,
+        reason: "Supercast private podcast",
+    },
+    KnownProvider {
+        host_contains: "supercast.tech",
+        marker: None,
+        reason: "Supercast private podcast",
+    },
+    // Supporting Cast private podcast feeds (supportingcast.fm).
+    KnownProvider {
+        host_contains: "supportingcast.fm",
+        marker: None,
+        reason: "Supporting Cast private podcast",
+    },
+    // RedCircle private/exclusive feeds.
+    KnownProvider {
+        host_contains: "redcircle.com",
+        marker: Some("private"),
+        reason: "RedCircle private podcast",
+    },
+    // Private/tokened Megaphone, Acast+, and Omny feeds carry an access token.
+    KnownProvider {
+        host_contains: "megaphone.fm",
+        marker: Some("token"),
+        reason: "Megaphone private podcast",
+    },
+    KnownProvider {
+        host_contains: "acast.com",
+        marker: Some("token"),
+        reason: "Acast+ private podcast",
+    },
+    KnownProvider {
+        host_contains: "omny.fm",
+        marker: Some("token"),
+        reason: "Omny private podcast",
+    },
+    // Apple / Spotify subscriber podcast feeds carry a per-listener token.
+    KnownProvider {
+        host_contains: "podcasts.apple.com",
+        marker: Some("token"),
+        reason: "Apple subscriber podcast",
+    },
+    KnownProvider {
+        host_contains: "spotify.com",
+        marker: Some("token"),
+        reason: "Spotify subscriber podcast",
+    },
+];
 
 /// Classify whether a feed URL carries a secret credential in the URL itself.
 ///
 /// Returns [`FeedPrivacy::Private`] (with a reason) when the URL looks like it
-/// embeds a token / key / auth credential, else [`FeedPrivacy::Public`]. This is
-/// deliberately **conservative** — a false positive merely keeps a feed URL
-/// local-only (still fully functional, just not mirrored verbatim to the PDS),
-/// whereas a false negative would LEAK a paid-content secret onto the public
-/// atproto network. When in doubt we lean toward `Private`.
+/// embeds a token / key / auth credential, else [`FeedPrivacy::Public`].
 ///
-/// Detection heuristics (any one is sufficient):
-/// 1. **Known private-feed path shapes** — Substack's `/feed/private/<token>`,
-///    or any `/private/` path segment (Ghost/others expose members feeds this
-///    way). These are unambiguous "this is a secret feed" markers.
-/// 2. **Credential query parameters** — a query key in [`SECRET_QUERY_KEYS`]
-///    (Patreon `?auth=`, token-in-query feeds `?token=`/`?key=`/`?k=`, generic
-///    `?secret=`/`?apikey=`).
-/// 3. **High-entropy opaque segments** — a long, high-entropy path segment or
-///    query value that looks like an embedded key/token even without a telltale
-///    name (e.g. a 32+ char base64/hex blob). Bounded by a length + entropy
-///    floor so ordinary slugs (`my-first-post`) don't trip it.
+/// **Design — provider-agnostic first.** The primary defence is a generic
+/// credential-in-URL heuristic that catches paid feeds from *any* provider, not
+/// just the ones we've named; a secondary known-provider table adds precision
+/// (and a nicer reason) for the common paid newsletters and private podcasts. We
+/// deliberately **bias toward flagging**: a false-positive block of a public feed
+/// is low-harm (the user just can't add that one feed yet), whereas a false
+/// negative would leak a paid secret onto the public network — high-harm.
 ///
-/// An unparseable URL is treated as [`FeedPrivacy::Public`]: the poller/SSRF
-/// guard will reject it downstream anyway, and we don't want a parse quirk to
-/// silently reclassify (and thus withhold) an otherwise-normal feed.
+/// Detection (any one is sufficient):
+/// 1. **Userinfo** — `https://user:pass@host/…` embeds credentials directly.
+/// 2. **Known private-feed path markers** — [`PRIVATE_PATH_MARKERS`]
+///    (`/feed/private/`, `/members/`, `/subscriber/`, …).
+/// 3. **Credential query parameters** — a query key in [`SECRET_QUERY_KEYS`] with
+///    a long/opaque value (Patreon `?auth=`, Ghost `?uuid=`, `?token=`, …).
+/// 4. **High-entropy opaque token segments** — a long opaque blob (hex ≥ 16,
+///    base64url ≥ 16, or a UUID) anywhere in the path or a query value, even
+///    without a telltale name.
+/// 5. **Known providers** — [`KNOWN_PROVIDERS`] host (+ optional marker) match.
+///
+/// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
+/// a malformed URL downstream anyway, and we don't want a parse quirk to
+/// misclassify.
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     let parsed = match Url::parse(url) {
         Ok(u) => u,
-        // Can't parse => can't have extracted a secret with confidence; the
-        // fetch path will reject a malformed URL regardless.
+        // Can't parse => the add path will reject it as a malformed URL regardless.
         Err(_) => return FeedPrivacy::Public,
     };
 
-    let path = parsed.path();
-    let path_lower = path.to_ascii_lowercase();
-
-    // (1) Known private-feed path shapes.
-    if path_lower.contains("/feed/private/") {
-        return FeedPrivacy::Private("substack private feed path".to_string());
-    }
-    // A `/private/` segment anywhere in the path (Ghost members feeds, and a
-    // common convention for tokened feeds). Match on segment boundaries so we
-    // don't trip on a literal word like `/my-private-life/`.
-    if parsed
-        .path_segments()
-        .map(|segs| segs.into_iter().any(|s| s.eq_ignore_ascii_case("private")))
-        .unwrap_or(false)
-    {
-        return FeedPrivacy::Private("private path segment".to_string());
+    // (1) Userinfo (`https://user:pass@host/…`) — credentials in the authority.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return FeedPrivacy::Private("credentials in URL userinfo".to_string());
     }
 
-    // (2) Credential query parameters.
+    let path_lower = parsed.path().to_ascii_lowercase();
+    let query_lower = parsed.query().unwrap_or("").to_ascii_lowercase();
+    let host_lower = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+
+    // (5) Known-provider precision layer (checked early so its specific reason
+    // wins over a generic one). Host substring + optional path/query marker.
+    for kp in KNOWN_PROVIDERS {
+        if host_lower.contains(kp.host_contains) {
+            let marker_ok = match kp.marker {
+                None => true,
+                Some(m) => {
+                    let m = m.to_ascii_lowercase();
+                    path_lower.contains(&m) || query_lower.contains(&m)
+                }
+            };
+            if marker_ok {
+                return FeedPrivacy::Private(kp.reason.to_string());
+            }
+        }
+    }
+
+    // (2) Known private-feed path markers.
+    for marker in PRIVATE_PATH_MARKERS {
+        if path_lower.contains(marker) {
+            return FeedPrivacy::Private(format!("private feed path `{marker}`"));
+        }
+    }
+
+    // (3) Credential query parameters with a long/opaque value.
     for (k, v) in parsed.query_pairs() {
         let key = k.as_ref().to_ascii_lowercase();
-        if SECRET_QUERY_KEYS.iter().any(|sk| *sk == key) && !v.is_empty() {
+        if SECRET_QUERY_KEYS.iter().any(|sk| *sk == key) && value_is_opaque(v.as_ref()) {
             return FeedPrivacy::Private(format!("credential query parameter `{key}`"));
         }
     }
 
-    // (3) High-entropy opaque path/query segments (an embedded key/token with no
-    // telltale name). Only trip on a genuinely key-shaped blob to avoid
-    // reclassifying ordinary long slugs.
-    for seg in path.split('/').filter(|s| !s.is_empty()) {
+    // (4) High-entropy opaque token segments (an embedded key/token with no
+    // telltale name): hex ≥ 16, base64url ≥ 16, or a UUID, in path or query.
+    for seg in parsed.path().split('/').filter(|s| !s.is_empty()) {
         if looks_like_embedded_secret(seg) {
-            return FeedPrivacy::Private("high-entropy path segment".to_string());
+            return FeedPrivacy::Private("high-entropy token in path".to_string());
         }
     }
     for (_, v) in parsed.query_pairs() {
         if looks_like_embedded_secret(v.as_ref()) {
-            return FeedPrivacy::Private("high-entropy query value".to_string());
+            return FeedPrivacy::Private("high-entropy token in query".to_string());
         }
     }
 
     FeedPrivacy::Public
 }
 
+/// Whether a *named* credential query value (`?token=<v>`) is long/opaque enough
+/// to count as a secret. A short value (e.g. an enum like `?token=none`) is not.
+/// We treat a UUID, or anything ≥ 8 chars that isn't an obvious plain word, as
+/// opaque — named credential keys already signal intent, so the length bar is
+/// low.
+fn value_is_opaque(v: &str) -> bool {
+    if v.is_empty() {
+        return false;
+    }
+    if is_uuid(v) {
+        return true;
+    }
+    v.len() >= 8
+}
+
 /// Heuristic: does `s` look like an embedded secret (an opaque high-entropy
-/// token / key), as opposed to an ordinary slug or word?
-///
-/// Requires ALL of: length >= 24, no `-`/`.`/`_`-delimited word structure that
-/// dominates (i.e. it isn't a hyphenated slug like `my-first-blog-post`), a mix
-/// of letter *and* digit characters, and a high ratio of distinct characters.
-/// Deliberately strict so it only fires on things that really look like keys —
-/// false negatives here are covered by the named-marker checks (1) and (2); this
-/// is only the catch-all for unnamed tokens.
+/// token), as opposed to an ordinary slug or word? Matches a UUID, a hex string
+/// ≥ 16 chars, or a base64url-ish blob ≥ 16 chars that mixes letters and digits
+/// and isn't a hyphen/dot slug. Deliberately strict so it only fires on things
+/// that really look like keys — the named-marker and known-provider checks cover
+/// the rest.
 fn looks_like_embedded_secret(s: &str) -> bool {
-    // Long enough to plausibly be a token, not a word.
-    if s.len() < 24 {
+    if is_uuid(s) {
+        return true;
+    }
+    // Hex string ≥ 16 chars (e.g. a 32-char MD5-ish token).
+    if s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    // base64url-ish opaque blob ≥ 16 chars.
+    if s.len() < 16 {
         return false;
     }
     // Hyphen/dot-heavy slugs (`this-is-a-normal-post-title`) are not secrets.
@@ -167,11 +356,10 @@ fn looks_like_embedded_secret(s: &str) -> bool {
     if separators >= 3 {
         return false;
     }
-    // Must be plausibly token-charset: letters/digits (plus a few base64/url
-    // chars). Anything with lots of other punctuation is more likely a path.
+    // Must be plausibly token-charset: base64url alphabet only.
     let token_chars = s
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '/' | '='))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
         .count();
     if token_chars < s.chars().count() {
         return false;
@@ -184,12 +372,25 @@ fn looks_like_embedded_secret(s: &str) -> bool {
         return false;
     }
     // Distinct-character ratio: real tokens use most of the alphabet, words
-    // repeat a small set. Require >= 12 distinct chars.
+    // repeat a small set. Require >= 10 distinct chars for a 16+ char blob.
     let mut seen = std::collections::HashSet::new();
     for c in s.chars() {
         seen.insert(c.to_ascii_lowercase());
     }
-    seen.len() >= 12
+    seen.len() >= 10
+}
+
+/// Whether `s` is a canonical 8-4-4-4-12 hyphenated UUID (any hex case).
+fn is_uuid(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != groups.len() {
+        return false;
+    }
+    parts
+        .iter()
+        .zip(groups.iter())
+        .all(|(p, &n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// How long a single feed fetch may take before we give up.
@@ -350,9 +551,6 @@ pub async fn poll_feed(pool: &SqlitePool, client: &Client, feed: &Feed) -> Resul
         last_modified: new_last_modified,
         last_polled: Some(now_rfc3339()),
         next_poll: None, // the scheduler owns cadence; leave it to set next_poll.
-        // The poller doesn't classify privacy; upsert_feed ORs the flag so this
-        // `false` can never clobber a feed the subscribe path marked private.
-        private: false,
     };
 
     let entries: Vec<NewEntry> = parsed.entries.iter().map(normalize_entry).collect();
@@ -824,42 +1022,90 @@ mod tests {
     }
 
     #[test]
-    fn classify_privacy_flags_known_secret_urls() {
+    fn classify_privacy_flags_secret_urls_across_providers() {
+        // --- Known providers: newsletters ---
         // Substack private feed path.
         assert!(
-            classify_feed_privacy("https://author.substack.com/feed/private/abcdef123456")
+            classify_feed_privacy("https://author.substack.com/feed/private/deadbeefcafe1234")
                 .is_private()
         );
+        // Patreon ?auth= member feed.
+        assert!(classify_feed_privacy(
+            "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4"
+        )
+        .is_private());
+        // Ghost members feed via ?uuid=.
+        assert!(classify_feed_privacy(
+            "https://blog.ghost.io/rss/?uuid=1f2e3d4c-5b6a-7089-90ab-cdef01234567"
+        )
+        .is_private());
 
-        // Patreon-style ?auth= credential.
+        // --- Known providers: private podcasts ---
+        // Supporting Cast tokened podcast feed.
+        assert!(classify_feed_privacy(
+            "https://feeds.supportingcast.fm/show/abcdef0123456789abcdef01"
+        )
+        .is_private());
+        // Supercast private podcast (host alone is enough).
+        assert!(classify_feed_privacy("https://feeds.supercast.com/12345/rss").is_private());
+
+        // --- Generic, provider-agnostic heuristic ---
+        // Named credential query params with an opaque value.
         assert!(
-            classify_feed_privacy("https://www.patreon.com/rss/author?auth=SEKRET").is_private()
+            classify_feed_privacy("https://example.com/feed?token=Zm9vYmFyc2VjcmV0").is_private()
         );
-
-        // Generic token/key/secret query params.
-        assert!(classify_feed_privacy("https://example.com/feed?token=xyz").is_private());
-        assert!(classify_feed_privacy("https://example.com/feed?key=xyz").is_private());
-        assert!(classify_feed_privacy("https://example.com/feed?k=xyz").is_private());
-        assert!(classify_feed_privacy("https://example.com/feed?secret=xyz").is_private());
-
-        // A `/private/` path segment (Ghost members, tokened feeds).
+        assert!(
+            classify_feed_privacy("https://example.com/feed?key=Zm9vYmFyc2VjcmV0").is_private()
+        );
+        assert!(
+            classify_feed_privacy("https://example.com/feed?secret=Zm9vYmFyc2VjcmV0").is_private()
+        );
+        // Userinfo credentials in the authority.
+        assert!(classify_feed_privacy("https://user:pass@example.com/feed").is_private());
+        // A `/private/` path segment on an unknown host.
         assert!(classify_feed_privacy("https://blog.example.com/private/rss").is_private());
-
+        // `/members/` path convention.
+        assert!(classify_feed_privacy("https://news.example.com/members/feed.xml").is_private());
         // A high-entropy opaque token embedded in the path with no telltale name.
         assert!(
             classify_feed_privacy("https://feeds.example.com/aB3xK9zQ7mP2rT5wL8nD4vF6")
                 .is_private()
         );
+        // A bare UUID path segment (many tokened feeds).
+        assert!(classify_feed_privacy(
+            "https://feeds.example.com/1f2e3d4c-5b6a-7089-90ab-cdef01234567"
+        )
+        .is_private());
     }
 
     #[test]
     fn classify_privacy_leaves_normal_public_feeds_public() {
+        // Plain feed documents.
         assert_eq!(
             classify_feed_privacy("https://example.com/feed.xml"),
             FeedPrivacy::Public
         );
         assert_eq!(
             classify_feed_privacy("https://blog.example.com/rss"),
+            FeedPrivacy::Public
+        );
+        assert_eq!(
+            classify_feed_privacy("https://blog.example.com/rss.xml"),
+            FeedPrivacy::Public
+        );
+        // A Substack PUBLIC feed (`/feed`, not `/feed/private/`) stays public.
+        assert_eq!(
+            classify_feed_privacy("https://author.substack.com/feed"),
+            FeedPrivacy::Public
+        );
+        // A WordPress `/feed` endpoint.
+        assert_eq!(
+            classify_feed_privacy("https://wordpress.example.com/feed/"),
+            FeedPrivacy::Public
+        );
+        // A plain Atom feed.
+        assert_eq!(
+            classify_feed_privacy("https://example.org/atom.xml"),
             FeedPrivacy::Public
         );
         // A long, hyphenated slug must NOT be mistaken for an embedded secret.
@@ -872,12 +1118,17 @@ mod tests {
             classify_feed_privacy("https://example.com/feed?keyword=rust"),
             FeedPrivacy::Public
         );
+        // A short, non-opaque value on a named key (e.g. an enum) is not a secret.
+        assert_eq!(
+            classify_feed_privacy("https://example.com/feed?p=2"),
+            FeedPrivacy::Public
+        );
         // An empty credential value is not a secret.
         assert_eq!(
             classify_feed_privacy("https://example.com/feed?token="),
             FeedPrivacy::Public
         );
-        // Unparseable URL: treated as Public (fetch path rejects it downstream).
+        // Unparseable URL: treated as Public (add path rejects it downstream).
         assert_eq!(classify_feed_privacy("not a url"), FeedPrivacy::Public);
     }
 

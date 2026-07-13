@@ -50,10 +50,6 @@
               {% endfor %}
             </select>
           {% endif %}
-          <label class="form-hint" for="feed-private">
-            <input id="feed-private" name="private" type="checkbox" value="on" />
-            Keep this feed private (local-only) — don't sync its URL to my PDS.
-          </label>
           <button class="btn btn-primary" type="submit">
             Subscribe
             <span class="htmx-indicator spinner" aria-hidden="true"></span>
@@ -61,9 +57,10 @@
         </form>
         <p class="form-hint">A site URL works too — FeatherReader discovers the feed.</p>
         <p class="form-hint">
-          Private feeds (Substack <code>/feed/private/…</code>, Patreon <code>?auth=</code>, members-only)
-          are detected automatically and kept on this device — atproto PDS records are public, so the
-          secret URL is never written there.
+          Public feeds only for now. Private/paid feeds (Substack <code>/feed/private/…</code>,
+          Patreon <code>?auth=</code>, members-only newsletters, private podcasts) aren't supported
+          yet — because your subscriptions live in your public PDS, private-feed support arrives when
+          atproto's permissioned data ships. A private URL is never saved or fetched.
         </p>
         <p class="pds-note">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
