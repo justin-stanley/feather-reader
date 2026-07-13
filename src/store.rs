@@ -1474,6 +1474,163 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // PDS-outage authorization (fail CLOSED). REGRESSION GUARD for the past
+    // FAIL-OPEN bug (fixed in 2e53e0e): `resolve_subscriptions`' PDS/sidecar-
+    // unreachable fallback used to synthesize a DID's `sub_ref` from EVERY
+    // cached feed (`due_feeds(.., i64::MAX)`), granting cross-tenant read +
+    // mutate during any outage. The fix serves the DID's OWN last-known
+    // `sub_ref` via `feeds_for_did(did)` and NEVER widens it.
+    //
+    // This test replays that fixed fallback at the store layer — the seam the
+    // web handler drives when `list_subscriptions_sorted(did) -> Err`. The
+    // key adversarial shape is an ORPHAN cached feed (in the shared cache but
+    // subscribed by NO ONE): the old fail-open code would have folded it into
+    // the caller's surface. If the fail-open is reintroduced, `feeds_for_did`
+    // would include that orphan and every assertion below flips — so this is a
+    // real guard, not a tautology.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pds_outage_fallback_fails_closed_not_open() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        let did_a = "did:plc:aaaa";
+
+        // feed_a: A's own subscription (its last-known `sub_ref`; the fallback
+        // may serve this stale but must not widen past it).
+        let feed_a = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://a.example/feed.xml".to_string(),
+                title: Some("A".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // feed_orphan: present in the SHARED cache but subscribed by NO DID.
+        // This is exactly what the fail-open path would have leaked to A.
+        let feed_orphan = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://orphan.example/feed.xml".to_string(),
+                title: Some("Orphan".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        insert_entries(
+            &pool,
+            feed_a,
+            &[NewEntry {
+                guid: "a-1".to_string(),
+                url: Some("https://a.example/1".to_string()),
+                title: Some("A one".to_string()),
+                published: Some("2026-07-10T00:00:00Z".to_string()),
+                content_html: Some("<p>A body</p>".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_orphan,
+            &[NewEntry {
+                guid: "orphan-1".to_string(),
+                url: Some("https://orphan.example/1".to_string()),
+                title: Some("Orphan one".to_string()),
+                published: Some("2026-07-11T00:00:00Z".to_string()),
+                content_html: Some("<p>secret orphan body</p>".to_string()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        // A's last-known subscription set is feed_a ONLY. No `sub_ref` row ever
+        // points any DID at feed_orphan.
+        replace_sub_refs(&pool, did_a, &[feed_a]).await?;
+
+        // Grab the orphan entry id via a transient sub so we can address it,
+        // then drop the sub — nobody subscribes to feed_orphan afterwards.
+        replace_sub_refs(&pool, "did:plc:seed", &[feed_orphan]).await?;
+        let orphan_entry_id = entries_for_feed(&pool, "did:plc:seed", feed_orphan).await?[0].id;
+        replace_sub_refs(&pool, "did:plc:seed", &[]).await?;
+
+        // --- Replay the FIXED fallback projection ----------------------------
+        // This is what `resolve_subscriptions` serves on the Err (outage) path:
+        // the caller's OWN feeds, never widened. It must contain feed_a and
+        // NEVER the orphan. (The old fail-open synthesized from every cached
+        // feed → this vec would have held feed_orphan too.)
+        let fallback = feeds_for_did(&pool, did_a).await?;
+        let fallback_ids: Vec<i64> = fallback.iter().map(|f| f.id).collect();
+        assert_eq!(
+            fallback_ids,
+            vec![feed_a],
+            "outage fallback must serve ONLY A's own last-known sub_ref, \
+             never widen to the orphan cached feed"
+        );
+        assert!(
+            !fallback_ids.contains(&feed_orphan),
+            "FAIL-OPEN regression: outage fallback leaked an unsubscribed \
+             cached feed into A's surface"
+        );
+
+        // --- With that projection in place, EVERY scoped read denies A -------
+        assert!(
+            !did_subscribes_to_entry(&pool, did_a, orphan_entry_id).await?,
+            "A must not be authorized for an orphan feed's entry during an outage"
+        );
+        assert!(
+            entries_for_feed(&pool, did_a, feed_orphan)
+                .await?
+                .is_empty(),
+            "entries_for_feed must not expose the orphan feed to A during an outage"
+        );
+        // Neither the unread nor the starred list may surface the orphan entry.
+        let unread_guids: Vec<String> = get_unread_for_did(&pool, did_a)
+            .await?
+            .into_iter()
+            .map(|e| e.guid)
+            .collect();
+        assert!(
+            !unread_guids.iter().any(|g| g == "orphan-1"),
+            "orphan entry leaked into A's unread list during an outage"
+        );
+        assert!(
+            get_starred_for_did(&pool, did_a).await?.is_empty(),
+            "A has no starred entries; the orphan must not appear"
+        );
+
+        // --- And EVERY scoped mutation is a no-op (→ 404 at the web layer) ---
+        assert!(
+            !mark_read(&pool, did_a, orphan_entry_id, true).await?,
+            "A must not mark an orphan feed's entry read during an outage"
+        );
+        assert!(
+            !mark_starred(&pool, did_a, orphan_entry_id, true).await?,
+            "A must not star an orphan feed's entry during an outage"
+        );
+        assert_eq!(
+            mark_feed_read(&pool, did_a, feed_orphan, true).await?,
+            0,
+            "A must not mark-all-read the orphan feed during an outage"
+        );
+
+        // Nothing was written for A against the orphan entry.
+        let es_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND entry_id = ?2")
+                .bind(did_a)
+                .bind(orphan_entry_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(es_count, 0, "no cross-tenant mutation during the outage");
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Closed-beta invite gate
     // -----------------------------------------------------------------------
 
