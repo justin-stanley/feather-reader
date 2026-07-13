@@ -1,0 +1,166 @@
+name: release-image
+
+# Build + publish the FeatherReader container image on a version tag, then sign
+# SLSA build provenance (and, optionally, a CycloneDX SBOM) for the pushed image
+# DIGEST. This does NOT deploy to Fly — that stays with the deploy runbook.
+#
+# Trigger: pushing a semver tag, e.g.  git tag v0.1.0 && git push origin v0.1.0
+#
+# Deploy contract: the attestations are bound to the image DIGEST. The runbook
+# resolves the tag to that digest, runs `gh attestation verify` (fail-closed),
+# then `fly deploy -i ghcr.io/...@<digest>`. Deploying a mutable tag defeats the
+# guarantee. `:latest` is published only for the newest semver (flavor latest=auto)
+# so a hotfix on an OLDER line can never repoint :latest backward.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      enable_sbom:
+        description: "PART C: build with cargo-auditable + emit & attest a CycloneDX SBOM"
+        type: boolean
+        default: false
+
+# Top-level default is intentionally narrowed to least privilege — checkout only.
+# Any FUTURE job that forgets its own `permissions:` block inherits only this, so
+# it can never accidentally push or sign. The publish + attestation scopes
+# (packages:write / id-token:write / attestations:write) are granted explicitly at
+# JOB level below, exactly where they are needed and nowhere else.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/justin-stanley/feather-reader
+  # PART C master toggle. Flip to '1' (or dispatch with enable_sbom=true) to build
+  # the Rust binary with cargo-auditable AND generate + attest a CycloneDX SBOM.
+  # Default '0' keeps the image a plain --release build with provenance only.
+  ENABLE_SBOM: "0"
+
+jobs:
+  build-push-attest:
+    name: build, push, attest
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.private == false }}
+    # Least privilege — exactly the scopes the publish + attestation need:
+    #   contents:read       checkout only (no tag/release writes)
+    #   packages:write      push to GHCR
+    #   id-token:write      OIDC token for keyless (Sigstore) attestation signing
+    #   attestations:write  record the provenance/SBOM attestations on the image
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      # All actions are SHA-pinned (comment = the human-readable tag). Re-resolve
+      # with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` when bumping.
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Resolve SBOM toggle
+        id: toggle
+        env:
+          DISPATCH_SBOM: ${{ github.event.inputs.enable_sbom }}
+        run: |
+          if [ "${DISPATCH_SBOM}" = "true" ] || [ "${ENABLE_SBOM}" = "1" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags + labels
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
+        with:
+          images: ${{ env.IMAGE }}
+          # latest=auto: metadata-action only moves :latest to the HIGHEST semver
+          # it has seen, so cutting v0.1.6 AFTER v0.2.0 will NOT repoint :latest
+          # backward. (Deploys still resolve a DIGEST — :latest is a convenience.)
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # PART C: pass the cargo-auditable build-arg through to the Dockerfile.
+          build-args: |
+            ENABLE_SBOM=${{ steps.toggle.outputs.enabled }}
+          provenance: false   # we attest provenance ourselves (below), not via buildkit
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- SLSA build provenance for the pushed image DIGEST -----------------
+      # Signs a provenance attestation bound to the exact digest, stored in the
+      # GHCR registry alongside the image. Keyless (Sigstore) via the OIDC token.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ======================================================================
+      # PART C (TOGGLABLE) — CycloneDX SBOM + SBOM attestation.
+      # Runs only when the SBOM toggle is on. The image was already built with
+      # `cargo auditable` (ENABLE_SBOM build-arg) so the Rust dep graph is
+      # embedded in the binary (readable later with `cargo audit bin`).
+      # ======================================================================
+      - name: Generate CycloneDX SBOM (PART C)
+        if: steps.toggle.outputs.enabled == '1'
+        id: sbom
+        uses: anchore/sbom-action@f8bdd1d8ac5e901a77a92f111440fdb1b593736b # v0.20.6
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: feather-reader-sbom.cdx.json
+
+      - name: Attest SBOM against the image digest (PART C)
+        if: steps.toggle.outputs.enabled == '1'
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+
+      # --- Verification note (no deploy) ------------------------------------
+      # Deployment is intentionally NOT automated here — it stays in the deploy
+      # runbook and MUST deploy the DIGEST after verifying its attestation:
+      #
+      #   DIGEST="${{ steps.build.outputs.digest }}"
+      #   gh attestation verify \
+      #     oci://ghcr.io/justin-stanley/feather-reader@${DIGEST} \
+      #     --repo justin-stanley/feather-reader        # fail-closed gate
+      #   fly deploy -i ghcr.io/justin-stanley/feather-reader@${DIGEST}
+      #
+      # (Add `--predicate-type https://cyclonedx.org/bom` to check the SBOM
+      # attestation specifically when PART C is enabled.)
+      - name: Verification note
+        run: |
+          echo "Image (deploy THIS, by digest): ${IMAGE}@${{ steps.build.outputs.digest }}"
+          echo "Verify: gh attestation verify oci://${IMAGE}@${{ steps.build.outputs.digest }} --repo ${{ github.repository }}"
+          echo "Then:   fly deploy -i ${IMAGE}@${{ steps.build.outputs.digest }}"
+

@@ -26,7 +26,8 @@
 //!
 //! | Variable                       | Default                   | Meaning |
 //! |--------------------------------|---------------------------|---------|
-//! | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`   | Base URL of the OAuth sidecar (its public `/login` + internal API). |
+//! | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`   | Public base URL of the OAuth sidecar (its browser-facing `/login`, plus the OAuth `client_id`/`redirect_uri`). |
+//! | `SIDECAR_INTERNAL_URL`         | *(= `SIDECAR_PUBLIC_URL`)* | Loopback base URL the Rust server reaches the sidecar's `/internal/*` API on. Defaults to the public URL for single-URL local dev. |
 //! | `SIDECAR_INTERNAL_SECRET`      | *(dev fallback)*          | Shared `X-Internal-Secret` for the sidecar's `/internal/*` API. |
 //! | `FEATHERREADER_COOKIE_SECRET`  | *(dev fallback)*          | HMAC key used to sign the session cookie. |
 //! | `FEATHERREADER_DEV_DID`        | *(unset)*                 | When set, a request with no session cookie acts as this DID (local runs without the sidecar). |
@@ -106,14 +107,23 @@ pub struct Config {
 /// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
 ///
 /// The Rust server drives the sidecar over two surfaces:
-/// * the **public** `${public_url}/login` URL the browser is redirected to, and
-/// * the **internal** `${public_url}/internal/*` API (session lookup + the authed
+/// * the **public** `${public_url}/login` URL the browser is redirected to (and
+///   which anchors the sidecar's OAuth `client_id`/`redirect_uri`), and
+/// * the **internal** `${internal_url}/internal/*` API (session lookup + the authed
 ///   `com.atproto.repo.*` proxy), gated by the shared [`internal_secret`] sent as
 ///   the `X-Internal-Secret` header.
+///
+/// The two URLs differ in a split deployment (public = the edge origin, internal =
+/// a loopback address the app reaches the sidecar on); they collapse to the same
+/// value in single-URL local dev.
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
-    /// Base URL of the sidecar (no trailing slash), e.g. `http://127.0.0.1:8081`.
+    /// Public base URL of the sidecar (no trailing slash), e.g.
+    /// `https://feather-reader.com/oauth`. Anchors the browser `/login` redirect.
     pub public_url: String,
+    /// Loopback base URL for the sidecar's `/internal/*` API (no trailing slash),
+    /// e.g. `http://127.0.0.1:8081`. Defaults to `public_url` in single-URL dev.
+    pub internal_url: String,
     /// Shared secret for the sidecar's internal API (`X-Internal-Secret`).
     pub internal_secret: String,
 }
@@ -133,6 +143,7 @@ impl Default for SidecarConfig {
     fn default() -> Self {
         Self {
             public_url: DEFAULT_SIDECAR_URL.to_string(),
+            internal_url: DEFAULT_SIDECAR_URL.to_string(),
             internal_secret: DEV_INTERNAL_SECRET.to_string(),
         }
     }
@@ -144,14 +155,14 @@ impl SidecarConfig {
         format!("{}/login", self.public_url)
     }
 
-    /// The sidecar's `/internal/session/:id` URL.
+    /// The sidecar's `/internal/session/:id` URL (loopback internal API).
     pub fn session_url(&self, session_id: &str) -> String {
-        format!("{}/internal/session/{}", self.public_url, session_id)
+        format!("{}/internal/session/{}", self.internal_url, session_id)
     }
 
     /// The sidecar's `/internal/repo` URL (the authed `com.atproto.repo.*` proxy).
     pub fn repo_url(&self) -> String {
-        format!("{}/internal/repo", self.public_url)
+        format!("{}/internal/repo", self.internal_url)
     }
 }
 
@@ -282,10 +293,16 @@ impl Config {
         let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| defaults.sidecar.public_url.clone());
+        // The internal API is reached over loopback in a split deployment; it
+        // falls back to the resolved public URL so single-URL local dev works.
+        let internal_url = env_opt("SIDECAR_INTERNAL_URL")
+            .map(|u| u.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| sidecar_url.clone());
         let internal_secret = env_opt("SIDECAR_INTERNAL_SECRET")
             .unwrap_or_else(|| defaults.sidecar.internal_secret.clone());
         let sidecar = SidecarConfig {
             public_url: sidecar_url,
+            internal_url,
             internal_secret,
         };
 
@@ -543,6 +560,7 @@ mod tests {
             cookie_secret: "a".repeat(48),
             sidecar: SidecarConfig {
                 public_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_url: DEFAULT_SIDECAR_URL.to_string(),
                 internal_secret: "b".repeat(48),
             },
             ..Config::default()

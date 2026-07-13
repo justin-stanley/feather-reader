@@ -159,6 +159,7 @@ impl AppState {
         let sidecar = SidecarClient::new(
             http.clone(),
             config.sidecar.public_url.clone(),
+            config.sidecar.internal_url.clone(),
             config.sidecar.internal_secret.clone(),
         );
         Ok(Self {
