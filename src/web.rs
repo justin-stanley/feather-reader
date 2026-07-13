@@ -1715,7 +1715,21 @@ async fn rename_subscription(
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    let mut sub = Subscription::new(form.url.trim().to_string(), now_rfc3339());
+    let feed_url = form.url.trim().to_string();
+
+    // Block private/paid feeds on rename too. `url` is attacker-controllable, and
+    // rename both upserts it to the local cache AND rewrites the PDS subscription
+    // record (a public `putRecord`), so without this guard a crafted rename could
+    // land a secret-bearing URL in the public PDS — the exact leak the add and
+    // OPML paths already prevent. Refuse before touching either store.
+    if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
+        info!(url = %feed_url, %reason, %did, %rkey, "refused private/paid feed at rename (not stored or written)");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+        );
+    }
+
+    let mut sub = Subscription::new(feed_url, now_rfc3339());
     sub.title = form
         .title
         .map(|t| t.trim().to_string())
@@ -2936,6 +2950,9 @@ mod tests {
             "https://wordpress.example.com/feed/",
             "https://example.com/rss.xml",
             "https://example.org/atom.xml",
+            // YouTube channel/playlist RSS is fully public — must not false-block.
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-lHJZR3Gqxm24_Vd_AJ5Yw",
+            "https://www.youtube.com/feeds/videos.xml?playlist_id=PLFgquLnL59alCl_2TQvOiD5Vgm1",
         ] {
             assert!(
                 !feed::classify_feed_privacy(url).is_private(),
