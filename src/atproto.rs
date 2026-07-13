@@ -819,6 +819,7 @@ impl PdsClient {
 pub struct SidecarClient {
     http: Client,
     public_url: Arc<str>,
+    internal_url: Arc<str>,
     internal_secret: Arc<str>,
 }
 
@@ -897,15 +898,20 @@ struct RepoErr {
 
 impl SidecarClient {
     /// Build a sidecar client from the shared [`reqwest::Client`] and the
-    /// resolved base URL + internal secret (from [`crate::config::SidecarConfig`]).
+    /// resolved public + internal base URLs + internal secret (from
+    /// [`crate::config::SidecarConfig`]). `public_url` anchors the browser
+    /// `/login` redirect; `internal_url` is the loopback base for the `/internal/*`
+    /// API (they collapse to the same value in single-URL local dev).
     pub fn new(
         http: Client,
         public_url: impl Into<String>,
+        internal_url: impl Into<String>,
         internal_secret: impl Into<String>,
     ) -> Self {
         Self {
             http,
             public_url: Arc::from(public_url.into().trim_end_matches('/')),
+            internal_url: Arc::from(internal_url.into().trim_end_matches('/')),
             internal_secret: Arc::from(internal_secret.into()),
         }
     }
@@ -926,7 +932,7 @@ impl SidecarClient {
     pub async fn resolve_session(&self, session_id: &str) -> Result<Option<SidecarSession>> {
         let url = format!(
             "{}/internal/session/{}",
-            self.public_url,
+            self.internal_url,
             urlencode(session_id)
         );
         let resp = self
@@ -956,7 +962,7 @@ impl SidecarClient {
     /// `had_session: false`. Called on `/logout` (so the cookie clear isn't the
     /// only thing that ends the session) and on `/account/delete`.
     pub async fn revoke_session(&self, did: &str) -> Result<RevokeResult> {
-        let url = format!("{}/internal/revoke", self.public_url);
+        let url = format!("{}/internal/revoke", self.internal_url);
         let resp = self
             .http
             .post(&url)
@@ -981,7 +987,7 @@ impl SidecarClient {
     /// to [`AtProtoError`]: `404 SessionNotFound` → `Xrpc{error:"SessionNotFound"}`
     /// so callers can treat it as "re-login required".
     async fn repo(&self, body: Value) -> Result<Value> {
-        let url = format!("{}/internal/repo", self.public_url);
+        let url = format!("{}/internal/repo", self.internal_url);
         let resp = self
             .http
             .post(&url)

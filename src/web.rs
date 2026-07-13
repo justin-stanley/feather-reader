@@ -4054,6 +4054,9 @@ mod tests {
             ..Config::default()
         };
         config.sidecar.public_url = sidecar_url.to_string();
+        // The revoke/session/repo calls go over the internal URL; point it at the
+        // same mock so `/internal/*` requests land there.
+        config.sidecar.internal_url = sidecar_url.to_string();
         AppState::new(config, db).unwrap()
     }
 
