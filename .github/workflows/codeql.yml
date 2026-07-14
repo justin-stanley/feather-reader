@@ -11,9 +11,9 @@ name: CodeQL
 #   * Once the repo is PUBLIC, GitHub-hosted Actions (and code scanning) are
 #     FREE — this is the intended steady state for the OSS release.
 #
-# To bound private-repo spend we DON'T run on every PR: it runs on push to the
-# default branch (`main`) and on a weekly schedule. Flip to `pull_request:` for
-# per-PR scanning once public (it's free then). See .github/workflows/README.md.
+# Now the repo is public, GitHub-hosted Actions + code scanning are free, so it
+# runs on every PR to `main` (per-PR SAST), on push to `main`, and on a weekly
+# schedule. See .github/workflows/README.md.
 #
 # ── LANGUAGES ─────────────────────────────────────────────────────────────────
 #   * javascript-typescript — the OAuth sidecar (oauth-sidecar/).
@@ -25,9 +25,16 @@ name: CodeQL
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: "27 4 * * 1"  # Mondays 04:27 UTC — weekly deep scan
   workflow_dispatch:
+
+# Least-privilege default for the workflow; the analyze job grants itself the
+# security-events: write it needs to upload SARIF.
+permissions:
+  contents: read
 
 concurrency:
   group: codeql-${{ github.ref }}
@@ -49,10 +56,10 @@ jobs:
       matrix:
         language: [javascript-typescript]  # rust dropped — see header (extractor beta errors on all files)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           languages: ${{ matrix.language }}
           # `security-and-quality` = the broader query suite (security + code
@@ -63,9 +70,9 @@ jobs:
       # autobuilds). If the Rust extractor ever needs a real build, replace this
       # with an explicit `cargo build` step guarded on matrix.language == rust.
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+        uses: github/codeql-action/autobuild@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           category: "/language:${{ matrix.language }}"
