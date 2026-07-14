@@ -20,8 +20,11 @@
  *    survives restarts; the *public* half is what the JWKS endpoint serves.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { NodeOAuthClient, type OAuthClientMetadataInput } from '@atproto/oauth-client-node';
+import { readFileSync, writeFileSync } from 'node:fs';
+import {
+  NodeOAuthClient,
+  type OAuthClientMetadataInput,
+} from '@atproto/oauth-client-node';
 import { JoseKey } from '@atproto/jwk-jose';
 import type { SidecarConfig } from './config.js';
 import type { SqliteStores } from './stores.js';
@@ -40,20 +43,39 @@ function keyPath(cfg: SidecarConfig): string {
  * Migrate-on-read: an existing plaintext JWK file (written before encryption
  * was enabled) is loaded via `codec.maybeDecrypt` and re-written encrypted.
  */
-async function loadOrCreateKey(cfg: SidecarConfig, codec: Codec): Promise<JoseKey> {
+async function loadOrCreateKey(
+  cfg: SidecarConfig,
+  codec: Codec,
+): Promise<JoseKey> {
   const path = keyPath(cfg);
-  if (existsSync(path)) {
-    const raw = readFileSync(path, 'utf8');
+  // Read directly rather than existsSync()+read: a check-then-use pair is a
+  // file-system race (the file can change between the two syscalls). A missing
+  // file surfaces as ENOENT, which we treat as "not generated yet".
+  let raw: string | null = null;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  if (raw !== null) {
     const plaintext = codec.maybeDecrypt(raw.trim());
     const key = await JoseKey.fromJWK(JSON.parse(plaintext));
     // Upgrade a legacy plaintext file to ciphertext in place.
     if (!Aead.isCiphertext(raw.trim())) {
-      writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), { mode: 0o600 });
+      writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), {
+        mode: 0o600,
+      });
     }
     return key;
   }
   const key = await JoseKey.generate(['ES256'], 'featherreader-oauth-1');
-  writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), { mode: 0o600 });
+  // Exclusive create ('wx'): if the key file appeared since our read (a racing
+  // process generated one), fail loudly instead of clobbering a key that may
+  // already be in use.
+  writeFileSync(path, codec.encrypt(JSON.stringify(key.privateJwk)), {
+    mode: 0o600,
+    flag: 'wx',
+  });
   return key;
 }
 
@@ -63,7 +85,9 @@ async function loadOrCreateKey(cfg: SidecarConfig, codec: Codec): Promise<JoseKe
  * the real published document. Exposed separately so the HTTP layer can serve it
  * verbatim from `client.clientMetadata`.
  */
-export function buildClientMetadata(cfg: SidecarConfig): OAuthClientMetadataInput {
+export function buildClientMetadata(
+  cfg: SidecarConfig,
+): OAuthClientMetadataInput {
   const redirectUri = `${cfg.publicUrl}/callback`;
 
   if (cfg.dev) {

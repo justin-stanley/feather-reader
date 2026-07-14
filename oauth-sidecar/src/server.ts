@@ -89,6 +89,7 @@
 
 import { randomBytes } from 'node:crypto';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
 import { SqliteStores, type SessionTtls } from './stores.js';
@@ -101,9 +102,16 @@ const cfg = loadConfig();
 // pass-through NullCodec (config.ts has already warned); prod always has a key.
 const codec: Codec = cfg.encKey ? new Aead(cfg.encKey) : new NullCodec();
 const stores = new SqliteStores(cfg.dbPath, codec);
-const { client: oauthClient, metadata, jwks } = await buildOAuthClient(cfg, stores, codec);
+const {
+  client: oauthClient,
+  metadata,
+  jwks,
+} = await buildOAuthClient(cfg, stores, codec);
 
-const ttls: SessionTtls = { absoluteMs: cfg.sessionAbsoluteTtlMs, idleMs: cfg.sessionIdleTtlMs };
+const ttls: SessionTtls = {
+  absoluteMs: cfg.sessionAbsoluteTtlMs,
+  idleMs: cfg.sessionIdleTtlMs,
+};
 
 // Freshness bound for the one-shot session-id handoff. The browser round-trips
 // sidecar redirect -> app callback -> `GET /internal/session/:id` in well under
@@ -111,7 +119,37 @@ const ttls: SessionTtls = { absoluteMs: cfg.sessionAbsoluteTtlMs, idleMs: cfg.se
 // leaked callback URL useless almost immediately.
 const HANDOFF_TTL_MS = 120_000;
 
-const app = Fastify({ logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' } });
+const app = Fastify({
+  logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' },
+});
+
+/**
+ * Rate-limit key: the true client IP. Behind Fly (and optionally Cloudflare) the
+ * platform sets an un-spoofable client-IP header, and the in-container Caddy hop
+ * makes `req.ip` useless for limiting (it's always loopback). Prefer the platform
+ * headers — matching the Rust server's trusted-IP handling — and never key on raw
+ * X-Forwarded-For (which the client can spoof).
+ */
+function clientIp(req: FastifyRequest): string {
+  const h = req.headers;
+  const fly = h['fly-client-ip'];
+  if (typeof fly === 'string' && fly.trim()) return fly.trim();
+  const cf = h['cf-connecting-ip'];
+  if (typeof cf === 'string' && cf.trim()) return cf.trim();
+  return req.ip;
+}
+
+/** Per-IP budget for the public, unauthenticated browser routes. */
+const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
+
+// Rate limiting for the PUBLIC OAuth routes (/login, /callback): both resolve
+// arbitrary handles and drive outbound PDS/identity network calls, so leaving
+// them un-throttled is a resource-exhaustion + outbound-amplification vector.
+// Caddy routes /oauth/* straight to this sidecar, bypassing the Rust server's
+// limiter, so the throttle has to live here. `global: false` — routes opt in
+// individually, so the shared-secret internal API (hit frequently by the Rust
+// server) is never limited.
+await app.register(rateLimit, { global: false, keyGenerator: clientIp });
 
 function newSessionId(): string {
   return randomBytes(24).toString('base64url');
@@ -134,7 +172,10 @@ app.get('/client-metadata.json', async (_req, reply) => {
 app.get('/jwks.json', async (_req, reply) => {
   if (!jwks) {
     reply.code(404);
-    return { error: 'NotFound', message: 'no published JWKS in dev/localhost mode' };
+    return {
+      error: 'NotFound',
+      message: 'no published JWKS in dev/localhost mode',
+    };
   }
   reply.header('content-type', 'application/json');
   return jwks;
@@ -142,82 +183,92 @@ app.get('/jwks.json', async (_req, reply) => {
 
 // ─── Public: begin OAuth ─────────────────────────────────────────────────────
 
-app.get('/login', async (req: FastifyRequest, reply: FastifyReply) => {
-  const q = req.query as Record<string, string | undefined>;
-  const handle = (q.handle ?? '').trim();
-  if (!handle) {
-    reply.code(400);
-    return { error: 'BadRequest', message: 'missing ?handle' };
-  }
-  // Round-trip an opaque app value (e.g. a post-login redirect target) via the
-  // OAuth `state`; the library returns it to us at the callback.
-  const appReturn = (q.return ?? '').trim();
-  try {
-    const url = await oauthClient.authorize(handle, {
-      scope: cfg.scope,
-      state: appReturn ? JSON.stringify({ r: appReturn }) : undefined,
-    });
-    reply.redirect(url.toString());
-  } catch (err) {
-    // Keep the library's detail server-side only; return a fixed slug so we don't
-    // reflect internal error strings (which can embed request/token context) to
-    // the browser.
-    req.log.error({ err }, 'authorize failed');
-    reply.code(400);
-    return {
-      error: 'AuthorizeFailed',
-      message: 'could not start login for that handle',
-    };
-  }
-});
+app.get(
+  '/login',
+  { config: { rateLimit: PUBLIC_RATE_LIMIT } },
+  async (req: FastifyRequest, reply: FastifyReply) => {
+    const q = req.query as Record<string, string | undefined>;
+    const handle = (q.handle ?? '').trim();
+    if (!handle) {
+      reply.code(400);
+      return { error: 'BadRequest', message: 'missing ?handle' };
+    }
+    // Round-trip an opaque app value (e.g. a post-login redirect target) via the
+    // OAuth `state`; the library returns it to us at the callback.
+    const appReturn = (q.return ?? '').trim();
+    try {
+      const url = await oauthClient.authorize(handle, {
+        scope: cfg.scope,
+        state: appReturn ? JSON.stringify({ r: appReturn }) : undefined,
+      });
+      reply.redirect(url.toString());
+    } catch (err) {
+      // Keep the library's detail server-side only; return a fixed slug so we don't
+      // reflect internal error strings (which can embed request/token context) to
+      // the browser.
+      req.log.error({ err }, 'authorize failed');
+      reply.code(400);
+      return {
+        error: 'AuthorizeFailed',
+        message: 'could not start login for that handle',
+      };
+    }
+  },
+);
 
 // ─── Public: OAuth callback ──────────────────────────────────────────────────
 
-app.get('/callback', async (req: FastifyRequest, reply: FastifyReply) => {
-  const params = new URLSearchParams(req.query as Record<string, string>);
-  try {
-    const { session, state } = await oauthClient.callback(params);
-    const did = session.did;
-
-    // Resolve the handle for the who-is-this response (best-effort).
-    let handle: string | null = null;
+app.get(
+  '/callback',
+  { config: { rateLimit: PUBLIC_RATE_LIMIT } },
+  async (req: FastifyRequest, reply: FastifyReply) => {
+    const params = new URLSearchParams(req.query as Record<string, string>);
     try {
-      const agent = new Agent(session);
-      const prof = await agent.com.atproto.repo.describeRepo({ repo: did });
-      handle = prof.data.handle ?? null;
-    } catch {
-      handle = null;
-    }
+      const { session, state } = await oauthClient.callback(params);
+      const did = session.did;
 
-    const sessionId = newSessionId();
-    stores.putAppSession(sessionId, did, handle);
-
-    let appReturn: string | undefined;
-    if (state) {
+      // Resolve the handle for the who-is-this response (best-effort).
+      let handle: string | null = null;
       try {
-        appReturn = (JSON.parse(state) as { r?: string }).r;
+        const agent = new Agent(session);
+        const prof = await agent.com.atproto.repo.describeRepo({ repo: did });
+        handle = prof.data.handle ?? null;
       } catch {
-        appReturn = undefined;
+        handle = null;
       }
-    }
 
-    const target = withQuery(
-      cfg.appCallbackUrl,
-      appReturn ? { session_id: sessionId, return: appReturn } : { session_id: sessionId },
-    );
-    reply.redirect(target);
-  } catch (err) {
-    // Detail stays in the server log; the user-facing redirect carries a fixed
-    // slug, not the library's raw error string (which can embed token/request
-    // context).
-    req.log.error({ err }, 'callback failed');
-    const target = withQuery(cfg.appCallbackUrl, {
-      error: 'OAuthCallbackFailed',
-      error_description: 'login could not be completed',
-    });
-    reply.redirect(target);
-  }
-});
+      const sessionId = newSessionId();
+      stores.putAppSession(sessionId, did, handle);
+
+      let appReturn: string | undefined;
+      if (state) {
+        try {
+          appReturn = (JSON.parse(state) as { r?: string }).r;
+        } catch {
+          appReturn = undefined;
+        }
+      }
+
+      const target = withQuery(
+        cfg.appCallbackUrl,
+        appReturn
+          ? { session_id: sessionId, return: appReturn }
+          : { session_id: sessionId },
+      );
+      reply.redirect(target);
+    } catch (err) {
+      // Detail stays in the server log; the user-facing redirect carries a fixed
+      // slug, not the library's raw error string (which can embed token/request
+      // context).
+      req.log.error({ err }, 'callback failed');
+      const target = withQuery(cfg.appCallbackUrl, {
+        error: 'OAuthCallbackFailed',
+        error_description: 'login could not be completed',
+      });
+      reply.redirect(target);
+    }
+  },
+);
 
 // ─── Internal: shared-secret guard ───────────────────────────────────────────
 
@@ -226,13 +277,26 @@ function requireSecret(req: FastifyRequest, reply: FastifyReply): boolean {
   const want = cfg.internalSecret;
   // Constant-time-ish compare on strings of equal length.
   if (typeof got !== 'string' || got.length !== want.length) {
-    reply.code(403).send({ ok: false, error: 'Forbidden', message: 'bad or missing X-Internal-Secret' });
+    reply
+      .code(403)
+      .send({
+        ok: false,
+        error: 'Forbidden',
+        message: 'bad or missing X-Internal-Secret',
+      });
     return false;
   }
   let diff = 0;
-  for (let i = 0; i < want.length; i++) diff |= got.charCodeAt(i) ^ want.charCodeAt(i);
+  for (let i = 0; i < want.length; i++)
+    diff |= got.charCodeAt(i) ^ want.charCodeAt(i);
   if (diff !== 0) {
-    reply.code(403).send({ ok: false, error: 'Forbidden', message: 'bad or missing X-Internal-Secret' });
+    reply
+      .code(403)
+      .send({
+        ok: false,
+        error: 'Forbidden',
+        message: 'bad or missing X-Internal-Secret',
+      });
     return false;
   }
   return true;
@@ -243,50 +307,59 @@ app.get('/internal/health', async (req, reply) => {
   return { ok: true };
 });
 
-app.get('/internal/session/:id', async (req: FastifyRequest, reply: FastifyReply) => {
-  if (!requireSecret(req, reply)) return;
-  const { id } = req.params as { id: string };
-  const row = stores.getAppSession(id);
-  if (!row) {
-    reply.code(404);
-    return { error: 'SessionNotFound', message: 'no such session id' };
-  }
-  // The handoff token is SINGLE-USE and short-lived. Consume it on the first
-  // successful resolve, and reject a stale row, so a `session_id` that leaks via
-  // the callback URL (browser history, proxy/tunnel access logs) is useless
-  // after the one legitimate resolve or after HANDOFF_TTL_MS. Delete first, then
-  // check freshness, so an expired id is also consumed (can't be retried).
-  stores.deleteAppSession(id);
-  if (Date.now() - row.createdAt > HANDOFF_TTL_MS) {
-    reply.code(404);
-    return { error: 'SessionExpired', message: 'session id expired' };
-  }
-  return { did: row.did, handle: row.handle };
-});
+app.get(
+  '/internal/session/:id',
+  async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!requireSecret(req, reply)) return;
+    const { id } = req.params as { id: string };
+    const row = stores.getAppSession(id);
+    if (!row) {
+      reply.code(404);
+      return { error: 'SessionNotFound', message: 'no such session id' };
+    }
+    // The handoff token is SINGLE-USE and short-lived. Consume it on the first
+    // successful resolve, and reject a stale row, so a `session_id` that leaks via
+    // the callback URL (browser history, proxy/tunnel access logs) is useless
+    // after the one legitimate resolve or after HANDOFF_TTL_MS. Delete first, then
+    // check freshness, so an expired id is also consumed (can't be retried).
+    stores.deleteAppSession(id);
+    if (Date.now() - row.createdAt > HANDOFF_TTL_MS) {
+      reply.code(404);
+      return { error: 'SessionExpired', message: 'session id expired' };
+    }
+    return { did: row.did, handle: row.handle };
+  },
+);
 
 // ─── Internal: revoke a DID's session (logout / account teardown) ─────────────
 
-app.post('/internal/revoke', async (req: FastifyRequest, reply: FastifyReply) => {
-  if (!requireSecret(req, reply)) return;
-  const body = (req.body ?? {}) as { did?: string };
-  const did = body.did;
-  if (!did) {
-    reply.code(400);
-    return { ok: false, error: 'BadRequest', message: 'did is required' };
-  }
-  // Best-effort token revocation at the PDS (revokes refresh + access tokens and
-  // deletes the library-managed session row). Then purge our own rows so nothing
-  // lingers even if the network call failed.
-  let revoked = false;
-  try {
-    await oauthClient.revoke(did);
-    revoked = true;
-  } catch (err) {
-    req.log.warn({ err, did }, 'oauth revoke failed; purging local rows anyway');
-  }
-  const hadSession = stores.purgeDid(did);
-  return { ok: true, did, revoked, hadSession };
-});
+app.post(
+  '/internal/revoke',
+  async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!requireSecret(req, reply)) return;
+    const body = (req.body ?? {}) as { did?: string };
+    const did = body.did;
+    if (!did) {
+      reply.code(400);
+      return { ok: false, error: 'BadRequest', message: 'did is required' };
+    }
+    // Best-effort token revocation at the PDS (revokes refresh + access tokens and
+    // deletes the library-managed session row). Then purge our own rows so nothing
+    // lingers even if the network call failed.
+    let revoked = false;
+    try {
+      await oauthClient.revoke(did);
+      revoked = true;
+    } catch (err) {
+      req.log.warn(
+        { err, did },
+        'oauth revoke failed; purging local rows anyway',
+      );
+    }
+    const hadSession = stores.purgeDid(did);
+    return { ok: true, did, revoked, hadSession };
+  },
+);
 
 // ─── Internal: authed com.atproto.repo.* ─────────────────────────────────────
 
@@ -314,7 +387,11 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
 
   if (!did || !action) {
     reply.code(400);
-    return { ok: false, error: 'BadRequest', message: 'did and action are required' };
+    return {
+      ok: false,
+      error: 'BadRequest',
+      message: 'did and action are required',
+    };
   }
 
   // Restore the OAuth session for this DID (refreshes tokens transparently).
@@ -335,8 +412,10 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
   try {
     switch (action) {
       case 'list': {
-        if (!body.collection) return badReq(reply, 'collection required for list');
-        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
+        if (!body.collection)
+          return badReq(reply, 'collection required for list');
+        if (!isAllowedCollection(body.collection))
+          return collectionDenied(reply, body.collection);
         const res = await agent.com.atproto.repo.listRecords({
           repo: did,
           collection: body.collection,
@@ -346,8 +425,10 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         return { ok: true, data: res.data };
       }
       case 'create': {
-        if (!body.collection) return badReq(reply, 'collection required for create');
-        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
+        if (!body.collection)
+          return badReq(reply, 'collection required for create');
+        if (!isAllowedCollection(body.collection))
+          return collectionDenied(reply, body.collection);
         if (!body.record) return badReq(reply, 'record required for create');
         const res = await agent.com.atproto.repo.createRecord({
           repo: did,
@@ -358,8 +439,10 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         return { ok: true, data: res.data };
       }
       case 'put': {
-        if (!body.collection) return badReq(reply, 'collection required for put');
-        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
+        if (!body.collection)
+          return badReq(reply, 'collection required for put');
+        if (!isAllowedCollection(body.collection))
+          return collectionDenied(reply, body.collection);
         if (!body.rkey) return badReq(reply, 'rkey required for put');
         if (!body.record) return badReq(reply, 'record required for put');
         const res = await agent.com.atproto.repo.putRecord({
@@ -371,8 +454,10 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         return { ok: true, data: res.data };
       }
       case 'delete': {
-        if (!body.collection) return badReq(reply, 'collection required for delete');
-        if (!isAllowedCollection(body.collection)) return collectionDenied(reply, body.collection);
+        if (!body.collection)
+          return badReq(reply, 'collection required for delete');
+        if (!isAllowedCollection(body.collection))
+          return collectionDenied(reply, body.collection);
         if (!body.rkey) return badReq(reply, 'rkey required for delete');
         const res = await agent.com.atproto.repo.deleteRecord({
           repo: did,
@@ -388,7 +473,8 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         // Allow-list EVERY write's collection before touching the PDS — one
         // out-of-namespace write fails the whole batch (applyWrites is atomic).
         for (const w of body.writes) {
-          if (!isAllowedCollection(w.collection)) return collectionDenied(reply, w.collection);
+          if (!isAllowedCollection(w.collection))
+            return collectionDenied(reply, w.collection);
         }
         const writes = body.writes.map((w) => {
           const kind = w.action ?? w.$type?.split('#')[1];
@@ -414,10 +500,15 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
                 rkey: w.rkey ?? '',
               };
             default:
-              throw new Error(`unknown write action for collection ${w.collection}`);
+              throw new Error(
+                `unknown write action for collection ${w.collection}`,
+              );
           }
         });
-        const res = await agent.com.atproto.repo.applyWrites({ repo: did, writes });
+        const res = await agent.com.atproto.repo.applyWrites({
+          repo: did,
+          writes,
+        });
         return { ok: true, data: res.data };
       }
       default:
@@ -493,7 +584,11 @@ const reaperTimer = setInterval(() => {
       }
     })
     .then((dids) => {
-      if (dids.length > 0) app.log.info({ count: dids.length, dids }, 'reaper: purged expired sessions');
+      if (dids.length > 0)
+        app.log.info(
+          { count: dids.length, dids },
+          'reaper: purged expired sessions',
+        );
     })
     .catch((err) => app.log.error({ err }, 'reaper sweep failed'));
 }, cfg.reaperIntervalMs);

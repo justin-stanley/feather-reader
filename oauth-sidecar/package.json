@@ -26,6 +26,7 @@
     "@atproto/api": "^0.20.28",
     "@atproto/jwk-jose": "^0.2.4",
     "@atproto/oauth-client-node": "^0.4.8",
+    "@fastify/rate-limit": "^10.3.0",
     "fastify": "^5.2.0"
   },
   "devDependencies": {
