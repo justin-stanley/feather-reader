@@ -22,6 +22,15 @@ name: CodeQL
 #     Rust is covered by clippy (-D warnings) + cargo-deny + cargo-audit. Re-add
 #     the `rust` matrix entry once GitHub GA's a working Rust pack.
 
+# ── TRIGGERS / SCORECARD SAST COVERAGE ────────────────────────────────────────
+# Runs on EVERY pull_request targeting `main` (so every merged PR carries a
+# CodeQL check-run), on push to `main`, on a weekly deep scan, and manually.
+#
+# Do NOT add a `paths:`/`paths-ignore:` filter here. OSSF Scorecard's SAST check
+# samples recent merged PRs and expects a CodeQL check-run on each — including
+# config-only PRs (e.g. a lone Cargo.toml / *.yml change). A path filter would
+# skip those, drop the check-run, and regress the Scorecard SAST score. The
+# single javascript-typescript leg is cheap (~1 min) and always produces the run.
 on:
   push:
     branches: [main]
