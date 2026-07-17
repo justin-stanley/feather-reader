@@ -4,7 +4,11 @@
 # `featherreader` app + the Node atproto OAuth sidecar, under tini as PID1.
 #
 # Grounded in the source tree (read, not guessed):
-#   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021 / rust 1.82.
+#   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021 / rust 1.94
+#     (MSRV bumped from 1.82 to track current stable: sqlx 0.9 requires rustc
+#     1.94 and askama 0.16 requires 1.88 — a 1.82 builder can't even parse
+#     askama's `edition2024` manifest. CI stays green on 1.82's tag only because
+#     ci.yml builds on `@stable`; this pin must move with the dep floor).
 #     sqlx `sqlite-bundled` + `tls-rustls-ring` and reqwest `rustls` mean NO
 #     system libsqlite3 / OpenSSL are needed at runtime.
 #   * The DB schema is EMBEDDED in the binary (src/store.rs) — there is no
@@ -23,7 +27,7 @@
 # Runtime base is `node:24-bookworm-slim` (glibc), NOT bare debian-slim: it gives
 # a supported, correctly-linked `node` (no fragile hand-copy of the node binary
 # or its libstdc++6/libgcc-s1 deps into a bare base), and its glibc ABI matches
-# the rust:1.82-bookworm builder so the Rust binary + the (static) Caddy binary
+# the rust:1.94-bookworm builder so the Rust binary + the (static) Caddy binary
 # both run on it unchanged.
 #
 # Base images are pinned by @sha256. Digests are the multi-arch INDEX digests and
@@ -34,7 +38,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust builder: compile the `featherreader` binary.
 # ---------------------------------------------------------------------------
-FROM rust:1.82-bookworm@sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377 AS rust-build
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS rust-build
 
 # PART C toggle: when ENABLE_SBOM=1 the binary is built with `cargo auditable`,
 # which embeds the exact dependency graph into the ELF so `cargo audit bin` (and
