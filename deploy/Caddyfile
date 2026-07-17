@@ -53,6 +53,31 @@
 		format console
 	}
 
+	# --- Origin lock: require Cloudflare's injected shared secret --------------
+	# Cloudflare fronts this app (Full-strict) and sets `X-Origin-Auth` on every
+	# request via a Transform Rule. A request that reaches the Fly origin WITHOUT
+	# it bypassed Cloudflare (someone hit the origin IP directly) — reject it, so
+	# the cf-connecting-ip trust (rate limiting) and the edge WAF/cache rules
+	# can't be sidestepped. The secret comes from the FEATHERREADER_ORIGIN_SECRET
+	# env (a `fly secret`), never baked into this file/image.
+	#
+	# `/health` is EXEMPT: Fly's internal health probe hits it directly (not
+	# through Cloudflare, so no header) — gating it would flap the machine
+	# unhealthy. It only returns a static "ok featherreader/<ver>" string, so
+	# leaving it open to direct origin hits is harmless.
+	#
+	# Placed FIRST so nothing below routes for a header-less request. If
+	# FEATHERREADER_ORIGIN_SECRET is unset the matcher value is empty and every
+	# non-/health request is refused — fail CLOSED (a missing secret locks the
+	# door rather than opening it).
+	@no_origin_secret {
+		not path /health
+		not header X-Origin-Auth {env.FEATHERREADER_ORIGIN_SECRET}
+	}
+	handle @no_origin_secret {
+		respond 403
+	}
+
 	# --- Hard block: the sidecar's internal API is never edge-routable --------
 	# Matches the bare path AND the /oauth-prefixed path (the latter would else
 	# fall through handle_path /oauth/* -> sidecar /internal/*). This block is
