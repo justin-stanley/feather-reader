@@ -2147,9 +2147,10 @@ struct LoginQuery {
 /// `GET /login` — start the atproto OAuth flow, or render the handle form.
 ///
 /// **Pre-handshake gate:** starting OAuth (a `?handle=` GET) is refused unless
-/// the visitor already holds beta access *or* presents a valid reserving invite
-/// cookie — otherwise a non-invited visitor could burn a sidecar handshake.
-/// Refusal redirects to `/beta/redeem`. The bare form (no handle) always renders.
+/// the visitor is allowed by [`may_start_oauth`] — an existing beta seat (via
+/// session cookie *or* the submitted handle resolving to a seated DID) or a
+/// valid reserving invite cookie. Refusal redirects to `/beta/redeem`. The bare
+/// form (no handle) always renders.
 async fn login_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2160,7 +2161,7 @@ async fn login_form(
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
     {
-        if !may_start_oauth(&state, &headers).await {
+        if !may_start_oauth(&state, &headers, &handle).await {
             return Redirect::to("/beta/redeem").into_response();
         }
         return start_oauth(&state, &handle);
@@ -2183,19 +2184,57 @@ async fn login_submit(
     if handle.is_empty() {
         return login_error("Enter your atproto handle.");
     }
-    if !may_start_oauth(&state, &headers).await {
+    if !may_start_oauth(&state, &headers, handle).await {
         return Redirect::to("/beta/redeem").into_response();
     }
     start_oauth(&state, handle)
 }
 
-/// Whether this visitor is allowed to *start* the OAuth handshake: either an
-/// existing beta member (cookie session whose DID already holds a seat) or a
-/// fresh visitor carrying a valid reserving invite cookie. This is the
-/// pre-handshake guard that stops non-invited visitors from burning a sidecar
-/// handshake.
-async fn may_start_oauth(state: &AppState, headers: &HeaderMap) -> bool {
-    // An already-beta'd session may re-auth freely.
+/// Whether this visitor is allowed to *start* the OAuth handshake. The gate
+/// admits, in order of cost:
+///
+/// 1. an existing beta member's cookie session whose DID already holds a seat;
+/// 2. a fresh visitor carrying a valid reserving invite cookie;
+/// 3. a cookie-less visitor whose submitted `handle` resolves to a DID that
+///    already holds a seat — this honors the **seeded admin's first login** on a
+///    fresh deploy (and any returning member who cleared cookies) without a
+///    session cookie or an invite code.
+///
+/// The cookie/invite fast paths run FIRST and short-circuit, so the network
+/// handle→DID resolution is only attempted when neither applies. It fails
+/// CLOSED: a malformed/unresolvable handle, a resolution error/timeout, or a
+/// resolved DID with no seat all leave the visitor bounced to `/beta/redeem`.
+/// This keeps the anti-abuse intent — a rando now pays a cheap handle
+/// resolution instead of a burned sidecar handshake (and `/login` is already in
+/// the rate-limited path set).
+async fn may_start_oauth(state: &AppState, headers: &HeaderMap, handle: &str) -> bool {
+    // The production resolver is the app's existing atproto handle→DID path,
+    // routed through the SSRF guard. Resolution is injected so tests can exercise
+    // the gate without a live network call (the guard forbids loopback mocks).
+    may_start_oauth_with(state, headers, handle, |h| async move {
+        crate::atproto::resolve_handle(&state.http, &state.config.resolver_base, &h)
+            .await
+            .ok()
+    })
+    .await
+}
+
+/// Core of [`may_start_oauth`] with the handle→DID resolver injected as `resolve`
+/// (returning `Some(did)` on success, `None` on any failure/unresolvable handle).
+/// The cookie + invite fast paths run FIRST and short-circuit, so `resolve` is
+/// only called when neither admits — keeping the network round-trip off the hot
+/// path and preserving the fail-closed contract on resolution failure.
+async fn may_start_oauth_with<F, Fut>(
+    state: &AppState,
+    headers: &HeaderMap,
+    handle: &str,
+    resolve: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    // 1. An already-beta'd session may re-auth freely.
     if let Some(did) = current_did(state, headers).await {
         if store::has_beta_access(&state.db, &did)
             .await
@@ -2204,8 +2243,22 @@ async fn may_start_oauth(state: &AppState, headers: &HeaderMap) -> bool {
             return true;
         }
     }
-    // Otherwise require a valid reserving invite cookie.
-    invite_cookie_code(headers, &state.config.cookie_secret).is_some()
+    // 2. A valid reserving invite cookie.
+    if invite_cookie_code(headers, &state.config.cookie_secret).is_some() {
+        return true;
+    }
+    // 3. Cookie-less: honor an existing seat by resolving the submitted handle to
+    //    a DID (the seeded-admin first-login / cleared-cookies case). Fail closed
+    //    on any resolution error or unresolvable/malformed handle.
+    match resolve(handle.to_string()).await {
+        Some(did) => store::has_beta_access(&state.db, &did)
+            .await
+            .unwrap_or(false),
+        None => {
+            warn!(%handle, "handle resolution failed in pre-handshake beta gate");
+            false
+        }
+    }
 }
 
 /// Redirect the browser to the sidecar's public `/login` for `handle`.
@@ -3702,6 +3755,102 @@ mod tests {
             .unwrap();
         assert!(loc.contains("/login"), "loc = {loc}");
         assert_ne!(loc, "/beta/redeem");
+    }
+
+    /// A resolver that always fails — proves the fast paths short-circuit BEFORE
+    /// any network resolution and that a resolution failure fails closed.
+    async fn resolver_never(_handle: String) -> Option<String> {
+        None
+    }
+
+    /// A resolver that maps every handle to `did`.
+    fn resolver_to(did: &'static str) -> impl FnOnce(String) -> std::future::Ready<Option<String>> {
+        move |_handle| std::future::ready(Some(did.to_string()))
+    }
+
+    /// Path 3: a cookie-less visitor whose submitted handle resolves to a DID
+    /// that already holds a seat (the seeded-admin first-login case) passes the
+    /// gate — no session cookie, no invite code.
+    #[tokio::test]
+    async fn may_start_oauth_honors_seat_via_resolved_handle() {
+        // The seeded admin holds a seat (via ALLOWED_DIDS → ensure_seed) but has
+        // no cookie on a fresh deploy.
+        let state = test_state(&["did:plc:admin"]).await;
+        let headers = HeaderMap::new();
+        assert!(
+            may_start_oauth_with(
+                &state,
+                &headers,
+                "admin.example",
+                resolver_to("did:plc:admin")
+            )
+            .await,
+            "a handle resolving to a seated DID must pass the gate"
+        );
+    }
+
+    /// Path 3, negative: a handle that resolves to a DID with NO seat is bounced
+    /// — the anti-abuse intent is preserved (resolution succeeds, seat check
+    /// fails).
+    #[tokio::test]
+    async fn may_start_oauth_bounces_non_member_handle() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let headers = HeaderMap::new();
+        assert!(
+            !may_start_oauth_with(
+                &state,
+                &headers,
+                "rando.example",
+                resolver_to("did:plc:rando")
+            )
+            .await,
+            "a resolved DID with no seat must be bounced"
+        );
+    }
+
+    /// Fail-closed: an unresolvable/malformed handle (resolver returns `None`)
+    /// bounces gracefully — no panic, no handshake.
+    #[tokio::test]
+    async fn may_start_oauth_fails_closed_on_unresolvable_handle() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let headers = HeaderMap::new();
+        assert!(
+            !may_start_oauth_with(&state, &headers, "not a handle", resolver_never).await,
+            "an unresolvable handle must fail closed"
+        );
+    }
+
+    /// The session-cookie fast path admits a seated member WITHOUT calling the
+    /// resolver (proven by injecting `resolver_never`, which would otherwise
+    /// bounce).
+    #[tokio::test]
+    async fn may_start_oauth_session_cookie_shortcircuits_resolution() {
+        let state = test_state(&[]).await;
+        let did = "did:plc:member";
+        store::grant_access(&state.db, did, Some("member.example"), "test", None)
+            .await
+            .unwrap();
+        let cookie = session_cookie(&state, did, Some("member.example"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        assert!(
+            may_start_oauth_with(&state, &headers, "member.example", resolver_never).await,
+            "a seated session cookie must pass without resolution"
+        );
+    }
+
+    /// The invite-cookie fast path admits WITHOUT calling the resolver.
+    #[tokio::test]
+    async fn may_start_oauth_invite_cookie_shortcircuits_resolution() {
+        let state = test_state(&[]).await;
+        let cookie = sign_invite("FEATHER-ABCDWXYZ", &state.config.cookie_secret);
+        let cookie = cookie.split(';').next().unwrap().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        assert!(
+            may_start_oauth_with(&state, &headers, "someone.example", resolver_never).await,
+            "a valid invite cookie must pass without resolution"
+        );
     }
 
     #[tokio::test]

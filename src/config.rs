@@ -19,6 +19,7 @@
 //! | `FEATHERREADER_MAX_FEEDS`    | `10000`                  | Global distinct-feed ceiling. |
 //! | `FEATHERREADER_MAX_ENTRIES_PER_FEED` | `2000`           | Per-feed retained-entry cap (newest N). |
 //! | `FEATHERREADER_DB_SIZE_WATERMARK_BYTES` | `2 GiB`       | Above this the poller stops fetching new content (0 disables). |
+//! | `FEATHERREADER_RESOLVER_HOST` | `https://bsky.social`    | atproto handle-resolver base (`com.atproto.identity.resolveHandle`) the pre-handshake beta gate uses to honor an existing seat on a cookie-less login. |
 //!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
@@ -102,6 +103,12 @@ pub struct Config {
     /// is served as this DID (local runs without the OAuth sidecar). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
+    /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
+    /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
+    /// handle into a DID so an existing seat can be honored on a cookie-less first
+    /// login. Defaults to [`crate::atproto::DEFAULT_RESOLVER_HOST`]. From
+    /// `FEATHERREADER_RESOLVER_HOST`.
+    pub resolver_base: String,
 }
 
 /// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
@@ -187,6 +194,7 @@ impl Default for Config {
             sidecar: SidecarConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             dev_did: None,
+            resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
         }
     }
 }
@@ -313,6 +321,10 @@ impl Config {
         // deployment never silently falls back to a shared identity.
         let dev_did = env_opt("FEATHERREADER_DEV_DID");
 
+        let resolver_base = env_opt("FEATHERREADER_RESOLVER_HOST")
+            .map(|u| u.trim_end_matches('/').to_string())
+            .unwrap_or(defaults.resolver_base);
+
         let config = Self {
             bind,
             db_path,
@@ -330,6 +342,7 @@ impl Config {
             sidecar,
             cookie_secret,
             dev_did,
+            resolver_base,
         };
 
         // FAIL LOUD: a non-loopback (public) instance must never fall back to the
