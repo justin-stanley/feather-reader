@@ -34,7 +34,7 @@
 # cookie / internal / enc secrets are missing or weak on this (public) instance.
 
 app = "featherreader"
-primary_region = "sea"
+primary_region = "ord"
 
 [build]
   # Image is built + pushed by .github/workflows/release-image.yml to GHCR with
