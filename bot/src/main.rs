@@ -216,8 +216,9 @@ async fn handle_follower(
 
 /// Mint a claim for `did` (cap-aware) and persist the code+url on the row BEFORE
 /// returning, so a subsequent post failure resumes from the stored code rather
-/// than minting again. Returns `None` when the app signals the beta is full (the
-/// DID's intent row is dropped so a later cycle retries once seats free up).
+/// than minting again. Returns `None` when the app signals the beta is full — the
+/// DID's row is marked `waitlisted` (non-terminal), so a later cycle retries the
+/// mint once seats free up.
 async fn mint(
     app: &AppClient,
     store: &Store,

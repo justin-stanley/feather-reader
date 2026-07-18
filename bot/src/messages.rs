@@ -83,14 +83,20 @@ pub fn render(template: &str, handle: &str, url: &str) -> RenderedPost {
     RenderedPost { text, mention }
 }
 
-/// Pick a template at random and render it. Kept separate from [`render`] so
-/// tests can render a specific template deterministically.
+/// Pick a template pseudo-randomly and render it. Kept separate from [`render`]
+/// so tests can render a specific template deterministically.
+///
+/// Message selection needs *variety*, not cryptographic randomness, so this uses
+/// a cheap clock-derived index (no `rand`/`getrandom` dependency — which keeps the
+/// bot's supply chain small). Consecutive posts land microseconds apart, so the
+/// low bits of the nanosecond clock spread the choice across the templates well
+/// enough that the timeline doesn't read as one fixed template.
 pub fn render_random(handle: &str, url: &str) -> RenderedPost {
-    use rand::seq::SliceRandom;
-    let template = TEMPLATES
-        .choose(&mut rand::thread_rng())
-        .copied()
-        .unwrap_or(TEMPLATES[0]);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as usize;
+    let template = TEMPLATES[nanos % TEMPLATES.len()];
     render(template, handle, url)
 }
 
