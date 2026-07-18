@@ -84,7 +84,9 @@ lexicon.
 
 Caddy fronts everything on a single port — routing `/oauth/*` to the Node
 confidential-client sidecar and the rest to the Rust server. The SQLite cache on
-the mounted volume is disposable; all durable state lives in your PDS.
+the mounted volume is disposable; all durable state lives in your PDS. An
+[optional follow→invite bot](#invite-bot-optional) runs *outside* this container
+and reaches the app over `POST /bot/claims`; it isn't part of the core app.
 
 <sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
 
@@ -153,6 +155,17 @@ FeatherReader is designed to be run by anyone: a single static Rust binary plus
 the sidecar, an embedded SQLite cache, and no external database. Front it with
 your own reverse proxy / TLS. Teardown and data-ownership notes live in
 [`deploy/`](deploy/).
+
+## Invite bot (optional)
+
+The repo also ships a small, **optional** follow→invite bot in [`bot/`](bot/) — a
+tool for running a closed invite-beta, **not** needed to self-host the reader. It's
+a standalone Rust crate (its own workspace, deliberately **not** built by the app's
+`cargo build`) that watches an atproto account's followers and, for each new one,
+calls the app's `POST /bot/claims` to mint a single-use invite, then posts a public
+claim link. That endpoint stays disabled unless `FEATHERREADER_BOT_SECRET` is set,
+so the core app runs fine without the bot. Details + configuration in
+[`bot/README.md`](bot/README.md).
 
 ## Contributing
 
