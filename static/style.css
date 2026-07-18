@@ -259,6 +259,11 @@ button {
 }
 
 .btn-primary:hover {
+  /* Keep the label on the accent fill: without this, the global a:hover rule
+     (color: var(--accent-deep)) repaints an <a class="btn-primary"> label in
+     the same spruce as its background, so the text vanishes on hover in BOTH
+     themes. --on-accent stays legible on the accent fill in light and dark. */
+  color: var(--on-accent);
   background: var(--accent-deep);
   border-color: var(--accent-deep);
 }
