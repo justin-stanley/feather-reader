@@ -1,0 +1,57 @@
+# cargo-deny configuration for the standalone follow→invite bot crate.
+#
+# The bot is its OWN workspace (see bot/Cargo.toml), so it needs its own deny.toml
+# — the repo-root `cargo deny` gate evaluates only the app crate. Run locally with:
+#   cd bot && cargo deny check
+#
+# License policy is kept in lock-step with the app's root deny.toml: every crate
+# must carry an AGPL-3.0-compatible, OSI-approved (or public-domain-equivalent)
+# license, since the bot ships under AGPL-3.0-only too.
+
+[graph]
+# Evaluate all target platforms so a target-gated crate (e.g. the UEFI-only
+# `r-efi` pulled by getrandom) is still license-checked rather than silently
+# skipped on the dev/CI host.
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "AGPL-3.0-only",   # this crate
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",             # zmij (serde_json's float formatter), most of the tree
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",         # ryu — permissive, AGPL-compatible
+    "0BSD",
+    "CC0-1.0",         # public-domain dedication
+    "Unlicense",       # public-domain dedication
+    "Zlib",
+    "MPL-2.0",         # file-level copyleft, compatible
+    "Unicode-3.0",     # ICU crates (unicode-ident et al.)
+    "CDLA-Permissive-2.0", # webpki-root-certs — permissive data license
+]
+# `r-efi`'s SPDX expression is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; cargo-deny
+# resolves the OR to a permissive branch (MIT/Apache-2.0) automatically, so no
+# per-crate clarification is needed. (GitHub's dependency-review-action does NOT do
+# this and needs an explicit exemption — see .github/workflows/dependency-review.yml.)
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+# Only crates.io — no unvetted git/registry supply-chain inputs.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

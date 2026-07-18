@@ -1,0 +1,8 @@
+/target
+# Local idempotency store + its WAL sidecars (bot host state, never committed).
+invite-bot.db
+invite-bot.db-shm
+invite-bot.db-wal
+*.db
+*.db-shm
+*.db-wal

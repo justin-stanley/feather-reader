@@ -27,6 +27,13 @@
 #     SIDECAR_PUBLIC_URL="https://feather-reader.com/oauth" \
 #     SIDECAR_APP_CALLBACK_URL="https://feather-reader.com/oauth/callback" \
 #     FEATHERREADER_ALLOWED_DIDS="did:plc:..."
+#
+# OPTIONAL SECRET — only if running the follow→invite bot (POST /bot/claims):
+#   fly secrets set FEATHERREADER_BOT_SECRET="$(openssl rand -base64 48)"
+# Unset ⇒ /bot/claims returns 503 (endpoint disabled). If set on this (public)
+# instance it must be strong (>= 32 bytes, not a dev default) or boot fails. The
+# bot host must be given the SAME value (see bot/README.md). Optionally also
+#   FEATHERREADER_CLAIM_TTL_SECS   (default 1209600 = 14 days)
 # SIDECAR_PUBLIC_URL is the BROWSER-facing value (client_id/redirect_uri). The
 # server-to-server SIDECAR_INTERNAL_URL is a NON-secret loopback value baked into
 # the image + set in [env] below, so /internal/* calls never egress the edge.

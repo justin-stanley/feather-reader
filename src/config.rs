@@ -20,6 +20,8 @@
 //! | `FEATHERREADER_MAX_ENTRIES_PER_FEED` | `2000`           | Per-feed retained-entry cap (newest N). |
 //! | `FEATHERREADER_DB_SIZE_WATERMARK_BYTES` | `2 GiB`       | Above this the poller stops fetching new content (0 disables). |
 //! | `FEATHERREADER_RESOLVER_HOST` | `https://bsky.social`    | atproto handle-resolver base (`com.atproto.identity.resolveHandle`) the pre-handshake beta gate uses to honor an existing seat on a cookie-less login. |
+//! | `FEATHERREADER_BOT_SECRET`   | *(unset = `/bot/claims` disabled)* | Shared bearer secret (`X-Bot-Secret`) gating the headless follow→invite bot's mint endpoint `POST /bot/claims`. Unset ⇒ endpoint returns 503. MUST be set (strong) on a production-like instance if the bot is used. |
+//! | `FEATHERREADER_CLAIM_TTL_SECS` | `1209600` (14 days)   | TTL for a bot-minted claim invite code — long, since the claim link is delivered asynchronously (a public skeet). |
 //!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
@@ -109,6 +111,19 @@ pub struct Config {
     /// login. Defaults to [`crate::atproto::DEFAULT_RESOLVER_HOST`]. From
     /// `FEATHERREADER_RESOLVER_HOST`.
     pub resolver_base: String,
+    /// Shared bearer secret gating the headless bot mint endpoint (`POST
+    /// /bot/claims`), sent by the follow→invite bot as `X-Bot-Secret`. When empty
+    /// the endpoint is DISABLED (503) — a bot can't mint. Like the cookie/sidecar
+    /// secrets it MUST be set on a production-like instance (fail-loud at boot);
+    /// on a loopback/dev instance it stays unset so `/bot/claims` is simply off
+    /// until an operator opts in. From `FEATHERREADER_BOT_SECRET`.
+    pub bot_secret: Option<String>,
+    /// TTL (seconds) for a claim invite code minted by `POST /bot/claims`. The
+    /// bot delivers the claim link asynchronously (a public skeet), so this is a
+    /// generous window — the admin-mint browser flow's 30-minute TTL would expire
+    /// before the follower ever taps the link. From `FEATHERREADER_CLAIM_TTL_SECS`,
+    /// default 14 days.
+    pub claim_ttl_secs: i64,
 }
 
 /// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
@@ -145,6 +160,11 @@ const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8081";
 /// A stable, clearly-marked dev cookie key. Overridden by
 /// `FEATHERREADER_COOKIE_SECRET` in any real deployment.
 const DEV_COOKIE_SECRET: &str = "featherreader-dev-cookie-secret-change-me";
+
+/// Default TTL for a bot-minted claim code: 14 days. Long enough that an
+/// asynchronously-delivered claim link (a public follow-back skeet) is still
+/// live when the follower taps it.
+const DEFAULT_CLAIM_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 
 impl Default for SidecarConfig {
     fn default() -> Self {
@@ -195,6 +215,8 @@ impl Default for Config {
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
+            bot_secret: None,
+            claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
         }
     }
 }
@@ -325,6 +347,21 @@ impl Config {
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or(defaults.resolver_base);
 
+        // Shared bot secret gating `POST /bot/claims`. Unset => the endpoint is
+        // disabled; `validate_secrets` still fail-loud rejects the *published dev
+        // default* / a too-short value on a production-like instance.
+        let bot_secret = env_opt("FEATHERREADER_BOT_SECRET");
+
+        let claim_ttl_secs = match env_opt("FEATHERREADER_CLAIM_TTL_SECS") {
+            Some(raw) => {
+                let secs: i64 = raw.parse().with_context(|| {
+                    format!("FEATHERREADER_CLAIM_TTL_SECS: expected seconds, got {raw:?}")
+                })?;
+                validate_claim_ttl(secs)?
+            }
+            None => defaults.claim_ttl_secs,
+        };
+
         let config = Self {
             bind,
             db_path,
@@ -343,6 +380,8 @@ impl Config {
             cookie_secret,
             dev_did,
             resolver_base,
+            bot_secret,
+            claim_ttl_secs,
         };
 
         // FAIL LOUD: a non-loopback (public) instance must never fall back to the
@@ -387,6 +426,12 @@ impl Config {
             &self.sidecar.internal_secret,
             DEV_INTERNAL_SECRET,
         )?;
+        // The bot secret is OPTIONAL (unset => `/bot/claims` disabled, which is a
+        // safe default). But if it IS set on a production-like instance it must be
+        // strong — a weak/short shared bearer would let anyone mint claim codes.
+        if let Some(bot_secret) = &self.bot_secret {
+            check_secret("FEATHERREADER_BOT_SECRET", bot_secret, "")?;
+        }
         // Split-deploy footgun: on a production-like instance, if the sidecar's
         // INTERNAL base equals its PUBLIC base and that base is non-loopback, the
         // Rust server would send the `X-Internal-Secret` + all session/repo
@@ -467,6 +512,20 @@ fn public_url_is_non_loopback(public_url: &str) -> bool {
         },
         Err(_) => true,
     }
+}
+
+/// Validate a parsed `FEATHERREADER_CLAIM_TTL_SECS`: it MUST be positive. The
+/// bot-minted claim link is delivered ASYNCHRONOUSLY (a public skeet), so a
+/// non-positive TTL mints an instantly-expired, dead link the follower can never
+/// redeem. Fail loud at boot rather than silently hand out broken links.
+fn validate_claim_ttl(secs: i64) -> Result<i64> {
+    if secs <= 0 {
+        anyhow::bail!(
+            "FEATHERREADER_CLAIM_TTL_SECS must be > 0 (got {secs}); a non-positive TTL yields \
+             instantly-expired, dead claim links"
+        );
+    }
+    Ok(secs)
 }
 
 /// Read an env var, treating an empty value the same as unset.
@@ -630,6 +689,91 @@ mod tests {
                 internal_url: "http://127.0.0.1:8081".to_string(),
                 internal_secret: "b".repeat(48),
             },
+            ..Config::default()
+        };
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn bot_secret_defaults_unset() {
+        let c = Config::default();
+        assert!(c.bot_secret.is_none());
+        assert_eq!(c.claim_ttl_secs, DEFAULT_CLAIM_TTL_SECS);
+    }
+
+    #[test]
+    fn claim_ttl_must_be_positive() {
+        // A positive TTL passes through unchanged.
+        assert_eq!(validate_claim_ttl(3600).unwrap(), 3600);
+        assert_eq!(
+            validate_claim_ttl(DEFAULT_CLAIM_TTL_SECS).unwrap(),
+            DEFAULT_CLAIM_TTL_SECS
+        );
+        // Zero and negative are rejected loudly (they mint dead, expired links).
+        for bad in [0, -1, -1209600] {
+            let err = validate_claim_ttl(bad).unwrap_err().to_string();
+            assert!(err.contains("FEATHERREADER_CLAIM_TTL_SECS"), "{err}");
+            assert!(err.contains("must be > 0"), "{err}");
+        }
+    }
+
+    #[test]
+    fn loopback_instance_allows_weak_bot_secret() {
+        // On a dev/loopback instance the bot secret isn't validated (the whole
+        // secret policy is skipped), so even a short one is accepted.
+        let c = Config {
+            bot_secret: Some("short".to_string()),
+            ..Config::default()
+        };
+        assert!(!c.is_prod_like());
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_bind_with_short_bot_secret_refuses_boot() {
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            bot_secret: Some("too-short".to_string()),
+            ..Config::default()
+        };
+        let err = c.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("FEATHERREADER_BOT_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn public_bind_with_strong_bot_secret_boots() {
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            bot_secret: Some("c".repeat(48)),
+            ..Config::default()
+        };
+        assert!(c.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_bind_with_unset_bot_secret_boots() {
+        // An unset bot secret is fine on prod (the endpoint is just disabled).
+        let c = Config {
+            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
+            cookie_secret: "a".repeat(48),
+            sidecar: SidecarConfig {
+                public_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_url: DEFAULT_SIDECAR_URL.to_string(),
+                internal_secret: "b".repeat(48),
+            },
+            bot_secret: None,
             ..Config::default()
         };
         assert!(c.validate_secrets().is_ok());
