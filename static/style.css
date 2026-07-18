@@ -1729,6 +1729,16 @@ html[data-overlay="1"] .kbd-overlay {
   }
 }
 
+/* A chrome page whose only rail is the mobile topbar (e.g. /about): it reuses
+   .shell for the sticky mobile back-bar but has no persistent rail, so at the
+   >=900px breakpoint it must opt out of the two-column rail grid. Without this
+   it inherits `grid-template-columns: var(--rail-w) minmax(0,1fr)` and its
+   content collapses into the empty 280px rail slot. Instead: one centered
+   column (the inner .about / .colophon keep their own reading measure). */
+.shell-plain {
+  display: block;
+}
+
 /* /about — same reading measure + serif voice as an article. */
 .about {
   max-width: calc(var(--measure) + 2 * var(--s5));
