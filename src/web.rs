@@ -58,7 +58,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -241,6 +241,10 @@ pub fn router(state: AppState) -> Router {
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
         .nest_service("/static", ServeDir::new("static"))
+        // Browsers (and some feed clients) request /favicon.ico at the root
+        // regardless of the <link rel="icon"> tags; serve the same icon that
+        // lives under /static so the bare path stops 404-ing.
+        .route_service("/favicon.ico", ServeFile::new("static/favicon.ico"))
         // Cache-Control (viral/CDN plan): `public, max-age=300` on the cacheable
         // logged-out landing + static assets, `no-store` on anything that
         // rendered a session's private view. Runs *inside* the security layers so
@@ -3701,6 +3705,34 @@ mod tests {
         assert_eq!(
             preflight_code(&state, &code).await,
             Err(store::RedeemError::CapacityFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn favicon_ico_served_at_root() {
+        // Browsers request bare /favicon.ico regardless of the <link rel="icon">
+        // tags in <head>; the root route must serve the icon, not 404.
+        let state = test_state(&[]).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("icon") || ct.starts_with("image/"),
+            "content-type = {ct}"
         );
     }
 
