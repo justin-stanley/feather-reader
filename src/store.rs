@@ -1456,6 +1456,24 @@ pub async fn count_beta_access(pool: &SqlitePool) -> Result<i64> {
     Ok(row.get::<i64, _>("n"))
 }
 
+/// Count `active`, unexpired invite codes — the outstanding-but-unredeemed seats
+/// a bot has already promised. Added to [`count_beta_access`] this is the "seats
+/// committed" figure the bot mint path (`POST /bot/claims`) checks against the
+/// cap, so it doesn't over-promise more claims than seats remain (the redeem-time
+/// cap in [`redeem_code`] is the hard backstop; this avoids telling a follower
+/// "you're in" for a seat that will be full by the time they claim it).
+pub async fn count_active_codes(pool: &SqlitePool) -> Result<i64> {
+    let now = now_unix();
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM invite_codes WHERE status = 'active' AND expires_at >= ?1",
+    )
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .context("count_active_codes failed")?;
+    Ok(row.get::<i64, _>("n"))
+}
+
 /// Grant a beta seat directly (admin / seed path — no code consumed). Idempotent
 /// on `did` (re-granting updates the row rather than erroring).
 pub async fn grant_access(
@@ -2478,6 +2496,27 @@ mod tests {
         // Raising the cap lets the same code redeem.
         let ok = redeem_code(&pool, &code, "did:plc:new", None, 2).await?;
         assert_eq!(ok, Ok(()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_active_codes_excludes_expired_and_redeemed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        assert_eq!(count_active_codes(&pool).await?, 0);
+
+        // Two live codes.
+        let a = mint_code(&pool, "did:plc:bot", 3600).await?;
+        let _b = mint_code(&pool, "did:plc:bot", 3600).await?;
+        assert_eq!(count_active_codes(&pool).await?, 2);
+
+        // An expired code doesn't count.
+        insert_expired_code(&pool, "FEATHER-EXPIRED0", "did:plc:bot").await?;
+        assert_eq!(count_active_codes(&pool).await?, 2);
+
+        // Redeeming one drops the active count.
+        let out = redeem_code(&pool, &a, "did:plc:new", None, 100).await?;
+        assert_eq!(out, Ok(()));
+        assert_eq!(count_active_codes(&pool).await?, 1);
         Ok(())
     }
 
