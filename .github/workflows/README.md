@@ -11,7 +11,7 @@ small amount of hosted minutes, so their triggers are deliberately narrow.
 | Workflow | Runner | Triggers | What it does |
 |---|---|---|---|
 | `ci.yml` | **self-hosted** | push/PR to `main`, manual | The gate. Jobs: **rust** (build/test/clippy `-D warnings`/rustfmt), **cargo-deny** (licenses + bans + advisories + sources via `deny.toml`), **cargo-audit** (RustSec), **sidecar** (npm ci/build/typecheck + **ESLint** + **Prettier `--check`** + `npm audit --omit=dev`), **secrets** (**gitleaks** tree + history via `.gitleaks.toml`). |
-| `codeql.yml` | **GitHub-hosted** (`ubuntu-latest`) | push to `main` + weekly cron + manual | SAST for `javascript-typescript` (sidecar) and `rust` (axum server; CodeQL Rust is public beta). Results → Security tab. Free once public. |
+| `codeql.yml` | **GitHub-hosted** (`ubuntu-latest`) | **PR to `main`** + push to `main` + weekly cron + manual | SAST for `javascript-typescript` (the OAuth sidecar). Runs on **every** PR — no `paths:` filter, so config-only PRs still get a CodeQL check-run (OSSF Scorecard's SAST check needs one on each merged PR). Rust is covered by clippy + cargo-deny + cargo-audit (CodeQL's Rust extractor errored on all files; re-add when GA'd). Results → Security tab. Free once public. |
 | `dependency-review.yml` | **GitHub-hosted** | pull_request to `main` | Blocks PRs that add vulnerable deps or disallowed licenses (aligned with `deny.toml`). Needs the Dependency Graph — free/on for public repos. |
 | `scorecard.yml` | **GitHub-hosted** | branch-protection change + weekly cron + push `main` | OpenSSF supply-chain posture score → Security tab + public badge. Most useful once public. |
 | `../dependabot.yml` | n/a (GitHub-native) | weekly | Grouped minor/patch update PRs for **cargo** (`/`), **npm** (`/oauth-sidecar`), **github-actions** (`/`), and **docker** (`/deploy`, commented until a Dockerfile lands). |
@@ -24,11 +24,13 @@ small amount of hosted minutes, so their triggers are deliberately narrow.
 * **GitHub-hosted (`codeql.yml`, `dependency-review.yml`, `scorecard.yml`)** —
   these tools ship in the GitHub-hosted Actions image / call GitHub-only APIs
   (dependency graph, code-scanning SARIF ingest, the Scorecard API). They are
-  **free for public repositories**. While the repo is still private they consume
-  hosted minutes, so:
-  * CodeQL runs on **default-branch push + weekly cron only** (not every PR).
-    Once public, switch it to `pull_request:` for per-PR scanning at no cost.
-  * `dependency-review` and `scorecard` only become fully effective once public
+  **free for public repositories**, which is the steady state for this repo:
+  * CodeQL runs on **every PR to `main`** plus push to `main` and a weekly cron.
+    Do **not** add a `paths:`/`paths-ignore:` filter — OSSF Scorecard's SAST
+    check inspects recent merged PRs and wants a CodeQL check-run on each one,
+    including config-only PRs. A path filter would silently skip those and
+    regress the Scorecard SAST score.
+  * `dependency-review` and `scorecard` are fully effective on the public repo
     (they lean on the dependency graph / public results).
 
 ## Local pre-push parity
