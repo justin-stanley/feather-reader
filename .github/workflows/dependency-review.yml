@@ -45,12 +45,22 @@ jobs:
           # NOT denied — it's this project's own license.)
           deny-licenses: >-
             GPL-2.0-only, GPL-3.0-only, LGPL-3.0-only, SSPL-1.0
-          # Per-package license exemption. `r-efi` is a UEFI-target-only crate
-          # pulled transitively by the rustls TLS stack (getrandom → r-efi, seen in
-          # bot/Cargo.lock) that NEVER compiles on this project's Linux/Fly targets.
-          # Its SPDX expression `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is an OR —
-          # a permissive branch is available and taken — but the action naively
-          # matches the LGPL term against `deny-licenses` and blocks. Exempt it; the
-          # permissive option keeps us AGPL-compatible. (deny.toml still governs the
-          # *shipped* app crate — this only unblocks the standalone bot's lockfile.)
-          allow-dependencies-licenses: pkg:cargo/r-efi
+          # Per-package license exemptions (version-pinned purls). Each is a
+          # transitive crate the action mis-flags; cargo-deny (the REQUIRED gate,
+          # deny.toml) resolves all three correctly — these unblock the advisory-only
+          # dependency-review action to match.
+          #   * r-efi 6.0.0 — UEFI-target-only crate pulled by the rustls TLS stack
+          #     (getrandom → r-efi); NEVER compiles on this project's Linux/Fly
+          #     targets. Its SPDX `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is an OR
+          #     with a permissive branch we take, but the action naively matches the
+          #     LGPL term against deny-licenses and blocks.
+          #   * webpki-root-certs 1.0.8 — Mozilla root store, license CDLA-Permissive-2.0
+          #     (a permissive DATA license the action can't map → reads as unknown).
+          #   * zmij 1.0.23 — dtolnay's Schubfach double→string formatter, a genuine
+          #     transitive dep of serde_json ≥1.0.145. Real license is MIT (verified
+          #     on crates.io: published by dtolnay, repo github.com/dtolnay/zmij);
+          #     the action reads it as null/unknown, so pin-exempt it.
+          allow-dependencies-licenses: >-
+            pkg:cargo/r-efi@6.0.0,
+            pkg:cargo/webpki-root-certs@1.0.8,
+            pkg:cargo/zmij@1.0.23

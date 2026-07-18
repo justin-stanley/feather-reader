@@ -12,9 +12,10 @@
 //! | `BOT_APP_PASSWORD`           | **yes**  | A DEDICATED atproto app password with WRITE scope (not the account's primary password). Vaultwarden-injected. |
 //! | `FEATHERREADER_APP_BASE`     | no (default `https://feather-reader.com`) | Base URL of the FeatherReader app the bot mints claims against. |
 //! | `FEATHERREADER_BOT_SECRET`   | **yes**  | Shared bearer for `POST /bot/claims` (== the app's Fly secret of the same name). Vaultwarden-injected. |
-//! | `BOT_STATE_DB`               | no (default `invite-bot.db`) | SQLite idempotency store on the bot host. |
+//! | `BOT_STATE_DB`               | no (default `invite-bot.db`) | SQLite idempotency store on the bot host. MUST be an ABSOLUTE path on a persistent volume in production (a relative/ephemeral path re-mints on every restart). |
 //! | `BOT_POLL_INTERVAL_SECS`     | no (default `300` = 5 min) | How often to poll `getFollowers`. |
 //! | `BOT_MAX_PER_CYCLE`          | no (default `10`) | Safety cap on how many NEW followers to process per poll (blunts a follow spike). |
+//! | `BOT_MAX_DAILY_MINTS`        | no (default `50`) | Global daily budget on fresh claim mints across ALL cycles — a sybil-farming brake (a flood of throwaway follows can't drain the beta in a day). Idempotent re-posts/waitlist-welcomes don't count. |
 //! | `RUST_LOG`                   | no (default `info`) | Tracing filter. |
 
 use anyhow::{Context, Result};
@@ -49,6 +50,8 @@ pub struct Config {
     pub poll_interval_secs: u64,
     /// Max new followers processed per poll cycle.
     pub max_per_cycle: usize,
+    /// Global daily budget on FRESH claim mints across all cycles (sybil brake).
+    pub max_daily_mints: usize,
 }
 
 impl Config {
@@ -73,11 +76,40 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             bot_secret,
-            state_db: opt("BOT_STATE_DB").unwrap_or_else(|| "invite-bot.db".to_string()),
+            state_db: resolve_state_db()?,
             poll_interval_secs: parse_or("BOT_POLL_INTERVAL_SECS", 300)?,
             max_per_cycle: parse_or("BOT_MAX_PER_CYCLE", 10)?,
+            max_daily_mints: parse_or("BOT_MAX_DAILY_MINTS", 50)?,
         })
     }
+}
+
+/// Resolve `BOT_STATE_DB`, warning LOUDLY if it is a relative (non-absolute) path.
+///
+/// The state DB is the bot's per-DID idempotency cache; if it lives on an ephemeral
+/// filesystem (or a relative path that changes with the working directory), a
+/// restart re-processes every follower. The app-side DID idempotency (B1) is the
+/// authoritative backstop against re-minting, but a non-persistent store still
+/// causes needless re-posting and waitlist churn, so we insist on an absolute path
+/// on a persistent volume. We WARN rather than hard-fail on the default so a quick
+/// local run still works, but a clearly-ephemeral `/tmp` path is called out.
+fn resolve_state_db() -> Result<String> {
+    let path = opt("BOT_STATE_DB").unwrap_or_else(|| "invite-bot.db".to_string());
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
+        tracing::warn!(
+            %path,
+            "BOT_STATE_DB is a RELATIVE path — in production set it to an ABSOLUTE \
+             path on a PERSISTENT volume, or a restart will re-process every follower"
+        );
+    } else if path.starts_with("/tmp/") || path.starts_with("/var/tmp/") {
+        tracing::warn!(
+            %path,
+            "BOT_STATE_DB is under a temp dir — this is NOT a persistent volume; a \
+             reboot loses the idempotency cache and re-processes followers"
+        );
+    }
+    Ok(path)
 }
 
 /// An env var, empty treated as unset.

@@ -66,13 +66,58 @@ impl Store {
                 code         TEXT,
                 claim_url    TEXT,
                 post_uri     TEXT,
+                -- 1 once the waitlist-welcome skeet has been posted for this DID,
+                -- so a follower who stays `waitlisted` across many cycles is NOT
+                -- re-welcomed every cycle (post-once semantics).
+                welcomed     INTEGER NOT NULL DEFAULT 0,
                 created_at   INTEGER NOT NULL,
                 delivered_at INTEGER
             );
             "#,
         )
         .context("create bot schema")?;
+        conn.execute_batch(
+            r#"
+            -- One row per FRESH claim mint, for the global daily mint budget (the
+            -- sybil brake). Idempotent re-posts / waitlist-welcomes are NOT logged
+            -- here, so the budget only meters genuinely-new seats handed out.
+            CREATE TABLE IF NOT EXISTS mint_log (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                did      TEXT NOT NULL,
+                minted_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mint_log_time ON mint_log (minted_at);
+            "#,
+        )
+        .context("create bot mint_log schema")?;
+        // Additive migration for an OLD bot DB that predates `welcomed`. SQLite has
+        // no `ADD COLUMN IF NOT EXISTS`, so probe `table_info` first.
+        Self::ensure_welcomed_column(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Add the `welcomed` column to an existing `handled` table if it is missing.
+    fn ensure_welcomed_column(conn: &Connection) -> Result<()> {
+        let present: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(handled)")?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            let mut found = false;
+            for c in cols {
+                if c? == "welcomed" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !present {
+            conn.execute(
+                "ALTER TABLE handled ADD COLUMN welcomed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .context("add handled.welcomed column")?;
+        }
+        Ok(())
     }
 
     /// Whether this DID has reached a TERMINAL state (`delivered` or `skipped`) —
@@ -176,6 +221,76 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Whether the waitlist-welcome skeet has already been posted for `did`. The
+    /// welcome is posted ONCE; a follower who stays `waitlisted` across many cycles
+    /// must not be re-welcomed every cycle.
+    pub fn was_welcomed(&self, did: &str) -> Result<bool> {
+        let flag: Option<i64> = self
+            .conn
+            .query_row("SELECT welcomed FROM handled WHERE did = ?1", [did], |r| {
+                r.get(0)
+            })
+            .ok();
+        Ok(flag.unwrap_or(0) != 0)
+    }
+
+    /// Record that the waitlist-welcome skeet has been posted for `did` (creating
+    /// or updating the row, leaving status/handle intact). Idempotent.
+    pub fn mark_welcomed(&self, did: &str, handle: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO handled (did, handle, status, welcomed, created_at)
+             VALUES (?1, ?2, 'waitlisted', 1, ?3)
+             ON CONFLICT(did) DO UPDATE SET
+                 welcomed=1,
+                 handle=COALESCE(excluded.handle, handled.handle)",
+            rusqlite::params![did, handle, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Record a FRESH claim mint for the global daily budget (the sybil brake).
+    /// Call this ONLY when the app returns a freshly-minted claim — not on an
+    /// idempotent re-post of an existing one, so the budget meters real new seats.
+    pub fn record_mint(&self, did: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO mint_log (did, minted_at) VALUES (?1, ?2)",
+            rusqlite::params![did, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Count fresh mints in the rolling window `[now - window_secs, now]` — the
+    /// figure the poll loop checks against `max_daily_mints` before minting more.
+    pub fn count_mints_since(&self, window_secs: i64) -> Result<usize> {
+        let cutoff = now() - window_secs;
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM mint_log WHERE minted_at >= ?1",
+            [cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Enumerate the DIDs currently `waitlisted` (with their stored handle), so the
+    /// poll loop can RETRY their mint each cycle INDEPENDENT of follower paging —
+    /// a waitlisted follower who scrolled off the first `MAX_PAGES` of getFollowers
+    /// would otherwise be stranded until they happened to be re-seen. Bounded by the
+    /// caller (`max_per_cycle`); ordered oldest-first (FIFO fairness).
+    pub fn waitlisted_dids(&self, limit: usize) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT did, handle FROM handled
+             WHERE status = 'waitlisted'
+             ORDER BY created_at ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 fn now() -> i64 {
@@ -262,5 +377,59 @@ mod tests {
         // A waitlisted row PERSISTS but is NON-terminal, so a later cycle retries
         // it (the poll loop keeps collecting it) while operators can still see it.
         assert!(!s.is_terminal("did:plc:w").unwrap());
+    }
+
+    #[test]
+    fn welcome_is_posted_once_per_waitlisted_did() {
+        let s = mem();
+        // Not welcomed until marked.
+        assert!(!s.was_welcomed("did:plc:w").unwrap());
+        s.mark_welcomed("did:plc:w", Some("w.test")).unwrap();
+        assert!(s.was_welcomed("did:plc:w").unwrap());
+        // Marking is idempotent and keeps the waitlisted status (non-terminal).
+        s.mark_welcomed("did:plc:w", Some("w.test")).unwrap();
+        assert!(s.was_welcomed("did:plc:w").unwrap());
+        assert_eq!(s.status_of("did:plc:w").unwrap(), Some(Status::Waitlisted));
+        assert!(!s.is_terminal("did:plc:w").unwrap());
+        // A later delivery (seat freed) clears the pipeline without disturbing the
+        // welcomed flag (the follower already got their welcome post).
+        s.record_minted_code("did:plc:w", "FEATHER-ZZ", "https://x/claim?t=9")
+            .unwrap();
+        s.mark_delivered("did:plc:w", "FEATHER-ZZ", "https://x/claim?t=9", "at://p")
+            .unwrap();
+        assert_eq!(s.status_of("did:plc:w").unwrap(), Some(Status::Delivered));
+        assert!(s.was_welcomed("did:plc:w").unwrap());
+    }
+
+    #[test]
+    fn waitlisted_dids_enumerates_for_retry_bounded_and_fifo() {
+        let s = mem();
+        // Two waitlisted, one delivered, one skipped — only the waitlisted appear.
+        s.mark_status("did:plc:w1", Some("w1"), Status::Waitlisted)
+            .unwrap();
+        s.mark_status("did:plc:w2", Some("w2"), Status::Waitlisted)
+            .unwrap();
+        s.record_intent("did:plc:d", Some("d")).unwrap();
+        s.mark_delivered("did:plc:d", "c", "u", "p").unwrap();
+        s.mark_status("did:plc:s", None, Status::Skipped).unwrap();
+
+        let all = s.waitlisted_dids(10).unwrap();
+        assert_eq!(all.len(), 2);
+        let dids: Vec<&str> = all.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(dids.contains(&"did:plc:w1"));
+        assert!(dids.contains(&"did:plc:w2"));
+        // The bound is honoured.
+        assert_eq!(s.waitlisted_dids(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mint_log_counts_within_window() {
+        let s = mem();
+        assert_eq!(s.count_mints_since(86_400).unwrap(), 0);
+        s.record_mint("did:plc:a").unwrap();
+        s.record_mint("did:plc:b").unwrap();
+        assert_eq!(s.count_mints_since(86_400).unwrap(), 2);
+        // A zero-width window (cutoff == now) still counts mints stamped this second.
+        assert_eq!(s.count_mints_since(0).unwrap(), 2);
     }
 }

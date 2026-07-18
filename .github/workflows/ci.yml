@@ -170,6 +170,62 @@ jobs:
         # break CI. Fails on high/critical advisories.
         run: npm audit --omit=dev --audit-level=high
 
+  bot:
+    name: Invite bot (build + test + lint + deny + audit)
+    # The follow→invite bot is a STANDALONE workspace (bot/Cargo.toml has its own
+    # `[workspace]`), so the root Rust / cargo-deny / cargo-audit jobs above NEVER
+    # touch it. This job gives the bot the SAME gates as the app, scoped to `bot/`.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install stable toolchain (clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable  # required — SHA-pinned, so the @ref no longer selects the toolchain
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: bot  # cache the bot workspace's target/, not the repo root
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+      # The bot's supply-chain gates live here (mirroring the app's jobs). The
+      # bot's own bot/deny.toml carries the AGPL-compatible license allowlist,
+      # including CDLA-Permissive-2.0 (webpki-root-certs) and MIT (zmij); r-efi's
+      # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` OR-expression resolves to a
+      # permissive branch automatically.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo-deny (licenses + bans + sources)
+        run: cargo-deny check bans licenses sources
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: cargo audit
+        # `-D warnings` promotes unmaintained/unsound advisories to failures too.
+        run: cargo audit -D warnings
+
   secrets:
     name: Secret scan (gitleaks)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)

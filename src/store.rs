@@ -245,15 +245,23 @@ CREATE TABLE IF NOT EXISTS beta_access (
 );
 
 CREATE TABLE IF NOT EXISTS invite_codes (
-    code        TEXT PRIMARY KEY,
-    creator_did TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    invitee_did TEXT,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL,
-    redeemed_at INTEGER
+    code         TEXT PRIMARY KEY,
+    creator_did  TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    invitee_did  TEXT,
+    -- The follower DID a bot-minted claim was minted FOR (recorded at mint time,
+    -- distinct from `invitee_did` which is stamped at redeem). This is the
+    -- server-side idempotency key: a second `POST /bot/claims` for a DID that
+    -- already holds an outstanding active code returns the SAME code instead of
+    -- minting a duplicate, so a bot-host state loss cannot re-mint per follower.
+    intended_did TEXT,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    redeemed_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_invite_codes_status ON invite_codes (status, expires_at);
+-- Look up an outstanding active claim by the DID it was minted for (bot dedupe).
+CREATE INDEX IF NOT EXISTS idx_invite_codes_intended ON invite_codes (intended_did, status);
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
@@ -357,6 +365,17 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "PRAGMA table_info(read_cursor)",
         "pds_created",
         "ALTER TABLE read_cursor ADD COLUMN pds_created INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    // invite_codes.intended_did — the follower DID a bot claim was minted for, the
+    // server-side idempotency key for `POST /bot/claims`. Older DBs (before the
+    // follow→invite bot) predate it; it is nullable (browser/admin-minted codes
+    // leave it NULL).
+    ensure_column(
+        pool,
+        "PRAGMA table_info(invite_codes)",
+        "intended_did",
+        "ALTER TABLE invite_codes ADD COLUMN intended_did TEXT",
     )
     .await?;
     Ok(())
@@ -1505,26 +1524,76 @@ pub async fn grant_access(
 }
 
 /// Mint a new `active` invite code owned by `creator_did`, expiring `ttl_secs`
-/// from now. Returns the generated code string.
+/// from now. Returns the generated code string. The browser/admin path leaves the
+/// bot idempotency key (`intended_did`) NULL; see [`mint_code_for_did`] for the
+/// bot path that records the target follower.
 pub async fn mint_code(pool: &SqlitePool, creator_did: &str, ttl_secs: i64) -> Result<String> {
+    mint_code_inner(pool, creator_did, ttl_secs, None).await
+}
+
+/// Like [`mint_code`] but records the follower `intended_did` the code is minted
+/// FOR, so a later `POST /bot/claims` for the same DID can return the SAME code
+/// (see [`find_active_code_for_did`]) rather than minting a duplicate. This is the
+/// app-side idempotency backstop that survives a bot-host state loss.
+pub async fn mint_code_for_did(
+    pool: &SqlitePool,
+    creator_did: &str,
+    ttl_secs: i64,
+    intended_did: &str,
+) -> Result<String> {
+    mint_code_inner(pool, creator_did, ttl_secs, Some(intended_did)).await
+}
+
+async fn mint_code_inner(
+    pool: &SqlitePool,
+    creator_did: &str,
+    ttl_secs: i64,
+    intended_did: Option<&str>,
+) -> Result<String> {
     let code = generate_invite_code()?;
     let now = now_unix();
     let expires_at = now.saturating_add(ttl_secs.max(0));
     sqlx::query(
         r#"
         INSERT INTO invite_codes
-            (code, creator_did, status, invitee_did, created_at, expires_at, redeemed_at)
-        VALUES (?1, ?2, 'active', NULL, ?3, ?4, NULL)
+            (code, creator_did, status, invitee_did, intended_did, created_at, expires_at, redeemed_at)
+        VALUES (?1, ?2, 'active', NULL, ?3, ?4, ?5, NULL)
         "#,
     )
     .bind(&code)
     .bind(creator_did)
+    .bind(intended_did)
     .bind(now)
     .bind(expires_at)
     .execute(pool)
     .await
     .with_context(|| format!("mint_code failed for creator {creator_did}"))?;
     Ok(code)
+}
+
+/// The `code` of an outstanding (`active`, unexpired) invite minted FOR the
+/// follower `intended_did`, if one exists — the app-side idempotency lookup for
+/// `POST /bot/claims`. `Some(code)` means "return this existing code, do NOT mint
+/// a second"; `None` means "no live code for this DID — mint one". If several
+/// exist (shouldn't, but a race could) the soonest-expiring is returned so the
+/// bot re-posts the one closest to needing a refresh.
+pub async fn find_active_code_for_did(
+    pool: &SqlitePool,
+    intended_did: &str,
+) -> Result<Option<String>> {
+    let now = now_unix();
+    let row = sqlx::query(
+        "SELECT code FROM invite_codes
+         WHERE intended_did = ?1 AND status = 'active' AND expires_at >= ?2
+         ORDER BY expires_at ASC
+         LIMIT 1",
+    )
+    .bind(intended_did)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("find_active_code_for_did failed for {intended_did}"))?;
+    Ok(row.map(|r| r.get::<String, _>("code")))
 }
 
 /// Atomically redeem an invite code for `did`, granting a beta seat.
@@ -1788,6 +1857,16 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
             .await
             .with_context(|| format!("scrub invitee_did for {did}"))?
             .rows_affected();
+
+    // A departing DID may also be the TARGET of an outstanding bot claim
+    // (`intended_did`, minted for them before they joined/left) — NULL it so no
+    // per-DID residue survives. The code itself (creator = the bot account) is
+    // left to expire/redeem normally.
+    sqlx::query("UPDATE invite_codes SET intended_did = NULL WHERE intended_did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("scrub intended_did for {did}"))?;
 
     let granted_by_scrubbed =
         sqlx::query("UPDATE beta_access SET granted_by = ?2 WHERE granted_by = ?1")

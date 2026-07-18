@@ -353,9 +353,12 @@ impl Config {
         let bot_secret = env_opt("FEATHERREADER_BOT_SECRET");
 
         let claim_ttl_secs = match env_opt("FEATHERREADER_CLAIM_TTL_SECS") {
-            Some(raw) => raw.parse().with_context(|| {
-                format!("FEATHERREADER_CLAIM_TTL_SECS: expected seconds, got {raw:?}")
-            })?,
+            Some(raw) => {
+                let secs: i64 = raw.parse().with_context(|| {
+                    format!("FEATHERREADER_CLAIM_TTL_SECS: expected seconds, got {raw:?}")
+                })?;
+                validate_claim_ttl(secs)?
+            }
             None => defaults.claim_ttl_secs,
         };
 
@@ -509,6 +512,20 @@ fn public_url_is_non_loopback(public_url: &str) -> bool {
         },
         Err(_) => true,
     }
+}
+
+/// Validate a parsed `FEATHERREADER_CLAIM_TTL_SECS`: it MUST be positive. The
+/// bot-minted claim link is delivered ASYNCHRONOUSLY (a public skeet), so a
+/// non-positive TTL mints an instantly-expired, dead link the follower can never
+/// redeem. Fail loud at boot rather than silently hand out broken links.
+fn validate_claim_ttl(secs: i64) -> Result<i64> {
+    if secs <= 0 {
+        anyhow::bail!(
+            "FEATHERREADER_CLAIM_TTL_SECS must be > 0 (got {secs}); a non-positive TTL yields \
+             instantly-expired, dead claim links"
+        );
+    }
+    Ok(secs)
 }
 
 /// Read an env var, treating an empty value the same as unset.
@@ -682,6 +699,22 @@ mod tests {
         let c = Config::default();
         assert!(c.bot_secret.is_none());
         assert_eq!(c.claim_ttl_secs, DEFAULT_CLAIM_TTL_SECS);
+    }
+
+    #[test]
+    fn claim_ttl_must_be_positive() {
+        // A positive TTL passes through unchanged.
+        assert_eq!(validate_claim_ttl(3600).unwrap(), 3600);
+        assert_eq!(
+            validate_claim_ttl(DEFAULT_CLAIM_TTL_SECS).unwrap(),
+            DEFAULT_CLAIM_TTL_SECS
+        );
+        // Zero and negative are rejected loudly (they mint dead, expired links).
+        for bad in [0, -1, -1209600] {
+            let err = validate_claim_ttl(bad).unwrap_err().to_string();
+            assert!(err.contains("FEATHERREADER_CLAIM_TTL_SECS"), "{err}");
+            assert!(err.contains("must be > 0"), "{err}");
+        }
     }
 
     #[test]
