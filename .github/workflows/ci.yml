@@ -1,7 +1,9 @@
 name: CI
 
-# Build / test / lint / audit gate. Runs entirely on a SELF-HOSTED runner
-# (labelled `self-hosted, linux, x64`) to spend zero GitHub-hosted Actions minutes.
+# Build / test / lint / audit gate. Runs on GitHub-hosted `ubuntu-latest` — free
+# and unlimited for this public repo, with the 5 jobs running in parallel. (They
+# used to be pinned to the single self-hosted ci-VM runner to save private-repo
+# minutes; that rationale went away when the repo went public.)
 # CodeQL, dependency-review, and OSSF Scorecard live in their own workflows
 # (they are designed for GitHub-hosted runners — see those files + the README).
 
@@ -13,12 +15,11 @@ on:
   workflow_dispatch:  # allow manual runs from the Actions tab / gh CLI
 
 concurrency:
-  # One in-flight CI run per ref. With a SINGLE self-hosted runner and 13+ open
-  # Dependabot PRs, every superseded push would otherwise queue a full 5-job run
-  # behind the others. Keying on the PR number (falling back to the ref for
-  # push/dispatch) and cancelling in-progress runs means a new push to a PR
-  # kills its own stale run instead of piling up. Distinct PRs still run
-  # serially on the one runner, but no PR wastes the queue on outdated commits.
+  # One in-flight CI run per ref: a new push to a PR cancels that PR's own
+  # in-progress run rather than letting a superseded 5-job build finish. Keyed on
+  # the PR number (falling back to the ref for push/dispatch). On GitHub-hosted
+  # runners the jobs also run in parallel — so this is purely about not wasting a
+  # run on outdated commits.
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -33,14 +34,14 @@ permissions:
 jobs:
   rust:
     name: Rust
-    # FORK-PR GUARD (applied to every job): never run untrusted fork code on the
-    # self-hosted, tailnet-connected runner — a slipped-in build.rs / proc-macro /
-    # npm lifecycle script would be RCE on the homelab. Same-repo PRs + push /
-    # dispatch only. Fork PRs get NO CI here; add a hosted ubuntu-latest lane if
-    # they should. Harmless while private (all PRs are same-repo); closes the hole
-    # before the public flip.
+    # FORK-PR GUARD (applied to every job): same-repo PRs + push / dispatch only;
+    # fork PRs get NO CI. Originally to keep untrusted fork code (a slipped-in
+    # build.rs / proc-macro / npm lifecycle script) off the self-hosted homelab
+    # runner. Now that CI is GitHub-hosted (sandboxed; secrets aren't exposed to
+    # fork-PR workflows) that RCE risk is gone — so this is now a POLICY choice:
+    # drop this `if:` to give contributor PRs CI.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -68,7 +69,7 @@ jobs:
   cargo-deny:
     name: cargo deny (licenses + bans + sources)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -82,7 +83,7 @@ jobs:
 
       # Install a pinned cargo-deny binary directly (rather than
       # EmbarkStudios/cargo-deny-action@v2, whose bundled RustSec advisory-DB
-      # fetch failed on this self-hosted runner and broke the gate every run).
+      # fetch broke the gate on the old self-hosted runner every run).
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
@@ -102,7 +103,7 @@ jobs:
   cargo-audit:
     name: cargo audit (RustSec)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -129,7 +130,7 @@ jobs:
   sidecar:
     name: OAuth sidecar
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — GitHub free-tier minutes are precious
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     defaults:
       run:
         working-directory: oauth-sidecar
@@ -172,7 +173,7 @@ jobs:
   secrets:
     name: Secret scan (gitleaks)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: [self-hosted, linux, x64]  # self-hosted CI VM — scans fine here now
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     env:
       GITLEAKS_VERSION: 8.28.0
     steps:
