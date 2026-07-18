@@ -1,0 +1,16 @@
+flowchart TB
+    B["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>proxy · cache · origin lock"]
+    subgraph Fly["Fly.io container — tini + gosu"]
+        Caddy["Caddy edge · :8080"]
+        App["Rust app · axum · :8082"]
+        Side["Node OAuth sidecar · :8081"]
+        DB[("SQLite cache · /data")]
+        Caddy -->|"/oauth/*"| Side
+        Caddy -->|"everything else"| App
+        App --- DB
+        App <-->|"internal API"| Side
+    end
+    CF -->|"X-Origin-Auth"| Caddy
+    App -->|"conditional GET · SSRF-guarded"| Feeds[("Feed origins")]
+    App <-->|"com.atproto.repo.*"| PDS[("Your atproto PDS")]
+    Side <-->|"OAuth handshake · tokens"| PDS

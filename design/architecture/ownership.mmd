@@ -1,0 +1,6 @@
+flowchart LR
+    You(["You"]) -->|"read · star · mark read"| FR["FeatherReader"]
+    FR -->|"fetch + parse"| Feeds[("RSS / Atom feeds")]
+    FR -.->|"disposable"| Cache[("Local SQLite cache")]
+    FR <-->|"subscriptions · folders · stars · read-state<br/>(community.lexicon.rss.*)"| PDS[("Your atproto PDS")]
+    PDS -.->|"same records — portable"| Other["Any other atproto reader"]
