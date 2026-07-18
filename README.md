@@ -55,6 +55,51 @@ The record types:
 - `community.lexicon.rss.saved` — a starred / saved item
 - `community.lexicon.rss.readState` — a compact per-feed read cursor
 
+## Architecture
+
+Two views — **where your data lives** and **how the running system is wired**.
+Both render inline on GitHub and adapt to your light/dark theme.
+
+**Data ownership — your PDS is the source of truth**
+
+```mermaid
+flowchart LR
+    You(["You"]) -->|"read · star · mark read"| FR["FeatherReader"]
+    FR -->|"fetch + parse"| Feeds[("RSS / Atom feeds")]
+    FR -.->|"disposable"| Cache[("Local SQLite cache")]
+    FR <-->|"subscriptions · folders · stars · read-state<br/>(community.lexicon.rss.*)"| PDS[("Your atproto PDS")]
+    PDS -.->|"same records — portable"| Other["Any other atproto reader"]
+```
+
+Your subscriptions and read-state are records in **your** PDS, so the local cache
+is throwaway and your reading list follows you to any reader that speaks the same
+lexicon.
+
+**Runtime — one container, three processes**
+
+```mermaid
+flowchart TB
+    B["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>proxy · cache · origin lock"]
+    subgraph Fly["Fly.io container — tini + gosu"]
+        Caddy["Caddy edge · :8080"]
+        App["Rust app · axum · :8082"]
+        Side["Node OAuth sidecar · :8081"]
+        DB[("SQLite cache · /data")]
+        Caddy -->|"/oauth/*"| Side
+        Caddy -->|"everything else"| App
+        App --- DB
+        App <-->|"internal API"| Side
+    end
+    CF -->|"X-Origin-Auth"| Caddy
+    App -->|"conditional GET · SSRF-guarded"| Feeds[("Feed origins")]
+    App <-->|"com.atproto.repo.*"| PDS[("Your atproto PDS")]
+    Side <-->|"OAuth handshake · tokens"| PDS
+```
+
+Caddy fronts everything on a single port — routing `/oauth/*` to the Node
+confidential-client sidecar and the rest to the Rust server. The SQLite cache on
+the mounted volume is disposable; all durable state lives in your PDS.
+
 ## Features
 
 - **A clean list + a distraction-free reader view** — the headline feature.
