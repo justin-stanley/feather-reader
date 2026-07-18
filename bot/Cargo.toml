@@ -1,0 +1,45 @@
+# The follow→invite bot is a STANDALONE crate, deliberately NOT a member of the
+# app's build. The repo root has no `[workspace]`, so `cargo build` there only
+# builds `feather-reader`; this crate is built/tested on its own (see
+# bot/README.md). Keeping it separate keeps the app's Cargo.lock — and the
+# repo-root `cargo deny` / `cargo audit` gates — free of the bot's dependency
+# tree. The empty `[workspace]` below pins THIS directory as its own workspace
+# root so a future root workspace never silently absorbs it.
+[workspace]
+
+[package]
+name = "feather-reader-invite-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Follow→invite bot for FeatherReader: watches @feather-reader.com followers and posts a public claim link to each new one."
+authors = ["Justin Stanley"]
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "invite-bot"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "time", "signal"] }
+
+# The bot speaks atproto XRPC directly over reqwest (getFollowers is a public
+# GET; com.atproto.server.createSession + com.atproto.repo.createRecord are
+# simple JSON POSTs). Talking raw XRPC — rather than pulling a heavy client SDK —
+# keeps the dependency/audit surface small AND makes the self-hosted-PDS path
+# (pds.justin-stanley.com) explicit: every call targets the account's OWN PDS.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+# Local idempotency store (handled DIDs), same SQLite engine as the app.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"

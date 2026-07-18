@@ -31,6 +31,11 @@
 //! * `GET  /opml/export` — OPML export (records → a downloadable document).
 //! * `GET /login` + `POST /login` + `/oauth/callback` + `/logout` — the atproto
 //!   OAuth sign-in flow (routed through the sidecar).
+//! * `GET /claim?t=<token>` — the follow→invite bot's claim link: an opaque token
+//!   reserving a pre-minted invite code; behaves like a successful `/beta/redeem`
+//!   (sets the reserving cookie → `/login`).
+//! * `POST /bot/claims` — headless, shared-secret (`X-Bot-Secret`) mint of a claim
+//!   code + token/url for the bot to post. Cap-aware (409 when full).
 //!
 //! ## Identity — a cookie-resolved atproto session
 //!
@@ -236,6 +241,12 @@ pub fn router(state: AppState) -> Router {
             "/beta/redeem",
             get(beta_redeem_form).post(beta_redeem_submit),
         )
+        // The follow→invite bot's claim link: a public skeet points a new
+        // follower here with an opaque token that reserves a pre-minted code.
+        .route("/claim", get(claim))
+        // Headless bot mint endpoint (shared-secret, not OAuth). Mints a claim
+        // code + returns its token/url for the bot to post.
+        .route("/bot/claims", post(bot_mint_claim))
         .route("/admin/invites", post(admin_mint_invites))
         .route("/account/delete", post(account_delete))
         .route("/oauth/callback", get(oauth_callback))
@@ -296,12 +307,16 @@ fn static_header_layer(
 /// /mark-all. Read-only navigation is intentionally *not* limited.
 fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
     use axum::http::Method;
-    if method != Method::POST && !(method == Method::GET && path == "/login") {
+    // `/claim` is a GET (a link the bot posts), but it consumes a reservation and
+    // a claim token in a public URL is grabbable, so it MUST be per-IP limited
+    // like the other abuse-prone entry points — not just `/login`.
+    if method != Method::POST && !(method == Method::GET && (path == "/login" || path == "/claim"))
+    {
         return false;
     }
     match path {
-        "/login" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all" | "/admin/invites"
-        | "/account/delete" | "/folders" => true,
+        "/login" | "/claim" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all"
+        | "/admin/invites" | "/bot/claims" | "/account/delete" | "/folders" => true,
         // Every per-record subscription/folder mutation (delete/rename) and the
         // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
         p => {
@@ -2575,7 +2590,19 @@ async fn beta_redeem_submit(
 /// typed [`store::RedeemError`] variants so the two paths share one message map.
 async fn preflight_code(state: &AppState, code: &str) -> Result<(), store::RedeemError> {
     // Cap check first: a clear "capacity full" beats "code invalid" when both.
-    let count = store::count_beta_access(&state.db).await.unwrap_or(0);
+    // FAIL CLOSED on a count error — an `unwrap_or(0)` would let a DB blip read as
+    // "0 seats used" and wave the redeem through the preflight. (`redeem_code`
+    // still backstops the real cap inside its tx, so this is a consistency /
+    // defence-in-depth fix, not the only guard.) Treat an unverifiable count as
+    // capacity-full: the redeemer sees "at capacity, try later" rather than a mint
+    // that might overrun the cap.
+    let count = match store::count_beta_access(&state.db).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(%err, "preflight_code: count_beta_access failed; failing closed");
+            return Err(store::RedeemError::CapacityFull);
+        }
+    };
     if count >= state.config.beta_cap {
         return Err(store::RedeemError::CapacityFull);
     }
@@ -2665,6 +2692,346 @@ async fn admin_mint_invites(
 }
 
 // ---------------------------------------------------------------------------
+// Bot claim link: /claim?t=<token>  +  POST /bot/claims (shared-secret mint)
+// ---------------------------------------------------------------------------
+
+/// Query for `GET /claim`.
+#[derive(Debug, Deserialize)]
+struct ClaimQuery {
+    /// The opaque claim token from the bot's public follow-back skeet.
+    t: Option<String>,
+}
+
+/// `GET /claim?t=<token>` — redeem a bot-issued claim link.
+///
+/// The follow→invite bot posts a public skeet mentioning a new follower with a
+/// link here. The token wraps a pre-minted invite code (never the raw code — see
+/// [`sign_claim_token`]). On a valid, still-redeemable token this behaves exactly
+/// like a successful `POST /beta/redeem`: it sets the reserving `fr_invite`
+/// cookie and sends the visitor to `/login`, so they flow through OAuth and the
+/// callback atomically consumes the code (`store::redeem_code`) — the same
+/// machinery as a pasted code. On any failure it bounces to the invite page with
+/// the matching message.
+///
+/// Single-use / grabbability: a token in a public URL is grabbable. The code it
+/// wraps is single-use (redeem flips `active→redeemed`), and `preflight_code`
+/// here rejects an already-used / expired / capacity-full code before reserving,
+/// so a replayed link past the first successful claim is refused. The residual
+/// window is the same as any pasted invite code: whoever completes OAuth *first*
+/// with a live reservation wins the seat. The per-IP rate limit on `/claim`
+/// blunts brute-force enumeration.
+async fn claim(State(state): State<AppState>, Query(q): Query<ClaimQuery>) -> Response {
+    let token = match q.t {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            warn!("claim link with no token");
+            return redeem_bounce(&store::RedeemError::NotFound);
+        }
+    };
+
+    // Unwrap the token → the invite code it reserves. A tampered/forged token
+    // yields nothing → treat as an invalid code (don't leak whether it parsed).
+    let code = match claim_token_code(&token, &state.config.cookie_secret) {
+        Some(c) => c,
+        None => {
+            warn!("claim token invalid (bad signature / malformed)");
+            return redeem_bounce(&store::RedeemError::NotFound);
+        }
+    };
+
+    // Re-run the same preflight as the pasted-code path: exists, active,
+    // unexpired, seat free. This is what makes a replayed link past first-claim
+    // (or past cap) fail cleanly.
+    match preflight_code(&state, &code).await {
+        Ok(()) => {
+            let cookie = sign_invite(&code, &state.config.cookie_secret);
+            let mut resp = Redirect::to("/login").into_response();
+            set_cookie(&mut resp, &cookie);
+            info!("claim token preflight OK; reserving intent + redirecting to /login");
+            resp
+        }
+        Err(policy) => {
+            warn!(?policy, "claim token preflight rejected");
+            redeem_bounce(&policy)
+        }
+    }
+}
+
+/// The JSON body `POST /bot/claims` accepts — the follower the claim is FOR.
+///
+/// Passing the follower DID makes the APP the authoritative deduper: the app can
+/// short-circuit a DID that already holds a seat, and return the SAME code for a
+/// DID that already has an outstanding claim — so a bot-host state loss cannot
+/// re-mint or re-post per follower. Handle is advisory (logs only).
+#[derive(Debug, Default, Deserialize)]
+struct BotClaimRequest {
+    /// The follower's DID (the idempotency key). Optional for backward-compat: an
+    /// omitted DID falls back to the old un-keyed mint (no server-side dedupe).
+    #[serde(default)]
+    did: Option<String>,
+    /// The follower's handle (advisory; recorded for operator logs only).
+    #[serde(default)]
+    #[allow(dead_code)]
+    handle: Option<String>,
+}
+
+/// The JSON body `POST /bot/claims` returns on success.
+#[derive(Debug, serde::Serialize)]
+struct BotClaimResponse {
+    /// Server-side dedupe outcome, so the bot knows whether to post:
+    /// `"minted"` (a fresh code — post the claim link), `"existing"` (this DID
+    /// already had an outstanding claim; the SAME code/token/url is returned, so an
+    /// idempotent re-post is safe), or `"already_seated"` (this DID already holds
+    /// beta access; code/token/url are empty and the bot should post NOTHING).
+    status: &'static str,
+    /// The bare invite code (`FEATHER-…`) — for the bot's own logs/idempotency
+    /// store. NEVER post this publicly; post the `url` instead. Empty when
+    /// `already_seated`.
+    code: String,
+    /// The opaque claim token (the code wrapped + signed). Empty when
+    /// `already_seated`.
+    token: String,
+    /// The full claim URL to put in the public skeet: `${public_url}/claim?t=…`.
+    /// Empty when `already_seated`.
+    url: String,
+}
+
+/// `POST /bot/claims` — headless, shared-secret mint of a claim link.
+///
+/// Auth is a bearer shared secret in the `X-Bot-Secret` header (== the Fly secret
+/// `FEATHERREADER_BOT_SECRET`), NOT an OAuth cookie — so the homelab-hosted bot
+/// can call it. When `FEATHERREADER_BOT_SECRET` is unset the endpoint is DISABLED
+/// (503), so a bare/dev instance never exposes an unauthenticated mint.
+///
+/// Server-side DID idempotency (the authoritative dedupe backstop): the request
+/// body carries the follower `did`. The app — not the bot's local SQLite — is the
+/// source of truth, so a bot-host state loss cannot re-mint or re-post per
+/// follower:
+///   * DID already holds beta access → `200 {status:"already_seated"}` (empty
+///     code/url; the bot marks it handled and posts NOTHING);
+///   * DID already has an outstanding active claim → `200 {status:"existing"}`
+///     returning the SAME code/token/url (idempotent — never a second mint);
+///   * otherwise mint a fresh code recorded FOR that DID → `200 {status:"minted"}`.
+///
+/// Cap accounting: the bot must not promise more claims than seats remain, so
+/// this refuses with `409 Conflict {"error":"full"}` when
+/// `beta_access + outstanding active codes >= FEATHERREADER_BETA_CAP`. (The
+/// redeem-time cap in `store::redeem_code` is still the hard backstop.) The count
+/// queries FAIL CLOSED: a DB error propagates as `500` rather than reading 0 and
+/// minting past the cap.
+///
+/// On a fresh mint it uses the generous claim TTL (`FEATHERREADER_CLAIM_TTL_SECS`,
+/// default 14d — the admin browser flow's 30-min TTL would expire before the
+/// follower taps an async-delivered link).
+async fn bot_mint_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // 1. The endpoint is OFF unless a bot secret is configured.
+    let bot_secret = match state.config.bot_secret.as_deref() {
+        Some(s) => s,
+        None => {
+            warn!(
+                "POST /bot/claims called but FEATHERREADER_BOT_SECRET is unset (endpoint disabled)"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bot mint endpoint disabled (FEATHERREADER_BOT_SECRET unset)\n",
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Constant-time bearer check on the X-Bot-Secret header.
+    let presented = headers
+        .get("x-bot-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !bot_secret_matches(presented, bot_secret) {
+        warn!("POST /bot/claims rejected: bad or missing X-Bot-Secret");
+        return (StatusCode::UNAUTHORIZED, "bad bot secret\n").into_response();
+    }
+
+    // 2b. Parse the (optional) JSON body → the follower DID/handle. An empty body
+    // (legacy caller) parses to an all-None request; a malformed body is a 400.
+    let req: BotClaimRequest = if body.is_empty() {
+        BotClaimRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(%err, "POST /bot/claims: bad JSON body");
+                return (StatusCode::BAD_REQUEST, "bad json body\n").into_response();
+            }
+        }
+    };
+    let follower_did = req.did.as_deref().filter(|d| !d.is_empty());
+
+    // 3. Server-side DID idempotency (only when a DID was supplied):
+    if let Some(did) = follower_did {
+        // 3a. Already seated → tell the bot to post nothing.
+        match store::has_beta_access(&state.db, did).await {
+            Ok(true) => {
+                info!("bot mint: DID already holds beta access; already_seated");
+                return bot_claim_json(BotClaimResponse {
+                    status: "already_seated",
+                    code: String::new(),
+                    token: String::new(),
+                    url: String::new(),
+                });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                // Fail closed: a DB error must not fall through to a fresh mint.
+                warn!(%err, "bot mint: has_beta_access failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed\n").into_response();
+            }
+        }
+        // 3b. Outstanding active claim for this DID → return the SAME code (no
+        // second mint). This is what survives a bot-host state loss.
+        match store::find_active_code_for_did(&state.db, did).await {
+            Ok(Some(code)) => {
+                info!("bot mint: existing outstanding claim for DID; returning same code");
+                let token = sign_claim_token(&code, &state.config.cookie_secret);
+                let url = format!("{}/claim?t={}", state.config.public_url, qenc(&token));
+                return bot_claim_json(BotClaimResponse {
+                    status: "existing",
+                    code,
+                    token,
+                    url,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(%err, "bot mint: find_active_code_for_did failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed\n").into_response();
+            }
+        }
+    }
+
+    // 4. Cap accounting: seats already granted + outstanding unredeemed codes.
+    //    FAIL CLOSED — a count error is a 500, not a silent mint past the cap.
+    let granted = match store::count_beta_access(&state.db).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(%err, "bot mint: count_beta_access failed; failing closed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "count failed\n").into_response();
+        }
+    };
+    let outstanding = match store::count_active_codes(&state.db).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(%err, "bot mint: count_active_codes failed; failing closed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "count failed\n").into_response();
+        }
+    };
+    if granted + outstanding >= state.config.beta_cap {
+        info!(
+            granted,
+            outstanding,
+            cap = state.config.beta_cap,
+            "bot mint refused: at capacity"
+        );
+        return (
+            StatusCode::CONFLICT,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\":\"full\"}\n",
+        )
+            .into_response();
+    }
+
+    // 5. Mint with the generous claim TTL, recording the follower DID (when given)
+    //    so a re-request for the same DID returns THIS code idempotently.
+    let bot_did = state
+        .config
+        .admin_seed_dids()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "did:bot:featherreader".to_string());
+    let minted = match follower_did {
+        Some(did) => {
+            store::mint_code_for_did(&state.db, &bot_did, state.config.claim_ttl_secs, did).await
+        }
+        None => store::mint_code(&state.db, &bot_did, state.config.claim_ttl_secs).await,
+    };
+    let code = match minted {
+        Ok(c) => c,
+        // S4: the dedupe check (3b) and this mint are separate statements, so two
+        // concurrent requests for one DID can both fall through 3b's `Ok(None)`.
+        // The partial unique index `idx_invite_codes_intended_active` makes the
+        // loser's INSERT fail (only one active row per intended DID), which
+        // surfaces here as a conflict. Recover by returning the winner's existing
+        // code (same shape as the 3b idempotent path) instead of a 500.
+        Err(err) if follower_did.is_some() && store::is_intended_active_conflict(&err) => {
+            match store::find_active_code_for_did(&state.db, follower_did.unwrap()).await {
+                Ok(Some(code)) => {
+                    info!("bot mint: lost the mint race; returning the concurrently-minted code");
+                    let token = sign_claim_token(&code, &state.config.cookie_secret);
+                    let url = format!("{}/claim?t={}", state.config.public_url, qenc(&token));
+                    return bot_claim_json(BotClaimResponse {
+                        status: "existing",
+                        code,
+                        token,
+                        url,
+                    });
+                }
+                // The winner's row vanished between the conflict and this lookup
+                // (redeemed/expired/purged in the gap) — nothing to hand back.
+                // Fail closed rather than silently mint past the just-hit guard.
+                Ok(None) => {
+                    warn!("bot mint: conflict but no active code found on recovery");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+                }
+                Err(err) => {
+                    warn!(%err, "bot mint: recovery lookup after conflict failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+                }
+            }
+        }
+        Err(err) => {
+            warn!(%err, "bot mint_code failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+        }
+    };
+    let token = sign_claim_token(&code, &state.config.cookie_secret);
+    let url = format!("{}/claim?t={}", state.config.public_url, qenc(&token));
+    info!("bot minted a claim code + token");
+
+    bot_claim_json(BotClaimResponse {
+        status: "minted",
+        code,
+        token,
+        url,
+    })
+}
+
+/// Serialize a [`BotClaimResponse`] to a `200 application/json` response (or a
+/// `500` if serialization somehow fails).
+fn bot_claim_json(resp: BotClaimResponse) -> Response {
+    match serde_json::to_string(&resp) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => {
+            warn!(%err, "serializing bot claim response failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "serialize failed\n").into_response()
+        }
+    }
+}
+
+/// Constant-time equality for the bot bearer secret (avoid a timing side-channel
+/// on the shared secret). Delegates to the same `cookie::constant_time_eq` used
+/// by the HMAC checks so there is one comparator to audit; a length mismatch
+/// short-circuits to `false`, which is fine — the secret length isn't sensitive.
+fn bot_secret_matches(presented: &str, expected: &str) -> bool {
+    cookie::constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // Signed, short-lived invite cookie (reuses the session-cookie HMAC helper)
 // ---------------------------------------------------------------------------
 
@@ -2682,6 +3049,34 @@ fn sign_invite(code: &str, secret: &str) -> String {
 /// authority on the code's live status.
 fn invite_cookie_code(headers: &HeaderMap, secret: &str) -> Option<String> {
     cookie::verify_value(headers, INVITE_COOKIE, secret)
+}
+
+/// Domain-separation label for the claim TOKEN's HMAC (distinct from the
+/// `fr_invite`/`fr_session` cookie names), so a token can never be replayed as a
+/// cookie value and vice-versa.
+const CLAIM_TOKEN_LABEL: &str = "claim-token";
+
+/// Sign an invite `code` into a URL-safe claim TOKEN: `b64url(code).<sig>`
+/// (HMAC-SHA256 over `"claim-token" || 0x00 || code`).
+///
+/// NOTE — the token is NOT confidential: the `b64url(code)` half is trivially
+/// decodable by anyone, so the raw `FEATHER-…` code is effectively public in the
+/// claim URL. The token's security is INTEGRITY + SINGLE-USE, not secrecy: the
+/// `<sig>` HMAC means only this instance can MINT a valid token (a forged/guessed
+/// code won't verify), the wrapped code is single-use (redeem flips
+/// `active→redeemed`), and `/claim` is per-IP rate-limited. Wrapping keeps the
+/// token one self-contained string needing no server-side token table; it does
+/// NOT hide the code.
+fn sign_claim_token(code: &str, secret: &str) -> String {
+    cookie::sign_token(CLAIM_TOKEN_LABEL, code, secret)
+}
+
+/// Verify a claim token and return the invite code it wraps (`None` on a tampered
+/// / forged / malformed token). The code's live status (active/unexpired/seat
+/// free) is re-checked by `preflight_code`; this only proves the token was minted
+/// by this instance.
+fn claim_token_code(token: &str, secret: &str) -> Option<String> {
+    cookie::verify_token(CLAIM_TOKEN_LABEL, token, secret)
 }
 
 /// Clear the invite cookie on a response (after a successful bind, or when the
@@ -3052,6 +3447,31 @@ mod cookie {
         }
     }
 
+    /// Sign an arbitrary `value` into an opaque, URL-safe token string
+    /// `b64url(value).<sig>` (HMAC-SHA256 over `label || 0x00 || value`). Unlike
+    /// [`sign_value`] this is NOT a `Set-Cookie` header — it's a bare token for a
+    /// URL query param (the bot's claim link). `label` domain-separates it from
+    /// the cookies so a token can't be replayed as a cookie value.
+    pub fn sign_token(label: &str, value: &str, secret: &str) -> String {
+        let sig = hmac_sha256_hex(secret.as_bytes(), &cookie_hmac_msg(label, value));
+        let b64 = b64url_encode(value.as_bytes());
+        format!("{b64}.{sig}")
+    }
+
+    /// Verify a token minted by [`sign_token`] and return the wrapped value
+    /// (`None` on tamper / forge / malformed). Constant-time signature compare.
+    pub fn verify_token(label: &str, token: &str, secret: &str) -> Option<String> {
+        let (b64, sig) = token.split_once('.')?;
+        let bytes = b64url_decode(b64)?;
+        let value = String::from_utf8(bytes).ok()?;
+        let expected = hmac_sha256_hex(secret.as_bytes(), &cookie_hmac_msg(label, &value));
+        if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     /// Pull one cookie value out of the `Cookie` request header.
     fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
@@ -3066,8 +3486,10 @@ mod cookie {
         None
     }
 
-    /// Constant-time byte comparison (avoid signature-timing leaks).
-    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    /// Constant-time byte comparison (avoid signature-timing leaks). Public
+    /// within the module so the bot-secret bearer check reuses the exact same
+    /// comparator as the cookie/token HMAC checks (one implementation to audit).
+    pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
         }
@@ -3706,6 +4128,466 @@ mod tests {
             preflight_code(&state, &code).await,
             Err(store::RedeemError::CapacityFull)
         );
+    }
+
+    // -- Bot claim link + shared-secret mint ---------------------------------
+
+    /// A test state with a configured bot secret (so `/bot/claims` is live).
+    async fn bot_state(bot_secret: &str) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &["did:plc:admin".to_string()])
+            .await
+            .unwrap();
+        let config = Config {
+            allowed_dids: vec!["did:plc:admin".to_string()],
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            bot_secret: Some(bot_secret.to_string()),
+            public_url: "https://feather-reader.com".to_string(),
+            ..Config::default()
+        };
+        AppState::new(config, db).unwrap()
+    }
+
+    #[test]
+    fn claim_token_round_trips_and_rejects_tamper() {
+        let secret = "test-cookie-secret-000";
+        let token = sign_claim_token("FEATHER-ABCDWXYZ", secret);
+        // No cookie framing — a bare URL-safe token.
+        assert!(!token.contains(';'));
+        assert_eq!(
+            claim_token_code(&token, secret).as_deref(),
+            Some("FEATHER-ABCDWXYZ")
+        );
+        // Wrong secret → rejected.
+        assert!(claim_token_code(&token, "other").is_none());
+        // Tampered token → rejected.
+        let mut bad = token.clone();
+        bad.push('x');
+        assert!(claim_token_code(&bad, secret).is_none());
+        // The token is NOT confidential: it is `b64url(code).<sig>`, so the code is
+        // only base64-obscured (not verbatim, but TRIVIALLY decodable — anyone can
+        // recover it WITHOUT the secret). The security is single-use + HMAC
+        // integrity + rate-limit, not secrecy of the code. Assert the code half is
+        // publicly decodable (a plain base64url decode, no secret involved).
+        let (b64, _sig) = token.split_once('.').expect("token is b64.sig");
+        assert_eq!(
+            test_b64url_decode(b64).as_deref(),
+            Some("FEATHER-ABCDWXYZ".as_bytes()),
+            "the code half of the token is plain base64url, decodable by anyone"
+        );
+    }
+
+    /// Minimal URL-safe base64 (no padding) decoder for the test above, proving the
+    /// claim token's code half needs NO secret to recover (it is not confidential).
+    fn test_b64url_decode(input: &str) -> Option<Vec<u8>> {
+        fn val(c: u8) -> Option<u32> {
+            match c {
+                b'A'..=b'Z' => Some((c - b'A') as u32),
+                b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+                b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+                b'-' => Some(62),
+                b'_' => Some(63),
+                _ => None,
+            }
+        }
+        let mut out = Vec::with_capacity(input.len() / 4 * 3);
+        for chunk in input.as_bytes().chunks(4) {
+            let mut n = 0u32;
+            let mut bits = 0;
+            for &c in chunk {
+                n = (n << 6) | val(c)?;
+                bits += 6;
+            }
+            let bytes = bits / 8;
+            n <<= 24 - bits;
+            for i in 0..bytes {
+                out.push((n >> (16 - i * 8)) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    #[tokio::test]
+    async fn bot_mint_then_claim_grants_a_seat() {
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state.clone());
+
+        // 1. Mint a claim via the shared-secret endpoint.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "bot-secret-abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = json["token"].as_str().unwrap().to_string();
+        let url = json["url"].as_str().unwrap();
+        assert!(url.starts_with("https://feather-reader.com/claim?t="));
+        // The raw code is returned for the bot's records but not embedded in url.
+        assert!(json["code"].as_str().unwrap().starts_with("FEATHER-"));
+        assert!(!url.contains("FEATHER-"));
+
+        // 2. Follow the claim link → reserves the invite cookie + redirects to /login.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/claim?t={}", qenc(&token)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.starts_with(INVITE_COOKIE), "{set_cookie}");
+
+        // 3. The reserved cookie carries the same code the token wrapped, and
+        //    redeeming it (the callback's machinery) grants a seat.
+        let code = claim_token_code(&token, &state.config.cookie_secret).unwrap();
+        let out = store::redeem_code(
+            &state.db,
+            &code,
+            "did:plc:follower",
+            None,
+            state.config.beta_cap,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Ok(()));
+        assert!(store::has_beta_access(&state.db, "did:plc:follower")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_with_invalid_token_bounces() {
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/claim?t=not-a-real-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Renders the invite page (200), NOT a redirect to /login.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn claim_with_used_token_is_refused() {
+        let state = bot_state("bot-secret-abcdef").await;
+        // Mint a code + wrap it, then redeem it out from under the token.
+        let code = store::mint_code(&state.db, "did:plc:admin", 3600)
+            .await
+            .unwrap();
+        let token = sign_claim_token(&code, &state.config.cookie_secret);
+        store::redeem_code(
+            &state.db,
+            &code,
+            "did:plc:someone",
+            None,
+            state.config.beta_cap,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/claim?t={}", qenc(&token)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A used code → the invite page (AlreadyRedeemed), not a fresh reservation.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn bot_claims_rejects_bad_and_missing_secret() {
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state);
+        // Wrong secret.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Missing secret.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bot_claims_disabled_when_secret_unset() {
+        // test_state configures NO bot secret → the endpoint is off (503).
+        let state = test_state(&["did:plc:admin"]).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn bot_claims_refuses_at_capacity() {
+        let state = bot_state("bot-secret-abcdef").await;
+        // cap=3, admin seed took 1 seat. Grant 2 more to fill it.
+        store::grant_access(&state.db, "did:plc:b", None, "admin", None)
+            .await
+            .unwrap();
+        store::grant_access(&state.db, "did:plc:c", None, "admin", None)
+            .await
+            .unwrap();
+        assert_eq!(store::count_beta_access(&state.db).await.unwrap(), 3);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "bot-secret-abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("full"));
+    }
+
+    #[tokio::test]
+    async fn bot_claims_counts_outstanding_codes_against_cap() {
+        let state = bot_state("bot-secret-abcdef").await;
+        // cap=3, admin seed = 1 seat. Two outstanding active codes = 3 committed.
+        store::mint_code(&state.db, "did:plc:admin", 3600)
+            .await
+            .unwrap();
+        store::mint_code(&state.db, "did:plc:admin", 3600)
+            .await
+            .unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "bot-secret-abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 1 seat + 2 outstanding >= cap 3 → refused even though only 1 real seat used.
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// POST /bot/claims with a JSON body carrying the follower DID.
+    async fn post_bot_claim_for(
+        app: &axum::Router,
+        secret: &str,
+        did: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", secret)
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"did\":\"{did}\",\"handle\":\"who.test\"}}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn bot_claims_returns_already_seated_for_a_member() {
+        // A DID that already holds beta access must get `already_seated` with NO
+        // code/url — the bot posts nothing. This is the server-side backstop that
+        // survives a bot-host state loss (it would otherwise re-mint + re-post).
+        let state = bot_state("bot-secret-abcdef").await;
+        store::grant_access(&state.db, "did:plc:member", None, "admin", None)
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let (status, json) = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:member").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "already_seated");
+        assert_eq!(json["code"], "");
+        assert_eq!(json["url"], "");
+        // No new invite code was minted for the seated DID.
+        assert!(store::find_active_code_for_did(&state.db, "did:plc:member")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bot_claims_is_idempotent_per_did_returns_same_code() {
+        // Two mint requests for the SAME follower DID must return the SAME code
+        // (the app is authoritative), never a second one — so a bot-host state loss
+        // re-requesting cannot double-mint or double-post.
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state.clone());
+
+        let (s1, j1) = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:follower1").await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(j1["status"], "minted");
+        let code1 = j1["code"].as_str().unwrap().to_string();
+
+        let (s2, j2) = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:follower1").await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(j2["status"], "existing");
+        assert_eq!(j2["code"].as_str().unwrap(), code1, "same code returned");
+        assert_eq!(j2["url"], j1["url"], "same url returned");
+
+        // Exactly ONE active code exists for that DID.
+        assert_eq!(store::count_active_codes(&state.db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn bot_claims_records_intended_did_at_mint() {
+        // A fresh mint records the follower DID so the lookup finds it.
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state.clone());
+        let (status, json) =
+            post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:follower2").await;
+        assert_eq!(status, StatusCode::OK);
+        let code = json["code"].as_str().unwrap();
+        assert_eq!(
+            store::find_active_code_for_did(&state.db, "did:plc:follower2")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(code)
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_claims_concurrent_same_did_never_double_mints() {
+        // S4: two concurrent /bot/claims for ONE follower DID must not both mint an
+        // active code. The dedupe check (3b) and the mint are separate statements,
+        // so a race can slip both past 3b's `Ok(None)`; the partial unique index
+        // then makes the loser's INSERT conflict, and the handler recovers by
+        // returning the winner's code (status `existing`) rather than 500-ing.
+        // Result: exactly ONE active code, and BOTH callers get a usable code.
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state.clone());
+
+        let a = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:racer");
+        let b = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:racer");
+        let ((sa, ja), (sb, jb)) = tokio::join!(a, b);
+
+        assert_eq!(sa, StatusCode::OK, "first response: {ja:?}");
+        assert_eq!(sb, StatusCode::OK, "second response: {jb:?}");
+
+        // Exactly one active code for the DID — the whole point of the fix.
+        assert_eq!(
+            store::count_active_codes(&state.db).await.unwrap(),
+            1,
+            "concurrent mints must not create two active codes"
+        );
+
+        // Both callers received the SAME (single) code, and neither got a 500.
+        let ca = ja["code"].as_str().unwrap_or("");
+        let cb = jb["code"].as_str().unwrap_or("");
+        assert!(!ca.is_empty() && !cb.is_empty(), "both must return a code");
+        assert_eq!(ca, cb, "both callers must get the one minted code");
+        // One is `minted` (the winner), the other `minted` or `existing` depending
+        // on interleaving — but never an error status.
+        for st in [&ja["status"], &jb["status"]] {
+            let s = st.as_str().unwrap_or("");
+            assert!(s == "minted" || s == "existing", "unexpected status {s:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bot_claims_rejects_malformed_json_body() {
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/claims")
+                    .header("x-bot-secret", "bot-secret-abcdef")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
