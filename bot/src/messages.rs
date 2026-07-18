@@ -37,6 +37,23 @@ pub const WAITLIST_TEMPLATES: &[&str] = &[
     "@{handle} thanks for the follow. FeatherReader is full at the moment — you're waitlisted, and your invite comes through here as soon as there's room",
 ];
 
+/// The rotation of QUEUE templates, posted ONCE to a follower when the daily mint
+/// BUDGET is exhausted (the sybil brake) — NOT because the beta is full. The copy
+/// is deliberately distinct from [`WAITLIST_TEMPLATES`]: it must NOT say "the beta
+/// is full" (that would be inaccurate — there may be open seats; we're just pacing
+/// mints), so it says neutrally "you're in the queue, your invite is on its way".
+/// Each contains exactly `{handle}` (a real `@`-mention) and NO `{url}` (S6).
+pub const QUEUE_TEMPLATES: &[&str] = &[
+    "thanks for the follow @{handle} — you're in the queue for FeatherReader; your invite is on its way shortly 🪶",
+    "@{handle} welcome! you're in line for a FeatherReader invite — I pace these out, so your claim link lands here soon",
+    "appreciate the follow @{handle}. you're queued for FeatherReader — your invite will arrive here shortly 🪶",
+    "hey @{handle}, thanks for following! you're in the queue — I send invites in batches, so yours is coming soon",
+    "@{handle} you're queued for a FeatherReader invite — I meter these out to keep things smooth; your claim link is on its way",
+    "thanks @{handle}! you're in line for FeatherReader — invites go out in waves and yours is coming through soon 🪶",
+    "welcome @{handle} — you're in the queue; I'll send your FeatherReader claim link here shortly",
+    "@{handle} thanks for the follow. you're queued up — your FeatherReader invite is on its way soon",
+];
+
 /// Where the mention starts and ends inside a rendered post — needed to build the
 /// atproto `app.bsky.richtext.facet` byte range so the `@handle` is a real,
 /// notifying mention rather than plain text.
@@ -119,6 +136,15 @@ pub fn render_waitlist_random(handle: &str) -> RenderedPost {
     render(template, handle, "")
 }
 
+/// Like [`render_waitlist_random`] but for the daily-mint-BUDGET queue post (S6):
+/// neutral "you're in the queue" copy that (unlike the waitlist copy) does NOT
+/// claim the beta is full. No `{url}` — the claim link comes on a later cycle when
+/// the budget refreshes.
+pub fn render_queue_random(handle: &str) -> RenderedPost {
+    let template = QUEUE_TEMPLATES[clock_index(QUEUE_TEMPLATES.len())];
+    render(template, handle, "")
+}
+
 /// A cheap clock-derived index in `0..len` for pseudo-random template variety (no
 /// `rand`/`getrandom` dependency — keeps the bot's supply chain small).
 fn clock_index(len: usize) -> usize {
@@ -187,6 +213,49 @@ mod tests {
             assert_eq!(
                 &p.text[p.mention.byte_start..p.mention.byte_end],
                 "@dave.example"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_templates_are_neutral_not_full_and_linkless() {
+        // S6: the budget-queue copy must NOT say the beta is "full"/"at capacity"
+        // (that's the WAITLIST copy's claim, and it's inaccurate for a budget defer),
+        // must mention the handle, and must carry no claim link.
+        for t in QUEUE_TEMPLATES {
+            assert!(t.contains("{handle}"), "missing {{handle}} in: {t}");
+            assert!(!t.contains("{url}"), "queue template must not link: {t}");
+            let lc = t.to_ascii_lowercase();
+            assert!(!lc.contains("full"), "queue copy must not say 'full': {t}");
+            assert!(
+                !lc.contains("capacity"),
+                "queue copy must not say 'capacity': {t}"
+            );
+            assert!(
+                !lc.contains("waitlist"),
+                "queue copy must not say 'waitlist': {t}"
+            );
+        }
+        // And it renders a working, linkless mention post.
+        for _ in 0..50 {
+            let p = render_queue_random("erin.example");
+            assert!(p.text.contains("@erin.example"));
+            assert!(!p.text.contains("http"), "no link in a queue post");
+            assert_eq!(
+                &p.text[p.mention.byte_start..p.mention.byte_end],
+                "@erin.example"
+            );
+        }
+    }
+
+    #[test]
+    fn waitlist_and_queue_copy_are_distinct() {
+        // The two deferral reasons (beta full vs. mint budget paced) use different
+        // template sets so the follower gets accurate copy for their situation.
+        for q in QUEUE_TEMPLATES {
+            assert!(
+                !WAITLIST_TEMPLATES.contains(q),
+                "queue template must not also be a waitlist template: {q}"
             );
         }
     }

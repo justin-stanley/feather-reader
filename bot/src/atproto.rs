@@ -241,21 +241,7 @@ impl Session {
         kind: PostKind,
     ) -> Result<String> {
         let rkey = rkey_for(mention_did, kind);
-        let record = json!({
-            "$type": "app.bsky.feed.post",
-            "text": post.text,
-            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "facets": [{
-                "index": {
-                    "byteStart": post.mention.byte_start,
-                    "byteEnd": post.mention.byte_end,
-                },
-                "features": [{
-                    "$type": "app.bsky.richtext.facet#mention",
-                    "did": mention_did,
-                }],
-            }],
-        });
+        let record = build_post_record(post, mention_did);
         let url = format!("{}/xrpc/com.atproto.repo.createRecord", self.pds_host);
         let deterministic_uri = format!("at://{}/app.bsky.feed.post/{}", self.did, rkey);
 
@@ -296,15 +282,161 @@ impl Session {
             // A duplicate rkey (the record already exists from a prior, interrupted
             // run) is SUCCESS for our purposes: the skeet was already delivered.
             if record_already_exists(&body) {
-                tracing::info!(
-                    %deterministic_uri,
-                    "createRecord: record already exists (prior post); treating as delivered"
-                );
-                return Ok(deterministic_uri);
+                // S1 — dead-link-after-remint. The rkey is deterministic per
+                // (kind, DID) FOREVER, so if the bot state DB is lost and a fresh
+                // code is minted (new claim URL), a naive "already exists → done"
+                // would re-post nothing and leave the OLD, now-dead link live. So
+                // before treating it as delivered, fetch the existing record and,
+                // if its text no longer matches the CURRENT post (a stale claim
+                // URL), `putRecord`-update it in place (same rkey) so the follower
+                // sees the working link. If it already matches, it's a true no-op.
+                match self.reconcile_stale_record(&rkey, post, mention_did).await {
+                    Ok(uri) => {
+                        tracing::info!(
+                            %uri,
+                            "createRecord: record already exists; reconciled to current claim link"
+                        );
+                        return Ok(uri);
+                    }
+                    Err(err) => {
+                        // Reconciliation is best-effort: if the get/put path fails,
+                        // fall back to treating the existing record as delivered
+                        // (the old behaviour) rather than failing the whole cycle.
+                        tracing::warn!(
+                            %err,
+                            %deterministic_uri,
+                            "createRecord: record exists but reconcile failed; treating as delivered"
+                        );
+                        return Ok(deterministic_uri);
+                    }
+                }
             }
             bail!("createRecord returned {status}: {body}");
         }
     }
+
+    /// S1 helper: fetch the existing `app.bsky.feed.post` at `rkey` and, if its
+    /// text differs from `post` (a stale claim URL after a re-mint), overwrite it
+    /// with `putRecord` (same rkey → same at:// URI, so no duplicate skeet). Returns
+    /// the record's `at://` URI. A matching record is left untouched.
+    async fn reconcile_stale_record(
+        &self,
+        rkey: &str,
+        post: &RenderedPost,
+        mention_did: &str,
+    ) -> Result<String> {
+        let deterministic_uri = format!("at://{}/app.bsky.feed.post/{}", self.did, rkey);
+
+        // 1. getRecord — read the existing post's text (with a 401 refresh retry).
+        let get_url = format!(
+            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=app.bsky.feed.post&rkey={}",
+            self.pds_host,
+            urlencode(&self.did),
+            urlencode(rkey),
+        );
+        #[derive(Deserialize)]
+        struct ExistingPost {
+            #[serde(default)]
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct GetRecordResp {
+            #[serde(default)]
+            value: Option<ExistingPost>,
+        }
+        let existing_text = {
+            let mut refreshed = false;
+            loop {
+                let resp = self
+                    .http
+                    .get(&get_url)
+                    .bearer_auth(&self.access_jwt().await)
+                    .send()
+                    .await
+                    .context("getRecord request failed")?;
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                    refreshed = true;
+                    self.refresh()
+                        .await
+                        .context("refresh before getRecord retry")?;
+                    continue;
+                }
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("getRecord returned {status}: {body}");
+                }
+                let r: GetRecordResp = resp.json().await.context("parse getRecord response")?;
+                break r.value.map(|v| v.text).unwrap_or_default();
+            }
+        };
+
+        // 2. Already current → nothing to do (the common case: a genuine retry of
+        //    the SAME code, not a re-mint).
+        if existing_text == post.text {
+            return Ok(deterministic_uri);
+        }
+
+        // 3. Stale → overwrite in place with putRecord (same rkey), rebuilding the
+        //    record (text + fresh mention facet) exactly as createRecord would.
+        let record = build_post_record(post, mention_did);
+        let put_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_host);
+        let mut refreshed = false;
+        loop {
+            let resp = self
+                .http
+                .post(&put_url)
+                .bearer_auth(&self.access_jwt().await)
+                .json(&json!({
+                    "repo": self.did,
+                    "collection": "app.bsky.feed.post",
+                    "rkey": rkey,
+                    "record": record,
+                }))
+                .send()
+                .await
+                .context("putRecord request failed")?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
+                self.refresh()
+                    .await
+                    .context("refresh before putRecord retry")?;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("putRecord returned {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct PutRecordResp {
+                uri: String,
+            }
+            let r: PutRecordResp = resp.json().await.context("parse putRecord response")?;
+            return Ok(r.uri);
+        }
+    }
+}
+
+/// Build the `app.bsky.feed.post` record JSON (text + a single `@`-mention facet)
+/// for `post`, mentioning `mention_did`. Shared by `createRecord` and the S1
+/// `putRecord` reconcile so both emit an identical record shape.
+fn build_post_record(post: &RenderedPost, mention_did: &str) -> serde_json::Value {
+    json!({
+        "$type": "app.bsky.feed.post",
+        "text": post.text,
+        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "facets": [{
+            "index": {
+                "byteStart": post.mention.byte_start,
+                "byteEnd": post.mention.byte_end,
+            },
+            "features": [{
+                "$type": "app.bsky.richtext.facet#mention",
+                "did": mention_did,
+            }],
+        }],
+    })
 }
 
 /// A DETERMINISTIC atproto record key for `did` + `kind`. atproto rkeys must match
@@ -328,12 +460,44 @@ fn rkey_for(did: &str, kind: PostKind) -> String {
     s
 }
 
-/// Whether a `createRecord` error body indicates the record already exists — the
-/// PDS reports a duplicate rkey as an `InvalidSwap` / "could not... already exists"
-/// error. We match leniently (the exact wording varies across PDS versions).
+/// The XRPC error envelope: `{ "error": "<Name>", "message": "..." }`.
+#[derive(Deserialize)]
+struct XrpcError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Whether a `createRecord` error body indicates the record already exists — a
+/// duplicate rkey. (S2) We parse the XRPC JSON envelope and match the error NAME
+/// EXACTLY (`InvalidSwap` / `RecordAlreadyExists`) rather than substring-scanning
+/// the whole body: a lenient `body.contains("already exists")` would misread an
+/// unrelated "already exists" (a proxy/HTML error page, a different PDS failure)
+/// as "delivered" and silently drop a real post. If the body isn't a JSON XRPC
+/// envelope, this is NOT a record-exists error (it's some other failure — surface
+/// it), except that we still accept a `message` whose EXACT text is the canonical
+/// "Could not add record: already exists" a few PDS builds return with an empty
+/// `error` name.
 fn record_already_exists(body: &str) -> bool {
-    let b = body.to_ascii_lowercase();
-    b.contains("already exists") || b.contains("invalidswap") || b.contains("record already")
+    let Ok(env) = serde_json::from_str::<XrpcError>(body) else {
+        return false;
+    };
+    if let Some(name) = env.error.as_deref() {
+        // The error NAME, matched exactly (case-insensitive to tolerate a PDS that
+        // varies the casing, but it's the whole token — not a substring of prose).
+        if name.eq_ignore_ascii_case("InvalidSwap")
+            || name.eq_ignore_ascii_case("RecordAlreadyExists")
+        {
+            return true;
+        }
+    }
+    // Some PDS builds return the duplicate as a bare `message` (empty/absent
+    // `error` name). Accept ONLY the exact canonical phrasing, not any substring.
+    matches!(
+        env.message.as_deref(),
+        Some("Could not add record: already exists")
+    )
 }
 
 /// Call `com.atproto.server.createSession` and return the parsed tokens + DID.
@@ -409,14 +573,64 @@ mod tests {
     }
 
     #[test]
-    fn record_already_exists_matches_pds_wordings() {
+    fn record_already_exists_matches_exact_xrpc_error_names() {
+        // The real PDS duplicate-rkey response: an XRPC envelope naming InvalidSwap.
         assert!(record_already_exists(
-            "Could not add record: already exists"
+            r#"{"error":"InvalidSwap","message":"Record already exists"}"#
         ));
-        assert!(record_already_exists("InvalidSwap"));
-        assert!(record_already_exists("Record already exists in the repo"));
-        assert!(!record_already_exists("RateLimitExceeded"));
-        assert!(!record_already_exists("some other error"));
+        // The alternate canonical name.
+        assert!(record_already_exists(
+            r#"{"error":"RecordAlreadyExists","message":"..."}"#
+        ));
+        // Case-insensitive on the NAME token.
+        assert!(record_already_exists(r#"{"error":"invalidswap"}"#));
+        // A bare-message PDS build, EXACT phrasing only.
+        assert!(record_already_exists(
+            r#"{"message":"Could not add record: already exists"}"#
+        ));
+
+        // S2: an UNRELATED error whose prose happens to contain "already exists"
+        // must NOT be misread as delivered (this is the whole point of the fix).
+        assert!(!record_already_exists(
+            r#"{"error":"InvalidRequest","message":"the collection already exists elsewhere"}"#
+        ));
+        // A non-JSON proxy/HTML page mentioning "already exists" is NOT a match.
+        assert!(!record_already_exists(
+            "<html>the resource already exists</html>"
+        ));
+        // Other real XRPC errors are not matches.
+        assert!(!record_already_exists(
+            r#"{"error":"RateLimitExceeded","message":"slow down"}"#
+        ));
+        assert!(!record_already_exists(
+            r#"{"error":"ExpiredToken","message":"token has expired"}"#
+        ));
+        // A near-miss message (not the exact canonical phrasing) is not a match.
+        assert!(!record_already_exists(
+            r#"{"message":"record already exists in the repo"}"#
+        ));
+    }
+
+    #[test]
+    fn build_post_record_text_tracks_the_claim_url() {
+        // S1's stale-detection compares the existing record's `text` to the current
+        // post's `text`; a re-mint changes the URL, so the rendered text (and thus
+        // the record text) must differ — which is what triggers the putRecord update.
+        use crate::messages::render;
+        let old = render("claim @{handle}: {url}", "z.test", "https://x/claim?t=OLD");
+        let new = render("claim @{handle}: {url}", "z.test", "https://x/claim?t=NEW");
+        let rec_old = build_post_record(&old, "did:plc:z");
+        let rec_new = build_post_record(&new, "did:plc:z");
+        // A changed URL → different record text (stale → reconcile fires).
+        assert_ne!(rec_old["text"], rec_new["text"]);
+        // Same URL → identical text (no-op, reconcile is skipped).
+        let new_again = render("claim @{handle}: {url}", "z.test", "https://x/claim?t=NEW");
+        assert_eq!(
+            build_post_record(&new_again, "did:plc:z")["text"],
+            rec_new["text"]
+        );
+        // The mention facet targets the follower DID.
+        assert_eq!(rec_new["facets"][0]["features"][0]["did"], "did:plc:z");
     }
 
     #[test]

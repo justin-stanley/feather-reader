@@ -89,10 +89,18 @@ async fn main() -> Result<()> {
                 let sess = session.as_ref().expect("session set above");
                 if let Err(err) = run_cycle(&config, &store, sess, &app).await {
                     // A cycle failure (PDS 5xx, a follower's post 400) must not kill
-                    // the bot; log and retry next tick. Drop the session so a login
-                    // blip re-authenticates next cycle.
-                    error!(%err, "poll cycle failed; will retry next interval");
-                    session = None;
+                    // the bot; log and retry next tick. Only DROP the session (forcing
+                    // a fresh createSession next cycle) on an AUTH-shaped failure —
+                    // the Session already self-refreshes on a 401, so a flaky
+                    // getFollowers/createRecord 5xx should NOT burn a login. (Nit:
+                    // indiscriminate session-nulling put needless pressure on the
+                    // ~300/day createSession budget.)
+                    if is_auth_failure(&err) {
+                        error!(%err, "poll cycle failed (auth); re-authenticating next interval");
+                        session = None;
+                    } else {
+                        error!(%err, "poll cycle failed (transient); keeping session, retry next interval");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -120,7 +128,22 @@ async fn run_cycle(
     let mut new_followers: Vec<atproto::Follower> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0;
+    // S5 — on the FIRST run (empty state DB) page the FULL follower history so an
+    // existing backlog beyond the newest ~300 is reached and backfilled; the
+    // steady-state cap (`MAX_PAGES` × 100) is fine thereafter because a handled DID
+    // near the top short-circuits paging. `FIRST_RUN_MAX_PAGES` is a generous safety
+    // bound so a pathological account can't page unbounded. (Per-cycle post volume
+    // is still capped by `max_per_cycle` — the backfill only COLLECTS here; it
+    // doesn't post them all at once.)
+    let first_run = store.is_empty().context("checking first-run state")?;
     const MAX_PAGES: usize = 3;
+    const FIRST_RUN_MAX_PAGES: usize = 500; // up to ~50k followers on a cold start
+    let max_pages = if first_run {
+        info!("first run (empty state db): full-history follower backfill");
+        FIRST_RUN_MAX_PAGES
+    } else {
+        MAX_PAGES
+    };
     'paging: loop {
         let (page, next) = session
             .get_followers(&config.handle, 100, cursor.as_deref())
@@ -140,8 +163,10 @@ async fn run_cycle(
         }
         pages += 1;
         // Stop paging once a page was fully handled (caught up) or we hit the
-        // page/collect bounds.
-        if hit_handled || next.is_none() || pages >= MAX_PAGES {
+        // page/collect bounds. On a first-run backfill, `hit_handled` is never true
+        // (the store is empty) so paging continues to `next.is_none()` (the true end
+        // of the follower list) or the generous `FIRST_RUN_MAX_PAGES` safety bound.
+        if hit_handled || next.is_none() || pages >= max_pages {
             break 'paging;
         }
         cursor = next;
@@ -338,9 +363,19 @@ async fn mint(
         warn!(
             %handle,
             budget = config.max_daily_mints,
-            "daily mint budget reached; deferring follower (waitlist)"
+            "daily mint budget reached; deferring follower (queue)"
         );
-        waitlist_and_welcome(store, session, did, handle, posts_this_cycle).await?;
+        // S6 — the budget defer is NOT "beta full": use the neutral QUEUE copy so
+        // we don't tell a follower the beta is full when it may not be.
+        waitlist_and_welcome(
+            store,
+            session,
+            did,
+            handle,
+            posts_this_cycle,
+            DeferReason::Budget,
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -355,7 +390,15 @@ async fn mint(
         MintOutcome::Full => {
             // Beta full: post a ONE-TIME public waitlist-welcome, then waitlist for
             // a later retry once seats free up.
-            waitlist_and_welcome(store, session, did, handle, posts_this_cycle).await?;
+            waitlist_and_welcome(
+                store,
+                session,
+                did,
+                handle,
+                posts_this_cycle,
+                DeferReason::Full,
+            )
+            .await?;
             Ok(None)
         }
         MintOutcome::Minted(claim) => {
@@ -376,18 +419,30 @@ async fn mint(
     }
 }
 
+/// Why a follower is being deferred (which drives the one-time welcome copy, S6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferReason {
+    /// The beta is at capacity (the app returned `full`). Copy: "you're waitlisted".
+    Full,
+    /// The daily mint BUDGET is exhausted (sybil brake), not necessarily full.
+    /// Copy: neutral "you're in the queue" — must NOT claim the beta is full.
+    Budget,
+}
+
 /// Waitlist a follower and, if not already welcomed, post a ONE-TIME public
-/// waitlist-welcome skeet (mention, no claim link). The `welcomed` flag makes this
+/// welcome skeet (mention, no claim link). The `welcomed` flag makes this
 /// post-once: a follower who stays waitlisted across many cycles is welcomed only
 /// on the first. The welcome post's rkey is deterministic (PostKind::Waitlist +
 /// DID) and distinct from the later claim post, so a crash never double-posts and
-/// the two never collide.
+/// the two never collide. `reason` selects the copy (S6): `Full` → "beta's full,
+/// you're waitlisted"; `Budget` → neutral "you're in the queue".
 async fn waitlist_and_welcome(
     store: &Store,
     session: &Session,
     did: &str,
     handle: &str,
     posts_this_cycle: &mut usize,
+    reason: DeferReason,
 ) -> Result<()> {
     // Persist the waitlisted row first (non-terminal → retried later cycles).
     store.mark_status(did, Some(handle), Status::Waitlisted)?;
@@ -395,9 +450,17 @@ async fn waitlist_and_welcome(
     if store.was_welcomed(did)? {
         return Ok(());
     }
-    info!(%handle, "beta full; posting one-time waitlist-welcome");
+    let post = match reason {
+        DeferReason::Full => {
+            info!(%handle, "beta full; posting one-time waitlist-welcome");
+            messages::render_waitlist_random(handle)
+        }
+        DeferReason::Budget => {
+            info!(%handle, "mint budget paced; posting one-time queue welcome");
+            messages::render_queue_random(handle)
+        }
+    };
     jitter_between_posts(*posts_this_cycle).await;
-    let post = messages::render_waitlist_random(handle);
     let post_uri = session
         .post_with_mention(&post, did, PostKind::Waitlist)
         .await
@@ -408,6 +471,21 @@ async fn waitlist_and_welcome(
     store.mark_welcomed(did, Some(handle))?;
     info!(%handle, %post_uri, "posted waitlist-welcome");
     Ok(())
+}
+
+/// Whether a `run_cycle` error is AUTH-shaped — i.e. the session itself is
+/// unusable and a fresh `createSession` is warranted next cycle. The `Session`
+/// transparently refreshes its access token on a 401 and, if refresh fails, falls
+/// back to a full re-login; it only surfaces an error to us when BOTH the refresh
+/// AND that fallback createSession failed (its context strings mention
+/// `createSession`/`refreshSession`). A plain getFollowers/createRecord 5xx/4xx is
+/// NOT auth-shaped and must not drop the session (which would waste a login from
+/// the ~300/day budget). Matches on the anyhow context chain.
+fn is_auth_failure(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let m = cause.to_string();
+        m.contains("createSession") || m.contains("refreshSession")
+    })
 }
 
 fn init_tracing() {

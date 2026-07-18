@@ -6,7 +6,7 @@
 //! poll rather than minting a second code / posting a second skeet.
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Lifecycle of a handled follower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,12 +126,17 @@ impl Store {
     /// terminal, so a follower whose mint/post was interrupted is picked up again
     /// and resumed (rather than silently stranded forever).
     pub fn is_terminal(&self, did: &str) -> Result<bool> {
+        // S7: `.optional()` maps a MISSING row to `None`; any OTHER rusqlite error
+        // (a locked/corrupt DB, an I/O fault) PROPAGATES rather than being swallowed
+        // as "no row". A silent error here would make an already-delivered follower
+        // look un-handled → a duplicate mint/post.
         let status: Option<String> = self
             .conn
             .query_row("SELECT status FROM handled WHERE did = ?1", [did], |r| {
                 r.get(0)
             })
-            .ok();
+            .optional()
+            .with_context(|| format!("is_terminal query for {did}"))?;
         Ok(matches!(
             status.as_deref().and_then(Status::parse),
             Some(Status::Delivered) | Some(Status::Skipped)
@@ -150,7 +155,11 @@ impl Store {
                 [did],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .ok();
+            // S7: distinguish "no row" (→ None → mint) from a real DB error (→
+            // propagate). Swallowing an error as None would re-mint a code that
+            // was already minted+stored, stranding the first.
+            .optional()
+            .with_context(|| format!("resume_claim query for {did}"))?;
         Ok(match row {
             Some((Some(code), Some(url))) => Some((code, url)),
             _ => None,
@@ -164,7 +173,9 @@ impl Store {
             .query_row("SELECT status FROM handled WHERE did = ?1", [did], |r| {
                 r.get(0)
             })
-            .ok();
+            // S7: real DB errors propagate; only a missing row is `None`.
+            .optional()
+            .with_context(|| format!("status_of query for {did}"))?;
         Ok(row.and_then(|s| Status::parse(&s)))
     }
 
@@ -231,7 +242,11 @@ impl Store {
             .query_row("SELECT welcomed FROM handled WHERE did = ?1", [did], |r| {
                 r.get(0)
             })
-            .ok();
+            // S7: a real DB error must NOT read as "not welcomed" (which would
+            // re-post the welcome every cycle) — propagate it; only a missing row
+            // is the legitimate `None` → not welcomed.
+            .optional()
+            .with_context(|| format!("was_welcomed query for {did}"))?;
         Ok(flag.unwrap_or(0) != 0)
     }
 
@@ -270,6 +285,20 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Whether the store has NO handled rows yet — i.e. this is a FIRST RUN (fresh
+    /// state DB / persistent volume). The poll loop uses this to do a FULL-history
+    /// follower backfill on the first cycle (S5): the normal `MAX_PAGES` cap would
+    /// otherwise never reach a follower beyond the newest ~300, stranding an
+    /// existing backlog on a freshly-deployed bot until each old follower happened
+    /// to re-follow. Propagates a real DB error (S7).
+    pub fn is_empty(&self) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM handled", [], |r| r.get(0))
+            .context("counting handled rows")?;
+        Ok(n == 0)
     }
 
     /// Enumerate the DIDs currently `waitlisted` (with their stored handle), so the
@@ -420,6 +449,48 @@ mod tests {
         assert!(dids.contains(&"did:plc:w2"));
         // The bound is honoured.
         assert_eq!(s.waitlisted_dids(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_reads_propagate_real_db_errors_not_no_row() {
+        // S7: a REAL DB error (here: the `handled` table dropped out from under the
+        // reads) must PROPAGATE as Err, not be swallowed as "no row" (which would
+        // re-welcome / re-mint / re-post a follower). A genuinely-missing row still
+        // returns Ok(None)/Ok(false) (covered by the other tests).
+        let s = mem();
+        s.record_intent("did:plc:x", Some("x.test")).unwrap();
+        // Break the table the reads depend on.
+        s.conn.execute_batch("DROP TABLE handled;").unwrap();
+
+        assert!(
+            s.status_of("did:plc:x").is_err(),
+            "status_of must propagate a table-missing error"
+        );
+        assert!(
+            s.is_terminal("did:plc:x").is_err(),
+            "is_terminal must propagate a table-missing error"
+        );
+        assert!(
+            s.was_welcomed("did:plc:x").is_err(),
+            "was_welcomed must propagate a table-missing error"
+        );
+        assert!(
+            s.resume_claim("did:plc:x").is_err(),
+            "resume_claim must propagate a table-missing error"
+        );
+    }
+
+    #[test]
+    fn is_empty_flips_after_first_handled_row() {
+        // S5: a fresh store is empty (drives the first-run full backfill); once any
+        // row exists it's no longer a first run.
+        let s = mem();
+        assert!(s.is_empty().unwrap(), "a fresh store is a first run");
+        s.record_intent("did:plc:first", Some("f.test")).unwrap();
+        assert!(
+            !s.is_empty().unwrap(),
+            "after the first handled row it is no longer a first run"
+        );
     }
 
     #[test]

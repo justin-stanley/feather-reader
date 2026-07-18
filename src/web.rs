@@ -2590,7 +2590,19 @@ async fn beta_redeem_submit(
 /// typed [`store::RedeemError`] variants so the two paths share one message map.
 async fn preflight_code(state: &AppState, code: &str) -> Result<(), store::RedeemError> {
     // Cap check first: a clear "capacity full" beats "code invalid" when both.
-    let count = store::count_beta_access(&state.db).await.unwrap_or(0);
+    // FAIL CLOSED on a count error — an `unwrap_or(0)` would let a DB blip read as
+    // "0 seats used" and wave the redeem through the preflight. (`redeem_code`
+    // still backstops the real cap inside its tx, so this is a consistency /
+    // defence-in-depth fix, not the only guard.) Treat an unverifiable count as
+    // capacity-full: the redeemer sees "at capacity, try later" rather than a mint
+    // that might overrun the cap.
+    let count = match store::count_beta_access(&state.db).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(%err, "preflight_code: count_beta_access failed; failing closed");
+            return Err(store::RedeemError::CapacityFull);
+        }
+    };
     if count >= state.config.beta_cap {
         return Err(store::RedeemError::CapacityFull);
     }
@@ -2945,6 +2957,38 @@ async fn bot_mint_claim(
     };
     let code = match minted {
         Ok(c) => c,
+        // S4: the dedupe check (3b) and this mint are separate statements, so two
+        // concurrent requests for one DID can both fall through 3b's `Ok(None)`.
+        // The partial unique index `idx_invite_codes_intended_active` makes the
+        // loser's INSERT fail (only one active row per intended DID), which
+        // surfaces here as a conflict. Recover by returning the winner's existing
+        // code (same shape as the 3b idempotent path) instead of a 500.
+        Err(err) if follower_did.is_some() && store::is_intended_active_conflict(&err) => {
+            match store::find_active_code_for_did(&state.db, follower_did.unwrap()).await {
+                Ok(Some(code)) => {
+                    info!("bot mint: lost the mint race; returning the concurrently-minted code");
+                    let token = sign_claim_token(&code, &state.config.cookie_secret);
+                    let url = format!("{}/claim?t={}", state.config.public_url, qenc(&token));
+                    return bot_claim_json(BotClaimResponse {
+                        status: "existing",
+                        code,
+                        token,
+                        url,
+                    });
+                }
+                // The winner's row vanished between the conflict and this lookup
+                // (redeemed/expired/purged in the gap) — nothing to hand back.
+                // Fail closed rather than silently mint past the just-hit guard.
+                Ok(None) => {
+                    warn!("bot mint: conflict but no active code found on recovery");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+                }
+                Err(err) => {
+                    warn!(%err, "bot mint: recovery lookup after conflict failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
+                }
+            }
+        }
         Err(err) => {
             warn!(%err, "bot mint_code failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "mint failed\n").into_response();
@@ -4487,6 +4531,44 @@ mod tests {
                 .as_deref(),
             Some(code)
         );
+    }
+
+    #[tokio::test]
+    async fn bot_claims_concurrent_same_did_never_double_mints() {
+        // S4: two concurrent /bot/claims for ONE follower DID must not both mint an
+        // active code. The dedupe check (3b) and the mint are separate statements,
+        // so a race can slip both past 3b's `Ok(None)`; the partial unique index
+        // then makes the loser's INSERT conflict, and the handler recovers by
+        // returning the winner's code (status `existing`) rather than 500-ing.
+        // Result: exactly ONE active code, and BOTH callers get a usable code.
+        let state = bot_state("bot-secret-abcdef").await;
+        let app = router(state.clone());
+
+        let a = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:racer");
+        let b = post_bot_claim_for(&app, "bot-secret-abcdef", "did:plc:racer");
+        let ((sa, ja), (sb, jb)) = tokio::join!(a, b);
+
+        assert_eq!(sa, StatusCode::OK, "first response: {ja:?}");
+        assert_eq!(sb, StatusCode::OK, "second response: {jb:?}");
+
+        // Exactly one active code for the DID — the whole point of the fix.
+        assert_eq!(
+            store::count_active_codes(&state.db).await.unwrap(),
+            1,
+            "concurrent mints must not create two active codes"
+        );
+
+        // Both callers received the SAME (single) code, and neither got a 500.
+        let ca = ja["code"].as_str().unwrap_or("");
+        let cb = jb["code"].as_str().unwrap_or("");
+        assert!(!ca.is_empty() && !cb.is_empty(), "both must return a code");
+        assert_eq!(ca, cb, "both callers must get the one minted code");
+        // One is `minted` (the winner), the other `minted` or `existing` depending
+        // on interleaving — but never an error status.
+        for st in [&ja["status"], &jb["status"]] {
+            let s = st.as_str().unwrap_or("");
+            assert!(s == "minted" || s == "existing", "unexpected status {s:?}");
+        }
     }
 
     #[tokio::test]

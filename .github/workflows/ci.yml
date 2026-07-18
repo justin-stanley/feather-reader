@@ -120,8 +120,13 @@ jobs:
       # a fix that needs a semver-major bump) are whitelisted in deny.toml's
       # `[advisories] ignore = [...]`; mirror any such id here as an explicit
       # `--ignore RUSTSEC-YYYY-NNNN` flag. Keep the list SHORT and documented.
+      # Install the pinned cargo-audit BINARY (like the cargo-deny job) rather than
+      # `cargo install ... || true`, which masked an install failure and let the
+      # next step die command-not-found — a green job that skipped the RustSec scan.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.22.2
 
       - name: cargo audit
         # `-D warnings` promotes unmaintained/unsound advisories to failures too.
@@ -219,8 +224,15 @@ jobs:
       - name: cargo-deny (licenses + bans + sources)
         run: cargo-deny check bans licenses sources
 
+      # Install the pinned cargo-audit BINARY (mirroring the cargo-deny step above)
+      # rather than `cargo install ... || true`: the `|| true` masked an install
+      # FAILURE, so the next step would die "cargo-audit: command not found" — a
+      # green-looking job that never actually ran the RustSec scan. install-action
+      # fails the job loudly if the tool can't be fetched. (Cheap nit.)
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.22.2
 
       - name: cargo audit
         # `-D warnings` promotes unmaintained/unsound advisories to failures too.

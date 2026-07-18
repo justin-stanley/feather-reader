@@ -260,8 +260,12 @@ CREATE TABLE IF NOT EXISTS invite_codes (
     redeemed_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_invite_codes_status ON invite_codes (status, expires_at);
--- Look up an outstanding active claim by the DID it was minted for (bot dedupe).
-CREATE INDEX IF NOT EXISTS idx_invite_codes_intended ON invite_codes (intended_did, status);
+-- NOTE: the `intended_did` indexes are created in `apply_migrations`, AFTER the
+-- `intended_did` column is ensured. They MUST NOT live in this base SCHEMA batch:
+-- on an existing pre-0.2.2 volume the `CREATE TABLE IF NOT EXISTS invite_codes`
+-- above is a no-op (the table already exists without `intended_did`), so a
+-- `CREATE INDEX ... (intended_did, ...)` here would fail with "no such column"
+-- and crash-loop the boot before migrations ever run.
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
@@ -378,6 +382,34 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE invite_codes ADD COLUMN intended_did TEXT",
     )
     .await?;
+    // Indexes on `intended_did` are created HERE (not in the base SCHEMA batch)
+    // because they reference a column that only exists after the migration above.
+    // On an existing pre-0.2.2 DB the `invite_codes` CREATE TABLE is a no-op, so
+    // an index on `intended_did` in SCHEMA would fail before this migration ran
+    // (that was blocker B1). All are `IF NOT EXISTS`, so re-running is a no-op.
+    //
+    // Look up an outstanding active claim by the DID it was minted for (bot dedupe).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_invite_codes_intended \
+         ON invite_codes (intended_did, status)",
+    )
+    .execute(pool)
+    .await
+    .context("creating idx_invite_codes_intended")?;
+    // Enforce at MOST one outstanding active claim per intended DID. This makes
+    // the bot's dedupe check-then-mint race-safe: two concurrent `POST /bot/claims`
+    // for the same follower can no longer both insert an active code (the second
+    // INSERT hits this unique constraint). Partial so it only constrains active
+    // bot-minted rows — redeemed/expired rows and NULL-intended (admin/browser)
+    // codes are unconstrained. (Blocker/should-fix S4.)
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_invite_codes_intended_active \
+         ON invite_codes (intended_did) \
+         WHERE intended_did IS NOT NULL AND status = 'active'",
+    )
+    .execute(pool)
+    .await
+    .context("creating idx_invite_codes_intended_active")?;
     Ok(())
 }
 
@@ -1571,12 +1603,53 @@ async fn mint_code_inner(
     Ok(code)
 }
 
+/// Does this error chain represent the partial-unique-index conflict raised when
+/// a SECOND active claim is minted for a DID that already has one
+/// (`idx_invite_codes_intended_active`)? The web layer uses this to recover from a
+/// lost mint race (S4): on a conflict it re-reads the winner's code instead of
+/// 500-ing. Matches on the sqlx `Database` error's UNIQUE-constraint code (SQLite
+/// 2067 / primary 19) AND the offending COLUMN in the message
+/// (`invite_codes.intended_did` — SQLite names the column(s), not the index), so an
+/// unrelated constraint violation (e.g. the `code` PRIMARY KEY) is NOT swallowed.
+pub fn is_intended_active_conflict(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(sqlx::Error::Database(db)) = cause.downcast_ref::<sqlx::Error>() {
+            let msg = db.message();
+            // SQLite reports UNIQUE violations with (primary) code 19 /
+            // (extended) 2067; the message names the offending column(s), e.g.
+            // "UNIQUE constraint failed: invite_codes.intended_did".
+            let is_unique = db.code().as_deref() == Some("2067")
+                || db.code().as_deref() == Some("19")
+                || msg.contains("UNIQUE constraint failed");
+            // Scope to the intended_did index specifically. Only that index and the
+            // `code` PRIMARY KEY can raise a UNIQUE error here; the partial unique
+            // index is the only one over `intended_did`, so the column reference
+            // uniquely identifies it.
+            if is_unique && msg.contains("invite_codes.intended_did") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The `code` of an outstanding (`active`, unexpired) invite minted FOR the
 /// follower `intended_did`, if one exists — the app-side idempotency lookup for
 /// `POST /bot/claims`. `Some(code)` means "return this existing code, do NOT mint
-/// a second"; `None` means "no live code for this DID — mint one". If several
-/// exist (shouldn't, but a race could) the soonest-expiring is returned so the
-/// bot re-posts the one closest to needing a refresh.
+/// a second"; `None` means "no live code for this DID — mint one".
+///
+/// S3 — this lookup ONLY returns `active`, UNEXPIRED codes; once a code passes
+/// `expires_at` (or `expire_old_codes` flips it to `expired`) this returns `None`,
+/// so the next `POST /bot/claims` MINTS A FRESH code for the DID. There is no
+/// in-place "refresh" of an expired code (the partial-unique index only constrains
+/// `active` rows, so a fresh mint after expiry is allowed). The bot then re-posts:
+/// its record rkey is deterministic per DID, so the existing skeet is UPDATED in
+/// place with the new claim URL (see the bot's `reconcile_stale_record`, S1) rather
+/// than a second skeet being posted. NOTE: a bot-`delivered` follower whose link
+/// expired UNCLAIMED is only re-minted if the bot re-processes that DID (a re-seen
+/// follow, a `waitlisted` retry, or a bot-store reset); manual recovery is to clear
+/// the bot's `handled` row for that DID so the next cycle re-mints + re-posts.
+/// If several live codes somehow exist (a race), the soonest-expiring is returned.
 pub async fn find_active_code_for_did(
     pool: &SqlitePool,
     intended_did: &str,
@@ -1634,17 +1707,33 @@ pub async fn redeem_code(
         .context("redeem_code: acquire write lock")?;
 
     // 1. Look the code up.
-    let row = sqlx::query("SELECT status, expires_at FROM invite_codes WHERE code = ?1")
-        .bind(code)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("redeem_code: lookup")?;
+    let row =
+        sqlx::query("SELECT status, expires_at, intended_did FROM invite_codes WHERE code = ?1")
+            .bind(code)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("redeem_code: lookup")?;
     let row = match row {
         Some(r) => r,
         None => return Ok(Err(RedeemError::NotFound)),
     };
     let status: String = row.get("status");
     let expires_at: i64 = row.get("expires_at");
+    let intended_did: Option<String> = row.get("intended_did");
+
+    // DID-binding gate (blocker B2). A bot-minted claim link is posted PUBLICLY
+    // with a non-confidential token, so anyone who sees a follower's reply could
+    // redeem it with a throwaway account — defeating the follow-gate, the daily
+    // sybil budget, and the rate limit. When the code was minted FOR a specific
+    // follower (`intended_did IS NOT NULL`), only that DID may redeem it; anyone
+    // else gets a `NotFound` (indistinguishable from a bad code — no oracle).
+    // Codes with a NULL `intended_did` (admin/browser-minted) stay open, as
+    // before — those are meant to be sharable.
+    if let Some(bound) = intended_did.as_deref() {
+        if bound != did {
+            return Ok(Err(RedeemError::NotFound));
+        }
+    }
 
     // Status gate: only an `active` code is redeemable. Anything already
     // redeemed/revoked is "already redeemed" from the redeemer's view; an
@@ -1860,13 +1949,21 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
 
     // A departing DID may also be the TARGET of an outstanding bot claim
     // (`intended_did`, minted for them before they joined/left) — NULL it so no
-    // per-DID residue survives. The code itself (creator = the bot account) is
-    // left to expire/redeem normally.
-    sqlx::query("UPDATE invite_codes SET intended_did = NULL WHERE intended_did = ?1")
-        .bind(did)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("scrub intended_did for {did}"))?;
+    // per-DID residue survives. We ALSO expire the orphaned code in the same tx:
+    // once `intended_did` is NULLed, an `active` row would otherwise keep counting
+    // against the daily mint cap for its full 14-day TTL (and a re-follow would
+    // double-count it), so `expired` it now. `redeemed`/already-`expired` rows are
+    // untouched (the WHERE only matches `active`). (Cheap nit — purge orphan.)
+    sqlx::query(
+        "UPDATE invite_codes \
+         SET intended_did = NULL, \
+             status = CASE WHEN status = 'active' THEN 'expired' ELSE status END \
+         WHERE intended_did = ?1",
+    )
+    .bind(did)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("scrub intended_did for {did}"))?;
 
     let granted_by_scrubbed =
         sqlx::query("UPDATE beta_access SET granted_by = ?2 WHERE granted_by = ?1")
@@ -3418,6 +3515,213 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
+
+    // ---- B1: an existing PRE-0.2.2 invite_codes table (no intended_did) must
+    // migrate cleanly, not crash-loop boot. ----------------------------------
+
+    #[tokio::test]
+    async fn migrates_pre_intended_did_invite_codes_table() -> Result<()> {
+        // Build an on-disk DB whose `invite_codes` table has the OLD 0.2.1 shape
+        // (NO `intended_did` column, and therefore no `intended_did` index), then
+        // run init_schema/migrations against it — this is exactly the existing-prod
+        // volume that blocker B1 crash-looped (the SCHEMA's `CREATE INDEX ...
+        // (intended_did, ...)` fired before the ALTER TABLE added the column).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-b1-{}.db", std::process::id()));
+        let url = format!("sqlite://{}", path.display());
+
+        // Open a raw pool WITHOUT init_schema and hand-build the old table shape.
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        sqlx::query(
+            r#"CREATE TABLE invite_codes (
+                code         TEXT PRIMARY KEY,
+                creator_did  TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                invitee_did  TEXT,
+                created_at   INTEGER NOT NULL,
+                expires_at   INTEGER NOT NULL,
+                redeemed_at  INTEGER
+            );"#,
+        )
+        .execute(&pool)
+        .await?;
+        // Seed a legacy active code so the migration runs against real data.
+        sqlx::query(
+            "INSERT INTO invite_codes (code, creator_did, status, created_at, expires_at) \
+             VALUES ('FEATHER-LEGACY00', 'did:plc:old', 'active', 1, 9999999999)",
+        )
+        .execute(&pool)
+        .await?;
+
+        // The column is genuinely absent to start with (pre-condition of B1).
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(invite_codes)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "intended_did"),
+            "pre-condition: legacy table must lack intended_did"
+        );
+
+        // THE FIX: init_schema must succeed (not error with "no such column").
+        init_schema(&pool)
+            .await
+            .expect("init_schema on a pre-0.2.2 invite_codes table must not crash");
+
+        // Post-condition: the column now exists, both indexes were created, and the
+        // legacy row is intact.
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(invite_codes)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(cols.iter().any(|c| c == "intended_did"));
+        let idx: Vec<String> = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='invite_codes'",
+        )
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+        assert!(idx.iter().any(|n| n == "idx_invite_codes_intended"));
+        assert!(idx.iter().any(|n| n == "idx_invite_codes_intended_active"));
+
+        // Idempotent: running it again is a no-op, not an error.
+        init_schema(&pool)
+            .await
+            .expect("re-running init_schema must be idempotent");
+
+        // The legacy code still redeems (NULL intended_did → open, as before).
+        let out = redeem_code(&pool, "FEATHER-LEGACY00", "did:plc:new", None, 100).await?;
+        assert_eq!(out, Ok(()));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
+
+    // ---- B2: a code minted FOR a specific DID is redeemable ONLY by that DID. --
+
+    #[tokio::test]
+    async fn redeem_enforces_intended_did_binding() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // Mint a claim FOR did:plc:A (the follower the bot posted the link to).
+        let code = mint_code_for_did(&pool, "did:bot:fr", 3600, "did:plc:A").await?;
+
+        // A DIFFERENT DID (a throwaway that stole the public link) is refused as if
+        // the code didn't exist — no seat granted, code still active.
+        let stolen = redeem_code(&pool, &code, "did:plc:B", Some("thief.bsky"), 100).await?;
+        assert_eq!(stolen, Err(RedeemError::NotFound));
+        assert!(!has_beta_access(&pool, "did:plc:B").await?);
+        assert_eq!(count_active_codes(&pool).await?, 1, "code must stay active");
+
+        // The INTENDED DID redeems successfully.
+        let ok = redeem_code(&pool, &code, "did:plc:A", Some("alice.bsky"), 100).await?;
+        assert_eq!(ok, Ok(()));
+        assert!(has_beta_access(&pool, "did:plc:A").await?);
+
+        // A NULL-intended (admin/browser) code stays open to anyone (unchanged).
+        let open = mint_code(&pool, "did:plc:admin", 3600).await?;
+        let anyone = redeem_code(&pool, &open, "did:plc:C", None, 100).await?;
+        assert_eq!(anyone, Ok(()));
+        assert!(has_beta_access(&pool, "did:plc:C").await?);
+        Ok(())
+    }
+
+    // ---- S4: at most one ACTIVE code per intended DID; a concurrent second mint
+    // hits the partial-unique index, and is_intended_active_conflict recognises it.
+
+    #[tokio::test]
+    async fn intended_active_partial_unique_index_blocks_double_mint() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // First mint for the DID succeeds.
+        mint_code_for_did(&pool, "did:bot:fr", 3600, "did:plc:dup").await?;
+        // A SECOND active mint for the SAME DID violates the partial unique index.
+        let err = mint_code_for_did(&pool, "did:bot:fr", 3600, "did:plc:dup")
+            .await
+            .expect_err("second active mint for the same DID must fail the unique index");
+        assert!(
+            is_intended_active_conflict(&err),
+            "the conflict must be recognised so the web layer can recover: {err:?}"
+        );
+        // Still exactly one active code for the DID.
+        assert!(find_active_code_for_did(&pool, "did:plc:dup")
+            .await?
+            .is_some());
+
+        // Once the first code is redeemed (no longer active), a fresh mint for the
+        // DID is allowed again (partial index only constrains active rows).
+        let existing = find_active_code_for_did(&pool, "did:plc:dup")
+            .await?
+            .unwrap();
+        redeem_code(&pool, &existing, "did:plc:dup", None, 100).await??;
+        mint_code_for_did(&pool, "did:bot:fr", 3600, "did:plc:dup")
+            .await
+            .expect("a new mint is allowed after the prior one is redeemed");
+
+        // And the conflict helper does NOT fire on an unrelated error (a PRIMARY KEY
+        // clash on `code`, i.e. a different constraint).
+        sqlx::query(
+            "INSERT INTO invite_codes (code, creator_did, status, created_at, expires_at) \
+             VALUES ('FEATHER-DUPEKEY0', 'did:x', 'active', 1, 9999999999)",
+        )
+        .execute(&pool)
+        .await?;
+        let pk_err = sqlx::query(
+            "INSERT INTO invite_codes (code, creator_did, status, created_at, expires_at) \
+             VALUES ('FEATHER-DUPEKEY0', 'did:x', 'active', 1, 9999999999)",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("duplicate PRIMARY KEY must error");
+        let as_anyhow = anyhow::Error::new(pk_err);
+        assert!(
+            !is_intended_active_conflict(&as_anyhow),
+            "a non-intended-index conflict must NOT be mistaken for the recover-able one"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_expires_orphaned_active_intended_code() -> Result<()> {
+        // Cheap nit: purging a DID that is the TARGET of an active claim must both
+        // NULL intended_did AND expire the (now orphaned) active code, so it stops
+        // counting against the mint cap for its full TTL.
+        let pool = init_url("sqlite::memory:").await?;
+        let code = mint_code_for_did(&pool, "did:bot:fr", 3600, "did:plc:leaver").await?;
+        assert_eq!(count_active_codes(&pool).await?, 1);
+
+        purge_did_data(&pool, "did:plc:leaver").await?;
+
+        // The code is no longer active (expired), so it no longer counts.
+        assert_eq!(
+            count_active_codes(&pool).await?,
+            0,
+            "orphaned code must be expired by purge, not left active"
+        );
+        // And intended_did was scrubbed.
+        let intended: Option<String> =
+            sqlx::query("SELECT intended_did FROM invite_codes WHERE code = ?1")
+                .bind(&code)
+                .fetch_one(&pool)
+                .await?
+                .get("intended_did");
+        assert!(intended.is_none(), "intended_did must be NULLed");
         Ok(())
     }
 }
