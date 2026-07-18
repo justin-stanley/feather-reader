@@ -45,3 +45,12 @@ jobs:
           # NOT denied — it's this project's own license.)
           deny-licenses: >-
             GPL-2.0-only, GPL-3.0-only, LGPL-3.0-only, SSPL-1.0
+          # Per-package license exemption. `r-efi` is a UEFI-target-only crate
+          # pulled transitively by the rustls TLS stack (getrandom → r-efi, seen in
+          # bot/Cargo.lock) that NEVER compiles on this project's Linux/Fly targets.
+          # Its SPDX expression `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is an OR —
+          # a permissive branch is available and taken — but the action naively
+          # matches the LGPL term against `deny-licenses` and blocks. Exempt it; the
+          # permissive option keeps us AGPL-compatible. (deny.toml still governs the
+          # *shipped* app crate — this only unblocks the standalone bot's lockfile.)
+          allow-dependencies-licenses: pkg:cargo/r-efi
