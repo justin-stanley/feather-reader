@@ -30,6 +30,11 @@ cd oauth-sidecar && npm ci && npm run build
 See the [README](README.md) for how the two are configured (environment variables
 only; no config file) and how to run them.
 
+The repo also contains an optional standalone **`bot/`** crate — the follow→invite
+bot for the closed beta. It's its **own** Cargo workspace (not built by the app's
+`cargo build`) and isn't needed to build or run the reader; build/test it on its
+own and see [`bot/README.md`](bot/README.md).
+
 ## Before you open a pull request
 
 Run the full local CI — it mirrors the GitHub Actions workflow and uses zero
