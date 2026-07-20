@@ -23,9 +23,9 @@
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
   },
   "dependencies": {
-    "@atproto/api": "^0.20.28",
+    "@atproto/api": "^0.20.30",
     "@atproto/jwk-jose": "^0.2.4",
-    "@atproto/oauth-client-node": "^0.4.8",
+    "@atproto/oauth-client-node": "^0.4.9",
     "@fastify/rate-limit": "^10.3.0",
     "fastify": "^5.2.0"
   },
@@ -37,6 +37,6 @@
     "prettier": "3.9.5",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.0",
-    "typescript-eslint": "8.63.0"
+    "typescript-eslint": "8.64.0"
   }
 }
