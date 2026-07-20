@@ -10,7 +10,7 @@ small amount of hosted minutes, so their triggers are deliberately narrow.
 
 | Workflow | Runner | Triggers | What it does |
 |---|---|---|---|
-| `ci.yml` | **self-hosted** | push/PR to `main`, manual | The gate. Jobs: **rust** (build/test/clippy `-D warnings`/rustfmt), **cargo-deny** (licenses + bans + advisories + sources via `deny.toml`), **cargo-audit** (RustSec), **sidecar** (npm ci/build/typecheck + **ESLint** + **Prettier `--check`** + `npm audit --omit=dev`), **secrets** (**gitleaks** tree + history via `.gitleaks.toml`). |
+| `ci.yml` | **self-hosted** | push/PR to `main`, manual | The gate. Jobs: **rust** (build/test/clippy `-D warnings`/rustfmt), **cargo-deny** (licenses + bans + advisories + sources via `deny.toml`), **cargo-audit** (RustSec), **sidecar** (npm ci/build/typecheck + **oxlint** + **Prettier `--check`** + `npm audit --omit=dev`), **secrets** (**gitleaks** tree + history via `.gitleaks.toml`). |
 | `codeql.yml` | **GitHub-hosted** (`ubuntu-latest`) | **PR to `main`** + push to `main` + weekly cron + manual | SAST for `javascript-typescript` (the OAuth sidecar). Runs on **every** PR — no `paths:` filter, so config-only PRs still get a CodeQL check-run (OSSF Scorecard's SAST check needs one on each merged PR). Rust is covered by clippy + cargo-deny + cargo-audit (CodeQL's Rust extractor errored on all files; re-add when GA'd). Results → Security tab. Free once public. |
 | `dependency-review.yml` | **GitHub-hosted** | pull_request to `main` | Blocks PRs that add vulnerable deps or disallowed licenses (aligned with `deny.toml`). Needs the Dependency Graph — free/on for public repos. |
 | `scorecard.yml` | **GitHub-hosted** | branch-protection change + weekly cron + push `main` | OpenSSF supply-chain posture score → Security tab + public badge. Most useful once public. |
@@ -52,10 +52,10 @@ gitleaks dir . --config .gitleaks.toml
 * `.gitleaks.toml` — gitleaks ruleset + false-positive allowlist (lockfiles,
   `*.example`, and the base64 `foobarsecrettoken` test fixture in the Rust
   redaction tests).
-* `oauth-sidecar/eslint.config.js`, `.prettierrc.json`, `.prettierignore` —
+* `oauth-sidecar/.oxlintrc.json`, `.prettierrc.json`, `.prettierignore` —
   sidecar lint/format config. `npm run format:check` is scoped to the tooling
   files; the hand-authored `src/`/`test/` predate Prettier and are enforced for
-  **correctness** by ESLint. `npm run format:write` is the one-time follow-up to
+  **correctness** by oxlint. `npm run format:write` is the one-time follow-up to
   Prettier-format the whole sidecar when convenient.
 
 ## Repo-settings toggles (NOT in these files — do them in the GitHub UI)
