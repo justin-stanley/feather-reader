@@ -1,6 +1,6 @@
 [package]
 name = "feather-reader"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 rust-version = "1.94"
 description = "A minimalist, atproto-native RSS/Atom reader in Rust — your feed subscriptions live in your own PDS."
