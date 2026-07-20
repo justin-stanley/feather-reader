@@ -439,25 +439,43 @@ fn build_post_record(post: &RenderedPost, mention_did: &str) -> serde_json::Valu
     })
 }
 
-/// A DETERMINISTIC atproto record key for `did` + `kind`. atproto rkeys must match
-/// `[A-Za-z0-9._~-]{1,512}` and not be `.`/`..`; a DID contains `:` (e.g.
-/// `did:plc:abc`), which is NOT in that set, so we sanitise every out-of-charset
-/// byte to `-`. Prefixing with the post-kind + `did-` keeps `Claim` and `Waitlist`
-/// rkeys for the same follower distinct and well under the 512-char cap.
+/// A DETERMINISTIC, syntactically-valid **TID** record key for `did` + `kind`.
+///
+/// `app.bsky.feed.post` declares `record: { key: "tid" }` in its lexicon, so the
+/// PDS rejects any rkey that is not a valid TID with
+/// `InvalidRequest: Invalid TID string` — a generic sanitised-DID rkey (the old
+/// behaviour) is refused and the claim skeet never posts. A TID is 13 characters
+/// of the sortable base32 alphabet (`234567abcdefghijklmnopqrstuvwxyz`) encoding a
+/// 63-bit big-endian integer (top bit 0).
+///
+/// The rkey MUST stay deterministic per `(kind, did)` so a post-then-crash retry
+/// reuses the same rkey and is deduped server-side (`RecordAlreadyExists`) instead
+/// of double-posting. So rather than a clock, we derive the 63-bit value from a
+/// stable FNV-1a hash of `<prefix>-<did>` and s32-encode it: same follower + kind →
+/// the same TID forever, and `Claim`/`Waitlist` differ by the hashed prefix.
+/// Cross-`(kind, did)` collisions are ~1/2^63.
 fn rkey_for(did: &str, kind: PostKind) -> String {
-    let mut s = String::with_capacity(did.len() + 8);
-    s.push_str(kind.prefix());
-    s.push('-');
-    for b in did.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => {
-                s.push(b as char)
-            }
-            _ => s.push('-'),
-        }
+    const S32: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
+    // FNV-1a (64-bit) over `<prefix>-<did>`.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in kind
+        .prefix()
+        .bytes()
+        .chain(std::iter::once(b'-'))
+        .chain(did.bytes())
+    {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    s.truncate(512);
-    s
+    // TIDs are 63-bit, big-endian, with the top bit always 0.
+    h &= 0x7fff_ffff_ffff_ffff;
+    let mut out = [0u8; 13];
+    for slot in out.iter_mut().rev() {
+        *slot = S32[(h & 0x1f) as usize];
+        h >>= 5;
+    }
+    // Every byte is from S32, which is ASCII.
+    String::from_utf8(out.to_vec()).expect("s32 output is ASCII")
 }
 
 /// The XRPC error envelope: `{ "error": "<Name>", "message": "..." }`.
@@ -548,8 +566,17 @@ mod tests {
         assert_eq!(urlencode("did:plc:abc"), "did%3Aplc%3Aabc");
     }
 
+    /// A syntactically valid atproto TID: 13 chars of sortable-base32, with the
+    /// first char restricted (it carries only the 63-bit value's top 3 bits).
+    fn is_valid_tid(s: &str) -> bool {
+        const FIRST: &[u8] = b"234567abcdefghij";
+        const REST: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+        let b = s.as_bytes();
+        b.len() == 13 && FIRST.contains(&b[0]) && b[1..].iter().all(|c| REST.contains(c))
+    }
+
     #[test]
-    fn rkey_is_deterministic_charset_safe_and_kind_distinct() {
+    fn rkey_is_a_deterministic_valid_tid_distinct_per_kind() {
         let did = "did:plc:abc123";
         let claim = rkey_for(did, PostKind::Claim);
         let wl = rkey_for(did, PostKind::Waitlist);
@@ -557,19 +584,19 @@ mod tests {
         assert_eq!(claim, rkey_for(did, PostKind::Claim));
         // The two post kinds NEVER collide for the same follower.
         assert_ne!(claim, wl);
-        // Colons (illegal in an rkey) are sanitised; only the legal charset remains.
-        assert!(!claim.contains(':'));
-        assert!(claim
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-')));
-        assert!(claim.starts_with("clm-"));
-        assert!(wl.starts_with("wl-"));
+        // Both MUST be valid TIDs — `app.bsky.feed.post` requires `key: tid`, and a
+        // non-TID rkey is rejected with `InvalidRequest: Invalid TID string`.
+        assert!(is_valid_tid(&claim), "claim rkey not a valid TID: {claim}");
+        assert!(is_valid_tid(&wl), "waitlist rkey not a valid TID: {wl}");
     }
 
     #[test]
-    fn rkey_is_capped_at_512() {
+    fn rkey_is_a_fixed_length_tid_regardless_of_did() {
+        // A TID is always 13 chars, however long the DID.
         let long_did = format!("did:plc:{}", "x".repeat(1000));
-        assert!(rkey_for(&long_did, PostKind::Claim).len() <= 512);
+        let rk = rkey_for(&long_did, PostKind::Claim);
+        assert_eq!(rk.len(), 13);
+        assert!(is_valid_tid(&rk));
     }
 
     #[test]

@@ -195,7 +195,10 @@ async fn run_cycle(
             Ok(()) => {}
             Err(err) => {
                 // One follower failing (e.g. their post 400s) must not abort the batch.
-                warn!(did = %f.did, %err, "failed to handle follower; leaving for retry");
+                // `?err` (Debug) prints the full anyhow chain — the underlying status/
+                // body or transport error, not just the top-level context — so a stuck
+                // follower is diagnosable from the logs without a rebuild.
+                warn!(did = %f.did, err = ?err, "failed to handle follower; leaving for retry");
             }
         }
     }
