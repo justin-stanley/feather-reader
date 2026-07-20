@@ -1,0 +1,17 @@
+{
+  "ignorePatterns": ["dist", "dist-test", "node_modules"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "no-console": "error",
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
+      }
+    ]
+  }
+}

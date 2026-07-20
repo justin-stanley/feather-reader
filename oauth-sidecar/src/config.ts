@@ -131,7 +131,7 @@ export function loadConfig(): SidecarConfig {
   if (rawSecret === undefined) {
     if (securityDev) {
       internalSecret = DEV_INTERNAL_SECRET;
-      // eslint-disable-next-line no-console
+      // oxlint-disable-next-line no-console
       console.warn(
         '[config] SIDECAR_INTERNAL_SECRET unset — using an insecure dev default (SIDECAR_DEV set). NEVER do this in prod.',
       );
@@ -166,7 +166,7 @@ export function loadConfig(): SidecarConfig {
   if (rawEncKey === undefined) {
     if (securityDev) {
       encKey = undefined; // stores fall back to plaintext for a local dev stack
-      // eslint-disable-next-line no-console
+      // oxlint-disable-next-line no-console
       console.warn(
         '[config] SIDECAR_ENC_KEY unset — persisting OAuth tokens/JWK in PLAINTEXT (SIDECAR_DEV set). ' +
           'Set SIDECAR_ENC_KEY (via fly secrets) before any real deploy.',

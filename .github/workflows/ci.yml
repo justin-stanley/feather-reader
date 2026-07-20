@@ -158,13 +158,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Lint (ESLint, --max-warnings 0)
+      - name: Lint (oxlint, --max-warnings 0)
         run: npm run lint
 
       - name: Format check (Prettier)
         # Scoped to the tooling/config files the CI pipeline owns. The hand-
         # authored src/ + test/ predate Prettier and are enforced for
-        # CORRECTNESS by ESLint above; a repo-wide `prettier --write` is left as
+        # CORRECTNESS by oxlint above; a repo-wide `prettier --write` is left as
         # a deliberate one-time follow-up (`npm run format:write`) so this gate
         # never fights the code-fix workflows over whitespace. See
         # .github/workflows/README.md.
