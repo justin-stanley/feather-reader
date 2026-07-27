@@ -43,7 +43,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install stable toolchain (clippy + rustfmt)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -71,7 +71,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # cargo-deny shells out to `cargo metadata` to build the crate graph, so
       # this job needs a Rust toolchain (cargo on PATH) even though it only runs
@@ -87,7 +87,7 @@ jobs:
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -105,7 +105,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
     runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -124,7 +124,7 @@ jobs:
       # `cargo install ... || true`, which masked an install failure and let the
       # next step die command-not-found — a green job that skipped the RustSec scan.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -140,7 +140,7 @@ jobs:
       run:
         working-directory: oauth-sidecar
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -186,7 +186,7 @@ jobs:
       run:
         working-directory: bot
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install stable toolchain (clippy + rustfmt)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -217,7 +217,7 @@ jobs:
       # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` OR-expression resolves to a
       # permissive branch automatically.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -230,7 +230,7 @@ jobs:
       # green-looking job that never actually ran the RustSec scan. install-action
       # fails the job loudly if the tool can't be fetched. (Cheap nit.)
       - name: Install cargo-audit
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -245,7 +245,7 @@ jobs:
     env:
       GITLEAKS_VERSION: 8.28.0
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0  # full history so gitleaks can scan past commits too
 
