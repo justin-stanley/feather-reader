@@ -217,6 +217,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/about", get(about))
+        .route("/privacy", get(privacy))
+        .route("/terms", get(terms))
         .route("/manage", get(manage))
         .route("/", get(index))
         .route("/entries/{id}", get(entry_view))
@@ -477,8 +479,9 @@ async fn rate_limit(
 // ---------------------------------------------------------------------------
 
 /// Cache-Control middleware. Emits `public, max-age=300` on the cacheable
-/// logged-out surfaces (the `/login` landing without a handle, `/about`, and the
-/// `/static/*` assets) and `no-store` on the authenticated app pages, so a CDN /
+/// logged-out surfaces (the `/login` landing without a handle, `/about`,
+/// `/privacy`, `/terms`, and the `/static/*` assets) and `no-store` on the
+/// authenticated app pages, so a CDN /
 /// browser can hold the viral landing while never caching a signed-in user's
 /// private view. Never overrides a handler that already set Cache-Control.
 async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
@@ -488,7 +491,11 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
     let is_login_landing = path == "/login"
         && req.method() == axum::http::Method::GET
         && !req.uri().query().unwrap_or("").contains("handle=");
-    let public = is_login_landing || path == "/about" || path.starts_with("/static/");
+    let public = is_login_landing
+        || path == "/about"
+        || path == "/privacy"
+        || path == "/terms"
+        || path.starts_with("/static/");
 
     let mut resp = next.run(req).await;
     if resp.headers().contains_key(header::CACHE_CONTROL) {
@@ -519,6 +526,28 @@ async fn health() -> impl IntoResponse {
 /// static render; readable whether or not a session exists.
 async fn about() -> Response {
     render(&AboutTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+    })
+}
+
+/// `GET /privacy` — the plain-language privacy page: no account/tracking, data
+/// lives in the user's PDS, what the server caches, and the session-token
+/// handling. A static render; readable whether or not a session exists.
+async fn privacy() -> Response {
+    render(&PrivacyTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+    })
+}
+
+/// `GET /terms` — the terms of use: the experimental / as-is disclaimer,
+/// acceptable use, the AGPL/self-host note, and the liability limitation. A
+/// static render; readable whether or not a session exists.
+async fn terms() -> Response {
+    render(&TermsTemplate {
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -638,6 +667,27 @@ struct ManageTemplate {
 #[derive(Template)]
 #[template(path = "about.html")]
 struct AboutTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+}
+
+/// The public `/privacy` page — what the server holds vs. what lives in the
+/// user's PDS. Carries the same `repo_url`/`kofi_url`/`version` the shared
+/// footer include needs.
+#[derive(Template)]
+#[template(path = "privacy.html")]
+struct PrivacyTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+}
+
+/// The public `/terms` page — the as-is / no-warranty terms of use. Carries the
+/// same fields the shared footer include needs.
+#[derive(Template)]
+#[template(path = "terms.html")]
+struct TermsTemplate {
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -4855,6 +4905,24 @@ mod tests {
         // The security headers are still intact.
         assert!(about.headers().contains_key("content-security-policy"));
         assert_eq!(about.headers().get("x-frame-options").unwrap(), "DENY");
+
+        // /privacy and /terms are static public pages → public, cacheable.
+        for path in ["/privacy", "/terms"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "public, max-age=300",
+                "{path} should be publicly cacheable"
+            );
+            // Security headers apply to these pages too.
+            assert!(resp.headers().contains_key("content-security-policy"));
+            assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+        }
 
         // The bare /login landing → public, cacheable.
         let login = app
