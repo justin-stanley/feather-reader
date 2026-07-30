@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+
+{% block title %}Terms — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell shell-plain" id="shell">
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">Terms</h1>
+    <span class="icon-btn" aria-hidden="true"></span>
+  </header>
+
+  <main class="content" id="content">
+    <div class="about">
+      <h1>Terms of use</h1>
+
+      <p class="about-lede">
+        FeatherReader at feather-reader.com is a personal, experimental service,
+        offered for free and as-is. Using it means accepting the terms below.
+      </p>
+
+      <h2>An experiment, provided as-is</h2>
+      <p>
+        FeatherReader is run as a public experiment with <strong>no service-level
+        agreement and no uptime guarantee</strong>. It may change, break, slow down,
+        or be paused at any time, without notice. Please don't rely on it as your
+        only reader — treat it as something to try, not something to depend on.
+      </p>
+
+      <h2>Your identity and your data</h2>
+      <p>
+        You sign in with your own atproto identity, and you are responsible for that
+        account and the PDS that hosts it. FeatherReader acts only on your behalf, to
+        read and write your own <code>community.lexicon.rss.*</code> records; it does
+        not own your data. Because your reading list lives in your PDS, keep your own
+        copy where it matters — OPML export is always available.
+      </p>
+
+      <h2>Acceptable use</h2>
+      <p>
+        Please use FeatherReader as intended: to read feeds. Do not use it to break
+        the law or infringe others' rights, to attack, overload, or probe the service,
+        to circumvent rate limits or abuse controls, or to access feeds you are not
+        entitled to. FeatherReader supports <strong>public feeds only</strong> — do
+        not use it to store secret or paid-feed credentials.
+      </p>
+
+      <h2>The software is open source</h2>
+      <p>
+        FeatherReader is free software under the
+        <a href="{{ repo_url }}" rel="noopener noreferrer">AGPL-3.0</a>. You are
+        welcome to read the code, file issues, or run your own copy — a single static
+        binary plus a small OAuth sidecar. The instance at feather-reader.com is just
+        one deployment, run as a personal experiment.
+      </p>
+
+      <h2>No warranty; limitation of liability</h2>
+      <p>
+        The service is provided <strong>"as is", without warranty of any kind</strong>.
+        To the fullest extent permitted by law, the maker is not liable for any damages
+        or data loss arising from use of the service or its interruption. Your canonical
+        data lives in your PDS and via OPML export, so you always hold a copy.
+      </p>
+
+      <h2>Suspension</h2>
+      <p>
+        Access may be rate-limited, restricted, or paused at any time — for abuse
+        prevention, maintenance, or any other reason — without notice.
+      </p>
+
+      <h2>Changes to these terms</h2>
+      <p>
+        These terms may be updated on this page; the "last updated" date below reflects
+        the current version, and continued use means accepting it.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Reach FeatherReader on
+        <a href="https://bsky.app/profile/feather-reader.com" rel="noopener noreferrer">Bluesky</a>
+        or open an issue on
+        <a href="{{ repo_url }}" rel="noopener noreferrer">GitHub</a>.
+      </p>
+
+      <p class="about-meta">Last updated: 29 July 2026.</p>
+    </div>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+{% endblock %}

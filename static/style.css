@@ -1789,6 +1789,25 @@ html[data-overlay="1"] .kbd-overlay {
   color: var(--ink-soft);
 }
 
+.about ul {
+  margin: 0 0 var(--s4);
+  padding-left: var(--s5);
+  font-family: var(--font-serif);
+  font-size: var(--reading-size);
+  line-height: var(--reading-leading);
+  color: var(--ink);
+}
+
+.about li {
+  margin: 0 0 var(--s2);
+}
+
+.about .about-meta {
+  margin-top: var(--s6);
+  font-size: var(--text-sm);
+  color: var(--ink-soft);
+}
+
 /* --------------------------------------------------------------------------
    14. Real-template helpers (rail folder links, inline mgmt forms, disabled
        action-bar buttons) — small additions the mockups didn't need.

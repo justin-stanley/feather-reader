@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{% block title %}Privacy — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell shell-plain" id="shell">
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">Privacy</h1>
+    <span class="icon-btn" aria-hidden="true"></span>
+  </header>
+
+  <main class="content" id="content">
+    <div class="about">
+      <h1>Privacy at FeatherReader</h1>
+
+      <p class="about-lede">
+        FeatherReader is built so there is very little of your data for it to hold.
+        Your reading lives in your own PDS; this server keeps only a cache and your
+        login session.
+      </p>
+
+      <h2>No account, no tracking</h2>
+      <p>
+        There is no signup and no password database. You sign in with your own
+        atproto identity over OAuth, so FeatherReader never sees or stores a
+        password. There are <strong>no analytics, no advertising networks, no
+        third-party trackers, and no telemetry</strong> — nothing here profiles you
+        or follows you around the web.
+      </p>
+
+      <h2>Your reading data lives in your PDS</h2>
+      <p>
+        Your subscriptions, folders, stars, and read-state are written as
+        open-standard <code>community.lexicon.rss.*</code> records in
+        <strong>your own PDS</strong> — not on this server. That data is yours: it
+        stays under your control, and OPML export is always available so you can
+        leave with it at any time.
+      </p>
+
+      <h2>What this server does hold</h2>
+      <p>
+        To run the reader — and, during the current closed beta, to gate access —
+        the server holds:
+      </p>
+      <ul>
+        <li>A <strong>shared cache of public feed content</strong> it has fetched —
+          articles from the feeds people subscribe to, not personal data.</li>
+        <li>A <strong>per-user cache</strong> of your subscriptions and read/star
+          state, so the list loads without re-reading your PDS on every request.</li>
+        <li>Your <strong>OAuth session</strong> — access and refresh tokens,
+          <strong>encrypted at rest</strong> on the server's private volume and used
+          only to read and write your own PDS records on your behalf.</li>
+        <li>While FeatherReader is in <strong>closed beta</strong>: the list of
+          atproto identities (DIDs) that hold a beta seat, and the invite codes used
+          to grant them.</li>
+      </ul>
+
+      <h2>Network and logs</h2>
+      <p>
+        The site is served through <strong>Cloudflare</strong>, a CDN and proxy that
+        processes connection metadata such as IP addresses to deliver and protect the
+        service. Operational server logs may briefly record request metadata for
+        debugging and abuse-prevention; they are not used to profile you. The feed
+        poller makes outbound requests to the feed hosts you subscribe to, on a
+        schedule, to fetch new items.
+      </p>
+
+      <h2>Public feeds only</h2>
+      <p>
+        Because your PDS is public, FeatherReader supports <strong>public feeds
+        only</strong>. A private or paid feed carries its secret in the URL, and this
+        server never stores or writes such a secret — please don't subscribe with one.
+      </p>
+
+      <h2>Deleting your data</h2>
+      <p>
+        Sign out to drop the server-side session. Your canonical data lives in your
+        PDS, so removing a subscription, star, or folder in FeatherReader deletes the
+        corresponding record from your PDS; the server-side caches are transient. To
+        remove everything, delete the <code>community.lexicon.rss.*</code> records
+        from your PDS, then sign out and stop using the service.
+      </p>
+
+      <h2>Changes</h2>
+      <p>
+        This page will be updated as FeatherReader evolves. Material changes will be
+        reflected in the "last updated" date below.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Questions or concerns: reach FeatherReader on
+        <a href="https://bsky.app/profile/feather-reader.com" rel="noopener noreferrer">Bluesky</a>
+        or open an issue on
+        <a href="{{ repo_url }}" rel="noopener noreferrer">GitHub</a>. Security
+        reports should use private
+        <a href="{{ repo_url }}/security/advisories/new" rel="noopener noreferrer">vulnerability reporting</a>,
+        not a public issue.
+      </p>
+
+      <p class="about-meta">Last updated: 29 July 2026.</p>
+    </div>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+{% endblock %}
