@@ -42,24 +42,62 @@ import { NullCodec } from './crypto.js';
  * upstream explicitly warns against for a session store): this store is the
  * source of truth for tokens, so a persistence failure must propagate.
  */
+export type StoreFaultKind =
+  /** The store itself misbehaved: SQLITE_BUSY, disk/IO, closed handle. Retrying may work. */
+  | 'unavailable'
+  /** A row was read but could not be decoded — wrong `SIDECAR_ENC_KEY`, or corruption. */
+  | 'corrupt';
+
 export class StoreError extends Error {
   constructor(
     readonly store: 'state' | 'session',
     readonly op: 'get' | 'set' | 'del',
+    readonly kind: StoreFaultKind,
     cause: unknown,
   ) {
-    super(`oauth ${store} store failed during "${op}"`, { cause });
+    super(`oauth ${store} store failed during "${op}" (${kind})`, { cause });
     this.name = 'StoreError';
   }
 }
 
 /** Run a store operation, tagging any throw as a {@link StoreError}. */
-function guard<T>(store: 'state' | 'session', op: 'get' | 'set' | 'del', fn: () => T): T {
+function guard<T>(
+  store: 'state' | 'session',
+  op: 'get' | 'set' | 'del',
+  kind: StoreFaultKind,
+  fn: () => T,
+): T {
   try {
     return fn();
   } catch (err) {
-    throw new StoreError(store, op, err);
+    throw new StoreError(store, op, kind, err);
   }
+}
+
+/**
+ * True when `err` is a *transient* failure to read the session store — the row is
+ * intact and a retry may well succeed, so the caller should back off rather than
+ * push the user through login again.
+ *
+ * Deliberately narrow, and each exclusion is load-bearing:
+ *
+ *  - `kind === 'corrupt'` is excluded. An undecryptable row (e.g. after an
+ *    `SIDECAR_ENC_KEY` rotation) fails identically forever; retrying is a loop.
+ *    Only a fresh login rewrites that row, so re-login genuinely *is* the fix.
+ *  - Writes are excluded. A failed `set` reaches callers wrapped in an
+ *    `AggregateError` — `SessionGetter.setStored` revokes the tokens at the PDS
+ *    and deletes the row before rethrowing — so by then the session really is
+ *    gone. An `AggregateError` is not a `StoreError`, so it falls through here.
+ *  - The state store is excluded: it is per-authorization-request scratch data,
+ *    not a live session, and its failures surface on `/login` + `/callback`.
+ */
+export function isTransientSessionReadFailure(err: unknown): boolean {
+  return (
+    err instanceof StoreError &&
+    err.store === 'session' &&
+    err.op === 'get' &&
+    err.kind === 'unavailable'
+  );
 }
 
 export interface SessionRow {
@@ -128,23 +166,37 @@ export class SqliteStores {
     const codec = this.codec;
     return {
       async set(key: string, value: NodeSavedState): Promise<void> {
-        guard('state', 'set', () =>
+        guard('state', 'set', 'unavailable', () =>
           db
             .prepare('INSERT OR REPLACE INTO oauth_state (key, value) VALUES (?, ?)')
             .run(key, codec.encrypt(JSON.stringify(value))),
         );
       },
       async get(key: string): Promise<NodeSavedState | undefined> {
-        return guard('state', 'get', () => {
-          const row = db.prepare('SELECT value FROM oauth_state WHERE key = ?').get(key) as
-            | { value: string }
-            | undefined;
-          // Migrate-on-read: `maybeDecrypt` passes through legacy plaintext rows.
-          return row ? (JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedState) : undefined;
-        });
+        const row = guard(
+          'state',
+          'get',
+          'unavailable',
+          () =>
+            db.prepare('SELECT value FROM oauth_state WHERE key = ?').get(key) as
+              | { value: string }
+              | undefined,
+        );
+        if (!row) return undefined;
+        // Decoding is a separate fault class: reaching the row but failing to read
+        // it is permanent, not a blip. Migrate-on-read: `maybeDecrypt` passes
+        // through legacy plaintext rows.
+        return guard(
+          'state',
+          'get',
+          'corrupt',
+          () => JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedState,
+        );
       },
       async del(key: string): Promise<void> {
-        guard('state', 'del', () => db.prepare('DELETE FROM oauth_state WHERE key = ?').run(key));
+        guard('state', 'del', 'unavailable', () =>
+          db.prepare('DELETE FROM oauth_state WHERE key = ?').run(key),
+        );
       },
     };
   }
@@ -155,7 +207,7 @@ export class SqliteStores {
     const codec = this.codec;
     return {
       async set(sub: string, session: NodeSavedSession): Promise<void> {
-        guard('session', 'set', () => {
+        guard('session', 'set', 'unavailable', () => {
           const now = Date.now();
           const enc = codec.encrypt(JSON.stringify(session));
           // Preserve the original created_at across refresh-driven rewrites so the
@@ -172,18 +224,33 @@ export class SqliteStores {
         });
       },
       async get(sub: string): Promise<NodeSavedSession | undefined> {
-        return guard('session', 'get', () => {
-          const row = db.prepare('SELECT value FROM oauth_session WHERE did = ?').get(sub) as
-            | { value: string }
-            | undefined;
-          if (!row) return undefined;
-          // Touch idle-TTL clock on every restore/read.
-          db.prepare('UPDATE oauth_session SET last_used_at = ? WHERE did = ?').run(Date.now(), sub);
-          return JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedSession;
-        });
+        const row = guard(
+          'session',
+          'get',
+          'unavailable',
+          () =>
+            db.prepare('SELECT value FROM oauth_session WHERE did = ?').get(sub) as
+              | { value: string }
+              | undefined,
+        );
+        if (!row) return undefined;
+        // Decode before touching the TTL clock. A row we cannot decrypt is dead
+        // weight, and touching `last_used_at` on every failed read would keep
+        // refreshing its idle-TTL — letting a polled, unreadable row outlive the
+        // idle reap and linger until the absolute TTL.
+        const session = guard(
+          'session',
+          'get',
+          'corrupt',
+          () => JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedSession,
+        );
+        guard('session', 'get', 'unavailable', () =>
+          db.prepare('UPDATE oauth_session SET last_used_at = ? WHERE did = ?').run(Date.now(), sub),
+        );
+        return session;
       },
       async del(sub: string): Promise<void> {
-        guard('session', 'del', () =>
+        guard('session', 'del', 'unavailable', () =>
           db.prepare('DELETE FROM oauth_session WHERE did = ?').run(sub),
         );
       },
