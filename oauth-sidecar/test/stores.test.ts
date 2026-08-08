@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { SqliteStores, StoreError } from '../src/stores.js';
+import { SqliteStores, StoreError, isTransientSessionReadFailure } from '../src/stores.js';
 import { Aead } from '../src/crypto.js';
 
 const ENC_KEY = 'stores-test-passphrase-value-32b!';
@@ -192,7 +192,9 @@ test('StoreError: a failed session-store read is tagged op=get, not reported as 
         assert.ok(err instanceof StoreError, `expected StoreError, got ${String(err)}`);
         assert.equal(err.store, 'session');
         assert.equal(err.op, 'get');
+        assert.equal(err.kind, 'unavailable');
         assert.ok(err.cause, 'underlying cause is preserved');
+        assert.ok(isTransientSessionReadFailure(err), 'a store-level blip is retryable');
         return true;
       },
     );
@@ -212,7 +214,15 @@ test('StoreError: an undecryptable session row surfaces as op=get rather than a 
     const rotated = new SqliteStores(path, new Aead('a-totally-different-passphrase!!'));
     await assert.rejects(
       async () => void (await rotated.sessionStore().get('did:plc:alice')),
-      (err: unknown) => err instanceof StoreError && err.op === 'get',
+      (err: unknown) => {
+        assert.ok(err instanceof StoreError);
+        assert.equal(err.op, 'get');
+        assert.equal(err.kind, 'corrupt', 'an unreadable row is not a store outage');
+        // The whole point: this fails identically forever, so it must NOT be
+        // advertised as retryable — only a fresh login rewrites the row.
+        assert.equal(isTransientSessionReadFailure(err), false);
+        return true;
+      },
     );
     rotated.close();
   } finally {
@@ -254,5 +264,89 @@ test('StoreError: a genuinely absent row is still a plain miss, not an error', a
     stores.close();
   } finally {
     cleanup();
+  }
+});
+
+// ─── Follow-up to #77: fault classification + the handler's decision rule ─────
+
+test('a corrupt row does not refresh its idle-TTL clock, so the reaper can still collect it', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    await stores.sessionStore().set('did:plc:alice', { tokenSet: {} } as never);
+    stores.close();
+
+    const rotated = new SqliteStores(path, new Aead('a-totally-different-passphrase!!'));
+    const before = new DatabaseSync(path)
+      .prepare('SELECT last_used_at FROM oauth_session WHERE did = ?')
+      .get('did:plc:alice') as { last_used_at: number };
+
+    // Poll the unreadable row a few times, as a retrying client would.
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(async () => void (await rotated.sessionStore().get('did:plc:alice')));
+    }
+
+    const after = new DatabaseSync(path)
+      .prepare('SELECT last_used_at FROM oauth_session WHERE did = ?')
+      .get('did:plc:alice') as { last_used_at: number };
+    assert.equal(after.last_used_at, before.last_used_at, 'failed reads must not touch the clock');
+
+    // And it is genuinely reapable rather than being kept alive by the polling:
+    // evaluate the idle TTL at a fixed point past the clock's last honest value.
+    const reaped = await rotated.reap(
+      { absoluteMs: 60_000, idleMs: 5_000 },
+      undefined,
+      before.last_used_at + 10_000,
+    );
+    assert.deepEqual(reaped, ['did:plc:alice']);
+    rotated.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test('a healthy read still touches the idle-TTL clock', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    const ss = stores.sessionStore();
+    await ss.set('did:plc:alice', { tokenSet: { access_token: 't' } } as never);
+    const before = stores.db
+      .prepare('SELECT last_used_at FROM oauth_session WHERE did = ?')
+      .get('did:plc:alice') as { last_used_at: number };
+
+    await new Promise((r) => setTimeout(r, 5));
+    assert.ok(await ss.get('did:plc:alice'));
+
+    const after = stores.db
+      .prepare('SELECT last_used_at FROM oauth_session WHERE did = ?')
+      .get('did:plc:alice') as { last_used_at: number };
+    assert.ok(after.last_used_at > before.last_used_at);
+    stores.close();
+  } finally {
+    cleanup();
+  }
+});
+
+// This is the rule /internal/repo branches on: 503-and-retry vs 404-and-re-login.
+// It encodes an assumption borrowed from library internals (a failed write reaches
+// us wrapped in AggregateError, after the library has already revoked + deleted),
+// so pin every arm — a future oauth-client bump that stops wrapping should fail
+// here rather than silently start telling users to "retry shortly".
+test('isTransientSessionReadFailure: only a transient session-store read is retryable', async () => {
+  const transient = new StoreError('session', 'get', 'unavailable', new Error('SQLITE_BUSY'));
+  assert.equal(isTransientSessionReadFailure(transient), true);
+
+  const cases: Array<[string, unknown]> = [
+    ['corrupt row (permanent — re-login is the fix)', new StoreError('session', 'get', 'corrupt', new Error('bad tag'))],
+    ['write failure (library already revoked + deleted)', new StoreError('session', 'set', 'unavailable', new Error('disk full'))],
+    ['delete failure', new StoreError('session', 'del', 'unavailable', new Error('io'))],
+    ['state store, not a live session', new StoreError('state', 'get', 'unavailable', new Error('io'))],
+    ['wrapped write failure, as the library rethrows it', new AggregateError([transient], 'Failed to store session')],
+    ['an ordinary error', new Error('nope')],
+    ['nothing at all', undefined],
+  ];
+  for (const [label, err] of cases) {
+    assert.equal(isTransientSessionReadFailure(err), false, `should not be retryable: ${label}`);
   }
 });

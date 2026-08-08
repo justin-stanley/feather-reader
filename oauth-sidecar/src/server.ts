@@ -70,8 +70,12 @@
  *    `error: "SessionNotFound"` (404) when no OAuth session exists for the DID —
  *    the Rust app should treat that as "re-login required".
  *    `error: "StoreUnavailable"` (503) when the session store could not be *read*
- *    (e.g. SQLITE_BUSY). The session is untouched and still valid, so the Rust
- *    app should retry rather than send the user back through login.
+ *    because the store itself was unavailable (e.g. SQLITE_BUSY, disk/IO). The
+ *    session is untouched and still valid, so the Rust app should retry rather
+ *    than send the user back through login. Note this is strictly the transient
+ *    case: a row that exists but cannot be decrypted (e.g. after a
+ *    `SIDECAR_ENC_KEY` rotation) fails the same way on every retry, so it stays
+ *    `SessionNotFound` (404) — only a fresh login rewrites that row.
  *
  *  GET  /internal/health        → 200 {ok:true}  (secret-guarded liveness)
  *
@@ -95,7 +99,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
-import { SqliteStores, StoreError, type SessionTtls } from './stores.js';
+import { SqliteStores, isTransientSessionReadFailure, type SessionTtls } from './stores.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
@@ -403,15 +407,15 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
     const session = await oauthClient.restore(did);
     agent = new Agent(session);
   } catch (err) {
-    // A read failure against the session store means we could not *look up* the
-    // session, not that it is gone: the row is still there and still valid. Say
-    // so with a retryable 503 instead of telling the user to re-login.
-    //
-    // Only the read path qualifies. A failed write is wrapped by the library in
-    // an AggregateError *after* it has revoked the tokens at the PDS and deleted
-    // the row (see SessionGetter.setStored), so by then the session really is
-    // gone and 404 is the honest answer.
-    if (err instanceof StoreError && err.op === 'get') {
+    // A *transient* read failure means we could not look the session up, not that
+    // it is gone: the row is intact, so answer with a retryable 503 rather than
+    // telling the user to re-login. Everything else keeps the 404, and each case
+    // earns it (see isTransientSessionReadFailure for the full reasoning):
+    //   - an undecryptable row fails identically forever, and only a fresh login
+    //     rewrites it, so re-login really is the recovery;
+    //   - a failed write arrives wrapped in an AggregateError, by which point the
+    //     library has already revoked at the PDS and deleted the row.
+    if (isTransientSessionReadFailure(err)) {
       req.log.error({ err, did }, 'session store read failed; session left intact');
       reply.code(503);
       return {
