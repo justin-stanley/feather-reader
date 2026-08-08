@@ -29,6 +29,39 @@ import type {
 import type { Codec } from './crypto.js';
 import { NullCodec } from './crypto.js';
 
+/**
+ * A failure of the underlying SQLite store, as opposed to "the row isn't there".
+ *
+ * Since `@atproto-labs/simple-store@0.5`, `CachedGetter` propagates errors thrown
+ * by the store rather than swallowing them, so a `SQLITE_BUSY`/IO blip on the
+ * read path now surfaces out of `oauthClient.restore()`. Without a marker type,
+ * the caller cannot tell that apart from a genuinely absent session and would
+ * report "re-login required" for what is really a transient infra fault.
+ *
+ * We deliberately do **not** swallow these (cf. `swallowStoreErrors`, which
+ * upstream explicitly warns against for a session store): this store is the
+ * source of truth for tokens, so a persistence failure must propagate.
+ */
+export class StoreError extends Error {
+  constructor(
+    readonly store: 'state' | 'session',
+    readonly op: 'get' | 'set' | 'del',
+    cause: unknown,
+  ) {
+    super(`oauth ${store} store failed during "${op}"`, { cause });
+    this.name = 'StoreError';
+  }
+}
+
+/** Run a store operation, tagging any throw as a {@link StoreError}. */
+function guard<T>(store: 'state' | 'session', op: 'get' | 'set' | 'del', fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    throw new StoreError(store, op, err);
+  }
+}
+
 export interface SessionRow {
   id: string;
   did: string;
@@ -95,20 +128,23 @@ export class SqliteStores {
     const codec = this.codec;
     return {
       async set(key: string, value: NodeSavedState): Promise<void> {
-        db.prepare('INSERT OR REPLACE INTO oauth_state (key, value) VALUES (?, ?)').run(
-          key,
-          codec.encrypt(JSON.stringify(value)),
+        guard('state', 'set', () =>
+          db
+            .prepare('INSERT OR REPLACE INTO oauth_state (key, value) VALUES (?, ?)')
+            .run(key, codec.encrypt(JSON.stringify(value))),
         );
       },
       async get(key: string): Promise<NodeSavedState | undefined> {
-        const row = db.prepare('SELECT value FROM oauth_state WHERE key = ?').get(key) as
-          | { value: string }
-          | undefined;
-        // Migrate-on-read: `maybeDecrypt` passes through legacy plaintext rows.
-        return row ? (JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedState) : undefined;
+        return guard('state', 'get', () => {
+          const row = db.prepare('SELECT value FROM oauth_state WHERE key = ?').get(key) as
+            | { value: string }
+            | undefined;
+          // Migrate-on-read: `maybeDecrypt` passes through legacy plaintext rows.
+          return row ? (JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedState) : undefined;
+        });
       },
       async del(key: string): Promise<void> {
-        db.prepare('DELETE FROM oauth_state WHERE key = ?').run(key);
+        guard('state', 'del', () => db.prepare('DELETE FROM oauth_state WHERE key = ?').run(key));
       },
     };
   }
@@ -119,31 +155,37 @@ export class SqliteStores {
     const codec = this.codec;
     return {
       async set(sub: string, session: NodeSavedSession): Promise<void> {
-        const now = Date.now();
-        const enc = codec.encrypt(JSON.stringify(session));
-        // Preserve the original created_at across refresh-driven rewrites so the
-        // absolute-TTL clock starts at first login, not at the last refresh.
-        db.prepare(
-          `INSERT INTO oauth_session (did, value, created_at, last_used_at)
+        guard('session', 'set', () => {
+          const now = Date.now();
+          const enc = codec.encrypt(JSON.stringify(session));
+          // Preserve the original created_at across refresh-driven rewrites so the
+          // absolute-TTL clock starts at first login, not at the last refresh.
+          db.prepare(
+            `INSERT INTO oauth_session (did, value, created_at, last_used_at)
              VALUES (?, ?, ?, ?)
            ON CONFLICT(did) DO UPDATE SET
              value        = excluded.value,
              last_used_at = excluded.last_used_at,
              created_at   = CASE WHEN oauth_session.created_at = 0
                                  THEN excluded.created_at ELSE oauth_session.created_at END`,
-        ).run(sub, enc, now, now);
+          ).run(sub, enc, now, now);
+        });
       },
       async get(sub: string): Promise<NodeSavedSession | undefined> {
-        const row = db.prepare('SELECT value FROM oauth_session WHERE did = ?').get(sub) as
-          | { value: string }
-          | undefined;
-        if (!row) return undefined;
-        // Touch idle-TTL clock on every restore/read.
-        db.prepare('UPDATE oauth_session SET last_used_at = ? WHERE did = ?').run(Date.now(), sub);
-        return JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedSession;
+        return guard('session', 'get', () => {
+          const row = db.prepare('SELECT value FROM oauth_session WHERE did = ?').get(sub) as
+            | { value: string }
+            | undefined;
+          if (!row) return undefined;
+          // Touch idle-TTL clock on every restore/read.
+          db.prepare('UPDATE oauth_session SET last_used_at = ? WHERE did = ?').run(Date.now(), sub);
+          return JSON.parse(codec.maybeDecrypt(row.value)) as NodeSavedSession;
+        });
       },
       async del(sub: string): Promise<void> {
-        db.prepare('DELETE FROM oauth_session WHERE did = ?').run(sub);
+        guard('session', 'del', () =>
+          db.prepare('DELETE FROM oauth_session WHERE did = ?').run(sub),
+        );
       },
     };
   }

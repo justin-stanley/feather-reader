@@ -69,6 +69,9 @@
  *      4xx/5xx { ok: false, error: "<slug>", message: "<detail>", status?: n }
  *    `error: "SessionNotFound"` (404) when no OAuth session exists for the DID —
  *    the Rust app should treat that as "re-login required".
+ *    `error: "StoreUnavailable"` (503) when the session store could not be *read*
+ *    (e.g. SQLITE_BUSY). The session is untouched and still valid, so the Rust
+ *    app should retry rather than send the user back through login.
  *
  *  GET  /internal/health        → 200 {ok:true}  (secret-guarded liveness)
  *
@@ -92,7 +95,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
-import { SqliteStores, type SessionTtls } from './stores.js';
+import { SqliteStores, StoreError, type SessionTtls } from './stores.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
@@ -400,6 +403,23 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
     const session = await oauthClient.restore(did);
     agent = new Agent(session);
   } catch (err) {
+    // A read failure against the session store means we could not *look up* the
+    // session, not that it is gone: the row is still there and still valid. Say
+    // so with a retryable 503 instead of telling the user to re-login.
+    //
+    // Only the read path qualifies. A failed write is wrapped by the library in
+    // an AggregateError *after* it has revoked the tokens at the PDS and deleted
+    // the row (see SessionGetter.setStored), so by then the session really is
+    // gone and 404 is the honest answer.
+    if (err instanceof StoreError && err.op === 'get') {
+      req.log.error({ err, did }, 'session store read failed; session left intact');
+      reply.code(503);
+      return {
+        ok: false,
+        error: 'StoreUnavailable',
+        message: 'session store temporarily unavailable — retry shortly',
+      };
+    }
     req.log.warn({ err, did }, 'no restorable OAuth session for DID');
     reply.code(404);
     return {
