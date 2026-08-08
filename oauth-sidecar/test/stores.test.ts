@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { SqliteStores } from '../src/stores.js';
+import { SqliteStores, StoreError } from '../src/stores.js';
 import { Aead } from '../src/crypto.js';
 
 const ENC_KEY = 'stores-test-passphrase-value-32b!';
@@ -162,6 +162,95 @@ test('reaper: leaves un-timestamped legacy rows (created_at=0) alone', async () 
     const dids = await stores.reap({ absoluteMs: 1, idleMs: 1 }, undefined, Date.now());
     assert.deepEqual(dids, []);
     assert.ok(stores.hasOauthSession('did:plc:legacy'));
+    stores.close();
+  } finally {
+    cleanup();
+  }
+});
+
+// ─── StoreError (issue #77) ──────────────────────────────────────────────────
+//
+// `@atproto-labs/simple-store@0.5` made `CachedGetter` propagate store errors
+// instead of swallowing them. These pin the marker type the /internal/repo
+// handler relies on to tell "the store broke" (503, retryable) apart from
+// "there is no session" (404, re-login).
+
+test('StoreError: a failed session-store read is tagged op=get, not reported as a miss', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    const ss = stores.sessionStore();
+    await ss.set('did:plc:alice', { tokenSet: { access_token: 't' } } as never);
+
+    // Closing the handle makes every subsequent statement throw, standing in for
+    // a SQLITE_BUSY/IO fault.
+    stores.close();
+
+    await assert.rejects(
+      async () => void (await ss.get('did:plc:alice')),
+      (err: unknown) => {
+        assert.ok(err instanceof StoreError, `expected StoreError, got ${String(err)}`);
+        assert.equal(err.store, 'session');
+        assert.equal(err.op, 'get');
+        assert.ok(err.cause, 'underlying cause is preserved');
+        return true;
+      },
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('StoreError: an undecryptable session row surfaces as op=get rather than a raw parse error', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    await stores.sessionStore().set('did:plc:alice', { tokenSet: {} } as never);
+    stores.close();
+
+    // Re-open under a *different* key: the ciphertext can no longer be read.
+    const rotated = new SqliteStores(path, new Aead('a-totally-different-passphrase!!'));
+    await assert.rejects(
+      async () => void (await rotated.sessionStore().get('did:plc:alice')),
+      (err: unknown) => err instanceof StoreError && err.op === 'get',
+    );
+    rotated.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test('StoreError: write and delete failures are tagged too, and still propagate', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    const ss = stores.sessionStore();
+    const st = stores.stateStore();
+    stores.close();
+
+    await assert.rejects(
+      async () => void (await ss.set('did:plc:alice', { tokenSet: {} } as never)),
+      (err: unknown) => err instanceof StoreError && err.store === 'session' && err.op === 'set',
+    );
+    await assert.rejects(
+      async () => void (await ss.del('did:plc:alice')),
+      (err: unknown) => err instanceof StoreError && err.op === 'del',
+    );
+    await assert.rejects(
+      async () => void (await st.get('some-state-key')),
+      (err: unknown) => err instanceof StoreError && err.store === 'state' && err.op === 'get',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('StoreError: a genuinely absent row is still a plain miss, not an error', async () => {
+  const { path, cleanup } = tmpDb();
+  try {
+    const stores = new SqliteStores(path, new Aead(ENC_KEY));
+    assert.equal(await stores.sessionStore().get('did:plc:nobody'), undefined);
+    assert.equal(await stores.stateStore().get('no-such-key'), undefined);
     stores.close();
   } finally {
     cleanup();
