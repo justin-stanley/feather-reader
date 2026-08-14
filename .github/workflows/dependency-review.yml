@@ -45,10 +45,18 @@ jobs:
           # NOT denied — it's this project's own license.)
           deny-licenses: >-
             GPL-2.0-only, GPL-3.0-only, LGPL-3.0-only, SSPL-1.0
-          # Per-package license exemptions (version-pinned purls). Each is a
-          # transitive crate the action mis-flags; cargo-deny (the REQUIRED gate,
-          # deny.toml) resolves all three correctly — these unblock the advisory-only
-          # dependency-review action to match.
+          # Per-package license exemptions. Each is something the action
+          # mis-flags; cargo-deny (the REQUIRED gate, deny.toml) resolves the
+          # crates correctly — these unblock the advisory-only dependency-review
+          # action to match.
+          #
+          # NOTE ON VERSIONS: the `@x.y.z` suffixes below are DECORATIVE. The
+          # action's matcher (`purlsMatch`, src/purl.ts) compares only the purl
+          # type and namespace/name — its own comment reads "ignoring version" —
+          # so these exempt the package at every version, not just the one named.
+          # They are kept as documentation of the version the finding was
+          # verified against. Do NOT add a version expecting it to pin anything;
+          # equally, do not rely on a version to *narrow* an exemption.
           #   * r-efi 6.0.0 — UEFI-target-only crate pulled by the rustls TLS stack
           #     (getrandom → r-efi); NEVER compiles on this project's Linux/Fly
           #     targets. Its SPDX `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is an OR
@@ -59,8 +67,24 @@ jobs:
           #   * zmij 1.0.23 — dtolnay's Schubfach double→string formatter, a genuine
           #     transitive dep of serde_json ≥1.0.145. Real license is MIT (verified
           #     on crates.io: published by dtolnay, repo github.com/dtolnay/zmij);
-          #     the action reads it as null/unknown, so pin-exempt it.
+          #     the action reads it as null/unknown, so exempt it.
+          #   * Swatinem/rust-cache — LGPL-3.0, and the ONLY non-permissive action
+          #     in the pinned fleet (every other one is MIT or Apache-2.0). It is a
+          #     CI-only GitHub Action: it executes on the runner, is never copied
+          #     into this repo, never linked into the AGPL binary, and never
+          #     distributed with the crate or the container image. LGPLv3
+          #     obligations trigger on *conveying* a covered or combined work
+          #     (LGPLv3 §4 → GPLv3 §§4-6); `uses:` is an invocation, and running a
+          #     program is unrestricted. So there is no combined work and no
+          #     conveyance — nothing for the copyleft to attach to. (Even where
+          #     they genuinely combine, LGPL-3.0 is AGPL-3.0-compatible.)
+          #     Deliberately VERSIONLESS: Dependabot changes the pinned SHA on
+          #     every bump, and a versioned purl would read as if it re-blocked
+          #     each time. `LGPL-3.0-only` stays in deny-licenses above — it is
+          #     the right rule for a *linked crate*, and dropping it would put
+          #     this file out of sync with deny.toml, which does not admit LGPL.
           allow-dependencies-licenses: >-
             pkg:cargo/r-efi@6.0.0,
             pkg:cargo/webpki-root-certs@1.0.8,
-            pkg:cargo/zmij@1.0.23
+            pkg:cargo/zmij@1.0.23,
+            pkg:githubactions/Swatinem/rust-cache
