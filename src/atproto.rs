@@ -96,6 +96,17 @@ pub const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
 /// `com.atproto.identity.resolveHandle`; `bsky.social` is a reliable default.
 pub const DEFAULT_RESOLVER_HOST: &str = "https://bsky.social";
 
+/// Hard cap on cursor pages any `list_all_records` walk will follow.
+///
+/// [`crate::net::read_capped`] bounds each individual response, but nothing
+/// bounded the *accumulation* across pages: a repo host that returns a full page
+/// and a fresh cursor forever walks memory until the (512 MB) box dies. At 100
+/// records per page this admits 20 000 records — far past any real
+/// `community.lexicon.rss.*` collection — while making the loop finite against a
+/// host we do not control. Mirrors [`crate::network::MAX_PAGES`], which bounds
+/// the relay walk for the same reason.
+const MAX_LIST_PAGES: usize = 200;
+
 /// Errors from the atproto identity + PDS layer.
 ///
 /// Wraps the transport, the atproto XRPC error envelope (`{"error","message"}`),
@@ -684,18 +695,23 @@ impl PdsClient {
     /// Page through **all** records in a collection, following the cursor until
     /// exhausted. Convenience over [`list_records`](Self::list_records) for the
     /// login-time "load the whole follow-list" read.
+    ///
+    /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
+    /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
             out.extend(page.records);
             match page.cursor {
-                // Guard against a PDS that echoes a cursor with an empty page.
-                Some(next) if got > 0 => cursor = Some(next),
+                // Guard against a PDS that echoes a cursor with an empty page,
+                // or that hands back the SAME cursor forever (an infinite walk
+                // that would otherwise re-count the same page every pass).
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
             }
         }
@@ -1134,17 +1150,21 @@ impl SidecarClient {
     }
 
     /// Page through **all** records in a collection for `did`.
+    ///
+    /// Bounded by [`MAX_LIST_PAGES`] and cursor-repetition detection, same as
+    /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
+    /// PDS, so the page count is ultimately remote-controlled here too.
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(did, collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
             out.extend(page.records);
             match page.cursor {
-                Some(next) if got > 0 => cursor = Some(next),
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
             }
         }
@@ -1737,13 +1757,24 @@ struct XrpcErrorBody {
 
 /// Consume a non-2xx response into a typed [`AtProtoError::Xrpc`], parsing the
 /// atproto error envelope when present (falling back to `"Unknown"`).
+///
+/// The body is read through [`crate::net::read_capped`], **not** `resp.json()`.
+/// Every guarded call caps its success body; routing the error body through
+/// `resp.json()` would have left a hole exactly where the hostile-PDS threat
+/// model points — reqwest decompresses gzip before deserialising, so a `400`
+/// carrying a decompression bomb was an unbounded allocation on a 512 MB box.
+/// A body we cannot read (over-cap, transport error) degrades to `"Unknown"`,
+/// which is the same fallback an unparseable envelope already took.
 async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
     let status = resp.status();
-    let (error, message) = match resp.json::<XrpcErrorBody>().await {
-        Ok(body) => (
-            body.error.unwrap_or_else(|| "Unknown".to_string()),
-            body.message,
-        ),
+    let (error, message) = match crate::net::read_capped(resp).await {
+        Ok(raw) => match serde_json::from_slice::<XrpcErrorBody>(&raw) {
+            Ok(body) => (
+                body.error.unwrap_or_else(|| "Unknown".to_string()),
+                body.message,
+            ),
+            Err(_) => ("Unknown".to_string(), None),
+        },
         Err(_) => ("Unknown".to_string(), None),
     };
     AtProtoError::Xrpc {
@@ -1761,6 +1792,71 @@ async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Regression (v0.2.8 review).** Every guarded call caps its *success*
+    /// body via `read_capped`, but the non-2xx branch went through
+    /// `resp.json::<XrpcErrorBody>()` — unbounded, and with reqwest's gzip
+    /// decompression in front of it. That left a hole precisely where the
+    /// module's own threat model points: a hostile or DNS-rebound PDS answers
+    /// `400` with a decompression bomb and gets an unbounded allocation on a
+    /// 512 MB box. Both this PR's review passes checked the success path and
+    /// walked past the error path, so the cap is asserted here explicitly.
+    ///
+    /// Fetched directly rather than through the guard, which rightly refuses
+    /// loopback — the same reason `net::tests::read_capped_rejects_over_cap_body`
+    /// bypasses it. The stub answers 200; `xrpc_error_from` reads the status only
+    /// to record it, so the body handling under test is identical.
+    #[tokio::test]
+    async fn xrpc_error_body_is_capped() {
+        // A syntactically VALID envelope, one byte past the cap. If the body were
+        // parsed unbounded this would deserialize and yield "TooBig"; capped, it
+        // is refused unread and degrades to the "Unknown" fallback.
+        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
+        let big = format!(r#"{{"error":"TooBig","message":"{filler}"}}"#).into_bytes();
+        assert!(big.len() > crate::net::MAX_BODY_BYTES);
+
+        let base = crate::net::tests::serve_body(big).await;
+        let resp = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(&base)
+            .send()
+            .await
+            .unwrap();
+
+        match xrpc_error_from(resp).await {
+            AtProtoError::Xrpc { error, message, .. } => {
+                assert_eq!(error, "Unknown", "an over-cap error body must not parse");
+                assert!(message.is_none());
+            }
+            other => panic!("expected Xrpc, got {other:?}"),
+        }
+    }
+
+    /// The other half: a normal-sized envelope still parses, so capping the
+    /// error path did not cost the diagnostics it exists to provide.
+    #[tokio::test]
+    async fn xrpc_error_body_within_the_cap_still_parses() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"bad rkey"}"#.to_vec(),
+        )
+        .await;
+        let resp = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(&base)
+            .send()
+            .await
+            .unwrap();
+
+        match xrpc_error_from(resp).await {
+            AtProtoError::Xrpc { error, message, .. } => {
+                assert_eq!(error, "InvalidRequest");
+                assert_eq!(message.as_deref(), Some("bad rkey"));
+            }
+            other => panic!("expected Xrpc, got {other:?}"),
+        }
+    }
 
     /// A realistic `com.atproto.repo.listRecords` response for the subscription
     /// collection, as a PDS returns it — the envelope wraps each record in

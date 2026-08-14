@@ -577,6 +577,17 @@ pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<(
         info!("adoption probe: disabled (FEATHERREADER_ADOPTION_INTERVAL_SECS=0)");
         return;
     }
+    // Rejected entries are surfaced HERE rather than at parse time: config is
+    // read before `init_tracing` (main.rs:38 vs :41), so a warning emitted during
+    // parsing would go nowhere. Warn whether or not any usable host survived —
+    // a typo the operator never hears about is the failure mode this replaced a
+    // boot abort with, and it must not be silent as well as non-fatal.
+    for bad in &state.config.relay_host_errors {
+        warn!(
+            entry = %bad,
+            "adoption probe: ignoring unusable FEATHERREADER_RELAY_HOSTS entry"
+        );
+    }
     if state.config.relay_hosts.is_empty() {
         info!("adoption probe: no relay hosts configured, probe disabled");
         return;

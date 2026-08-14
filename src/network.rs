@@ -435,7 +435,7 @@ impl RelayClient {
         collection: &str,
     ) -> Result<AdoptionObservation, RelayError> {
         let (repos, truncated) = self
-            .walk_pages(|cursor| self.fetch_page(host, collection, cursor))
+            .walk_pages(host, |cursor| self.fetch_page(host, collection, cursor))
             .await?;
         Ok(self.observe(host, collection, repos, truncated))
     }
@@ -446,7 +446,7 @@ impl RelayClient {
     /// loopback stub server, so an end-to-end fixture is not available.
     ///
     /// Returns `(repos, truncated)`.
-    async fn walk_pages<F, Fut>(&self, mut fetch: F) -> Result<(u64, bool), RelayError>
+    async fn walk_pages<F, Fut>(&self, host: &str, mut fetch: F) -> Result<(u64, bool), RelayError>
     where
         F: FnMut(Option<String>) -> Fut,
         Fut: std::future::Future<Output = Result<ListReposByCollectionOut, RelayError>>,
@@ -458,10 +458,25 @@ impl RelayClient {
             if page_no > 0 && !self.page_delay.is_zero() {
                 tokio::time::sleep(self.page_delay).await;
             }
-            let page = fetch(cursor.take()).await?;
+            let sent = cursor.take();
+            let page = fetch(sent.clone()).await?;
             // `repos` is fed by an untrusted peer; never panic on overflow.
             repos = repos.saturating_add(page.repos.len() as u64);
             match advance(&page) {
+                // A relay that hands back the SAME cursor it was just given is
+                // not paginating. Following it would re-count the identical page
+                // up to `max_pages` times and publish the sum as "at least N" —
+                // inflating, in the UNSAFE direction, the one number this whole
+                // feature exists to state. Refuse the walk rather than record a
+                // count we already know is wrong.
+                PageStep::Continue(next) if Some(&next) == sent.as_ref() => {
+                    return Err(RelayError::Malformed {
+                        host: host.to_string(),
+                        reason: format!(
+                            "repeated cursor {next:?} at page {page_no} instead of advancing"
+                        ),
+                    })
+                }
                 PageStep::Continue(next) => cursor = Some(next),
                 PageStep::Done => return Ok((repos, false)),
             }
@@ -803,7 +818,7 @@ mod tests {
         let mut seen_cursors: Vec<Option<String>> = Vec::new();
         let mut n = 0usize;
         let (repos, truncated) = c
-            .walk_pages(|cursor| {
+            .walk_pages("https://relay.example", |cursor| {
                 seen_cursors.push(cursor);
                 let body = pages[n];
                 n += 1;
@@ -819,10 +834,14 @@ mod tests {
     #[tokio::test]
     async fn walk_pages_stops_at_the_page_cap_and_marks_truncated() {
         let c = instant_client(3);
-        // A relay that always returns a full-ish page and a fresh cursor.
+        // A relay that always returns a full-ish page and a genuinely FRESH
+        // cursor each time (a repeated one is refused — see the test below).
+        let mut n = 0usize;
         let (repos, truncated) = c
-            .walk_pages(|_| async {
-                Ok(parse(r#"{"repos":[{"did":"a"},{"did":"b"}],"cursor":"c"}"#))
+            .walk_pages("https://relay.example", |_| {
+                n += 1;
+                let body = format!(r#"{{"repos":[{{"did":"a"}},{{"did":"b"}}],"cursor":"c{n}"}}"#);
+                async move { Ok(parse(&body)) }
             })
             .await
             .unwrap();
@@ -831,10 +850,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_pages_refuses_a_relay_that_repeats_its_cursor() {
+        // The failure this guards: a relay stuck on one page would otherwise be
+        // followed to the cap, summing the SAME page every pass and publishing
+        // "at least 2 × max_pages" for what is really 2 repos — inflating the
+        // number in the unsafe direction. No observation is better than a wrong
+        // one, so the walk errors instead of returning a count.
+        let c = instant_client(50);
+        let err = c
+            .walk_pages("https://relay.example", |_| async {
+                Ok(parse(
+                    r#"{"repos":[{"did":"a"},{"did":"b"}],"cursor":"stuck"}"#,
+                ))
+            })
+            .await
+            .unwrap_err();
+        match err {
+            RelayError::Malformed { host, reason } => {
+                assert_eq!(host, "https://relay.example");
+                assert!(reason.contains("repeated cursor"), "reason was {reason:?}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn walk_pages_propagates_a_page_error() {
         let c = instant_client(MAX_PAGES);
         let err = c
-            .walk_pages(|_| async {
+            .walk_pages("https://relay.example", |_| async {
                 Err(RelayError::Malformed {
                     host: "https://relay.example".to_string(),
                     reason: "expected value".to_string(),

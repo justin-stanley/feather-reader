@@ -135,6 +135,11 @@ pub struct Config {
     /// leaving the variable unset, which takes the defaults. Bare hostnames are
     /// accepted and normalized to `https://…`.
     pub relay_hosts: Vec<String>,
+    /// Entries of `FEATHERREADER_RELAY_HOSTS` that were rejected as unusable, in
+    /// `"value" (reason)` form. Parsing happens before `init_tracing`, so these
+    /// are carried here and warned about by the adoption probe task instead of
+    /// being lost — or, as they were previously, aborting boot.
+    pub relay_host_errors: Vec<String>,
     /// How often the adoption probe runs. [`Duration::ZERO`] (the env value `0`)
     /// DISABLES it. From `FEATHERREADER_ADOPTION_INTERVAL_SECS`, default 24 h.
     pub adoption_interval: Duration,
@@ -239,6 +244,7 @@ impl Default for Config {
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
+            relay_host_errors: Vec::new(),
             relay_hosts: crate::network::DEFAULT_RELAY_HOSTS
                 .iter()
                 .map(|h| format!("https://{h}"))
@@ -396,7 +402,8 @@ impl Config {
         // is the documented kill switch, so "set, and set to nothing" has to stay
         // distinguishable from "not set".
         let relay_hosts_raw = env::var("FEATHERREADER_RELAY_HOSTS").ok();
-        let relay_hosts = parse_relay_hosts(relay_hosts_raw.as_deref(), defaults.relay_hosts)?;
+        let (relay_hosts, relay_host_errors) =
+            parse_relay_hosts(relay_hosts_raw.as_deref(), defaults.relay_hosts);
 
         // NOTE: parsed here, NOT via the scheduler's `env_duration_secs`, which
         // maps `0` back to its default — that would silently turn the documented
@@ -439,6 +446,7 @@ impl Config {
             bot_secret,
             claim_ttl_secs,
             relay_hosts,
+            relay_host_errors,
             adoption_interval,
             show_adoption,
         };
@@ -605,20 +613,30 @@ fn env_opt(key: &str) -> Option<String> {
 /// present-but-empty into absent and so silently restored the two Bluesky relay
 /// defaults for an operator who had explicitly asked for none.
 ///
-/// A *malformed* host fails loud, like every other present-but-bad var: a typo
-/// should be visible at boot, not silently probed forever.
-fn parse_relay_hosts(raw: Option<&str>, defaults: Vec<String>) -> Result<Vec<String>> {
+/// A *malformed* host is **dropped, not fatal**, and returned in the second
+/// element so the caller can surface it once logging exists.
+///
+/// This deliberately breaks the "a present-but-bad var fails loud" rule, because
+/// here that rule had a worse failure mode than the thing it was guarding:
+/// `Config::from_env` runs before `init_tracing` (`main.rs:38` vs `:41`), so a
+/// hard error is an unexplained non-zero exit, and `deploy/container-entrypoint.sh`
+/// turns that into a restart loop. A typo in an **optional metric's** host list
+/// would have taken the whole reader offline. `run_adoption_probe` already
+/// states the intended contract — "a typo'd relay host must disable an optional
+/// metric, never block boot" — and this makes it true.
+fn parse_relay_hosts(raw: Option<&str>, defaults: Vec<String>) -> (Vec<String>, Vec<String>) {
     let Some(raw) = raw else {
-        return Ok(defaults);
+        return (defaults, Vec::new());
     };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|h| {
-            crate::network::normalize_relay_host(h)
-                .with_context(|| format!("FEATHERREADER_RELAY_HOSTS: unusable relay host {h:?}"))
-        })
-        .collect()
+    let mut hosts = Vec::new();
+    let mut rejected = Vec::new();
+    for h in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match crate::network::normalize_relay_host(h) {
+            Ok(host) => hosts.push(host),
+            Err(err) => rejected.push(format!("{h:?} ({err})")),
+        }
+    }
+    (hosts, rejected)
 }
 
 /// Parse a permissive boolean: `1/true/yes/on` vs `0/false/no/off`
@@ -683,11 +701,12 @@ mod tests {
     #[test]
     fn empty_relay_hosts_env_disables_the_probe() {
         for raw in ["", "   ", ",", " , ,\t"] {
-            let hosts = parse_relay_hosts(Some(raw), relay_defaults()).unwrap();
+            let (hosts, rejected) = parse_relay_hosts(Some(raw), relay_defaults());
             assert!(
                 hosts.is_empty(),
                 "FEATHERREADER_RELAY_HOSTS={raw:?} must name no relays, got {hosts:?}"
             );
+            assert!(rejected.is_empty(), "an empty value is not a typo");
         }
     }
 
@@ -695,7 +714,7 @@ mod tests {
     #[test]
     fn absent_relay_hosts_env_keeps_the_defaults() {
         assert_eq!(
-            parse_relay_hosts(None, relay_defaults()).unwrap(),
+            parse_relay_hosts(None, relay_defaults()).0,
             relay_defaults()
         );
     }
@@ -707,7 +726,7 @@ mod tests {
                 Some(" relay.example , https://other.example/ ,"),
                 Vec::new()
             )
-            .unwrap(),
+            .0,
             vec![
                 "https://relay.example".to_string(),
                 "https://other.example".to_string(),
@@ -715,13 +734,29 @@ mod tests {
         );
     }
 
-    /// A typo fails loud rather than being silently dropped into "probe disabled".
+    /// **Regression (v0.2.8 review):** a typo used to abort `Config::from_env`,
+    /// and because config is parsed before `init_tracing` that surfaced as an
+    /// unexplained exit — which `container-entrypoint.sh` turns into a restart
+    /// loop. A bad host in an OPTIONAL metric's list must never take the reader
+    /// offline: drop it, keep the good ones, and hand the operator the reason so
+    /// the probe task can warn.
     #[test]
-    fn malformed_relay_host_env_is_an_error() {
-        let err = parse_relay_hosts(Some("relay.example,wss://relay.example"), Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("FEATHERREADER_RELAY_HOSTS"), "{err}");
+    fn malformed_relay_host_is_dropped_not_fatal() {
+        let (hosts, rejected) =
+            parse_relay_hosts(Some("relay.example,wss://relay.example"), Vec::new());
+        assert_eq!(hosts, vec!["https://relay.example".to_string()]);
+        assert_eq!(rejected.len(), 1, "the bad entry is reported, not silent");
+        assert!(rejected[0].contains("wss://relay.example"), "{rejected:?}");
+    }
+
+    /// Every entry bad ⇒ no hosts ⇒ the probe disables itself, still no panic
+    /// and still no boot failure.
+    #[test]
+    fn all_relay_hosts_malformed_disables_the_probe_without_failing() {
+        let (hosts, rejected) =
+            parse_relay_hosts(Some("wss://a.example, ftp://b.example"), relay_defaults());
+        assert!(hosts.is_empty());
+        assert_eq!(rejected.len(), 2);
     }
 
     #[test]

@@ -456,7 +456,7 @@ pub fn safe_link(raw: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
     /// A raw HTTP server on loopback that answers every request with `body`
     /// (fixed Content-Length). Returns its `http://127.0.0.1:port/` base URL.
     /// Used to exercise [`read_capped`] against a real reqwest `Response`.
-    async fn serve_body(body: Vec<u8>) -> String {
+    pub(crate) async fn serve_body(body: Vec<u8>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
