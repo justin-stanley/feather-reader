@@ -22,6 +22,9 @@
 //! | `FEATHERREADER_RESOLVER_HOST` | `https://bsky.social`    | atproto handle-resolver base (`com.atproto.identity.resolveHandle`) the pre-handshake beta gate uses to honor an existing seat on a cookie-less login. |
 //! | `FEATHERREADER_BOT_SECRET`   | *(unset = `/bot/claims` disabled)* | Shared bearer secret (`X-Bot-Secret`) gating the headless follow→invite bot's mint endpoint `POST /bot/claims`. Unset ⇒ endpoint returns 503. MUST be set (strong) on a production-like instance if the bot is used. |
 //! | `FEATHERREADER_CLAIM_TTL_SECS` | `1209600` (14 days)   | TTL for a bot-minted claim invite code — long, since the claim link is delivered asynchronously (a public skeet). |
+//! | `FEATHERREADER_RELAY_HOSTS`  | `relay1.us-west.bsky.network,relay1.us-east.bsky.network` | Relays queried for the network adoption count. Bare hosts or full URLs. Setting it to the **empty string** names no relays and so disables the probe (unset ⇒ the defaults above; the two are deliberately distinguished). |
+//! | `FEATHERREADER_ADOPTION_INTERVAL_SECS` | `86400` (24h)  | Adoption-probe cadence (±10% jitter). `0` disables the probe. |
+//! | `FEATHERREADER_SHOW_ADOPTION` | `false`                 | Render the one-line adoption fact on `/about`. |
 //!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
@@ -124,6 +127,21 @@ pub struct Config {
     /// before the follower ever taps the link. From `FEATHERREADER_CLAIM_TTL_SECS`,
     /// default 14 days.
     pub claim_ttl_secs: i64,
+    /// Relay bases queried for the network adoption count, as normalized origin
+    /// URLs (scheme + host, no trailing slash) — the fetch layer is handed
+    /// something [`crate::net`] can scheme-allow-list rather than being asked to
+    /// guess. An empty list disables the probe, and `FEATHERREADER_RELAY_HOSTS=`
+    /// (present, empty) is how an operator asks for exactly that — distinct from
+    /// leaving the variable unset, which takes the defaults. Bare hostnames are
+    /// accepted and normalized to `https://…`.
+    pub relay_hosts: Vec<String>,
+    /// How often the adoption probe runs. [`Duration::ZERO`] (the env value `0`)
+    /// DISABLES it. From `FEATHERREADER_ADOPTION_INTERVAL_SECS`, default 24 h.
+    pub adoption_interval: Duration,
+    /// Render the one-line adoption fact on `/about`. Default **false**: a count
+    /// of `1` reads as a status claim rather than a fact, and the honest home for
+    /// it today is the log. From `FEATHERREADER_SHOW_ADOPTION`.
+    pub show_adoption: bool,
 }
 
 /// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
@@ -165,6 +183,10 @@ const DEV_COOKIE_SECRET: &str = "featherreader-dev-cookie-secret-change-me";
 /// asynchronously-delivered claim link (a public follow-back skeet) is still
 /// live when the follower taps it.
 const DEFAULT_CLAIM_TTL_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// Default adoption-probe cadence: once a day. One unauthenticated GET per relay
+/// per day is the entire network cost of the feature.
+const DEFAULT_ADOPTION_INTERVAL: Duration = Duration::from_secs(86_400);
 
 impl Default for SidecarConfig {
     fn default() -> Self {
@@ -217,6 +239,12 @@ impl Default for Config {
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
+            relay_hosts: crate::network::DEFAULT_RELAY_HOSTS
+                .iter()
+                .map(|h| format!("https://{h}"))
+                .collect(),
+            adoption_interval: DEFAULT_ADOPTION_INTERVAL,
+            show_adoption: false,
         }
     }
 }
@@ -362,6 +390,34 @@ impl Config {
             None => defaults.claim_ttl_secs,
         };
 
+        // Relay hosts for the adoption probe. Read with `env::var` and NOT with
+        // `env_opt`, which folds a present-but-empty value into `None` — i.e.
+        // straight back to the two Bluesky defaults. `FEATHERREADER_RELAY_HOSTS=`
+        // is the documented kill switch, so "set, and set to nothing" has to stay
+        // distinguishable from "not set".
+        let relay_hosts_raw = env::var("FEATHERREADER_RELAY_HOSTS").ok();
+        let relay_hosts = parse_relay_hosts(relay_hosts_raw.as_deref(), defaults.relay_hosts)?;
+
+        // NOTE: parsed here, NOT via the scheduler's `env_duration_secs`, which
+        // maps `0` back to its default — that would silently turn the documented
+        // "0 disables" kill switch into "every 24 h".
+        let adoption_interval = match env_opt("FEATHERREADER_ADOPTION_INTERVAL_SECS") {
+            Some(raw) => {
+                let secs: u64 = raw.parse().with_context(|| {
+                    format!("FEATHERREADER_ADOPTION_INTERVAL_SECS: expected seconds, got {raw:?}")
+                })?;
+                Duration::from_secs(secs)
+            }
+            None => defaults.adoption_interval,
+        };
+
+        let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
+            Some(raw) => parse_bool(&raw).with_context(|| {
+                format!("FEATHERREADER_SHOW_ADOPTION: expected a boolean, got {raw:?}")
+            })?,
+            None => defaults.show_adoption,
+        };
+
         let config = Self {
             bind,
             db_path,
@@ -382,6 +438,9 @@ impl Config {
             resolver_base,
             bot_secret,
             claim_ttl_secs,
+            relay_hosts,
+            adoption_interval,
+            show_adoption,
         };
 
         // FAIL LOUD: a non-loopback (public) instance must never fall back to the
@@ -536,6 +595,32 @@ fn env_opt(key: &str) -> Option<String> {
     }
 }
 
+/// Parse `FEATHERREADER_RELAY_HOSTS` into normalized relay origin URLs.
+///
+/// `raw` is `None` **only** when the variable is genuinely absent, in which case
+/// `defaults` wins. A *present* value — including `""`, `"   "`, or `","` —
+/// yields exactly the hosts it names, so an empty one yields an empty list and
+/// the probe never runs. That distinction is the whole point of this function
+/// existing rather than being inlined behind `env_opt`, which collapses
+/// present-but-empty into absent and so silently restored the two Bluesky relay
+/// defaults for an operator who had explicitly asked for none.
+///
+/// A *malformed* host fails loud, like every other present-but-bad var: a typo
+/// should be visible at boot, not silently probed forever.
+fn parse_relay_hosts(raw: Option<&str>, defaults: Vec<String>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(defaults);
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|h| {
+            crate::network::normalize_relay_host(h)
+                .with_context(|| format!("FEATHERREADER_RELAY_HOSTS: unusable relay host {h:?}"))
+        })
+        .collect()
+}
+
 /// Parse a permissive boolean: `1/true/yes/on` vs `0/false/no/off`
 /// (case-insensitive).
 fn parse_bool(raw: &str) -> Result<bool> {
@@ -565,6 +650,78 @@ mod tests {
         assert_eq!(c.max_feeds_global, 10_000);
         assert_eq!(c.max_entries_per_feed, 2_000);
         assert_eq!(c.db_size_watermark_bytes, 2 * 1024 * 1024 * 1024);
+        // The adoption probe ships on (one GET per relay per day) but its
+        // /about line ships off.
+        assert_eq!(
+            c.relay_hosts,
+            vec![
+                "https://relay1.us-west.bsky.network".to_string(),
+                "https://relay1.us-east.bsky.network".to_string(),
+            ]
+        );
+        assert_eq!(c.adoption_interval, Duration::from_secs(86_400));
+        assert!(!c.show_adoption);
+    }
+
+    /// The default host list must be exactly what `RelayClient` accepts — i.e.
+    /// already normalized, so a default boot needs no re-parse and cannot fail.
+    #[test]
+    fn default_relay_hosts_are_already_normalized() {
+        for host in Config::default().relay_hosts {
+            assert_eq!(crate::network::normalize_relay_host(&host).unwrap(), host);
+        }
+    }
+
+    fn relay_defaults() -> Vec<String> {
+        Config::default().relay_hosts
+    }
+
+    /// **Regression (v0.2.8):** `FEATHERREADER_RELAY_HOSTS=` (present, empty) is
+    /// the documented kill switch and must yield NO relays. Routing it through
+    /// `env_opt` collapsed empty into absent, restoring the two Bluesky defaults
+    /// and probing them daily against the operator's explicit instruction.
+    #[test]
+    fn empty_relay_hosts_env_disables_the_probe() {
+        for raw in ["", "   ", ",", " , ,\t"] {
+            let hosts = parse_relay_hosts(Some(raw), relay_defaults()).unwrap();
+            assert!(
+                hosts.is_empty(),
+                "FEATHERREADER_RELAY_HOSTS={raw:?} must name no relays, got {hosts:?}"
+            );
+        }
+    }
+
+    /// The other half of the same distinction: *unset* still takes the defaults.
+    #[test]
+    fn absent_relay_hosts_env_keeps_the_defaults() {
+        assert_eq!(
+            parse_relay_hosts(None, relay_defaults()).unwrap(),
+            relay_defaults()
+        );
+    }
+
+    #[test]
+    fn relay_hosts_env_is_split_trimmed_and_normalized() {
+        assert_eq!(
+            parse_relay_hosts(
+                Some(" relay.example , https://other.example/ ,"),
+                Vec::new()
+            )
+            .unwrap(),
+            vec![
+                "https://relay.example".to_string(),
+                "https://other.example".to_string(),
+            ]
+        );
+    }
+
+    /// A typo fails loud rather than being silently dropped into "probe disabled".
+    #[test]
+    fn malformed_relay_host_env_is_an_error() {
+        let err = parse_relay_hosts(Some("relay.example,wss://relay.example"), Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FEATHERREADER_RELAY_HOSTS"), "{err}");
     }
 
     #[test]

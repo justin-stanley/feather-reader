@@ -19,6 +19,9 @@
 //! - [`atproto`] — the atproto identity + PDS record layer (subscriptions,
 //!   folders, saved, batched read-state sync). Live repo writes go through the
 //!   OAuth confidential-client sidecar ([`atproto::SidecarClient`]).
+//! - [`network`] — read-only queries against the *public* atproto network (the
+//!   relay adoption probe). A projection, never a source of truth, and never on
+//!   a reader path.
 //! - [`web`]     — the axum router + askama server-rendered views.
 //!
 //! **Status:** experimental / pre-1.0. See <https://feather-reader.com>.
@@ -29,6 +32,7 @@ pub mod config;
 pub mod feed;
 pub mod lexicon;
 pub mod net;
+pub mod network;
 pub mod store;
 pub mod web;
 

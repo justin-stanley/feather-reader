@@ -133,6 +133,31 @@ pub struct ReadCursor {
     pub updated_at: String,
 }
 
+/// The `network_stat` key the relay adoption probe writes under.
+///
+/// Lives here, beside [`NetworkStat`], because **both** the writer (the
+/// scheduler's probe, compiled into the binary) and the reader (`web::about`,
+/// compiled into the library) name it — a literal in either place would be two
+/// strings free to drift apart.
+pub const ADOPTION_STAT_KEY: &str = "adoption.subscription";
+
+/// One relay's observation of how many repos hold a collection
+/// (`design/NETWORK-SPEC.md` §4.3). A projection: droppable, rebuildable from
+/// the network, and never read by anything on the reading path.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct NetworkStat {
+    /// The metric key, e.g. [`ADOPTION_STAT_KEY`].
+    pub key: String,
+    /// The relay base URL the number came from.
+    pub source: String,
+    /// The observed count.
+    pub value: i64,
+    /// Set when the probe hit its page cap: the value is a floor, not a count.
+    pub truncated: bool,
+    /// When the observation was taken (RFC3339, UTC).
+    pub observed_at: String,
+}
+
 /// New-feed payload for [`upsert_feed`] (id is assigned by SQLite).
 #[derive(Debug, Clone, Default)]
 pub struct NewFeed {
@@ -266,6 +291,23 @@ CREATE INDEX IF NOT EXISTS idx_invite_codes_status ON invite_codes (status, expi
 -- above is a no-op (the table already exists without `intended_did`), so a
 -- `CREATE INDEX ... (intended_did, ...)` here would fail with "no such column"
 -- and crash-loop the boot before migrations ever run.
+
+-- Network-observation counters (v0.2.8, design/NETWORK-SPEC.md §4.3). One row
+-- per (metric, relay): the adoption probe records how many repos a given relay
+-- has INDEXED as holding a collection. We store the COUNT, never the DID list —
+-- persisting the DIDs would build a durable register of "accounts that use an
+-- RSS reader" on our disk for a feature whose only output is an integer. This
+-- table is a PROJECTION, not a source of truth: `DROP TABLE` it and the next
+-- probe rebuilds it, and nothing in the reader path reads it. Bounded forever at
+-- (metrics × relays) rows, so it never interacts with the DB-size watermark.
+CREATE TABLE IF NOT EXISTS network_stat (
+    key         TEXT NOT NULL,   -- e.g. 'adoption.subscription'
+    source      TEXT NOT NULL,   -- the relay host the number came from
+    value       INTEGER NOT NULL,
+    truncated   INTEGER NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (key, source)
+);
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
@@ -1389,6 +1431,58 @@ pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
             .await
             .with_context(|| format!("dirty_cursors failed for {did}"))?;
     Ok(cursors)
+}
+
+// ---------------------------------------------------------------------------
+// Network observations (the adoption probe's projection)
+// ---------------------------------------------------------------------------
+
+/// Record one relay's observation, keyed by `(key, source)` so each relay's
+/// number is kept separately (non-archival relays legitimately disagree).
+///
+/// A plain upsert: the table is bounded forever at (metrics × relays) rows — two
+/// today — so this can never grow the DB. It must stay a plain upsert and never
+/// become a per-DID insert.
+pub async fn record_network_stat(pool: &SqlitePool, stat: &NetworkStat) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO network_stat (key, source, value, truncated, observed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT (key, source) DO UPDATE SET
+            value       = excluded.value,
+            truncated   = excluded.truncated,
+            observed_at = excluded.observed_at
+        "#,
+    )
+    .bind(&stat.key)
+    .bind(&stat.source)
+    .bind(stat.value)
+    .bind(stat.truncated)
+    .bind(&stat.observed_at)
+    .execute(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "record_network_stat failed for {}/{}",
+            stat.key, stat.source
+        )
+    })?;
+    Ok(())
+}
+
+/// The highest observation for `key` across every relay — the number to surface
+/// (`design/NETWORK-SPEC.md` §4.1: relays disagree; show the max). `None` when no
+/// probe has ever succeeded.
+pub async fn latest_network_stat(pool: &SqlitePool, key: &str) -> Result<Option<NetworkStat>> {
+    let stat = sqlx::query_as::<_, NetworkStat>(
+        "SELECT key, source, value, truncated, observed_at FROM network_stat \
+         WHERE key = ?1 ORDER BY value DESC, observed_at DESC LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("latest_network_stat failed for {key}"))?;
+    Ok(stat)
 }
 
 /// Mark a cursor's PDS `readState` record as CREATED after the flush that first
@@ -3722,6 +3816,75 @@ mod tests {
                 .await?
                 .get("intended_did");
         assert!(intended.is_none(), "intended_did must be NULLed");
+        Ok(())
+    }
+
+    /// A `(key, source)` observation upserts in place: two writes for the same
+    /// relay leave ONE row, carrying the newer value.
+    #[tokio::test]
+    async fn network_stat_upserts_per_source() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let mut stat = NetworkStat {
+            key: ADOPTION_STAT_KEY.to_string(),
+            source: "https://relay1.us-west.bsky.network".to_string(),
+            value: 1,
+            truncated: false,
+            observed_at: "2026-08-12T00:00:00Z".to_string(),
+        };
+        record_network_stat(&pool, &stat).await?;
+        stat.value = 4;
+        stat.observed_at = "2026-08-13T00:00:00Z".to_string();
+        record_network_stat(&pool, &stat).await?;
+
+        let rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM network_stat")
+            .fetch_one(&pool)
+            .await?
+            .get("n");
+        assert_eq!(rows, 1, "the same relay must update, not duplicate");
+        let latest = latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .expect("a stat");
+        assert_eq!(latest.value, 4);
+        assert_eq!(latest.observed_at, "2026-08-13T00:00:00Z");
+        Ok(())
+    }
+
+    /// Relays disagree by design (non-archival indexes); the max is surfaced.
+    #[tokio::test]
+    async fn latest_network_stat_picks_the_max_across_sources() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for (source, value, truncated) in [
+            ("https://relay1.us-west.bsky.network", 2i64, false),
+            ("https://relay1.us-east.bsky.network", 40i64, true),
+        ] {
+            record_network_stat(
+                &pool,
+                &NetworkStat {
+                    key: ADOPTION_STAT_KEY.to_string(),
+                    source: source.to_string(),
+                    value,
+                    truncated,
+                    observed_at: "2026-08-13T00:00:00Z".to_string(),
+                },
+            )
+            .await?;
+        }
+        let latest = latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .expect("a stat");
+        assert_eq!(latest.value, 40);
+        assert_eq!(latest.source, "https://relay1.us-east.bsky.network");
+        // `truncated` round-trips as a bool.
+        assert!(latest.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_network_stat_is_none_on_an_empty_table() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        assert!(latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .is_none());
         Ok(())
     }
 }

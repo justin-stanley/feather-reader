@@ -33,7 +33,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::{
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, COOKIE, PROXY_AUTHORIZATION,
+    WWW_AUTHENTICATE,
+};
 use reqwest::{Client, Response};
 use url::{Host, Url};
 
@@ -194,7 +197,10 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
 /// TCP handshake.
 ///
 /// `extra_headers` are applied to every hop (e.g. the conditional-GET
-/// `If-None-Match` / `If-Modified-Since` validators). Returns the final
+/// `If-None-Match` / `If-Modified-Since` validators) — **except** credential
+/// headers (`Authorization`, `Cookie`, …), which are dropped the moment a
+/// redirect leaves the original origin, mirroring what reqwest's own redirect
+/// policy does for the shared client (see [`hop_headers`]). Returns the final
 /// [`Response`] (headers only; the body is read separately via [`read_capped`]).
 /// `Err` on a blocked scheme/address, an exhausted redirect budget, or a
 /// transport error.
@@ -225,6 +231,46 @@ pub async fn guarded_get_no_privacy(
     guarded_get_inner(client, url, extra_headers, false).await
 }
 
+/// Whether a header carries credentials that must never follow a redirect onto a
+/// different origin. Mirrors reqwest's own `redirect::remove_sensitive_headers`
+/// set (`Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization`,
+/// `WWW-Authenticate`), which the shared client applies automatically — and which
+/// [`guarded_get_inner`] must reimplement because it disables auto-redirect and
+/// re-applies `extra_headers` by hand on every manually-followed hop.
+fn is_sensitive_header(name: &HeaderName) -> bool {
+    name == AUTHORIZATION
+        || name == COOKIE
+        || name == PROXY_AUTHORIZATION
+        || name == WWW_AUTHENTICATE
+        || name.as_str() == "cookie2"
+}
+
+/// Same-origin in the web sense: identical scheme, host, and effective port.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The headers to apply on THIS hop: all of `extra` while we are still on the
+/// original origin, otherwise only the non-sensitive ones.
+///
+/// The comparison base is the **original** URL rather than the previous hop (what
+/// reqwest does). That is strictly stricter: an `a → b → a` redirect chain never
+/// re-attaches the credential, at the cost of a small, deliberate divergence from
+/// the stock client's behaviour.
+fn hop_headers<'a>(
+    original: &Url,
+    current: &Url,
+    extra: &'a [(HeaderName, HeaderValue)],
+) -> Vec<&'a (HeaderName, HeaderValue)> {
+    let cross_origin = !same_origin(original, current);
+    extra
+        .iter()
+        .filter(|(name, _)| !(cross_origin && is_sensitive_header(name)))
+        .collect()
+}
+
 async fn guarded_get_inner(
     client: &Client,
     url: &str,
@@ -235,6 +281,8 @@ async fn guarded_get_inner(
     // template; the actual send goes through a per-hop IP-pinned client.
     let _ = client;
     let mut current = Url::parse(url).with_context(|| format!("not a valid URL {url:?}"))?;
+    // The origin the caller's credentials belong to; a hop off it drops them.
+    let original = current.clone();
 
     for _ in 0..=MAX_REDIRECTS {
         check_scheme(&current)?;
@@ -262,7 +310,10 @@ async fn guarded_get_inner(
         let hop_client = pinned_client(&host, vetted)?;
 
         let mut req = hop_client.get(current.clone());
-        for (name, value) in extra_headers {
+        // Sensitive headers (Authorization / Cookie / …) are applied only while
+        // the hop is still on the ORIGINAL origin: a hostile upstream must not be
+        // able to `302` a caller's bearer token onto a host it controls.
+        for (name, value) in hop_headers(&original, &current, extra_headers) {
             req = req.header(name.clone(), value.clone());
         }
         let resp = req
@@ -288,6 +339,70 @@ async fn guarded_get_inner(
     }
 
     bail!("too many redirects (> {MAX_REDIRECTS}) while fetching {url:?}")
+}
+
+/// POST a JSON body to a **user-influenced** URL through the SSRF guard.
+///
+/// The write-side counterpart to [`guarded_get_no_privacy`], and the only way
+/// [`crate::atproto::PdsClient`] is allowed to reach a PDS host it did not
+/// choose. It runs the same scheme allow-list, the same IP allow-list, and the
+/// same connect-pinning (via [`pinned_client`]), so the DNS-rebinding window
+/// between "`assert_public_target` said this host is public" and "the TCP
+/// handshake happens" is closed for writes exactly as it is for reads.
+///
+/// `Content-Type: application/json` is set here rather than by the caller, so
+/// the one header the XRPC wire format requires cannot be forgotten; the caller
+/// passes only its credential header(s).
+///
+/// **Redirects are refused, not followed** — the single deliberate divergence
+/// from [`guarded_get`]. A `307`/`308` re-sends the method *and the body*
+/// verbatim, and reqwest's cross-origin header sanitisation only strips
+/// **headers**: an app password or a record body lives in the JSON payload, so a
+/// hostile PDS answering `307 Location: https://evil.example/collect` would
+/// exfiltrate it however carefully the headers were handled. There is no
+/// legitimate reason for a PDS to redirect an `com.atproto.repo.*` write, so the
+/// safe behaviour and the correct behaviour coincide: `Err`, loudly.
+pub async fn guarded_post_json(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    body: Vec<u8>,
+) -> Result<Response> {
+    // As in `guarded_get_inner`: `client` is the policy template; the send goes
+    // through a freshly built, IP-pinned client.
+    let _ = client;
+    let target = Url::parse(url).with_context(|| format!("not a valid URL {url:?}"))?;
+    check_scheme(&target)?;
+    let vetted = resolve_and_check(&target).await?;
+    let host = target.host_str().context("URL has no host")?.to_string();
+    let hop_client = pinned_client(&host, vetted)?;
+
+    let mut req = hop_client
+        .post(target.clone())
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(body);
+    for (name, value) in extra_headers {
+        req = req.header(name.clone(), value.clone());
+    }
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("posting to {target}"))?;
+
+    if resp.status().is_redirection() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<none>");
+        bail!(
+            "refusing to follow a {} redirect on a POST to {url:?} (Location: {location}) — \
+             a 307/308 would re-send the request body to the new host",
+            resp.status()
+        );
+    }
+
+    Ok(resp)
 }
 
 /// Read a response body, streaming chunk-by-chunk and **aborting** the moment
@@ -496,6 +611,49 @@ mod tests {
         assert_eq!(body, b"hello world");
     }
 
+    /// **Regression (v0.2.8):** the write-side guard must refuse the same targets
+    /// the read-side one does — loopback, cloud metadata, RFC1918, ULA — *before*
+    /// the connect, so a rebound PDS host never receives a request body carrying
+    /// an app password or a session bearer.
+    ///
+    /// (The companion rule — a `307`/`308` is refused rather than followed,
+    /// because a redirect re-sends the BODY and reqwest only sanitises headers —
+    /// is not exercised here for the same reason `read_capped`'s stub is fetched
+    /// unguarded: the guard forbids loopback, so a local stub server can never be
+    /// reached through it. It is enforced by construction in `guarded_post_json`.)
+    #[tokio::test]
+    async fn guarded_post_refuses_internal_targets() {
+        let client = Client::builder().build().unwrap();
+        for url in [
+            "http://127.0.0.1:9/xrpc/com.atproto.server.createSession",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/xrpc/com.atproto.repo.applyWrites",
+            "http://[::1]/xrpc/com.atproto.repo.deleteRecord",
+        ] {
+            let err = guarded_post_json(&client, url, &[], b"{}".to_vec())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("forbidden") || err.contains("internal"),
+                "{url}: expected an SSRF refusal, got: {err}"
+            );
+        }
+    }
+
+    /// A non-http(s) scheme is refused on the write path too.
+    #[tokio::test]
+    async fn guarded_post_refuses_bad_schemes() {
+        let client = Client::builder().build().unwrap();
+        for url in ["file:///etc/passwd", "gopher://example.com/1"] {
+            let err = guarded_post_json(&client, url, &[], b"{}".to_vec())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("scheme"), "{url}: got: {err}");
+        }
+    }
+
     /// A public first hop that `30x`-redirects to a private, secret-bearing feed
     /// URL must be REFUSED before the private target is ever fetched — the
     /// per-hop privacy re-check in [`guarded_get`]. We serve a `302` on loopback
@@ -532,6 +690,66 @@ mod tests {
             err.contains("private/paid feed"),
             "expected privacy refusal, got: {err}"
         );
+    }
+
+    /// Header names/values for the hop-header tests: one credential, one benign
+    /// conditional-GET validator.
+    fn hop_fixture() -> Vec<(HeaderName, HeaderValue)> {
+        vec![
+            (AUTHORIZATION, HeaderValue::from_static("Bearer secret")),
+            (
+                reqwest::header::IF_NONE_MATCH,
+                HeaderValue::from_static("\"etag\""),
+            ),
+        ]
+    }
+
+    #[test]
+    fn sensitive_header_set() {
+        assert!(is_sensitive_header(&AUTHORIZATION));
+        assert!(is_sensitive_header(&COOKIE));
+        assert!(is_sensitive_header(&PROXY_AUTHORIZATION));
+        assert!(is_sensitive_header(&WWW_AUTHENTICATE));
+        assert!(is_sensitive_header(&HeaderName::from_static("cookie2")));
+        assert!(!is_sensitive_header(&reqwest::header::IF_NONE_MATCH));
+        assert!(!is_sensitive_header(&reqwest::header::IF_MODIFIED_SINCE));
+        assert!(!is_sensitive_header(&reqwest::header::ACCEPT));
+    }
+
+    #[test]
+    fn hop_headers_keeps_all_on_same_origin() {
+        let extra = hop_fixture();
+        let original = Url::parse("https://pds.example.com/xrpc/x").unwrap();
+        // The very first hop (identical URL) keeps everything…
+        assert_eq!(hop_headers(&original, &original, &extra).len(), 2);
+        // …and so does a same-origin path change (a `302 /a → /b` on one host).
+        let same = Url::parse("https://pds.example.com/other/path?q=1").unwrap();
+        assert_eq!(hop_headers(&original, &same, &extra).len(), 2);
+    }
+
+    #[test]
+    fn hop_headers_strips_authorization_cross_host() {
+        let extra = hop_fixture();
+        let original = Url::parse("https://pds.example.com/x").unwrap();
+        let evil = Url::parse("https://evil.example.net/y").unwrap();
+        let kept = hop_headers(&original, &evil, &extra);
+        assert_eq!(kept.len(), 1, "the bearer must not follow a cross-host 302");
+        assert_eq!(kept[0].0, reqwest::header::IF_NONE_MATCH);
+    }
+
+    #[test]
+    fn hop_headers_strips_on_port_and_scheme_change() {
+        let extra = hop_fixture();
+        let original = Url::parse("https://a.example/x").unwrap();
+        for downgraded in ["http://a.example/x", "https://a.example:8443/x"] {
+            let current = Url::parse(downgraded).unwrap();
+            let kept = hop_headers(&original, &current, &extra);
+            assert_eq!(kept.len(), 1, "{downgraded} must drop the credential");
+            assert_eq!(kept[0].0, reqwest::header::IF_NONE_MATCH);
+        }
+        // The default port spelled explicitly is still the same origin.
+        let explicit = Url::parse("https://a.example:443/x").unwrap();
+        assert_eq!(hop_headers(&original, &explicit, &extra).len(), 2);
     }
 
     #[test]
