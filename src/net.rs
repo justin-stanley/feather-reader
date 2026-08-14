@@ -49,7 +49,11 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// [`crate::feed::build_client`]'s `FETCH_TIMEOUT` so the poller's per-hop
 /// pinned client is bounded the same way the feed client is — an unattended
 /// poll can't hang forever on a slow/silent upstream.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// `pub(crate)` so a caller that wraps a *multi-request* walk in its own
+/// deadline can size that deadline against this per-request bound rather than
+/// hardcoding a second copy of the number — see [`crate::network::RelayClient`].
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
 /// that trickles bytes forever (slowloris) can't tie up a fetch under the total

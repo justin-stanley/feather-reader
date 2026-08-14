@@ -102,3 +102,9 @@ libc = "0.2"
 # login refusal, admin-mint authz). Already in the lock transitively; the `util`
 # feature exposes `oneshot`.
 tower = { version = "0.5", features = ["util"] }
+
+# `#[tokio::test(start_paused = true)]` for the relay-walk budget test: it drives
+# tokio's clock so a simulated slow relay costs no real time and the assertion is
+# exact rather than timing-dependent. Same tokio crate as the runtime dependency
+# above — this enables a feature, it does not add a package to the lock.
+tokio = { version = "1.45", features = ["test-util"] }

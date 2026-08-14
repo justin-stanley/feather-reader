@@ -43,10 +43,21 @@
 //!   convenience wrappers (list/create/put/delete subscriptions, batch-flush
 //!   read-state) live on it and map 1:1 to the old [`PdsClient`] surface.
 //! * **The interim path — [`Auth::Session`] (app password).** A session obtained
-//!   from `com.atproto.server.createSession`. Kept behind the [`Auth`] seam as a
-//!   fallback for local runs without the sidecar, but it is **no longer the live
-//!   path**: [`PdsClient`] and [`login_with_app_password`] remain for tests and
-//!   dev, while [`SidecarClient`] is what the web layer routes through.
+//!   from `com.atproto.server.createSession`. Kept behind the [`Auth`] seam, but
+//!   it is **no longer the live path**: [`PdsClient`] and
+//!   [`login_with_app_password`] remain for tests, while [`SidecarClient`] is
+//!   what the web layer routes through.
+//!
+//!   ⚠️ **This is no longer a working "local runs without the sidecar" fallback,
+//!   and the docs used to claim otherwise.** Since v0.2.8 every [`PdsClient`]
+//!   request goes through the SSRF guard, which refuses loopback, RFC1918, ULA
+//!   and `100.64/10` (Tailscale). So pointing this at `http://localhost:2583`
+//!   or a tailnet PDS now fails with *"refusing to fetch forbidden (internal)
+//!   address"* rather than returning a session. That is the guard behaving
+//!   correctly — the target host is attacker-influenced in the cases that
+//!   matter, and a dev-only escape hatch is exactly the kind of flag that ends
+//!   up set in production — but it does mean a local-PDS workflow needs the
+//!   PDS reachable on a public address, or a deliberate change here.
 //! * **The public-read path — [`Auth::Anonymous`], via [`PdsClient::anonymous`].**
 //!   `com.atproto.repo.listRecords` is public on a standard PDS, so a stranger's
 //!   `community.lexicon.rss.*` records can be read with no credentials at all.
