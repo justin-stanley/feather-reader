@@ -1440,9 +1440,19 @@ pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
 /// Record one relay's observation, keyed by `(key, source)` so each relay's
 /// number is kept separately (non-archival relays legitimately disagree).
 ///
-/// A plain upsert: the table is bounded forever at (metrics × relays) rows — two
-/// today — so this can never grow the DB. It must stay a plain upsert and never
+/// An upsert: the table is bounded forever at (metrics × relays) rows — two
+/// today — so this can never grow the DB. It must stay an upsert and never
 /// become a per-DID insert.
+///
+/// **A truncated observation never lowers a stored count.** A truncated walk
+/// saw only part of the network, so a smaller number is evidence about the
+/// *walk*, not about adoption. Without the guard, one slow run that managed a
+/// single 500-repo page would overwrite a complete 2 000 and drag the published
+/// "at least N" down — and because `latest_network_stat` takes the max across
+/// sources, two relays behind the same operator degrade together, so `/about`
+/// would sit at the lower figure until a full walk succeeded again. A COMPLETE
+/// observation always wins, even when smaller (repos genuinely can disappear);
+/// a truncated one may only ever raise the floor.
 pub async fn record_network_stat(pool: &SqlitePool, stat: &NetworkStat) -> Result<()> {
     sqlx::query(
         r#"
@@ -1452,6 +1462,7 @@ pub async fn record_network_stat(pool: &SqlitePool, stat: &NetworkStat) -> Resul
             value       = excluded.value,
             truncated   = excluded.truncated,
             observed_at = excluded.observed_at
+        WHERE NOT (excluded.truncated = 1 AND excluded.value < network_stat.value)
         "#,
     )
     .bind(&stat.key)
@@ -3846,6 +3857,62 @@ mod tests {
             .expect("a stat");
         assert_eq!(latest.value, 4);
         assert_eq!(latest.observed_at, "2026-08-13T00:00:00Z");
+        Ok(())
+    }
+
+    /// **Regression (v0.2.9 review).** Once a slow walk can return a PARTIAL
+    /// count, a plain upsert lets it overwrite a complete, larger one — moving
+    /// the published "at least N" DOWN because a relay was slow, not because
+    /// adoption fell. A truncated observation may only ever raise the floor.
+    #[tokio::test]
+    async fn a_truncated_observation_never_lowers_a_stored_count() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let mut stat = NetworkStat {
+            key: ADOPTION_STAT_KEY.to_string(),
+            source: "https://relay1.us-west.bsky.network".to_string(),
+            value: 2000,
+            truncated: false,
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        };
+        record_network_stat(&pool, &stat).await?;
+
+        // A budget-truncated walk that only got one page in.
+        stat.value = 500;
+        stat.truncated = true;
+        stat.observed_at = "2026-08-14T00:00:00Z".to_string();
+        record_network_stat(&pool, &stat).await?;
+
+        let kept = latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .expect("a stat");
+        assert_eq!(kept.value, 2000, "a partial walk must not lower the count");
+        assert!(!kept.truncated, "and must not mark the kept row truncated");
+        assert_eq!(kept.observed_at, "2026-08-13T00:00:00Z");
+
+        // A truncated observation that RAISES the floor is still accepted...
+        stat.value = 3000;
+        record_network_stat(&pool, &stat).await?;
+        assert_eq!(
+            latest_network_stat(&pool, ADOPTION_STAT_KEY)
+                .await?
+                .expect("a stat")
+                .value,
+            3000
+        );
+
+        // ...and a COMPLETE observation wins even when it is smaller, because
+        // repos genuinely can go away and a full walk is authoritative.
+        stat.value = 42;
+        stat.truncated = false;
+        record_network_stat(&pool, &stat).await?;
+        assert_eq!(
+            latest_network_stat(&pool, ADOPTION_STAT_KEY)
+                .await?
+                .expect("a stat")
+                .value,
+            42,
+            "a complete walk is authoritative even when it shrinks"
+        );
         Ok(())
     }
 

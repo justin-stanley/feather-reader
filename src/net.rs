@@ -49,7 +49,11 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// [`crate::feed::build_client`]'s `FETCH_TIMEOUT` so the poller's per-hop
 /// pinned client is bounded the same way the feed client is — an unattended
 /// poll can't hang forever on a slow/silent upstream.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// `pub(crate)` so a caller that wraps a *multi-request* walk in its own
+/// deadline can size that deadline against this per-request bound rather than
+/// hardcoding a second copy of the number — see [`crate::network::RelayClient`].
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
 /// that trickles bytes forever (slowloris) can't tie up a fetch under the total
@@ -57,7 +61,19 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum number of redirect hops we will follow (each re-validated).
-const MAX_REDIRECTS: usize = 5;
+///
+/// `pub(crate)` alongside [`FETCH_TIMEOUT`] because the two together give the
+/// real worst-case cost of ONE guarded request: the redirect loop runs
+/// `0..=MAX_REDIRECTS`, and every hop builds a fresh [`pinned_client`] carrying
+/// its own full [`FETCH_TIMEOUT`]. A caller that wraps a guarded request in an
+/// outer deadline must budget `(MAX_REDIRECTS + 1) * FETCH_TIMEOUT`, not one
+/// `FETCH_TIMEOUT` — getting that wrong silently pre-empts the inner logic.
+pub(crate) const MAX_REDIRECTS: usize = 5;
+
+/// Worst-case wall-clock cost of a single guarded request, redirects included.
+/// The number an outer deadline has to respect; see [`MAX_REDIRECTS`].
+pub(crate) const WORST_CASE_REQUEST: Duration =
+    Duration::from_secs(FETCH_TIMEOUT.as_secs() * (MAX_REDIRECTS as u64 + 1));
 
 /// Whether an already-resolved IP address is one we must never connect to on
 /// behalf of an untrusted URL (SSRF sinks): loopback, link-local, private,
