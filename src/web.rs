@@ -522,14 +522,53 @@ async fn health() -> impl IntoResponse {
 }
 
 /// `GET /about` — the public-experiment page: the full disclaimer (experimental,
-/// no SLA, may pause anytime), the OSS / self-host pitch, and the tip link. A
-/// static render; readable whether or not a session exists.
-async fn about() -> Response {
+/// no SLA, may pause anytime), the OSS / self-host pitch, and the tip link.
+/// Readable whether or not a session exists.
+///
+/// Optionally carries one quiet line about network adoption
+/// (`design/NETWORK-SPEC.md` §4.4). With `FEATHERREADER_SHOW_ADOPTION` off — the
+/// default — the handler issues **zero** queries and the page is byte-identical
+/// to what it was before the probe existed.
+async fn about(State(state): State<AppState>) -> Response {
+    let adoption = if state.config.show_adoption {
+        adoption_line(&state).await
+    } else {
+        None
+    };
     render(&AboutTemplate {
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
+        adoption,
     })
+}
+
+/// The `/about` adoption line's data, or `None` (no successful probe yet, an
+/// observation of zero, or a store failure).
+///
+/// A read failure degrades to `None` plus a `warn!` rather than propagating: the
+/// probe is never allowed to affect the reader, and that rule applies at the
+/// display end too — a locked or corrupt DB costs the About page one log line,
+/// not a 500.
+async fn adoption_line(state: &AppState) -> Option<AdoptionLine> {
+    match store::latest_network_stat(&state.db, store::ADOPTION_STAT_KEY).await {
+        // A legitimate zero renders nothing rather than a sad "0 accounts".
+        Ok(Some(stat)) if stat.value > 0 => Some(AdoptionLine {
+            repos: stat.value,
+            truncated: stat.truncated,
+            observed_on: stat
+                .observed_at
+                .split('T')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        Ok(_) => None,
+        Err(err) => {
+            warn!(%err, "about: adoption stat read failed; omitting the line");
+            None
+        }
+    }
 }
 
 /// `GET /privacy` — the plain-language privacy page: no account/tracking, data
@@ -663,13 +702,28 @@ struct ManageTemplate {
     loose_feeds: Vec<FeedView>,
 }
 
-/// The public-experiment `/about` page — disclaimer + OSS pitch + tip link.
+/// The optional one-line adoption fact at the bottom of `/about`
+/// (`design/NETWORK-SPEC.md` §4.4). `None` whenever the display flag is off, no
+/// probe has succeeded yet, or the read failed — the line then simply does not
+/// render.
+struct AdoptionLine {
+    /// Repos a relay has indexed as holding the subscription collection.
+    repos: i64,
+    /// The probe hit its page cap, so the copy must say "at least".
+    truncated: bool,
+    /// Observation date, `YYYY-MM-DD` (UTC), sliced from the stored RFC3339 stamp.
+    observed_on: String,
+}
+
+/// The public-experiment `/about` page — disclaimer + OSS pitch + tip link, plus
+/// the optional adoption line.
 #[derive(Template)]
 #[template(path = "about.html")]
 struct AboutTemplate {
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
+    adoption: Option<AdoptionLine>,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -4879,6 +4933,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A state whose `/about` renders the adoption line, seeded with one
+    /// observation.
+    async fn adoption_state(repos: i64, truncated: bool) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::record_network_stat(
+            &db,
+            &store::NetworkStat {
+                key: store::ADOPTION_STAT_KEY.to_string(),
+                source: "https://relay1.us-west.bsky.network".to_string(),
+                value: repos,
+                truncated,
+                observed_at: "2026-08-13T04:05:06Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            show_adoption: true,
+            ..Config::default()
+        };
+        AppState::new(config, db).unwrap()
+    }
+
+    async fn about_body(state: AppState) -> String {
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Default config ⇒ the flag is off ⇒ no line, and no query is issued.
+    #[tokio::test]
+    async fn about_omits_adoption_line_by_default() {
+        let state = test_state(&[]).await;
+        assert!(!state.config.show_adoption);
+        let body = about_body(state).await;
+        assert!(
+            !body.contains("atproto network"),
+            "the adoption line must not render by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn about_renders_adoption_line_when_enabled() {
+        let body = about_body(adoption_state(4, false).await).await;
+        assert!(body.contains("4"), "the count must render");
+        assert!(
+            body.contains("accounts on the atproto network hold"),
+            "{body}"
+        );
+        assert!(
+            body.contains("2026-08-13"),
+            "the observation date must render"
+        );
+        assert!(
+            body.contains("lower bound"),
+            "the non-archival caveat must ride along with the number"
+        );
+        assert!(
+            !body.contains("At least"),
+            "an untruncated count is exact-ish"
+        );
+    }
+
+    /// A count of one must read as "1 account … holds", not "1 accounts … hold".
+    #[tokio::test]
+    async fn about_adoption_line_is_singular_at_one() {
+        let body = about_body(adoption_state(1, false).await).await;
+        assert!(
+            body.contains("account on the atproto network holds"),
+            "{body}"
+        );
+    }
+
+    /// A truncated observation is a floor, and must say so.
+    #[tokio::test]
+    async fn about_adoption_line_says_at_least_when_truncated() {
+        let body = about_body(adoption_state(25_000, true).await).await;
+        assert!(body.contains("At least"), "{body}");
+    }
+
+    /// Flag on but no observation (or a zero) ⇒ 200, no line, no error.
+    #[tokio::test]
+    async fn about_omits_line_when_enabled_with_no_observation() {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let config = Config {
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            show_adoption: true,
+            ..Config::default()
+        };
+        let body = about_body(AppState::new(config, db).unwrap()).await;
+        assert!(!body.contains("atproto network"));
     }
 
     #[tokio::test]

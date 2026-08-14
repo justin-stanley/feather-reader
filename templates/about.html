@@ -64,6 +64,16 @@
         you can <a class="tip-link" href="{{ kofi_url }}" rel="noopener noreferrer">leave a tip ♥</a>.
         It's a solo project; there's no obligation, and the reader stays free either way.
       </p>
+
+      {% if let Some(a) = adoption %}
+      <p class="about-meta">
+        {% if a.truncated %}At least {{ a.repos }}{% else %}{{ a.repos }}{% endif %}
+        {% if a.repos == 1 %}account on the atproto network holds{% else %}accounts on the atproto network hold{% endif %}
+        <code>community.lexicon.rss.subscription</code> records, as of
+        <time datetime="{{ a.observed_on }}">{{ a.observed_on }}</time>.
+        Relays only index the hosts they crawl, so this is a lower bound.
+      </p>
+      {% endif %}
     </div>
 
     <div class="colophon">

@@ -31,6 +31,15 @@
 //! feed-derived rkey), and several feeds' cursors ride one round-trip. It also
 //! flushes **once more on graceful shutdown** so a Ctrl-C never strands unsynced
 //! read-state.
+//!
+//! ## Relay adoption probe ([`run_adoption_probe`])
+//!
+//! One unauthenticated GET per configured relay per day, counting the repos on
+//! the public atproto network that hold `community.lexicon.rss.subscription`
+//! (see `design/NETWORK-SPEC.md` §4 and [`feather_reader::network`]). It holds no
+//! personal data, writes one `network_stat` row per relay, and cannot affect the
+//! reader: every failure is a `warn!` that leaves the previous observation in
+//! place. `FEATHERREADER_ADOPTION_INTERVAL_SECS=0` disables it on its own.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,7 +52,8 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use feather_reader::feed::{self, PollOutcome};
-use feather_reader::lexicon::ReadState;
+use feather_reader::lexicon::{nsid, ReadState};
+use feather_reader::network::RelayClient;
 use feather_reader::store::{self, Feed, Pool, ReadCursor};
 use feather_reader::AppState;
 
@@ -85,6 +95,13 @@ const DEFAULT_CODE_SWEEP: Duration = Duration::from_secs(3600);
 /// per-feed `max_entries_per_feed` trim already bounds any single feed on every
 /// poll. Overridable via `FEATHERREADER_RETENTION_SWEEP_SECS`.
 const DEFAULT_RETENTION_SWEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay before the FIRST adoption probe after boot. Unlike the local sweeps,
+/// this tick is an outbound request to somebody else's relay, and
+/// `deploy/container-entrypoint.sh` tears the machine down (and Fly recreates it)
+/// the moment any child exits — so an immediate first tick would probe the relay
+/// once per crash-loop restart rather than once per day.
+const ADOPTION_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Read a `Duration` (in seconds) from the environment, or fall back.
 fn env_duration_secs(key: &str, default: Duration) -> Duration {
@@ -147,7 +164,9 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         return Vec::new();
     }
 
-    info!("spawning background schedulers (poller + read-state flusher)");
+    info!(
+        "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
+    );
 
     let poller = {
         let state = state.clone();
@@ -164,9 +183,16 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_retention_sweeper(state, shutdown).await })
     };
+    // NOTE: must be constructed BEFORE the flusher, which consumes the
+    // un-cloned `state` / `shutdown` by move.
+    let probe = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_adoption_probe(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, sweeper, retention, flusher]
+    vec![poller, sweeper, retention, probe, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -523,6 +549,145 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relay adoption probe
+// ---------------------------------------------------------------------------
+
+/// The relay adoption probe loop (`design/NETWORK-SPEC.md` §4). On a periodic
+/// tick (daily by default) it asks every configured relay how many repos hold
+/// `community.lexicon.rss.subscription`, logs the number — **the log is the
+/// metric**; there is no `/metrics` endpoint — and upserts one `network_stat`
+/// row per relay.
+///
+/// Two kill switches: `FEATHERREADER_ADOPTION_INTERVAL_SECS=0` (or an empty
+/// `FEATHERREADER_RELAY_HOSTS`) stops just this loop, and the pre-existing
+/// `FEATHERREADER_DISABLE_SCHEDULER` stops it with the other four.
+///
+/// It deviates from its four siblings in exactly one way: `interval_at` with an
+/// [`ADOPTION_STARTUP_DELAY`] instead of an immediate first tick, because this
+/// tick is a request to a third party and the container supervisor turns "once
+/// per boot" into "once per crash-loop restart". Nothing it does can fail the
+/// process: every error path is a `warn!` that leaves the previous observation
+/// in place.
+pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = state.config.adoption_interval;
+    if period.is_zero() {
+        info!("adoption probe: disabled (FEATHERREADER_ADOPTION_INTERVAL_SECS=0)");
+        return;
+    }
+    // Rejected entries are surfaced HERE rather than at parse time: config is
+    // read before `init_tracing` (main.rs:38 vs :41), so a warning emitted during
+    // parsing would go nowhere. Warn whether or not any usable host survived —
+    // a typo the operator never hears about is the failure mode this replaced a
+    // boot abort with, and it must not be silent as well as non-fatal.
+    for bad in &state.config.relay_host_errors {
+        warn!(
+            entry = %bad,
+            "adoption probe: ignoring unusable FEATHERREADER_RELAY_HOSTS entry"
+        );
+    }
+    if state.config.relay_hosts.is_empty() {
+        info!("adoption probe: no relay hosts configured, probe disabled");
+        return;
+    }
+    // A typo'd relay host must disable an optional metric, never block boot —
+    // so the client is built here, in the task, not in `main`.
+    let client = match RelayClient::new(state.http.clone(), &state.config.relay_hosts) {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(%err, "adoption probe: unusable FEATHERREADER_RELAY_HOSTS, probe disabled");
+            return;
+        }
+    };
+
+    let period = jittered(period, &state.config.public_url);
+    info!(
+        ?period,
+        relays = client.hosts().len(),
+        "adoption probe started"
+    );
+
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + ADOPTION_STARTUP_DELAY, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("adoption probe: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => probe_adoption_once(&state, &client).await,
+        }
+    }
+}
+
+/// One probe run. Returns `()` — no error can reach the loop body, because none
+/// of them is actionable: a relay outage, a 429, a malformed body, and a SQLite
+/// write failure all leave the previous row in place and change nothing else.
+/// (Deliberately unlike `poll_due_once`, which returns `Result` because a
+/// store-level failure there IS a real signal.)
+async fn probe_adoption_once(state: &AppState, client: &RelayClient) {
+    let report = client.count_repos_with_collection(nsid::SUBSCRIPTION).await;
+
+    for failure in &report.failures {
+        warn!(
+            host = %failure.host,
+            reason = %failure.reason,
+            "adoption probe: relay query failed; keeping previous observation"
+        );
+    }
+
+    for obs in &report.observations {
+        // §4.4: this log line IS the operator-facing metric.
+        info!(
+            key = store::ADOPTION_STAT_KEY,
+            source = %obs.source,
+            repos = obs.repos,
+            truncated = obs.truncated,
+            "adoption probe: observed"
+        );
+        let stat = store::NetworkStat {
+            key: store::ADOPTION_STAT_KEY.to_string(),
+            source: obs.source.clone(),
+            // Bounded by MAX_PAGES × the page limit, far inside i64.
+            value: obs.repos as i64,
+            truncated: obs.truncated,
+            observed_at: obs.observed_at.clone(),
+        };
+        if let Err(err) = store::record_network_stat(&state.db, &stat).await {
+            warn!(%err, source = %obs.source, "adoption probe: failed to persist observation");
+        }
+    }
+
+    // §4.1: two relays disagreeing is itself worth logging — non-archival
+    // relays index different host sets, so this is information, not an error.
+    if report.disagrees() {
+        let counts: Vec<(String, u64)> = report
+            .observations
+            .iter()
+            .map(|o| (o.source.clone(), o.repos))
+            .collect();
+        info!(
+            ?counts,
+            "adoption probe: relays disagree; the max is surfaced"
+        );
+    }
+}
+
+/// Spread the probe cadence ±10% so many self-hosted instances do not
+/// synchronise on the relay.
+///
+/// Seeded from the instance's public URL through the FNV hash already in this
+/// file, so it is **stable across restarts** (a restart must never re-roll into
+/// a tighter cadence) and unit-testable — no `rand` dependency, no RNG in the
+/// loop. The result is clamped to at least one second.
+fn jittered(period: Duration, seed: &str) -> Duration {
+    // 0..=200 → −100..=+100 tenths of a percent… i.e. ±10%.
+    let basis = (fnv1a_64(seed.as_bytes()) % 201) as i64 - 100;
+    let secs = period.as_secs_f64() * (1.0 + basis as f64 / 1000.0);
+    Duration::from_secs_f64(secs.max(1.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -888,5 +1053,33 @@ mod tests {
         assert_eq!(cadence_from_hint("weekly", d), Duration::from_secs(604_800));
         assert_eq!(cadence_from_hint("realtime", d), Duration::from_secs(300));
         assert_eq!(cadence_from_hint("bogus", d), d);
+    }
+
+    #[test]
+    fn jitter_stays_within_ten_percent_and_is_seed_stable() {
+        let period = Duration::from_secs(86_400);
+        let seeds = [
+            "https://feather-reader.com",
+            "http://localhost:8080",
+            "https://reader.example.org",
+        ];
+        for seed in seeds {
+            let j = jittered(period, seed);
+            assert!(
+                j >= Duration::from_secs(77_760) && j <= Duration::from_secs(95_040),
+                "{seed}: {j:?} escaped ±10% of a day"
+            );
+            // Stable across "restarts": the same seed always yields the same
+            // cadence, so a crash loop cannot walk the interval tighter.
+            assert_eq!(j, jittered(period, seed));
+        }
+        // Different instances land on different cadences.
+        assert_ne!(jittered(period, seeds[0]), jittered(period, seeds[1]));
+    }
+
+    #[test]
+    fn jitter_never_returns_a_sub_second_period() {
+        assert!(jittered(Duration::from_secs(1), "x") >= Duration::from_secs(1));
+        assert!(jittered(Duration::from_millis(1), "x") >= Duration::from_secs(1));
     }
 }

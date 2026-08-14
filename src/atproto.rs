@@ -30,7 +30,7 @@
 //! ## Auth — the OAuth sidecar is the live path
 //!
 //! Auth is a **trait/enum boundary** so the mechanism can vary without touching
-//! call sites. There are two paths:
+//! call sites. There are three paths:
 //!
 //! * **The live path — the atproto OAuth confidential client, via [`SidecarClient`].**
 //!   atproto OAuth (DPoP, PAR, token refresh) is fiddly and is **not** hand-rolled
@@ -47,6 +47,30 @@
 //!   fallback for local runs without the sidecar, but it is **no longer the live
 //!   path**: [`PdsClient`] and [`login_with_app_password`] remain for tests and
 //!   dev, while [`SidecarClient`] is what the web layer routes through.
+//! * **The public-read path — [`Auth::Anonymous`], via [`PdsClient::anonymous`].**
+//!   `com.atproto.repo.listRecords` is public on a standard PDS, so a stranger's
+//!   `community.lexicon.rss.*` records can be read with no credentials at all.
+//!   An anonymous client sends no `Authorization` header and is **read-only** —
+//!   every write fails closed on [`Auth::bearer`]. Because the target host is
+//!   then chosen by a stranger, the read is routed through
+//!   [`crate::net::guarded_get_no_privacy`] (per-hop SSRF re-validation +
+//!   connect-pinning) and capped by [`crate::net::read_capped`].
+//!
+//! ## Every PDS request goes through the SSRF guard
+//!
+//! A PDS host is *never* a host FeatherReader chose: it comes out of a DID
+//! document, which is attacker-controllable. So identity resolution, the record
+//! **reads**, and the record **writes** all route through [`crate::net`] —
+//! [`crate::net::guarded_get_no_privacy`] and
+//! [`crate::net::guarded_post_json`] — rather than the shared
+//! [`reqwest::Client`]. [`resolve_did_to_pds`] runs
+//! [`crate::net::assert_public_target`] on the `serviceEndpoint` it returns, but
+//! that check is a *separate DNS resolution* from the later request; only
+//! re-vetting and connect-pinning at request time closes the rebinding window.
+//! The writes matter most: they carry the session bearer, and
+//! [`login_with_app_password`] carries the app password in the request **body**,
+//! where reqwest's cross-origin header sanitisation offers no protection at all
+//! — which is why the guarded POST refuses redirects outright.
 //!
 //! All network I/O is `reqwest` (rustls, no OpenSSL); every fallible path returns
 //! [`anyhow::Result`] or the typed [`AtProtoError`] — nothing panics.
@@ -54,7 +78,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -71,6 +95,17 @@ pub const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
 /// works against any atproto host that implements
 /// `com.atproto.identity.resolveHandle`; `bsky.social` is a reliable default.
 pub const DEFAULT_RESOLVER_HOST: &str = "https://bsky.social";
+
+/// Hard cap on cursor pages any `list_all_records` walk will follow.
+///
+/// [`crate::net::read_capped`] bounds each individual response, but nothing
+/// bounded the *accumulation* across pages: a repo host that returns a full page
+/// and a fresh cursor forever walks memory until the (512 MB) box dies. At 100
+/// records per page this admits 20 000 records — far past any real
+/// `community.lexicon.rss.*` collection — while making the loop finite against a
+/// host we do not control. Mirrors [`crate::network::MAX_PAGES`], which bounds
+/// the relay walk for the same reason.
+const MAX_LIST_PAGES: usize = 200;
 
 /// Errors from the atproto identity + PDS layer.
 ///
@@ -161,6 +196,19 @@ pub enum Auth {
     /// this variant is a placeholder so the `Auth` enum documents that the OAuth
     /// path lives elsewhere.
     Oauth(OauthPlaceholder),
+
+    /// **No credentials at all** — an unauthenticated public read of a repo the
+    /// caller does not own. `com.atproto.repo.listRecords` is public on a
+    /// standard PDS, so a stranger's `community.lexicon.rss.*` records can be
+    /// read with no session; this variant makes that expressible without
+    /// inventing a fake token.
+    ///
+    /// A client holding it is **read-only**: [`Auth::bearer`] returns an error,
+    /// so every write path (`create_record` / `put_record` / `delete_record` /
+    /// `apply_writes`, all of which go through
+    /// [`authed_headers`](PdsClient::authed_headers)) fails closed. Construct one
+    /// via [`PdsClient::anonymous`].
+    Anonymous,
 }
 
 impl Auth {
@@ -168,7 +216,9 @@ impl Auth {
     ///
     /// Only [`Auth::Session`] carries a token (the session's `accessJwt`).
     /// [`Auth::Oauth`] carries none — the sidecar owns the OAuth path — so it
-    /// returns an error pointing callers at [`SidecarClient`].
+    /// returns an error pointing callers at [`SidecarClient`]. [`Auth::Anonymous`]
+    /// carries none by construction, which is what makes an anonymous client
+    /// read-only.
     pub fn bearer(&self) -> Result<&str> {
         match self {
             Auth::Session(s) => Ok(&s.access_jwt),
@@ -176,6 +226,11 @@ impl Auth {
                 "the direct PdsClient does not carry OAuth tokens — atproto OAuth is \
                  handled by the @atproto/oauth-client sidecar (SidecarClient); \
                  use Auth::Session (app-password) for the direct-PDS path"
+            ),
+            Auth::Anonymous => anyhow::bail!(
+                "this PdsClient is anonymous (unauthenticated public read) and carries no \
+                 bearer token — authenticated repo writes require Auth::Session or the \
+                 SidecarClient"
             ),
         }
     }
@@ -370,6 +425,13 @@ impl DidDocument {
 /// first with [`resolve_handle`] + [`resolve_did_to_pds`], or pass the entryway
 /// like `https://bsky.social`, which will service-proxy). `identifier` is a
 /// handle or DID; `app_password` is an app-password (never the main password).
+///
+/// The POST goes through [`crate::net::guarded_post_json`]. This is the single
+/// most credential-dense request in the crate — the app password travels in the
+/// JSON **body**, where reqwest's cross-origin header sanitisation cannot help
+/// it — so it gets the scheme/IP allow-list, the connect pin (no second DNS
+/// resolution to rebind), and a hard refusal to follow a redirect that would
+/// re-send that body to another host.
 pub async fn login_with_app_password(
     client: &Client,
     pds_base: &str,
@@ -380,19 +442,14 @@ pub async fn login_with_app_password(
         "{}/xrpc/com.atproto.server.createSession",
         pds_base.trim_end_matches('/')
     );
-    let resp = client
-        .post(&url)
-        .json(&json!({ "identifier": identifier, "password": app_password }))
-        .send()
-        .await?;
+    let body = serde_json::to_vec(&json!({ "identifier": identifier, "password": app_password }))
+        .context("serializing createSession request")?;
+    let resp = crate::net::guarded_post_json(client, &url, &[], body).await?;
     if !resp.status().is_success() {
         return Err(xrpc_error_from(resp).await.into());
     }
-    let session: SessionAuth = resp
-        .json()
-        .await
-        .context("parsing createSession response")?;
-    Ok(session)
+    let raw = crate::net::read_capped(resp).await?;
+    serde_json::from_slice(&raw).context("parsing createSession response")
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +462,10 @@ pub async fn login_with_app_password(
 /// from the DID doc), the shared [`reqwest::Client`], and the [`Auth`] token.
 /// All the `com.atproto.repo.*` methods below act on `self.did`'s repo.
 ///
+/// The client may also be **anonymous** ([`PdsClient::anonymous`]), in which case
+/// it is read-only: it sends no `Authorization` header and every write path
+/// errors out of [`Auth::bearer`].
+///
 /// Cheap to clone (`Arc` internals); one is held per logged-in session.
 #[derive(Clone)]
 pub struct PdsClient {
@@ -413,7 +474,8 @@ pub struct PdsClient {
     pds_base: Arc<str>,
     /// The repo DID all calls target.
     did: Arc<str>,
-    /// The auth material (an app-password session bearer for the direct path).
+    /// The auth material (an app-password session bearer for the direct path, or
+    /// [`Auth::Anonymous`] for a read-only public read of a stranger's repo).
     auth: Auth,
 }
 
@@ -500,6 +562,23 @@ impl PdsClient {
         }
     }
 
+    /// Construct a **read-only, unauthenticated** client for a public repo the
+    /// caller does not own — `com.atproto.repo.listRecords` is public on a
+    /// standard PDS, so a stranger's records need no credentials.
+    ///
+    /// Every `com.atproto.repo.*` **write** returns an error (there is no bearer;
+    /// see [`Auth::Anonymous`]). Callers are expected to have obtained `pds_base`
+    /// from [`resolve_did_to_pds`], which already runs
+    /// [`crate::net::assert_public_target`] on the resolved `serviceEndpoint` —
+    /// but that is not what makes the fetch safe: every read is **re-vetted at
+    /// fetch time** by [`crate::net::guarded_get_no_privacy`], which closes the
+    /// DNS-rebinding window between resolve and connect. This constructor is
+    /// deliberately synchronous and does no validation of its own, so the
+    /// authoritative check is not duplicated (or, worse, mistaken for sufficient).
+    pub fn anonymous(http: Client, pds_base: impl Into<String>, did: impl Into<String>) -> Self {
+        Self::new(http, pds_base, did, Auth::Anonymous)
+    }
+
     /// Resolve `handle` → DID → PDS, obtain an app-password session, and build a
     /// ready-to-use client. A convenience constructor for the direct-PDS path
     /// that exercises the whole stack end-to-end.
@@ -538,16 +617,19 @@ impl PdsClient {
         &self.pds_base
     }
 
-    /// Build the `Authorization: Bearer …` + JSON headers for an authed call.
-    fn authed_headers(&self) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    /// Build the `Authorization: Bearer …` header pair for an authed write.
+    ///
+    /// A `Vec` of pairs rather than a [`HeaderMap`] because every write now goes
+    /// through [`crate::net::guarded_post_json`], which takes header pairs and
+    /// sets `Content-Type: application/json` itself. Fails closed on
+    /// [`Auth::Anonymous`] (there is no bearer), which is what makes an anonymous
+    /// client read-only.
+    fn authed_headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>> {
         let bearer = self.auth.bearer()?;
         let mut value = HeaderValue::from_str(&format!("Bearer {bearer}"))
             .context("building Authorization header")?;
         value.set_sensitive(true);
-        headers.insert(AUTHORIZATION, value);
-        Ok(headers)
+        Ok(vec![(AUTHORIZATION, value)])
     }
 
     fn xrpc_url(&self, method: &str) -> String {
@@ -560,6 +642,16 @@ impl PdsClient {
     ///
     /// `cursor` continues a previous page; `limit` caps the page (atproto's max
     /// is 100). Use [`list_all_records`](Self::list_all_records) to page fully.
+    ///
+    /// The fetch is routed through [`crate::net::guarded_get_no_privacy`] — the
+    /// same per-hop scheme/IP allow-list and connect-pinning the feed poller and
+    /// the identity-resolution paths use. `pds_base` was vetted by
+    /// [`crate::net::assert_public_target`] at resolve time, but that is a
+    /// *separate* DNS resolution from this fetch; routing the request through the
+    /// guard closes the rebinding window, which matters as soon as the repo (and
+    /// therefore the host) is chosen by a stranger. The response body is read via
+    /// [`crate::net::read_capped`] so a hostile PDS cannot stream an unbounded
+    /// body at a 512 MB box.
     pub async fn list_records(
         &self,
         collection: &str,
@@ -582,33 +674,44 @@ impl PdsClient {
         }
 
         // listRecords is public/unauthenticated on most PDSes, but we send the
-        // bearer when we have a session one so private repos work too.
-        let mut req = self.http.get(&url);
+        // bearer when we have a session one so private repos work too. An
+        // Auth::Oauth / Auth::Anonymous client sends no Authorization header at
+        // all. The guard drops the header if a redirect leaves this PDS's origin.
+        let mut headers: Vec<(reqwest::header::HeaderName, HeaderValue)> = Vec::new();
         if let Auth::Session(s) = &self.auth {
-            req = req.bearer_auth(&s.access_jwt);
+            let mut value = HeaderValue::from_str(&format!("Bearer {}", s.access_jwt))
+                .context("building Authorization header")?;
+            value.set_sensitive(true);
+            headers.push((AUTHORIZATION, value));
         }
-        let resp = req.send().await?;
+        let resp = crate::net::guarded_get_no_privacy(&self.http, &url, &headers).await?;
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
-        resp.json().await.context("parsing listRecords response")
+        let body = crate::net::read_capped(resp).await?;
+        serde_json::from_slice(&body).context("parsing listRecords response")
     }
 
     /// Page through **all** records in a collection, following the cursor until
     /// exhausted. Convenience over [`list_records`](Self::list_records) for the
     /// login-time "load the whole follow-list" read.
+    ///
+    /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
+    /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
             out.extend(page.records);
             match page.cursor {
-                // Guard against a PDS that echoes a cursor with an empty page.
-                Some(next) if got > 0 => cursor = Some(next),
+                // Guard against a PDS that echoes a cursor with an empty page,
+                // or that hands back the SAME cursor forever (an infinite walk
+                // that would otherwise re-count the same page every pass).
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
             }
         }
@@ -648,6 +751,23 @@ impl PdsClient {
         self.repo_write("com.atproto.repo.putRecord", body).await
     }
 
+    /// The single outbound path for every authenticated `com.atproto.repo.*`
+    /// **write**, routed through [`crate::net::guarded_post_json`].
+    ///
+    /// Reads were hardened first (see [`list_records`](Self::list_records)), but
+    /// the argument applies with more force here: `pds_base` is vetted by
+    /// [`crate::net::assert_public_target`] at *resolve* time, and the write is a
+    /// *separate* DNS resolution — the rebinding window `net.rs` exists to close.
+    /// A write also carries the session bearer and, in
+    /// [`login_with_app_password`], the app password itself, so the guard's
+    /// refusal to follow redirects (a `307` re-sends the body verbatim to the new
+    /// host) is doing real work and not just symmetry.
+    async fn guarded_post(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        let headers = self.authed_headers()?;
+        let payload = serde_json::to_vec(body).context("serializing XRPC request body")?;
+        crate::net::guarded_post_json(&self.http, url, &headers, payload).await
+    }
+
     /// `com.atproto.repo.deleteRecord` — delete a record by collection + rkey
     /// (e.g. unsubscribe → delete the subscription record).
     pub async fn delete_record(&self, collection: &str, rkey: &str) -> Result<()> {
@@ -657,13 +777,7 @@ impl PdsClient {
             "collection": collection,
             "rkey": rkey,
         });
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.authed_headers()?)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.guarded_post(&url, &body).await?;
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
@@ -683,13 +797,7 @@ impl PdsClient {
             "repo": self.did.as_ref(),
             "writes": ops,
         });
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.authed_headers()?)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.guarded_post(&url, &body).await?;
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
@@ -699,19 +807,14 @@ impl PdsClient {
     /// Shared create/put path (both return a `{uri,cid}` strong ref).
     async fn repo_write(&self, method: &str, body: Value) -> Result<WriteResult> {
         let url = self.xrpc_url(method);
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.authed_headers()?)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.guarded_post(&url, &body).await?;
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
-        resp.json()
-            .await
-            .with_context(|| format!("parsing {method} response"))
+        // `read_capped` rather than `resp.json()`: a hostile PDS must not be able
+        // to stream an unbounded body at a 512 MB box (same rule as the reads).
+        let raw = crate::net::read_capped(resp).await?;
+        serde_json::from_slice(&raw).with_context(|| format!("parsing {method} response"))
     }
 
     // -- typed lexicon wrappers ---------------------------------------------
@@ -1047,17 +1150,21 @@ impl SidecarClient {
     }
 
     /// Page through **all** records in a collection for `did`.
+    ///
+    /// Bounded by [`MAX_LIST_PAGES`] and cursor-repetition detection, same as
+    /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
+    /// PDS, so the page count is ultimately remote-controlled here too.
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(did, collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
             out.extend(page.records);
             match page.cursor {
-                Some(next) if got > 0 => cursor = Some(next),
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
             }
         }
@@ -1623,7 +1730,10 @@ fn encode_s32_tid(mut v: u64) -> String {
 /// Encodes everything outside the RFC 3986 unreserved set, which covers the
 /// values FeatherReader passes (DIDs like `did:plc:…`, NSIDs, opaque cursors,
 /// handles) without pulling in the optional reqwest `url`/`query` feature.
-fn urlencode(s: &str) -> String {
+///
+/// `pub(crate)` so [`crate::network`] builds its relay query strings the same
+/// way rather than keeping a second copy of the escape table.
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -1647,13 +1757,24 @@ struct XrpcErrorBody {
 
 /// Consume a non-2xx response into a typed [`AtProtoError::Xrpc`], parsing the
 /// atproto error envelope when present (falling back to `"Unknown"`).
+///
+/// The body is read through [`crate::net::read_capped`], **not** `resp.json()`.
+/// Every guarded call caps its success body; routing the error body through
+/// `resp.json()` would have left a hole exactly where the hostile-PDS threat
+/// model points — reqwest decompresses gzip before deserialising, so a `400`
+/// carrying a decompression bomb was an unbounded allocation on a 512 MB box.
+/// A body we cannot read (over-cap, transport error) degrades to `"Unknown"`,
+/// which is the same fallback an unparseable envelope already took.
 async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
     let status = resp.status();
-    let (error, message) = match resp.json::<XrpcErrorBody>().await {
-        Ok(body) => (
-            body.error.unwrap_or_else(|| "Unknown".to_string()),
-            body.message,
-        ),
+    let (error, message) = match crate::net::read_capped(resp).await {
+        Ok(raw) => match serde_json::from_slice::<XrpcErrorBody>(&raw) {
+            Ok(body) => (
+                body.error.unwrap_or_else(|| "Unknown".to_string()),
+                body.message,
+            ),
+            Err(_) => ("Unknown".to_string(), None),
+        },
         Err(_) => ("Unknown".to_string(), None),
     };
     AtProtoError::Xrpc {
@@ -1671,6 +1792,71 @@ async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Regression (v0.2.8 review).** Every guarded call caps its *success*
+    /// body via `read_capped`, but the non-2xx branch went through
+    /// `resp.json::<XrpcErrorBody>()` — unbounded, and with reqwest's gzip
+    /// decompression in front of it. That left a hole precisely where the
+    /// module's own threat model points: a hostile or DNS-rebound PDS answers
+    /// `400` with a decompression bomb and gets an unbounded allocation on a
+    /// 512 MB box. Both this PR's review passes checked the success path and
+    /// walked past the error path, so the cap is asserted here explicitly.
+    ///
+    /// Fetched directly rather than through the guard, which rightly refuses
+    /// loopback — the same reason `net::tests::read_capped_rejects_over_cap_body`
+    /// bypasses it. The stub answers 200; `xrpc_error_from` reads the status only
+    /// to record it, so the body handling under test is identical.
+    #[tokio::test]
+    async fn xrpc_error_body_is_capped() {
+        // A syntactically VALID envelope, one byte past the cap. If the body were
+        // parsed unbounded this would deserialize and yield "TooBig"; capped, it
+        // is refused unread and degrades to the "Unknown" fallback.
+        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
+        let big = format!(r#"{{"error":"TooBig","message":"{filler}"}}"#).into_bytes();
+        assert!(big.len() > crate::net::MAX_BODY_BYTES);
+
+        let base = crate::net::tests::serve_body(big).await;
+        let resp = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(&base)
+            .send()
+            .await
+            .unwrap();
+
+        match xrpc_error_from(resp).await {
+            AtProtoError::Xrpc { error, message, .. } => {
+                assert_eq!(error, "Unknown", "an over-cap error body must not parse");
+                assert!(message.is_none());
+            }
+            other => panic!("expected Xrpc, got {other:?}"),
+        }
+    }
+
+    /// The other half: a normal-sized envelope still parses, so capping the
+    /// error path did not cost the diagnostics it exists to provide.
+    #[tokio::test]
+    async fn xrpc_error_body_within_the_cap_still_parses() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"bad rkey"}"#.to_vec(),
+        )
+        .await;
+        let resp = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(&base)
+            .send()
+            .await
+            .unwrap();
+
+        match xrpc_error_from(resp).await {
+            AtProtoError::Xrpc { error, message, .. } => {
+                assert_eq!(error, "InvalidRequest");
+                assert_eq!(message.as_deref(), Some("bad rkey"));
+            }
+            other => panic!("expected Xrpc, got {other:?}"),
+        }
+    }
 
     /// A realistic `com.atproto.repo.listRecords` response for the subscription
     /// collection, as a PDS returns it — the envelope wraps each record in
@@ -1809,6 +1995,115 @@ mod tests {
             .is_ok());
     }
 
+    /// A `PdsClient` pointed at an internal `pds_base`, as an attacker-controlled
+    /// DID document could arrange between the `assert_public_target` at resolve
+    /// time and the request.
+    fn internal_target_client(pds_base: &str) -> PdsClient {
+        PdsClient::new(
+            ssrf_test_client(),
+            pds_base,
+            "did:plc:victim",
+            Auth::Session(SessionAuth {
+                did: "did:plc:victim".to_string(),
+                handle: None,
+                access_jwt: "session-bearer-must-not-leak".to_string(),
+                refresh_jwt: None,
+            }),
+        )
+    }
+
+    /// **Regression (v0.2.8):** every `com.atproto.repo.*` WRITE must go through
+    /// the SSRF guard, not the shared client. Before the fix only `list_records`
+    /// was guarded, so `createRecord` / `putRecord` / `deleteRecord` /
+    /// `applyWrites` would happily deliver the session bearer to
+    /// `169.254.169.254` or loopback on a rebound host.
+    #[tokio::test]
+    async fn every_repo_write_is_refused_against_an_internal_pds() {
+        for base in [
+            "http://169.254.169.254",
+            "http://127.0.0.1:9",
+            "http://[::1]",
+        ] {
+            let client = internal_target_client(base);
+            let sub = Subscription::new("https://example.com/feed.xml", "2026-08-13T00:00:00Z");
+
+            let mut errors = vec![
+                client
+                    .create_record(lexicon::nsid::SUBSCRIPTION, &sub)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                client
+                    .put_record(lexicon::nsid::SUBSCRIPTION, "rkey", &sub)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                client
+                    .delete_record(lexicon::nsid::SUBSCRIPTION, "rkey")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            ];
+            errors.push(
+                client
+                    .apply_writes(&[WriteOp::Delete {
+                        collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                        rkey: "rkey".to_string(),
+                    }])
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            );
+
+            for err in errors {
+                assert!(
+                    err.contains("forbidden") || err.contains("internal"),
+                    "{base}: expected an SSRF refusal, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// **Regression (v0.2.8):** the app password travels in the request BODY,
+    /// where reqwest's cross-origin header sanitisation cannot protect it — so
+    /// `createSession` is guarded too, and a rebound/internal `pds_base` never
+    /// receives it.
+    #[tokio::test]
+    async fn app_password_login_is_refused_against_an_internal_pds() {
+        let client = ssrf_test_client();
+        for base in ["http://169.254.169.254", "http://127.0.0.1:9"] {
+            let err = login_with_app_password(&client, base, "alice.example.com", "hunter2-app-pw")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("forbidden") || err.contains("internal"),
+                "{base}: expected an SSRF refusal, got: {err}"
+            );
+        }
+    }
+
+    /// An anonymous client is read-only: the write paths fail closed on
+    /// [`Auth::bearer`] before any socket work, so `Auth::Anonymous` can never
+    /// become a credential-less write primitive against a stranger's PDS.
+    #[tokio::test]
+    async fn anonymous_client_cannot_write() {
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            "https://pds.example.com",
+            "did:plc:stranger",
+        );
+        let err = client
+            .delete_record(lexicon::nsid::SUBSCRIPTION, "rkey")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no credentials") || err.contains("anonymous") || err.contains("bearer"),
+            "expected a fail-closed auth error, got: {err}"
+        );
+    }
+
     #[test]
     fn write_result_deserializes() {
         let wr: WriteResult = serde_json::from_value(json!({
@@ -1870,6 +2165,78 @@ mod tests {
         assert!(
             auth.bearer().is_err(),
             "Auth::Oauth carries no direct bearer — the sidecar owns the OAuth path"
+        );
+    }
+
+    #[test]
+    fn anonymous_variant_carries_no_bearer() {
+        let err = Auth::Anonymous.bearer().unwrap_err().to_string();
+        assert!(
+            err.contains("anonymous"),
+            "the anonymous refusal must name itself, got: {err}"
+        );
+    }
+
+    #[test]
+    fn anonymous_client_targets_the_requested_repo() {
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            "https://pds.example.com/",
+            "did:plc:abc123",
+        );
+        // The trailing slash is trimmed so `xrpc_url` joins cleanly.
+        assert_eq!(client.pds_base(), "https://pds.example.com");
+        assert_eq!(client.did(), "did:plc:abc123");
+        // …and it holds no credential.
+        assert!(client.auth.bearer().is_err());
+    }
+
+    /// The regression test for the defect this milestone fixes: `list_records`
+    /// used to send on the shared client, bypassing the SSRF guard entirely. It
+    /// now routes through `net::guarded_get_no_privacy`, so an internal
+    /// `pds_base` is refused before a packet leaves the box. Hermetic — the hosts
+    /// are IP literals, rejected without any DNS lookup or connect.
+    #[tokio::test]
+    async fn list_records_blocks_internal_pds_base() {
+        for base in ["http://169.254.169.254", "http://127.0.0.1:1"] {
+            let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+            let err = client
+                .list_records(lexicon::nsid::SUBSCRIPTION, Some(1), None)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("forbidden") || err.contains("internal"),
+                "expected an SSRF refusal for {base}, got: {err}"
+            );
+        }
+    }
+
+    /// The guard is not anonymous-only: an *authenticated* client reading a
+    /// hostile PDS base is blocked identically. (That path was only ever safe by
+    /// accident of usage.)
+    #[tokio::test]
+    async fn list_records_guard_applies_to_authed_clients_too() {
+        let auth = Auth::Session(SessionAuth {
+            did: "did:plc:x".to_string(),
+            handle: None,
+            access_jwt: "x".to_string(),
+            refresh_jwt: None,
+        });
+        let client = PdsClient::new(
+            ssrf_test_client(),
+            "http://169.254.169.254",
+            "did:plc:x",
+            auth,
+        );
+        let err = client
+            .list_records(lexicon::nsid::SUBSCRIPTION, Some(1), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("forbidden") || err.contains("internal"),
+            "expected an SSRF refusal, got: {err}"
         );
     }
 
