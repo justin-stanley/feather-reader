@@ -53,3 +53,26 @@ subdomain), a strong `SIDECAR_INTERNAL_SECRET`, and
 confidential-client signing key is generated once and persisted to
 `${SIDECAR_DB}.jwk.json` (keep it with the DB volume); `/jwks.json` serves its
 public half. `client-metadata.json` and `jwks.json` must be reachable at the edge.
+
+`SIDECAR_TRUSTED_IP_HEADER` is also required in production, and the sidecar
+refuses to boot without it. It names the header your edge sets to the real
+client IP — `cf-connecting-ip` behind Cloudflare, `fly-client-ip` where Fly is
+the outermost proxy — and it keys the rate limiter on `/login` and `/callback`.
+
+Two things about it are worth stating plainly, because getting either wrong
+fails quietly rather than loudly:
+
+- **Name the header set by a proxy every request provably transits.** Naming one
+  an arbitrary client can set makes the limiter evadable: the client just varies
+  it to mint a fresh bucket per request. For `cf-connecting-ip` that guarantee
+  comes from the CF-only origin lock in [`deploy/Caddyfile`](../deploy/Caddyfile),
+  not from Cloudflare alone.
+- **Name the outermost proxy's header, not the innermost.** Behind Cloudflare,
+  Fly sets `fly-client-ip` to the *Cloudflare edge* IP, so choosing it there
+  collapses every visitor behind that edge into one shared bucket — over-limiting
+  that surfaces as unexplained 429s for innocent users, not as an obvious fault.
+
+There is deliberately no default. Behind a proxy the socket peer is always
+loopback, so a silent fallback would be exactly that shared-bucket failure. This
+mirrors the Rust server's `FEATHERREADER_TRUSTED_IP_HEADER`; set both to the same
+value.

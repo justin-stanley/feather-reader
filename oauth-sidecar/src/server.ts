@@ -100,7 +100,7 @@ import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
 import { SqliteStores, isTransientSessionReadFailure, type SessionTtls } from './stores.js';
-import { clientIp } from './client-ip.js';
+import { clientIpKeyGenerator } from './client-ip.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
@@ -141,7 +141,10 @@ const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
 // limiter, so the throttle has to live here. `global: false` — routes opt in
 // individually, so the shared-secret internal API (hit frequently by the Rust
 // server) is never limited.
-await app.register(rateLimit, { global: false, keyGenerator: clientIp });
+await app.register(rateLimit, {
+  global: false,
+  keyGenerator: clientIpKeyGenerator(cfg.trustedIpHeader),
+});
 
 function newSessionId(): string {
   return randomBytes(24).toString('base64url');

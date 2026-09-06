@@ -35,6 +35,7 @@ function cfg(overrides: Partial<SidecarConfig> = {}): SidecarConfig {
     handleResolver: 'https://bsky.social',
     plcDirectory: 'https://plc.directory',
     dev: false,
+    trustedIpHeader: 'cf-connecting-ip',
     scope: 'atproto repo:generic',
     encKey: 'k'.repeat(32),
     sessionAbsoluteTtlMs: 1_000,

@@ -5,46 +5,47 @@
  * calls `app.listen()` at import scope, so nothing defined in it is reachable
  * from a test.
  *
- * ## The deployment this reasons about
+ * ## One configured header, not a guessed order
+ *
+ * Which header carries the visitor is a property of the DEPLOYMENT, not of the
+ * code, so it is configuration (`SIDECAR_TRUSTED_IP_HEADER`) rather than a
+ * built-in preference list. This mirrors the Rust server's
+ * `FEATHERREADER_TRUSTED_IP_HEADER` and its `client_ip()` in `src/web.rs`, so
+ * both halves of the app agree on who the client is by construction.
+ *
+ * The distinction matters because every hop rewrites what "the peer" means:
  *
  * ```
  *   visitor → Cloudflare (Full-strict) → Fly proxy → Caddy :8080 → sidecar :8081
  * ```
  *
- * Each hop rewrites what "the peer" means, so header choice is not
- * interchangeable:
+ *  - `cf-connecting-ip` is set by Cloudflare to the **true visitor**, with any
+ *    client-supplied copy stripped at the edge. It is authoritative only because
+ *    `deploy/Caddyfile` 403s any request lacking Cloudflare's injected
+ *    `X-Origin-Auth` secret (and fails closed when that secret is unset), so a
+ *    request reaching this sidecar provably transited Cloudflare. This is the
+ *    value to configure for the deployed topology.
+ *  - `fly-client-ip` is set by Fly to the peer **Fly** sees — behind Cloudflare
+ *    that is the CF edge, not the visitor. Correct only where Fly is the
+ *    outermost proxy.
  *
- *  - `cf-connecting-ip` — set by Cloudflare to the **true visitor**, with any
- *    client-supplied copy stripped at the edge. Authoritative here *because*
- *    `deploy/Caddyfile` refuses (403) any request lacking Cloudflare's injected
- *    `X-Origin-Auth` secret, and fails closed when that secret is unset — so a
- *    request that reaches this sidecar provably transited Cloudflare. This is
- *    also the header the Rust app trusts
- *    (`FEATHERREADER_TRUSTED_IP_HEADER=cf-connecting-ip` in `fly.toml`), so the
- *    two halves of the app now agree on who the client is.
+ * Naming a header here is therefore also asserting "every request provably
+ * transits the proxy that sets it". Configure one that an arbitrary client can
+ * set and the limiter becomes trivially evadable — which is exactly why this is
+ * a deliberate, per-deployment choice rather than a default.
  *
- *  - `fly-client-ip` — set by Fly's proxy to the peer **Fly** sees. Behind
- *    Cloudflare that is the Cloudflare edge IP, *not* the visitor. Preferring it
- *    collapses every visitor behind a given edge IP into one rate-limit bucket
- *    (see the note in `deploy/Caddyfile`: overwriting the visitor IP with the CF
- *    edge IP "defeats the whole point"). Kept only as a fallback for a
- *    Cloudflare-less deployment, where Fly is the outermost proxy and this
- *    header *is* the visitor.
- *
- *  - `req.ip` — the socket peer, which the in-container Caddy hop makes
- *    permanently loopback. Useless as a key; see {@link clientIp}.
- *
- * Raw `X-Forwarded-For` is deliberately never consulted: any client can send it.
- * Fastify is likewise constructed without `trustProxy`, so it never parses
- * `X-Forwarded-*` into `req.ip` either.
+ * Raw `X-Forwarded-For` is never special-cased: it is only ever consulted if an
+ * operator explicitly names it, which they should not behind an edge that does
+ * not rewrite it. Fastify is likewise constructed without `trustProxy`, so it
+ * never parses `X-Forwarded-*` into `req.ip` either.
  */
 
 import type { IncomingHttpHeaders } from 'node:http';
 
 /**
  * The part of a request this needs. Structurally satisfied by `FastifyRequest`,
- * so `clientIp` can be handed straight to `@fastify/rate-limit` as its
- * `keyGenerator` while staying trivially constructible in a test.
+ * so the generated key function can be handed straight to `@fastify/rate-limit`
+ * while staying trivially constructible in a test.
  */
 export interface ClientIpSource {
   headers: IncomingHttpHeaders;
@@ -55,13 +56,13 @@ export interface ClientIpSource {
  * The right-most comma-separated entry of a header, trimmed.
  *
  * A trusted proxy appends its observation last, so anything to the left may be
- * client-forged. This mirrors `client_ip` in `src/web.rs`, which takes
+ * client-forged. Mirrors `client_ip` in `src/web.rs`, which takes
  * `raw.split(',').next_back()` for the same reason. Returns `null` for a missing
  * header, an array-valued one (a repeated header is not something our proxies
  * emit, and guessing which copy is authoritative would be exactly the wrong
  * instinct), or an empty value.
  */
-function trustedHeader(headers: IncomingHttpHeaders, name: string): string | null {
+function rightmost(headers: IncomingHttpHeaders, name: string): string | null {
   const raw = headers[name];
   if (typeof raw !== 'string') return null;
   const parts = raw.split(',');
@@ -70,23 +71,33 @@ function trustedHeader(headers: IncomingHttpHeaders, name: string): string | nul
 }
 
 /**
- * Rate-limit key: the true client IP.
+ * Rate-limit key: the true client IP, per the configured trusted header.
  *
- * Order matters and is the point of this function — see the module header.
- * Cloudflare's view wins, Fly's is the Cloudflare-less fallback, and the socket
- * peer is last.
+ * `trustedHeader` must already be lower-cased — Node lower-cases incoming header
+ * names, and `loadConfig` normalises the configured value to match.
  *
- * The `req.ip` fallback is reached only if neither platform header is present,
- * which in the deployed topology cannot happen. If it ever does, it degrades to
- * loopback — one shared bucket for everyone rather than a per-visitor one. That
- * is deliberately the *safe* direction (over-limiting, not a bypass), but it
- * means a missing platform header shows up as unexplained 429s rather than as
- * silently unlimited traffic.
+ * Falls back to the socket peer when no header is configured, or when the
+ * configured one is absent/unusable. Behind the in-container Caddy hop that peer
+ * is permanently loopback, so the fallback means one bucket shared by every such
+ * request. That is deliberately the *safe* direction — over-limiting rather than
+ * a bypass — but it shows up as unexplained 429s rather than as silently
+ * unlimited traffic, which is why `SIDECAR_TRUSTED_IP_HEADER` is required in
+ * production instead of quietly defaulting.
  */
-export function clientIp(req: ClientIpSource): string {
-  return (
-    trustedHeader(req.headers, 'cf-connecting-ip') ??
-    trustedHeader(req.headers, 'fly-client-ip') ??
-    req.ip
-  );
+export function clientIp(req: ClientIpSource, trustedHeader: string | null): string {
+  if (trustedHeader) {
+    const found = rightmost(req.headers, trustedHeader);
+    if (found) return found;
+  }
+  return req.ip;
+}
+
+/**
+ * Bind a trusted header to produce a `@fastify/rate-limit` `keyGenerator`.
+ * Resolved once at boot so the per-request path stays a single header lookup.
+ */
+export function clientIpKeyGenerator(
+  trustedHeader: string | null,
+): (req: ClientIpSource) => string {
+  return (req) => clientIp(req, trustedHeader);
 }
