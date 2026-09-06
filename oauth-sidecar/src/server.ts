@@ -143,7 +143,19 @@ const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
 // server) is never limited.
 await app.register(rateLimit, {
   global: false,
-  keyGenerator: clientIpKeyGenerator(cfg.trustedIpHeader),
+  // The `onMissingHeader` arm catches the one misconfiguration loadConfig
+  // cannot: a header name that is set but WRONG. It boots clean, then every
+  // request keys on the loopback peer — one shared bucket for the whole site.
+  // Logged at error, once, from the request path because only live traffic can
+  // reveal it.
+  keyGenerator: clientIpKeyGenerator(cfg.trustedIpHeader, () => {
+    app.log.error(
+      { trustedIpHeader: cfg.trustedIpHeader },
+      'SIDECAR_TRUSTED_IP_HEADER names a header absent from an incoming rate-limited request — ' +
+        'rate limiting has fallen back to the socket peer (loopback behind a proxy), so ALL ' +
+        'clients now share one bucket. Check the header name against what your edge actually sets.',
+    );
+  }),
 });
 
 function newSessionId(): string {

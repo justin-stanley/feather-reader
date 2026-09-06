@@ -95,9 +95,34 @@ export function clientIp(req: ClientIpSource, trustedHeader: string | null): str
 /**
  * Bind a trusted header to produce a `@fastify/rate-limit` `keyGenerator`.
  * Resolved once at boot so the per-request path stays a single header lookup.
+ *
+ * `onMissingHeader` fires **once**, the first time a rate-limited request
+ * arrives without the configured header. That case is the one failure this
+ * design cannot catch at boot: `loadConfig` can check that
+ * `SIDECAR_TRUSTED_IP_HEADER` is set, but not that the name is *correct*. A typo
+ * (`cf_connecting_ip` for `cf-connecting-ip`) boots cleanly and then keys every
+ * request on the loopback socket peer — one shared 30/min bucket for the whole
+ * site, i.e. exactly the login denial this module exists to prevent, with
+ * nothing in the logs. Only live traffic can reveal it, so it is reported from
+ * the request path.
+ *
+ * Once, not per-request: under the very traffic that makes the misconfiguration
+ * hurt, a per-request log line would be its own outage.
  */
 export function clientIpKeyGenerator(
   trustedHeader: string | null,
+  onMissingHeader?: () => void,
 ): (req: ClientIpSource) => string {
-  return (req) => clientIp(req, trustedHeader);
+  let reported = false;
+  return (req) => {
+    if (trustedHeader) {
+      const found = rightmost(req.headers, trustedHeader);
+      if (found) return found;
+      if (!reported) {
+        reported = true;
+        onMissingHeader?.();
+      }
+    }
+    return req.ip;
+  };
 }

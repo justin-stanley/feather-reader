@@ -132,3 +132,47 @@ test('clientIpKeyGenerator binds the header once and is usable as a keyGenerator
 test('clientIpKeyGenerator(null) degrades to the socket peer', () => {
   assert.equal(clientIpKeyGenerator(null)(req({ [CF]: '203.0.113.7' })), LOOPBACK);
 });
+
+// ─── The misconfiguration boot cannot catch ──────────────────────────────────
+
+test('a header name that is set but WRONG reports itself on first use', () => {
+  // loadConfig can check SIDECAR_TRUSTED_IP_HEADER is set, not that it is
+  // correct. A typo boots clean and then keys every request on the loopback
+  // peer — one shared bucket for the whole site, which is the exact login
+  // denial this module exists to prevent. Only live traffic reveals it.
+  let reports = 0;
+  const key = clientIpKeyGenerator('cf_connecting_ip', () => void reports++);
+
+  assert.equal(key(req({ [CF]: '203.0.113.7' })), LOOPBACK);
+  assert.equal(reports, 1, 'the misconfiguration must not be silent');
+});
+
+test('the report fires once, not once per request', () => {
+  // Under the very traffic that makes this misconfiguration hurt, a per-request
+  // log line would be its own outage.
+  let reports = 0;
+  const key = clientIpKeyGenerator('cf_connecting_ip', () => void reports++);
+
+  for (let i = 0; i < 50; i++) key(req({ [CF]: '203.0.113.7' }));
+
+  assert.equal(reports, 1);
+});
+
+test('a correctly configured header never reports', () => {
+  let reports = 0;
+  const key = clientIpKeyGenerator(CF, () => void reports++);
+
+  assert.equal(key(req({ [CF]: '203.0.113.7' })), '203.0.113.7');
+  assert.equal(reports, 0);
+});
+
+test('with no header configured the request path stays quiet — boot already warned', () => {
+  // config.ts warns at boot for the dev/null case; re-reporting per request
+  // would just be noise on a stack that is knowingly unlimited.
+  let reports = 0;
+  const key = clientIpKeyGenerator(null, () => void reports++);
+
+  key(req({ [CF]: '203.0.113.7' }));
+
+  assert.equal(reports, 0);
+});
