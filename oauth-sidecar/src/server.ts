@@ -100,6 +100,7 @@ import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
 import { SqliteStores, isTransientSessionReadFailure, type SessionTtls } from './stores.js';
+import { clientIp } from './client-ip.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
@@ -129,22 +130,6 @@ const HANDOFF_TTL_MS = 120_000;
 const app = Fastify({
   logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' },
 });
-
-/**
- * Rate-limit key: the true client IP. Behind Fly (and optionally Cloudflare) the
- * platform sets an un-spoofable client-IP header, and the in-container Caddy hop
- * makes `req.ip` useless for limiting (it's always loopback). Prefer the platform
- * headers — matching the Rust server's trusted-IP handling — and never key on raw
- * X-Forwarded-For (which the client can spoof).
- */
-function clientIp(req: FastifyRequest): string {
-  const h = req.headers;
-  const fly = h['fly-client-ip'];
-  if (typeof fly === 'string' && fly.trim()) return fly.trim();
-  const cf = h['cf-connecting-ip'];
-  if (typeof cf === 'string' && cf.trim()) return cf.trim();
-  return req.ip;
-}
 
 /** Per-IP budget for the public, unauthenticated browser routes. */
 const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
