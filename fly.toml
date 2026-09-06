@@ -65,6 +65,10 @@ primary_region = "ord"
   # Keep the poller from filling a 1GB volume: pause new fetches below the volume
   # size (see the startup watermark-vs-disk check in src/main.rs).
   FEATHERREADER_DB_SIZE_WATERMARK_BYTES = "805306368"  # 768 MiB (< 1GB volume)
+  # Same reasoning as FEATHERREADER_TRUSTED_IP_HEADER above: the sidecar's public
+  # OAuth routes are rate-limited per client IP, and behind Caddy the socket peer
+  # is always loopback. Authoritative ONLY with the CF-only origin lock in place.
+  SIDECAR_TRUSTED_IP_HEADER = "cf-connecting-ip"
   SIDECAR_HOST = "127.0.0.1"
   SIDECAR_PORT = "8081"
   # Loopback base the Rust app uses for the sidecar's /internal/* API. DISTINCT

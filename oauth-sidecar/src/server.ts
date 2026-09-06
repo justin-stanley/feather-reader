@@ -100,6 +100,7 @@ import rateLimit from '@fastify/rate-limit';
 import { Agent } from '@atproto/api';
 import { loadConfig } from './config.js';
 import { SqliteStores, isTransientSessionReadFailure, type SessionTtls } from './stores.js';
+import { clientIpKeyGenerator } from './client-ip.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
@@ -130,22 +131,6 @@ const app = Fastify({
   logger: { level: process.env.SIDECAR_LOG_LEVEL ?? 'info' },
 });
 
-/**
- * Rate-limit key: the true client IP. Behind Fly (and optionally Cloudflare) the
- * platform sets an un-spoofable client-IP header, and the in-container Caddy hop
- * makes `req.ip` useless for limiting (it's always loopback). Prefer the platform
- * headers — matching the Rust server's trusted-IP handling — and never key on raw
- * X-Forwarded-For (which the client can spoof).
- */
-function clientIp(req: FastifyRequest): string {
-  const h = req.headers;
-  const fly = h['fly-client-ip'];
-  if (typeof fly === 'string' && fly.trim()) return fly.trim();
-  const cf = h['cf-connecting-ip'];
-  if (typeof cf === 'string' && cf.trim()) return cf.trim();
-  return req.ip;
-}
-
 /** Per-IP budget for the public, unauthenticated browser routes. */
 const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
 
@@ -156,7 +141,22 @@ const PUBLIC_RATE_LIMIT = { max: 30, timeWindow: '1 minute' } as const;
 // limiter, so the throttle has to live here. `global: false` — routes opt in
 // individually, so the shared-secret internal API (hit frequently by the Rust
 // server) is never limited.
-await app.register(rateLimit, { global: false, keyGenerator: clientIp });
+await app.register(rateLimit, {
+  global: false,
+  // The `onMissingHeader` arm catches the one misconfiguration loadConfig
+  // cannot: a header name that is set but WRONG. It boots clean, then every
+  // request keys on the loopback peer — one shared bucket for the whole site.
+  // Logged at error, once, from the request path because only live traffic can
+  // reveal it.
+  keyGenerator: clientIpKeyGenerator(cfg.trustedIpHeader, () => {
+    app.log.error(
+      { trustedIpHeader: cfg.trustedIpHeader },
+      'SIDECAR_TRUSTED_IP_HEADER names a header absent from an incoming rate-limited request — ' +
+        'rate limiting has fallen back to the socket peer (loopback behind a proxy), so ALL ' +
+        'clients now share one bucket. Check the header name against what your edge actually sets.',
+    );
+  }),
+});
 
 function newSessionId(): string {
   return randomBytes(24).toString('base64url');
