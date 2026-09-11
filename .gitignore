@@ -1,1 +1,7 @@
 /target
+
+# Local dev SQLite database. WAL mode creates -shm / -wal siblings; none of the
+# three belong in the repo — the file holds session and cache state.
+/featherreader.db
+/featherreader.db-shm
+/featherreader.db-wal
