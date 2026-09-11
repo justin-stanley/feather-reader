@@ -19,6 +19,9 @@ pub enum Status {
     /// poll loop retries this DID on a later cycle once seats free up — but the
     /// row PERSISTS (unlike a forget) so operators can enumerate who is pending.
     Waitlisted,
+    /// Daily mint budget exhausted; nothing minted. NON-terminal, retried later
+    /// when budget refreshes. Distinct from waitlisted (which is beta-full).
+    Queued,
     /// Deliberately skipped (already a member, the bot itself, etc.).
     Skipped,
 }
@@ -29,6 +32,7 @@ impl Status {
             Status::Minting => "minting",
             Status::Delivered => "delivered",
             Status::Waitlisted => "waitlisted",
+            Status::Queued => "queued",
             Status::Skipped => "skipped",
         }
     }
@@ -38,6 +42,7 @@ impl Status {
             "minting" => Status::Minting,
             "delivered" => Status::Delivered,
             "waitlisted" => Status::Waitlisted,
+            "queued" => Status::Queued,
             "skipped" => Status::Skipped,
             _ => return None,
         })
@@ -252,14 +257,14 @@ impl Store {
 
     /// Record that the waitlist-welcome skeet has been posted for `did` (creating
     /// or updating the row, leaving status/handle intact). Idempotent.
-    pub fn mark_welcomed(&self, did: &str, handle: Option<&str>) -> Result<()> {
+    pub fn mark_welcomed(&self, did: &str, handle: Option<&str>, status: Status) -> Result<()> {
         self.conn.execute(
             "INSERT INTO handled (did, handle, status, welcomed, created_at)
-             VALUES (?1, ?2, 'waitlisted', 1, ?3)
+             VALUES (?1, ?2, ?3, 1, ?4)
              ON CONFLICT(did) DO UPDATE SET
                  welcomed=1,
                  handle=COALESCE(excluded.handle, handled.handle)",
-            rusqlite::params![did, handle, now()],
+            rusqlite::params![did, handle, status.as_str(), now()],
         )?;
         Ok(())
     }
@@ -301,19 +306,25 @@ impl Store {
         Ok(n == 0)
     }
 
-    /// Enumerate the DIDs currently `waitlisted` (with their stored handle), so the
+    /// Enumerate the DIDs currently `waitlisted` or `queued` (with their stored handle), so the
     /// poll loop can RETRY their mint each cycle INDEPENDENT of follower paging —
-    /// a waitlisted follower who scrolled off the first `MAX_PAGES` of getFollowers
+    /// a waitlisted/queued follower who scrolled off the first `MAX_PAGES` of getFollowers
     /// would otherwise be stranded until they happened to be re-seen. Bounded by the
     /// caller (`max_per_cycle`); ordered oldest-first (FIFO fairness).
-    pub fn waitlisted_dids(&self, limit: usize) -> Result<Vec<(String, Option<String>)>> {
+    pub fn waitlisted_dids(
+        &self,
+        status: Status,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT did, handle FROM handled
-             WHERE status = 'waitlisted'
+             WHERE status = ?1
              ORDER BY created_at ASC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(rusqlite::params![status.as_str(), limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -413,10 +424,12 @@ mod tests {
         let s = mem();
         // Not welcomed until marked.
         assert!(!s.was_welcomed("did:plc:w").unwrap());
-        s.mark_welcomed("did:plc:w", Some("w.test")).unwrap();
+        s.mark_welcomed("did:plc:w", Some("w.test"), Status::Waitlisted)
+            .unwrap();
         assert!(s.was_welcomed("did:plc:w").unwrap());
         // Marking is idempotent and keeps the waitlisted status (non-terminal).
-        s.mark_welcomed("did:plc:w", Some("w.test")).unwrap();
+        s.mark_welcomed("did:plc:w", Some("w.test"), Status::Waitlisted)
+            .unwrap();
         assert!(s.was_welcomed("did:plc:w").unwrap());
         assert_eq!(s.status_of("did:plc:w").unwrap(), Some(Status::Waitlisted));
         assert!(!s.is_terminal("did:plc:w").unwrap());
@@ -442,13 +455,13 @@ mod tests {
         s.mark_delivered("did:plc:d", "c", "u", "p").unwrap();
         s.mark_status("did:plc:s", None, Status::Skipped).unwrap();
 
-        let all = s.waitlisted_dids(10).unwrap();
+        let all = s.waitlisted_dids(Status::Waitlisted, 10).unwrap();
         assert_eq!(all.len(), 2);
         let dids: Vec<&str> = all.iter().map(|(d, _)| d.as_str()).collect();
         assert!(dids.contains(&"did:plc:w1"));
         assert!(dids.contains(&"did:plc:w2"));
         // The bound is honoured.
-        assert_eq!(s.waitlisted_dids(1).unwrap().len(), 1);
+        assert_eq!(s.waitlisted_dids(Status::Waitlisted, 1).unwrap().len(), 1);
     }
 
     #[test]

@@ -203,20 +203,23 @@ async fn run_cycle(
         }
     }
 
-    // B2 — retry WAITLISTED followers directly from the store, independent of
-    // follower paging: a waitlisted DID that scrolled past MAX_PAGES would
+    // B2 — retry WAITLISTED and QUEUED followers directly from the store, independent of
+    // follower paging: a waitlisted/queued DID that scrolled past MAX_PAGES would
     // otherwise be stranded until re-seen. Safe to call repeatedly now that
     // /bot/claims is idempotent per DID. Bounded by the remaining per-cycle budget.
     let remaining = config.max_per_cycle.saturating_sub(take);
     if remaining > 0 {
         let waitlisted = store
-            .waitlisted_dids(remaining)
+            .waitlisted_dids(Status::Waitlisted, remaining)
             .context("enumerating waitlisted followers")?;
         if !waitlisted.is_empty() {
             info!(count = waitlisted.len(), "retrying waitlisted followers");
         }
-        for (did, handle) in waitlisted {
-            let follower = atproto::Follower { did, handle };
+        for (did, handle) in &waitlisted {
+            let follower = atproto::Follower {
+                did: did.clone(),
+                handle: handle.clone(),
+            };
             if let Err(err) = handle_follower(
                 config,
                 store,
@@ -228,6 +231,30 @@ async fn run_cycle(
             .await
             {
                 warn!(did = %follower.did, %err, "waitlist retry failed; will retry next cycle");
+            }
+        }
+        let queued = store
+            .waitlisted_dids(Status::Queued, remaining.saturating_sub(waitlisted.len()))
+            .context("enumerating queued followers")?;
+        if !queued.is_empty() {
+            info!(count = queued.len(), "retrying queued followers");
+        }
+        for (did, handle) in &queued {
+            let follower = atproto::Follower {
+                did: did.clone(),
+                handle: handle.clone(),
+            };
+            if let Err(err) = handle_follower(
+                config,
+                store,
+                session,
+                app,
+                &follower,
+                &mut posts_this_cycle,
+            )
+            .await
+            {
+                warn!(did = %follower.did, %err, "queued retry failed; will retry next cycle");
             }
         }
     }
@@ -447,8 +474,12 @@ async fn waitlist_and_welcome(
     posts_this_cycle: &mut usize,
     reason: DeferReason,
 ) -> Result<()> {
-    // Persist the waitlisted row first (non-terminal → retried later cycles).
-    store.mark_status(did, Some(handle), Status::Waitlisted)?;
+    // Persist the status row first (non-terminal → retried later cycles).
+    let status = match reason {
+        DeferReason::Full => Status::Waitlisted,
+        DeferReason::Budget => Status::Queued,
+    };
+    store.mark_status(did, Some(handle), status)?;
 
     if store.was_welcomed(did)? {
         return Ok(());
@@ -471,8 +502,13 @@ async fn waitlist_and_welcome(
     *posts_this_cycle += 1;
     // Mark welcomed only AFTER the post succeeds (a failure retries next cycle). The
     // deterministic rkey makes a duplicate a no-op even if the mark is interrupted.
-    store.mark_welcomed(did, Some(handle))?;
-    info!(%handle, %post_uri, "posted waitlist-welcome");
+    store.mark_welcomed(did, Some(handle), status)?;
+    let status_str = match status {
+        Status::Waitlisted => "waitlist-welcome",
+        Status::Queued => "queue-welcome",
+        Status::Minting | Status::Delivered | Status::Skipped => unreachable!(),
+    };
+    info!(%handle, %post_uri, "posted {status_str}");
     Ok(())
 }
 
