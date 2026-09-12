@@ -1502,7 +1502,7 @@ impl SidecarClient {
 /// not-yet-created cursor in the batch would drop the whole DID's flush. Emitting
 /// a `create` for those makes a feed's first flush succeed while keeping every
 /// op in ONE batch. Shared by both the sidecar and direct-PDS flush paths.
-fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
+pub(crate) fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
     cursors
         .iter()
         .map(|(rkey, state, pds_created)| {
@@ -1659,7 +1659,7 @@ const S32_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 /// Monotonicity within one generator is guaranteed by tracking the last value
 /// and bumping to `last + 1` if the clock hasn't advanced — so a burst of
 /// same-microsecond calls still yields strictly increasing, ordered rkeys.
-struct TidGenerator {
+pub(crate) struct TidGenerator {
     /// The last raw 64-bit TID value emitted (0 = none yet).
     last: u64,
     /// The low-10-bit clock id, randomized once per generator to avoid
@@ -1671,7 +1671,7 @@ impl TidGenerator {
     /// A fresh generator with a per-instance clock id derived from the current
     /// nanosecond clock (no extra deps; uniqueness only needs to hold within a
     /// single import batch, and the timestamp bits carry the ordering).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
@@ -1683,7 +1683,7 @@ impl TidGenerator {
     }
 
     /// The next monotonic TID rkey (13 `s32` chars).
-    fn next(&mut self) -> String {
+    pub(crate) fn next(&mut self) -> String {
         let micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)

@@ -316,19 +316,31 @@ impl Repo<'_> {
     ///
     /// One round trip rather than N: an import of several hundred feeds is the
     /// case this exists for.
+    /// Returns the new rkeys, which are assigned HERE rather than by the server:
+    /// client-side TIDs keep the imported feeds in input order and make the
+    /// batch reproducible. The sidecar client does the same, with the same
+    /// generator.
     pub async fn add_subscriptions_bulk(
         &self,
         subs: &[crate::lexicon::Subscription],
-    ) -> Result<()> {
-        let writes: Vec<WriteOp> = subs
-            .iter()
-            .map(|sub| WriteOp::Create {
+    ) -> Result<Vec<String>> {
+        let mut gen = crate::atproto::TidGenerator::new();
+        let mut rkeys = Vec::with_capacity(subs.len());
+        let mut writes = Vec::with_capacity(subs.len());
+        for sub in subs {
+            let rkey = gen.next();
+            writes.push(WriteOp::Create {
                 collection: crate::lexicon::nsid::SUBSCRIPTION.to_string(),
-                rkey: None,
-                value: serde_json::to_value(sub).unwrap_or(Value::Null),
-            })
-            .collect();
-        self.apply_writes(&writes).await
+                rkey: Some(rkey.clone()),
+                // Propagated, NOT defaulted: `unwrap_or(Value::Null)` here would
+                // write a null record into the user's repo on a serialization
+                // failure rather than failing the import.
+                value: serde_json::to_value(sub)?,
+            });
+            rkeys.push(rkey);
+        }
+        self.apply_writes(&writes).await?;
+        Ok(rkeys)
     }
 
     // ── folders ──────────────────────────────────────────────────────────────
@@ -409,18 +421,19 @@ impl Repo<'_> {
     /// Read state changes on nearly every page view, so this is the hottest
     /// write path in the app; one round trip per flush rather than per feed is
     /// the whole point.
+    /// The `bool` is whether the record already exists in the PDS. It is not
+    /// optional bookkeeping: an `#update` on a missing record ERRORS, and
+    /// `applyWrites` is atomic per repo, so one not-yet-created cursor in the
+    /// batch would drop the whole DID's flush. The op builder is shared with the
+    /// sidecar client so the two cannot decide create-vs-update differently.
     pub async fn flush_read_states(
         &self,
-        states: &[(String, crate::lexicon::ReadState)],
+        cursors: &[(String, crate::lexicon::ReadState, bool)],
     ) -> Result<()> {
-        let writes: Vec<WriteOp> = states
-            .iter()
-            .map(|(rkey, state)| WriteOp::Create {
-                collection: crate::lexicon::nsid::READ_STATE.to_string(),
-                rkey: Some(rkey.clone()),
-                value: serde_json::to_value(state).unwrap_or(Value::Null),
-            })
-            .collect();
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let writes = crate::atproto::read_state_write_ops(cursors)?;
         self.apply_writes(&writes).await
     }
 }
@@ -428,6 +441,63 @@ impl Repo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Both clients must build the SAME write ops.**
+    ///
+    /// `flush_read_states` is the hottest write path in the app, and the
+    /// create-vs-update choice is the one part of it that cannot be got wrong
+    /// quietly: an `#update` on a record that does not exist errors, and
+    /// `applyWrites` is atomic per repo, so a single first-flush cursor in the
+    /// batch takes the whole DID's flush down with it.
+    ///
+    /// The first version of this method here ignored the flag and emitted
+    /// `#create` unconditionally, which would have broken every feed's first
+    /// flush after the cutover. Sharing the builder is what makes that
+    /// impossible rather than merely fixed.
+    #[test]
+    fn read_state_writes_choose_create_or_update_per_cursor() {
+        let state = crate::lexicon::ReadState::new(
+            "https://example.com/feed",
+            Some("2026-01-01T00:00:00Z".to_string()),
+            "2026-01-01T00:00:00Z",
+        );
+        let cursors = vec![
+            ("existing".to_string(), state.clone(), true),
+            ("brand-new".to_string(), state.clone(), false),
+        ];
+
+        let ops = crate::atproto::read_state_write_ops(&cursors).expect("ops build");
+        assert_eq!(ops.len(), 2);
+
+        let rendered: Vec<Value> = ops.iter().map(|op| op.to_json()).collect();
+        assert_eq!(
+            rendered[0]["$type"], "com.atproto.repo.applyWrites#update",
+            "an existing record must be UPDATED, not re-created"
+        );
+        assert_eq!(
+            rendered[1]["$type"], "com.atproto.repo.applyWrites#create",
+            "a first flush must CREATE, or the whole atomic batch fails"
+        );
+    }
+
+    /// Bulk import assigns its own rkeys, in input order, and returns them —
+    /// the sidecar client's contract, which `web.rs` logs the length of.
+    #[test]
+    fn bulk_subscription_rkeys_are_client_assigned_and_ordered() {
+        let mut gen = crate::atproto::TidGenerator::new();
+        let rkeys: Vec<String> = (0..5).map(|_| gen.next()).collect();
+        let mut sorted = rkeys.clone();
+        sorted.sort();
+        assert_eq!(
+            rkeys, sorted,
+            "client-assigned rkeys must ascend so an import keeps its input order"
+        );
+        assert_eq!(
+            rkeys.iter().collect::<std::collections::HashSet<_>>().len(),
+            5,
+            "a same-microsecond burst must still yield distinct rkeys"
+        );
+    }
 
     fn session() -> OAuthSession {
         OAuthSession {
