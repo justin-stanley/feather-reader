@@ -308,6 +308,36 @@ CREATE TABLE IF NOT EXISTS network_stat (
     observed_at TEXT NOT NULL,
     PRIMARY KEY (key, source)
 );
+-- Repo-operation timings, for comparing the two backends across a CUTOVER.
+--
+-- Persisted rather than held in memory because flipping the backend requires a
+-- restart, and an in-memory table would lose the outgoing backend's numbers at
+-- exactly the moment they became worth comparing against. These rows are the
+-- only reason a "side by side" table can show two backends at once.
+--
+-- `repo_timing` is a bounded window of recent samples (pruned per backend+op);
+-- `repo_timing_total` carries the all-time counts, which must survive that
+-- pruning or a long-running backend would appear to have served fewer calls
+-- than a fresh one.
+CREATE TABLE IF NOT EXISTS repo_timing (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend  TEXT    NOT NULL,
+    op       TEXT    NOT NULL,
+    micros   INTEGER NOT NULL,
+    ok       INTEGER NOT NULL,
+    at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_repo_timing_key ON repo_timing(backend, op, id);
+
+CREATE TABLE IF NOT EXISTS repo_timing_total (
+    backend    TEXT    NOT NULL,
+    op         TEXT    NOT NULL,
+    ok_count   INTEGER NOT NULL DEFAULT 0,
+    err_count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (backend, op)
+);
+
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for

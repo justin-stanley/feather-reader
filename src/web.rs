@@ -2401,6 +2401,20 @@ where
 
 /// Begin the OAuth handshake for `handle`, on whichever backend is live.
 ///
+/// **On `form-action 'self'` and this redirect.** The Rust arm answers a form
+/// POST with a redirect straight to the PDS — cross-origin — while the app's CSP
+/// carries `form-action 'self'`. Browsers have historically disagreed about
+/// whether that directive applies to redirects following a form submission, and
+/// if it did here, login would break in a browser while every test passed.
+///
+/// It does not, and the evidence is the SIDECAR path, which is live in
+/// production today: `POST /login` -> 303 to the same-origin `/oauth/login` ->
+/// 302 to the PDS, cross-origin, under this same CSP. A browser checking the
+/// whole redirect chain would already be blocking that. One checking only the
+/// form's action URL sees `/login` in both cases. The two arms differ only in
+/// how many same-origin hops precede the cross-origin one, so any policy that
+/// permits the sidecar flow permits this one.
+///
 /// The two arms differ in SHAPE, not just in implementation. The sidecar owns
 /// its own `/login` and its own callback, so starting a login is one redirect
 /// and nothing is stored here. The Rust backend pushes the authorization
@@ -2971,12 +2985,29 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
         return (StatusCode::FORBIDDEN, "not an admin\n").into_response();
     }
 
+    // Flush first, so the table includes this process's traffic up to now.
+    // Then read the PERSISTED rows, which is the only place both backends can
+    // appear at once -- a flip is a restart, and in-process memory only ever
+    // holds the backend currently running.
+    if let Err(err) =
+        crate::metrics::flush(&state.metrics, &state.db, crate::store::now_unix()).await
+    {
+        warn!(%err, "could not flush repo timings before rendering");
+    }
+    let rows = match crate::metrics::persisted_rows(&state.db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(%err, "could not read persisted repo timings");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n").into_response();
+        }
+    };
+
     // The live backend is named at the top: a table of two populated rows is
     // ambiguous about which one is currently serving users.
     let body = format!(
         "live backend: {}\n\n{}",
         state.config.repo_backend.as_str(),
-        crate::metrics::render(&state.metrics.snapshot()),
+        crate::metrics::render(&rows),
     );
     (StatusCode::OK, body).into_response()
 }

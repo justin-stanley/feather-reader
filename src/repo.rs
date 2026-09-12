@@ -300,12 +300,12 @@ mod tests {
             .expect("rust state");
         let _ = rust.repo().list_subscriptions_sorted(DID).await;
 
-        let names: Vec<&str> = sidecar
-            .metrics
-            .snapshot()
+        let sidecar_rows = sidecar.metrics.snapshot();
+        let rust_rows = rust.metrics.snapshot();
+        let names: Vec<&str> = sidecar_rows
             .iter()
-            .chain(rust.metrics.snapshot().iter())
-            .map(|((_, op), _)| *op)
+            .chain(rust_rows.iter())
+            .map(|row| row.op.as_str())
             .collect();
 
         assert_eq!(
@@ -331,7 +331,7 @@ mod tests {
         assert!(result.is_err(), "there is no session, so this must fail");
 
         let snapshot = state.metrics.snapshot();
-        let stats = &snapshot[0].1;
+        let stats = &snapshot[0].stats;
         assert_eq!(stats.err_count, 1);
         assert_eq!(
             stats.ok_count, 0,

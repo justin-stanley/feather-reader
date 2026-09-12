@@ -190,9 +190,14 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_adoption_probe(state, shutdown).await })
     };
+    let metrics = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, sweeper, retention, probe, flusher]
+    vec![poller, sweeper, retention, probe, metrics, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -688,6 +693,50 @@ fn jittered(period: Duration, seed: &str) -> Duration {
     let basis = (fnv1a_64(seed.as_bytes()) % 201) as i64 - 100;
     let secs = period.as_secs_f64() * (1.0 + basis as f64 / 1000.0);
     Duration::from_secs_f64(secs.max(1.0))
+}
+
+// ---------------------------------------------------------------------------
+// Repo-timing flusher
+// ---------------------------------------------------------------------------
+
+/// How often buffered repo timings are written to SQLite.
+///
+/// Frequent enough that a crash loses little, rare enough that the write is
+/// nowhere near the request path. Recording itself only touches memory.
+const METRICS_FLUSH_SECS: u64 = 30;
+
+/// Periodically persist buffered repo timings, and once more on shutdown.
+///
+/// The shutdown flush is the one that matters for a CUTOVER: throwing the
+/// switch means a restart, and unflushed samples from the outgoing backend
+/// would be lost at precisely the moment they became the thing worth comparing
+/// against.
+pub async fn run_metrics_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = Duration::from_secs(METRICS_FLUSH_SECS);
+    info!(?period, "repo-timing flusher started");
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => flush_metrics_once(&state).await,
+            _ = shutdown.changed() => {
+                flush_metrics_once(&state).await;
+                info!("repo-timing flusher stopped (final flush done)");
+                return;
+            }
+        }
+    }
+}
+
+/// One flush. A metrics write must never be able to take anything else down, so
+/// a failure is logged and the loop continues.
+async fn flush_metrics_once(state: &AppState) {
+    if let Err(err) =
+        feather_reader::metrics::flush(&state.metrics, &state.db, Utc::now().timestamp()).await
+    {
+        warn!(%err, "could not persist repo timings");
+    }
 }
 
 // ---------------------------------------------------------------------------
