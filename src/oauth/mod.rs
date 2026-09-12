@@ -16,3 +16,4 @@ pub mod jwt;
 pub mod keys;
 pub mod metadata;
 pub mod store;
+pub mod token;
