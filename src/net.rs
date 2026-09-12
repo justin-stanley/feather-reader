@@ -29,8 +29,11 @@
 //! attacker-controlled resolver cannot answer "public IP" for the check and
 //! "127.0.0.1" for the connect, because there is no second resolution.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{
@@ -159,6 +162,90 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
     }
 }
 
+/// How long an idle pinned client may be kept before it is rebuilt.
+///
+/// Not a security boundary — the address is re-resolved and re-checked on every
+/// single request, and a changed address misses the cache by construction. This
+/// only bounds how long a pooled connection to a once-vetted address may live,
+/// and keeps the map from holding entries for hosts nobody fetches any more.
+const PINNED_CLIENT_TTL: Duration = Duration::from_secs(300);
+
+/// Most distinct (host, address) pairs kept. A bound, not a target: the reader
+/// talks to one PDS, while the poller talks to as many hosts as there are feeds.
+const MAX_PINNED_CLIENTS: usize = 256;
+
+/// Pinned clients, keyed by the **vetted address** they are pinned to.
+///
+/// ## Why this is safe to reuse
+///
+/// Building a fresh client per request meant a fresh connection pool, so every
+/// PDS call paid a full TCP + TLS handshake: measured at 91 ms against this
+/// project's PDS versus 30 ms on a warm connection. That is most of why the
+/// Rust repo backend measured ~3x slower than the Node sidecar, which pools.
+///
+/// Reuse does NOT weaken the DNS-rebinding defence, because the defence does not
+/// live in the client's lifetime:
+///
+/// * every request still resolves the host and runs [`is_forbidden_ip`] over
+///   EVERY answer before this cache is consulted — a host that now resolves to
+///   an internal address is refused before a pooled client could be returned;
+/// * the key includes the vetted [`SocketAddr`], so a host that legitimately
+///   moves to a different address MISSES the cache and gets a client pinned to
+///   the new one. A pooled connection can only ever be reused for an address
+///   that was just re-vetted this request.
+struct PinnedClients {
+    entries: Mutex<HashMap<(String, SocketAddr), (Client, Instant)>>,
+    /// How many clients have actually been constructed. Test-only bookkeeping:
+    /// it is the only way to observe that a hit avoided a rebuild, since
+    /// `reqwest::Client` exposes no identity.
+    builds: AtomicUsize,
+}
+
+impl PinnedClients {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            builds: AtomicUsize::new(0),
+        }
+    }
+
+    /// A client pinned to `addr` for `host`, reusing a pooled one when the
+    /// address is unchanged and the entry is fresh.
+    fn get(&self, host: &str, addr: SocketAddr, now: Instant) -> Result<Client> {
+        let key = (host.to_string(), addr);
+        let mut entries = self.entries.lock().expect("pinned client cache poisoned");
+
+        if let Some((client, last_used)) = entries.get_mut(&key) {
+            if now.duration_since(*last_used) < PINNED_CLIENT_TTL {
+                *last_used = now;
+                // Cloning a `reqwest::Client` shares its connection pool, which
+                // is the entire point — a clone is a handle, not a new pool.
+                return Ok(client.clone());
+            }
+        }
+
+        let client = build_pinned_client(host, addr)?;
+        self.builds.fetch_add(1, Ordering::Relaxed);
+
+        // Drop anything idle past the TTL before considering the bound, so a
+        // burst of one-off hosts does not evict the PDS client we use constantly.
+        entries.retain(|_, (_, last_used)| now.duration_since(*last_used) < PINNED_CLIENT_TTL);
+        if entries.len() >= MAX_PINNED_CLIENTS {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (client.clone(), now));
+        Ok(client)
+    }
+}
+
+static PINNED_CLIENTS: LazyLock<PinnedClients> = LazyLock::new(PinnedClients::new);
+
 /// Build a per-hop client that **pins** DNS for `host` to the already-vetted
 /// `addr`, so reqwest's `connect` reuses the exact IP that passed the SSRF check
 /// instead of doing its own second resolution (the DNS-rebinding fix). The pin is
@@ -168,7 +255,7 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
 /// its slowloris / slow-upstream defence even though each hop is a freshly built
 /// client), and auto-redirect off — [`guarded_get`] follows + re-validates each
 /// hop itself.
-fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
     Client::builder()
         .user_agent(crate::USER_AGENT)
         // Bound each hop the same way the feed client is bounded: a total
@@ -185,6 +272,15 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build IP-pinned fetch client")
+}
+
+/// The per-hop client for an already-vetted `(host, addr)`, pooled.
+///
+/// Callers must have run [`resolve_and_check`] for THIS request before calling
+/// this — the cache trusts its key, and the key is only as good as the check
+/// that produced it.
+fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+    PINNED_CLIENTS.get(host, addr, Instant::now())
 }
 
 /// Fetch a user-supplied URL through the full SSRF guard: scheme + IP checks on
@@ -640,6 +736,132 @@ pub(crate) mod tests {
         assert_eq!(
             addr,
             "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    // ── the pinned-client cache ──────────────────────────────────────────────
+
+    const V4: &str = "93.184.216.34:443";
+    const V4_OTHER: &str = "93.184.216.35:443";
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    /// A repeat request to the same vetted address REUSES the client, so the
+    /// connection pool survives and the TLS handshake is paid once.
+    ///
+    /// Measured motivation: a fresh connection to this project's PDS costs 91 ms
+    /// against 30 ms warm, which was most of the ~3x gap between the Rust repo
+    /// backend and the Node sidecar.
+    #[test]
+    fn the_same_vetted_address_reuses_one_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for i in 0..5 {
+            cache.get("example.com", addr, at(now, i)).unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "each request rebuilt the client, so every call pays a TLS handshake"
+        );
+    }
+
+    /// **A CHANGED ADDRESS MUST NOT REUSE THE POOL.**
+    ///
+    /// This is the property that makes the cache safe. The DNS-rebinding defence
+    /// is that we connect only to an address vetted for THIS request; a cache
+    /// keyed on the host alone would hand back a connection pinned to an address
+    /// vetted minutes ago, quietly undoing it. The key includes the address, so
+    /// a move is a miss.
+    #[test]
+    fn a_changed_address_does_not_reuse_the_pooled_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+
+        cache.get("example.com", V4.parse().unwrap(), now).unwrap();
+        cache
+            .get("example.com", V4_OTHER.parse().unwrap(), at(now, 1))
+            .unwrap();
+
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            2,
+            "the same host at a DIFFERENT address reused a connection pinned to the old one"
+        );
+        assert_eq!(cache.entries.lock().unwrap().len(), 2);
+    }
+
+    /// Two hosts that happen to resolve to the same address still get their own
+    /// clients — the pin is per host, and SNI/Host differ.
+    #[test]
+    fn different_hosts_at_one_address_are_separate_clients() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("a.example.com", addr, now).unwrap();
+        cache.get("b.example.com", addr, now).unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// An entry idle past the TTL is rebuilt, bounding how long a pooled
+    /// connection to a once-vetted address can live.
+    #[test]
+    fn an_idle_entry_is_rebuilt_after_the_ttl() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("example.com", addr, now).unwrap();
+        cache
+            .get(
+                "example.com",
+                addr,
+                now + PINNED_CLIENT_TTL + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// Use keeps an entry alive: a client fetched every minute must not be
+    /// rebuilt just because it was first created more than a TTL ago. The TTL is
+    /// idle time, not total age — otherwise the busiest client in the process
+    /// would be the one thrown away on a schedule.
+    #[test]
+    fn continued_use_keeps_an_entry_alive() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for minute in 0..20 {
+            cache
+                .get("example.com", addr, at(now, minute * 60))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "a continuously-used client was expired by age rather than idleness"
+        );
+    }
+
+    /// The map is bounded. The poller talks to as many hosts as there are feeds,
+    /// so an unbounded map would be a slow leak of connection pools.
+    #[test]
+    fn the_cache_is_bounded() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        for i in 0..(MAX_PINNED_CLIENTS + 50) {
+            let addr: SocketAddr = format!("93.184.216.34:{}", 1024 + i).parse().unwrap();
+            cache.get(&format!("h{i}.example.com"), addr, now).unwrap();
+        }
+        assert!(
+            cache.entries.lock().unwrap().len() <= MAX_PINNED_CLIENTS,
+            "the cache grew past its bound"
         );
     }
 

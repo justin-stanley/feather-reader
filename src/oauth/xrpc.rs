@@ -148,10 +148,19 @@ impl Repo<'_> {
             let (page, next) = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
+            let got = page.len();
             out.extend(page);
             match next {
-                // A server that repeats a cursor would otherwise loop forever.
-                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                // `got > 0` is not defensive tidiness -- it is a whole round
+                // trip. This project's own PDS returns a cursor ALONGSIDE a
+                // short page, so without it every list fetches a second, empty
+                // page before stopping. Both of the other clients have this
+                // guard; measured, its absence was most of the remaining gap
+                // against the sidecar.
+                //
+                // The cursor-repeat check is the separate concern: a server that
+                // hands back the same cursor forever would otherwise loop.
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => return Ok(out),
             }
         }

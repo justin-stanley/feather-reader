@@ -247,6 +247,11 @@ pub async fn send_with_dpop(
             offered.as_deref(),
         );
         if let Some(fresh) = next_nonce(attempt, retry, challenge, nonce.as_deref()) {
+            // Logged because a nonce challenge DOUBLES the round trips for that
+            // request, and nothing else makes that visible: the call is recorded
+            // once by the metrics either way. A server that challenges every
+            // request would halve throughput silently.
+            tracing::debug!(%url, status, "DPoP nonce challenge; retrying once with a fresh nonce");
             nonce = Some(fresh);
             continue;
         }
