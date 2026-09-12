@@ -106,27 +106,24 @@ pub async fn sign_out(
     sub: &str,
     now: i64,
 ) -> Revocation {
-    let outcome = match super::store::get_session(pool, codec, sub).await {
-        Ok(Some(session)) => {
-            match tokio::time::timeout(ctx.deadline, revoke_tokens(pool, http, ctx, &session, now))
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => Revocation::Failed(format!(
-                    "revocation did not finish within {:?}; signing out locally anyway",
-                    ctx.deadline
-                )),
-            }
+    let session = match super::store::get_session(pool, codec, sub).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Revocation::NoSession,
+        Err(err) => {
+            // Still delete: an unreadable row is exactly the state a sign-out
+            // should clear, and leaving it wedges every later request.
+            let _ = super::store::delete_session(pool, sub).await;
+            return Revocation::Failed(format!("reading the session: {err:#}"));
         }
-        Ok(None) => Revocation::NoSession,
-        Err(err) => Revocation::Failed(format!("reading the session: {err:#}")),
     };
 
-    // Unconditional, and its own failure is reported without masking the above.
-    if let Err(err) = super::store::delete_session(pool, sub).await {
-        return Revocation::Failed(format!("deleting the local session: {err:#}"));
-    }
-    outcome
+    bounded_then_delete(
+        pool,
+        sub,
+        ctx.deadline,
+        revoke_tokens(pool, http, ctx, &session, now),
+    )
+    .await
 }
 
 /// The revocation request itself. Errors become [`Revocation::Failed`] rather
@@ -221,51 +218,61 @@ pub async fn sign_out_discovering(
         Err(err) => return Revocation::Failed(format!("reading the session: {err:#}")),
     };
 
-    // **The deadline covers DISCOVERY too.**
+    // **Discovery is bounded too**, and separately.
     //
     // Bounding only the revocation request left the real wait unbounded:
     // `discover` makes two guarded fetches, each with its own 30-second timeout,
     // so an unreachable PDS held a user's sign-out for a minute before the
-    // five-second deadline even began. The first version of the test missed this
-    // by exercising `sign_out` rather than this function — the one production
-    // actually calls.
-    let attempt =
-        async {
-            let endpoint =
-                match super::discovery::discover(http, &session.aud, runtime.auth_method.as_str())
-                    .await
-                {
-                    Ok(server) => server.revocation_endpoint,
-                    Err(err) => {
-                        tracing::warn!(%err, %sub, "could not discover the revocation endpoint");
-                        None
-                    }
-                };
-            revoke_tokens(
-                pool,
-                http,
-                &RevokeContext {
-                    revocation_endpoint: endpoint.as_deref(),
-                    client_id: &runtime.client_id,
-                    auth_method: runtime.auth_method,
-                    client_key: runtime.client_key.as_ref(),
-                    deadline: REVOKE_DEADLINE,
-                },
-                &session,
-                now,
-            )
-            .await
-        };
+    // five-second deadline even began.
+    //
+    // Bounded HERE rather than by wrapping the whole operation, so this function
+    // still ENDS in a call to `sign_out` — which owns the contract that matters
+    // (a bounded attempt, then an unconditional local delete) and is where that
+    // contract is tested. Wrapping instead meant production stopped going
+    // through `sign_out` at all, leaving three invariant tests aimed at a
+    // function nothing called. Worst case is two deadlines, one per phase, which
+    // is what independently bounding each phase costs.
+    let endpoint = match tokio::time::timeout(
+        REVOKE_DEADLINE,
+        super::discovery::discover(http, &session.aud, runtime.auth_method.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(server)) => server.revocation_endpoint,
+        Ok(Err(err)) => {
+            tracing::warn!(%err, %sub, "could not discover the revocation endpoint");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(%sub, "discovering the revocation endpoint timed out");
+            None
+        }
+    };
 
-    bounded_then_delete(pool, sub, REVOKE_DEADLINE, attempt).await
+    sign_out(
+        pool,
+        &runtime.codec,
+        http,
+        &RevokeContext {
+            revocation_endpoint: endpoint.as_deref(),
+            client_id: &runtime.client_id,
+            auth_method: runtime.auth_method,
+            client_key: runtime.client_key.as_ref(),
+            deadline: REVOKE_DEADLINE,
+        },
+        sub,
+        now,
+    )
+    .await
 }
 
 /// Run `attempt` under `deadline`, then delete the local session **whatever
 /// happened** — including when the deadline expired.
 ///
-/// Separated out so the bound can be tested against a future that never
-/// resolves, rather than against a network address that may be refused
-/// instantly in one environment and hang in another.
+/// The single implementation of the sign-out contract, so there is no second
+/// copy to drift. Separated out from [`sign_out`] so the bound can be tested
+/// against a future that never resolves, rather than against a network address
+/// that may be refused instantly in one environment and hang in another.
 async fn bounded_then_delete<F>(
     pool: &sqlx::SqlitePool,
     sub: &str,
@@ -520,6 +527,55 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the session survived a timed-out revocation"
+        );
+    }
+
+    /// **An UNREADABLE session row is still deleted.**
+    ///
+    /// A row whose bound context was altered no longer decrypts, so
+    /// `get_session` returns an error. Returning early without deleting left
+    /// that row in place — and because every repo call reads it, the account
+    /// then failed on every page load with no way out but a sign-out that had
+    /// just refused to clear it.
+    #[tokio::test]
+    async fn an_unreadable_session_is_still_signed_out() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+
+        // Break the AAD binding the way a tampered row would.
+        sqlx::query("UPDATE oauth_session SET issuer = ? WHERE sub = ?")
+            .bind("https://evil.example")
+            .bind(DID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            super::super::store::get_session(&pool, &codec, DID)
+                .await
+                .is_err(),
+            "precondition: the row must be unreadable"
+        );
+
+        let outcome = sign_out(
+            &pool,
+            &codec,
+            &reqwest::Client::new(),
+            &ctx(Some("https://pds.example.com/oauth/revoke")),
+            DID,
+            NOW,
+        )
+        .await;
+        assert!(matches!(outcome, Revocation::Failed(_)), "got {outcome:?}");
+
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session WHERE sub = ?")
+                .bind(DID)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_there, 0,
+            "an unreadable row survived a sign-out, so the account stays wedged"
         );
     }
 
