@@ -5,6 +5,7 @@
 //! and both implementations share an at-rest wire format so the switch is
 //! reversible. See [`crypto`] for that format.
 
+pub mod client_auth;
 pub mod crypto;
 pub mod discovery;
 pub mod dpop;
