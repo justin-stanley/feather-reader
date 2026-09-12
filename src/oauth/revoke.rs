@@ -61,6 +61,13 @@ pub fn revoke_params(
     Ok(params)
 }
 
+/// Longest a sign-out will wait on the authorization server.
+///
+/// Sign-out is a foreground action a user is watching. Revocation is
+/// best-effort by design, so the local delete must not be held behind an
+/// unbounded wait on a server that may be down.
+const REVOKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a revocation needs beyond the session itself. Mirrors
 /// [`super::session::RefreshContext`]; `aud` is the issuer for both.
 pub struct RevokeContext<'a> {
@@ -71,6 +78,10 @@ pub struct RevokeContext<'a> {
     pub auth_method: AuthMethod,
     /// The confidential client's signing key; unused by the dev client.
     pub client_key: Option<&'a super::keys::SigningKey>,
+    /// Longest to wait on the authorization server before giving up and signing
+    /// out locally. Injectable so the deadline can be TESTED without a
+    /// five-second test.
+    pub deadline: std::time::Duration,
 }
 
 /// Sign a subject out: tell the authorization server, then drop the local row.
@@ -83,7 +94,10 @@ pub struct RevokeContext<'a> {
 /// while their credentials stay live locally.
 ///
 /// Revocation is attempted FIRST, because it needs the tokens the delete
-/// destroys.
+/// destroys — but it is BOUNDED. The whole design already treats a failed
+/// revocation as acceptable, so making the user wait out a dead PDS's timeouts
+/// to reach a delete that happens regardless is the wrong trade. Past the
+/// deadline the attempt is abandoned and the local session goes.
 pub async fn sign_out(
     pool: &sqlx::SqlitePool,
     codec: &super::crypto::Codec,
@@ -93,7 +107,17 @@ pub async fn sign_out(
     now: i64,
 ) -> Revocation {
     let outcome = match super::store::get_session(pool, codec, sub).await {
-        Ok(Some(session)) => revoke_tokens(pool, http, ctx, &session, now).await,
+        Ok(Some(session)) => {
+            match tokio::time::timeout(ctx.deadline, revoke_tokens(pool, http, ctx, &session, now))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => Revocation::Failed(format!(
+                    "revocation did not finish within {:?}; signing out locally anyway",
+                    ctx.deadline
+                )),
+            }
+        }
         Ok(None) => Revocation::NoSession,
         Err(err) => Revocation::Failed(format!("reading the session: {err:#}")),
     };
@@ -220,6 +244,7 @@ pub async fn sign_out_discovering(
             client_id: &runtime.client_id,
             auth_method: runtime.auth_method,
             client_key: runtime.client_key.as_ref(),
+            deadline: REVOKE_DEADLINE,
         },
         sub,
         now,
@@ -338,12 +363,18 @@ mod tests {
         session
     }
 
+    /// A short deadline: the property under test is that the wait is BOUNDED,
+    /// and proving that with the production five seconds would make the whole
+    /// suite ten times slower for one assertion.
+    const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
     fn ctx(endpoint: Option<&str>) -> RevokeContext<'_> {
         RevokeContext {
             revocation_endpoint: endpoint,
             client_id: "http://localhost",
             auth_method: AuthMethod::None,
             client_key: None,
+            deadline: TEST_DEADLINE,
         }
     }
 
@@ -406,6 +437,47 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// **A dead authorization server must not hold a sign-out open.**
+    ///
+    /// Revocation is best-effort by design — the local row goes either way — so
+    /// waiting out an unreachable server's timeouts to reach a delete that
+    /// happens regardless is the wrong trade. The user is watching this one.
+    ///
+    /// A blackholed address is used rather than a refused one: a refusal returns
+    /// immediately and would prove nothing about the deadline.
+    #[tokio::test]
+    async fn a_hanging_revocation_does_not_hold_the_sign_out_open() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+
+        let started = std::time::Instant::now();
+        let outcome = sign_out(
+            &pool,
+            &codec,
+            &reqwest::Client::new(),
+            // TEST-NET-1, which is routable-looking but blackholed: connects
+            // hang rather than being refused.
+            &ctx(Some("https://192.0.2.1/oauth/revoke")),
+            DID,
+            NOW,
+        )
+        .await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited < TEST_DEADLINE * 4,
+            "the sign-out waited {waited:?}, past the {TEST_DEADLINE:?} deadline"
+        );
+        assert!(matches!(outcome, Revocation::Failed(_)), "got {outcome:?}");
+        assert!(
+            super::super::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the session survived a timed-out revocation"
+        );
     }
 
     /// Logging out twice is not an error. The second call has nothing to revoke

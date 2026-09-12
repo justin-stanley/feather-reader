@@ -2523,15 +2523,32 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    if let Some(err) = q.error {
-        let desc = q.error_description.unwrap_or_default();
+    // An error response is handled by the SAME arm that would have handled a
+    // success, not short-circuited here.
+    //
+    // Returning early looks obviously right and is wrong on the Rust path: it
+    // skips `verify_callback`, which validates `iss` BEFORE reporting the error
+    // precisely because RFC 9207 §2.4 says a client "MUST NOT assume that the
+    // error originates from the intended AS". It also leaves the pending row
+    // unconsumed, so a `state` that has already produced a callback stays usable
+    // until it expires.
+    //
+    // The sidecar arm has no such check to reach, so it is short-circuited
+    // below, preserving exactly what it did before.
+    let sidecar_handoff = q.session_id.as_deref().is_some_and(|s| !s.is_empty());
+    if let Some(err) = q.error.clone() {
+        let desc = q.error_description.clone().unwrap_or_default();
         warn!(error = %err, desc = %desc, "OAuth callback returned an error");
-        return login_error(&format!("Login failed: {err}"));
+        if sidecar_handoff || state.oauth.is_none() {
+            return login_error(&format!("Login failed: {err}"));
+        }
+        // Fall through: the Rust arm consumes the pending row and validates
+        // `iss` against it, and reports the failure afterwards.
     }
 
     // Which arm runs is decided by WHAT ARRIVED, not by which backend is
     // currently selected: a login started before a flip must still complete.
-    let session = if q.session_id.as_deref().is_some_and(|s| !s.is_empty()) {
+    let session = if sidecar_handoff {
         let session_id = q.session_id.clone().unwrap_or_default();
         match state.sidecar.resolve_session(&session_id).await {
             Ok(Some(s)) => s,
@@ -2553,8 +2570,11 @@ async fn oauth_callback(
             code: q.code.clone(),
             state: q.state.clone(),
             iss: q.iss.clone(),
-            error: None,
-            error_description: None,
+            // Passed through, NOT dropped: `verify_callback` checks `iss`
+            // against the pending row's issuer before it reports the error, and
+            // it cannot do that for an error it never sees.
+            error: q.error.clone(),
+            error_description: q.error_description.clone(),
             response: q.response.clone(),
         };
         let binding =

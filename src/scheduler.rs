@@ -195,9 +195,14 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
     };
+    let pending = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_pending_sweeper(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, sweeper, retention, probe, metrics, flusher]
+    vec![poller, sweeper, retention, probe, metrics, pending, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -693,6 +698,52 @@ fn jittered(period: Duration, seed: &str) -> Duration {
     let basis = (fnv1a_64(seed.as_bytes()) % 201) as i64 - 100;
     let secs = period.as_secs_f64() * (1.0 + basis as f64 / 1000.0);
     Duration::from_secs_f64(secs.max(1.0))
+}
+
+// ---------------------------------------------------------------------------
+// Pending-login sweeper
+// ---------------------------------------------------------------------------
+
+/// How often abandoned logins are swept.
+const PENDING_SWEEP_SECS: u64 = 900;
+
+/// Delete expired pending logins.
+///
+/// An abandoned login — the user is redirected to their PDS and closes the tab —
+/// leaves an `oauth_state` row behind. `take_pending` only ever consumes rows
+/// that come BACK, so nothing else removes these, and each one holds a sealed
+/// DPoP private key and a PKCE verifier. Without this the table grows without
+/// bound and accumulates secret material that can no longer be used for
+/// anything.
+///
+/// Runs on both backends: the rows are written by the Rust login path, and a
+/// deployment that flips back to the sidecar still has whatever it left behind.
+pub async fn run_pending_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = Duration::from_secs(PENDING_SWEEP_SECS);
+    info!(?period, "pending-login sweeper started");
+
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("pending-login sweeper: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => {
+                match feather_reader::oauth::store::sweep_expired_pending(
+                    &state.db,
+                    Utc::now().timestamp(),
+                )
+                .await
+                {
+                    Ok(0) => debug!("pending-login sweeper: nothing to expire"),
+                    Ok(n) => info!(swept = n, "pending-login sweeper: removed abandoned logins"),
+                    Err(err) => error!(%err, "pending-login sweeper: sweep failed"),
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

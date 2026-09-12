@@ -25,6 +25,8 @@
 #   caddy         :8080          public edge (= Fly internal_port)
 #   featherreader 127.0.0.1:8082 Rust app (loopback only)
 #   node sidecar  127.0.0.1:8081 OAuth sidecar (loopback only; /internal/* here)
+#                                — ONLY on FEATHERREADER_REPO_BACKEND=sidecar.
+#                                The rust backend runs two processes, not three.
 set -eu
 
 DATA_DIR="${DATA_DIR:-/data}"
@@ -49,6 +51,24 @@ term() {
 }
 trap term TERM INT
 
+# --- Which OAuth backend? -------------------------------------------------
+# Resolved ONCE, up front, because it decides two things that must agree: which
+# processes run, and how Caddy routes /oauth/*. Deciding them separately is how
+# they drift.
+#
+# An unrecognised value is fatal, matching the Rust side: silently defaulting to
+# the sidecar while the app served the rust backend would break every login, and
+# the symptom would look like a PDS outage.
+backend="${FEATHERREADER_REPO_BACKEND:-sidecar}"
+case "${backend}" in
+    sidecar) oauth_routes=/etc/caddy/caddy-oauth-sidecar.conf ;;
+    rust)    oauth_routes=/etc/caddy/caddy-oauth-rust.conf ;;
+    *)
+        echo "[entrypoint] FEATHERREADER_REPO_BACKEND must be 'sidecar' or 'rust', got '${backend}'" 1>&2
+        exit 64
+        ;;
+esac
+
 # --- Rust app -------------------------------------------------------------
 # Runs from /app so its relative `ServeDir::new("static")` resolves /app/static.
 cd /app
@@ -56,11 +76,21 @@ cd /app
 fr_pid=$!
 pids="${pids} ${fr_pid}"
 
-# --- OAuth sidecar --------------------------------------------------------
+# --- OAuth sidecar (only on the sidecar backend) --------------------------
+# NOT started on the rust backend. Leaving it running there would keep a second
+# process alive holding its own SQLite of PDS tokens and serving its /internal
+# API on loopback -- an idle store of live credentials and an attack surface, for
+# a component nothing routes to. It would also make the supervisor treat that
+# unused process's death as a reason to tear the container down.
+#
 # Node 24: `node:sqlite` is stable + flagless, so no --experimental-sqlite here.
-node /app/oauth-sidecar/dist/server.js &
-sc_pid=$!
-pids="${pids} ${sc_pid}"
+if [ "${backend}" = "sidecar" ]; then
+    node /app/oauth-sidecar/dist/server.js &
+    sc_pid=$!
+    pids="${pids} ${sc_pid}"
+else
+    echo "[entrypoint] rust OAuth backend: not starting the Node sidecar" 1>&2
+fi
 
 # --- OAuth edge routing: pick the file matching the selected backend -------
 # The two backends cannot share /oauth/callback: the PDS redirects to it with
@@ -71,14 +101,6 @@ pids="${pids} ${sc_pid}"
 # An unrecognised value is fatal, matching the Rust side: silently defaulting to
 # the sidecar routing while the app served the Rust backend would break every
 # login, and the symptom would look like a PDS outage.
-case "${FEATHERREADER_REPO_BACKEND:-sidecar}" in
-    sidecar) oauth_routes=/etc/caddy/caddy-oauth-sidecar.conf ;;
-    rust)    oauth_routes=/etc/caddy/caddy-oauth-rust.conf ;;
-    *)
-        echo "[entrypoint] FEATHERREADER_REPO_BACKEND must be 'sidecar' or 'rust', got '${FEATHERREADER_REPO_BACKEND}'" 1>&2
-        exit 64
-        ;;
-esac
 cp "${oauth_routes}" /etc/caddy/oauth-routes.conf
 echo "[entrypoint] oauth routing: $(basename "${oauth_routes}")" 1>&2
 

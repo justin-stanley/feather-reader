@@ -53,9 +53,18 @@ impl OauthRuntime {
     /// public URL means atproto's localhost development client: a public client
     /// with no JWKS.
     ///
-    /// The signing key is loaded (or created) ONLY for a confidential client.
-    /// Creating one in dev would write a key file that is never used and never
-    /// published, which later reads as "the key exists, so it must be in play".
+    /// The signing key is loaded (or created) only for a confidential client
+    /// **that is actually going to use it** — i.e. when the Rust backend is the
+    /// selected one. Two reasons, and the second is the one that bit:
+    ///
+    /// * a dev client is public, so a key there is never used and never
+    ///   published, and later reads as "the key exists, so it must be in play";
+    /// * the runtime is built on EVERY start so configuration errors surface
+    ///   early, including when the sidecar is serving. Creating the key as part
+    ///   of that validation meant a sidecar deployment wrote an ES256 private
+    ///   key it would never use — key material at rest, for nothing. In tests it
+    ///   also meant any `AppState` built with a production-like `public_url`
+    ///   dropped a private key into the working directory.
     pub fn new(cfg: &crate::config::Config) -> Result<Self> {
         let dev = is_loopback_url(&cfg.public_url);
         let client = ClientConfig::new(&cfg.public_url, &cfg.oauth.scope, dev)
@@ -65,8 +74,9 @@ impl OauthRuntime {
         let codec = Codec::new(cfg.oauth.encryption_key.as_deref())
             .context("building the at-rest encryption codec")?;
 
+        let uses_this_client = cfg.repo_backend == crate::metrics::Backend::Rust;
         let client_key = match auth_method {
-            AuthMethod::PrivateKeyJwt => Some(
+            AuthMethod::PrivateKeyJwt if uses_this_client => Some(
                 super::keys::load_or_create(Path::new(&cfg.oauth.key_path), &codec, CLIENT_KID)
                     .with_context(|| {
                         format!(
@@ -75,7 +85,9 @@ impl OauthRuntime {
                         )
                     })?,
             ),
-            AuthMethod::None => None,
+            // Either a public client, or a confidential one whose backend is not
+            // selected. Both mean: no key on disk.
+            AuthMethod::PrivateKeyJwt | AuthMethod::None => None,
         };
 
         Ok(Self {
@@ -149,32 +161,93 @@ mod tests {
 }
 
 #[cfg(test)]
-mod default_config_tests {
-    /// **A default local run must be a PUBLIC client and write no key file.**
+mod key_creation_tests {
+    use super::*;
+
+    fn cfg(
+        backend: crate::metrics::Backend,
+        public_url: &str,
+        key_path: &std::path::Path,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            repo_backend: backend,
+            public_url: public_url.to_string(),
+            oauth: crate::config::OauthConfig {
+                key_path: key_path.to_path_buf(),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        }
+    }
+
+    fn temp_key_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fr-test-key-{name}-{}.json", std::process::id()))
+    }
+
+    /// **Building the runtime must not write a key the deployment will not use.**
     ///
-    /// Observed: a bare `./featherreader` left an ES256 private key at
-    /// `oauth-signing-key.json` in the working directory. That is the
-    /// confidential-client path, so a default local run was presenting a
-    /// different client identity than intended — and dropping a private key into
-    /// whatever directory it was started from, which for a clone is the repo
-    /// root.
+    /// The runtime is constructed on every start, whatever the backend, so
+    /// configuration errors surface early. Creating the signing key as part of
+    /// that meant a SIDECAR deployment — the default — wrote an ES256 private
+    /// key it never touches: key material at rest for nothing.
+    ///
+    /// It surfaced as a unit test dropping a private key into the repo root,
+    /// because any `AppState` built with a production-like `public_url` did it.
     #[test]
-    fn the_default_config_is_a_public_client_with_no_key_file() {
-        let cfg = crate::config::Config::default();
-        let runtime = super::OauthRuntime::new(&cfg).expect("the default config must build");
-        assert_eq!(
-            runtime.auth_method,
-            crate::oauth::client_auth::AuthMethod::None,
-            "a loopback public_url must negotiate a PUBLIC client"
-        );
+    fn the_sidecar_backend_writes_no_signing_key() {
+        let path = temp_key_path("sidecar");
+        let _ = std::fs::remove_file(&path);
+
+        let runtime = OauthRuntime::new(&cfg(
+            crate::metrics::Backend::Sidecar,
+            "https://feather-reader.com",
+            &path,
+        ))
+        .expect("must build");
+
+        assert!(runtime.client_key.is_none());
         assert!(
-            runtime.client_key.is_none(),
-            "a public client must hold no signing key"
+            !path.exists(),
+            "the sidecar backend wrote a signing key it will never use"
         );
+    }
+
+    /// The Rust backend on a production URL DOES need the key, and creates it.
+    #[test]
+    fn the_rust_backend_creates_its_signing_key() {
+        let path = temp_key_path("rust");
+        let _ = std::fs::remove_file(&path);
+
+        let runtime = OauthRuntime::new(&cfg(
+            crate::metrics::Backend::Rust,
+            "https://feather-reader.com",
+            &path,
+        ))
+        .expect("must build");
+
         assert!(
-            !std::path::Path::new(&cfg.oauth.key_path).exists(),
-            "building the runtime wrote a private key file at {}",
-            cfg.oauth.key_path.display()
+            runtime.client_key.is_some(),
+            "a confidential client needs its key"
         );
+        assert!(path.exists(), "the key was not persisted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A loopback deployment is a PUBLIC client: no key, on either backend.
+    #[test]
+    fn a_loopback_deployment_is_public_and_keyless() {
+        let path = temp_key_path("dev");
+        let _ = std::fs::remove_file(&path);
+
+        let runtime = OauthRuntime::new(&cfg(
+            crate::metrics::Backend::Rust,
+            "http://localhost:8080",
+            &path,
+        ))
+        .expect("must build");
+
+        assert_eq!(runtime.auth_method, AuthMethod::None);
+        assert!(runtime.client_key.is_none());
+        assert!(!path.exists(), "a public client wrote a signing key");
     }
 }

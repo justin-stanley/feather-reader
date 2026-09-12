@@ -174,6 +174,25 @@ pub async fn complete(
         .parse()
         .context("the pending login stored an unknown auth method")?;
 
+    // The client's IDENTITY must also be the one PAR was pushed under. Both
+    // `client_id` and `redirect_uri` derive from `public_url`, so the stored
+    // redirect is enough to detect a configuration change between the push and
+    // the callback — no second column needed, and no migration for a row that
+    // lives ten minutes.
+    //
+    // Without this the exchange fails at the authorization server with a
+    // mismatched client, and nothing on our side says why. Checked here so the
+    // reason is in the log rather than inferred from a 400.
+    let current_redirect = super::metadata::redirect_uri(&runtime.client);
+    if current_redirect != pending.redirect_uri {
+        bail!(
+            "this login was started under a different public URL (redirect {:?}, now {:?}); \
+             the client identity changed mid-flight and the exchange would be rejected",
+            pending.redirect_uri,
+            current_redirect
+        );
+    }
+
     let server = discovery::discover(http, &pending.pds_url, auth_method.as_str()).await?;
     let mut token_params =
         token::token_request_params(&code, &pending.redirect_uri, &pending.pkce_verifier);
@@ -301,4 +320,64 @@ async fn post_form(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// **A login must complete under the identity it STARTED under.**
+    ///
+    /// `client_id` and `redirect_uri` both derive from `public_url`, so a
+    /// deployment whose public URL changes between the push and the callback
+    /// would present a different client than PAR authenticated as. The
+    /// authorization server rejects that, and without this check nothing on our
+    /// side explains why — the same failure mode the stored `auth_method`
+    /// already guards against.
+    ///
+    /// The pending row's `redirect_uri` is the witness: it is written at push
+    /// time and is derived from the same value.
+    #[test]
+    fn a_changed_public_url_is_detected_from_the_stored_redirect() {
+        let started_under = super::super::metadata::ClientConfig::new(
+            "https://feather-reader.com",
+            "atproto",
+            false,
+        )
+        .unwrap();
+        let now_configured = super::super::metadata::ClientConfig::new(
+            "https://reader.example.org",
+            "atproto",
+            false,
+        )
+        .unwrap();
+
+        let pushed = super::super::metadata::redirect_uri(&started_under);
+        let current = super::super::metadata::redirect_uri(&now_configured);
+
+        assert_ne!(
+            pushed, current,
+            "a changed public URL must change the redirect, or the check cannot see it"
+        );
+        // And the client_id moves with it — which is what the server rejects.
+        assert_ne!(
+            super::super::metadata::client_id(&started_under),
+            super::super::metadata::client_id(&now_configured)
+        );
+    }
+
+    /// The check must NOT fire on an unchanged configuration, or every login
+    /// breaks.
+    #[test]
+    fn an_unchanged_public_url_matches_the_stored_redirect() {
+        let cfg = super::super::metadata::ClientConfig::new(
+            "https://feather-reader.com",
+            "atproto",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::metadata::redirect_uri(&cfg),
+            super::super::metadata::redirect_uri(&cfg)
+        );
+    }
 }
