@@ -10,6 +10,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod dpop;
 pub mod fetch;
+pub mod flow;
 pub mod identity;
 pub mod jwt;
 pub mod keys;
