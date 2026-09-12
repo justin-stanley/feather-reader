@@ -77,9 +77,18 @@ impl PostOutcome {
 pub enum Retry {
     /// Safe to repeat: PAR, refresh, resource reads.
     Allowed,
-    /// **Must not be repeated.** The authorization-code exchange: re-POSTing
-    /// the same `code` can burn it, and the login then fails AFTER the user has
-    /// already approved.
+    /// **Must not be repeated**, because the body cannot be sent again — a
+    /// consumed stream, say.
+    ///
+    /// This is NOT the right setting for the authorization-code exchange, which
+    /// an earlier revision assumed. A `use_dpop_nonce` challenge means the
+    /// server rejected the request BEFORE processing the grant, so the code was
+    /// never consumed and resending it is safe. Refusing the retry there cost a
+    /// real login against a live PDS: the server rotated its nonce between PAR
+    /// and the token request (nonces last at most five minutes, and user
+    /// approval can take longer), and the flow died with the user already
+    /// approved. The reference declines a retry only when the request body has
+    /// been consumed, which a buffered form body never is.
     Forbidden,
 }
 

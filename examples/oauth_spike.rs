@@ -44,10 +44,12 @@ fn hex_prefix(bytes: &[u8]) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    // Flags are filtered out first, so `--write-test` cannot be mistaken for the
+    // optional PDS override.
+    let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
     let subject = args
         .next()
-        .context("usage: oauth_spike <handle-or-did> [pds]")?;
+        .context("usage: oauth_spike <handle-or-did> [pds] [--write-test]")?;
     let pds_override = args.next();
 
     let http = Client::new();
@@ -232,10 +234,11 @@ async fn main() -> Result<()> {
             key: &key,
             access_token: None,
             body: request::DpopBody::Form(&borrowed),
-            // The code exchange must NOT be repeated: re-POSTing the same
-            // `code` can burn it, and the login then fails after the user has
-            // already approved.
-            retry: Retry::Forbidden,
+            // A nonce challenge is rejected BEFORE the grant is processed, so
+            // the code is not consumed and the request is safe to resend. The
+            // nonce harvested at PAR is routinely stale by now: approval can
+            // take minutes and a server nonce lasts at most five.
+            retry: Retry::Allowed,
         },
     )
     .await?;
@@ -266,7 +269,131 @@ async fn main() -> Result<()> {
     );
     println!("  sub == resolved did: {}", tokens.sub == pending.did);
 
+    // ── 9. a real repo read, through the DPoP-bound XRPC layer ───────────────
+    println!("\n=== 9. authenticated repo read ===");
+    let session = store::OAuthSession {
+        sub: tokens.sub.clone(),
+        issuer: pending.issuer.clone(),
+        aud: pending.pds_url.clone(),
+        dpop_key_jwk: pending.dpop_key_jwk.clone(),
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone().unwrap_or_default(),
+        token_type: tokens.token_type.clone(),
+        granted_scope: tokens.granted_scope.clone(),
+        expires_at: tokens
+            .expires_in
+            .map(|s| chrono::Utc::now().timestamp() + s),
+    };
+    store::put_session(&pool, &codec, &session).await?;
+    println!("  session    stored and read back AAD-bound");
+    let stored = store::get_session(&pool, &codec, &tokens.sub)
+        .await?
+        .context("session did not round-trip")?;
+
+    let repo = feather_reader::oauth::xrpc::Repo {
+        http: &http,
+        pool: &pool,
+        session: &stored,
+        key: &key,
+    };
+    for collection in [
+        feather_reader::lexicon::nsid::SUBSCRIPTION,
+        feather_reader::lexicon::nsid::FOLDER,
+        feather_reader::lexicon::nsid::SAVED,
+    ] {
+        match repo.list_records(collection, Some(5), None).await {
+            Ok((records, cursor)) => println!(
+                "  {collection}: {} record(s), cursor {}",
+                records.len(),
+                cursor.as_deref().unwrap_or("<none>")
+            ),
+            Err(err) => println!("  {collection}: FAILED -- {err:#}"),
+        }
+    }
+
+    if std::env::args().any(|a| a == "--write-test") {
+        write_test(&repo).await?;
+    } else {
+        println!("\n  (writes not exercised; pass --write-test to include them)");
+    }
+
     println!("\nEnd to end OK.\n");
+    Ok(())
+}
+
+/// Exercise every write operation against a REAL repo, then clean up.
+///
+/// Uses a collection the reader never reads, so a failure part-way cannot leave
+/// anything visible in the UI — and deletes what it creates on every exit path,
+/// including the failing ones.
+async fn write_test(repo: &feather_reader::oauth::xrpc::Repo<'_>) -> Result<()> {
+    const COLLECTION: &str = "com.feather.spikeTest";
+    println!("\n=== 10. write path ({COLLECTION}) ===");
+
+    let mut created: Vec<String> = Vec::new();
+    let outcome = run_writes(repo, COLLECTION, &mut created).await;
+
+    // Clean up whatever exists, whether the run above succeeded or not.
+    for rkey in &created {
+        match repo.delete_record(COLLECTION, rkey).await {
+            Ok(()) => println!("  cleanup    deleted {rkey}"),
+            Err(err) => println!("  cleanup    FAILED to delete {rkey}: {err:#}"),
+        }
+    }
+    let (left, _) = repo.list_records(COLLECTION, Some(10), None).await?;
+    println!(
+        "  remaining  {} record(s) in the test collection",
+        left.len()
+    );
+    outcome
+}
+
+async fn run_writes(
+    repo: &feather_reader::oauth::xrpc::Repo<'_>,
+    collection: &str,
+    created: &mut Vec<String>,
+) -> Result<()> {
+    use feather_reader::atproto::WriteOp;
+    use serde_json::json;
+
+    let record = json!({
+        "$type": collection,
+        "note": "feather-reader OAuth spike; safe to delete",
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let written = repo.create_record(collection, &record).await?;
+    let rkey = written
+        .rkey()
+        .context("createRecord returned no usable rkey")?
+        .to_string();
+    created.push(rkey.clone());
+    println!("  create     OK -> {rkey}");
+
+    let (records, _) = repo.list_records(collection, Some(10), None).await?;
+    println!("  list       {} record(s) after create", records.len());
+
+    let updated = json!({
+        "$type": collection,
+        "note": "feather-reader OAuth spike; updated",
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+    repo.put_record(collection, &rkey, &updated).await?;
+    println!("  put        OK (same rkey)");
+
+    // applyWrites: a batch create, to prove the batch body is accepted.
+    let batch_rkey = format!("spike{}", chrono::Utc::now().timestamp());
+    repo.apply_writes(&[WriteOp::Create {
+        collection: collection.to_string(),
+        rkey: Some(batch_rkey.clone()),
+        value: record.clone(),
+    }])
+    .await?;
+    created.push(batch_rkey.clone());
+    println!("  applyWrites OK -> {batch_rkey}");
+
+    let (records, _) = repo.list_records(collection, Some(10), None).await?;
+    println!("  list       {} record(s) after batch", records.len());
     Ok(())
 }
 
