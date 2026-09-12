@@ -133,6 +133,21 @@ pub fn is_atproto_did(did: &str) -> bool {
     false
 }
 
+/// Join one TXT record's character-strings into its value.
+///
+/// A DNS TXT record is a SEQUENCE of strings, each at most 255 bytes, and the
+/// record's value is their concatenation. A DID that crosses that boundary
+/// arrives as two chunks; passing them along as two separate records produces
+/// two truncated fragments, neither a valid DID, and the handle fails to resolve
+/// with nothing to show for it.
+///
+/// `dig +short` performs this join itself, which is precisely why a shell-based
+/// spike will never surface the bug.
+pub fn join_txt_chunks(chunks: &[&[u8]]) -> String {
+    let joined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    String::from_utf8_lossy(&joined).into_owned()
+}
+
 /// Extract the DID from a handle's `_atproto` TXT records.
 ///
 /// `Ok(None)` means no record — a normal outcome that falls through to the
@@ -410,6 +425,39 @@ mod tests {
     }
 
     // ── DNS TXT resolution ───────────────────────────────────────────────────
+
+    /// **A DNS TXT record is a sequence of character-strings**, each capped at
+    /// 255 bytes, and the record's value is their CONCATENATION. A DID that
+    /// crosses that boundary arrives as two chunks; treating them as separate
+    /// records yields two truncated fragments, neither a valid DID, and the
+    /// handle fails to resolve for no visible reason.
+    ///
+    /// `dig +short` hides this by joining for you, which is exactly why the
+    /// spike did not catch it.
+    #[test]
+    fn txt_chunks_are_joined_into_one_record_value() {
+        let long = format!("did={DID}");
+        let (head, tail) = long.split_at(20);
+        assert_eq!(
+            join_txt_chunks(&[head.as_bytes(), tail.as_bytes()]),
+            long,
+            "chunks were not concatenated"
+        );
+        assert_eq!(join_txt_chunks(&[long.as_bytes()]), long);
+        assert_eq!(join_txt_chunks(&[]), "");
+    }
+
+    /// Joined chunks must then resolve exactly as a single-chunk record would.
+    #[test]
+    fn a_did_split_across_txt_chunks_still_resolves() {
+        let long = format!("did={DID}");
+        let (head, tail) = long.split_at(20);
+        let joined = join_txt_chunks(&[head.as_bytes(), tail.as_bytes()]);
+        assert_eq!(
+            did_from_txt_records(&[joined]).unwrap().as_deref(),
+            Some(DID)
+        );
+    }
 
     #[test]
     fn a_single_did_record_resolves() {

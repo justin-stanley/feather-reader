@@ -15,5 +15,7 @@ pub mod identity;
 pub mod jwt;
 pub mod keys;
 pub mod metadata;
+pub mod request;
+pub mod resolve;
 pub mod store;
 pub mod token;

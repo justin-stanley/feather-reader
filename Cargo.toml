@@ -122,6 +122,26 @@ subtle = "2"
 # newer one already present). `deny.toml` only warns on multiple versions, so
 # this is recorded here rather than left for it to catch.
 p256 = { version = "0.13", features = ["jwk"] }
+# --- DNS, for atproto handle resolution ----------------------------------
+# Handle -> DID resolves by `_atproto.<handle>` TXT record, and DNS is the
+# PREFERRED method per the handle spec -- not a fallback. This is not optional:
+# a live PDS test found a real handle whose /.well-known/atproto-did returns 404
+# and which resolves by TXT alone, so an HTTP-only client simply cannot log it
+# in. `tokio::net::lookup_host` does A/AAAA only, so a resolver is required.
+#
+# Worth noting against the p256 comment above, which rejected
+# atproto-identity partly for pulling hickory: the objection there was never
+# hickory itself but reqwest 0.12 riding along with it -- a SECOND HTTP stack
+# the SSRF guard does not cover. A DNS resolver adds no such path.
+#
+# Cost: 21 packages (incl. `moka`, `crossbeam-*`, `ipconfig`), and it newly
+# duplicates `core-foundation`. default-features are already the minimum
+# (`tokio` + `system-config`); using the host's own resolver configuration is
+# the correct behaviour for handle resolution.
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
+    "tokio",
+    "system-config",
+] }
 
 # --- filesystem stat (startup disk-headroom check) -----------------------
 # Already in the tree transitively; pinned as a direct dep so the startup
