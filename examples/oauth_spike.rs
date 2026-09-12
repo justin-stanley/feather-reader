@@ -122,15 +122,15 @@ async fn main() -> Result<()> {
     )?);
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let outcome = request::post_form_with_dpop(
+    let outcome = request::send_with_dpop(
         &http,
         &pool,
-        &request::DpopPost {
+        &request::DpopRequest {
             endpoint: dpop::Endpoint::AuthorizationServer,
             url: &server.par_endpoint,
             key: &session_key,
             access_token: None,
-            params: &borrowed,
+            body: request::DpopBody::Form(&borrowed),
             // PAR is safe to repeat: nothing is consumed by a rejected attempt.
             retry: Retry::Allowed,
         },
@@ -223,15 +223,15 @@ async fn main() -> Result<()> {
     )?);
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let outcome = request::post_form_with_dpop(
+    let outcome = request::send_with_dpop(
         &http,
         &pool,
-        &request::DpopPost {
+        &request::DpopRequest {
             endpoint: dpop::Endpoint::AuthorizationServer,
             url: &server.token_endpoint,
             key: &key,
             access_token: None,
-            params: &borrowed,
+            body: request::DpopBody::Form(&borrowed),
             // The code exchange must NOT be repeated: re-POSTing the same
             // `code` can burn it, and the login then fails after the user has
             // already approved.
