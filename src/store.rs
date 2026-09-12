@@ -386,6 +386,14 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
         .await
         .context("failed to create schema")?;
     apply_migrations(pool).await?;
+    // The Rust OAuth client's tables live in the same database. Created
+    // UNCONDITIONALLY, not only when that backend is selected: the tables are
+    // empty and harmless under the sidecar, whereas creating them lazily would
+    // make the first request after a cutover flip fail with "no such table" --
+    // at the one moment nobody wants to discover a migration was missed.
+    crate::oauth::store::init_schema(pool)
+        .await
+        .context("failed to create the OAuth schema")?;
     Ok(())
 }
 
@@ -3697,6 +3705,23 @@ mod tests {
         init_schema(&pool)
             .await
             .expect("re-running init_schema must be idempotent");
+
+        // **The OAuth tables must exist too.** They live in this database, and
+        // creating them only when the Rust backend is selected would make the
+        // first request after a cutover flip fail with "no such table" -- at the
+        // one moment nobody wants to find out a migration was missed. They are
+        // empty and harmless while the sidecar is serving.
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for table in ["oauth_state", "oauth_session", "oauth_nonce"] {
+            assert!(
+                tables.iter().any(|t| t == table),
+                "{table} is missing, so the rust backend would fail on its first request: {tables:?}"
+            );
+        }
 
         // The legacy code still redeems (NULL intended_did → open, as before).
         let out = redeem_code(&pool, "FEATHER-LEGACY00", "did:plc:new", None, 100).await?;

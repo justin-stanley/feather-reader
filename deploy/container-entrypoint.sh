@@ -62,7 +62,30 @@ node /app/oauth-sidecar/dist/server.js &
 sc_pid=$!
 pids="${pids} ${sc_pid}"
 
+# --- OAuth edge routing: pick the file matching the selected backend -------
+# The two backends cannot share /oauth/callback: the PDS redirects to it with
+# identical `?code=&state=&iss=` in both cases, so the edge cannot tell them
+# apart and one process has to own the path. The flag and the routing therefore
+# have to agree, and they are made to agree HERE rather than by hand.
+#
+# An unrecognised value is fatal, matching the Rust side: silently defaulting to
+# the sidecar routing while the app served the Rust backend would break every
+# login, and the symptom would look like a PDS outage.
+case "${FEATHERREADER_REPO_BACKEND:-sidecar}" in
+    sidecar) oauth_routes=/etc/caddy/caddy-oauth-sidecar.conf ;;
+    rust)    oauth_routes=/etc/caddy/caddy-oauth-rust.conf ;;
+    *)
+        echo "[entrypoint] FEATHERREADER_REPO_BACKEND must be 'sidecar' or 'rust', got '${FEATHERREADER_REPO_BACKEND}'" 1>&2
+        exit 64
+        ;;
+esac
+cp "${oauth_routes}" /etc/caddy/oauth-routes.conf
+echo "[entrypoint] oauth routing: $(basename "${oauth_routes}")" 1>&2
+
 # --- Caddy (public edge) --------------------------------------------------
+# Validated before `run`: a bad adapt here would otherwise take the whole
+# container down on boot with the failure buried among three children's output.
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 cy_pid=$!
 pids="${pids} ${cy_pid}"

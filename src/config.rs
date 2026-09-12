@@ -26,6 +26,16 @@
 //! | `FEATHERREADER_ADOPTION_INTERVAL_SECS` | `86400` (24h)  | Adoption-probe cadence (±10% jitter). `0` disables the probe. |
 //! | `FEATHERREADER_SHOW_ADOPTION` | `false`                 | Render the one-line adoption fact on `/about`. |
 //!
+//! The **cutover switch** and the Rust-native OAuth client it selects:
+//!
+//! | Variable                          | Default             | Meaning |
+//! |-----------------------------------|---------------------|---------|
+//! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
+//! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
+//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. |
+//! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
+//! | `FEATHERREADER_OAUTH_SCOPE`       | `atproto transition:generic` | Scope requested at login. Part of the dev `client_id`, so changing it changes the client's identity in dev. |
+//!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
 //! secret gating its internal API (see [`SidecarConfig`]):

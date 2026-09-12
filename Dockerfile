@@ -142,6 +142,12 @@ COPY --from=node-build --chown=app:app /sidecar/package.json /app/oauth-sidecar/
 
 # Caddy config + the multi-process supervisor.
 COPY --chown=app:app deploy/Caddyfile /etc/caddy/Caddyfile
+# Both OAuth routing variants ship; the entrypoint installs the one matching
+# FEATHERREADER_REPO_BACKEND as /etc/caddy/oauth-routes.conf at start-up. Both
+# are present in every image so a rollback is an env change and a restart, with
+# no rebuild.
+COPY --chown=app:app deploy/caddy-oauth-sidecar.conf /etc/caddy/caddy-oauth-sidecar.conf
+COPY --chown=app:app deploy/caddy-oauth-rust.conf /etc/caddy/caddy-oauth-rust.conf
 COPY --chown=app:app deploy/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
 
