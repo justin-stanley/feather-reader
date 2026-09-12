@@ -1,1 +1,32 @@
 /target
+
+# Runtime artefacts written into the WORKING DIRECTORY by the documented
+# defaults. These are ignored because the defaults are relative paths, so a
+# `cargo run` or a `./featherreader` from a clone writes them straight into the
+# repo — and one of them is a private key.
+
+# The confidential client's ES256 signing key (FEATHERREADER_OAUTH_KEY_PATH,
+# default `oauth-signing-key.json`). It holds the private scalar. It is
+# encrypted at rest only when FEATHERREADER_OAUTH_ENCRYPTION_KEY is set, so on a
+# misconfigured run this file is a plaintext private key sitting in the repo
+# root. Never commit it.
+/oauth-signing-key.json
+*.jwk.json
+
+# The disposable SQLite cache (FEATHERREADER_DB, default `featherreader.db`) and
+# its WAL/SHM siblings. Disposable, but it also holds the `oauth_session` table
+# — access tokens, refresh tokens and per-session DPoP keys.
+/featherreader.db
+/featherreader.db-shm
+/featherreader.db-wal
+
+# The Node sidecar's own store and signing key (SIDECAR_DB), same reasoning.
+/oauth-sidecar.db
+/oauth-sidecar.db-shm
+/oauth-sidecar.db-wal
+
+# Local env files. The committed examples are `.env.example`; anything else is
+# someone's real configuration.
+.env
+.env.*
+!.env.example

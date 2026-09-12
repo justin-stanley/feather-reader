@@ -147,3 +147,34 @@ mod tests {
         assert!(!is_loopback_url(""));
     }
 }
+
+#[cfg(test)]
+mod default_config_tests {
+    /// **A default local run must be a PUBLIC client and write no key file.**
+    ///
+    /// Observed: a bare `./featherreader` left an ES256 private key at
+    /// `oauth-signing-key.json` in the working directory. That is the
+    /// confidential-client path, so a default local run was presenting a
+    /// different client identity than intended — and dropping a private key into
+    /// whatever directory it was started from, which for a clone is the repo
+    /// root.
+    #[test]
+    fn the_default_config_is_a_public_client_with_no_key_file() {
+        let cfg = crate::config::Config::default();
+        let runtime = super::OauthRuntime::new(&cfg).expect("the default config must build");
+        assert_eq!(
+            runtime.auth_method,
+            crate::oauth::client_auth::AuthMethod::None,
+            "a loopback public_url must negotiate a PUBLIC client"
+        );
+        assert!(
+            runtime.client_key.is_none(),
+            "a public client must hold no signing key"
+        );
+        assert!(
+            !std::path::Path::new(&cfg.oauth.key_path).exists(),
+            "building the runtime wrote a private key file at {}",
+            cfg.oauth.key_path.display()
+        );
+    }
+}
