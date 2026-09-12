@@ -30,6 +30,11 @@ pub struct AuthorizationServer {
     pub par_endpoint: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
+    /// RFC 7009 revocation. **Optional** — RFC 8414 does not require it, and a
+    /// server without one simply cannot be told about a sign-out. Absent rather
+    /// than an error, because refusing to log a user in over a missing LOGOUT
+    /// endpoint would be the wrong trade.
+    pub revocation_endpoint: Option<String>,
 }
 
 /// Resolve a PDS to its authorization server, both fetches and both validations.
@@ -200,6 +205,18 @@ fn require_endpoint(metadata: &Value, field: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
+/// The same validation for a field that may legitimately be absent.
+///
+/// Present-but-unusable is still an ERROR: a `revocation_endpoint` of
+/// `http://…` or a relative path is a broken document, and silently treating it
+/// as absent would turn a misconfigured server into a silent no-op sign-out.
+fn optional_endpoint(metadata: &Value, field: &str) -> Result<Option<String>> {
+    match metadata.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => require_endpoint(metadata, field).map(Some),
+    }
+}
+
 /// Validate `/.well-known/oauth-authorization-server` and return its endpoints.
 ///
 /// `issuer` is the URL the document was fetched from; `pds_url` the PDS that
@@ -307,6 +324,7 @@ pub fn validate_authorization_server(
         par_endpoint: require_endpoint(metadata, "pushed_authorization_request_endpoint")?,
         authorization_endpoint: require_endpoint(metadata, "authorization_endpoint")?,
         token_endpoint: require_endpoint(metadata, "token_endpoint")?,
+        revocation_endpoint: optional_endpoint(metadata, "revocation_endpoint")?,
     })
 }
 
@@ -314,6 +332,45 @@ pub fn validate_authorization_server(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An ABSENT `revocation_endpoint` is absent, not an error. RFC 8414 does
+    /// not require one, and refusing to log a user in because a server offers no
+    /// way to log them out later would be the wrong trade.
+    #[test]
+    fn an_absent_revocation_endpoint_is_tolerated() {
+        assert_eq!(
+            optional_endpoint(&json!({}), "revocation_endpoint").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_endpoint(
+                &json!({ "revocation_endpoint": null }),
+                "revocation_endpoint"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// **Present but unusable is an ERROR, not "absent".**
+    ///
+    /// Folding a broken value into `None` would turn a misconfigured server into
+    /// a silent no-op sign-out: revocation would be skipped, the local row would
+    /// still be deleted, and the logout would look entirely successful while the
+    /// refresh token stayed live at the PDS.
+    #[test]
+    fn a_malformed_revocation_endpoint_is_an_error_rather_than_absent() {
+        let plain_http = json!({ "revocation_endpoint": "http://auth.example.com/revoke" });
+        let err = optional_endpoint(&plain_http, "revocation_endpoint")
+            .expect_err("plain http must be refused");
+        assert!(format!("{err:#}").contains("must be https"));
+
+        let relative = json!({ "revocation_endpoint": "/revoke" });
+        assert!(optional_endpoint(&relative, "revocation_endpoint").is_err());
+
+        let wrong_type = json!({ "revocation_endpoint": 42 });
+        assert!(optional_endpoint(&wrong_type, "revocation_endpoint").is_err());
+    }
 
     const PDS: &str = "https://pds.example.com";
     const ISS: &str = "https://auth.example.com";
@@ -662,6 +719,15 @@ mod tests {
             assert_eq!(
                 server.token_endpoint,
                 "https://pds.justin-stanley.com/oauth/token"
+            );
+            // The real PDS advertises revocation, so sign-out can actually reach
+            // it. Asserted against the frozen real document rather than assumed:
+            // an optional field that happens to be absent everywhere we deploy
+            // would make the revocation path dead code that still passes its own
+            // unit tests.
+            assert_eq!(
+                server.revocation_endpoint.as_deref(),
+                Some("https://pds.justin-stanley.com/oauth/revoke")
             );
         }
     }

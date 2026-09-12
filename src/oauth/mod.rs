@@ -14,6 +14,7 @@ pub mod flow;
 pub mod identity;
 pub mod jwt;
 pub mod keys;
+pub mod login;
 pub mod metadata;
 pub mod request;
 pub mod resolve;

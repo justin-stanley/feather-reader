@@ -174,6 +174,59 @@ async fn try_revoke(
     Ok(())
 }
 
+/// Sign out, discovering the revocation endpoint from the session itself.
+///
+/// The endpoint lives in the authorization server's metadata, which is not
+/// stored on the session — so it has to be fetched. That fetch is done only when
+/// there IS a session to revoke: discovering first and finding nothing to do
+/// would put a network round trip on every logout of a dev-DID or an
+/// already-expired account.
+///
+/// A discovery failure is not fatal. It means the server cannot be told, which
+/// is exactly the case [`sign_out`] already handles by deleting locally anyway.
+pub async fn sign_out_discovering(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    sub: &str,
+    now: i64,
+) -> Revocation {
+    let session = match super::store::get_session(pool, &runtime.codec, sub).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Revocation::NoSession,
+        Err(err) => return Revocation::Failed(format!("reading the session: {err:#}")),
+    };
+
+    let endpoint = match super::discovery::discover(
+        http,
+        &session.aud,
+        runtime.auth_method.as_str(),
+    )
+    .await
+    {
+        Ok(server) => server.revocation_endpoint,
+        Err(err) => {
+            tracing::warn!(%err, %sub, "could not discover the revocation endpoint; signing out locally");
+            None
+        }
+    };
+
+    sign_out(
+        pool,
+        &runtime.codec,
+        http,
+        &RevokeContext {
+            revocation_endpoint: endpoint.as_deref(),
+            client_id: &runtime.client_id,
+            auth_method: runtime.auth_method,
+            client_key: runtime.client_key.as_ref(),
+        },
+        sub,
+        now,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

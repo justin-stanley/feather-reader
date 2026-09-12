@@ -98,6 +98,11 @@ impl ClientConfig {
         })
     }
 
+    /// The requested scope, as sent in PAR and stored on the pending row.
+    pub fn scope_str(&self) -> &str {
+        &self.scope
+    }
+
     /// The public base URL without a trailing slash, so the path joins below
     /// cannot produce a `//`.
     fn base(&self) -> &str {

@@ -91,6 +91,18 @@ const SESSION_COOKIE: &str = "fr_session";
 /// signed with the same key as the session cookie.
 const INVITE_COOKIE: &str = "fr_invite";
 
+/// Browser-binding cookie for an in-flight OAuth login (Rust backend only).
+///
+/// `state` alone cannot stop a login CSRF: it lives in a server-global table, so
+/// a stolen `state` replayed from ANOTHER browser matches just as well as from
+/// the one that started the flow. This cookie is what makes the callback
+/// browser-specific — the pending row stores only its hash, and a callback that
+/// cannot present it is refused.
+const OAUTH_BINDING_COOKIE: &str = "fr_oauth";
+
+/// How long an in-flight login may sit, matching the pending row's own TTL.
+const OAUTH_BINDING_MAX_AGE_SECS: i64 = 600;
+
 /// TTL (seconds) for a minted invite code and for the reserving invite cookie.
 /// Short enough that a reserved-but-unclaimed seat frees quickly.
 const INVITE_TTL_SECS: i64 = 1800;
@@ -251,6 +263,8 @@ pub fn router(state: AppState) -> Router {
         .route("/bot/claims", post(bot_mint_claim))
         .route("/admin/invites", post(admin_mint_invites))
         .route("/admin/metrics", get(admin_metrics))
+        .route("/oauth/client-metadata.json", get(oauth_client_metadata))
+        .route("/oauth/jwks.json", get(oauth_jwks))
         .route("/account/delete", post(account_delete))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
@@ -2288,7 +2302,7 @@ async fn login_form(
         if !may_start_oauth(&state, &headers, &handle).await {
             return Redirect::to("/beta/redeem").into_response();
         }
-        return start_oauth(&state, &handle);
+        return start_oauth(&state, &handle).await;
     }
     render(&LoginTemplate {
         repo_url: REPO_URL,
@@ -2311,7 +2325,7 @@ async fn login_submit(
     if !may_start_oauth(&state, &headers, handle).await {
         return Redirect::to("/beta/redeem").into_response();
     }
-    start_oauth(&state, handle)
+    start_oauth(&state, handle).await
 }
 
 /// Whether this visitor is allowed to *start* the OAuth handshake. The gate
@@ -2385,11 +2399,67 @@ where
     }
 }
 
-/// Redirect the browser to the sidecar's public `/login` for `handle`.
-fn start_oauth(state: &AppState, handle: &str) -> Response {
-    let url = state.sidecar.login_url(handle, None);
-    info!(%handle, "redirecting to OAuth sidecar login");
-    Redirect::to(&url).into_response()
+/// Begin the OAuth handshake for `handle`, on whichever backend is live.
+///
+/// The two arms differ in SHAPE, not just in implementation. The sidecar owns
+/// its own `/login` and its own callback, so starting a login is one redirect
+/// and nothing is stored here. The Rust backend pushes the authorization
+/// request itself, which means this app now holds the pending login — and must
+/// set the browser-binding cookie that the callback will be checked against.
+async fn start_oauth(state: &AppState, handle: &str) -> Response {
+    match state.config.repo_backend {
+        crate::metrics::Backend::Sidecar => {
+            let url = state.sidecar.login_url(handle, None);
+            info!(%handle, "redirecting to OAuth sidecar login");
+            Redirect::to(&url).into_response()
+        }
+        crate::metrics::Backend::Rust => {
+            let Some(runtime) = state.oauth.as_deref() else {
+                warn!("the rust backend is live but its OAuth runtime is absent");
+                return login_error("Login is not available right now.");
+            };
+            match crate::oauth::login::start(
+                runtime,
+                &state.http,
+                &state.db,
+                handle,
+                crate::store::now_unix(),
+            )
+            .await
+            {
+                Ok(started) => {
+                    info!(%handle, "pushed authorization request; redirecting to the PDS");
+                    let mut resp = Redirect::to(&started.authorize_url).into_response();
+                    set_cookie(
+                        &mut resp,
+                        &cookie::sign_value(
+                            OAUTH_BINDING_COOKIE,
+                            &started.binding_token,
+                            &state.config.cookie_secret,
+                            OAUTH_BINDING_MAX_AGE_SECS,
+                        ),
+                    );
+                    resp
+                }
+                Err(err) => {
+                    // The handle the user typed is logged; the error is not shown
+                    // to them verbatim, since it can name internal hosts.
+                    warn!(%err, %handle, "could not start the OAuth login");
+                    login_error("Could not start login for that handle.")
+                }
+            }
+        }
+    }
+}
+
+/// Clear the browser-binding cookie. Called on every terminal outcome of a
+/// callback, successful or not: the pending row is consumed either way, so a
+/// lingering cookie can only ever match a login that no longer exists.
+fn clear_binding_cookie(resp: &mut Response) {
+    set_cookie(
+        resp,
+        &format!("{OAUTH_BINDING_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+    );
 }
 
 /// Form body for `POST /login`.
@@ -2399,10 +2469,29 @@ struct LoginForm {
 }
 
 /// Query for `GET /oauth/callback`.
+///
+/// Carries BOTH shapes, because the two backends deliver different things to
+/// the same URL: the sidecar hands back a one-shot `session_id` it has already
+/// exchanged, while the PDS redirects here directly with `code`/`state`/`iss`
+/// for this app to exchange itself. Which fields are populated is decided by
+/// which backend started the login, not by which is live now — so a flip with a
+/// login already in flight still lands in the right arm.
 #[derive(Debug, Deserialize, Default)]
 struct CallbackQuery {
+    /// Sidecar backend: the handoff id.
     #[serde(default)]
     session_id: Option<String>,
+    /// Rust backend: the authorization code and its envelope.
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    iss: Option<String>,
+    /// JARM, which is not supported — carried only so it can be refused
+    /// explicitly rather than read as "no code".
+    #[serde(default)]
+    response: Option<String>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -2426,20 +2515,58 @@ async fn oauth_callback(
         return login_error(&format!("Login failed: {err}"));
     }
 
-    let session_id = match q.session_id {
-        Some(s) if !s.is_empty() => s,
-        _ => return login_error("Login failed: the callback carried no session."),
-    };
-
-    let session = match state.sidecar.resolve_session(&session_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            warn!("OAuth callback session_id did not resolve (expired/unknown)");
-            return login_error("Login session expired — please try again.");
+    // Which arm runs is decided by WHAT ARRIVED, not by which backend is
+    // currently selected: a login started before a flip must still complete.
+    let session = if q.session_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        let session_id = q.session_id.clone().unwrap_or_default();
+        match state.sidecar.resolve_session(&session_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                warn!("OAuth callback session_id did not resolve (expired/unknown)");
+                return login_error("Login session expired — please try again.");
+            }
+            Err(err) => {
+                warn!(%err, "failed to resolve OAuth session via the sidecar");
+                return login_error("Login failed talking to the auth service.");
+            }
         }
-        Err(err) => {
-            warn!(%err, "failed to resolve OAuth session via the sidecar");
-            return login_error("Login failed talking to the auth service.");
+    } else {
+        let Some(runtime) = state.oauth.as_deref() else {
+            warn!("an OAuth callback arrived with no sidecar session and no Rust runtime");
+            return login_error("Login failed: this login could not be completed.");
+        };
+        let params = crate::oauth::flow::CallbackParams {
+            code: q.code.clone(),
+            state: q.state.clone(),
+            iss: q.iss.clone(),
+            error: None,
+            error_description: None,
+            response: q.response.clone(),
+        };
+        let binding =
+            cookie::verify_value(&headers, OAUTH_BINDING_COOKIE, &state.config.cookie_secret);
+        match crate::oauth::login::complete(
+            runtime,
+            &state.http,
+            &state.db,
+            &params,
+            binding.as_deref(),
+            crate::store::now_unix(),
+        )
+        .await
+        {
+            Ok(done) => crate::atproto::SidecarSession {
+                did: done.did,
+                handle: done.handle,
+            },
+            Err(err) => {
+                // Never echoed to the browser: the message can name the issuer,
+                // the PDS, and why a binding check failed.
+                warn!(%err, "could not complete the OAuth callback");
+                let mut resp = login_error("Login failed — please try again.");
+                clear_binding_cookie(&mut resp);
+                return resp;
+            }
         }
     };
 
@@ -2496,10 +2623,48 @@ async fn oauth_callback(
 
     let mut resp = Redirect::to("/").into_response();
     set_cookie(&mut resp, &cookie);
+    clear_binding_cookie(&mut resp);
     if clear_invite {
         clear_invite_cookie(&mut resp);
     }
     resp
+}
+
+/// Revoke a DID's OAuth session on BOTH backends, best-effort.
+///
+/// Not "whichever backend is live": during a cutover a user's tokens can be in
+/// either store — they logged in under one backend and are logging out under
+/// the other. Revoking only the live one would leave a live refresh token
+/// behind in the other, which is the exact failure sign-out exists to prevent,
+/// and it would be invisible because the sign-out itself looks successful.
+///
+/// Both arms are best-effort. The caller has already decided to sign the user
+/// out, and a network failure must not trap them in a half-logged-out state.
+async fn revoke_everywhere(state: &AppState, did: &str) {
+    match state.sidecar.revoke_session(did).await {
+        Ok(res) => info!(%did, revoked = res.revoked, "sidecar session revoked"),
+        Err(err) => warn!(%did, %err, "sidecar revoke failed; continuing"),
+    }
+
+    if let Some(runtime) = state.oauth.as_deref() {
+        let outcome = crate::oauth::revoke::sign_out_discovering(
+            runtime,
+            &state.http,
+            &state.db,
+            did,
+            crate::store::now_unix(),
+        )
+        .await;
+        match outcome {
+            crate::oauth::revoke::Revocation::Revoked => {
+                info!(%did, "rust OAuth session revoked at the PDS")
+            }
+            crate::oauth::revoke::Revocation::NoSession => {}
+            crate::oauth::revoke::Revocation::Failed(reason) => {
+                warn!(%did, %reason, "rust OAuth revoke failed; the local session is gone regardless")
+            }
+        }
+    }
 }
 
 /// `POST /logout` — end the session everywhere, not just in this browser.
@@ -2517,14 +2682,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         // revoke; the dev-DID fallback never handshook the sidecar.
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
-            match state.sidecar.revoke_session(&user.did).await {
-                Ok(res) => {
-                    info!(did = %user.did, revoked = res.revoked, "logout: sidecar session revoked");
-                }
-                Err(err) => {
-                    warn!(did = %user.did, %err, "logout: sidecar revoke failed; clearing cookie anyway");
-                }
-            }
+            revoke_everywhere(&state, &user.did).await;
         }
     }
     let mut resp = Redirect::to("/login").into_response();
@@ -2595,12 +2753,7 @@ async fn account_delete(
 
     // 2. Revoke the OAuth session at the sidecar/PDS (best-effort — the local
     //    rows are already gone; a network blip must not block the sign-out).
-    match state.sidecar.revoke_session(&did).await {
-        Ok(res) => info!(%did, revoked = res.revoked, "account/delete: sidecar session revoked"),
-        Err(err) => {
-            warn!(%did, %err, "account/delete: sidecar revoke failed; local data already purged")
-        }
-    }
+    revoke_everywhere(&state, &did).await;
 
     // 3. Drop the in-memory session and clear the cookie: sign the user out.
     if let Some(sid) = user.sid {
@@ -2760,6 +2913,46 @@ struct MintQuery {
 
 /// `POST /admin/invites?n=N` — mint N invite codes.
 ///
+/// `GET /oauth/client-metadata.json` — the client's published identity.
+///
+/// **This URL IS the `client_id`.** The PDS fetches it during every login and
+/// caches it against every existing grant, so it must keep answering at exactly
+/// this path across the cutover — the sidecar serves the same document at the
+/// same URL today, proxied by the edge.
+///
+/// Served whatever backend is live: a request that arrives here is from a PDS
+/// resolving our identity, and it has no idea which of our two implementations
+/// is currently answering repo calls.
+async fn oauth_client_metadata(State(state): State<AppState>) -> Response {
+    let Some(runtime) = state.oauth.as_deref() else {
+        // The sidecar is serving this path in front of us, or nothing is.
+        return (StatusCode::NOT_FOUND, "no client metadata\n").into_response();
+    };
+    axum::Json(crate::oauth::metadata::client_metadata(&runtime.client)).into_response()
+}
+
+/// `GET /oauth/jwks.json` — the client's public signing key.
+///
+/// Production only. The localhost dev client is a PUBLIC client: it registers no
+/// key and signs no assertions, so publishing a JWKS there would advertise a
+/// credential that is never used — and would make a dev deployment look like a
+/// confidential client to anyone reading it.
+async fn oauth_jwks(State(state): State<AppState>) -> Response {
+    let Some(runtime) = state.oauth.as_deref() else {
+        return (StatusCode::NOT_FOUND, "no jwks\n").into_response();
+    };
+    match runtime.client_key.as_ref() {
+        Some(key) => match key.jwks_document() {
+            Ok(doc) => axum::Json(doc).into_response(),
+            Err(err) => {
+                warn!(%err, "could not render the client JWKS");
+                (StatusCode::INTERNAL_SERVER_ERROR, "jwks unavailable\n").into_response()
+            }
+        },
+        None => (StatusCode::NOT_FOUND, "this client publishes no jwks\n").into_response(),
+    }
+}
+
 /// `GET /admin/metrics` — repo-op latency for both backends, as plain text.
 ///
 /// Admin-gated on the same rule as the invite minter: the table names every
