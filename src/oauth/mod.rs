@@ -6,6 +6,7 @@
 //! reversible. See [`crypto`] for that format.
 
 pub mod crypto;
+pub mod discovery;
 pub mod dpop;
 pub mod fetch;
 pub mod identity;
