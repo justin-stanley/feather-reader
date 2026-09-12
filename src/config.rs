@@ -100,6 +100,10 @@ pub struct Config {
     pub db_size_watermark_bytes: i64,
     /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
     pub sidecar: SidecarConfig,
+    /// The Rust-native OAuth client's own wiring. Read whatever the backend, so
+    /// a misconfiguration is caught at startup rather than at the moment the
+    /// switch is thrown.
+    pub oauth: OauthConfig,
     /// HMAC key used to sign the session cookie. In production this MUST be set
     /// (`FEATHERREADER_COOKIE_SECRET`); a stable dev fallback is used otherwise
     /// so local runs work without configuration.
@@ -175,6 +179,42 @@ pub struct SidecarConfig {
     pub internal_url: String,
     /// Shared secret for the sidecar's internal API (`X-Internal-Secret`).
     pub internal_secret: String,
+}
+
+/// Wiring for the Rust-native OAuth client.
+#[derive(Debug, Clone)]
+pub struct OauthConfig {
+    /// Path to the client's ES256 signing key. Encrypted at rest with
+    /// `encryption_key`, in the SAME `enc.v1` format the sidecar writes, so the
+    /// two can share one file and a rollback finds the key it expects.
+    pub key_path: PathBuf,
+    /// Passphrase for the at-rest encryption of the signing key and the stored
+    /// sessions. `None` leaves them in plaintext — refused on a production-like
+    /// instance by `validate_secrets`.
+    pub encryption_key: Option<String>,
+    /// The PLC directory used to resolve `did:plc` documents.
+    pub plc_directory: String,
+    /// The OAuth scope requested at login. Part of the dev `client_id`, so
+    /// changing it changes the client's identity in dev.
+    pub scope: String,
+}
+
+/// The default PLC directory — the canonical one operated by Bluesky.
+const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
+
+/// The scope the reader needs: `atproto` for identity, `transition:generic` for
+/// the `com.atproto.repo.*` writes. Matches the sidecar's.
+const DEFAULT_OAUTH_SCOPE: &str = "atproto transition:generic";
+
+impl Default for OauthConfig {
+    fn default() -> Self {
+        Self {
+            key_path: PathBuf::from("oauth-signing-key.json"),
+            encryption_key: None,
+            plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
+            scope: DEFAULT_OAUTH_SCOPE.to_string(),
+        }
+    }
 }
 
 /// The sidecar's own dev fallback for the shared secret (matches the sidecar's
@@ -257,6 +297,7 @@ impl Default for Config {
             max_entries_per_feed: 2_000,
             db_size_watermark_bytes: 2 * 1024 * 1024 * 1024,
             sidecar: SidecarConfig::default(),
+            oauth: OauthConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             // The sidecar stays the live path until the switch is thrown.
             repo_backend: crate::metrics::Backend::Sidecar,
@@ -438,6 +479,17 @@ impl Config {
             None => defaults.adoption_interval,
         };
 
+        let oauth = OauthConfig {
+            key_path: env_opt("FEATHERREADER_OAUTH_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or(defaults.oauth.key_path),
+            encryption_key: env_opt("FEATHERREADER_OAUTH_ENCRYPTION_KEY"),
+            plc_directory: env_opt("FEATHERREADER_PLC_DIRECTORY")
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or(defaults.oauth.plc_directory),
+            scope: env_opt("FEATHERREADER_OAUTH_SCOPE").unwrap_or(defaults.oauth.scope),
+        };
+
         let repo_backend = match env_opt("FEATHERREADER_REPO_BACKEND") {
             Some(raw) => parse_repo_backend(&raw)?,
             None => defaults.repo_backend,
@@ -451,6 +503,7 @@ impl Config {
         };
 
         let config = Self {
+            oauth,
             repo_backend,
             bind,
             db_path,

@@ -302,14 +302,16 @@ impl Repo<'_> {
     }
 
     /// Replace a subscription in place — retitle, refile, change cadence.
+    /// Returns the [`WriteResult`] rather than discarding it: the caller logs
+    /// the resulting record URI, and a `()` here would have silently dropped
+    /// that field from the log line after the cutover.
     pub async fn update_subscription(
         &self,
         rkey: &str,
         sub: &crate::lexicon::Subscription,
-    ) -> Result<()> {
+    ) -> Result<WriteResult> {
         self.put_record(crate::lexicon::nsid::SUBSCRIPTION, rkey, sub)
-            .await?;
-        Ok(())
+            .await
     }
 
     /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
@@ -369,10 +371,15 @@ impl Repo<'_> {
         self.delete_record(crate::lexicon::nsid::FOLDER, rkey).await
     }
 
-    pub async fn rename_folder(&self, rkey: &str, folder: &crate::lexicon::Folder) -> Result<()> {
+    /// Returns the [`WriteResult`], matching the sidecar client — the caller
+    /// logs the record URI from it.
+    pub async fn rename_folder(
+        &self,
+        rkey: &str,
+        folder: &crate::lexicon::Folder,
+    ) -> Result<WriteResult> {
         self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder)
-            .await?;
-        Ok(())
+            .await
     }
 
     // ── saved ────────────────────────────────────────────────────────────────

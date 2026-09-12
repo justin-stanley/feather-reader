@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod net;
 pub mod network;
 pub mod oauth;
+pub mod repo;
 pub mod store;
 pub mod web;
 
@@ -155,6 +156,10 @@ pub struct AppState {
     /// Repo-op latency for BOTH backends, for reading the two side by side
     /// across a cutover flip.
     pub metrics: Arc<metrics::RepoMetrics>,
+    /// The Rust OAuth client's runtime. `None` when it could not be built —
+    /// tolerated only while the sidecar is the selected backend, and refused at
+    /// startup otherwise.
+    pub oauth: Option<Arc<oauth::runtime::OauthRuntime>>,
 }
 
 impl AppState {
@@ -165,6 +170,25 @@ impl AppState {
     /// registry. The binary's `main` calls this after opening the store.
     pub fn new(config: Config, db: Pool) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+
+        // Built whatever the backend, so a bad OAuth config is caught on every
+        // deploy rather than at the moment the switch is thrown. With the
+        // sidecar selected a failure is only a warning; with the Rust backend
+        // selected it is fatal, because there would be nothing to serve with.
+        let oauth = match oauth::runtime::OauthRuntime::new(&config) {
+            Ok(runtime) => Some(Arc::new(runtime)),
+            Err(err) if config.repo_backend == metrics::Backend::Sidecar => {
+                tracing::warn!(
+                    %err,
+                    "the Rust OAuth runtime could not be built; the sidecar backend is \
+                     unaffected, but FEATHERREADER_REPO_BACKEND=rust would refuse to start"
+                );
+                None
+            }
+            Err(err) => return Err(err.context(
+                "FEATHERREADER_REPO_BACKEND=rust, but the Rust OAuth runtime could not be built",
+            )),
+        };
         let sidecar = SidecarClient::new(
             http.clone(),
             config.sidecar.public_url.clone(),
@@ -178,6 +202,7 @@ impl AppState {
             sidecar,
             sessions: SessionRegistry::new(),
             metrics: Arc::new(metrics::RepoMetrics::new()),
+            oauth,
         })
     }
 }

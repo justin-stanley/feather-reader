@@ -32,6 +32,35 @@ pub struct AuthorizationServer {
     pub token_endpoint: String,
 }
 
+/// Resolve a PDS to its authorization server, both fetches and both validations.
+///
+/// Shared by the login path and the refresh path so the two cannot disagree
+/// about which server they are talking to. The order is not arbitrary: the
+/// protected-resource document names the issuer, and the issuer's own metadata
+/// is then required to agree — an authorization server that claims a different
+/// issuer than the one that pointed at it is the mix-up attack RFC 9207 exists
+/// for.
+pub async fn discover(
+    http: &reqwest::Client,
+    pds_url: &str,
+    auth_method: &str,
+) -> Result<AuthorizationServer> {
+    let prm_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        origin_of(pds_url)?
+    );
+    let prm = super::fetch::get_json(http, &prm_url, super::fetch::JSON)
+        .await
+        .with_context(|| format!("fetching {prm_url}"))?;
+    let issuer = validate_protected_resource(&prm, pds_url)?;
+
+    let asm_url = format!("{issuer}/.well-known/oauth-authorization-server");
+    let asm = super::fetch::get_json(http, &asm_url, super::fetch::JSON)
+        .await
+        .with_context(|| format!("fetching {asm_url}"))?;
+    validate_authorization_server(&asm, &issuer, pds_url, auth_method)
+}
+
 /// The origin of a URL: scheme + host + non-default port, and nothing else.
 ///
 /// Built from the parsed components rather than sliced out of the input, so

@@ -1539,7 +1539,7 @@ pub async fn clear_cursor_dirty(
 // under the configured cap.
 
 /// Unix-epoch seconds for "now" — the integer time base for the beta tables.
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
