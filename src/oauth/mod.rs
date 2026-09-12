@@ -17,6 +17,7 @@ pub mod keys;
 pub mod metadata;
 pub mod request;
 pub mod resolve;
+pub mod revoke;
 pub mod session;
 pub mod store;
 pub mod token;
