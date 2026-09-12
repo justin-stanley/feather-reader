@@ -594,4 +594,46 @@ mod tests {
             }
         }
     }
+    /// **Against a REAL PDS.** These are the documents `pds.justin-stanley.com`
+    /// actually served on 2026-09-12, captured verbatim.
+    ///
+    /// The preflight in this module is deliberately strict, and the failure mode
+    /// of strictness is rejecting a conformant server — which unit tests built
+    /// from a hand-written fixture cannot detect, because the fixture is written
+    /// to pass. This one was written by somebody else's implementation.
+    ///
+    /// It also carries fields this module does not look at
+    /// (`request_object_signing_alg_values_supported`, `ui_locales_supported`,
+    /// and others), confirming that unknown members are ignored rather than
+    /// tripping anything.
+    #[test]
+    fn a_real_pds_passes_the_preflight() {
+        const REAL_PROTECTED_RESOURCE: &str = r#"{"resource":"https://pds.justin-stanley.com","authorization_servers":["https://pds.justin-stanley.com"],"scopes_supported":[],"bearer_methods_supported":["header"],"resource_documentation":"https://atproto.com"}"#;
+        const REAL_AUTHORIZATION_SERVER: &str = r#"{"issuer":"https://pds.justin-stanley.com","request_parameter_supported":true,"request_uri_parameter_supported":true,"require_request_uri_registration":true,"scopes_supported":["atproto","transition:email","transition:generic","transition:chat.bsky"],"subject_types_supported":["public"],"response_types_supported":["code"],"response_modes_supported":["query","fragment","form_post"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"ui_locales_supported":["en-US"],"display_values_supported":["page","popup","touch"],"request_object_signing_alg_values_supported":["RS256","RS384","RS512","PS256","PS384","PS512","ES256","ES256K","ES384","ES512","none"],"authorization_response_iss_parameter_supported":true,"request_object_encryption_alg_values_supported":[],"request_object_encryption_enc_values_supported":[],"jwks_uri":"https://pds.justin-stanley.com/oauth/jwks","authorization_endpoint":"https://pds.justin-stanley.com/oauth/authorize","token_endpoint":"https://pds.justin-stanley.com/oauth/token","token_endpoint_auth_methods_supported":["none","private_key_jwt"],"token_endpoint_auth_signing_alg_values_supported":["RS256","RS384","RS512","PS256","PS384","PS512","ES256","ES256K","ES384","ES512"],"revocation_endpoint":"https://pds.justin-stanley.com/oauth/revoke","pushed_authorization_request_endpoint":"https://pds.justin-stanley.com/oauth/par","require_pushed_authorization_requests":true,"dpop_signing_alg_values_supported":["RS256","RS384","RS512","PS256","PS384","PS512","ES256","ES256K","ES384","ES512"],"protected_resources":["https://pds.justin-stanley.com"],"client_id_metadata_document_supported":true,"prompt_values_supported":["none","login","consent","select_account","create"]}"#;
+        let pds = "https://pds.justin-stanley.com";
+
+        let prm: Value = serde_json::from_str(REAL_PROTECTED_RESOURCE).unwrap();
+        let issuer = validate_protected_resource(&prm, pds).unwrap();
+        assert_eq!(issuer, pds);
+
+        let asm: Value = serde_json::from_str(REAL_AUTHORIZATION_SERVER).unwrap();
+        // Both client shapes must be accepted: the localhost dev client
+        // authenticates with `none`, production with `private_key_jwt`.
+        for method in ["none", "private_key_jwt"] {
+            let server = validate_authorization_server(&asm, &issuer, pds, method)
+                .unwrap_or_else(|e| panic!("a real PDS was rejected for {method}: {e:#}"));
+            assert_eq!(
+                server.par_endpoint,
+                "https://pds.justin-stanley.com/oauth/par"
+            );
+            assert_eq!(
+                server.authorization_endpoint,
+                "https://pds.justin-stanley.com/oauth/authorize"
+            );
+            assert_eq!(
+                server.token_endpoint,
+                "https://pds.justin-stanley.com/oauth/token"
+            );
+        }
+    }
 }
