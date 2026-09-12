@@ -209,7 +209,7 @@ pub async fn guarded_get(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, true).await
+    guarded_get_inner(client, url, extra_headers, true, MAX_REDIRECTS).await
 }
 
 /// The SSRF core of [`guarded_get`] **without** the feed-privacy layer: scheme +
@@ -228,7 +228,30 @@ pub async fn guarded_get_no_privacy(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, false).await
+    guarded_get_inner(client, url, extra_headers, false, MAX_REDIRECTS).await
+}
+
+/// Like [`guarded_get_no_privacy`] but **refuses redirects outright**.
+///
+/// For the OAuth discovery and DID documents, following a redirect is not a
+/// convenience — it is a hole. The mix-up defence rests on comparing a
+/// document's `issuer` against *the URL it was fetched from*; if a `302` can move
+/// the fetch to another origin, that comparison is against the original URL while
+/// the bytes came from somewhere else, and the check silently stops meaning
+/// anything. The reference client sets `redirect: 'manual'`/`'error'` on every
+/// one of these fetches for the same reason.
+///
+/// Applies to: `/.well-known/oauth-protected-resource`,
+/// `/.well-known/oauth-authorization-server`, `plc.directory/<did>`, `did:web`
+/// `did.json`, and the client-metadata self-fetch. It deliberately does NOT
+/// apply to `/.well-known/atproto-did`, where the handle spec explicitly permits
+/// redirects.
+pub async fn guarded_get_no_redirect(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<Response> {
+    guarded_get_inner(client, url, extra_headers, false, 0).await
 }
 
 /// Whether a header carries credentials that must never follow a redirect onto a
@@ -276,6 +299,7 @@ async fn guarded_get_inner(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
     check_privacy: bool,
+    max_redirects: usize,
 ) -> Result<Response> {
     // `client` is retained in the signature for API stability + as the policy
     // template; the actual send goes through a per-hop IP-pinned client.
@@ -284,7 +308,7 @@ async fn guarded_get_inner(
     // The origin the caller's credentials belong to; a hop off it drops them.
     let original = current.clone();
 
-    for _ in 0..=MAX_REDIRECTS {
+    for _ in 0..=max_redirects {
         check_scheme(&current)?;
         // Re-validate PRIVACY on EVERY hop: a public URL can `30x` to a
         // secret-bearing private feed (Substack/Patreon/tokened podcast). Without
@@ -322,6 +346,13 @@ async fn guarded_get_inner(
             .with_context(|| format!("fetching {current}"))?;
 
         if resp.status().is_redirection() {
+            if max_redirects == 0 {
+                bail!(
+                    "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
+                     this document's origin is load-bearing and must not be moved",
+                    resp.status()
+                );
+            }
             let location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -338,7 +369,7 @@ async fn guarded_get_inner(
         return Ok(resp);
     }
 
-    bail!("too many redirects (> {MAX_REDIRECTS}) while fetching {url:?}")
+    bail!("too many redirects (> {max_redirects}) while fetching {url:?}")
 }
 
 /// POST a JSON body to a **user-influenced** URL through the SSRF guard.
@@ -875,6 +906,24 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// OAuth metadata and DID documents must be fetched WITHOUT following
+    /// redirects, and still through the SSRF guard.
+    #[tokio::test]
+    async fn guarded_get_no_redirect_still_fails_closed_on_forbidden_targets() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1/.well-known/oauth-authorization-server",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/.well-known/did.json",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                guarded_get_no_redirect(&client, url, &[]).await.is_err(),
+                "must refuse {url}"
+            );
+        }
     }
 
     /// The content type must follow the body it describes. Because both come
