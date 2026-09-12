@@ -296,20 +296,49 @@ async fn main() -> Result<()> {
         session: &stored,
         key: &key,
     };
-    for collection in [
-        feather_reader::lexicon::nsid::SUBSCRIPTION,
-        feather_reader::lexicon::nsid::FOLDER,
-        feather_reader::lexicon::nsid::SAVED,
-    ] {
-        match repo.list_records(collection, Some(5), None).await {
-            Ok((records, cursor)) => println!(
-                "  {collection}: {} record(s), cursor {}",
-                records.len(),
-                cursor.as_deref().unwrap_or("<none>")
-            ),
-            Err(err) => println!("  {collection}: FAILED -- {err:#}"),
-        }
+    // The TYPED surface, against real records: this is the parse-and-sort path,
+    // which raw listRecords never exercises.
+    let subs = repo.list_subscriptions_sorted().await?;
+    println!("  subscriptions  {} (sorted)", subs.len());
+    for (rkey, sub) in subs.iter().take(5) {
+        println!(
+            "    {rkey}  {:<40}  {}",
+            sub.title.as_deref().unwrap_or("<untitled>"),
+            sub.url
+        );
     }
+
+    let folders = repo.list_folders_sorted().await?;
+    println!("  folders        {}", folders.len());
+    for (rkey, folder) in folders.iter().take(5) {
+        println!(
+            "    {rkey}  {} (position {:?})",
+            folder.name, folder.position
+        );
+    }
+
+    let saved = repo.list_saved_sorted().await?;
+    println!("  saved          {} (newest first)", saved.len());
+    for (rkey, item) in saved.iter().take(5) {
+        println!("    {rkey}  {}  {}", item.created_at, item.url);
+    }
+
+    let states = repo.list_read_states().await?;
+    println!("  read states    {}", states.len());
+
+    // Sorting must be TOTAL: a second read has to produce the same sequence, or
+    // the rendered list shuffles between page loads.
+    let again = repo.list_subscriptions_sorted().await?;
+    let first: Vec<&String> = subs.iter().map(|(k, _)| k).collect();
+    let second: Vec<&String> = again.iter().map(|(k, _)| k).collect();
+    println!(
+        "  ordering       {} across two reads",
+        if first == second {
+            "STABLE"
+        } else {
+            "UNSTABLE -- BUG"
+        }
+    );
 
     if std::env::args().any(|a| a == "--write-test") {
         write_test(&repo).await?;
