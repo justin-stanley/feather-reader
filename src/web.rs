@@ -2546,7 +2546,15 @@ async fn oauth_callback(
     // configuration. A login started before a flip still completes, because the
     // Rust arm is reached whenever the Rust runtime exists and can match the
     // `state` against a pending row it actually wrote.
-    let sidecar_handoff = q.session_id.as_deref().is_some_and(|s| !s.is_empty())
+    // The sidecar hands off in TWO shapes, not one: `?session_id=…` on success
+    // and `?error=…&error_description=…` on its own failure. Keying only on
+    // `session_id` sent the failure shape down the Rust arm, which then failed
+    // with "no `state`" and replaced the specific reason with a generic one —
+    // and `error_description` is exactly what the sidecar Caddy routing matches
+    // to send that request here in the first place.
+    let sidecar_shape =
+        q.session_id.as_deref().is_some_and(|s| !s.is_empty()) || q.error_description.is_some();
+    let sidecar_handoff = sidecar_shape
         && (state.oauth.is_none() || state.config.repo_backend == crate::metrics::Backend::Sidecar);
     if let Some(err) = q.error.clone() {
         let desc = q.error_description.clone().unwrap_or_default();

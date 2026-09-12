@@ -137,6 +137,23 @@ struct StateBinding<'a> {
     expires_at: i64,
 }
 
+/// A fixed marker distinguishing an absent optional field from an empty one.
+///
+/// Emitted as its OWN element beside the value. Encoding presence into the value
+/// (a prefix, a sentinel string) would only move the collision: a real value can
+/// always be chosen to look like the sentinel.
+fn present_or_absent(value: Option<&str>) -> &'static str {
+    match value {
+        Some(_) => "present",
+        None => "absent",
+    }
+}
+
+/// The AAD a state-row secret is sealed against: every non-secret column.
+///
+/// `column` is included so a ciphertext cannot be moved between columns of the
+/// same row, and `browser_binding_hash` because it is the only thing standing
+/// between a server-global state table and a login CSRF.
 fn state_aad(binding: &StateBinding<'_>, column: &str) -> Vec<u8> {
     let expires_at = binding.expires_at.to_string();
     structured_aad(
@@ -150,21 +167,30 @@ fn state_aad(binding: &StateBinding<'_>, column: &str) -> Vec<u8> {
             binding.redirect_uri,
             binding.browser_binding_hash,
             binding.auth_method,
-            // `auth_kid` selects which client key signs the assertion; stored
-            // and never re-verified, so it is bound rather than trusted.
+            // **An absent field and an empty one must not encode alike.**
+            // `unwrap_or("")` made `NULL` and `''` byte-identical, so either
+            // could be flipped to the other with every ciphertext still
+            // verifying — the very collision the session AAD below avoids with
+            // its `"none"` marker. A separate presence element keeps them
+            // distinct without depending on the value's own bytes.
+            present_or_absent(binding.auth_kid),
             binding.auth_kid.unwrap_or(""),
             binding.requested_scope,
             binding.request_uri,
             // Declared as a post-login redirect target. Nothing writes it yet,
             // which is exactly why binding it now costs nothing — unbound, it
-            // becomes an open redirect the day it is wired up.
+            // becomes an open redirect the day it is wired up. `None` versus
+            // `Some("")` is precisely the distinction a redirect helper would
+            // branch on, so the presence element matters here most.
+            present_or_absent(binding.app_return_to),
             binding.app_return_to.unwrap_or(""),
             // **The row's own lifetime is a destination too.** Both the expiry
-            // check and the sweeper filter on this column, so leaving it
-            // unauthenticated let anyone who can write the database keep a
-            // pending login — and its sealed DPoP key and PKCE verifier — alive
-            // indefinitely, defeating the cap whose stated purpose is narrowing
-            // the window in which a stolen `state` is worth replaying.
+            // check and the sweeper read this column RAW, so an adversary with
+            // database write can still keep the row itself around by pushing it
+            // out — binding it does not stop that. What it does stop is the row
+            // remaining USABLE: the sealed DPoP key and PKCE verifier no longer
+            // decrypt, so an extended `state` cannot be replayed into a
+            // completed login. The residual is row growth, not a live credential.
             &expires_at,
         ],
     )
@@ -835,6 +861,63 @@ mod tests {
             assert!(
                 get_session(&pool, &codec, DID).await.is_err(),
                 "tampering with `{column}` went undetected"
+            );
+        }
+        Ok(())
+    }
+
+    /// **An absent optional column and an empty one must not encode alike.**
+    ///
+    /// The tamper test above only ever writes a NON-EMPTY value, so it passed
+    /// while `NULL` and `''` produced byte-identical AAD and either could be
+    /// flipped to the other undetected. This covers both directions for both
+    /// optional columns, which is the case that test could not see.
+    #[tokio::test]
+    async fn swapping_an_absent_optional_column_for_an_empty_one_breaks_it() -> anyhow::Result<()> {
+        for (column, set_to_empty) in [
+            ("auth_kid", true),
+            ("auth_kid", false),
+            ("app_return_to", true),
+            ("app_return_to", false),
+        ] {
+            let (pool, codec) = db().await;
+            let mut auth = pending("state-1");
+            // Start from whichever state we are NOT flipping to.
+            if set_to_empty {
+                // Stored absent; an adversary makes it empty.
+                if column == "auth_kid" {
+                    auth.auth_kid = None;
+                } else {
+                    auth.app_return_to = None;
+                }
+            } else {
+                // Stored empty; an adversary makes it absent.
+                if column == "auth_kid" {
+                    auth.auth_kid = Some(String::new());
+                } else {
+                    auth.app_return_to = Some(String::new());
+                }
+            }
+            put_pending(&pool, &codec, &auth).await?;
+
+            let sql = leak(format!(
+                "UPDATE oauth_state SET {column} = ? WHERE state = ?"
+            ));
+            let query = if set_to_empty {
+                sqlx::query(sql).bind(Some(String::new()))
+            } else {
+                sqlx::query(sql).bind(Option::<String>::None)
+            };
+            query.bind("state-1").execute(&pool).await?;
+
+            assert!(
+                take_pending(&pool, &codec, "state-1", NOW).await.is_err(),
+                "`{column}`: {} went undetected",
+                if set_to_empty {
+                    "NULL -> ''"
+                } else {
+                    "'' -> NULL"
+                }
             );
         }
         Ok(())

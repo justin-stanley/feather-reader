@@ -120,9 +120,22 @@ fn is_bare_did_web_host(host: &str) -> bool {
     if host.parse::<std::net::IpAddr>().is_ok() {
         return false;
     }
-    // A DNS name is at most 253 bytes; anything longer cannot resolve, and an
-    // unbounded one is only useful for making us construct absurd URLs.
-    if host.len() > 253 {
+    // `IpAddr` only parses the CANONICAL spelling, while the URL parser the
+    // fetch path uses accepts far more: `127.1`, `0177.0.0.1` and `0x7f.0.0.1`
+    // all resolve to 127.0.0.1 and all passed the check above. A real TLD is
+    // never entirely numeric, so refusing a numeric final label catches every
+    // such spelling without needing to reimplement the URL parser's arithmetic.
+    // It is the same rule `normalize_handle` applies to handles.
+    if let Some(tld) = host.rsplit('.').next() {
+        if tld.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    // A DNS name is at most 253 bytes, and each label at most 63; anything
+    // longer cannot resolve, and an unbounded one is only useful for making us
+    // construct absurd URLs. Both bounds, to match what `normalize_handle`
+    // enforces — the earlier version checked only the total.
+    if host.len() > 253 || host.split('.').any(|label| label.len() > 63) {
         return false;
     }
     host.split('.').all(|label| {
@@ -817,8 +830,20 @@ mod tests {
         ] {
             assert!(!is_atproto_did(did), "accepted {did}");
         }
-        // A 300-character label cannot resolve and is refused.
+        // Non-canonical IP spellings resolve to loopback just as well, and
+        // `IpAddr::parse` accepts none of them — a numeric final label does.
+        for did in ["did:web:127.1", "did:web:0177.0.0.1", "did:web:0x7f.0.0.1"] {
+            assert!(!is_atproto_did(did), "accepted {did}");
+        }
+        // Length bounds: total and per-label, matching `normalize_handle`.
         assert!(!is_atproto_did(&format!("did:web:{}.com", "a".repeat(300))));
+        assert!(
+            !is_atproto_did(&format!("did:web:{}.com", "a".repeat(64))),
+            "a 64-byte label exceeds the DNS limit"
+        );
+        assert!(is_atproto_did(&format!("did:web:{}.com", "a".repeat(63))));
+        // A digit-leading TLD is not a TLD.
+        assert!(!is_atproto_did("did:web:foo.1com"));
         // Ordinary hosts still work.
         assert!(is_atproto_did("did:web:pds.example.com"));
     }

@@ -167,7 +167,7 @@ impl DpopBody<'_> {
 /// One DPoP-authenticated request.
 ///
 /// Grouped rather than passed positionally so a call site reads as a
-/// description of the request — `Retry::Forbidden` next to the code exchange is
+/// description of the request — `Retry::Forbidden` for a request whose body cannot be replayed is
 /// the kind of thing that should be visible at the call, not buried in an
 /// argument list.
 pub struct DpopRequest<'a> {

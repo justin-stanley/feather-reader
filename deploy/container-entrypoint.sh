@@ -9,12 +9,12 @@
 # Two-phase startup:
 #   PHASE 1 (ROOT): fix ownership of the /data volume. A fresh Fly volume mounts
 #     at /data owned root:root at RUNTIME, masking the image's build-time chown.
-#     The three children run as the unprivileged `app` user (uid 10001) and each
+#     The children run as the unprivileged `app` user (uid 10001) and each
 #     open files under /data (the Rust DB, the sidecar DB + signing JWK, Caddy's
 #     XDG_DATA_HOME). Without this chown they get EACCES on a virgin volume and
 #     crash-loop. We do it ONCE as root, then drop privileges.
 #   PHASE 2 (app via gosu): run under tini (PID1), which reaps zombies and
-#     forwards SIGTERM/SIGINT to us; we fan those out to the three children.
+#     forwards SIGTERM/SIGINT to us; we fan those out to the supervised children.
 #
 # This is a deliberate, tiny alternative to s6-overlay/supervisord: for this app
 # a dead proxy, dead poller, or dead OAuth sidecar all mean "broken", so the

@@ -376,20 +376,7 @@ pub fn load_or_create(path: &Path, codec: &Codec, kid: &str) -> Result<SigningKe
     };
 
     if let Some(raw) = raw {
-        let raw = raw.trim();
-        let plaintext = codec.maybe_decrypt(raw).with_context(|| {
-            format!(
-                "decrypting the signing-key file at {} -- refusing to generate a \
-                 replacement, since that would rotate the client's identity",
-                path.display()
-            )
-        })?;
-        let key = SigningKey::from_jwk_json(&plaintext, kid)?;
-        if !Aead::is_ciphertext(raw) {
-            // Upgrade a pre-encryption file in place.
-            rewrite_owner_only(path, &codec.encrypt(&plaintext))?;
-        }
-        return Ok(key);
+        return adopt_existing(path, &raw, codec, kid);
     }
 
     let key = SigningKey::generate(kid);
@@ -402,19 +389,61 @@ pub fn load_or_create(path: &Path, codec: &Codec, kid: &str) -> Result<SigningKe
     // rather than returning the one we generated and threw away — two replicas
     // holding different keys under the same `kid` is precisely the split this
     // no-clobber guard exists to prevent.
-    let raw = fs::read_to_string(path).with_context(|| {
+    //
+    // This goes through the SAME adoption path as a first read, deliberately. A
+    // second copy of that logic drifted immediately: it lost the `trim` that
+    // tolerates a hand-written file, so a winner's file with a trailing newline
+    // failed to boot — but only for whoever lost the race, making it
+    // non-deterministic — and it lost the plaintext re-encryption, so a legacy
+    // key file adopted this way stayed in plaintext on disk despite a configured
+    // encryption key.
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // `read_to_string` follows a symlink and `hard_link` does not, so a
+        // DANGLING SYMLINK at `path` reaches this branch: NotFound on the read,
+        // EEXIST on the link. Naming the race here would be a lie.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "the signing-key path {} exists but cannot be read; it is most likely a \
+                 dangling symlink, which must be removed or repointed by hand",
+                path.display()
+            )
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "re-reading the signing-key file at {} after losing the creation race",
+                    path.display()
+                )
+            })
+        }
+    };
+    adopt_existing(path, &raw, codec, kid)
+}
+
+/// Adopt a signing key that already exists on disk.
+///
+/// The single place a stored key becomes a usable one, so the first-read path
+/// and the lost-race path cannot diverge in what they tolerate or what they
+/// migrate.
+fn adopt_existing(path: &Path, raw: &str, codec: &Codec, kid: &str) -> Result<SigningKey> {
+    // Trimmed because a key file is something an operator may have written by
+    // hand or with `echo`, and a trailing newline is not a corrupt key.
+    let raw = raw.trim();
+    let plaintext = codec.maybe_decrypt(raw).with_context(|| {
         format!(
-            "re-reading the signing-key file at {} after losing the creation race",
+            "decrypting the signing-key file at {} -- refusing to generate a \
+             replacement, since that would rotate the client's identity",
             path.display()
         )
     })?;
-    let plaintext = codec.maybe_decrypt(&raw).with_context(|| {
-        format!(
-            "decrypting the signing-key file at {} written by another process",
-            path.display()
-        )
-    })?;
-    SigningKey::from_jwk_json(&plaintext, kid)
+    let key = SigningKey::from_jwk_json(&plaintext, kid)?;
+    if !Aead::is_ciphertext(raw) {
+        // Upgrade a pre-encryption file in place. Reached for a key the Node
+        // sidecar wrote, which is plaintext.
+        rewrite_owner_only(path, &codec.encrypt(&plaintext))?;
+    }
+    Ok(key)
 }
 
 #[cfg(test)]

@@ -213,8 +213,16 @@ fn require_endpoint(metadata: &Value, field: &str, issuer: &str) -> Result<Strin
     // endpoint points wherever they like.
     //
     // The atproto profile co-locates these in practice — the frozen real-PDS
-    // fixture in the tests below is the evidence — so the cost is refusing a
-    // server that is unusual rather than one that is wrong.
+    // fixture in the tests below is the evidence, as is the entryway/PDS split
+    // where the PDS is `*.host.bsky.network` and the issuer and its endpoints
+    // are all `bsky.social` — so the cost is refusing a server that is unusual
+    // rather than one that is wrong.
+    //
+    // Note what this does NOT do: an attacker who controls the `did:web` chain
+    // controls the issuer origin too, so `/login` can still redirect to any
+    // origin they can serve two self-consistent documents from. This narrows
+    // the target to origins that look like authorization servers; it does not
+    // remove the redirect.
     let origin = origin_of(raw)?;
     if origin != issuer {
         bail!(
@@ -374,8 +382,10 @@ mod tests {
         ] {
             let mut asm = as_metadata();
             asm[field] = json!("https://totally-other.example/authorize");
-            let err = validate_authorization_server(&asm, ISS, PDS, "none")
-                .expect_err("accepted a foreign-origin {field}");
+            let err = match validate_authorization_server(&asm, ISS, PDS, "none") {
+                Err(err) => err,
+                Ok(_) => panic!("accepted a foreign-origin {field}"),
+            };
             let rendered = format!("{err:#}");
             assert!(
                 rendered.contains("issuer's own origin"),

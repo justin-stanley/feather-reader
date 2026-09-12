@@ -31,8 +31,10 @@ pub struct OauthRuntime {
     /// `client_id`, precomputed — it is derived, and recomputing it per request
     /// invites a divergence between what we send and what we publish.
     pub client_id: String,
-    /// The ES256 client key. `None` for the dev client, which authenticates as
-    /// a public client and publishes no JWKS.
+    /// The ES256 client key. `None` for the dev client, which is a public
+    /// client and publishes no JWKS — and for a confidential client whose
+    /// backend is not selected and which has no key file yet, since creating one
+    /// it will never use is key material at rest for nothing.
     pub client_key: Option<SigningKey>,
     /// How this client authenticates to the authorization server.
     pub auth_method: AuthMethod,
@@ -74,9 +76,24 @@ impl OauthRuntime {
         let codec = Codec::new(cfg.oauth.encryption_key.as_deref())
             .context("building the at-rest encryption codec")?;
 
-        let uses_this_client = cfg.repo_backend == crate::metrics::Backend::Rust;
+        // CREATION is gated on the backend; LOADING is not.
+        //
+        // Gating both was wrong, and dangerously so: `revoke_everywhere` signs a
+        // user out of BOTH backends on purpose, because after a flip their
+        // tokens can be in either store. With the sidecar selected and a key
+        // already on disk from a previous rust deployment, refusing to load it
+        // left `auth_method` as `private_key_jwt` with no key — so revocation
+        // bailed while the local row was deleted anyway, and the PDS-side
+        // refresh token stayed live forever with no local record left to retry
+        // from. An in-flight rust login completing after a flip died the same
+        // way.
+        //
+        // So: create a key only for the backend that will use it, but adopt one
+        // that already exists whatever the backend.
+        let creates_key = cfg.repo_backend == crate::metrics::Backend::Rust;
+        let key_exists = cfg.oauth.key_path.exists();
         let client_key = match auth_method {
-            AuthMethod::PrivateKeyJwt if uses_this_client => Some(
+            AuthMethod::PrivateKeyJwt if creates_key || key_exists => Some(
                 super::keys::load_or_create(Path::new(&cfg.oauth.key_path), &codec, CLIENT_KID)
                     .with_context(|| {
                         format!(
@@ -86,7 +103,7 @@ impl OauthRuntime {
                     })?,
             ),
             // Either a public client, or a confidential one whose backend is not
-            // selected. Both mean: no key on disk.
+            // selected AND which has no key on disk to adopt.
             AuthMethod::PrivateKeyJwt | AuthMethod::None => None,
         };
 
@@ -230,6 +247,42 @@ mod key_creation_tests {
             "a confidential client needs its key"
         );
         assert!(path.exists(), "the key was not persisted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **An EXISTING key is adopted even when the backend will not create one.**
+    ///
+    /// This is the flip-back case. `revoke_everywhere` signs a user out of both
+    /// backends deliberately, because after a flip their tokens can be in either
+    /// store. Refusing to load a key that is already on disk left the sidecar
+    /// deployment with `private_key_jwt` and no key, so revocation bailed while
+    /// the local row was deleted regardless — the PDS-side refresh token then
+    /// stayed live with nothing left to retry from.
+    #[test]
+    fn an_existing_key_is_adopted_on_the_sidecar_backend() {
+        let path = temp_key_path("adopt");
+        let _ = std::fs::remove_file(&path);
+
+        // A previous rust deployment left a key behind.
+        OauthRuntime::new(&cfg(
+            crate::metrics::Backend::Rust,
+            "https://feather-reader.com",
+            &path,
+        ))
+        .expect("must build");
+        assert!(path.exists(), "precondition: the key was created");
+
+        // Flip back to the sidecar. The key must still be loaded.
+        let runtime = OauthRuntime::new(&cfg(
+            crate::metrics::Backend::Sidecar,
+            "https://feather-reader.com",
+            &path,
+        ))
+        .expect("must build");
+        assert!(
+            runtime.client_key.is_some(),
+            "an existing key was ignored, so rust sessions could never be revoked"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -221,35 +221,72 @@ pub async fn sign_out_discovering(
         Err(err) => return Revocation::Failed(format!("reading the session: {err:#}")),
     };
 
-    let endpoint = match super::discovery::discover(
-        http,
-        &session.aud,
-        runtime.auth_method.as_str(),
-    )
-    .await
-    {
-        Ok(server) => server.revocation_endpoint,
-        Err(err) => {
-            tracing::warn!(%err, %sub, "could not discover the revocation endpoint; signing out locally");
-            None
-        }
+    // **The deadline covers DISCOVERY too.**
+    //
+    // Bounding only the revocation request left the real wait unbounded:
+    // `discover` makes two guarded fetches, each with its own 30-second timeout,
+    // so an unreachable PDS held a user's sign-out for a minute before the
+    // five-second deadline even began. The first version of the test missed this
+    // by exercising `sign_out` rather than this function — the one production
+    // actually calls.
+    let attempt =
+        async {
+            let endpoint =
+                match super::discovery::discover(http, &session.aud, runtime.auth_method.as_str())
+                    .await
+                {
+                    Ok(server) => server.revocation_endpoint,
+                    Err(err) => {
+                        tracing::warn!(%err, %sub, "could not discover the revocation endpoint");
+                        None
+                    }
+                };
+            revoke_tokens(
+                pool,
+                http,
+                &RevokeContext {
+                    revocation_endpoint: endpoint.as_deref(),
+                    client_id: &runtime.client_id,
+                    auth_method: runtime.auth_method,
+                    client_key: runtime.client_key.as_ref(),
+                    deadline: REVOKE_DEADLINE,
+                },
+                &session,
+                now,
+            )
+            .await
+        };
+
+    bounded_then_delete(pool, sub, REVOKE_DEADLINE, attempt).await
+}
+
+/// Run `attempt` under `deadline`, then delete the local session **whatever
+/// happened** — including when the deadline expired.
+///
+/// Separated out so the bound can be tested against a future that never
+/// resolves, rather than against a network address that may be refused
+/// instantly in one environment and hang in another.
+async fn bounded_then_delete<F>(
+    pool: &sqlx::SqlitePool,
+    sub: &str,
+    deadline: std::time::Duration,
+    attempt: F,
+) -> Revocation
+where
+    F: std::future::Future<Output = Revocation>,
+{
+    let outcome = match tokio::time::timeout(deadline, attempt).await {
+        Ok(outcome) => outcome,
+        Err(_) => Revocation::Failed(format!(
+            "revocation did not finish within {deadline:?}; signing out locally anyway"
+        )),
     };
 
-    sign_out(
-        pool,
-        &runtime.codec,
-        http,
-        &RevokeContext {
-            revocation_endpoint: endpoint.as_deref(),
-            client_id: &runtime.client_id,
-            auth_method: runtime.auth_method,
-            client_key: runtime.client_key.as_ref(),
-            deadline: REVOKE_DEADLINE,
-        },
-        sub,
-        now,
-    )
-    .await
+    // Unconditional, exactly as in `sign_out`: the user asked to be logged out.
+    if let Err(err) = super::store::delete_session(pool, sub).await {
+        return Revocation::Failed(format!("deleting the local session: {err:#}"));
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -439,38 +476,44 @@ mod tests {
             .is_none());
     }
 
-    /// **A dead authorization server must not hold a sign-out open.**
+    /// **A dead authorization server must not hold a sign-out open — and the
+    /// bound must cover DISCOVERY, not just the revocation request.**
     ///
-    /// Revocation is best-effort by design — the local row goes either way — so
-    /// waiting out an unreachable server's timeouts to reach a delete that
-    /// happens regardless is the wrong trade. The user is watching this one.
+    /// Bounding only the request left the real wait unbounded: discovery makes
+    /// two guarded fetches with a 30-second timeout each, so an unreachable PDS
+    /// held the sign-out for a minute before the deadline began. The earlier
+    /// version of this test missed that by exercising `sign_out` rather than the
+    /// function production calls, and it reached the network to do it — so where
+    /// outbound was refused it passed instantly, proving nothing.
     ///
-    /// A blackholed address is used rather than a refused one: a refusal returns
-    /// immediately and would prove nothing about the deadline.
+    /// Exercised against a future that never resolves, with a short deadline:
+    /// deterministic, no network, and it proves the bound rather than observing
+    /// how long a particular host happens to take to refuse a connection.
     #[tokio::test]
-    async fn a_hanging_revocation_does_not_hold_the_sign_out_open() {
+    async fn a_hanging_attempt_does_not_hold_the_sign_out_open() {
         let (pool, codec) = db().await;
         stored(&pool, &codec).await;
 
         let started = std::time::Instant::now();
-        let outcome = sign_out(
+        let outcome = super::bounded_then_delete(
             &pool,
-            &codec,
-            &reqwest::Client::new(),
-            // TEST-NET-1, which is routable-looking but blackholed: connects
-            // hang rather than being refused.
-            &ctx(Some("https://192.0.2.1/oauth/revoke")),
             DID,
-            NOW,
+            std::time::Duration::from_millis(50),
+            std::future::pending::<Revocation>(),
         )
         .await;
-        let waited = started.elapsed();
-
         assert!(
-            waited < TEST_DEADLINE * 4,
-            "the sign-out waited {waited:?}, past the {TEST_DEADLINE:?} deadline"
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the bound did not fire"
         );
-        assert!(matches!(outcome, Revocation::Failed(_)), "got {outcome:?}");
+
+        match &outcome {
+            Revocation::Failed(reason) => assert!(
+                reason.contains("did not finish within"),
+                "failed for the wrong reason: {reason}"
+            ),
+            other => panic!("a never-resolving attempt must time out, got {other:?}"),
+        }
         assert!(
             super::super::store::get_session(&pool, &codec, DID)
                 .await
