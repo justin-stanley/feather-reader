@@ -910,6 +910,10 @@ pub(crate) mod tests {
 
     /// OAuth metadata and DID documents must be fetched WITHOUT following
     /// redirects, and still through the SSRF guard.
+    /// Asserts on the GUARD's error, not merely `is_err()`. Connecting to
+    /// `127.0.0.1` fails anyway (refused, or a slow timeout for an unrouted
+    /// RFC1918 address), so an `is_err()`-only assertion passes with
+    /// `resolve_and_check` deleted and proves nothing.
     #[tokio::test]
     async fn guarded_get_no_redirect_still_fails_closed_on_forbidden_targets() {
         let client = Client::new();
@@ -917,13 +921,22 @@ pub(crate) mod tests {
             "http://127.0.0.1/.well-known/oauth-authorization-server",
             "http://169.254.169.254/latest/meta-data/",
             "http://192.168.1.1/.well-known/did.json",
-            "file:///etc/passwd",
+            "http://[::1]/.well-known/did.json",
         ] {
+            let err = guarded_get_no_redirect(&client, url, &[])
+                .await
+                .expect_err("must refuse");
+            let rendered = format!("{err:#}");
             assert!(
-                guarded_get_no_redirect(&client, url, &[]).await.is_err(),
-                "must refuse {url}"
+                rendered.contains("forbidden (internal) address"),
+                "{url} failed for the wrong reason: {rendered}"
             );
         }
+        // And the scheme check, which is a different branch entirely.
+        let err = guarded_get_no_redirect(&client, "file:///etc/passwd", &[])
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("non-http(s) URL scheme"));
     }
 
     /// The content type must follow the body it describes. Because both come

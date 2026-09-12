@@ -32,13 +32,23 @@ pub struct AuthorizationServer {
     pub token_endpoint: String,
 }
 
-/// The origin (scheme + host + port) of a URL, with no trailing slash.
+/// The origin of a URL: scheme + host + non-default port, and nothing else.
+///
+/// Built from the parsed components rather than sliced out of the input, so
+/// userinfo cannot survive into it — `https://u:p@host/x` has origin
+/// `https://host`, and a slice would have kept the credentials. Both sides of
+/// the RFC 9728 `resource` comparison are attacker-influenced, so this needs to
+/// be an origin in fact and not just in name.
 pub fn origin_of(url: &str) -> Result<String> {
     let parsed = url::Url::parse(url).with_context(|| format!("{url:?} is not a URL"))?;
-    if !parsed.has_host() {
-        bail!("{url:?} has no host");
-    }
-    Ok(parsed[..url::Position::AfterPort].to_string())
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{url:?} has no host"))?;
+    Ok(match parsed.port() {
+        // `Url::port` is None for the scheme's default, so 443 drops out here.
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
 }
 
 /// An issuer identifier must be canonical before it can be compared.
@@ -70,6 +80,14 @@ pub fn validate_issuer_form(issuer: &str) -> Result<()> {
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("issuer {issuer:?} must not carry credentials");
+    }
+    // The catch-all, and the one that actually makes the comparison sound: the
+    // issuer must be spelled EXACTLY as its own origin. That covers a default
+    // port (the spec forbids `:443`), host casing, and percent-escapes in one
+    // check, rather than enumerating normalizations and missing some.
+    let canonical = origin_of(issuer)?;
+    if issuer != canonical {
+        bail!("issuer {issuer:?} is not in canonical form (expected {canonical:?})");
     }
     Ok(())
 }
@@ -121,6 +139,20 @@ fn require_listed(metadata: &Value, field: &str, wanted: &str) -> Result<()> {
         .with_context(|| format!("authorization-server metadata has no `{field}`"))?;
     if !values.iter().filter_map(Value::as_str).any(|v| v == wanted) {
         bail!("authorization-server `{field}` does not include {wanted:?}");
+    }
+    Ok(())
+}
+
+/// Require an array-valued metadata field NOT to contain `forbidden`.
+fn require_absent(metadata: &Value, field: &str, forbidden: &str) -> Result<()> {
+    if let Some(values) = metadata.get(field).and_then(Value::as_array) {
+        if values
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|v| v == forbidden)
+        {
+            bail!("authorization-server `{field}` includes {forbidden:?}, which is not allowed");
+        }
     }
     Ok(())
 }
@@ -187,7 +219,29 @@ pub fn validate_authorization_server(
     {
         bail!("authorization server does not support client-id metadata documents");
     }
+    // atproto mandates PAR, and mandates that the AS advertises it.
+    if metadata
+        .get("require_pushed_authorization_requests")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("authorization server does not require pushed authorization requests");
+    }
+    // Mandated `true` by atproto, and load-bearing downstream: the callback
+    // treats a MISSING `iss` as a rejection (RFC 9207), which is only sound
+    // because a conformant server always sends one. Checking it here turns a
+    // post-approval failure into a preflight one.
+    if metadata
+        .get("authorization_response_iss_parameter_supported")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("authorization server does not send the `iss` response parameter");
+    }
+
     require_listed(metadata, "code_challenge_methods_supported", "S256")?;
+    // `plain` is not merely "not required" -- the spec says it "is not allowed".
+    require_absent(metadata, "code_challenge_methods_supported", "plain")?;
     require_listed(metadata, "dpop_signing_alg_values_supported", ES256)?;
     require_listed(metadata, "response_types_supported", "code")?;
     require_listed(metadata, "grant_types_supported", "authorization_code")?;
@@ -197,6 +251,7 @@ pub fn validate_authorization_server(
         "token_endpoint_auth_methods_supported",
         auth_method,
     )?;
+    require_listed(metadata, "scopes_supported", "atproto")?;
 
     // An ABSENT signing-alg list means ES256, not "unknown". The spec says
     // clients and servers "currently must support the ES256 cryptographic
@@ -209,6 +264,12 @@ pub fn validate_authorization_server(
             metadata,
             "token_endpoint_auth_signing_alg_values_supported",
             ES256,
+        )?;
+        // The spec forbids `none` here outright.
+        require_absent(
+            metadata,
+            "token_endpoint_auth_signing_alg_values_supported",
+            "none",
         )?;
     }
 
@@ -272,9 +333,29 @@ mod tests {
             "https://u:p@auth.example.com",  // userinfo
             "auth.example.com",              // not absolute
             "",
+            // Spec: "a default port (443 for HTTPS) must not be included".
+            "https://auth.example.com:443",
+            // Case and percent-escapes get normalized by any URL parser, so an
+            // un-normalized spelling would compare unequal to itself.
+            "https://AUTH.example.com",
+            "https://auth%2eexample.com",
         ] {
             assert!(validate_issuer_form(issuer).is_err(), "accepted {issuer:?}");
         }
+    }
+
+    /// An origin is scheme + host + port. Userinfo is not part of it, and
+    /// leaving it in would make the RFC 9728 `resource` comparison compare
+    /// something that is not an origin.
+    #[test]
+    fn origin_of_drops_userinfo_path_query_and_default_ports() {
+        assert_eq!(origin_of("https://u:p@pds.example.com/x").unwrap(), PDS);
+        assert_eq!(origin_of("https://pds.example.com/a/b?c=1#d").unwrap(), PDS);
+        assert_eq!(origin_of("https://pds.example.com:443").unwrap(), PDS);
+        assert_eq!(
+            origin_of("https://pds.example.com:8443").unwrap(),
+            "https://pds.example.com:8443"
+        );
     }
 
     // ── protected-resource metadata ──────────────────────────────────────────
@@ -394,14 +475,58 @@ mod tests {
                 "token_endpoint_auth_signing_alg_values_supported",
                 json!(["RS256"]),
             ),
+            // --- the four the fixture carried but nothing asserted ---
+            ("scopes_supported", json!(["transition:generic"])),
+            ("require_pushed_authorization_requests", json!(false)),
+            (
+                "authorization_response_iss_parameter_supported",
+                json!(false),
+            ),
+            // `plain` is forbidden outright, not merely "S256 must also be there".
+            ("code_challenge_methods_supported", json!(["S256", "plain"])),
+            // The spec forbids `none` in the signing-alg list.
+            (
+                "token_endpoint_auth_signing_alg_values_supported",
+                json!(["ES256", "none"]),
+            ),
         ];
         for (field, bad) in cases {
             let mut doc = as_metadata();
             doc[*field] = bad.clone();
             assert!(
                 validate_authorization_server(&doc, ISS, PDS, "private_key_jwt").is_err(),
-                "accepted a bad {field}"
+                "accepted {field} = {bad}"
             );
+        }
+    }
+
+    /// **Every field the fixture carries must be load-bearing.** Four spec-`must`
+    /// checks were missing precisely because the fixture supplied them and no
+    /// test ever varied them -- the fixture manufactured the appearance of
+    /// coverage. Removing any field must now break something, so a check that
+    /// silently disappears shows up here.
+    #[test]
+    fn every_field_in_the_fixture_is_load_bearing() {
+        // The single deliberate exception: an absent signing-alg list means
+        // ES256 rather than "unknown", so removing it MUST still validate. It is
+        // named here rather than skipped silently, so the exemption is a
+        // decision on the record instead of a gap.
+        const OPTIONAL: &str = "token_endpoint_auth_signing_alg_values_supported";
+
+        let base = as_metadata();
+        for field in base.as_object().unwrap().keys() {
+            let mut doc = base.clone();
+            doc.as_object_mut().unwrap().remove(field);
+            let result = validate_authorization_server(&doc, ISS, PDS, "private_key_jwt");
+            if field == OPTIONAL {
+                assert!(result.is_ok(), "`{field}` is documented as optional");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "removing `{field}` changed nothing -- it is unchecked, or it \
+                     does not belong in the fixture"
+                );
+            }
         }
     }
 

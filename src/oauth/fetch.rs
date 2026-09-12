@@ -160,7 +160,11 @@ mod tests {
     }
 
     /// These fetches must fail closed on an internal target like every other
-    /// outbound call, and must not follow a redirect off the origin.
+    /// outbound call.
+    ///
+    /// Asserts on the GUARD's error rather than `is_err()`: connecting to
+    /// `127.0.0.1` fails regardless, so an `is_err()`-only assertion would pass
+    /// with the SSRF guard removed entirely.
     #[tokio::test]
     async fn discovery_fetches_fail_closed_on_internal_targets() {
         let client = Client::new();
@@ -169,11 +173,23 @@ mod tests {
             "http://169.254.169.254/.well-known/oauth-protected-resource",
             "http://10.1.2.3/did.json",
         ] {
-            assert!(get_json(&client, url, JSON).await.is_err(), "allowed {url}");
-            assert!(
-                get_json_optional(&client, url, JSON).await.is_err(),
-                "allowed {url}"
-            );
+            for rendered in [
+                format!(
+                    "{:#}",
+                    get_json(&client, url, JSON).await.expect_err("allowed")
+                ),
+                format!(
+                    "{:#}",
+                    get_json_optional(&client, url, JSON)
+                        .await
+                        .expect_err("allowed")
+                ),
+            ] {
+                assert!(
+                    rendered.contains("forbidden (internal) address"),
+                    "{url} failed for the wrong reason: {rendered}"
+                );
+            }
         }
     }
 }

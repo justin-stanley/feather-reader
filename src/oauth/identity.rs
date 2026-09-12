@@ -65,9 +65,12 @@ pub fn normalize_handle(input: &str) -> Result<String> {
             bail!("handle {input:?} has a segment starting or ending with a hyphen");
         }
     }
+    // Spec: "The last segment (the 'top level domain') can not start with a
+    // numeric digit." Rejecting only ALL-numeric TLDs would let `alice.1com`
+    // and `alice.4chan` through.
     let tld = labels[labels.len() - 1];
-    if tld.bytes().all(|b| b.is_ascii_digit()) {
-        bail!("handle {input:?} has an all-numeric TLD");
+    if tld.starts_with(|c: char| c.is_ascii_digit()) {
+        bail!("handle {input:?} has a TLD starting with a digit");
     }
     if RESERVED_TLDS.contains(&tld) {
         bail!("handle {input:?} uses the reserved TLD .{tld}");
@@ -75,17 +78,57 @@ pub fn normalize_handle(input: &str) -> Result<String> {
     Ok(handle)
 }
 
+/// Whether a `did:web` method-specific id is a bare, canonical hostname.
+///
+/// This is the gate that stops URL construction from being steerable. Two
+/// shapes matter and neither is obvious:
+///
+/// * `good.com@evil.com` builds `https://good.com@evil.com/…`, whose ACTUAL
+///   host is `evil.com` — the plausible-looking part is demoted to userinfo.
+/// * `evil.com/x` is a straight path injection into the well-known path.
+///
+/// `:` is the did:web path separator (a port is spelled `%3A`), and atproto
+/// permits neither, so any of them disqualifies the DID.
+fn is_bare_did_web_host(host: &str) -> bool {
+    if host.is_empty() || host != host.to_ascii_lowercase() {
+        return false;
+    }
+    // Explicitly, rather than relying on the URL parser to object: these are
+    // the characters that change what the host IS.
+    if host.bytes().any(|b| {
+        matches!(b, b':' | b'/' | b'@' | b'%' | b'?' | b'#' | b'\\') || b.is_ascii_whitespace()
+    }) {
+        return false;
+    }
+    if !host.contains('.') {
+        return false; // a bare token is not a resolvable host
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
 /// Whether `did` is a DID this client can resolve: `did:plc:` or `did:web:`.
+///
+/// This is the ONLY validation applied to a DID arriving from a TXT record or a
+/// well-known document, so anything it waves through becomes the account's
+/// identity and, for `did:web`, part of a URL.
 pub fn is_atproto_did(did: &str) -> bool {
     if let Some(ident) = did.strip_prefix("did:plc:") {
-        // PLC identifiers are 24 characters of base32-sortable.
+        // base32-SORTABLE: `[a-z2-7]`, 24 characters. Not `[a-z0-9]` — `0`,
+        // `1`, `8` and `9` are not in that alphabet.
         return ident.len() == 24
             && ident
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
     }
-    if let Some(rest) = did.strip_prefix("did:web:") {
-        return !rest.is_empty();
+    if let Some(host) = did.strip_prefix("did:web:") {
+        return is_bare_did_web_host(host);
     }
     false
 }
@@ -146,11 +189,11 @@ pub fn did_document_url(did: &str, plc_directory: &str) -> Result<String> {
         return Ok(format!("{}/{did}", plc_directory.trim_end_matches('/')));
     }
     if let Some(host) = did.strip_prefix("did:web:") {
-        if host.is_empty() {
-            bail!("did:web with no host");
-        }
-        if host.contains(':') {
-            bail!("atproto did:web must be a bare hostname with no path or port, got {host:?}");
+        if !is_bare_did_web_host(host) {
+            bail!(
+                "atproto did:web must be a bare, canonical hostname with no path, \
+                 port, credentials or escapes, got {host:?}"
+            );
         }
         return Ok(format!("https://{host}/.well-known/did.json"));
     }
@@ -172,12 +215,22 @@ pub fn validate_did_document(document: &Value, expected_did: &str) -> Result<()>
     }
 
     // Duplicate service ids make "the first #atproto_pds" depend on array order.
+    //
+    // Ids are NORMALIZED to absolute form before comparing: `#atproto_pds` and
+    // `did:plc:xxx#atproto_pds` are two spellings of the SAME service, so a
+    // raw-string dedup sees two distinct ids and lets a document list the
+    // service twice with different endpoints.
     if let Some(services) = document.get("service").and_then(Value::as_array) {
         let mut seen = HashSet::new();
         for service in services {
             if let Some(sid) = service.get("id").and_then(Value::as_str) {
-                if !seen.insert(sid) {
-                    bail!("DID document has duplicate service id {sid:?}");
+                let absolute = if let Some(fragment) = sid.strip_prefix('#') {
+                    format!("{expected_did}#{fragment}")
+                } else {
+                    sid.to_string()
+                };
+                if !seen.insert(absolute.clone()) {
+                    bail!("DID document has duplicate service id {absolute:?}");
                 }
             }
         }
@@ -191,18 +244,23 @@ pub fn validate_did_document(document: &Value, expected_did: &str) -> Result<()>
 /// `isAtprotoPersonalDataServerService`: the id matches `#atproto_pds` in
 /// relative or absolute form, the type is exactly `AtprotoPersonalDataServer`,
 /// and `serviceEndpoint` is a **string** that parses as a URL.
-pub fn pds_endpoint(document: &Value) -> Result<String> {
+pub fn pds_endpoint(document: &Value, did: &str) -> Result<String> {
     let services = document
         .get("service")
         .and_then(Value::as_array)
         .context("DID document has no `service` array")?;
+    let absolute = format!("{did}#atproto_pds");
 
     for service in services {
         let id = service
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let matches_id = id == "#atproto_pds" || id.ends_with("#atproto_pds");
+        // EXACTLY the relative or THIS DID's absolute spelling. An `ends_with`
+        // test would let a document list a decoy service -- `urn:evil#atproto_pds`,
+        // or another DID's `#atproto_pds` -- ahead of the real one and win,
+        // choosing the server for the entire session.
+        let matches_id = id == "#atproto_pds" || id == absolute;
         let matches_type =
             service.get("type").and_then(Value::as_str) == Some("AtprotoPersonalDataServer");
         if !matches_id || !matches_type {
@@ -214,12 +272,29 @@ pub fn pds_endpoint(document: &Value) -> Result<String> {
             .context("#atproto_pds serviceEndpoint is not a string")?;
         let parsed = url::Url::parse(endpoint)
             .with_context(|| format!("#atproto_pds serviceEndpoint {endpoint:?} is not a URL"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            bail!("#atproto_pds serviceEndpoint must be http(s), got {endpoint:?}");
+        match parsed.scheme() {
+            "https" => {}
+            // A DID document is attacker-controlled in the `did:web` case, and
+            // DPoP-bound tokens are sent to this host. Plaintext is tolerable
+            // only against a local dev PDS.
+            "http" if is_loopback_host(&parsed) => {}
+            _ => bail!(
+                "#atproto_pds serviceEndpoint must be https (or http on loopback), got {endpoint:?}"
+            ),
         }
         return Ok(endpoint.to_string());
     }
-    bail!("DID document declares no #atproto_pds service")
+    bail!("DID document declares no #atproto_pds service for {did}")
+}
+
+/// Whether a URL points at the local machine.
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The handle a DID document claims, normalized.
@@ -307,6 +382,12 @@ mod tests {
             "alice.com-",
             "alice_bob.com", // underscore not allowed
             "alice.123",     // all-numeric TLD
+            // Spec: "The last segment (the 'top level domain') can not start
+            // with a numeric digit." Rejecting only ALL-numeric TLDs let these
+            // three through.
+            "alice.1com",
+            "alice.4chan",
+            "alice.0x",
             "al ice.com",
             "alice.com/path",
             "alice.com:443",
@@ -425,19 +506,64 @@ mod tests {
         );
     }
 
-    /// atproto restricts `did:web` to a bare hostname: no path components, and
-    /// no port except on localhost.
+    /// atproto restricts `did:web` to a bare hostname: no path components, no
+    /// port. (`:` is the path separator in a did:web method-specific id; a port
+    /// is spelled `%3A`.)
     #[test]
     fn did_web_with_a_path_or_port_is_rejected() {
         for did in [
             "did:web:example.com:path",
             "did:web:example.com:8080",
+            "did:web:example.com%3A8080",
             "did:web:example.com:path:to:doc",
         ] {
             assert!(
                 did_document_url(did, "https://plc.directory").is_err(),
                 "accepted {did}"
             );
+            assert!(!is_atproto_did(did), "is_atproto_did accepted {did}");
+        }
+    }
+
+    /// **Host confusion.** `did:web:good.com@evil.com` builds
+    /// `https://good.com@evil.com/…`, whose ACTUAL host is `evil.com` — the
+    /// plausible-looking part is demoted to userinfo. A `/` is a straight path
+    /// injection. Neither may survive as far as URL construction.
+    #[test]
+    fn did_web_host_confusion_and_path_injection_are_rejected() {
+        for did in [
+            "did:web:good.com@evil.com",
+            "did:web:evil.com/x",
+            "did:web:evil.com/.well-known/did.json#",
+            "did:web:%00",
+            "did:web:%2e%2e",
+            "did:web:ex ample.com",
+            "did:web:",
+            "did:web:.",
+            "did:web:-example.com",
+            "did:web:Example.com", // must be canonical lowercase
+        ] {
+            assert!(!is_atproto_did(did), "is_atproto_did accepted {did:?}");
+            assert!(
+                did_document_url(did, "https://plc.directory").is_err(),
+                "built a URL for {did:?}"
+            );
+        }
+    }
+
+    /// `did:plc` identifiers are base32-SORTABLE: `[a-z2-7]`. `0`, `1`, `8` and
+    /// `9` are not in that alphabet.
+    #[test]
+    fn did_plc_uses_the_base32_sortable_alphabet() {
+        assert!(is_atproto_did(DID));
+        for did in [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaa01",
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaa89",
+            "did:plc:AAAAAAAAAAAAAAAAAAAAAAAA",
+            "did:plc:tooshort",
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!is_atproto_did(did), "accepted {did}");
         }
     }
 
@@ -498,16 +624,77 @@ mod tests {
 
     #[test]
     fn the_pds_endpoint_is_extracted() {
-        assert_eq!(pds_endpoint(&doc()).unwrap(), "https://pds.example.com");
+        assert_eq!(
+            pds_endpoint(&doc(), DID).unwrap(),
+            "https://pds.example.com"
+        );
     }
 
     /// The id may be relative (`#atproto_pds`) or absolute
-    /// (`did:plc:xxx#atproto_pds`).
+    /// (`did:plc:xxx#atproto_pds`) — but ONLY those two spellings.
     #[test]
     fn an_absolute_service_id_is_accepted() {
         let mut d = doc();
         d["service"][0]["id"] = json!(format!("{DID}#atproto_pds"));
-        assert_eq!(pds_endpoint(&d).unwrap(), "https://pds.example.com");
+        assert_eq!(pds_endpoint(&d, DID).unwrap(), "https://pds.example.com");
+    }
+
+    /// **PDS steering.** Matching on "ends with `#atproto_pds`" lets a DID
+    /// document put a DECOY service first whose id merely has that suffix, and
+    /// win. The PDS is what discovery runs against and what every later XRPC
+    /// call targets, so this chooses the server for the whole session.
+    ///
+    /// The decoy must be FIRST here — with a single service there is nothing to
+    /// beat, which is how the original tests missed this.
+    #[test]
+    fn a_foreign_service_id_ending_in_atproto_pds_does_not_win() {
+        let mut d = doc();
+        d["service"] = json!([
+            {"id": "urn:evil#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://attacker.example"},
+            {"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://real-pds.example"}
+        ]);
+        assert_eq!(
+            pds_endpoint(&d, DID).unwrap(),
+            "https://real-pds.example",
+            "a decoy service id steered the PDS"
+        );
+
+        // And an id belonging to a DIFFERENT DID is not ours either.
+        d["service"] = json!([
+            {"id": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://attacker.example"},
+            {"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://real-pds.example"}
+        ]);
+        assert_eq!(pds_endpoint(&d, DID).unwrap(), "https://real-pds.example");
+    }
+
+    /// The relative and absolute spellings are the SAME service, so listing both
+    /// is a duplicate — which the raw-string dedup did not see.
+    #[test]
+    fn the_relative_and_absolute_spellings_count_as_one_service() {
+        let mut d = doc();
+        d["service"] = json!([
+            {"id": format!("{DID}#atproto_pds"), "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://attacker.example"},
+            {"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://real-pds.example"}
+        ]);
+        assert!(
+            validate_did_document(&d, DID).is_err(),
+            "two spellings of the same service id were not seen as duplicates"
+        );
+    }
+
+    /// A DID document is attacker-controlled in the `did:web` case, and tokens
+    /// go to this host. Plaintext is only tolerable on loopback.
+    #[test]
+    fn a_plaintext_http_pds_is_rejected_outside_loopback() {
+        let mut d = doc();
+        for endpoint in ["http://pds.attacker.example", "http://10.0.0.5"] {
+            d["service"][0]["serviceEndpoint"] = json!(endpoint);
+            assert!(pds_endpoint(&d, DID).is_err(), "accepted {endpoint}");
+        }
+        for endpoint in ["http://localhost:2583", "http://127.0.0.1:2583"] {
+            d["service"][0]["serviceEndpoint"] = json!(endpoint);
+            assert!(pds_endpoint(&d, DID).is_ok(), "rejected dev {endpoint}");
+        }
     }
 
     /// All three conditions must hold: id, type, and a parseable endpoint.
@@ -516,6 +703,7 @@ mod tests {
         let cases = [
             json!({"id": "#atproto_pds", "type": "SomethingElse", "serviceEndpoint": "https://a.example"}),
             json!({"id": "#other", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://a.example"}),
+            json!({"id": "urn:evil#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://a.example"}),
             json!({"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "not a url"}),
             json!({"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": ["https://a.example"]}),
             json!({"id": "#atproto_pds", "type": "AtprotoPersonalDataServer"}),
@@ -523,7 +711,7 @@ mod tests {
         for svc in cases {
             let mut d = doc();
             d["service"] = json!([svc.clone()]);
-            assert!(pds_endpoint(&d).is_err(), "accepted {svc}");
+            assert!(pds_endpoint(&d, DID).is_err(), "accepted {svc}");
         }
     }
 
@@ -531,9 +719,9 @@ mod tests {
     fn a_document_with_no_services_has_no_pds() {
         let mut d = doc();
         d["service"] = json!([]);
-        assert!(pds_endpoint(&d).is_err());
+        assert!(pds_endpoint(&d, DID).is_err());
         d.as_object_mut().unwrap().remove("service");
-        assert!(pds_endpoint(&d).is_err());
+        assert!(pds_endpoint(&d, DID).is_err());
     }
 
     // ── bidirectional verification ───────────────────────────────────────────
