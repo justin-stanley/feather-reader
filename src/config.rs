@@ -199,8 +199,9 @@ pub struct OauthConfig {
     /// two can share one file and a rollback finds the key it expects.
     pub key_path: PathBuf,
     /// Passphrase for the at-rest encryption of the signing key and the stored
-    /// sessions. `None` leaves them in plaintext — refused on a production-like
-    /// instance by `validate_secrets`.
+    /// sessions. `None` leaves them in PLAINTEXT, which `validate_secrets`
+    /// refuses on a production-like instance when the Rust backend is selected
+    /// — that is the only configuration in which these tables are written.
     pub encryption_key: Option<String>,
     /// The PLC directory used to resolve `did:plc` documents.
     pub plc_directory: String,
@@ -588,6 +589,25 @@ impl Config {
         if let Some(bot_secret) = &self.bot_secret {
             check_secret("FEATHERREADER_BOT_SECRET", bot_secret, "")?;
         }
+        // With the Rust backend live, `oauth_session` holds every user's access
+        // token, refresh token and DPoP PRIVATE KEY. An unset encryption key
+        // makes the codec a no-op and leaves all three in the clear in SQLite —
+        // on the same mounted volume as the feed cache, and in every snapshot
+        // and backup of it. Gated on the backend because the sidecar path never
+        // writes these tables, and blocking a rollback over a key that path does
+        // not read would be the wrong failure.
+        if self.repo_backend == crate::metrics::Backend::Rust {
+            match self.oauth.encryption_key.as_deref() {
+                Some(key) => check_secret("FEATHERREADER_OAUTH_ENCRYPTION_KEY", key, "")?,
+                None => anyhow::bail!(
+                    "FEATHERREADER_REPO_BACKEND=rust on a production-like instance requires \
+                     FEATHERREADER_OAUTH_ENCRYPTION_KEY: without it every stored access token, \
+                     refresh token and DPoP private key is written to SQLite in plaintext. \
+                     Set it to a random secret of at least {MIN_SECRET_BYTES} bytes."
+                ),
+            }
+        }
+
         // Split-deploy footgun: on a production-like instance, if the sidecar's
         // INTERNAL base equals its PUBLIC base and that base is non-loopback, the
         // Rust server would send the `X-Internal-Secret` + all session/repo
@@ -846,6 +866,89 @@ mod tests {
             parse_relay_hosts(Some("wss://a.example, ftp://b.example"), relay_defaults());
         assert!(hosts.is_empty());
         assert_eq!(rejected.len(), 2);
+    }
+
+    /// **Plaintext tokens must not be deployable.**
+    ///
+    /// With the Rust backend live, `oauth_session` holds every user's access
+    /// token, refresh token and DPoP PRIVATE KEY. Without an encryption key the
+    /// codec is a no-op and all three sit in the clear in SQLite — on the same
+    /// mounted volume as the feed cache, in every snapshot and backup of it.
+    ///
+    /// This was found by reading a real session row during the live test: the
+    /// stored access token began `eyJ0eXAiOiJh`, i.e. a bare JWT. The doc
+    /// comment on `OauthConfig::encryption_key` already CLAIMED this was
+    /// refused; it was not.
+    #[test]
+    fn a_production_rust_backend_refuses_to_boot_without_an_encryption_key() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: None,
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate_secrets()
+            .expect_err("plaintext tokens must not boot in production");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("FEATHERREADER_OAUTH_ENCRYPTION_KEY"),
+            "the error must name the variable to set: {rendered}"
+        );
+    }
+
+    /// The SIDECAR backend is unaffected: it stores nothing in these tables, and
+    /// blocking a rollback over a key that path never reads would be the wrong
+    /// failure.
+    #[test]
+    fn the_sidecar_backend_boots_without_an_oauth_encryption_key() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Sidecar,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: None,
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_secrets().is_ok());
+    }
+
+    /// A weak key is refused on the same terms as every other secret — a short
+    /// passphrase is stretched into an AES key, so its entropy is the ceiling.
+    #[test]
+    fn a_weak_oauth_encryption_key_is_refused_in_production() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: Some("short".into()),
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_secrets().is_err());
     }
 
     /// **A typo must fail loudly.**
