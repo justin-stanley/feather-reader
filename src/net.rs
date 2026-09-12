@@ -368,28 +368,46 @@ pub async fn guarded_post_json(
     extra_headers: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response> {
-    guarded_post(
-        client,
-        url,
-        HeaderValue::from_static("application/json"),
-        extra_headers,
-        body,
-    )
-    .await
+    guarded_post(client, url, extra_headers, PostBody::Json(body)).await
 }
 
-/// Percent-encode `params` as an `application/x-www-form-urlencoded` body.
+/// A request body together with the content type that describes it.
 ///
-/// Every value goes through the serializer rather than string interpolation:
-/// an OAuth form carries the authorization code, the PKCE verifier and the
-/// client assertion, and a raw `&` or `=` in any of them would otherwise splice
-/// an extra parameter into the request.
-pub(crate) fn encode_form(params: &[(&str, &str)]) -> Vec<u8> {
-    let mut ser = url::form_urlencoded::Serializer::new(String::new());
-    for (k, v) in params {
-        ser.append_pair(k, v);
+/// The two travel as ONE value deliberately. Passing the content type alongside
+/// the bytes made it possible to send a JSON body labelled as a form, or the
+/// reverse — a swap no test could see without a live server, and the SSRF guard
+/// forbids pointing one of these at loopback. Deriving the header from the same
+/// value that produces the bytes removes the failure mode instead of watching
+/// for it.
+pub(crate) enum PostBody<'a> {
+    Json(Vec<u8>),
+    Form(&'a [(&'a str, &'a str)]),
+}
+
+impl PostBody<'_> {
+    fn content_type(&self) -> HeaderValue {
+        match self {
+            PostBody::Json(_) => HeaderValue::from_static("application/json"),
+            PostBody::Form(_) => HeaderValue::from_static("application/x-www-form-urlencoded"),
+        }
     }
-    ser.finish().into_bytes()
+
+    /// Every form value goes through the serializer rather than string
+    /// interpolation: an OAuth form carries the authorization code, the PKCE
+    /// verifier and the client assertion, and a raw `&` or `=` in any of them
+    /// would otherwise splice an extra parameter into the request.
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            PostBody::Json(bytes) => bytes,
+            PostBody::Form(params) => {
+                let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                for (k, v) in params {
+                    ser.append_pair(k, v);
+                }
+                ser.finish().into_bytes()
+            }
+        }
+    }
 }
 
 /// POST a form-encoded body to a **user-influenced** URL through the SSRF guard.
@@ -409,14 +427,7 @@ pub async fn guarded_post_form(
     extra_headers: &[(HeaderName, HeaderValue)],
     params: &[(&str, &str)],
 ) -> Result<Response> {
-    guarded_post(
-        client,
-        url,
-        HeaderValue::from_static("application/x-www-form-urlencoded"),
-        extra_headers,
-        encode_form(params),
-    )
-    .await
+    guarded_post(client, url, extra_headers, PostBody::Form(params)).await
 }
 
 /// The shared body of [`guarded_post_json`] and [`guarded_post_form`]. Kept as
@@ -424,10 +435,11 @@ pub async fn guarded_post_form(
 async fn guarded_post(
     client: &Client,
     url: &str,
-    content_type: HeaderValue,
     extra_headers: &[(HeaderName, HeaderValue)],
-    body: Vec<u8>,
+    body: PostBody<'_>,
 ) -> Result<Response> {
+    let content_type = body.content_type();
+    let body = body.into_bytes();
     // As in `guarded_get_inner`: `client` is the policy template; the send goes
     // through a freshly built, IP-pinned client.
     let _ = client;
@@ -865,15 +877,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// The content type must follow the body it describes. Because both come
+    /// from the same value, a JSON body can never be labelled as a form.
+    #[test]
+    fn the_content_type_follows_the_body_kind() {
+        assert_eq!(
+            PostBody::Json(b"{}".to_vec()).content_type(),
+            "application/json"
+        );
+        assert_eq!(
+            PostBody::Form(&[("a", "b")]).content_type(),
+            "application/x-www-form-urlencoded"
+        );
+        // And the bytes are encoded to match.
+        assert_eq!(
+            PostBody::Json(b"{\"a\":1}".to_vec()).into_bytes(),
+            b"{\"a\":1}"
+        );
+        assert_eq!(PostBody::Form(&[("a", "b c")]).into_bytes(), b"a=b+c");
+    }
+
     /// Form encoding must percent-encode values; a value containing `&` or `=`
     /// must not be able to inject an extra parameter into the body.
     #[test]
     fn form_body_percent_encodes_and_cannot_inject_parameters() {
-        let body = encode_form(&[
+        let body = PostBody::Form(&[
             ("grant_type", "authorization_code"),
             ("code", "abc&scope=evil"),
             ("redirect_uri", "https://x.example/oauth/callback"),
-        ]);
+        ])
+        .into_bytes();
         let s = String::from_utf8(body).unwrap();
         assert!(s.contains("grant_type=authorization_code"));
         assert!(

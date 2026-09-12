@@ -20,19 +20,65 @@
 //! app keeps `client_id` stable across the cutover, so existing authorizations
 //! survive and a rollback does not strand them either.
 
+use anyhow::{bail, Context as _, Result};
 use serde_json::{json, Value};
 
 /// Everything the client documents are derived from.
+///
+/// Fields are private and the only constructor is [`ClientConfig::new`], so a
+/// `ClientConfig` that exists has been validated. Leaving them public would
+/// make the validation advisory, and the value it guards — `client_id` — is the
+/// client's identity rather than a request parameter.
 pub struct ClientConfig {
     /// Public base URL of the app, e.g. `https://feather-reader.com`.
-    pub public_url: String,
+    public_url: String,
     /// The OAuth scope string requested at authorize time.
-    pub scope: String,
+    scope: String,
     /// Localhost development client (no PKI) rather than a confidential client.
-    pub dev: bool,
+    dev: bool,
 }
 
 impl ClientConfig {
+    /// Build a validated config.
+    ///
+    /// `public_url` must be an absolute `http(s)` URL with **no path**, and must
+    /// be `https` outside dev. The path rule is the one that bites: the sidecar
+    /// is mounted under `/oauth`, so `SIDECAR_PUBLIC_URL` is documented as
+    /// `https://feather-reader.com/oauth` — and reusing that value here would
+    /// produce `…/oauth/oauth/client-metadata.json`, which the edge proxy does
+    /// not route, 404ing a `client_id` the PDS has already cached.
+    ///
+    /// Validated at construction rather than at use because `client_id` is the
+    /// client's identity: a wrong one is not a bad request, it is a different
+    /// client, and it is discovered only after users cannot log in.
+    pub fn new(public_url: &str, scope: &str, dev: bool) -> Result<Self> {
+        let parsed = url::Url::parse(public_url)
+            .with_context(|| format!("public_url {public_url:?} is not an absolute URL"))?;
+
+        match parsed.scheme() {
+            "https" => {}
+            "http" if dev => {}
+            "http" => bail!("public_url must be https outside dev, got {public_url:?}"),
+            other => bail!("public_url must be http(s), got scheme {other:?}"),
+        }
+        if !parsed.has_host() {
+            bail!("public_url {public_url:?} has no host");
+        }
+        if parsed.path() != "/" && !parsed.path().is_empty() {
+            bail!(
+                "public_url must be an origin with no path, got {public_url:?} \
+                 (path {:?}) — the /oauth prefix is added by this module, so \
+                 including it would publish a doubled client_id",
+                parsed.path()
+            );
+        }
+        Ok(Self {
+            public_url: public_url.to_string(),
+            scope: scope.to_string(),
+            dev,
+        })
+    }
+
     /// The public base URL without a trailing slash, so the path joins below
     /// cannot produce a `//`.
     fn base(&self) -> &str {
@@ -110,19 +156,68 @@ mod tests {
     use super::*;
 
     fn prod() -> ClientConfig {
-        ClientConfig {
-            public_url: "https://feather-reader.com".into(),
-            scope: "atproto transition:generic".into(),
-            dev: false,
-        }
+        ClientConfig::new(
+            "https://feather-reader.com",
+            "atproto transition:generic",
+            false,
+        )
+        .unwrap()
     }
 
     fn dev() -> ClientConfig {
-        ClientConfig {
-            public_url: "http://127.0.0.1:8080".into(),
-            scope: "atproto transition:generic".into(),
-            dev: true,
+        ClientConfig::new("http://127.0.0.1:8080", "atproto transition:generic", true).unwrap()
+    }
+
+    // ── configuration validation ─────────────────────────────────────────────
+
+    /// **The misconfiguration that is waiting to happen.** `SIDECAR_PUBLIC_URL`
+    /// is documented as `https://feather-reader.com/oauth`, because the sidecar
+    /// is mounted under that prefix — so that is exactly the value an operator
+    /// reaches for. Carrying the path through would yield
+    /// `…/oauth/oauth/client-metadata.json`; Caddy strips ONE `/oauth` prefix,
+    /// so the request 404s, every login breaks, and the PDS has already cached
+    /// that `client_id`.
+    #[test]
+    fn a_public_url_carrying_a_path_is_rejected() {
+        for url in [
+            "https://feather-reader.com/oauth",
+            "https://feather-reader.com/a/b",
+            "https://feather-reader.com/oauth/",
+        ] {
+            let cfg = ClientConfig::new(url, "atproto", false);
+            assert!(cfg.is_err(), "accepted a public_url with a path: {url}");
         }
+    }
+
+    #[test]
+    fn a_public_url_must_be_an_absolute_http_url() {
+        for url in [
+            "feather-reader.com",
+            "",
+            "/////",
+            "not a url",
+            "ftp://x.example",
+        ] {
+            assert!(
+                ClientConfig::new(url, "atproto", false).is_err(),
+                "accepted {url:?}"
+            );
+        }
+    }
+
+    /// Production `client_id` must be https — a PDS will not accept a plaintext
+    /// client identity. Dev runs on loopback http, which is the documented
+    /// exception.
+    #[test]
+    fn plain_http_is_rejected_in_production_but_allowed_in_dev() {
+        assert!(ClientConfig::new("http://feather-reader.com", "atproto", false).is_err());
+        assert!(ClientConfig::new("http://127.0.0.1:8080", "atproto", true).is_ok());
+    }
+
+    #[test]
+    fn a_valid_public_url_is_accepted_with_or_without_a_trailing_slash() {
+        assert!(ClientConfig::new("https://feather-reader.com", "atproto", false).is_ok());
+        assert!(ClientConfig::new("https://feather-reader.com/", "atproto", false).is_ok());
     }
 
     // ── the URLs that must not change ────────────────────────────────────────

@@ -285,12 +285,24 @@ mod tests {
         assert_eq!(derive_key(raw), [0xfbu8; 32]);
     }
 
+    /// Not canonical hex/base64 of a 32-byte key, so it is hashed -- with the
+    /// domain separator. Asserting the exact expected digest rather than merely
+    /// "not the raw bytes": the weaker form passes for any hash, including one
+    /// with the separator dropped, which would silently invalidate every stored
+    /// ciphertext.
     #[test]
-    fn derive_key_hashes_a_human_passphrase_rather_than_using_it_as_raw_bytes() {
-        // Not canonical hex/base64 of a 32-byte key, so it is treated as a
-        // passphrase and hashed -- never used as raw key bytes.
+    fn derive_key_hashes_a_human_passphrase_with_the_domain_separator() {
         let pass = "correct horse battery staple pad!";
+        let mut ctx = ring::digest::Context::new(&SHA256);
+        ctx.update(b"featherreader-sidecar-enc:v1:");
+        ctx.update(pass.as_bytes());
+        let expected: [u8; 32] = ctx.finish().as_ref().try_into().unwrap();
+
+        assert_eq!(derive_key(pass), expected);
         assert_ne!(derive_key(pass), pass.as_bytes()[..32]);
+        // A bare SHA-256 with no domain separation must NOT be what we produce.
+        let undomained = ring::digest::digest(&SHA256, pass.as_bytes());
+        assert_ne!(derive_key(pass).as_slice(), undomained.as_ref());
     }
 
     #[test]
@@ -302,9 +314,21 @@ mod tests {
 
     /// A near-miss must not silently become a raw key: 43 base64url chars decode
     /// to 32 bytes, but only a value that RE-ENCODES to the input was really a
-    /// canonical key. Lenient base64 decoding makes this a real hazard.
+    /// canonical key.
+    ///
+    /// The value to guard against is the LENIENT DECODE, not the ASCII bytes.
+    /// `'a'` is base64 index 26 (`011010`), so 43 of them decode to the repeating
+    /// pattern `69 A6 9A`. An implementation that dropped the round-trip guard
+    /// would return exactly that — and comparing against `[b'a'; 32]` instead
+    /// would not notice.
     #[test]
     fn derive_key_sends_a_non_canonical_base64_lookalike_down_the_passphrase_path() {
+        let lenient: [u8; 32] = std::array::from_fn(|i| [0x69u8, 0xA6, 0x9A][i % 3]);
+        assert_ne!(
+            derive_key(KEY),
+            lenient,
+            "a lenient base64 decode was mistaken for a canonical key"
+        );
         assert_ne!(derive_key(KEY), [b'a'; 32]);
     }
 
@@ -319,14 +343,30 @@ mod tests {
         assert_eq!(aead.decrypt(&ct).unwrap(), "hello secret");
     }
 
+    /// Compares the NONCE SEGMENT, not the whole token: two tokens differing
+    /// only in ciphertext would satisfy a whole-token comparison while reusing
+    /// the nonce, which is the catastrophic case for GCM. A counter nonce is
+    /// also rejected — 32 samples must all be distinct AND not sequential.
     #[test]
-    fn aead_uses_a_fresh_nonce_per_record() {
+    fn aead_uses_a_fresh_random_nonce_per_record() {
         let aead = Aead::new(KEY).unwrap();
-        let a = aead.encrypt("same");
-        let b = aead.encrypt("same");
-        assert_ne!(a, b, "a reused nonce would be catastrophic for GCM");
-        assert_eq!(aead.decrypt(&a).unwrap(), "same");
-        assert_eq!(aead.decrypt(&b).unwrap(), "same");
+        let nonce_of = |token: &str| token.split('.').nth(3).unwrap().to_string();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let token = aead.encrypt("same");
+            let nonce = nonce_of(&token);
+            assert!(seen.insert(nonce), "GCM nonce reused across records");
+            assert_eq!(aead.decrypt(&token).unwrap(), "same");
+        }
+        // A counter would produce nonces differing only in the last bytes.
+        let a = nonce_of(&aead.encrypt("x"));
+        let b = nonce_of(&aead.encrypt("x"));
+        let shared_prefix = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        assert!(
+            shared_prefix < a.len() / 2,
+            "nonces look sequential rather than random: {a} vs {b}"
+        );
     }
 
     #[test]

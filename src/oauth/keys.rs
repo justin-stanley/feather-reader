@@ -7,11 +7,18 @@
 //! * survive restarts (it anchors `client_id`, so regenerating it invalidates
 //!   in-flight authorizations),
 //! * be published in public form at `jwks_uri` so the PDS can verify assertions,
-//! * and never sit on disk in the clear.
+//! * and not sit on disk in the clear **whenever a codec key is configured**.
 //!
 //! So it is persisted as a JWK, AEAD-encrypted with [`super::crypto`]. The JWK
 //! *format* is deliberately the same one the Node sidecar writes, so a rollback
 //! to the sidecar can still read a key this module created, and vice versa.
+//!
+//! That third requirement is conditional, and the condition is load-bearing:
+//! [`super::crypto::Codec::Null`] is a pass-through, so a deployment with no key
+//! configured writes the private JWK as plaintext. The sidecar refuses to boot
+//! in production without a key; the equivalent guard for this path belongs in
+//! config validation at cutover, and until then `Codec::Null` is a dev-only
+//! arrangement rather than an enforced one.
 //!
 //! The thumbprint is RFC 7638 and is computed over the PUBLIC members only
 //! (`crv`, `kty`, `x`, `y`) in lexicographic order — never over the raw JWK
@@ -59,9 +66,27 @@ fn thumbprint_of_members(jwk: &Value) -> Result<String> {
     if kty != "EC" {
         bail!("unsupported JWK key type {kty:?}; expected EC");
     }
-    // Built by hand rather than via a map: serde_json's default map preserves
-    // insertion order, and the lexicographic ordering here is normative.
-    let canonical = format!(r#"{{"crv":"{crv}","kty":"{kty}","x":"{x}","y":"{y}"}}"#);
+    if crv != "P-256" {
+        bail!("unsupported JWK curve {crv:?}; only P-256 is supported");
+    }
+    // `x`/`y` are unpadded base64url in a well-formed EC JWK. Validating rather
+    // than trusting matters because this is also how a REMOTE party's JWK gets
+    // thumbprinted, and a member carrying a quote or backslash would otherwise
+    // have to be escaped correctly to produce a value anyone else reproduces.
+    for (name, value) in [("x", x), ("y", y)] {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("JWK member `{name}` is not unpadded base64url");
+        }
+    }
+    // Serialized, not interpolated: the serializer escapes correctly, and
+    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order` feature), so
+    // the members come out in the lexicographic order RFC 7638 requires.
+    let canonical = serde_json::to_string(&json!({"crv": crv, "kty": kty, "x": x, "y": y}))
+        .context("serializing the canonical JWK")?;
     Ok(URL_SAFE_NO_PAD.encode(digest(&SHA256, canonical.as_bytes()).as_ref()))
 }
 
@@ -93,8 +118,8 @@ impl SigningKey {
         unreachable!("8 consecutive invalid P-256 scalars is not physically plausible")
     }
 
-    /// Parse a JWK, tolerating the extra members (`kid`, `alg`, `use`) that both
-    /// this module and the sidecar attach.
+    /// Parse a JWK, tolerating the extra members (`kid`, `alg`, `key_ops`,
+    /// `use`) that both this module and the sidecar attach.
     pub fn from_jwk_json(jwk_json: &str, kid: &str) -> Result<Self> {
         let v: Value = serde_json::from_str(jwk_json).context("key file is not valid JSON")?;
         if v.get("d").is_none() {
@@ -121,8 +146,8 @@ impl SigningKey {
         Ok(Self { secret, kid })
     }
 
-    /// The PRIVATE JWK, for persistence. Carries `kid`/`alg`/`use` so a rollback
-    /// to the sidecar finds the key under the same identifier.
+    /// The PRIVATE JWK, for persistence. Carries `kid`/`alg`/`key_ops` so a
+    /// rollback to the sidecar finds the key under the same identifier.
     pub fn to_jwk_json(&self) -> Result<String> {
         let mut v: Value =
             serde_json::to_value(self.secret.to_jwk()).context("serializing the private JWK")?;
@@ -131,7 +156,11 @@ impl SigningKey {
             .ok_or_else(|| anyhow!("JWK did not serialize to an object"))?;
         obj.insert("kid".into(), json!(self.kid));
         obj.insert("alg".into(), json!(ALG));
-        obj.insert("use".into(), json!("sig"));
+        // `key_ops`, not `use`, on the PRIVATE JWK. That is what the sidecar
+        // writes, and `jose` already warns that a private JWK carrying `use`
+        // will be rejected in a future release — which would break the very
+        // rollback path this shared format exists to preserve.
+        obj.insert("key_ops".into(), json!(["sign"]));
         serde_json::to_string(&v).context("rendering the private JWK")
     }
 
@@ -197,20 +226,64 @@ fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("creating the signing-key file at {}", path.display()))?;
     f.write_all(contents.as_bytes())
         .context("writing the signing-key file")?;
+    // A freshly generated key that never reached disk would be silently lost to
+    // a crash, and the next boot would mint a different client identity.
+    f.sync_all().context("flushing the signing-key file")?;
+    sync_parent_dir(path);
     Ok(())
 }
 
-/// Overwrite an EXISTING key file in place, keeping owner-only permissions.
+/// The sibling path a rewrite stages through.
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    std::path::PathBuf::from(name)
+}
+
+/// Replace an EXISTING key file **atomically**, keeping owner-only permissions.
+///
+/// Write-to-temp, fsync, rename. A plain `fs::write` truncates before it writes,
+/// so a crash in that window leaves a zero-length file — and because an
+/// unreadable key file is deliberately a hard error (see [`load_or_create`]),
+/// that would turn a transient crash into a permanent boot failure recoverable
+/// only by deleting the key. `rename` within a directory is atomic, so a reader
+/// sees either the old contents or the new ones and never nothing.
 fn rewrite_owner_only(path: &Path, contents: &str) -> Result<()> {
-    fs::write(path, contents)
-        .with_context(|| format!("rewriting the signing-key file at {}", path.display()))?;
-    #[cfg(unix)]
+    let temp = temp_sibling(path);
+    // A stale temp from a previous crash must not block the write, and creating
+    // exclusively afterwards keeps us from following a planted symlink.
+    let _ = fs::remove_file(&temp);
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .context("tightening permissions on the signing-key file")?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&temp)
+            .with_context(|| format!("staging a key rewrite at {}", temp.display()))?;
+        file.write_all(contents.as_bytes())
+            .context("writing the staged signing-key file")?;
+        // Durable before the rename, so the rename cannot expose a file whose
+        // contents have not reached disk.
+        file.sync_all().context("flushing the staged key file")?;
     }
+    fs::rename(&temp, path)
+        .with_context(|| format!("replacing the signing-key file at {}", path.display()))?;
+    sync_parent_dir(path);
     Ok(())
+}
+
+/// Best-effort fsync of the containing directory, so a rename survives a crash.
+/// Failure is not fatal — the data is already durable, only the link is at risk.
+fn sync_parent_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        if let Ok(handle) = fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
 }
 
 /// Load the signing key from `path`, generating and persisting one if absent.
@@ -316,6 +389,43 @@ mod tests {
 
     // ── generation and round-trip ────────────────────────────────────────────
 
+    /// The canonical form must be real JSON with real escaping. Building it by
+    /// string interpolation produced invalid JSON — and therefore a thumbprint
+    /// no other implementation reproduces — for any member containing a quote,
+    /// a backslash or a control character.
+    ///
+    /// Such members cannot occur in a well-formed EC JWK (`x`/`y` are base64url),
+    /// so the fix is to reject them rather than hash them. That matters because
+    /// this function takes JWKs from REMOTE parties.
+    #[test]
+    fn public_thumbprint_of_rejects_members_that_are_not_base64url() {
+        for x in [r#"A\"A"#, r#"A\\A"#, "A A", "A+A", "A/A", "AAA=", "", "é"] {
+            let jwk = serde_json::json!({"kty":"EC","crv":"P-256","x":x,"y":"BBB"});
+            assert!(
+                SigningKey::public_thumbprint_of(&jwk.to_string()).is_err(),
+                "accepted a non-base64url x: {x:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_thumbprint_of_rejects_malformed_or_non_ec_jwks() {
+        for jwk in [
+            r#"{"kty":"RSA","crv":"P-256","x":"AAA","y":"BBB"}"#,
+            r#"{"kty":"EC","crv":"P-521","x":"AAA","y":"BBB"}"#,
+            r#"{"kty":"EC","crv":"P-256","x":"AAA"}"#,
+            r#"{"kty":"EC","crv":"P-256"}"#,
+            r#"{"kty":"EC","crv":"P-256","x":123,"y":"BBB"}"#,
+            "not json",
+            "[]",
+        ] {
+            assert!(
+                SigningKey::public_thumbprint_of(jwk).is_err(),
+                "accepted {jwk}"
+            );
+        }
+    }
+
     #[test]
     fn generate_produces_distinct_keys() {
         let a = SigningKey::generate(KID);
@@ -411,7 +521,15 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(Aead::is_ciphertext(raw.trim()), "key file is not encrypted");
-        assert!(!raw.contains("\"d\""), "plaintext JWK leaked to disk");
+        // Assert the SCALAR is absent, not the string `"d"`: the file is
+        // base64url, which can never contain a quote, so checking for `"d"`
+        // would pass even with no encryption at all.
+        let scalar = serde_json::from_str::<serde_json::Value>(&key.to_jwk_json().unwrap())
+            .unwrap()["d"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!raw.contains(&scalar), "private scalar found on disk");
         // And it really is the same key underneath.
         let plain = codec.maybe_decrypt(raw.trim()).unwrap();
         let same = SigningKey::from_jwk_json(&plain, KID).unwrap();
@@ -464,9 +582,64 @@ mod tests {
         let path = tmp_path("corrupt");
         let codec = Codec::new(Some(KEY)).unwrap();
         let other = Codec::new(Some("a-completely-different-passphrase")).unwrap();
-        std::fs::write(&path, other.encrypt(JOSE_PRIVATE_JWK)).unwrap();
+        let on_disk = other.encrypt(JOSE_PRIVATE_JWK);
+        std::fs::write(&path, &on_disk).unwrap();
 
         assert!(load_or_create(&path, &codec, KID).is_err());
+        // And the unreadable key is LEFT ALONE. Replacing or deleting it would
+        // discard a key that is merely locked behind the wrong passphrase.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            on_disk,
+            "the key file was modified on a decrypt failure"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The persisted private JWK must use `key_ops`, not `use`. The sidecar
+    /// writes `key_ops: ["sign"]`, and `jose` already warns that a private JWK
+    /// carrying `use` will be rejected in future — which would break the
+    /// rollback path this format exists to preserve.
+    #[test]
+    fn the_private_jwk_uses_key_ops_rather_than_use() {
+        let key = SigningKey::generate(KID);
+        let v: serde_json::Value = serde_json::from_str(&key.to_jwk_json().unwrap()).unwrap();
+        assert_eq!(v["key_ops"], serde_json::json!(["sign"]));
+        assert!(
+            v.get("use").is_none(),
+            "private JWK carries `use`, which jose deprecates"
+        );
+        // The PUBLIC half is a JWKS entry, where `use: sig` is the norm.
+        assert_eq!(key.public_jwk().unwrap()["use"], "sig");
+    }
+
+    /// Migration rewrites an existing file. Doing that with truncate-then-write
+    /// leaves a zero-length file if the process dies in between — and since an
+    /// unreadable key file is deliberately a hard error, that would be a
+    /// permanent boot failure. A temp file plus rename makes it atomic.
+    #[test]
+    fn migration_leaves_no_temporary_file_behind() {
+        let path = tmp_path("atomic");
+        let codec = Codec::new(Some(KEY)).unwrap();
+        let original = SigningKey::generate(KID);
+        std::fs::write(&path, original.to_jwk_json().unwrap()).unwrap();
+
+        load_or_create(&path, &codec, KID).unwrap();
+
+        let dir = path.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| {
+                n.starts_with(path.file_name().unwrap().to_str().unwrap())
+                    && n != path.file_name().unwrap().to_str().unwrap()
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -487,8 +660,14 @@ mod tests {
         let codec = Codec::new(Some(KEY)).unwrap();
         load_or_create(&path, &codec, KID).unwrap();
 
+        // Assert no group/other bits rather than an exact 0600: `OpenOptions::mode`
+        // is masked by umask, so a umask of 0o177 legitimately yields 0o400.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "key file mode was {mode:o}, want 600");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "key file mode {mode:o} is group/world readable"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

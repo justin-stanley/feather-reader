@@ -22,6 +22,9 @@ use serde_json::Value;
 
 use super::keys::SigningKey;
 
+/// The only algorithm this module signs or accepts.
+const ALG: &str = "ES256";
+
 /// The JOSE signing input: `base64url(header) . base64url(payload)`.
 fn signing_input(header: &Value, claims: &Value) -> Result<String> {
     let header = serde_json::to_vec(header).context("serializing the JWS header")?;
@@ -43,7 +46,17 @@ fn signing_input(header: &Value, claims: &Value) -> Result<String> {
 /// and the message rather than drawn from an RNG, so there is no nonce-reuse
 /// failure mode here of the kind AES-GCM has.
 pub fn sign(key: &SigningKey, header: &Value, claims: &Value) -> Result<String> {
-    let input = signing_input(header, claims)?;
+    // `alg` is owned here, not taken from the caller: RFC 7515 §4.1.1 makes it
+    // REQUIRED, and a header advertising anything other than what actually
+    // signed is an algorithm-confusion bug. Same reasoning as `guarded_post`
+    // owning the Content-Type.
+    let mut header = header.clone();
+    header
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("JWS header must be a JSON object"))?
+        .insert("alg".into(), Value::String(ALG.into()));
+
+    let input = signing_input(&header, claims)?;
     let signer = EcdsaSigningKey::from(key.secret());
     let signature: Signature = signer.sign(input.as_bytes());
     Ok(format!(
@@ -61,6 +74,21 @@ pub fn verify(key: &SigningKey, jws: &str) -> Result<()> {
     if parts.len() != 3 {
         bail!("malformed JWS: expected 3 segments, got {}", parts.len());
     }
+    // Check the advertised algorithm before spending a verification. The header
+    // is covered by the signature, so a mismatch would fail anyway — but saying
+    // so explicitly means a caller can never be handed a verified-looking JWS
+    // whose header claims an algorithm we did not check.
+    let header: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .context("header is not valid base64url")?,
+    )
+    .context("JWS header is not valid JSON")?;
+    match header.get("alg").and_then(Value::as_str) {
+        Some(ALG) => {}
+        other => bail!("unsupported JWS alg {other:?}; only {ALG} is accepted"),
+    }
+
     let raw = URL_SAFE_NO_PAD
         .decode(parts[2])
         .context("signature is not valid base64url")?;
@@ -109,22 +137,81 @@ mod tests {
         assert_eq!(decode_part(parts[1]), claims);
     }
 
-    /// **The classic ES256 bug.** A DER-encoded ECDSA signature is variable
-    /// length (~70-72 bytes) and is what many ECDSA APIs return by default.
-    /// JOSE requires the fixed-width r||s concatenation — exactly 64 bytes for
-    /// P-256. A DER signature here would be rejected by every verifier.
+    /// **The classic ES256 bug.** JOSE requires the fixed-width `r || s`
+    /// concatenation — exactly 64 bytes for P-256 — while many ECDSA APIs return
+    /// ASN.1 DER by default. For P-256 with random `r`/`s`, DER runs 70-72
+    /// bytes, so the length alone discriminates.
+    ///
+    /// A fresh key per iteration: signing is RFC 6979-deterministic, so reusing
+    /// one key would produce sixteen identical signatures and test nothing.
     #[test]
     fn the_signature_is_fixed_width_r_s_not_der() {
-        let key = SigningKey::generate(KID);
         for _ in 0..16 {
-            let jws = sign(&key, &json!({"alg": "ES256"}), &json!({"n": 1})).unwrap();
+            let key = SigningKey::generate(KID);
+            let jws = sign(&key, &json!({}), &json!({"n": 1})).unwrap();
             let sig = URL_SAFE_NO_PAD
                 .decode(jws.split('.').nth(2).unwrap())
                 .unwrap();
             assert_eq!(sig.len(), 64, "not a fixed-width P-256 JOSE signature");
-            // A DER signature would start with the SEQUENCE tag 0x30.
-            assert_ne!(sig[0], 0x30, "looks like DER");
         }
+    }
+
+    /// `alg` is REQUIRED by RFC 7515 §4.1.1, and a header claiming anything else
+    /// while carrying an ES256 signature is an algorithm-confusion bug waiting
+    /// to happen. `sign` owns the field rather than trusting the caller — the
+    /// same reasoning as `guarded_post` owning Content-Type.
+    #[test]
+    fn sign_owns_the_alg_header_and_overrides_the_caller() {
+        let key = SigningKey::generate(KID);
+        for given in [json!({}), json!({"alg": "RS256"}), json!({"alg": "none"})] {
+            let jws = sign(&key, &given, &json!({"x": 1})).unwrap();
+            assert_eq!(decode_part(jws.split('.').next().unwrap())["alg"], "ES256");
+            assert!(verify(&key, &jws).is_ok());
+        }
+    }
+
+    #[test]
+    fn sign_preserves_the_callers_other_header_members() {
+        let key = SigningKey::generate(KID);
+        let jws = sign(&key, &json!({"typ": "dpop+jwt", "kid": KID}), &json!({})).unwrap();
+        let header = decode_part(jws.split('.').next().unwrap());
+        assert_eq!(header["typ"], "dpop+jwt");
+        assert_eq!(header["kid"], KID);
+        assert_eq!(header["alg"], "ES256");
+    }
+
+    /// A signature that is valid over the bytes but whose header advertises a
+    /// different algorithm must not verify — otherwise a caller could be talked
+    /// into treating an ES256 signature as an RS256 one.
+    #[test]
+    fn verify_rejects_a_header_advertising_another_algorithm() {
+        let key = SigningKey::generate(KID);
+        let jws = sign(&key, &json!({}), &json!({"x": 1})).unwrap();
+        let seg: Vec<&str> = jws.split('.').collect();
+
+        for forged_header in [json!({"alg": "RS256"}), json!({"alg": "none"}), json!({})] {
+            let swapped = format!(
+                "{}.{}.{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged_header).unwrap()),
+                seg[1],
+                seg[2]
+            );
+            assert!(verify(&key, &swapped).is_err(), "accepted {forged_header}");
+        }
+    }
+
+    #[test]
+    fn verify_rejects_a_non_json_header() {
+        let key = SigningKey::generate(KID);
+        let jws = sign(&key, &json!({}), &json!({"x": 1})).unwrap();
+        let seg: Vec<&str> = jws.split('.').collect();
+        let bad = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(b"not json"),
+            seg[1],
+            seg[2]
+        );
+        assert!(verify(&key, &bad).is_err());
     }
 
     #[test]
