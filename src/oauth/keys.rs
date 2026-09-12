@@ -170,6 +170,13 @@ impl SigningKey {
     pub fn kid(&self) -> &str {
         &self.kid
     }
+
+    /// The raw secret, for [`super::jwt`] to sign with. Deliberately
+    /// `pub(crate)`: nothing outside this crate should be able to reach the
+    /// private scalar, and nothing outside [`super::jwt`] needs to.
+    pub(crate) fn secret(&self) -> &SecretKey {
+        &self.secret
+    }
 }
 
 /// Write `contents` to `path` with owner-only permissions.

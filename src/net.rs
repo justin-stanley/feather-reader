@@ -368,6 +368,66 @@ pub async fn guarded_post_json(
     extra_headers: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response> {
+    guarded_post(
+        client,
+        url,
+        HeaderValue::from_static("application/json"),
+        extra_headers,
+        body,
+    )
+    .await
+}
+
+/// Percent-encode `params` as an `application/x-www-form-urlencoded` body.
+///
+/// Every value goes through the serializer rather than string interpolation:
+/// an OAuth form carries the authorization code, the PKCE verifier and the
+/// client assertion, and a raw `&` or `=` in any of them would otherwise splice
+/// an extra parameter into the request.
+pub(crate) fn encode_form(params: &[(&str, &str)]) -> Vec<u8> {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in params {
+        ser.append_pair(k, v);
+    }
+    ser.finish().into_bytes()
+}
+
+/// POST a form-encoded body to a **user-influenced** URL through the SSRF guard.
+///
+/// The OAuth counterpart to [`guarded_post_json`]: PAR, token exchange and
+/// refresh are all `application/x-www-form-urlencoded`. It matters more here
+/// than anywhere else that the guard applies — these are the requests that
+/// carry the client assertion and the authorization code, so an issuer URL
+/// that resolves to loopback or RFC1918 has to fail closed *before* the
+/// credential leaves the process.
+///
+/// Redirects are refused for the same reason as [`guarded_post_json`], and more
+/// acutely: a `307` would re-send the assertion and code to the new host.
+pub async fn guarded_post_form(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    params: &[(&str, &str)],
+) -> Result<Response> {
+    guarded_post(
+        client,
+        url,
+        HeaderValue::from_static("application/x-www-form-urlencoded"),
+        extra_headers,
+        encode_form(params),
+    )
+    .await
+}
+
+/// The shared body of [`guarded_post_json`] and [`guarded_post_form`]. Kept as
+/// one function so the guard cannot drift between the two content types.
+async fn guarded_post(
+    client: &Client,
+    url: &str,
+    content_type: HeaderValue,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    body: Vec<u8>,
+) -> Result<Response> {
     // As in `guarded_get_inner`: `client` is the policy template; the send goes
     // through a freshly built, IP-pinned client.
     let _ = client;
@@ -379,7 +439,7 @@ pub async fn guarded_post_json(
 
     let mut req = hop_client
         .post(target.clone())
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(CONTENT_TYPE, content_type)
         .body(body);
     for (name, value) in extra_headers {
         req = req.header(name.clone(), value.clone());
@@ -768,5 +828,59 @@ pub(crate) mod tests {
         assert_eq!(safe_link("   "), None);
         // A relative/naked path isn't an absolute http(s) URL → dropped.
         assert_eq!(safe_link("/relative/path"), None);
+    }
+
+    /// The OAuth token/PAR calls are form POSTs carrying a client assertion and,
+    /// on the token call, the authorization code. They must go through the SAME
+    /// SSRF guard as everything else: a PDS or issuer URL that resolves to
+    /// loopback/RFC1918 has to fail closed BEFORE the credential is sent.
+    #[tokio::test]
+    async fn guarded_post_form_fails_closed_on_a_forbidden_target() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1:2583/oauth/token",
+            "http://[::1]:2583/oauth/token",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/oauth/token",
+        ] {
+            let err = guarded_post_form(&client, url, &[], &[("grant_type", "authorization_code")])
+                .await
+                .expect_err("must refuse {url}");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("forbidden") || msg.contains("refus") || msg.contains("resolve"),
+                "unexpected error for {url}: {err:#}"
+            );
+        }
+    }
+
+    /// A non-http(s) scheme must be rejected before any DNS work.
+    #[tokio::test]
+    async fn guarded_post_form_rejects_non_http_schemes() {
+        let client = Client::new();
+        assert!(
+            guarded_post_form(&client, "file:///etc/passwd", &[], &[("a", "b")])
+                .await
+                .is_err()
+        );
+    }
+
+    /// Form encoding must percent-encode values; a value containing `&` or `=`
+    /// must not be able to inject an extra parameter into the body.
+    #[test]
+    fn form_body_percent_encodes_and_cannot_inject_parameters() {
+        let body = encode_form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "abc&scope=evil"),
+            ("redirect_uri", "https://x.example/oauth/callback"),
+        ]);
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains("grant_type=authorization_code"));
+        assert!(
+            s.matches("scope=").count() == 0,
+            "a `&` in a value injected a parameter: {s}"
+        );
+        assert!(s.contains("%26"), "the `&` was not encoded: {s}");
+        assert!(s.contains("%3A%2F%2F"), "the `://` was not encoded: {s}");
     }
 }
