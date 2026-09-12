@@ -1366,14 +1366,9 @@ impl SidecarClient {
         did: &str,
     ) -> Result<Vec<(String, Subscription)>> {
         let mut subs = self.list_subscriptions(did).await?;
-        subs.sort_by(|(a_key, a), (b_key, b)| {
-            let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
-            let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
-            a_title
-                .cmp(&b_title)
-                .then_with(|| a.url.cmp(&b.url))
-                .then_with(|| a_key.cmp(b_key))
-        });
+        // The comparator is SHARED with the Rust-native client so the two
+        // cannot order the list differently across the cutover.
+        subs.sort_by(lexicon::sort::subscriptions);
         Ok(subs)
     }
 
@@ -1439,13 +1434,7 @@ impl SidecarClient {
     /// then rkey — so the sidebar order is stable.
     pub async fn list_folders_sorted(&self, did: &str) -> Result<Vec<(String, Folder)>> {
         let mut folders = self.list_folders(did).await?;
-        folders.sort_by(|(a_key, a), (b_key, b)| {
-            a.position
-                .unwrap_or(u64::MAX)
-                .cmp(&b.position.unwrap_or(u64::MAX))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then_with(|| a_key.cmp(b_key))
-        });
+        folders.sort_by(lexicon::sort::folders);
         Ok(folders)
     }
 
@@ -1470,11 +1459,7 @@ impl SidecarClient {
     /// "saved for later" list reads most-recent-first and is stable.
     pub async fn list_saved_sorted(&self, did: &str) -> Result<Vec<(String, Saved)>> {
         let mut saved = self.list_saved(did).await?;
-        saved.sort_by(|(a_key, a), (b_key, b)| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a_key.cmp(b_key))
-        });
+        saved.sort_by(lexicon::sort::saved);
         Ok(saved)
     }
 

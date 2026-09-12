@@ -237,6 +237,194 @@ fn xrpc_error(body: &[u8], status: u16) -> String {
     }
 }
 
+/// The reader's typed surface, over [`Repo`].
+///
+/// Deliberately thin: each method is one repo call plus a parse, and the
+/// orderings come from [`crate::lexicon::sort`], SHARED with the sidecar client
+/// so the two cannot disagree across the cutover. A divergence there would not
+/// be subtle — it would reorder the user's feed list the moment the
+/// implementation swapped.
+impl Repo<'_> {
+    /// List a collection and parse each record into `T`, paired with its rkey.
+    ///
+    /// An unparseable record is SKIPPED with a warning rather than failing the
+    /// list. Records are written by other clients and by future versions of this
+    /// one; one record this build cannot read must not black out the whole feed
+    /// list.
+    async fn list_typed<T: serde::de::DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, T)>> {
+        let records = self.list_all_records(collection).await?;
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            let rkey = record.rkey().unwrap_or_default().to_string();
+            match record.parse::<T>() {
+                Ok(value) => out.push((rkey, value)),
+                Err(err) => tracing::warn!(
+                    collection,
+                    uri = %record.uri,
+                    error = %err,
+                    "skipping unparseable record in collection"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    // ── subscriptions ────────────────────────────────────────────────────────
+
+    pub async fn list_subscriptions(&self) -> Result<Vec<(String, crate::lexicon::Subscription)>> {
+        self.list_typed(crate::lexicon::nsid::SUBSCRIPTION).await
+    }
+
+    /// Every subscription, in the reader's deterministic order.
+    pub async fn list_subscriptions_sorted(
+        &self,
+    ) -> Result<Vec<(String, crate::lexicon::Subscription)>> {
+        let mut subs = self.list_subscriptions().await?;
+        subs.sort_by(crate::lexicon::sort::subscriptions);
+        Ok(subs)
+    }
+
+    /// Subscribe to a feed. Returns the new record's rkey so the caller can
+    /// address it (rename, delete) without re-listing.
+    pub async fn add_subscription(&self, sub: &crate::lexicon::Subscription) -> Result<String> {
+        Ok(self
+            .create_record(crate::lexicon::nsid::SUBSCRIPTION, sub)
+            .await?
+            .into_rkey())
+    }
+
+    pub async fn remove_subscription(&self, rkey: &str) -> Result<()> {
+        self.delete_record(crate::lexicon::nsid::SUBSCRIPTION, rkey)
+            .await
+    }
+
+    /// Replace a subscription in place — retitle, refile, change cadence.
+    pub async fn update_subscription(
+        &self,
+        rkey: &str,
+        sub: &crate::lexicon::Subscription,
+    ) -> Result<()> {
+        self.put_record(crate::lexicon::nsid::SUBSCRIPTION, rkey, sub)
+            .await?;
+        Ok(())
+    }
+
+    /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
+    ///
+    /// One round trip rather than N: an import of several hundred feeds is the
+    /// case this exists for.
+    pub async fn add_subscriptions_bulk(
+        &self,
+        subs: &[crate::lexicon::Subscription],
+    ) -> Result<()> {
+        let writes: Vec<WriteOp> = subs
+            .iter()
+            .map(|sub| WriteOp::Create {
+                collection: crate::lexicon::nsid::SUBSCRIPTION.to_string(),
+                rkey: None,
+                value: serde_json::to_value(sub).unwrap_or(Value::Null),
+            })
+            .collect();
+        self.apply_writes(&writes).await
+    }
+
+    // ── folders ──────────────────────────────────────────────────────────────
+
+    pub async fn list_folders(&self) -> Result<Vec<(String, crate::lexicon::Folder)>> {
+        self.list_typed(crate::lexicon::nsid::FOLDER).await
+    }
+
+    pub async fn list_folders_sorted(&self) -> Result<Vec<(String, crate::lexicon::Folder)>> {
+        let mut folders = self.list_folders().await?;
+        folders.sort_by(crate::lexicon::sort::folders);
+        Ok(folders)
+    }
+
+    pub async fn add_folder(&self, folder: &crate::lexicon::Folder) -> Result<String> {
+        Ok(self
+            .create_record(crate::lexicon::nsid::FOLDER, folder)
+            .await?
+            .into_rkey())
+    }
+
+    /// Delete a folder. Subscriptions referencing it are left alone; a dangling
+    /// reference reads as "unfiled", which is the same behaviour the sidecar
+    /// client has.
+    pub async fn remove_folder(&self, rkey: &str) -> Result<()> {
+        self.delete_record(crate::lexicon::nsid::FOLDER, rkey).await
+    }
+
+    pub async fn rename_folder(&self, rkey: &str, folder: &crate::lexicon::Folder) -> Result<()> {
+        self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder)
+            .await?;
+        Ok(())
+    }
+
+    // ── saved ────────────────────────────────────────────────────────────────
+
+    pub async fn list_saved(&self) -> Result<Vec<(String, crate::lexicon::Saved)>> {
+        self.list_typed(crate::lexicon::nsid::SAVED).await
+    }
+
+    /// Saved entries, newest first.
+    pub async fn list_saved_sorted(&self) -> Result<Vec<(String, crate::lexicon::Saved)>> {
+        let mut saved = self.list_saved().await?;
+        saved.sort_by(crate::lexicon::sort::saved);
+        Ok(saved)
+    }
+
+    pub async fn add_saved(&self, saved: &crate::lexicon::Saved) -> Result<String> {
+        Ok(self
+            .create_record(crate::lexicon::nsid::SAVED, saved)
+            .await?
+            .into_rkey())
+    }
+
+    pub async fn remove_saved(&self, rkey: &str) -> Result<()> {
+        self.delete_record(crate::lexicon::nsid::SAVED, rkey).await
+    }
+
+    // ── read state ───────────────────────────────────────────────────────────
+
+    pub async fn list_read_states(&self) -> Result<Vec<(String, crate::lexicon::ReadState)>> {
+        self.list_typed(crate::lexicon::nsid::READ_STATE).await
+    }
+
+    /// Upsert one read cursor at its feed-derived rkey.
+    pub async fn put_read_state(
+        &self,
+        rkey: &str,
+        state: &crate::lexicon::ReadState,
+    ) -> Result<()> {
+        self.put_record(crate::lexicon::nsid::READ_STATE, rkey, state)
+            .await?;
+        Ok(())
+    }
+
+    /// Flush many dirty read cursors in one `applyWrites`.
+    ///
+    /// Read state changes on nearly every page view, so this is the hottest
+    /// write path in the app; one round trip per flush rather than per feed is
+    /// the whole point.
+    pub async fn flush_read_states(
+        &self,
+        states: &[(String, crate::lexicon::ReadState)],
+    ) -> Result<()> {
+        let writes: Vec<WriteOp> = states
+            .iter()
+            .map(|(rkey, state)| WriteOp::Create {
+                collection: crate::lexicon::nsid::READ_STATE.to_string(),
+                rkey: Some(rkey.clone()),
+                value: serde_json::to_value(state).unwrap_or(Value::Null),
+            })
+            .collect();
+        self.apply_writes(&writes).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
