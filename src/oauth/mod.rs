@@ -13,3 +13,4 @@ pub mod identity;
 pub mod jwt;
 pub mod keys;
 pub mod metadata;
+pub mod store;
