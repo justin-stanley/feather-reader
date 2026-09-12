@@ -1574,7 +1574,11 @@ pub enum WriteOp {
 
 impl WriteOp {
     /// Render this op as the tagged JSON `com.atproto.repo.applyWrites` expects.
-    fn to_json(&self) -> Value {
+    ///
+    /// `pub(crate)` so [`crate::oauth::xrpc`] can build the same batch body.
+    /// Sharing the rendering rather than reimplementing it is what keeps the two
+    /// clients wire-identical across the cutover.
+    pub(crate) fn to_json(&self) -> Value {
         match self {
             WriteOp::Create {
                 collection,

@@ -131,13 +131,37 @@ fn request_headers(
     Ok(headers)
 }
 
-/// One DPoP-authenticated form POST.
+/// What this request carries, and therefore which method it uses.
+///
+/// The method is DERIVED rather than passed alongside the body. A DPoP proof
+/// binds `htm` to the HTTP method, so a mismatch between the two produces a
+/// proof the server rejects — and keeping them in one value makes that
+/// mismatch unrepresentable.
+pub enum DpopBody<'a> {
+    /// A GET; any parameters are already in the URL.
+    Query,
+    /// `application/x-www-form-urlencoded` — the OAuth endpoints.
+    Form(&'a [(&'a str, &'a str)]),
+    /// `application/json` — the XRPC write endpoints.
+    Json(Vec<u8>),
+}
+
+impl DpopBody<'_> {
+    pub(crate) fn method(&self) -> &'static str {
+        match self {
+            DpopBody::Query => "GET",
+            DpopBody::Form(_) | DpopBody::Json(_) => "POST",
+        }
+    }
+}
+
+/// One DPoP-authenticated request.
 ///
 /// Grouped rather than passed positionally so a call site reads as a
 /// description of the request — `Retry::Forbidden` next to the code exchange is
 /// the kind of thing that should be visible at the call, not buried in an
 /// argument list.
-pub struct DpopPost<'a> {
+pub struct DpopRequest<'a> {
     pub endpoint: Endpoint,
     pub url: &'a str,
     /// The session's DPoP key — the same one used from PAR onward.
@@ -145,35 +169,41 @@ pub struct DpopPost<'a> {
     /// Binds the proof via `ath` and is sent as `Authorization: DPoP …`.
     /// `None` for the authorization-server endpoints.
     pub access_token: Option<&'a str>,
-    pub params: &'a [(&'a str, &'a str)],
+    pub body: DpopBody<'a>,
     pub retry: Retry,
 }
 
-/// POST a form with a DPoP proof, retrying once if the server demands a nonce
-/// and [`Retry`] permits it.
-pub async fn post_form_with_dpop(
+/// Send a request with a DPoP proof, retrying once if the server demands a
+/// nonce and [`Retry`] permits it.
+pub async fn send_with_dpop(
     client: &Client,
     pool: &SqlitePool,
-    request: &DpopPost<'_>,
+    request: &DpopRequest<'_>,
 ) -> Result<PostOutcome> {
-    let DpopPost {
+    let DpopRequest {
         endpoint,
         url,
         key,
         access_token,
-        params,
         retry,
+        ref body,
     } = *request;
+    let method = body.method();
     let origin = origin_of(url)?;
     let mut nonce = store::get_nonce(pool, &origin).await?;
 
     for attempt in 0..2 {
-        let proof = dpop::proof(key, "POST", url, access_token, nonce.as_deref())?;
+        let proof = dpop::proof(key, method, url, access_token, nonce.as_deref())?;
         let headers = request_headers(&proof, access_token)?;
 
-        let response = net::guarded_post_form(client, url, &headers, params)
-            .await
-            .with_context(|| format!("posting to {url}"))?;
+        let response = match body {
+            DpopBody::Query => net::guarded_get_no_privacy(client, url, &headers).await,
+            DpopBody::Form(params) => net::guarded_post_form(client, url, &headers, params).await,
+            DpopBody::Json(bytes) => {
+                net::guarded_post_json(client, url, &headers, bytes.clone()).await
+            }
+        }
+        .with_context(|| format!("{method} {url}"))?;
 
         let status = response.status().as_u16();
         let www_authenticate = response
@@ -228,15 +258,15 @@ mod tests {
         store::init_schema(&pool).await.unwrap();
         let key = SigningKey::generate("k");
 
-        let err = post_form_with_dpop(
+        let err = send_with_dpop(
             &Client::new(),
             &pool,
-            &DpopPost {
+            &DpopRequest {
                 endpoint: Endpoint::AuthorizationServer,
                 url: "http://127.0.0.1/oauth/token",
                 key: &key,
                 access_token: None,
-                params: &[("grant_type", "refresh_token")],
+                body: DpopBody::Form(&[("grant_type", "refresh_token")]),
                 retry: Retry::Allowed,
             },
         )
@@ -309,6 +339,18 @@ mod tests {
     #[test]
     fn no_challenge_means_no_retry() {
         assert!(next_nonce(0, Retry::Allowed, None, None).is_none());
+    }
+
+    // ── request shape ────────────────────────────────────────────────────────
+
+    /// The DPoP proof's `htm` must match the method actually sent, so the method
+    /// is derived from the body rather than passed alongside it — there is no
+    /// way for the two to disagree.
+    #[test]
+    fn the_method_follows_the_body_kind() {
+        assert_eq!(DpopBody::Query.method(), "GET");
+        assert_eq!(DpopBody::Form(&[("a", "b")]).method(), "POST");
+        assert_eq!(DpopBody::Json(b"{}".to_vec()).method(), "POST");
     }
 
     // ── headers ──────────────────────────────────────────────────────────────

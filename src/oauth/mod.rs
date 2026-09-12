@@ -20,3 +20,4 @@ pub mod resolve;
 pub mod session;
 pub mod store;
 pub mod token;
+pub mod xrpc;

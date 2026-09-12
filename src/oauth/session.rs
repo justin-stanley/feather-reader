@@ -171,15 +171,15 @@ async fn refresh_locked(
     )?);
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let outcome = super::request::post_form_with_dpop(
+    let outcome = super::request::send_with_dpop(
         http,
         pool,
-        &super::request::DpopPost {
+        &super::request::DpopRequest {
             endpoint: super::dpop::Endpoint::AuthorizationServer,
             url: ctx.token_endpoint,
             key: &key,
             access_token: None,
-            params: &borrowed,
+            body: super::request::DpopBody::Form(&borrowed),
             // A refresh is safe to repeat on a nonce challenge: unlike the code
             // exchange, a rejected attempt consumes nothing.
             retry: super::request::Retry::Allowed,
