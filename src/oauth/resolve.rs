@@ -40,13 +40,45 @@ pub fn resolver() -> Result<TokioResolver> {
 /// lookup. An error means records exist but are unusable — two different `did=`
 /// values, say — which must NOT fall through, because resolving a handle two
 /// ways and taking whichever answers is how you resolve to the wrong account.
+/// Whether a resolver error means "this name has no such record", as opposed to
+/// a failure to find out which.
+fn is_no_records(err: &hickory_resolver::net::NetError) -> bool {
+    matches!(
+        err,
+        hickory_resolver::net::NetError::Dns(hickory_resolver::net::DnsError::NoRecordsFound(_))
+    )
+}
+
+/// The name to query, **fully qualified**.
+///
+/// The trailing dot is load-bearing. hickory's `build_names` short-circuits only
+/// on `is_fqdn()`; without it, the host's `search` domains are appended and
+/// `_atproto.victim.example` is also queried as
+/// `_atproto.victim.example.<search-domain>`. Whoever controls that domain can
+/// then answer for any handle that has no TXT record of its own — and because
+/// DNS is tried first, the well-known lookup never runs, so the substitution is
+/// total. Kubernetes always sets a search domain; so do most LANs.
+///
+/// Node's `dns.resolveTxt` issues the name as given (c-ares does not apply the
+/// search list), which is why the reference implementation never needed this.
+fn txt_query_name(handle: &str) -> String {
+    format!("_atproto.{}.", handle.trim_end_matches('.'))
+}
+
 pub async fn did_from_dns(resolver: &TokioResolver, handle: &str) -> Result<Option<String>> {
-    let name = format!("_atproto.{handle}");
+    let name = txt_query_name(handle);
     let lookup = match resolver.txt_lookup(&name).await {
         Ok(lookup) => lookup,
-        // NXDOMAIN and friends are "no record", not a failure: the well-known
-        // route is the documented alternative.
-        Err(_) => return Ok(None),
+        // ONLY "no records" is absence. Everything else — SERVFAIL, timeout,
+        // refused, a name too long to construct — is a failure and must NOT
+        // fall through to the well-known path: an attacker who can induce a
+        // resolver error would otherwise choose which of the two mechanisms
+        // answers, and the HTTP one is the weaker.
+        Err(err) if is_no_records(&err) => return Ok(None),
+        Err(err) => {
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("resolving the {name} TXT record"))
+        }
     };
 
     // One joined value per RECORD. A record's character-strings concatenate;
@@ -160,6 +192,30 @@ pub async fn resolve(
 mod tests {
     use super::*;
 
+    /// **The query name must be FULLY QUALIFIED.**
+    ///
+    /// Without the trailing dot, hickory appends the host's `search` domains
+    /// (`build_names` short-circuits only on `is_fqdn()`), so
+    /// `_atproto.victim.example` is ALSO queried as
+    /// `_atproto.victim.example.<search-domain>`. Whoever controls that domain
+    /// then answers for any handle lacking a TXT record — and since DNS is tried
+    /// first, the well-known lookup never runs. Kubernetes always has a search
+    /// domain; so do most corporate and home LANs.
+    ///
+    /// Node's `dns.resolveTxt` goes through c-ares, which issues the name as
+    /// given, so the reference implementation never had this and the port
+    /// acquired it silently.
+    #[test]
+    fn the_txt_query_name_is_fully_qualified() {
+        let name = txt_query_name("alice.example.com");
+        assert!(
+            name.ends_with('.'),
+            "not an FQDN, so the DNS search list applies: {name}"
+        );
+        assert_eq!(name, "_atproto.alice.example.com.");
+        assert!(!name.contains(".."), "double dot in {name}");
+    }
+
     /// A handle that does not exist must be reported as absent, not as an
     /// error — the well-known route is the documented fallback and has to be
     /// reachable.
@@ -168,6 +224,33 @@ mod tests {
         let resolver = resolver().unwrap();
         let result = did_from_dns(&resolver, "nonexistent-handle.invalid").await;
         assert!(matches!(result, Ok(None)), "got {result:?}");
+    }
+
+    /// **A resolver FAILURE is not "no record".** Treating every error as absent
+    /// silently downgrades resolution to the HTTP path, which is the weaker of
+    /// the two — and an off-path attacker who can force SERVFAIL or a timeout
+    /// gets to choose that downgrade.
+    ///
+    /// This case needs no network manipulation: a 251-character handle passes
+    /// `normalize_handle` (every label is within 63 bytes) but `_atproto.` + 251
+    /// exceeds the 255-byte DNS name limit, so name construction fails before a
+    /// query is ever issued.
+    #[tokio::test]
+    async fn a_resolver_failure_is_an_error_rather_than_absence() {
+        let label = "a".repeat(60);
+        let handle = format!("{label}.{label}.{label}.{label}.com");
+        assert!(handle.len() > 240 && handle.len() <= 253);
+        assert!(
+            identity::normalize_handle(&handle).is_ok(),
+            "the handle itself must be valid, or the test proves nothing"
+        );
+
+        let resolver = resolver().unwrap();
+        let result = did_from_dns(&resolver, &handle).await;
+        assert!(
+            result.is_err(),
+            "a name-construction failure was reported as 'no record': {result:?}"
+        );
     }
 
     /// The well-known fallback still goes through the SSRF guard, asserted on

@@ -19,7 +19,8 @@ use feather_reader::oauth::{
     discovery, dpop, fetch, flow,
     keys::SigningKey,
     metadata::{self, ClientConfig},
-    request, resolve, store, token,
+    request::{self, Retry},
+    resolve, store, token,
 };
 use reqwest::Client;
 use std::io::{BufRead, BufReader, Write};
@@ -124,11 +125,15 @@ async fn main() -> Result<()> {
     let outcome = request::post_form_with_dpop(
         &http,
         &pool,
-        dpop::Endpoint::AuthorizationServer,
-        &server.par_endpoint,
-        &session_key,
-        None,
-        &borrowed,
+        &request::DpopPost {
+            endpoint: dpop::Endpoint::AuthorizationServer,
+            url: &server.par_endpoint,
+            key: &session_key,
+            access_token: None,
+            params: &borrowed,
+            // PAR is safe to repeat: nothing is consumed by a rejected attempt.
+            retry: Retry::Allowed,
+        },
     )
     .await?;
     println!("  status     {}", outcome.status);
@@ -221,11 +226,17 @@ async fn main() -> Result<()> {
     let outcome = request::post_form_with_dpop(
         &http,
         &pool,
-        dpop::Endpoint::AuthorizationServer,
-        &server.token_endpoint,
-        &key,
-        None,
-        &borrowed,
+        &request::DpopPost {
+            endpoint: dpop::Endpoint::AuthorizationServer,
+            url: &server.token_endpoint,
+            key: &key,
+            access_token: None,
+            params: &borrowed,
+            // The code exchange must NOT be repeated: re-POSTing the same
+            // `code` can burn it, and the login then fails after the user has
+            // already approved.
+            retry: Retry::Forbidden,
+        },
     )
     .await?;
     println!("  status     {}", outcome.status);
