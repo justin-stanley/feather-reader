@@ -6,6 +6,7 @@
 //! reversible. See [`crypto`] for that format.
 
 pub mod crypto;
+pub mod dpop;
 pub mod jwt;
 pub mod keys;
 pub mod metadata;
