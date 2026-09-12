@@ -191,6 +191,17 @@ async fn refresh_locked(
         let response = super::token::parse_token_response(&outcome.json()?)?;
         let updated = apply_refresh(session, &response, now)?;
         super::store::put_session(pool, codec, &updated).await?;
+        // Logged because a refresh is otherwise INVISIBLE: it rotates both
+        // tokens and is the one path that can silently end a session, but it
+        // happens inside an ordinary page load and the metrics record that call
+        // no differently. Without this line, "everyone was logged out overnight"
+        // has nothing to correlate against. No token material is logged — only
+        // that it happened, and when the replacement expires.
+        tracing::info!(
+            sub = %updated.sub,
+            expires_at = ?updated.expires_at,
+            "refreshed the OAuth session"
+        );
         return Ok(updated);
     }
 
