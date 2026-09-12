@@ -5,13 +5,16 @@
 //! test server, so decisions that live inside an HTTP round trip are effectively
 //! untestable; keeping them out here is deliberate.
 //!
-//! The security-critical piece is [`verify_callback`]. A server-side client
+//! The security-critical piece is [`complete_callback`]. A server-side client
 //! stores `state` in a table that is global to the process, not per-browser, so
 //! an unguessable single-use `state` is **not** sufficient on its own: an
 //! attacker can start a login with their own account and induce a victim's
 //! browser to fetch the resulting callback URL, and the victim ends up holding a
 //! session for the attacker's account — reading their feeds, writing into their
-//! repo. The browser-binding cookie is what closes that.
+//! repo. The browser-binding cookie is what closes that, and
+//! [`complete_callback`] exists so the check cannot be left out — it consumes
+//! the pending row, verifies the binding, and validates the response as one
+//! operation, rather than three functions a caller must remember to chain.
 
 use anyhow::{bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -45,6 +48,15 @@ pub fn new_pkce_verifier() -> String {
 /// parameter here to get wrong.
 pub fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref())
+}
+
+/// A fresh `state`.
+///
+/// Unguessable is not optional: the spec requires that it "can not be forged or
+/// guessed by an untrusted party", and it is also the row key the at-rest AAD
+/// binds against, so its entropy is load-bearing in two places.
+pub fn new_state() -> String {
+    random_token(VERIFIER_BYTES)
 }
 
 /// A fresh browser-binding token, to be set as a cookie before the redirect.
@@ -100,6 +112,11 @@ pub fn par_params(request: &ParRequest<'_>) -> Vec<(&'static str, String)> {
         ("state", request.state.to_string()),
         ("redirect_uri", request.redirect_uri.to_string()),
         ("scope", request.scope.to_string()),
+        // Explicit, not left to the server. A server-side handler cannot read a
+        // fragment, so `response_mode=fragment` makes the callback structurally
+        // invisible -- the flow fails with "no state" and the code that would
+        // explain it never reaches us.
+        ("response_mode", "query".to_string()),
     ];
     if let Some(hint) = request.login_hint {
         params.push(("login_hint", hint.to_string()));
@@ -164,6 +181,31 @@ pub fn authorize_url(
     Ok(url.to_string())
 }
 
+/// OAuth error codes we will echo verbatim. Anything else is reduced, because
+/// the `error` parameter is server-controlled free text like any other.
+const KNOWN_ERRORS: [&str; 11] = [
+    "access_denied",
+    "consent_required",
+    "interaction_required",
+    "invalid_grant",
+    "invalid_request",
+    "invalid_scope",
+    "login_required",
+    "server_error",
+    "temporarily_unavailable",
+    "unauthorized_client",
+    "unsupported_response_type",
+];
+
+/// Reduce a server-supplied error code to a known slug.
+fn known_error_slug(raw: &str) -> &'static str {
+    KNOWN_ERRORS
+        .iter()
+        .find(|known| **known == raw)
+        .copied()
+        .unwrap_or("unrecognized_error")
+}
+
 /// What the authorization server sent back to the redirect URI.
 #[derive(Debug, Default, Clone)]
 pub struct CallbackParams {
@@ -197,13 +239,10 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
     if state.is_empty() {
         bail!("authorization response carries no `state`");
     }
-    // An error wins over a code: a response carrying both is not one to
-    // interpret.
-    if let Some(error) = params.error.as_deref() {
-        let description = params.error_description.as_deref().unwrap_or("");
-        bail!("authorization server returned error {error:?} {description:?}");
-    }
-
+    // `iss` is validated BEFORE any error is reported. RFC 9207 §2.4: "For error
+    // responses, clients MUST NOT assume that the error originates from the
+    // intended authorization server." Reporting first would let anyone able to
+    // make a browser fetch this URL tell the user their own server denied them.
     let iss = params
         .iss
         .as_deref()
@@ -212,11 +251,66 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
         bail!("authorization response `iss` is {iss:?}, expected {expected_issuer:?}");
     }
 
+    // An error wins over a code: a response carrying both is not one to
+    // interpret. Only a KNOWN code is echoed, and the free-form
+    // `error_description` is dropped entirely -- both are server-controlled
+    // text, and whatever the caller does with an error message should not
+    // inherit an injection surface from them.
+    if let Some(error) = params.error.as_deref() {
+        bail!(
+            "authorization server returned error {:?}",
+            known_error_slug(error)
+        );
+    }
+
     let code = params.code.as_deref().unwrap_or_default();
     if code.is_empty() {
         bail!("authorization response carries no `code`");
     }
     Ok(code.to_string())
+}
+
+/// Consume the pending login, check the browser binding, and validate the
+/// callback — in that order, as one operation.
+///
+/// These three steps were previously three free functions with nothing forcing
+/// the middle one to happen. That matters more than it sounds: the binding check
+/// is the single control standing between a server-global `state` table and a
+/// login-CSRF that hands a victim a session for the attacker's account. A caller
+/// that forgot it would still compile, still pass every test, and still work
+/// perfectly for every non-malicious login. Returning the code only from here
+/// makes the omission unrepresentable rather than merely discouraged.
+///
+/// The row is consumed **whatever happens next**, including a binding failure —
+/// so a mismatched cookie cannot simply be retried.
+pub async fn complete_callback(
+    pool: &sqlx::SqlitePool,
+    codec: &super::crypto::Codec,
+    params: &CallbackParams,
+    presented_cookie: Option<&str>,
+    now: i64,
+) -> Result<(super::store::PendingAuth, String)> {
+    if params.response.is_some() {
+        bail!("authorization response uses JARM, which is not supported");
+    }
+    let state = params.state.as_deref().unwrap_or_default();
+    if state.is_empty() {
+        bail!("authorization response carries no `state`");
+    }
+
+    let pending = super::store::take_pending(pool, codec, state, now)
+        .await?
+        .context("no pending login for that `state` (unknown, expired, or already used)")?;
+
+    if !binding_matches(&pending.browser_binding_hash, presented_cookie) {
+        bail!(
+            "the callback did not present the browser-binding cookie for this login; \
+             refusing to complete a flow this browser did not start"
+        );
+    }
+
+    let code = verify_callback(params, &pending.issuer)?;
+    Ok((pending, code))
 }
 
 #[cfg(test)]
@@ -276,12 +370,15 @@ mod tests {
 
     // ── browser binding ──────────────────────────────────────────────────────
 
+    /// Asserts the ACTUAL length, not a lower bound a regression could slip
+    /// under: 32 CSPRNG bytes is 43 base64url characters, and a `>= 22` bound
+    /// would have accepted a silent drop to 16 bytes.
     #[test]
     fn a_binding_token_is_fresh_and_unguessable() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
             let token = new_binding_token();
-            assert!(token.len() >= 22, "token too short: {token}");
+            assert_eq!(token.len(), 43, "binding token is not 32 bytes: {token}");
             assert!(seen.insert(token), "binding token repeated");
         }
     }
@@ -293,6 +390,42 @@ mod tests {
         assert!(binding_matches(&hash, Some(&token)));
         assert!(!binding_matches(&hash, Some(&new_binding_token())));
         assert!(!binding_matches(&hash, Some("")));
+    }
+
+    /// A prefix of the real hash must not match — a `starts_with` comparison
+    /// would let a one-character stored value accept everything.
+    #[test]
+    fn a_truncated_stored_hash_does_not_match() {
+        let token = new_binding_token();
+        let hash = binding_hash(&token);
+        for len in [1, 8, hash.len() - 1] {
+            assert!(
+                !binding_matches(&hash[..len], Some(&token)),
+                "a {len}-character prefix matched"
+            );
+        }
+    }
+
+    /// **The mistake the hash-vs-raw design exists to prevent.** If the stored
+    /// value were the token itself rather than its hash, a database read would
+    /// yield a directly replayable cookie. Storing the raw token must therefore
+    /// NOT authenticate.
+    #[test]
+    fn a_raw_token_stored_as_the_hash_does_not_match() {
+        let token = new_binding_token();
+        assert!(!binding_matches(&token, Some(&token)));
+    }
+
+    /// A state value must be unguessable and fresh; it is also the row key that
+    /// the AAD binds against, so its entropy is load-bearing twice over.
+    #[test]
+    fn every_state_is_fresh_and_full_length() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let state = new_state();
+            assert_eq!(state.len(), 43, "state is not 32 bytes of base64url");
+            assert!(seen.insert(state), "state repeated");
+        }
     }
 
     /// **A callback with no cookie is by definition not the browser that started
@@ -346,6 +479,24 @@ mod tests {
     fn the_challenge_method_is_always_s256() {
         let params = par_params(&par_input());
         assert!(!params.iter().any(|(_, v)| v == "plain"));
+    }
+
+    /// **`response_mode=query` must be explicit.** A server-side handler cannot
+    /// read a fragment at all: with `fragment`, the browser lands on
+    /// `/oauth/callback#code=…` and the server sees no parameters whatsoever.
+    /// The flow then dies with "no state", and the one diagnostic that would
+    /// explain it is structurally invisible. The atproto spec does not
+    /// constrain the AS's default, so nothing but this parameter does.
+    #[test]
+    fn the_response_mode_is_pinned_to_query() {
+        let params = par_params(&par_input());
+        assert_eq!(
+            params
+                .iter()
+                .find(|(name, _)| *name == "response_mode")
+                .map(|(_, v)| v.as_str()),
+            Some("query")
+        );
     }
 
     #[test]
@@ -478,6 +629,57 @@ mod tests {
         assert!(format!("{err:#}").contains("access_denied"));
     }
 
+    /// **RFC 9207 §2.4: "For error responses, clients MUST NOT assume that the
+    /// error originates from the intended authorization server."** So `iss` is
+    /// validated BEFORE an error is reported — otherwise anyone who can make a
+    /// browser fetch the callback URL can tell the user their own server denied
+    /// them, having proved nothing.
+    #[test]
+    fn an_error_from_the_wrong_issuer_is_reported_as_a_mismatch() {
+        let mut params = ok_params();
+        params.code = None;
+        params.error = Some("access_denied".into());
+        params.iss = Some("https://evil.example.com".into());
+        let rendered = format!("{:#}", verify_callback(&params, ISSUER).unwrap_err());
+        assert!(
+            rendered.contains("iss"),
+            "reported the error before checking who sent it: {rendered}"
+        );
+        assert!(!rendered.contains("access_denied"));
+    }
+
+    /// The free-form `error_description` is server-controlled text. Passing it
+    /// through means whatever the orchestration layer does with an error message
+    /// inherits an injection surface, so it is dropped at this boundary and the
+    /// code is reduced to a known slug.
+    #[test]
+    fn server_supplied_error_text_is_not_passed_through() {
+        let mut params = ok_params();
+        params.code = None;
+        params.error = Some("access_denied".into());
+        params.error_description = Some("<img src=x onerror=alert(1)>".into());
+        let rendered = format!("{:#}", verify_callback(&params, ISSUER).unwrap_err());
+        assert!(
+            !rendered.contains("<img"),
+            "raw description leaked: {rendered}"
+        );
+        assert!(!rendered.contains("onerror"));
+    }
+
+    /// An unrecognized error code is itself free-form, so it is reduced too
+    /// rather than echoed.
+    #[test]
+    fn an_unknown_error_code_is_reduced_to_a_slug() {
+        let mut params = ok_params();
+        params.code = None;
+        params.error = Some("<script>alert(1)</script>".into());
+        let rendered = format!("{:#}", verify_callback(&params, ISSUER).unwrap_err());
+        assert!(
+            !rendered.contains("<script>"),
+            "raw code leaked: {rendered}"
+        );
+    }
+
     /// An `error` wins even when a `code` is also present: a response carrying
     /// both is not one we should try to make sense of.
     #[test]
@@ -510,5 +712,116 @@ mod tests {
         let mut params = ok_params();
         params.state = None;
         assert!(verify_callback(&params, ISSUER).is_err());
+    }
+
+    // ── complete_callback: the three steps as one ────────────────────────────
+
+    async fn pending_db(cookie_hash: &str) -> (sqlx::SqlitePool, crate::oauth::crypto::Codec) {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::oauth::store::init_schema(&pool).await.unwrap();
+        let codec = crate::oauth::crypto::Codec::new(Some("a".repeat(43).as_str())).unwrap();
+        let pending = crate::oauth::store::PendingAuth {
+            state: "state-value".into(),
+            browser_binding_hash: cookie_hash.into(),
+            pkce_verifier: "verifier".into(),
+            dpop_key_jwk: "{}".into(),
+            issuer: ISSUER.into(),
+            pds_url: "https://pds.example.com".into(),
+            did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
+            auth_method: "private_key_jwt".into(),
+            auth_kid: None,
+            redirect_uri: "https://feather-reader.com/oauth/callback".into(),
+            requested_scope: "atproto".into(),
+            request_uri: "urn:x".into(),
+            app_return_to: None,
+            expires_at: 2_000_000_000,
+        };
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+        (pool, codec)
+    }
+
+    #[tokio::test]
+    async fn complete_callback_returns_the_code_for_the_right_browser() {
+        let cookie = new_binding_token();
+        let (pool, codec) = pending_db(&binding_hash(&cookie)).await;
+        let (pending, code) =
+            complete_callback(&pool, &codec, &ok_params(), Some(&cookie), 1_700_000_000)
+                .await
+                .unwrap();
+        assert_eq!(code, "the-code");
+        assert_eq!(pending.pkce_verifier, "verifier");
+    }
+
+    /// **The login-CSRF case.** Another browser fetching the callback URL has no
+    /// cookie, so it must not complete the flow -- and the row must be gone, so
+    /// the real browser cannot be raced afterwards either.
+    #[tokio::test]
+    async fn complete_callback_refuses_a_browser_that_did_not_start_the_flow() {
+        let cookie = new_binding_token();
+        for presented in [None, Some(new_binding_token())] {
+            let (pool, codec) = pending_db(&binding_hash(&cookie)).await;
+            assert!(complete_callback(
+                &pool,
+                &codec,
+                &ok_params(),
+                presented.as_deref(),
+                1_700_000_000
+            )
+            .await
+            .is_err());
+
+            // Consumed regardless, so a mismatched cookie cannot be retried.
+            assert!(
+                complete_callback(&pool, &codec, &ok_params(), Some(&cookie), 1_700_000_000)
+                    .await
+                    .is_err(),
+                "the pending row survived a failed binding check"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_callback_rejects_an_unknown_or_expired_state() {
+        let cookie = new_binding_token();
+        let (pool, codec) = pending_db(&binding_hash(&cookie)).await;
+
+        let mut unknown = ok_params();
+        unknown.state = Some("never-existed".into());
+        assert!(
+            complete_callback(&pool, &codec, &unknown, Some(&cookie), 1_700_000_000)
+                .await
+                .is_err()
+        );
+
+        // Expired: `now` past the row's expiry.
+        assert!(
+            complete_callback(&pool, &codec, &ok_params(), Some(&cookie), 2_000_000_001)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The binding is checked BEFORE the code is returned, so a wrong issuer or
+    /// an error response cannot be used to probe with the wrong cookie either.
+    #[tokio::test]
+    async fn complete_callback_checks_the_binding_before_anything_else_about_the_response() {
+        let cookie = new_binding_token();
+        let (pool, codec) = pending_db(&binding_hash(&cookie)).await;
+
+        let mut denied = ok_params();
+        denied.code = None;
+        denied.error = Some("access_denied".into());
+        let rendered = format!(
+            "{:#}",
+            complete_callback(&pool, &codec, &denied, None, 1_700_000_000)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            rendered.contains("browser-binding"),
+            "reported the response before checking the browser: {rendered}"
+        );
     }
 }

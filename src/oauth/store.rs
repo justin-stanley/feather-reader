@@ -10,10 +10,14 @@
 //!   loser destroys the winner's session. One statement, `RETURNING`, zero rows
 //!   means rejected.
 //!
-//! * **Secret columns are AAD-bound to their row.** Each ciphertext is sealed
-//!   against `oauth_state:<state>:<column>` (or `oauth_session:<sub>:<column>`),
-//!   so a value lifted into another row — or another column of the same row —
-//!   fails to authenticate rather than decrypting into the wrong place. See
+//! * **Secrets are AAD-bound to their row, column, AND destinations.** Binding
+//!   only the secrets is not enough: the declared adversary is anything able to
+//!   write the database, and against that adversary a plain unauthenticated
+//!   `aud` or `issuer` column defeats the scheme without touching a ciphertext
+//!   at all — repoint the PDS and a live DPoP-bound token is sent to the
+//!   attacker's host, with everything still decrypting perfectly. So the AAD
+//!   covers the destinations too, and is length-prefixed rather than
+//!   delimiter-joined so no rearrangement of fields can collide. See
 //!   [`super::crypto`]; the unbound `enc.v1` form is rejected outright here.
 
 use anyhow::{Context as _, Result};
@@ -84,14 +88,68 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Build an AAD from a table name and a list of fields, **length-prefixed**.
+///
+/// Not delimiter-joined. A `table:field:field` encoding is only unambiguous
+/// while no field can contain the delimiter, and the fields here include
+/// `did:web:…` subjects and URL issuers — precisely the inputs that erode that
+/// assumption. Length prefixes make the encoding injective unconditionally,
+/// rather than by an invariant nobody is enforcing.
+fn structured_aad(table: &str, fields: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for field in std::iter::once(&table).chain(fields.iter()) {
+        out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        out.extend_from_slice(field.as_bytes());
+    }
+    out
+}
+
 /// The AAD a state-row secret is sealed against.
-fn state_aad(state: &str, column: &str) -> Vec<u8> {
-    format!("oauth_state:{state}:{column}").into_bytes()
+///
+/// It covers the **destinations**, not just the row and column. Binding only the
+/// secrets leaves `issuer`/`pds_url`/`did`/`redirect_uri` as plain
+/// unauthenticated columns — and against the declared adversary (anything able
+/// to write the database) the scheme is then defeated without touching a
+/// ciphertext at all: repoint the issuer and we mint a client assertion for the
+/// attacker's server and neutralise the `iss` check, while every secret still
+/// decrypts perfectly.
+///
+/// `browser_binding_hash` is in here for the same reason — it is the only thing
+/// standing between a server-global state table and a login-CSRF, so it must not
+/// be swappable either.
+#[allow(clippy::too_many_arguments)]
+fn state_aad(
+    state: &str,
+    column: &str,
+    issuer: &str,
+    pds_url: &str,
+    did: &str,
+    redirect_uri: &str,
+    browser_binding_hash: &str,
+    auth_method: &str,
+) -> Vec<u8> {
+    structured_aad(
+        "oauth_state",
+        &[
+            state,
+            column,
+            issuer,
+            pds_url,
+            did,
+            redirect_uri,
+            browser_binding_hash,
+            auth_method,
+        ],
+    )
 }
 
 /// The AAD a session-row secret is sealed against.
-fn session_aad(sub: &str, column: &str) -> Vec<u8> {
-    format!("oauth_session:{sub}:{column}").into_bytes()
+///
+/// `aud` is the PDS every subsequent request is built against, so it is bound:
+/// repointing it would otherwise ship a live DPoP-bound access token to a host
+/// of the attacker's choosing, with the tokens decrypting perfectly.
+fn session_aad(sub: &str, column: &str, issuer: &str, aud: &str) -> Vec<u8> {
+    structured_aad("oauth_session", &[sub, column, issuer, aud])
 }
 
 /// An in-flight login.
@@ -147,9 +205,30 @@ pub async fn put_pending(pool: &SqlitePool, codec: &Codec, auth: &PendingAuth) -
     .bind(&auth.browser_binding_hash)
     .bind(codec.encrypt_bound(
         &auth.pkce_verifier,
-        &state_aad(&auth.state, "pkce_verifier"),
+        &state_aad(
+            &auth.state,
+            "pkce_verifier",
+            &auth.issuer,
+            &auth.pds_url,
+            &auth.did,
+            &auth.redirect_uri,
+            &auth.browser_binding_hash,
+            &auth.auth_method,
+        ),
     ))
-    .bind(codec.encrypt_bound(&auth.dpop_key_jwk, &state_aad(&auth.state, "dpop_key_jwk")))
+    .bind(codec.encrypt_bound(
+        &auth.dpop_key_jwk,
+        &state_aad(
+            &auth.state,
+            "dpop_key_jwk",
+            &auth.issuer,
+            &auth.pds_url,
+            &auth.did,
+            &auth.redirect_uri,
+            &auth.browser_binding_hash,
+            &auth.auth_method,
+        ),
+    ))
     .bind(&auth.issuer)
     .bind(&auth.pds_url)
     .bind(&auth.did)
@@ -195,18 +274,33 @@ pub async fn take_pending(
     .context("consuming the pending login")?;
 
     let Some(row) = row else { return Ok(None) };
-    if row.expires_at < now {
+    // Expired AT `expires_at`, not one second later.
+    if row.expires_at <= now {
         // Deleted above regardless; an expired flow is simply gone.
         return Ok(None);
     }
 
+    // The AAD is rebuilt from the STORED destinations, so any edit to them
+    // makes the secrets undecryptable rather than merely unnoticed.
+    let aad = |column: &str| {
+        state_aad(
+            &row.state,
+            column,
+            &row.issuer,
+            &row.pds_url,
+            &row.did,
+            &row.redirect_uri,
+            &row.browser_binding_hash,
+            &row.auth_method,
+        )
+    };
     Ok(Some(PendingAuth {
         pkce_verifier: codec
-            .decrypt_bound(&row.pkce_verifier, &state_aad(&row.state, "pkce_verifier"))
-            .context("decrypting the stored PKCE verifier")?,
+            .decrypt_bound(&row.pkce_verifier, &aad("pkce_verifier"))
+            .context("decrypting the stored PKCE verifier (or its bound context was altered)")?,
         dpop_key_jwk: codec
-            .decrypt_bound(&row.dpop_key_jwk, &state_aad(&row.state, "dpop_key_jwk"))
-            .context("decrypting the stored DPoP key")?,
+            .decrypt_bound(&row.dpop_key_jwk, &aad("dpop_key_jwk"))
+            .context("decrypting the stored DPoP key (or its bound context was altered)")?,
         state: row.state,
         browser_binding_hash: row.browser_binding_hash,
         issuer: row.issuer,
@@ -277,15 +371,15 @@ pub async fn put_session(pool: &SqlitePool, codec: &Codec, session: &OAuthSessio
     .bind(&session.aud)
     .bind(codec.encrypt_bound(
         &session.dpop_key_jwk,
-        &session_aad(&session.sub, "dpop_key_jwk"),
+        &session_aad(&session.sub, "dpop_key_jwk", &session.issuer, &session.aud),
     ))
     .bind(codec.encrypt_bound(
         &session.access_token,
-        &session_aad(&session.sub, "access_token"),
+        &session_aad(&session.sub, "access_token", &session.issuer, &session.aud),
     ))
     .bind(codec.encrypt_bound(
         &session.refresh_token,
-        &session_aad(&session.sub, "refresh_token"),
+        &session_aad(&session.sub, "refresh_token", &session.issuer, &session.aud),
     ))
     .bind(&session.token_type)
     .bind(&session.granted_scope)
@@ -315,16 +409,17 @@ pub async fn get_session(
     .context("reading the OAuth session")?;
 
     let Some(row) = row else { return Ok(None) };
+    let aad = |column: &str| session_aad(&row.sub, column, &row.issuer, &row.aud);
     Ok(Some(OAuthSession {
         dpop_key_jwk: codec
-            .decrypt_bound(&row.dpop_key_jwk, &session_aad(&row.sub, "dpop_key_jwk"))
-            .context("decrypting the session DPoP key")?,
+            .decrypt_bound(&row.dpop_key_jwk, &aad("dpop_key_jwk"))
+            .context("decrypting the session DPoP key (or its bound context was altered)")?,
         access_token: codec
-            .decrypt_bound(&row.access_token, &session_aad(&row.sub, "access_token"))
-            .context("decrypting the stored access token")?,
+            .decrypt_bound(&row.access_token, &aad("access_token"))
+            .context("decrypting the stored access token (or its bound context was altered)")?,
         refresh_token: codec
-            .decrypt_bound(&row.refresh_token, &session_aad(&row.sub, "refresh_token"))
-            .context("decrypting the stored refresh token")?,
+            .decrypt_bound(&row.refresh_token, &aad("refresh_token"))
+            .context("decrypting the stored refresh token (or its bound context was altered)")?,
         sub: row.sub,
         issuer: row.issuer,
         aud: row.aud,
@@ -342,6 +437,22 @@ pub async fn delete_session(pool: &SqlitePool, sub: &str) -> Result<bool> {
         .await
         .context("deleting the OAuth session")?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Delete every pending login that has expired. Returns how many went.
+///
+/// An abandoned login -- the user is redirected and closes the tab -- leaves a
+/// row holding a sealed DPoP key and is never consumed by `take_pending`, which
+/// only runs when a callback arrives. Without this they accumulate forever, and
+/// on a publicly reachable login form that is an unbounded write primitive
+/// against the volume.
+pub async fn sweep_expired_pending(pool: &SqlitePool, now: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM oauth_state WHERE expires_at <= ?1")
+        .bind(now)
+        .execute(pool)
+        .await
+        .context("sweeping expired pending logins")?;
+    Ok(result.rows_affected())
 }
 
 /// The stored DPoP nonce for an origin, if any.
@@ -385,6 +496,12 @@ mod tests {
         let pool = init_url("sqlite::memory:").await.unwrap();
         init_schema(&pool).await.unwrap();
         (pool, Codec::new(Some(KEY)).unwrap())
+    }
+
+    /// `sqlx::query` demands a `&'static str`, so a test that varies a COLUMN
+    /// name has to leak. Test-only, bounded by the fixed column lists below.
+    fn leak(sql: String) -> &'static str {
+        Box::leak(sql.into_boxed_str())
     }
 
     fn pending(state: &str) -> PendingAuth {
@@ -548,6 +665,136 @@ mod tests {
         Ok(())
     }
 
+    /// **Binding the secrets is not enough: the DESTINATIONS must be bound too.**
+    ///
+    /// The declared adversary is anything able to write the database. Against
+    /// that adversary, leaving `issuer`/`pds_url`/`did`/`redirect_uri` as plain
+    /// unauthenticated columns defeats the whole scheme without touching a
+    /// ciphertext — repoint the issuer and we mint a client assertion for the
+    /// attacker's server and neutralise the RFC 9207 `iss` check, while every
+    /// secret still decrypts perfectly.
+    #[tokio::test]
+    async fn tampering_with_a_pending_logins_destinations_breaks_it() -> anyhow::Result<()> {
+        for column in [
+            "issuer",
+            "pds_url",
+            "did",
+            "redirect_uri",
+            "browser_binding_hash",
+            "auth_method",
+        ] {
+            let (pool, codec) = db().await;
+            put_pending(&pool, &codec, &pending("state-1")).await?;
+            sqlx::query(leak(format!(
+                "UPDATE oauth_state SET {column} = ? WHERE state = ?"
+            )))
+            .bind("https://evil.example")
+            .bind("state-1")
+            .execute(&pool)
+            .await?;
+            assert!(
+                take_pending(&pool, &codec, "state-1", NOW).await.is_err(),
+                "tampering with `{column}` went undetected"
+            );
+        }
+        Ok(())
+    }
+
+    /// The session's `aud` IS the PDS every later request is sent to, so
+    /// repointing it would ship a live DPoP-bound access token to the attacker's
+    /// host. It must break the tokens, not travel alongside them.
+    #[tokio::test]
+    async fn tampering_with_a_sessions_destinations_breaks_it() -> anyhow::Result<()> {
+        for column in ["aud", "issuer"] {
+            let (pool, codec) = db().await;
+            put_session(&pool, &codec, &session()).await?;
+            sqlx::query(leak(format!(
+                "UPDATE oauth_session SET {column} = ? WHERE sub = ?"
+            )))
+            .bind("https://evil.example")
+            .bind(DID)
+            .execute(&pool)
+            .await?;
+            assert!(
+                get_session(&pool, &codec, DID).await.is_err(),
+                "tampering with `{column}` went undetected"
+            );
+        }
+        Ok(())
+    }
+
+    /// The AAD is length-prefixed, so no rearrangement of field boundaries can
+    /// produce the same bytes. A delimiter-joined encoding is only safe while no
+    /// field can contain the delimiter — and `did:web:…` subjects and URL
+    /// issuers are exactly the inputs that erode that assumption.
+    #[test]
+    fn the_aad_encoding_is_unambiguous_across_field_boundaries() {
+        assert_ne!(
+            structured_aad("t", &["ab", "c"]),
+            structured_aad("t", &["a", "bc"])
+        );
+        assert_ne!(
+            structured_aad("t", &["a:b"]),
+            structured_aad("t", &["a", "b"])
+        );
+        assert_ne!(
+            structured_aad("t", &["a", ""]),
+            structured_aad("t", &["", "a"])
+        );
+        assert_ne!(structured_aad("t1", &["a"]), structured_aad("t2", &["a"]));
+    }
+
+    /// Both nullable columns must survive the round trip as `None`.
+    #[tokio::test]
+    async fn a_pending_login_round_trips_with_its_optional_fields_absent() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        let mut want = pending("state-1");
+        want.auth_kid = None;
+        want.app_return_to = None;
+        put_pending(&pool, &codec, &want).await?;
+        assert_eq!(
+            take_pending(&pool, &codec, "state-1", NOW).await?.unwrap(),
+            want
+        );
+        Ok(())
+    }
+
+    /// A row is expired AT `expires_at`, not one second later. The earlier test
+    /// probed `expires_at + 1`, which cannot tell `<` from `<=`.
+    #[tokio::test]
+    async fn a_pending_login_is_expired_at_exactly_its_expiry() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_pending(&pool, &codec, &pending("edge")).await?;
+        assert!(take_pending(&pool, &codec, "edge", NOW + 600)
+            .await?
+            .is_none());
+
+        let (pool, codec) = db().await;
+        put_pending(&pool, &codec, &pending("edge")).await?;
+        assert!(take_pending(&pool, &codec, "edge", NOW + 599)
+            .await?
+            .is_some());
+        Ok(())
+    }
+
+    /// An abandoned login — the user closes the tab after being redirected —
+    /// leaves a row holding a sealed DPoP key. Without a sweep those accumulate
+    /// forever, and on a publicly reachable login form that is an unbounded
+    /// write primitive against the volume.
+    #[tokio::test]
+    async fn expired_pending_logins_are_swept() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_pending(&pool, &codec, &pending("old")).await?;
+        let mut fresh = pending("fresh");
+        fresh.expires_at = NOW + 3600;
+        put_pending(&pool, &codec, &fresh).await?;
+
+        assert_eq!(sweep_expired_pending(&pool, NOW + 700).await?, 1);
+        assert!(take_pending(&pool, &codec, "old", NOW).await?.is_none());
+        assert!(take_pending(&pool, &codec, "fresh", NOW).await?.is_some());
+        Ok(())
+    }
+
     /// An UNBOUND `enc.v1` value must be refused where a bound one is expected,
     /// or the binding is opt-out for anyone who can write the row.
     #[tokio::test]
@@ -562,6 +809,29 @@ mod tests {
             .await?;
 
         assert!(take_pending(&pool, &codec, "state-1", NOW).await.is_err());
+        Ok(())
+    }
+
+    /// The same downgrade check for sessions, which hold the LONG-LIVED tokens.
+    /// Covering only `oauth_state` would leave an implementation that used
+    /// `decrypt` instead of `decrypt_bound` here passing the whole suite.
+    #[tokio::test]
+    async fn an_unbound_session_ciphertext_is_refused() -> anyhow::Result<()> {
+        for column in ["access_token", "refresh_token", "dpop_key_jwk"] {
+            let (pool, codec) = db().await;
+            put_session(&pool, &codec, &session()).await?;
+            sqlx::query(leak(format!(
+                "UPDATE oauth_session SET {column} = ? WHERE sub = ?"
+            )))
+            .bind(codec.encrypt("some-value"))
+            .bind(DID)
+            .execute(&pool)
+            .await?;
+            assert!(
+                get_session(&pool, &codec, DID).await.is_err(),
+                "an unbound value was accepted in `{column}`"
+            );
+        }
         Ok(())
     }
 
