@@ -69,10 +69,12 @@ fn thumbprint_of_members(jwk: &Value) -> Result<String> {
     if crv != "P-256" {
         bail!("unsupported JWK curve {crv:?}; only P-256 is supported");
     }
-    // `x`/`y` are unpadded base64url in a well-formed EC JWK. Validating rather
-    // than trusting matters because this is also how a REMOTE party's JWK gets
-    // thumbprinted, and a member carrying a quote or backslash would otherwise
-    // have to be escaped correctly to produce a value anyone else reproduces.
+    // `x`/`y` are unpadded base64url in a well-formed EC JWK. The check is on
+    // the ALPHABET, which is all that is needed for the property that matters
+    // here: no member can require JSON escaping, so the canonical form is
+    // unambiguous. It is not a validity check — length and decodability are not
+    // verified, and do not need to be, since the caller either supplies our own
+    // key or is about to hand the JWK to `p256` anyway.
     for (name, value) in [("x", x), ("y", y)] {
         if value.is_empty()
             || !value
@@ -82,9 +84,11 @@ fn thumbprint_of_members(jwk: &Value) -> Result<String> {
             bail!("JWK member `{name}` is not unpadded base64url");
         }
     }
-    // Serialized, not interpolated: the serializer escapes correctly, and
-    // `serde_json::Map` is a `BTreeMap` here (no `preserve_order` feature), so
-    // the members come out in the lexicographic order RFC 7638 requires.
+    // Serialized, not interpolated, so the escaping is the serializer's job.
+    // The literal below is also WRITTEN in lexicographic order, so the output is
+    // RFC-canonical whether `serde_json::Map` is a `BTreeMap` (the default) or
+    // an insertion-ordered map (were `preserve_order` ever pulled in by feature
+    // unification elsewhere in the graph).
     let canonical = serde_json::to_string(&json!({"crv": crv, "kty": kty, "x": x, "y": y}))
         .context("serializing the canonical JWK")?;
     Ok(URL_SAFE_NO_PAD.encode(digest(&SHA256, canonical.as_bytes()).as_ref()))
@@ -156,10 +160,14 @@ impl SigningKey {
             .ok_or_else(|| anyhow!("JWK did not serialize to an object"))?;
         obj.insert("kid".into(), json!(self.kid));
         obj.insert("alg".into(), json!(ALG));
-        // `key_ops`, not `use`, on the PRIVATE JWK. That is what the sidecar
-        // writes, and `jose` already warns that a private JWK carrying `use`
-        // will be rejected in a future release — which would break the very
-        // rollback path this shared format exists to preserve.
+        // `key_ops`, not `use`, on the PRIVATE JWK: `jose` warns that a private
+        // JWK carrying `use` will be rejected in a future release, which would
+        // break the rollback path this shared format exists to preserve.
+        //
+        // (The sidecar writes NEITHER — `JoseKey.generate(...).privateJwk` is
+        // just `{kty, kid, crv, x, y, d}`. An earlier version of this comment
+        // claimed `key_ops` matched the sidecar; it does not. The change stands
+        // on the deprecation alone, and jwk-jose loads the result warning-free.)
         obj.insert("key_ops".into(), json!(["sign"]));
         serde_json::to_string(&v).context("rendering the private JWK")
     }
@@ -208,52 +216,39 @@ impl SigningKey {
     }
 }
 
-/// Write `contents` to `path` with owner-only permissions.
+/// A staged temp file that deletes itself on drop unless told not to.
 ///
-/// `create_new` is an EXCLUSIVE create: if the file appeared since we looked
-/// (a racing process generated a key), this fails rather than clobbering a key
-/// that may already be published in a JWKS and in use.
-fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(path)
-        .with_context(|| format!("creating the signing-key file at {}", path.display()))?;
-    f.write_all(contents.as_bytes())
-        .context("writing the signing-key file")?;
-    // A freshly generated key that never reached disk would be silently lost to
-    // a crash, and the next boot would mint a different client identity.
-    f.sync_all().context("flushing the signing-key file")?;
-    sync_parent_dir(path);
-    Ok(())
+/// Without this, any failure between creating the temp and linking it into
+/// place leaves the file behind until some later write happens to clear it.
+struct Staged {
+    path: std::path::PathBuf,
+    keep: bool,
 }
 
-/// The sibling path a rewrite stages through.
-fn temp_sibling(path: &Path) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
-    std::path::PathBuf::from(name)
-}
+impl Staged {
+    /// Write `contents` to a **uniquely named** sibling of `near`, fsynced.
+    ///
+    /// The name carries the pid and CSPRNG bytes deliberately. A shared,
+    /// predictable temp path lets two processes interleave `remove` and
+    /// `create` such that one renames the other's empty file into place —
+    /// producing exactly the zero-length key file this staging exists to
+    /// prevent. A unique name makes the collision impossible instead of
+    /// unlikely, and removes any need to clear a stale temp first (which is
+    /// what opened the window).
+    fn write(near: &Path, contents: &str) -> Result<Self> {
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix).expect("OS CSPRNG unavailable; refusing to stage a key");
+        let mut name = near.as_os_str().to_os_string();
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            suffix
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let path = std::path::PathBuf::from(name);
 
-/// Replace an EXISTING key file **atomically**, keeping owner-only permissions.
-///
-/// Write-to-temp, fsync, rename. A plain `fs::write` truncates before it writes,
-/// so a crash in that window leaves a zero-length file — and because an
-/// unreadable key file is deliberately a hard error (see [`load_or_create`]),
-/// that would turn a transient crash into a permanent boot failure recoverable
-/// only by deleting the key. `rename` within a directory is atomic, so a reader
-/// sees either the old contents or the new ones and never nothing.
-fn rewrite_owner_only(path: &Path, contents: &str) -> Result<()> {
-    let temp = temp_sibling(path);
-    // A stale temp from a previous crash must not block the write, and creating
-    // exclusively afterwards keeps us from following a planted symlink.
-    let _ = fs::remove_file(&temp);
-    {
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -262,17 +257,77 @@ fn rewrite_owner_only(path: &Path, contents: &str) -> Result<()> {
             opts.mode(0o600);
         }
         let mut file = opts
-            .open(&temp)
-            .with_context(|| format!("staging a key rewrite at {}", temp.display()))?;
+            .open(&path)
+            .with_context(|| format!("staging a key write at {}", path.display()))?;
+        let staged = Self { path, keep: false };
+
         file.write_all(contents.as_bytes())
             .context("writing the staged signing-key file")?;
-        // Durable before the rename, so the rename cannot expose a file whose
-        // contents have not reached disk.
+        // Durable BEFORE it is linked into place, so the final link can never
+        // expose a file whose contents have not reached disk.
         file.sync_all().context("flushing the staged key file")?;
+        Ok(staged)
     }
-    fs::rename(&temp, path)
-        .with_context(|| format!("replacing the signing-key file at {}", path.display()))?;
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The staged file has become the real one; stop tracking it.
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Create the key file **atomically**, refusing to clobber an existing one.
+///
+/// Stage, then `hard_link` into place. `hard_link` is the reason this is not a
+/// `rename`: it fails with `EEXIST` if the destination exists, which preserves
+/// the no-clobber guard against a racing process that already generated and
+/// published a key — a guard a `rename` would silently discard.
+///
+/// A plain `create_new` + `write` is NOT equivalent: it is atomic with respect
+/// to *existence* but not to *content*, so a crash between the open and the
+/// write leaves a zero-length file, and an unreadable key file is deliberately
+/// a hard error (see [`load_or_create`]).
+fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
+    let staged = Staged::write(path, contents)?;
+    fs::hard_link(staged.path(), path).with_context(|| {
+        format!(
+            "creating the signing-key file at {} (another process may have \
+             generated one already)",
+            path.display()
+        )
+    })?;
+    // The contents now live at `path`; dropping `staged` unlinks only the
+    // temporary second name for the same inode.
+    drop(staged);
     sync_parent_dir(path);
+    Ok(())
+}
+
+/// Replace an EXISTING key file **atomically**, keeping owner-only permissions.
+///
+/// Symlinks are resolved first so the rename replaces the **target** rather than
+/// the link. Renaming over the link itself would break an operator's deliberate
+/// indirection and — worse during a plaintext migration — leave the unencrypted
+/// private JWK sitting at the old target.
+fn rewrite_owner_only(path: &Path, contents: &str) -> Result<()> {
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let staged = Staged::write(&target, contents)?;
+    fs::rename(staged.path(), &target)
+        .with_context(|| format!("replacing the signing-key file at {}", target.display()))?;
+    // The temp name no longer exists; the rename consumed it.
+    staged.keep();
+    sync_parent_dir(&target);
     Ok(())
 }
 
@@ -649,6 +704,71 @@ mod tests {
         let codec = Codec::new(Some(KEY)).unwrap();
         std::fs::write(&path, codec.encrypt("{\"kty\":\"EC\",\"crv\":\"P-256\"}")).unwrap();
         assert!(load_or_create(&path, &codec, KID).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A symlinked key path must survive migration.** Replacing the link with
+    /// a regular file breaks the operator's indirection AND strands the
+    /// unencrypted private JWK at the old target — the exact opposite of what
+    /// migrating to ciphertext is for.
+    #[cfg(unix)]
+    #[test]
+    fn migrating_through_a_symlink_rewrites_the_target_not_the_link() {
+        let target = tmp_path("symlink-target");
+        let link = tmp_path("symlink-link");
+        let _ = std::fs::remove_file(&link);
+        let codec = Codec::new(Some(KEY)).unwrap();
+
+        let original = SigningKey::generate(KID);
+        std::fs::write(&target, original.to_jwk_json().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let loaded = load_or_create(&link, &codec, KID).unwrap();
+        assert_eq!(loaded.thumbprint().unwrap(), original.thumbprint().unwrap());
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink was replaced by a regular file"
+        );
+        let target_contents = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            Aead::is_ciphertext(target_contents.trim()),
+            "the real target still holds plaintext after migration"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// Two rewrites in a row must not collide on a shared temp path, and must
+    /// leave nothing behind.
+    #[cfg(unix)]
+    #[test]
+    fn repeated_migrations_leave_no_temporary_files() {
+        let path = tmp_path("repeat");
+        let codec = Codec::new(Some(KEY)).unwrap();
+        let original = SigningKey::generate(KID);
+
+        for _ in 0..3 {
+            // Force the migrate-on-read path each time by writing plaintext.
+            std::fs::write(&path, original.to_jwk_json().unwrap()).unwrap();
+            let loaded = load_or_create(&path, &codec, KID).unwrap();
+            assert_eq!(loaded.thumbprint().unwrap(), original.thumbprint().unwrap());
+        }
+
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&name) && *n != name)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -19,10 +19,14 @@
 //!   reading the first `error=` found attributes one scheme's error to the
 //!   other.
 //!
-//! The server may demand a nonce at any time, answering `4xx` with
-//! `DPoP-Nonce` and `WWW-Authenticate: DPoP …error="use_dpop_nonce"`. That is
-//! normal operation, not an error: the caller retries once with the supplied
-//! nonce. See [`nonce_challenge`].
+//! The server may demand a nonce at any time. That is normal operation, not an
+//! error: the caller retries ONCE with the supplied nonce.
+//!
+//! It is signalled two different ways depending on which endpoint answered —
+//! the authorization server uses a `400` and a JSON body, the resource server a
+//! `401` and a `WWW-Authenticate` header. Handling only the header misses every
+//! challenge from PAR, token and refresh, which is everything this client talks
+//! to first. See [`nonce_challenge`].
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -34,11 +38,11 @@ use super::keys::SigningKey;
 
 /// The one challenge that means "retry with a nonce".
 ///
-/// `invalid_dpop_proof` is deliberately NOT here. RFC 9449 §7.1 defines it as
-/// the proof having been rejected on its merits — bad `htu`, clock skew outside
-/// the §11.1 window, an unacceptable `alg`. Retrying spends the single permitted
-/// attempt replaying an equivalent proof and reports the failure as a nonce
-/// problem, hiding the real cause.
+/// `invalid_dpop_proof` is deliberately NOT here. RFC 9449 registers it (§12.2)
+/// for a proof rejected on its merits against the §4.3 checks — bad `htu`, clock
+/// skew, an unacceptable `alg`. Retrying spends the single permitted attempt
+/// replaying an equivalent proof and reports the failure as a nonce problem,
+/// hiding the real cause.
 const NONCE_CHALLENGE: &str = "use_dpop_nonce";
 
 /// A fresh, unguessable `jti`. 16 bytes of CSPRNG output is 22 base64url
@@ -265,8 +269,28 @@ fn parse_challenges(header: &str) -> Option<Vec<Challenge>> {
             });
             continue;
         };
-        let value = unquote(segment[eq + 1..].trim())?;
         let left = segment[..eq].trim();
+        let Some(value) = unquote(segment[eq + 1..].trim()) else {
+            // An unreadable VALUE is not grounds to discard the header. The
+            // common cause is `token68`, which RFC 9110 §11.6.1 permits in place
+            // of auth-params and which ends in `=` — so `Negotiate YII=` looks
+            // like a parameter with an empty value.
+            //
+            // The asymmetry with `split_segments` returning `None` is
+            // deliberate, and the direction is the reason: an unbalanced quote
+            // can manufacture a challenge that was never sent (a FALSE
+            // POSITIVE), so it fails closed; skipping a segment we cannot read
+            // can only ever miss one (a FALSE NEGATIVE), so it degrades to
+            // "this challenge has no readable parameters" and leaves the others
+            // intact.
+            if let Some((scheme, _)) = left.split_once(char::is_whitespace) {
+                challenges.push(Challenge {
+                    scheme: scheme.trim().to_string(),
+                    params: Vec::new(),
+                });
+            }
+            continue;
+        };
 
         match left.split_once(char::is_whitespace) {
             Some((scheme, name)) => challenges.push(Challenge {
@@ -283,23 +307,88 @@ fn parse_challenges(header: &str) -> Option<Vec<Challenge>> {
     Some(challenges)
 }
 
-/// The nonce to retry with, if the server's `WWW-Authenticate` carries a **DPoP**
-/// `use_dpop_nonce` challenge *and* it supplied a `DPoP-Nonce` to use.
+/// Which kind of endpoint produced a response.
 ///
-/// Both halves are required. Without a nonce there is nothing to retry with, so
-/// retrying would replay an equivalent proof and report the wrong cause.
+/// Passed in rather than inferred: we always know which we called, and the two
+/// signal a nonce requirement completely differently (see [`nonce_challenge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    /// PAR, token and refresh — RFC 9449 §8.
+    AuthorizationServer,
+    /// The PDS's XRPC endpoints — RFC 9449 §9.
+    ResourceServer,
+}
+
+/// Largest error body we will parse looking for a nonce challenge.
 ///
-/// Callers must bound the retry at ONE. A server answering every request with
-/// `use_dpop_nonce` would otherwise spin forever.
-pub fn nonce_challenge(www_authenticate: &str, dpop_nonce: Option<&str>) -> Option<String> {
-    let nonce = dpop_nonce.filter(|n| !n.is_empty())?;
-    let challenges = parse_challenges(www_authenticate)?;
-    let asked = challenges.iter().any(|c| {
+/// A `use_dpop_nonce` error is a few dozen bytes. Matching the reference
+/// client's 10 KiB peek bounds what a server can make us deserialize on a path
+/// that runs for every failed request.
+const MAX_ERROR_BODY: usize = 10 * 1024;
+
+/// Whether an authorization-server error body is a nonce challenge.
+fn body_asks_for_nonce(body: &[u8]) -> bool {
+    if body.is_empty() || body.len() > MAX_ERROR_BODY {
+        return false;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(Value::as_str)
+        == Some(NONCE_CHALLENGE)
+}
+
+/// Whether a `WWW-Authenticate` value carries a **DPoP** nonce challenge.
+fn header_asks_for_nonce(www_authenticate: &str) -> bool {
+    let Some(challenges) = parse_challenges(www_authenticate) else {
+        return false;
+    };
+    challenges.iter().any(|c| {
         c.scheme.eq_ignore_ascii_case("DPoP")
             && c.params
                 .iter()
                 .any(|(name, value)| name == "error" && value == NONCE_CHALLENGE)
-    });
+    })
+}
+
+/// The nonce to retry the request with, or `None` if this is not a nonce
+/// challenge.
+///
+/// **RFC 9449 signals this two different ways**, and which one applies depends
+/// on the endpoint, not on what happens to be in the response:
+///
+/// * **Authorization server** (§8) — PAR, token, refresh. `400` with an
+///   RFC 6749 §5.2 JSON body `{"error":"use_dpop_nonce"}`, and typically NO
+///   `WWW-Authenticate` header at all.
+/// * **Resource server** (§9) — the PDS's XRPC endpoints. `401` with
+///   `WWW-Authenticate: DPoP …error="use_dpop_nonce"`.
+///
+/// Reading only the header would miss every challenge on the authorization
+/// server — which is the first thing this client talks to — and the token
+/// exchange would fail permanently. `@atproto/oauth-client`'s
+/// `isUseDpopNonceError` branches on the same distinction.
+///
+/// A `DPoP-Nonce` must also actually be present: without one there is nothing to
+/// retry *with*, so retrying would replay an equivalent proof and report the
+/// wrong cause.
+///
+/// Callers must bound the retry at ONE. A server answering every request with
+/// `use_dpop_nonce` would otherwise spin forever.
+pub fn nonce_challenge(
+    endpoint: Endpoint,
+    status: u16,
+    www_authenticate: Option<&str>,
+    body: &[u8],
+    dpop_nonce: Option<&str>,
+) -> Option<String> {
+    let nonce = dpop_nonce.filter(|n| !n.is_empty())?;
+    let asked = match endpoint {
+        Endpoint::AuthorizationServer => status == 400 && body_asks_for_nonce(body),
+        Endpoint::ResourceServer => {
+            status == 401 && www_authenticate.is_some_and(header_asks_for_nonce)
+        }
+    };
     asked.then(|| nonce.to_string())
 }
 
@@ -539,6 +628,212 @@ mod tests {
 
     // ── nonce negotiation ────────────────────────────────────────────────────
 
+    /// Shorthand for the RESOURCE-server signalling path, which is what the
+    /// `WWW-Authenticate` parser tests below exercise.
+    fn rs(www_authenticate: &str, nonce: Option<&str>) -> Option<String> {
+        nonce_challenge(
+            Endpoint::ResourceServer,
+            401,
+            Some(www_authenticate),
+            b"",
+            nonce,
+        )
+    }
+
+    /// **RFC 9449 signals a nonce two different ways, and the authorization
+    /// server's way is the one this client hits first.**
+    ///
+    /// §8 (AS): `400` with an RFC 6749 §5.2 JSON body `{"error":"use_dpop_nonce"}`
+    /// and NO `WWW-Authenticate` at all. §9 (RS): `401` with the header.
+    ///
+    /// PAR, token exchange and refresh all go to the authorization server, so an
+    /// implementation that reads only `WWW-Authenticate` never sees the
+    /// challenge and the token exchange fails permanently. Cross-checked against
+    /// `@atproto/oauth-client`'s `isUseDpopNonceError`, which branches on
+    /// exactly this.
+    #[test]
+    fn the_authorization_server_signals_with_a_400_and_a_json_body() {
+        assert_eq!(
+            nonce_challenge(
+                Endpoint::AuthorizationServer,
+                400,
+                None,
+                br#"{"error":"use_dpop_nonce"}"#,
+                Some("n1"),
+            )
+            .as_deref(),
+            Some("n1")
+        );
+        // With the description RFC 6749 §5.2 allows alongside it.
+        assert_eq!(
+            nonce_challenge(
+                Endpoint::AuthorizationServer,
+                400,
+                None,
+                br#"{"error":"use_dpop_nonce","error_description":"nonce required"}"#,
+                Some("n1"),
+            )
+            .as_deref(),
+            Some("n1")
+        );
+    }
+
+    #[test]
+    fn the_authorization_server_path_ignores_other_errors_and_statuses() {
+        for (status, body) in [
+            (400u16, &br#"{"error":"invalid_grant"}"#[..]),
+            (400, br#"{"error":"invalid_dpop_proof"}"#),
+            (400, b"not json"),
+            (400, b""),
+            (400, br#"{"error":123}"#),
+            (400, br#"[]"#),
+            // Right error, wrong status.
+            (401, br#"{"error":"use_dpop_nonce"}"#),
+            (200, br#"{"error":"use_dpop_nonce"}"#),
+            (500, br#"{"error":"use_dpop_nonce"}"#),
+        ] {
+            assert!(
+                nonce_challenge(
+                    Endpoint::AuthorizationServer,
+                    status,
+                    None,
+                    body,
+                    Some("n1")
+                )
+                .is_none(),
+                "acted on status {status} body {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The two paths must not bleed into each other: the AS path does not read
+    /// `WWW-Authenticate`, and the RS path does not read the body.
+    #[test]
+    fn the_two_signalling_paths_are_independent() {
+        // AS status/body are wrong, but a resource-server-shaped header is set.
+        assert!(nonce_challenge(
+            Endpoint::AuthorizationServer,
+            400,
+            Some(r#"DPoP error="use_dpop_nonce""#),
+            br#"{"error":"invalid_grant"}"#,
+            Some("n1"),
+        )
+        .is_none());
+
+        // RS header is absent, but an AS-shaped body is present.
+        assert!(nonce_challenge(
+            Endpoint::ResourceServer,
+            401,
+            None,
+            br#"{"error":"use_dpop_nonce"}"#,
+            Some("n1"),
+        )
+        .is_none());
+    }
+
+    /// The resource-server path requires 401 specifically.
+    #[test]
+    fn the_resource_server_path_requires_a_401() {
+        for status in [400u16, 403, 200, 500] {
+            assert!(
+                nonce_challenge(
+                    Endpoint::ResourceServer,
+                    status,
+                    Some(r#"DPoP error="use_dpop_nonce""#),
+                    b"",
+                    Some("n1"),
+                )
+                .is_none(),
+                "acted on status {status}"
+            );
+        }
+    }
+
+    /// **Differential against the reference client.** Each expectation below is
+    /// what `@atproto/oauth-client`'s `isUseDpopNonceError` returns for the same
+    /// response, captured by running that function verbatim out of
+    /// `oauth-sidecar/node_modules/@atproto/oauth-client/dist/fetch-dpop.js`.
+    ///
+    /// This is the check that would have caught the original defect: the
+    /// implementation read only `WWW-Authenticate`, so every authorization-server
+    /// case here (the first nine) was wrong, and no amount of reading the parser
+    /// would have shown it.
+    #[test]
+    fn agrees_with_the_reference_client_on_nonce_detection() {
+        use Endpoint::{AuthorizationServer as As, ResourceServer as Rs};
+        /// (endpoint, status, WWW-Authenticate, body, reference verdict)
+        type Case = (Endpoint, u16, Option<&'static str>, &'static [u8], bool);
+        let cases: &[Case] = &[
+            (As, 400, None, br#"{"error":"use_dpop_nonce"}"#, true),
+            (
+                As,
+                400,
+                None,
+                br#"{"error":"use_dpop_nonce","error_description":"x"}"#,
+                true,
+            ),
+            (As, 400, None, br#"{"error":"invalid_grant"}"#, false),
+            (As, 400, None, br#"{"error":"invalid_dpop_proof"}"#, false),
+            (As, 400, None, b"not json", false),
+            (As, 400, None, b"", false),
+            (As, 401, None, br#"{"error":"use_dpop_nonce"}"#, false),
+            (As, 200, None, br#"{"error":"use_dpop_nonce"}"#, false),
+            (
+                As,
+                400,
+                Some(r#"DPoP error="use_dpop_nonce""#),
+                br#"{"error":"invalid_grant"}"#,
+                false,
+            ),
+            (Rs, 401, Some(r#"DPoP error="use_dpop_nonce""#), b"", true),
+            (
+                Rs,
+                401,
+                Some(r#"DPoP algs="ES256", error="use_dpop_nonce""#),
+                b"",
+                true,
+            ),
+            (
+                Rs,
+                401,
+                Some(r#"Bearer error="use_dpop_nonce""#),
+                b"",
+                false,
+            ),
+            (
+                Rs,
+                401,
+                Some(r#"DPoP error="invalid_dpop_proof""#),
+                b"",
+                false,
+            ),
+            (Rs, 400, Some(r#"DPoP error="use_dpop_nonce""#), b"", false),
+            (Rs, 401, None, br#"{"error":"use_dpop_nonce"}"#, false),
+        ];
+
+        for (i, (endpoint, status, header, body, expected)) in cases.iter().enumerate() {
+            let got = nonce_challenge(*endpoint, *status, *header, body, Some("n1")).is_some();
+            assert_eq!(
+                got, *expected,
+                "case {i} ({endpoint:?}, {status}, {header:?}) disagrees with the reference"
+            );
+        }
+    }
+
+    /// An oversized body is not parsed. A `use_dpop_nonce` error is a few dozen
+    /// bytes; anything large is a different response, and parsing it would let a
+    /// server spend our memory on every failed request.
+    #[test]
+    fn an_oversized_error_body_is_not_parsed() {
+        let mut body = br#"{"error":"use_dpop_nonce","pad":""#.to_vec();
+        body.extend(std::iter::repeat_n(b'a', 32 * 1024));
+        body.extend(br#""}"#);
+        assert!(
+            nonce_challenge(Endpoint::AuthorizationServer, 400, None, &body, Some("n1")).is_none()
+        );
+    }
+
     /// A `use_dpop_nonce` challenge is normal operation — the server is telling
     /// us to retry with its nonce, not reporting a failure.
     #[test]
@@ -552,7 +847,7 @@ mod tests {
             r#"DPoP error	=	"use_dpop_nonce""#,
         ] {
             assert_eq!(
-                nonce_challenge(header, Some("n1")).as_deref(),
+                rs(header, Some("n1")).as_deref(),
                 Some("n1"),
                 "should match: {header}"
             );
@@ -567,7 +862,7 @@ mod tests {
     fn challenges_are_matched_to_their_own_scheme() {
         // The DPoP challenge is present but not first: must still be found.
         assert_eq!(
-            nonce_challenge(
+            rs(
                 r#"Bearer error="invalid_token", DPoP error="use_dpop_nonce", algs="ES256""#,
                 Some("n1")
             )
@@ -575,14 +870,14 @@ mod tests {
             Some("n1")
         );
         // A `use_dpop_nonce` on a NON-DPoP scheme is not ours to act on.
-        assert!(nonce_challenge(r#"Bearer error="use_dpop_nonce""#, Some("n1")).is_none());
-        assert!(nonce_challenge(
+        assert!(rs(r#"Bearer error="use_dpop_nonce""#, Some("n1")).is_none());
+        assert!(rs(
             r#"Basic realm="r", Bearer error="use_dpop_nonce""#,
             Some("n1")
         )
         .is_none());
         // Params after a scheme belong to that scheme, not the previous one.
-        assert!(nonce_challenge(
+        assert!(rs(
             r#"DPoP algs="ES256", Bearer error="use_dpop_nonce""#,
             Some("n1")
         )
@@ -594,16 +889,16 @@ mod tests {
     /// not a request to retry. Retrying burns the one attempt and reports the
     /// wrong cause.
     #[test]
-    fn invalid_dpop_proof_is_a_failure_not_a_nonce_challenge() {
-        assert!(nonce_challenge(r#"DPoP error="invalid_dpop_proof""#, Some("n1")).is_none());
+    fn invalid_dpop_proof_is_a_failure_not_a_rs() {
+        assert!(rs(r#"DPoP error="invalid_dpop_proof""#, Some("n1")).is_none());
     }
 
     /// Without a nonce there is nothing to retry WITH; retrying would replay the
     /// same proof and mask the real error.
     #[test]
     fn no_retry_without_a_supplied_nonce() {
-        assert!(nonce_challenge(r#"DPoP error="use_dpop_nonce""#, None).is_none());
-        assert!(nonce_challenge(r#"DPoP error="use_dpop_nonce""#, Some("")).is_none());
+        assert!(rs(r#"DPoP error="use_dpop_nonce""#, None).is_none());
+        assert!(rs(r#"DPoP error="use_dpop_nonce""#, Some("")).is_none());
     }
 
     #[test]
@@ -618,8 +913,50 @@ mod tests {
             r#"DPoP error="x", error_description="do not use_dpop_nonce here""#,
         ] {
             assert!(
-                nonce_challenge(header, Some("n1")).is_none(),
+                rs(header, Some("n1")).is_none(),
                 "should not match: {header}"
+            );
+        }
+    }
+
+    /// **A `token68` challenge must not poison the rest of the header.**
+    /// RFC 9110 §11.6.1 allows `challenge = auth-scheme [ 1*SP ( token68 /
+    /// #auth-param ) ]`, and `token68` ends with `*"="` — so `Negotiate YII=`
+    /// parses as a parameter with an empty value. Discarding the whole header
+    /// over that would silently drop a valid DPoP nonce challenge sitting
+    /// beside it, which is the same permanent-failure shape as reading the
+    /// wrong scheme's error.
+    #[test]
+    fn a_token68_challenge_does_not_discard_the_other_challenges() {
+        for header in [
+            r#"DPoP error="use_dpop_nonce", Negotiate YII="#,
+            r#"Negotiate YII=, DPoP error="use_dpop_nonce""#,
+            r#"Basic realm=x, Negotiate abc==, DPoP error="use_dpop_nonce""#,
+            // A parameter we cannot read must not sink its own challenge either.
+            r#"DPoP foo=, error="use_dpop_nonce""#,
+            r#"DPoP error="use_dpop_nonce", bad="#,
+        ] {
+            assert_eq!(
+                rs(header, Some("n1")).as_deref(),
+                Some("n1"),
+                "token68 or unreadable param discarded the header: {header}"
+            );
+        }
+    }
+
+    /// Skipping an unreadable segment can only ever cause a FALSE NEGATIVE.
+    /// An unbalanced quote is different in kind — it can manufacture a
+    /// challenge that was never sent — so that still fails closed.
+    #[test]
+    fn a_token68_challenge_cannot_manufacture_a_rs() {
+        for header in [
+            r#"Negotiate YII="#,
+            r#"Basic realm=x, Negotiate abc=="#,
+            r#"Bearer error="use_dpop_nonce", Negotiate YII="#,
+        ] {
+            assert!(
+                rs(header, Some("n1")).is_none(),
+                "invented a challenge from: {header}"
             );
         }
     }
@@ -636,7 +973,7 @@ mod tests {
             r#"DPoP error=""use_dpop_nonce"""#,
         ] {
             assert!(
-                nonce_challenge(header, Some("n1")).is_none(),
+                rs(header, Some("n1")).is_none(),
                 "malformed header was acted on: {header}"
             );
         }
@@ -647,7 +984,7 @@ mod tests {
     #[test]
     fn quoted_values_may_contain_commas_and_escaped_quotes() {
         assert_eq!(
-            nonce_challenge(
+            rs(
                 r#"DPoP error_description="one, two, three", error="use_dpop_nonce""#,
                 Some("n1")
             )
@@ -655,7 +992,7 @@ mod tests {
             Some("n1")
         );
         assert_eq!(
-            nonce_challenge(
+            rs(
                 r#"DPoP error_description="he said \"hi\", ok", error="use_dpop_nonce""#,
                 Some("n1")
             )
@@ -668,7 +1005,7 @@ mod tests {
     #[test]
     fn an_unquoted_token_value_is_accepted() {
         assert_eq!(
-            nonce_challenge(r#"DPoP error=use_dpop_nonce"#, Some("n1")).as_deref(),
+            rs(r#"DPoP error=use_dpop_nonce"#, Some("n1")).as_deref(),
             Some("n1")
         );
     }
@@ -677,8 +1014,8 @@ mod tests {
     #[test]
     fn a_pathological_header_terminates() {
         let big = format!("DPoP error=\"{}", "a,".repeat(20_000));
-        assert!(nonce_challenge(&big, Some("n1")).is_none());
+        assert!(rs(&big, Some("n1")).is_none());
         let quotes = "\"".repeat(20_000);
-        assert!(nonce_challenge(&quotes, Some("n1")).is_none());
+        assert!(rs(&quotes, Some("n1")).is_none());
     }
 }

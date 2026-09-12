@@ -72,8 +72,27 @@ impl ClientConfig {
                 parsed.path()
             );
         }
+        // Query, fragment and userinfo are rejected rather than ignored: the
+        // stored value is concatenated with `/oauth/...`, so a query would
+        // produce `https://host?x=1/oauth/client-metadata.json`, and userinfo
+        // would publish credentials inside the client's identity and in every
+        // `redirect_uris` entry.
+        if parsed.query().is_some() {
+            bail!("public_url must not carry a query string, got {public_url:?}");
+        }
+        if parsed.fragment().is_some() {
+            bail!("public_url must not carry a fragment, got {public_url:?}");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("public_url must not carry credentials, got {public_url:?}");
+        }
+
+        // Store the PARSED origin, not the input string: `Url` has already
+        // lowercased the scheme and host and dropped a default port, so the
+        // published `client_id` is stable however it was spelled in config.
+        let origin = parsed[..url::Position::AfterPort].to_string();
         Ok(Self {
-            public_url: public_url.to_string(),
+            public_url: origin,
             scope: scope.to_string(),
             dev,
         })
@@ -187,6 +206,36 @@ mod tests {
             let cfg = ClientConfig::new(url, "atproto", false);
             assert!(cfg.is_err(), "accepted a public_url with a path: {url}");
         }
+    }
+
+    /// Checking only the path let these through, and the raw string was then
+    /// concatenated, so `client_id` came out as
+    /// `https://feather-reader.com?x=1/oauth/client-metadata.json` — or, worse,
+    /// published credentials inside the client's identity.
+    #[test]
+    fn a_public_url_carrying_a_query_fragment_or_credentials_is_rejected() {
+        for url in [
+            "https://feather-reader.com?x=1",
+            "https://feather-reader.com#frag",
+            "https://u:p@feather-reader.com",
+            "https://u@feather-reader.com",
+        ] {
+            assert!(
+                ClientConfig::new(url, "atproto", false).is_err(),
+                "accepted {url}"
+            );
+        }
+    }
+
+    /// The stored value is the PARSED origin, so casing is normalized and the
+    /// published `client_id` is stable regardless of how it was configured.
+    #[test]
+    fn the_origin_is_normalized_rather_than_echoed_back() {
+        let cfg = ClientConfig::new("HTTPS://Feather-Reader.COM", "atproto", false).unwrap();
+        assert_eq!(
+            client_id(&cfg),
+            "https://feather-reader.com/oauth/client-metadata.json"
+        );
     }
 
     #[test]

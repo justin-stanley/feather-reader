@@ -312,24 +312,34 @@ mod tests {
         assert_ne!(a, derive_key("different"));
     }
 
-    /// A near-miss must not silently become a raw key: 43 base64url chars decode
-    /// to 32 bytes, but only a value that RE-ENCODES to the input was really a
-    /// canonical key.
+    /// A base64-SHAPED value that is not a canonical 32-byte key must take the
+    /// passphrase path.
     ///
-    /// The value to guard against is the LENIENT DECODE, not the ASCII bytes.
-    /// `'a'` is base64 index 26 (`011010`), so 43 of them decode to the repeating
-    /// pattern `69 A6 9A`. An implementation that dropped the round-trip guard
-    /// would return exactly that — and comparing against `[b'a'; 32]` instead
-    /// would not notice.
+    /// Asserted as an EQUALITY against the domain-separated digest, not as a
+    /// `!=` against some value we guess a broken implementation would return.
+    /// Two earlier versions of this test guessed wrong: `[b'a'; 32]` (the ASCII
+    /// bytes) and then `69 A6 9A…` (the lenient decode Node's `Buffer` would
+    /// produce). base64 0.22's engines are strict and reject `"a"×43` outright
+    /// — `InvalidPadding` / `InvalidLastSymbol` — so neither value is reachable
+    /// and both assertions held for the wrong reason.
+    ///
+    /// Which also means: with these strict engines, a successful decode already
+    /// implies canonicality, so `decode_exact_key`'s re-encode check is
+    /// belt-and-braces rather than load-bearing. It is kept because it is the
+    /// property we actually want to hold, independent of how strict the decoder
+    /// happens to be.
     #[test]
-    fn derive_key_sends_a_non_canonical_base64_lookalike_down_the_passphrase_path() {
-        let lenient: [u8; 32] = std::array::from_fn(|i| [0x69u8, 0xA6, 0x9A][i % 3]);
-        assert_ne!(
-            derive_key(KEY),
-            lenient,
-            "a lenient base64 decode was mistaken for a canonical key"
-        );
-        assert_ne!(derive_key(KEY), [b'a'; 32]);
+    fn a_non_canonical_base64_lookalike_takes_the_passphrase_path() {
+        let mut ctx = ring::digest::Context::new(&SHA256);
+        ctx.update(PASSPHRASE_DOMAIN.as_bytes());
+        ctx.update(KEY.as_bytes());
+        let expected: [u8; 32] = ctx.finish().as_ref().try_into().unwrap();
+        assert_eq!(derive_key(KEY), expected, "not the passphrase path");
+
+        // And the raw-key path is still taken for a genuinely canonical value,
+        // so the two are distinguished rather than everything being hashed.
+        let canonical = URL_SAFE_NO_PAD.encode([0x11u8; 32]);
+        assert_eq!(derive_key(&canonical), [0x11u8; 32]);
     }
 
     // ── round-trip ───────────────────────────────────────────────────────────
