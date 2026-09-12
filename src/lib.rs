@@ -33,6 +33,7 @@ pub mod feed;
 pub mod lexicon;
 pub mod net;
 pub mod network;
+pub mod oauth;
 pub mod store;
 pub mod web;
 

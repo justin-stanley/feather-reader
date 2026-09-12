@@ -88,6 +88,21 @@ url = "2"
 # the session-id minting reads from the OS CSPRNG rather than a home-rolled RNG.
 getrandom = "0.4"
 
+# --- at-rest encryption for OAuth secrets --------------------------------
+# AES-256-GCM + SHA-256 for the `enc.v1.gcm.` codec that wraps OAuth tokens,
+# DPoP key material and the confidential-client signing JWK before they touch
+# the SQLite volume. `ring` is ALREADY in the tree (rustls pulls it); pinned as
+# a direct dep rather than adding a second AEAD implementation. base64 0.22 is
+# likewise already present transitively — pin 0.22, NOT 0.21, so the lock keeps
+# a single copy (`deny.toml` sets multiple-versions = "warn", which would not
+# catch a duplicate).
+ring = "0.17"
+base64 = "0.22"
+# Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
+# internal-only helper; `subtle` is the maintained option and is already in the
+# tree, so this adds no package to the lock either.
+subtle = "2"
+
 # --- filesystem stat (startup disk-headroom check) -----------------------
 # Already in the tree transitively; pinned as a direct dep so the startup
 # watermark-vs-disk safety check can call `statvfs(3)` on unix to compare the
