@@ -250,6 +250,7 @@ pub fn router(state: AppState) -> Router {
         // code + returns its token/url for the bot to post.
         .route("/bot/claims", post(bot_mint_claim))
         .route("/admin/invites", post(admin_mint_invites))
+        .route("/admin/metrics", get(admin_metrics))
         .route("/account/delete", post(account_delete))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
@@ -995,7 +996,7 @@ struct ResolvedSub {
 /// on the sidecar: a failure falls back to the local cache alone.
 async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> {
     let pool = &state.db;
-    let subs = match state.sidecar.list_subscriptions_sorted(did).await {
+    let subs = match state.repo().list_subscriptions_sorted(did).await {
         Ok(s) => s,
         Err(err) => {
             warn!(%err, %did, "could not list PDS subscriptions; showing this DID's cached subscriptions only");
@@ -1370,7 +1371,7 @@ async fn build_sidebar(
         .await
         .unwrap_or_default();
     let folders = state
-        .sidecar
+        .repo()
         .list_folders_sorted(did)
         .await
         .unwrap_or_default();
@@ -1762,16 +1763,16 @@ async fn toggle_star(
                 saved.title = entry.title.clone();
                 saved.feed_url = feed_url_for_id(pool, entry.feed_id).await;
                 saved.entry_id = Some(entry.guid.clone());
-                match state.sidecar.add_saved(&did, &saved).await {
+                match state.repo().add_saved(&did, &saved).await {
                     Ok(rkey) => info!(%did, url = %entry_url, %rkey, "wrote saved record to PDS"),
                     Err(err) => warn!(%err, %did, "PDS saved write failed (starred locally)"),
                 }
             } else {
                 // Un-star: find and delete the matching saved record by URL.
-                match state.sidecar.list_saved(&did).await {
+                match state.repo().list_saved(&did).await {
                     Ok(records) => {
                         for (rkey, _rec) in records.iter().filter(|(_, r)| r.url == entry_url) {
-                            if let Err(err) = state.sidecar.remove_saved(&did, rkey).await {
+                            if let Err(err) = state.repo().remove_saved(&did, rkey).await {
                                 warn!(%err, %did, %rkey, "PDS saved delete failed");
                             }
                         }
@@ -2002,7 +2003,7 @@ async fn add_subscription(
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
 
-    match state.sidecar.add_subscription(&did, &sub).await {
+    match state.repo().add_subscription(&did, &sub).await {
         Ok(rkey) => info!(feed = %feed_url, %rkey, %did, "wrote subscription record to PDS"),
         Err(err) => {
             warn!(%err, feed = %feed_url, %did, "PDS subscription write failed (cached locally)")
@@ -2022,7 +2023,7 @@ async fn delete_subscription(
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    match state.sidecar.remove_subscription(&did, &rkey).await {
+    match state.repo().remove_subscription(&did, &rkey).await {
         Ok(()) => info!(%did, %rkey, "unsubscribed (deleted PDS subscription record)"),
         Err(err) => warn!(%err, %did, %rkey, "PDS unsubscribe failed"),
     }
@@ -2126,7 +2127,7 @@ async fn rename_subscription(
     )
     .await;
 
-    match state.sidecar.update_subscription(&did, &rkey, &sub).await {
+    match state.repo().update_subscription(&did, &rkey, &sub).await {
         Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription"),
         Err(err) => warn!(%err, %did, %rkey, "PDS subscription update failed"),
     }
@@ -2158,7 +2159,7 @@ async fn create_folder(
         return Ok(Redirect::to("/").into_response());
     }
     let folder = Folder::new(name.to_string(), now_rfc3339());
-    match state.sidecar.add_folder(&did, &folder).await {
+    match state.repo().add_folder(&did, &folder).await {
         Ok(rkey) => info!(%did, %rkey, name, "created folder record"),
         Err(err) => warn!(%err, %did, "PDS folder create failed"),
     }
@@ -2181,7 +2182,7 @@ async fn rename_folder(
         return Ok(Redirect::to("/").into_response());
     }
     let folder = Folder::new(name.to_string(), now_rfc3339());
-    match state.sidecar.rename_folder(&did, &rkey, &folder).await {
+    match state.repo().rename_folder(&did, &rkey, &folder).await {
         Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed folder"),
         Err(err) => warn!(%err, %did, %rkey, "PDS folder rename failed"),
     }
@@ -2199,7 +2200,7 @@ async fn delete_folder(
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    match state.sidecar.remove_folder(&did, &rkey).await {
+    match state.repo().remove_folder(&did, &rkey).await {
         Ok(()) => info!(%did, %rkey, "deleted folder record"),
         Err(err) => warn!(%err, %did, %rkey, "PDS folder delete failed"),
     }
@@ -2759,6 +2760,34 @@ struct MintQuery {
 
 /// `POST /admin/invites?n=N` — mint N invite codes.
 ///
+/// `GET /admin/metrics` — repo-op latency for both backends, as plain text.
+///
+/// Admin-gated on the same rule as the invite minter: the table names every
+/// operation the reader performs and how often each fails, which is an
+/// operational picture rather than public information.
+///
+/// Text, not JSON or HTML: it is read by a person deciding whether the cutover
+/// is safe, and the comparison is two rows side by side.
+async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let did = match current_did(&state, &headers).await {
+        Some(d) => d,
+        None => return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response(),
+    };
+    if !state.config.admin_seed_dids().iter().any(|d| d == &did) {
+        warn!(%did, "admin metrics denied: not an admin-seed DID");
+        return (StatusCode::FORBIDDEN, "not an admin\n").into_response();
+    }
+
+    // The live backend is named at the top: a table of two populated rows is
+    // ambiguous about which one is currently serving users.
+    let body = format!(
+        "live backend: {}\n\n{}",
+        state.config.repo_backend.as_str(),
+        crate::metrics::render(&state.metrics.snapshot()),
+    );
+    (StatusCode::OK, body).into_response()
+}
+
 /// Authorized ONLY for a live session whose DID is in the `ALLOWED_DIDS` admin
 /// seed (`config.admin_seed_dids`). Returns the freshly-minted codes as
 /// newline-separated `text/plain`. Deliberately minimal (no HTML UI).
@@ -3249,7 +3278,7 @@ async fn import_opml(
     let mut folder_uris: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     // Reuse existing folders where the name already exists.
-    if let Ok(existing) = state.sidecar.list_folders_sorted(&did).await {
+    if let Ok(existing) = state.repo().list_folders_sorted(&did).await {
         for (rkey, folder) in existing {
             folder_uris
                 .entry(folder.name.clone())
@@ -3268,7 +3297,7 @@ async fn import_opml(
             continue;
         }
         let folder = Folder::new(name.clone(), now.clone());
-        match state.sidecar.add_folder(&did, &folder).await {
+        match state.repo().add_folder(&did, &folder).await {
             Ok(rkey) => {
                 folder_uris.insert(name, folder_uri(&did, &rkey));
             }
@@ -3383,7 +3412,7 @@ async fn import_opml(
         .await;
     }
 
-    match state.sidecar.add_subscriptions_bulk(&did, &subs).await {
+    match state.repo().add_subscriptions_bulk(&did, &subs).await {
         Ok(rkeys) => {
             info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)")
         }
@@ -3432,12 +3461,12 @@ async fn export_opml(
     };
 
     let subs = state
-        .sidecar
+        .repo()
         .list_subscriptions_sorted(&did)
         .await
         .unwrap_or_default();
     let folders = state
-        .sidecar
+        .repo()
         .list_folders_sorted(&did)
         .await
         .unwrap_or_default();

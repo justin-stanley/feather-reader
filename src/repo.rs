@@ -227,6 +227,14 @@ impl Repo<'_> {
     }
 
     dispatch! {
+        /// Saved items in PDS order — the un-star path, which matches by URL and
+        /// does not care about display order.
+        list_saved() -> Vec<(String, Saved)>,
+        sidecar: list_saved,
+        rust: list_saved
+    }
+
+    dispatch! {
         /// Unsave by rkey.
         remove_saved(rkey: &str) -> (),
         sidecar: remove_saved,

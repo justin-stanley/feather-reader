@@ -778,7 +778,7 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         .collect();
 
     // ONE applyWrites round-trip for all of this DID's dirty feeds.
-    state.sidecar.flush_read_states(did, &ops).await?;
+    state.repo().flush_read_states(did, &ops).await?;
 
     // Success — for each flushed cursor: mark its PDS record as created (so future
     // flushes emit an update), then clear `dirty` but ONLY if its `updated_at`
