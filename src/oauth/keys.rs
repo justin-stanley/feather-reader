@@ -298,20 +298,33 @@ impl Drop for Staged {
 /// to *existence* but not to *content*, so a crash between the open and the
 /// write leaves a zero-length file, and an unreadable key file is deliberately
 /// a hard error (see [`load_or_create`]).
-fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
+/// Returns `Ok(false)` when the file already exists — someone else won the race
+/// and their key is the one to use.
+fn write_new_owner_only(path: &Path, contents: &str) -> Result<bool> {
     let staged = Staged::write(path, contents)?;
-    fs::hard_link(staged.path(), path).with_context(|| {
-        format!(
-            "creating the signing-key file at {} (another process may have \
-             generated one already)",
-            path.display()
-        )
-    })?;
+    if let Err(err) = fs::hard_link(staged.path(), path) {
+        // EEXIST is not a failure, it is the outcome of a race we can lose
+        // safely: the file now at `path` is exactly the thing we wanted. Two
+        // replicas starting together both take the NotFound branch, both
+        // generate a key, and both link; treating the loser's EEXIST as fatal
+        // meant every replica but one refused to boot, and a scheduler
+        // restarting them together could flap indefinitely.
+        //
+        // A dangling SYMLINK lands here too — `read_to_string` follows it and
+        // reports NotFound, while `hard_link` does not follow it and reports
+        // EEXIST — so the retry path must be able to say "still not readable"
+        // rather than loop.
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return Ok(false);
+        }
+        return Err(err)
+            .with_context(|| format!("creating the signing-key file at {}", path.display()));
+    }
     // The contents now live at `path`; dropping `staged` unlinks only the
     // temporary second name for the same inode.
     drop(staged);
     sync_parent_dir(path);
-    Ok(())
+    Ok(true)
 }
 
 /// Replace an EXISTING key file **atomically**, keeping owner-only permissions.
@@ -380,8 +393,28 @@ pub fn load_or_create(path: &Path, codec: &Codec, kid: &str) -> Result<SigningKe
     }
 
     let key = SigningKey::generate(kid);
-    write_new_owner_only(path, &codec.encrypt(&key.to_jwk_json()?))?;
-    Ok(key)
+    if write_new_owner_only(path, &codec.encrypt(&key.to_jwk_json()?))? {
+        return Ok(key);
+    }
+
+    // Someone else created the file between our read and our link. Their key is
+    // the one on disk and therefore the one the JWKS will publish, so read it
+    // rather than returning the one we generated and threw away — two replicas
+    // holding different keys under the same `kid` is precisely the split this
+    // no-clobber guard exists to prevent.
+    let raw = fs::read_to_string(path).with_context(|| {
+        format!(
+            "re-reading the signing-key file at {} after losing the creation race",
+            path.display()
+        )
+    })?;
+    let plaintext = codec.maybe_decrypt(&raw).with_context(|| {
+        format!(
+            "decrypting the signing-key file at {} written by another process",
+            path.display()
+        )
+    })?;
+    SigningKey::from_jwk_json(&plaintext, kid)
 }
 
 #[cfg(test)]

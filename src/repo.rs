@@ -74,6 +74,27 @@ impl Repo<'_> {
         let server =
             oauth::discovery::discover(&self.state.http, &session.aud, rust.auth_method.as_str())
                 .await?;
+
+        // **The re-discovered issuer must be the one this session was issued
+        // by.** This is the worse of the two instances of the same hole: the
+        // refresh path sends the REFRESH TOKEN — long-lived, and the credential
+        // that mints every other one — to whatever endpoint discovery returns,
+        // and the session's stored issuer was being compared against nothing.
+        //
+        // Discovery's own checks are all internally consistent, so a hostile
+        // pair of documents satisfies every one of them. `store.rs` names this
+        // exact threat as the reason `issuer` is AAD-bound; the AAD protects the
+        // column from local tampering, and only this protects it from a network
+        // re-read.
+        if server.issuer != session.issuer {
+            anyhow::bail!(
+                "the PDS now names a different authorization server ({:?}) than this session \
+                 was issued by ({:?}); refusing to send the refresh token to it",
+                server.issuer,
+                session.issuer
+            );
+        }
+
         let ctx = oauth::session::RefreshContext {
             token_endpoint: &server.token_endpoint,
             client_id: &rust.client_id,

@@ -23,6 +23,13 @@ use super::identity::is_atproto_did;
 /// The scope atproto requires every session to hold.
 const ATPROTO_SCOPE: &str = "atproto";
 
+/// Largest `expires_in` a token response may claim: one year.
+///
+/// An upper bound exists because the value is added to the current time. Real
+/// atproto access tokens last an hour, so anything near this is already absurd;
+/// the cap only has to be low enough that `now + seconds` cannot overflow.
+const MAX_EXPIRES_IN_SECS: i64 = 365 * 24 * 60 * 60;
+
 /// Refresh at least this far ahead of expiry.
 pub const MIN_REFRESH_MARGIN_SECS: i64 = 10;
 
@@ -125,13 +132,33 @@ pub fn parse_token_response(body: &Value) -> Result<TokenResponse> {
             if seconds <= 0 {
                 bail!("`expires_in` must be positive, got {seconds}");
             }
+            // **And bounded.** Both consumers compute `now + seconds`. With
+            // overflow checks off — which is every release build, since the
+            // crate declares no `[profile]` — `i64::MAX` wraps to a large
+            // NEGATIVE expiry, `is_stale` becomes permanently true, and every
+            // subsequent request performs a full refresh round trip to the
+            // server that sent it.
+            if seconds > MAX_EXPIRES_IN_SECS {
+                bail!(
+                    "`expires_in` of {seconds}s is beyond anything a session should claim \
+                     (cap {MAX_EXPIRES_IN_SECS}s)"
+                );
+            }
             Some(seconds)
         }
     };
 
     Ok(TokenResponse {
         access_token: access_token.to_string(),
-        refresh_token: field("refresh_token").map(str::to_string),
+        // An EMPTY refresh token is absent, not a value. `access_token` is
+        // already checked for emptiness; this one was not, and only *absent*
+        // means "keep the one we have" downstream. So a server answering
+        // `"refresh_token": ""` replaced a live token with nothing, the next
+        // refresh was rejected as `invalid_grant`, and the session was deleted —
+        // exactly the spurious logout the refresh code is written to avoid.
+        refresh_token: field("refresh_token")
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
         token_type: token_type.to_string(),
         granted_scope: granted_scope.to_string(),
         sub: sub.to_string(),

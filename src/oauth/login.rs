@@ -194,6 +194,31 @@ pub async fn complete(
     }
 
     let server = discovery::discover(http, &pending.pds_url, auth_method.as_str()).await?;
+
+    // **The re-discovered issuer must be the one PAR was pushed under.**
+    //
+    // Discovery runs again here, from the network, and the token endpoint comes
+    // out of THAT document. Every discovery check is internally consistent — a
+    // hostile pair of documents satisfies all of them — so nothing else notices
+    // if the PDS's protected-resource document was repointed at a different
+    // authorization server between the push and this callback.
+    //
+    // `verify_callback` does not catch it either: the callback legitimately
+    // carries the ORIGINAL issuer, because the real server is what the user
+    // approved at. Without this check the authorization code, the PKCE verifier
+    // and a `private_key_jwt` assertion all go to the new endpoint.
+    //
+    // `store.rs` names this exact threat as the reason `issuer` is AAD-bound.
+    // The AAD protects the column from local tampering; only this protects it
+    // from a network re-read.
+    if server.issuer != pending.issuer {
+        bail!(
+            "the PDS now names a different authorization server ({:?}) than the login was \
+             pushed to ({:?}); refusing to send the authorization code to it",
+            server.issuer,
+            pending.issuer
+        );
+    }
     let mut token_params =
         token::token_request_params(&code, &pending.redirect_uri, &pending.pkce_verifier);
     let assertion = client_assertion(runtime, auth_method, &pending.issuer, now)?;

@@ -162,10 +162,18 @@ pub fn join_txt_chunks(chunks: &[&[u8]]) -> String {
 /// The value after `did=` is deliberately NOT trimmed, matching the spec and the
 /// reference: a padded record is invalid rather than silently repaired.
 pub fn did_from_txt_records(records: &[String]) -> Result<Option<String>> {
-    let candidates: Vec<&str> = records
+    let mut candidates: Vec<&str> = records
         .iter()
         .filter_map(|r| r.strip_prefix("did="))
         .collect();
+    // **Deduplicate before counting.** The spec fails resolution when multiple
+    // records name DIFFERENT DIDs; this counted RECORDS. A zone that serves the
+    // same `did=` value twice — routine with split-horizon or multi-provider DNS
+    // — was an unrecoverable error, and because it is an `Err` rather than
+    // `Ok(None)` it does not even fall through to the well-known lookup. That
+    // account simply could not log in.
+    candidates.sort_unstable();
+    candidates.dedup();
 
     match candidates.len() {
         0 => Ok(None),

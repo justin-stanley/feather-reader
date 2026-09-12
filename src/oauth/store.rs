@@ -117,28 +117,55 @@ fn structured_aad(table: &str, fields: &[&str]) -> Vec<u8> {
 /// `browser_binding_hash` is in here for the same reason — it is the only thing
 /// standing between a server-global state table and a login-CSRF, so it must not
 /// be swappable either.
-#[allow(clippy::too_many_arguments)]
-fn state_aad(
-    state: &str,
-    column: &str,
-    issuer: &str,
-    pds_url: &str,
-    did: &str,
-    redirect_uri: &str,
-    browser_binding_hash: &str,
-    auth_method: &str,
-) -> Vec<u8> {
+/// Every non-secret column of a state row, so the AAD covers the whole row.
+///
+/// A struct rather than a long argument list: the failure mode here is a field
+/// that nobody remembered to bind, and a struct makes adding a column without
+/// binding it a visible omission rather than an invisible one.
+struct StateBinding<'a> {
+    state: &'a str,
+    issuer: &'a str,
+    pds_url: &'a str,
+    did: &'a str,
+    redirect_uri: &'a str,
+    browser_binding_hash: &'a str,
+    auth_method: &'a str,
+    auth_kid: Option<&'a str>,
+    requested_scope: &'a str,
+    request_uri: &'a str,
+    app_return_to: Option<&'a str>,
+    expires_at: i64,
+}
+
+fn state_aad(binding: &StateBinding<'_>, column: &str) -> Vec<u8> {
+    let expires_at = binding.expires_at.to_string();
     structured_aad(
         "oauth_state",
         &[
-            state,
+            binding.state,
             column,
-            issuer,
-            pds_url,
-            did,
-            redirect_uri,
-            browser_binding_hash,
-            auth_method,
+            binding.issuer,
+            binding.pds_url,
+            binding.did,
+            binding.redirect_uri,
+            binding.browser_binding_hash,
+            binding.auth_method,
+            // `auth_kid` selects which client key signs the assertion; stored
+            // and never re-verified, so it is bound rather than trusted.
+            binding.auth_kid.unwrap_or(""),
+            binding.requested_scope,
+            binding.request_uri,
+            // Declared as a post-login redirect target. Nothing writes it yet,
+            // which is exactly why binding it now costs nothing — unbound, it
+            // becomes an open redirect the day it is wired up.
+            binding.app_return_to.unwrap_or(""),
+            // **The row's own lifetime is a destination too.** Both the expiry
+            // check and the sweeper filter on this column, so leaving it
+            // unauthenticated let anyone who can write the database keep a
+            // pending login — and its sealed DPoP key and PKCE verifier — alive
+            // indefinitely, defeating the cap whose stated purpose is narrowing
+            // the window in which a stolen `state` is worth replaying.
+            &expires_at,
         ],
     )
 }
@@ -148,8 +175,34 @@ fn state_aad(
 /// `aud` is the PDS every subsequent request is built against, so it is bound:
 /// repointing it would otherwise ship a live DPoP-bound access token to a host
 /// of the attacker's choosing, with the tokens decrypting perfectly.
-fn session_aad(sub: &str, column: &str, issuer: &str, aud: &str) -> Vec<u8> {
-    structured_aad("oauth_session", &[sub, column, issuer, aud])
+fn session_aad(
+    sub: &str,
+    column: &str,
+    issuer: &str,
+    aud: &str,
+    token_type: &str,
+    granted_scope: &str,
+    expires_at: Option<i64>,
+) -> Vec<u8> {
+    // `None` and `0` must not collide, so an absent expiry gets its own marker
+    // rather than a numeric stand-in.
+    let expires_at = expires_at.map_or_else(|| "none".to_string(), |secs| secs.to_string());
+    structured_aad(
+        "oauth_session",
+        &[
+            sub,
+            column,
+            issuer,
+            aud,
+            // Enforced strictly on the wire (`Bearer` is refused outright) and
+            // previously neither authenticated nor re-checked on read.
+            token_type,
+            granted_scope,
+            // Clearing this to NULL made `is_stale` permanently false, so the
+            // session was never proactively refreshed.
+            &expires_at,
+        ],
+    )
 }
 
 /// An in-flight login.
@@ -192,6 +245,21 @@ struct PendingRow {
 
 /// Record an in-flight login.
 pub async fn put_pending(pool: &SqlitePool, codec: &Codec, auth: &PendingAuth) -> Result<()> {
+    let binding = StateBinding {
+        state: &auth.state,
+        issuer: &auth.issuer,
+        pds_url: &auth.pds_url,
+        did: &auth.did,
+        redirect_uri: &auth.redirect_uri,
+        browser_binding_hash: &auth.browser_binding_hash,
+        auth_method: &auth.auth_method,
+        auth_kid: auth.auth_kid.as_deref(),
+        requested_scope: &auth.requested_scope,
+        request_uri: &auth.request_uri,
+        app_return_to: auth.app_return_to.as_deref(),
+        expires_at: auth.expires_at,
+    };
+
     sqlx::query(
         r#"
         INSERT INTO oauth_state (
@@ -203,32 +271,8 @@ pub async fn put_pending(pool: &SqlitePool, codec: &Codec, auth: &PendingAuth) -
     )
     .bind(&auth.state)
     .bind(&auth.browser_binding_hash)
-    .bind(codec.encrypt_bound(
-        &auth.pkce_verifier,
-        &state_aad(
-            &auth.state,
-            "pkce_verifier",
-            &auth.issuer,
-            &auth.pds_url,
-            &auth.did,
-            &auth.redirect_uri,
-            &auth.browser_binding_hash,
-            &auth.auth_method,
-        ),
-    ))
-    .bind(codec.encrypt_bound(
-        &auth.dpop_key_jwk,
-        &state_aad(
-            &auth.state,
-            "dpop_key_jwk",
-            &auth.issuer,
-            &auth.pds_url,
-            &auth.did,
-            &auth.redirect_uri,
-            &auth.browser_binding_hash,
-            &auth.auth_method,
-        ),
-    ))
+    .bind(codec.encrypt_bound(&auth.pkce_verifier, &state_aad(&binding, "pkce_verifier")))
+    .bind(codec.encrypt_bound(&auth.dpop_key_jwk, &state_aad(&binding, "dpop_key_jwk")))
     .bind(&auth.issuer)
     .bind(&auth.pds_url)
     .bind(&auth.did)
@@ -282,18 +326,21 @@ pub async fn take_pending(
 
     // The AAD is rebuilt from the STORED destinations, so any edit to them
     // makes the secrets undecryptable rather than merely unnoticed.
-    let aad = |column: &str| {
-        state_aad(
-            &row.state,
-            column,
-            &row.issuer,
-            &row.pds_url,
-            &row.did,
-            &row.redirect_uri,
-            &row.browser_binding_hash,
-            &row.auth_method,
-        )
+    let binding = StateBinding {
+        state: &row.state,
+        issuer: &row.issuer,
+        pds_url: &row.pds_url,
+        did: &row.did,
+        redirect_uri: &row.redirect_uri,
+        browser_binding_hash: &row.browser_binding_hash,
+        auth_method: &row.auth_method,
+        auth_kid: row.auth_kid.as_deref(),
+        requested_scope: &row.requested_scope,
+        request_uri: &row.request_uri,
+        app_return_to: row.app_return_to.as_deref(),
+        expires_at: row.expires_at,
     };
+    let aad = |column: &str| state_aad(&binding, column);
     Ok(Some(PendingAuth {
         pkce_verifier: codec
             .decrypt_bound(&row.pkce_verifier, &aad("pkce_verifier"))
@@ -371,15 +418,39 @@ pub async fn put_session(pool: &SqlitePool, codec: &Codec, session: &OAuthSessio
     .bind(&session.aud)
     .bind(codec.encrypt_bound(
         &session.dpop_key_jwk,
-        &session_aad(&session.sub, "dpop_key_jwk", &session.issuer, &session.aud),
+        &session_aad(
+            &session.sub,
+            "dpop_key_jwk",
+            &session.issuer,
+            &session.aud,
+            &session.token_type,
+            &session.granted_scope,
+            session.expires_at,
+        ),
     ))
     .bind(codec.encrypt_bound(
         &session.access_token,
-        &session_aad(&session.sub, "access_token", &session.issuer, &session.aud),
+        &session_aad(
+            &session.sub,
+            "access_token",
+            &session.issuer,
+            &session.aud,
+            &session.token_type,
+            &session.granted_scope,
+            session.expires_at,
+        ),
     ))
     .bind(codec.encrypt_bound(
         &session.refresh_token,
-        &session_aad(&session.sub, "refresh_token", &session.issuer, &session.aud),
+        &session_aad(
+            &session.sub,
+            "refresh_token",
+            &session.issuer,
+            &session.aud,
+            &session.token_type,
+            &session.granted_scope,
+            session.expires_at,
+        ),
     ))
     .bind(&session.token_type)
     .bind(&session.granted_scope)
@@ -409,7 +480,17 @@ pub async fn get_session(
     .context("reading the OAuth session")?;
 
     let Some(row) = row else { return Ok(None) };
-    let aad = |column: &str| session_aad(&row.sub, column, &row.issuer, &row.aud);
+    let aad = |column: &str| {
+        session_aad(
+            &row.sub,
+            column,
+            &row.issuer,
+            &row.aud,
+            &row.token_type,
+            &row.granted_scope,
+            row.expires_at,
+        )
+    };
     Ok(Some(OAuthSession {
         dpop_key_jwk: codec
             .decrypt_bound(&row.dpop_key_jwk, &aad("dpop_key_jwk"))
@@ -682,6 +763,18 @@ mod tests {
             "redirect_uri",
             "browser_binding_hash",
             "auth_method",
+            // Added after a cold review found each of these tamperable while
+            // every ciphertext still verified:
+            //
+            // `auth_kid` selects the signing key and is never re-verified;
+            // `requested_scope` and `request_uri` describe the grant being
+            // completed; `app_return_to` is a declared post-login redirect
+            // target, so unbound it becomes an open redirect the day it is
+            // wired up — binding it now costs nothing.
+            "auth_kid",
+            "requested_scope",
+            "request_uri",
+            "app_return_to",
         ] {
             let (pool, codec) = db().await;
             put_pending(&pool, &codec, &pending("state-1")).await?;
@@ -705,7 +798,14 @@ mod tests {
     /// host. It must break the tokens, not travel alongside them.
     #[tokio::test]
     async fn tampering_with_a_sessions_destinations_breaks_it() -> anyhow::Result<()> {
-        for column in ["aud", "issuer"] {
+        for column in [
+            "aud",
+            "issuer",
+            // `token_type` is refused outright on the wire if it is not `DPoP`,
+            // but the stored copy was neither authenticated nor re-checked.
+            "token_type",
+            "granted_scope",
+        ] {
             let (pool, codec) = db().await;
             put_session(&pool, &codec, &session()).await?;
             sqlx::query(leak(format!(
@@ -720,6 +820,48 @@ mod tests {
                 "tampering with `{column}` went undetected"
             );
         }
+        Ok(())
+    }
+
+    /// **A row's own lifetime is a destination.**
+    ///
+    /// Both the expiry check in `take_pending` and `sweep_expired_pending`
+    /// filter on `expires_at`. While it was outside the AAD, anyone who could
+    /// write the database could push it a year out and keep a pending login —
+    /// with its sealed DPoP key and PKCE verifier — alive indefinitely, which is
+    /// exactly what the ten-minute cap exists to prevent. Every ciphertext still
+    /// verified.
+    #[tokio::test]
+    async fn extending_a_pending_logins_expiry_breaks_it() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_pending(&pool, &codec, &pending("state-1")).await?;
+        sqlx::query("UPDATE oauth_state SET expires_at = ? WHERE state = ?")
+            .bind(NOW + 31_536_000)
+            .bind("state-1")
+            .execute(&pool)
+            .await?;
+        assert!(
+            take_pending(&pool, &codec, "state-1", NOW).await.is_err(),
+            "the expiry was extended without breaking the row"
+        );
+        Ok(())
+    }
+
+    /// Clearing a session's expiry made `is_stale` permanently false, so the
+    /// session was never proactively refreshed — behaviour steered by an
+    /// unauthenticated column while every token decrypted cleanly.
+    #[tokio::test]
+    async fn clearing_a_sessions_expiry_breaks_it() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_session(&pool, &codec, &session()).await?;
+        sqlx::query("UPDATE oauth_session SET expires_at = NULL WHERE sub = ?")
+            .bind(DID)
+            .execute(&pool)
+            .await?;
+        assert!(
+            get_session(&pool, &codec, DID).await.is_err(),
+            "the expiry was cleared without breaking the row"
+        );
         Ok(())
     }
 
