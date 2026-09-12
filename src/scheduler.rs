@@ -704,8 +704,12 @@ fn jittered(period: Duration, seed: &str) -> Duration {
 // Pending-login sweeper
 // ---------------------------------------------------------------------------
 
-/// How often abandoned logins are swept.
+/// How often abandoned logins and stale nonces are swept.
 const PENDING_SWEEP_SECS: u64 = 900;
+
+/// How long an untouched DPoP nonce is kept. A server nonce lasts minutes; a day
+/// is generous and keeps the table to the origins actually in use.
+const NONCE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 /// Delete expired pending logins.
 ///
@@ -731,15 +735,24 @@ pub async fn run_pending_sweeper(state: AppState, mut shutdown: watch::Receiver<
                 break;
             }
             _ = ticker.tick() => {
-                match feather_reader::oauth::store::sweep_expired_pending(
-                    &state.db,
-                    Utc::now().timestamp(),
-                )
-                .await
-                {
+                let now = Utc::now().timestamp();
+                match feather_reader::oauth::store::sweep_expired_pending(&state.db, now).await {
                     Ok(0) => debug!("pending-login sweeper: nothing to expire"),
                     Ok(n) => info!(swept = n, "pending-login sweeper: removed abandoned logins"),
                     Err(err) => error!(%err, "pending-login sweeper: sweep failed"),
+                }
+                // Same volume, same pre-auth write primitive, and a stale nonce
+                // is worthless — the server issues a new one with the next
+                // challenge.
+                match feather_reader::oauth::store::sweep_stale_nonces(
+                    &state.db,
+                    now - NONCE_MAX_AGE_SECS,
+                )
+                .await
+                {
+                    Ok(0) => debug!("nonce sweeper: nothing stale"),
+                    Ok(n) => info!(swept = n, "nonce sweeper: removed stale DPoP nonces"),
+                    Err(err) => error!(%err, "nonce sweeper: sweep failed"),
                 }
             }
         }

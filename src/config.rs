@@ -32,7 +32,7 @@
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
-//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. |
+//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
 //! | `FEATHERREADER_OAUTH_SCOPE`       | `atproto transition:generic` | Scope requested at login. Part of the dev `client_id`, so changing it changes the client's identity in dev. |
 //!

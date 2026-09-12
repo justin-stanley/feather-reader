@@ -59,8 +59,14 @@ impl Repo<'_> {
                 key: self.key,
                 access_token: Some(&self.session.access_token),
                 body,
-                // A repo call is safe to repeat on a nonce challenge: the PDS
-                // has not acted on a request it answered with a challenge.
+                // A repo call is repeated on a nonce challenge, on the
+                // ASSUMPTION that a PDS answering with a challenge has not acted
+                // on the request. That is how conformant servers behave and what
+                // the reference relies on, but it is not a guarantee we can
+                // verify: a PDS or intermediary that emitted `use_dpop_nonce`
+                // after a write committed would yield a duplicate record from
+                // `createRecord` or `applyWrites`, both of which are
+                // non-idempotent here.
                 retry: Retry::Allowed,
             },
         )

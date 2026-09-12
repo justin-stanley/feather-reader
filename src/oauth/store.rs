@@ -536,6 +536,23 @@ pub async fn sweep_expired_pending(pool: &SqlitePool, now: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Delete DPoP nonces untouched since `cutoff`. Returns how many went.
+///
+/// The origins come from whatever handle a visitor typed into the login form,
+/// and `put_nonce` runs during PAR — before any authentication. So this is a
+/// pre-auth write primitive against the volume, the same argument that
+/// justifies sweeping abandoned logins, applied to the one table that had no
+/// sweeper. A nonce is also worthless once stale: the server issues a new one
+/// with the next challenge.
+pub async fn sweep_stale_nonces(pool: &SqlitePool, cutoff: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM oauth_nonce WHERE updated_at <= ?1")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .context("sweeping stale DPoP nonces")?;
+    Ok(result.rows_affected())
+}
+
 /// The stored DPoP nonce for an origin, if any.
 pub async fn get_nonce(pool: &SqlitePool, origin: &str) -> Result<Option<String>> {
     sqlx::query_scalar("SELECT nonce FROM oauth_nonce WHERE origin = ?1")

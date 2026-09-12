@@ -2535,7 +2535,19 @@ async fn oauth_callback(
     //
     // The sidecar arm has no such check to reach, so it is short-circuited
     // below, preserving exactly what it did before.
-    let sidecar_handoff = q.session_id.as_deref().is_some_and(|s| !s.is_empty());
+    // **The arm is chosen by what the SERVER knows, not by what the caller
+    // sent.** A `session_id` in the query used to select the sidecar arm on its
+    // own — so a caller could pick which code path ran, and the sidecar arm has
+    // no browser-binding check at all. It also short-circuited the error path
+    // below, skipping the `iss` validation.
+    //
+    // Requiring the Rust runtime to be absent, or a sidecar backend to be the
+    // configured one, means the selection follows this deployment's own
+    // configuration. A login started before a flip still completes, because the
+    // Rust arm is reached whenever the Rust runtime exists and can match the
+    // `state` against a pending row it actually wrote.
+    let sidecar_handoff = q.session_id.as_deref().is_some_and(|s| !s.is_empty())
+        && (state.oauth.is_none() || state.config.repo_backend == crate::metrics::Backend::Sidecar);
     if let Some(err) = q.error.clone() {
         let desc = q.error_description.clone().unwrap_or_default();
         warn!(error = %err, desc = %desc, "OAuth callback returned an error");

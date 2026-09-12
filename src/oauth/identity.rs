@@ -103,6 +103,28 @@ fn is_bare_did_web_host(host: &str) -> bool {
     if !host.contains('.') {
         return false; // a bare token is not a resolvable host
     }
+    // The SAME reserved-TLD policy handles are held to. `normalize_handle`
+    // applies it and this did not, so `did:web:printer.local` and
+    // `did:web:pds.internal` were accepted and fetched. The SSRF guard does stop
+    // them — but the rule this module states for handles is that rejecting here
+    // makes the guard a SECOND line of defence rather than the only one, and for
+    // `did:web` it was the only one.
+    if let Some(tld) = host.rsplit('.').next() {
+        if RESERVED_TLDS.contains(&tld) {
+            return false;
+        }
+    }
+    // An IP literal is not a name, and `did:web:169.254.169.254` is a cloud
+    // metadata endpoint. A dotted-quad passes the label rules below, so it has
+    // to be refused explicitly.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    // A DNS name is at most 253 bytes; anything longer cannot resolve, and an
+    // unbounded one is only useful for making us construct absurd URLs.
+    if host.len() > 253 {
+        return false;
+    }
     host.split('.').all(|label| {
         !label.is_empty()
             && label
@@ -295,29 +317,27 @@ pub fn pds_endpoint(document: &Value, did: &str) -> Result<String> {
             .context("#atproto_pds serviceEndpoint is not a string")?;
         let parsed = url::Url::parse(endpoint)
             .with_context(|| format!("#atproto_pds serviceEndpoint {endpoint:?} is not a URL"))?;
-        match parsed.scheme() {
-            "https" => {}
-            // A DID document is attacker-controlled in the `did:web` case, and
-            // DPoP-bound tokens are sent to this host. Plaintext is tolerable
-            // only against a local dev PDS.
-            "http" if is_loopback_host(&parsed) => {}
-            _ => bail!(
-                "#atproto_pds serviceEndpoint must be https (or http on loopback), got {endpoint:?}"
-            ),
+        if parsed.scheme() != "https" {
+            // The `http`-on-loopback carve-out that used to live here was
+            // unreachable: every fetch against this endpoint goes through the
+            // SSRF guard, which rejects all loopback addresses unconditionally
+            // with no dev flag. It could never serve the local-dev case it
+            // named, and only widened what a hostile DID document could get
+            // past this function.
+            bail!("#atproto_pds serviceEndpoint must be https, got {endpoint:?}");
+        }
+        // Reject userinfo for the same reason `did:web` hosts reject `@`: the
+        // plausible-looking part becomes credentials and the REAL host is
+        // whatever follows. Every security decision downstream re-derives the
+        // host (`origin_of` and `htu` both strip userinfo), so this is not a
+        // trust bypass — but `aud` is what appears in logs and what reqwest
+        // would turn into a `Basic` credential on every XRPC call.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("#atproto_pds serviceEndpoint must not carry credentials, got {endpoint:?}");
         }
         return Ok(endpoint.to_string());
     }
     bail!("DID document declares no #atproto_pds service for {did}")
-}
-
-/// Whether a URL points at the local machine.
-fn is_loopback_host(url: &url::Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(name)) => name == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 /// The handle a DID document claims, normalized.
@@ -739,18 +759,68 @@ mod tests {
     }
 
     /// A DID document is attacker-controlled in the `did:web` case, and tokens
-    /// go to this host. Plaintext is only tolerable on loopback.
+    /// go to this host, so plaintext is refused — **including on loopback**.
+    ///
+    /// This previously carved out `http` on loopback "for a local dev PDS". That
+    /// carve-out was unreachable: every fetch against this endpoint goes through
+    /// the SSRF guard, which rejects all loopback addresses unconditionally with
+    /// no dev flag and no config bypass. It could never serve the case it named,
+    /// and only widened what a hostile document could get past this function.
     #[test]
-    fn a_plaintext_http_pds_is_rejected_outside_loopback() {
+    fn a_plaintext_http_pds_is_rejected_including_on_loopback() {
         let mut d = doc();
-        for endpoint in ["http://pds.attacker.example", "http://10.0.0.5"] {
+        for endpoint in [
+            "http://pds.attacker.example",
+            "http://10.0.0.5",
+            "http://localhost:2583",
+            "http://127.0.0.1:2583",
+        ] {
             d["service"][0]["serviceEndpoint"] = json!(endpoint);
             assert!(pds_endpoint(&d, DID).is_err(), "accepted {endpoint}");
         }
-        for endpoint in ["http://localhost:2583", "http://127.0.0.1:2583"] {
+    }
+
+    /// **Credentials in a `serviceEndpoint` are refused.**
+    ///
+    /// `https://good.example@attacker.example` has real host `attacker.example`
+    /// — the exact demotion this module already rejects for `did:web` hosts. The
+    /// downstream security decisions re-derive the host either way, so this is
+    /// not a trust bypass; but this value is `aud`, it is what appears in logs,
+    /// and reqwest would turn the userinfo into a `Basic` credential on every
+    /// XRPC call to the PDS.
+    #[test]
+    fn a_pds_endpoint_carrying_credentials_is_refused() {
+        let mut d = doc();
+        for endpoint in [
+            "https://good.example@attacker.example",
+            "https://u:p@attacker.example/x",
+        ] {
             d["service"][0]["serviceEndpoint"] = json!(endpoint);
-            assert!(pds_endpoint(&d, DID).is_ok(), "rejected dev {endpoint}");
+            assert!(pds_endpoint(&d, DID).is_err(), "accepted {endpoint}");
         }
+    }
+
+    /// `did:web` hosts are held to the SAME policy as handles: no reserved TLD,
+    /// no IP literal. The SSRF guard blocks these at fetch time, but this module
+    /// states that rejecting here is what makes the guard a second line of
+    /// defence rather than the only one.
+    #[test]
+    fn did_web_hosts_obey_the_reserved_tld_and_ip_policy() {
+        for did in [
+            "did:web:169.254.169.254", // cloud metadata
+            "did:web:127.0.0.1",
+            "did:web:10.0.0.5",
+            "did:web:pds.internal",
+            "did:web:printer.local",
+            "did:web:something.localhost",
+            "did:web:site.onion",
+        ] {
+            assert!(!is_atproto_did(did), "accepted {did}");
+        }
+        // A 300-character label cannot resolve and is refused.
+        assert!(!is_atproto_did(&format!("did:web:{}.com", "a".repeat(300))));
+        // Ordinary hosts still work.
+        assert!(is_atproto_did("did:web:pds.example.com"));
     }
 
     /// All three conditions must hold: id, type, and a parseable endpoint.

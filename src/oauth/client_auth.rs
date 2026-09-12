@@ -102,8 +102,18 @@ pub fn credential_params(
 /// must be the Authorization Server's `issuer`"* — which also means one audience
 /// covers PAR, token, refresh and revocation alike.
 ///
-/// A fresh `jti` per call, because that claim exists to stop replay; every
-/// request mints its own, including the retry after a nonce challenge.
+/// A fresh `jti` per call, because that claim exists to stop replay.
+///
+/// **But NOT per retry.** The nonce-challenge retry in
+/// [`super::request::send_with_dpop`] re-sends the identical form body and
+/// re-mints only the DPoP proof, so the assertion — and its `jti` — is replayed
+/// verbatim. This matches the reference client, which does the same, but an
+/// authorization server that enforces single-use `jti` on client assertions
+/// would answer the retry with `invalid_client` and turn a recoverable nonce
+/// challenge into a failed login.
+///
+/// This comment previously claimed the opposite. It was wrong, and the retry
+/// path is structurally unable to reach the assertion builder.
 ///
 /// The header carries `kid` and nothing else beyond `alg` (which
 /// [`super::jwt::sign`] owns). The reference sends no `typ` here, and keeping it

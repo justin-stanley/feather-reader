@@ -206,7 +206,15 @@ pub async fn send_with_dpop(
         let headers = request_headers(&proof, access_token)?;
 
         let response = match body {
-            DpopBody::Query => net::guarded_get_no_privacy(client, url, &headers).await,
+            // NO REDIRECTS on a DPoP GET. A proof's `htu` names the URL it was
+            // minted for, so the request cannot succeed after a cross-origin
+            // redirect anyway — following one buys nothing and costs two things:
+            // the `DPoP-Nonce` is harvested from the FINAL response and stored
+            // under the ORIGINAL origin, letting a redirect poison the nonce for
+            // the real PDS; and the proof itself is re-sent to the redirect
+            // target, since `net`'s cross-host header stripping covers
+            // `Authorization` but not `DPoP`.
+            DpopBody::Query => net::guarded_get_no_redirect(client, url, &headers).await,
             DpopBody::Form(params) => net::guarded_post_form(client, url, &headers, params).await,
             DpopBody::Json(bytes) => {
                 net::guarded_post_json(client, url, &headers, bytes.clone()).await
@@ -330,8 +338,19 @@ mod tests {
         assert!(next_nonce(1, Retry::Allowed, Some("fresh".into()), None).is_none());
     }
 
-    /// **The code exchange must not be retried.** Plan §11 and the reference
-    /// both refuse it: re-POSTing `grant_type=authorization_code` can burn the
+    /// **A request marked `Forbidden` is never retried, whatever the server
+    /// says.**
+    ///
+    /// NOTE: nothing currently passes `Forbidden`, and the authorization-code
+    /// exchange deliberately does NOT — a nonce challenge is rejected before the
+    /// grant is processed, so the code is not consumed and the request is safe
+    /// to resend. An earlier round of review marked that call site `Forbidden`
+    /// on the reasoning below and it killed a real login against a live PDS.
+    ///
+    /// The reference draws the line at whether the request BODY can be re-read,
+    /// not at what the request means; a buffered form always can. This variant
+    /// is kept for a body that cannot be replayed, and the original reasoning is
+    /// preserved here only so it is not rediscovered and re-applied: re-POSTing `grant_type=authorization_code` can burn the
     /// authorization code, and the login then dies AFTER the user approved,
     /// presenting as intermittent "login just doesn't work".
     #[test]

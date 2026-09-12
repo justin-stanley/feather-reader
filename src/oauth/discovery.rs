@@ -192,7 +192,7 @@ fn require_absent(metadata: &Value, field: &str, forbidden: &str) -> Result<()> 
 }
 
 /// Read a required endpoint, requiring an absolute https URL.
-fn require_endpoint(metadata: &Value, field: &str) -> Result<String> {
+fn require_endpoint(metadata: &Value, field: &str, issuer: &str) -> Result<String> {
     let raw = metadata
         .get(field)
         .and_then(Value::as_str)
@@ -202,6 +202,26 @@ fn require_endpoint(metadata: &Value, field: &str) -> Result<String> {
     if parsed.scheme() != "https" {
         bail!("`{field}` must be https, got {raw:?}");
     }
+    // **Endpoints must live on the issuer's own origin.**
+    //
+    // RFC 8414 does not require co-location, so this is a hardening choice
+    // rather than a conformance check — and it is made deliberately, because
+    // `authorization_endpoint` is a URL this app 303s a browser to from its own
+    // `/login`. Without it, anyone who can start a login with a `did:web` they
+    // control turns `/login` into an arbitrary-https-redirect on our origin: the
+    // chain is self-consistent, every other discovery check passes, and the
+    // endpoint points wherever they like.
+    //
+    // The atproto profile co-locates these in practice — the frozen real-PDS
+    // fixture in the tests below is the evidence — so the cost is refusing a
+    // server that is unusual rather than one that is wrong.
+    let origin = origin_of(raw)?;
+    if origin != issuer {
+        bail!(
+            "`{field}` {raw:?} is on {origin:?}, not the issuer's own origin {issuer:?}; \
+             refusing to treat it as part of this authorization server"
+        );
+    }
     Ok(raw.to_string())
 }
 
@@ -210,10 +230,10 @@ fn require_endpoint(metadata: &Value, field: &str) -> Result<String> {
 /// Present-but-unusable is still an ERROR: a `revocation_endpoint` of
 /// `http://…` or a relative path is a broken document, and silently treating it
 /// as absent would turn a misconfigured server into a silent no-op sign-out.
-fn optional_endpoint(metadata: &Value, field: &str) -> Result<Option<String>> {
+fn optional_endpoint(metadata: &Value, field: &str, issuer: &str) -> Result<Option<String>> {
     match metadata.get(field) {
         None | Some(Value::Null) => Ok(None),
-        Some(_) => require_endpoint(metadata, field).map(Some),
+        Some(_) => require_endpoint(metadata, field, issuer).map(Some),
     }
 }
 
@@ -321,10 +341,10 @@ pub fn validate_authorization_server(
 
     Ok(AuthorizationServer {
         issuer: issuer.to_string(),
-        par_endpoint: require_endpoint(metadata, "pushed_authorization_request_endpoint")?,
-        authorization_endpoint: require_endpoint(metadata, "authorization_endpoint")?,
-        token_endpoint: require_endpoint(metadata, "token_endpoint")?,
-        revocation_endpoint: optional_endpoint(metadata, "revocation_endpoint")?,
+        par_endpoint: require_endpoint(metadata, "pushed_authorization_request_endpoint", issuer)?,
+        authorization_endpoint: require_endpoint(metadata, "authorization_endpoint", issuer)?,
+        token_endpoint: require_endpoint(metadata, "token_endpoint", issuer)?,
+        revocation_endpoint: optional_endpoint(metadata, "revocation_endpoint", issuer)?,
     })
 }
 
@@ -333,19 +353,56 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// **An endpoint on a foreign origin is refused.**
+    ///
+    /// `authorization_endpoint` is a URL the app 303s a browser to from its own
+    /// `/login`. Left unconstrained, anyone who can start a login with a
+    /// `did:web` they control turns `/login` into an arbitrary-https-redirect on
+    /// our origin — every other discovery check passes, because the hostile
+    /// documents are self-consistent.
+    ///
+    /// RFC 8414 permits co-location to be absent, so this refuses a server that
+    /// is unusual rather than one that is wrong. The real-PDS fixture below is
+    /// the evidence that atproto co-locates in practice.
+    #[test]
+    fn an_endpoint_on_a_foreign_origin_is_refused() {
+        for field in [
+            "pushed_authorization_request_endpoint",
+            "authorization_endpoint",
+            "token_endpoint",
+            "revocation_endpoint",
+        ] {
+            let mut asm = as_metadata();
+            asm[field] = json!("https://totally-other.example/authorize");
+            let err = validate_authorization_server(&asm, ISS, PDS, "none")
+                .expect_err("accepted a foreign-origin {field}");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("issuer's own origin"),
+                "{field} failed for the wrong reason: {rendered}"
+            );
+        }
+    }
+
     /// An ABSENT `revocation_endpoint` is absent, not an error. RFC 8414 does
     /// not require one, and refusing to log a user in because a server offers no
     /// way to log them out later would be the wrong trade.
     #[test]
     fn an_absent_revocation_endpoint_is_tolerated() {
         assert_eq!(
-            optional_endpoint(&json!({}), "revocation_endpoint").unwrap(),
+            optional_endpoint(
+                &json!({}),
+                "revocation_endpoint",
+                "https://auth.example.com"
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
             optional_endpoint(
                 &json!({ "revocation_endpoint": null }),
-                "revocation_endpoint"
+                "revocation_endpoint",
+                "https://auth.example.com"
             )
             .unwrap(),
             None
@@ -361,15 +418,27 @@ mod tests {
     #[test]
     fn a_malformed_revocation_endpoint_is_an_error_rather_than_absent() {
         let plain_http = json!({ "revocation_endpoint": "http://auth.example.com/revoke" });
-        let err = optional_endpoint(&plain_http, "revocation_endpoint")
-            .expect_err("plain http must be refused");
+        let err = optional_endpoint(
+            &plain_http,
+            "revocation_endpoint",
+            "https://auth.example.com",
+        )
+        .expect_err("plain http must be refused");
         assert!(format!("{err:#}").contains("must be https"));
 
         let relative = json!({ "revocation_endpoint": "/revoke" });
-        assert!(optional_endpoint(&relative, "revocation_endpoint").is_err());
+        assert!(
+            optional_endpoint(&relative, "revocation_endpoint", "https://auth.example.com")
+                .is_err()
+        );
 
         let wrong_type = json!({ "revocation_endpoint": 42 });
-        assert!(optional_endpoint(&wrong_type, "revocation_endpoint").is_err());
+        assert!(optional_endpoint(
+            &wrong_type,
+            "revocation_endpoint",
+            "https://auth.example.com"
+        )
+        .is_err());
     }
 
     const PDS: &str = "https://pds.example.com";

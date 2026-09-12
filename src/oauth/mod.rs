@@ -1,9 +1,9 @@
 //! Rust-native atproto OAuth — the replacement for the Node sidecar.
 //!
-//! Built in phases; this module is NOT yet wired into the live login path.
-//! [`crate::atproto::SidecarClient`] remains the live path until the cutover,
-//! and both implementations share an at-rest wire format so the switch is
-//! reversible. See [`crypto`] for that format.
+//! This module is the live login and repo path when
+//! `FEATHERREADER_REPO_BACKEND=rust`; [`crate::atproto::SidecarClient`] is the
+//! default and serves it otherwise. Both implementations share an at-rest wire
+//! format so the switch is reversible in either direction — see [`crypto`].
 
 pub mod client_auth;
 pub mod crypto;
