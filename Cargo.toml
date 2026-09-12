@@ -103,6 +103,26 @@ base64 = "0.22"
 # tree, so this adds no package to the lock either.
 subtle = "2"
 
+# --- P-256 for the OAuth confidential-client signing key -----------------
+# The `jwk` feature is the reason for this dep: it gives first-class JWK
+# import/export, so the key file stays in the SAME format the Node sidecar
+# writes and a rollback can still read it. The alternative was hand-parsing
+# PKCS#8 DER out of `ring` to recover the private scalar — more code, in the
+# one place where a silent bug is worst.
+#
+# NOT `atproto-oauth`/`atproto-identity`: their `jwk`/`dpop`/`pkce` primitives
+# are exactly what is wanted, but `reqwest` is a NON-optional dependency of
+# both, so depending on either would compile a second HTTP stack (reqwest 0.12
+# beside our 0.13) plus hickory-dns into the binary — a network path the SSRF
+# guard does not cover — for functions that never touch the network. Version
+# 0.13 is the same one `atproto-identity` itself pins.
+#
+# Cost, stated plainly: 20 pure crypto/encoding packages, and it newly
+# duplicates `hmac` and `rand_core` (the RustCrypto 0.10-era stack beside the
+# newer one already present). `deny.toml` only warns on multiple versions, so
+# this is recorded here rather than left for it to catch.
+p256 = { version = "0.13", features = ["jwk"] }
+
 # --- filesystem stat (startup disk-headroom check) -----------------------
 # Already in the tree transitively; pinned as a direct dep so the startup
 # watermark-vs-disk safety check can call `statvfs(3)` on unix to compare the
