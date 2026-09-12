@@ -31,6 +31,7 @@ pub mod atproto;
 pub mod config;
 pub mod feed;
 pub mod lexicon;
+pub mod metrics;
 pub mod net;
 pub mod network;
 pub mod oauth;
@@ -151,6 +152,9 @@ pub struct AppState {
     pub sidecar: SidecarClient,
     /// DID ↔ handle session registry (cookie-resolved identity).
     pub sessions: SessionRegistry,
+    /// Repo-op latency for BOTH backends, for reading the two side by side
+    /// across a cutover flip.
+    pub metrics: Arc<metrics::RepoMetrics>,
 }
 
 impl AppState {
@@ -173,6 +177,7 @@ impl AppState {
             http,
             sidecar,
             sessions: SessionRegistry::new(),
+            metrics: Arc::new(metrics::RepoMetrics::new()),
         })
     }
 }

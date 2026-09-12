@@ -108,6 +108,10 @@ pub struct Config {
     /// is served as this DID (local runs without the OAuth sidecar). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
+    /// Which repo implementation serves `com.atproto.repo.*` — the cutover
+    /// switch. Defaults to the sidecar, so deploying the Rust client changes
+    /// nothing until this is set deliberately.
+    pub repo_backend: crate::metrics::Backend,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
     /// handle into a DID so an existing seat can be honored on a cookie-less first
@@ -220,6 +224,20 @@ impl SidecarConfig {
     }
 }
 
+/// Parse the cutover switch. Unknown values are an ERROR rather than a silent
+/// fall back to the default: a typo in `FEATHERREADER_REPO_BACKEND=rsut` that
+/// quietly kept the sidecar live would make the whole comparison a measurement
+/// of the sidecar against itself.
+fn parse_repo_backend(raw: &str) -> Result<crate::metrics::Backend> {
+    match raw.trim() {
+        "sidecar" => Ok(crate::metrics::Backend::Sidecar),
+        "rust" => Ok(crate::metrics::Backend::Rust),
+        other => anyhow::bail!(
+            "FEATHERREADER_REPO_BACKEND: expected \"sidecar\" or \"rust\", got {other:?}"
+        ),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -240,6 +258,8 @@ impl Default for Config {
             db_size_watermark_bytes: 2 * 1024 * 1024 * 1024,
             sidecar: SidecarConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
+            // The sidecar stays the live path until the switch is thrown.
+            repo_backend: crate::metrics::Backend::Sidecar,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
@@ -418,6 +438,11 @@ impl Config {
             None => defaults.adoption_interval,
         };
 
+        let repo_backend = match env_opt("FEATHERREADER_REPO_BACKEND") {
+            Some(raw) => parse_repo_backend(&raw)?,
+            None => defaults.repo_backend,
+        };
+
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
                 format!("FEATHERREADER_SHOW_ADOPTION: expected a boolean, got {raw:?}")
@@ -426,6 +451,7 @@ impl Config {
         };
 
         let config = Self {
+            repo_backend,
             bind,
             db_path,
             public_url,
@@ -757,6 +783,52 @@ mod tests {
             parse_relay_hosts(Some("wss://a.example, ftp://b.example"), relay_defaults());
         assert!(hosts.is_empty());
         assert_eq!(rejected.len(), 2);
+    }
+
+    /// **A typo must fail loudly.**
+    ///
+    /// `FEATHERREADER_REPO_BACKEND=rsut` falling back to the default would leave
+    /// the sidecar serving every request while the operator believed the Rust
+    /// path was live. Every number in the comparison would then be the sidecar
+    /// measured against itself, and the cutover would look flawless right up
+    /// until the flag was removed.
+    #[test]
+    fn an_unknown_repo_backend_is_an_error_rather_than_a_silent_default() {
+        let err = parse_repo_backend("rsut").expect_err("a typo must not be ignored");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rsut"),
+            "the message must name the bad value: {rendered}"
+        );
+        assert!(rendered.contains("sidecar") && rendered.contains("rust"));
+    }
+
+    /// Both spellings parse, and surrounding whitespace (a stray newline in a
+    /// compose file or secret) does not change the backend.
+    #[test]
+    fn the_two_backends_parse_including_stray_whitespace() {
+        assert_eq!(
+            parse_repo_backend("sidecar").unwrap(),
+            crate::metrics::Backend::Sidecar
+        );
+        assert_eq!(
+            parse_repo_backend("rust").unwrap(),
+            crate::metrics::Backend::Rust
+        );
+        assert_eq!(
+            parse_repo_backend(" rust\n").unwrap(),
+            crate::metrics::Backend::Rust
+        );
+    }
+
+    /// The default is the SIDECAR. Deploying this branch must not move anyone
+    /// onto the new path by merely shipping; the switch has to be thrown.
+    #[test]
+    fn the_default_backend_is_the_sidecar() {
+        assert_eq!(
+            Config::default().repo_backend,
+            crate::metrics::Backend::Sidecar
+        );
     }
 
     #[test]
