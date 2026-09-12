@@ -8,6 +8,7 @@
 pub mod crypto;
 pub mod dpop;
 pub mod fetch;
+pub mod identity;
 pub mod jwt;
 pub mod keys;
 pub mod metadata;
