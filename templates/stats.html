@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title %}Stats — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell shell-plain" id="shell">
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">Stats</h1>
+    <span class="icon-btn" aria-hidden="true"></span>
+  </header>
+
+  <main class="content" id="content">
+    <div class="about">
+      <h1>Is the poller keeping up?</h1>
+
+      <p class="about-lede">
+        FeatherReader fetches every subscribed feed on a schedule. These numbers
+        say whether it is managing that — the one thing that decides how many
+        readers an instance can take.
+      </p>
+
+      <table class="stats-table">
+        <caption class="visually-hidden">Feed polling health for this instance</caption>
+        <tbody>
+          <tr>
+            <th scope="row">Feeds tracked</th>
+            <td>{{ feeds_tracked }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Polled in the last hour</th>
+            <td>{{ polled_last_hour }} ({{ polled_pct }}%)</td>
+          </tr>
+          <tr>
+            <th scope="row">Waiting to be polled</th>
+            <td>{{ overdue }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Most recent poll</th>
+            <td>{{ last_poll }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Least recent poll</th>
+            <td>{{ oldest_poll }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Never polled</th>
+            <td>{{ never_polled }}</td>
+          </tr>
+          <tr>
+            <th scope="row">Failing (backing off)</th>
+            <td>
+              {{ in_backoff }}{% if badly_broken > 0 %}, {{ badly_broken }} badly{% endif %}
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">Fetching</th>
+            <td>
+              {% if fetching == "paused" %}
+                <strong>paused</strong> — the cache is at its size limit
+              {% else if fetching == "off" %}
+                <strong>off</strong> — the poller is not running on this instance
+              {% else if fetching == "stale" %}
+                <strong>stalled</strong> — the poller has not completed a round in some time
+              {% else if fetching == "starting" %}
+                starting — no poll has finished since this instance booted
+              {% else %}
+                running
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">Target interval</th>
+            <td>every {{ poll_interval_mins }} minutes</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Reading these</h2>
+      <p>
+        <strong>Waiting to be polled</strong> is the backlog. A healthy instance
+        clears it every minute or so, and it should hover near zero. A number
+        that keeps climbing means the poller cannot service the feeds it already
+        has, and feeds will update less often than the target interval.
+      </p>
+      <p>
+        <strong>Least recent poll</strong> is the worst staleness anyone here is
+        currently seeing. If it drifts far past the target interval, the backlog
+        above is the reason. It reads <em>never</em> whenever any feed has yet to
+        be fetched at all — that is a worse staleness than any number, so it wins
+        outright rather than being averaged away.
+      </p>
+
+      <p>
+        <strong>Failing</strong> counts feeds whose last fetch errored. These
+        retry on a widening delay rather than every interval, so they are
+        <em>not</em> part of the backlog above — which means a feed that breaks
+        makes the backlog look better, not worse. That is why the two numbers are
+        listed separately. The second figure, when present, is the feeds that
+        have failed often enough to be retrying hours apart: usually gone rather
+        than flaky.
+      </p>
+      <p>
+        <strong>Fetching</strong> says whether new content is being pulled at
+        all. It reads <em>paused</em> when the cache has hit the size limit that
+        protects the disk; nothing new arrives until the retention sweep frees
+        space. <em>Off</em> means the poller is not running here at all, and
+        <em>starting</em> means it has not finished a round since this instance
+        booted. <em>Stalled</em> means the poller is running but has not finished
+        a round in far longer than it should — the one state where the numbers
+        above keep looking plausible while nothing behind them moves. Reading, searching and everything already cached keep working in
+        every case — but every other number on this page will drift while this
+        row says anything but <em>running</em>, and this row is the reason.
+      </p>
+
+      <h2>What is not here</h2>
+      <p>
+        No user counts, no per-feed detail. This page is public, and none of that
+        is anyone else's business — it also says nothing about who reads what.
+        The failure counts above are totals: they say how many feeds are broken,
+        never which ones, and never whose. Everything here is about the machine,
+        not the people using it.
+      </p>
+
+      {% include "footer.html" %}
+    </div>
+  </main>
+</div>
+{% endblock %}

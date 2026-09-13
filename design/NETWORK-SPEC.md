@@ -97,13 +97,42 @@ the three capabilities outright.
 
 ### 2.1 Two operational constraints the implementation must not break
 
-- **`/health` is load-bearing twice over.** It returns the literal string
-  `ok featherreader/{VERSION}` ([`web::health`](../src/web.rs)); it is the
-  **only** path exempted from the Caddy origin-lock so Fly's internal probe can
-  reach it ([`deploy/Caddyfile`](../deploy/Caddyfile)); and `fly.toml` health-checks
-  it every 15 s with a 3 s timeout, so a slow `/health` flaps the machine.
+- **`/health` is load-bearing twice over.** It is the **only** path exempted
+  from the Caddy origin-lock so Fly's internal probe can reach it
+  ([`deploy/Caddyfile`](../deploy/Caddyfile)), and `fly.toml` health-checks it
+  every 15 s with a 3 s timeout, so a slow `/health` flaps the machine.
   **No capability in this spec may add a field to, reformat, or slow down
   `/health`.** Network state gets its own surface (§4.4).
+
+  *Superseded in part (T3.1).* This bullet described `/health` as returning the
+  literal string `ok featherreader/{VERSION}`, and that is no longer true: it now
+  probes the database and reports the poll heartbeat, the fetch-pause state and
+  the live OAuth backend. The change was made against this constraint knowingly,
+  because the constraint's own premise had been overtaken — a probe that touched
+  no database, no pool and no scheduler state, while being the *only* automated
+  signal in `fly.toml`, proved the HTTP listener was up and nothing else.
+
+  The parts of the constraint that were actually load-bearing are unchanged and
+  now enforced deliberately: the probe reads one real page (a bare `SELECT 1`
+  emits no `OpenRead` and so cannot detect a broken database), under a 2 s timeout
+  that fires inside Fly's 3 s; and **only** a measured database failure can change
+  the status code.
+
+  *Second correction, from research rather than reading.* The original reasoning
+  here was "Fly restarts on a failed check, and restarting fixes neither". That is
+  **false**: Fly's docs state three times that a failing service check does not
+  restart or stop a Machine — the proxy simply stops routing to it, and
+  re-registers automatically once the check passes. The restart-on-check
+  capability existed on Apps V1 (`restart_limit`) and has no successor on
+  Machines. The conclusion survives on a better premise: with ONE Machine a 503 is
+  not a failover but a total outage for the duration, and it additionally fails a
+  `fly deploy` with no auto-rollback. So the status code answers "can this process
+  serve a useful request at all", not "would a restart help".
+
+  The rule this bullet was written to protect still stands for capabilities in
+  this spec: **network state does not belong in `/health`** (§4.4). And the
+  origin-lock exemption bounds the body to machine facts of the class `/stats`
+  already publishes.
 
   *Correction to a premise this spec was drafted against:* there is **no
   automated `/health`-equals-version gate and no auto-rollback** in the repo.
