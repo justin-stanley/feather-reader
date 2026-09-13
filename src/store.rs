@@ -785,6 +785,14 @@ pub async fn insert_entries(
                   ORDER BY COALESCE(published, fetched_at) DESC, id DESC
                   LIMIT ?2
               )
+              -- Starred entries survive the per-feed trim, exactly as they
+              -- survive the retention sweep. This predicate was added to the
+              -- sweep and NOT here, which left the documented guarantee
+              -- ("starred entries are never evicted") false — and made this
+              -- path, which runs on every poll of every feed rather than daily,
+              -- the main producer of the very "starred but not cached" case the
+              -- saved-record rendering exists to paper over.
+              AND id NOT IN (SELECT entry_id FROM entry_state WHERE starred = 1)
             "#,
         )
         .bind(feed_id)
@@ -857,14 +865,42 @@ pub async fn mark_feed_due(
 /// entry. The caller (the retention sweep) should follow a non-zero return with
 /// [`reclaim`] so freed pages return to the OS. `days == 0` is a no-op (retention
 /// disabled). Returns the number of entry rows deleted.
-pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
+pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> Result<u64> {
     if days <= 0 {
         return Ok(0);
     }
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let hard_cutoff = (chrono::Utc::now() - chrono::Duration::days(hard_days.max(days)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
+
+    // **The hard ceiling — the bound that sparing would otherwise remove.**
+    //
+    // Sparing `read = 0` is not a small exception: "mark unread" is a one-click
+    // UI control, and `entries` is SHARED across every reader on the instance.
+    // Without a ceiling, one person can pin unbounded rows, and the pins are
+    // permanent.
+    //
+    // That matters beyond disk. `poll_due_once` stops ALL polling once the
+    // database crosses `db_size_watermark_bytes`, and the retention DELETE is
+    // the documented release valve. Pinned rows can hold the valve shut
+    // forever, so the failure mode is: one reader pins enough content, the DB
+    // latches above the watermark, and polling stops for EVERY reader with no
+    // self-healing path. The window used to be an unconditional bound; sparing
+    // removed it, and this restores it.
+    //
+    // Starred entries go too at this age, and that is now safe: a saved record
+    // whose entry is gone renders from the PDS record as a link card, so the
+    // reader keeps the article's identity even when the cache does not keep its
+    // text.
+    let hard = sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
+        .bind(&hard_cutoff)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("prune_old_entries hard ceiling (cutoff {hard_cutoff})"))?;
+    let hard_deleted = hard.rows_affected();
     // **Starred and unread entries are kept, whatever their age.**
     //
     // The window is a cache eviction policy, not a data-retention policy. The
@@ -895,7 +931,7 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
     .execute(&mut *tx)
     .await
     .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
-    let deleted = res.rows_affected();
+    let deleted = res.rows_affected() + hard_deleted;
 
     // Only touch cursors when rows actually went away.
     if deleted > 0 {
@@ -2203,20 +2239,33 @@ pub struct PollHealth {
     pub last_poll_secs_ago: Option<i64>,
     /// Seconds since the LEAST recently polled feed was polled — the worst
     /// staleness any reader is currently seeing.
+    ///
+    /// `None` when any feed has NEVER been polled, because that is a worse
+    /// staleness than any finite age and reporting the finite one would make
+    /// the page read healthiest exactly when it is least healthy.
     pub oldest_poll_secs_ago: Option<i64>,
+    /// How many feeds have never been polled at all.
+    pub never_polled: i64,
 }
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
 /// format the scheduler writes, so the comparisons are lexicographic).
 pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
-    let row: (i64, i64, i64, Option<String>, Option<String>) = sqlx::query_as(
+    let row: (i64, i64, i64, Option<String>, Option<String>, i64) = sqlx::query_as(
         r#"
         SELECT
             COUNT(*),
             COALESCE(SUM(CASE WHEN last_polled IS NOT NULL AND last_polled >= ?2 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN next_poll IS NULL OR next_poll <= ?1 THEN 1 ELSE 0 END), 0),
             MAX(last_polled),
-            MIN(last_polled)
+            -- NULL-AWARE. `MIN` skips NULLs, so an instance where most feeds
+            -- had NEVER been polled reported the freshest of the few that had —
+            -- the figure read healthiest in the most degraded state, which is
+            -- the opposite of what a health page is for. A never-polled feed IS
+            -- the worst staleness, so it wins outright.
+            CASE WHEN SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END) > 0
+                 THEN NULL ELSE MIN(last_polled) END,
+            SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END)
         FROM feeds
         "#,
     )
@@ -2232,6 +2281,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
         overdue: row.2,
         last_poll_secs_ago: secs_between(row.3.as_deref(), now),
         oldest_poll_secs_ago: secs_between(row.4.as_deref(), now),
+        never_polled: row.5,
     })
 }
 
@@ -3559,7 +3609,7 @@ mod tests {
         assert_eq!(state_before, 1);
 
         // Prune at a 90-day window: only the ancient entry is old.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 1, "only the year-old entry should be pruned");
         assert_eq!(
             count_entries(&pool).await?,
@@ -3582,7 +3632,7 @@ mod tests {
         assert_eq!(state_after, 0, "entry_state must cascade on entry delete");
 
         // days == 0 disables retention (no-op).
-        assert_eq!(prune_old_entries(&pool, 0).await?, 0);
+        assert_eq!(prune_old_entries(&pool, 0, 3650).await?, 0);
         assert_eq!(count_entries(&pool).await?, 2);
         Ok(())
     }
@@ -3642,7 +3692,7 @@ mod tests {
         assert!(ids_before.contains(&new_id.to_string()));
 
         // Prune the old entry — its id must be scrubbed from the cursor's id-set.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 1);
         let after = get_cursor(&pool, did, feed_url).await?.unwrap();
         let ids_after: Vec<String> = serde_json::from_str(&after.read_ids)?;
@@ -3759,7 +3809,7 @@ mod tests {
         assert!(full > 0);
 
         // A retention sweep prunes every (year-old) entry, then reclaim shrinks.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 2000);
         reclaim(&pool).await?;
         let after = db_size_bytes(&pool).await?;
@@ -4124,11 +4174,27 @@ mod tests {
             Some(600),
             "most recent poll was 10 minutes ago"
         );
+        // **A never-polled feed IS the worst staleness.**
+        //
+        // This originally asserted `Some(10_800)` — the oldest FINITE age — and
+        // in doing so pinned a defect: `MIN` skips NULLs, so the page reported
+        // "3h ago" while a quarter of the feeds had never been fetched at all.
+        // The figure read healthiest in the most degraded state, which is the
+        // opposite of what a health page is for.
         assert_eq!(
-            h.oldest_poll_secs_ago,
-            Some(10_800),
-            "the worst staleness is 3 hours"
+            h.oldest_poll_secs_ago, None,
+            "a never-polled feed must outrank any finite age"
         );
+        assert_eq!(h.never_polled, 1);
+
+        // With every feed polled, the finite worst case is reported again.
+        sqlx::query("UPDATE feeds SET last_polled = ?1 WHERE last_polled IS NULL")
+            .bind("2026-01-01T09:00:00Z")
+            .execute(&pool)
+            .await?;
+        let h = poll_health(&pool, now, hour_ago).await?;
+        assert_eq!(h.never_polled, 0);
+        assert_eq!(h.oldest_poll_secs_ago, Some(10_800));
         Ok(())
     }
 
@@ -4211,7 +4277,7 @@ mod tests {
         mark(&pool, old_unread, 0, 0).await;
         mark(&pool, recent_read, 1, 0).await;
 
-        let deleted = prune_old_entries(&pool, 14).await?;
+        let deleted = prune_old_entries(&pool, 14, 3650).await?;
         assert_eq!(deleted, 1, "only the old, read, unstarred entry should go");
 
         let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
@@ -4229,7 +4295,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         aged_entry(&pool, "untouched-old", 30).await;
         aged_entry(&pool, "untouched-new", 1).await;
-        assert_eq!(prune_old_entries(&pool, 14).await?, 1);
+        assert_eq!(prune_old_entries(&pool, 14, 3650).await?, 1);
         Ok(())
     }
 
@@ -4297,6 +4363,69 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert!(next.is_none());
+        Ok(())
+    }
+
+    /// **The hard ceiling is the bound that sparing would otherwise remove.**
+    ///
+    /// "Mark unread" is a one-click control and `entries` is shared across every
+    /// reader, so an unbounded `read = 0` exception lets one person pin rows
+    /// permanently — and since the poller stops entirely above
+    /// `db_size_watermark_bytes` with this DELETE as its only release valve,
+    /// those pins could stop polling for everyone.
+    #[tokio::test]
+    async fn the_hard_ceiling_evicts_even_starred_and_unread() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let ancient_starred = aged_entry(&pool, "ancient-starred", 400).await;
+        let ancient_unread = aged_entry(&pool, "ancient-unread", 400).await;
+        let recent_starred = aged_entry(&pool, "recent-starred", 30).await;
+        mark(&pool, ancient_starred, 1, 1).await;
+        mark(&pool, ancient_unread, 0, 0).await;
+        mark(&pool, recent_starred, 1, 1).await;
+
+        // 14-day soft window, 180-day hard ceiling.
+        prune_old_entries(&pool, 14, 180).await?;
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            left,
+            vec!["recent-starred"],
+            "past the ceiling nothing is pinned — otherwise one reader can stall the poller \
+             for every reader"
+        );
+        Ok(())
+    }
+
+    /// The per-feed trim spares starred entries too. It was fixed in the
+    /// retention sweep and NOT here, which left the documented guarantee false —
+    /// and this path runs on every poll of every feed rather than daily.
+    #[tokio::test]
+    async fn the_per_feed_trim_spares_starred_entries() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let old_starred = aged_entry(&pool, "old-starred", 5).await;
+        mark(&pool, old_starred, 1, 1).await;
+        for i in 0..5 {
+            aged_entry(&pool, &format!("filler-{i}"), 1).await;
+        }
+        let feed_id: i64 = sqlx::query_scalar("SELECT id FROM feeds LIMIT 1")
+            .fetch_one(&pool)
+            .await?;
+
+        // Trim hard enough that the older starred entry would be cut. The trim
+        // runs inside `insert_entries`, so drive it the way production does.
+        insert_entries(&pool, feed_id, &[], 2).await?;
+
+        let left: Vec<String> =
+            sqlx::query_scalar("SELECT guid FROM entries WHERE guid = 'old-starred'")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            left,
+            vec!["old-starred"],
+            "the per-feed trim evicted a starred entry"
+        );
         Ok(())
     }
 }

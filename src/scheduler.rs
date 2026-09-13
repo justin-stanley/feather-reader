@@ -544,7 +544,7 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
                 break;
             }
             _ = ticker.tick() => {
-                match store::prune_old_entries(&state.db, days).await {
+                match store::prune_old_entries(&state.db, days, state.config.retention_hard_days as i64).await {
                     Ok(0) => debug!("retention sweeper: nothing past the retention window"),
                     Ok(n) => {
                         info!(pruned = n, retention_days = days, "retention sweeper: pruned old entries");

@@ -12,7 +12,8 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this from the cache. Starred and unread entries are never evicted. `0` disables eviction. |
+//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. |
+//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables eviction. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
 //! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |
@@ -75,13 +76,27 @@ pub struct Config {
     pub poll_interval: Duration,
     /// Cache eviction window, in days: a READ, UNSTARRED entry older than this
     /// is dropped from the local cache. Starred and still-unread entries are
-    /// kept whatever their age — the PDS holds the reader's choices, but the
-    /// entry CONTENT lives only here and at the origin feed, which usually
-    /// serves just its last few dozen items.
+    /// kept past this window — but NOT indefinitely: see `retention_hard_days`,
+    /// which is the bound. The PDS holds the reader's choices, and the entry
+    /// CONTENT lives only here and at the origin feed, which usually serves just
+    /// its last few dozen items.
     ///
     /// Two weeks by default. The cache exists to render a feed list quickly,
     /// not to archive the web.
     pub retention_days: u32,
+    /// Absolute cache ceiling, in days. Entries older than this are dropped
+    /// REGARDLESS of starred or unread state.
+    ///
+    /// This is the bound, and sparing would remove it without one. "Mark
+    /// unread" is a one-click control and `entries` is shared across every
+    /// reader, so an unbounded exception lets one person pin rows permanently —
+    /// and because the poller stops entirely once the database crosses
+    /// `db_size_watermark_bytes`, with the retention DELETE as its only release
+    /// valve, those pins could stop polling for everyone.
+    ///
+    /// Losing a starred entry here is survivable: the saved record stays in the
+    /// reader's PDS and renders as a link.
+    pub retention_hard_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
     /// Closed-beta seat cap: the maximum number of DIDs that may hold beta
@@ -307,6 +322,7 @@ impl Default for Config {
             allowed_dids: Vec::new(),
             poll_interval: Duration::from_secs(3600),
             retention_days: 14,
+            retention_hard_days: 180,
             proxy_images: false,
             beta_cap: 100,
             trusted_ip_header: None,
@@ -376,6 +392,13 @@ impl Config {
                 Duration::from_secs(secs)
             }
             None => defaults.poll_interval,
+        };
+
+        let retention_hard_days = match env_opt("FEATHERREADER_RETENTION_HARD_DAYS") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_RETENTION_HARD_DAYS: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.retention_hard_days,
         };
 
         let retention_days = match env_opt("FEATHERREADER_RETENTION_DAYS") {
@@ -529,6 +552,7 @@ impl Config {
             allowed_dids,
             poll_interval,
             retention_days,
+            retention_hard_days,
             proxy_images,
             beta_cap,
             trusted_ip_header,

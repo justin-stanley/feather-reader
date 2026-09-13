@@ -49,6 +49,10 @@
             <td>{{ oldest_poll }}</td>
           </tr>
           <tr>
+            <th scope="row">Never polled</th>
+            <td>{{ never_polled }}</td>
+          </tr>
+          <tr>
             <th scope="row">Target interval</th>
             <td>every {{ poll_interval_mins }} minutes</td>
           </tr>
@@ -65,7 +69,9 @@
       <p>
         <strong>Least recent poll</strong> is the worst staleness anyone here is
         currently seeing. If it drifts far past the target interval, the backlog
-        above is the reason.
+        above is the reason. It reads <em>never</em> whenever any feed has yet to
+        be fetched at all — that is a worse staleness than any number, so it wins
+        outright rather than being averaged away.
       </p>
 
       <h2>What is not here</h2>

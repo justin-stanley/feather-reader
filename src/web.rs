@@ -340,6 +340,10 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
         // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
         p => {
             (p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")))
+                // Unsaving makes a DPoP-signed deleteRecord round-trip to the
+                // PDS, which is exactly the reason the neighbours above are
+                // limited. It was added as a new route and not added here.
+                || p.starts_with("/saved/")
                 || p.starts_with("/subscriptions/")
                 || p.starts_with("/folders/")
         }
@@ -620,7 +624,12 @@ async fn stats(State(state): State<AppState>) -> Response {
         polled_pct,
         overdue: health.overdue,
         last_poll: humanise_ago(health.last_poll_secs_ago),
-        oldest_poll: humanise_ago(health.oldest_poll_secs_ago),
+        oldest_poll: if health.never_polled > 0 {
+            "never".to_string()
+        } else {
+            humanise_ago(health.oldest_poll_secs_ago)
+        },
+        never_polled: health.never_polled,
         poll_interval_mins: state.config.poll_interval.as_secs() as i64 / 60,
     })
 }
@@ -852,6 +861,7 @@ struct StatsTemplate {
     overdue: i64,
     last_poll: String,
     oldest_poll: String,
+    never_polled: i64,
     poll_interval_mins: i64,
 }
 
@@ -1067,9 +1077,16 @@ fn avatar_initials(handle: Option<&str>, did: &str) -> String {
 /// Trim a stored RFC3339 timestamp down to the `YYYY-MM-DD` date for calm,
 /// low-noise display. Falls back to the raw string if it doesn't look like one.
 fn display_date(published: Option<&str>) -> String {
+    // CHARACTERS, not bytes. `p[..10]` panics when byte 10 lands inside a
+    // multi-byte character, and every caller used to pass a timestamp the feed
+    // parser had produced. The saved-record path passes `createdAt` straight off
+    // a PDS record, which the lexicon types as a bare string with no validation
+    // — written by whatever atproto client the reader used. A `createdAt` of
+    // "日本語日本語日本" took down the whole starred view, and there is no
+    // catch-panic layer in the stack, so the page stayed down until the record
+    // was removed from the very view that would not render.
     match published {
-        Some(p) if p.len() >= 10 => p[..10].to_string(),
-        Some(p) => p.to_string(),
+        Some(p) => p.chars().take(10).collect(),
         None => String::new(),
     }
 }
@@ -1341,10 +1358,17 @@ async fn index(
     // lexicon exists for. Those rows are rendered from the PDS record alone.
     let mut entries = entries;
     if view == "starred" {
+        // **Match against ALL cached starred entries, not the scoped `source`.**
+        //
+        // `source` has already been filtered by feed/folder. Matching against it
+        // meant an entry that IS cached but sits outside the current filter
+        // looked uncached — so it rendered as a "not cached" row whose star
+        // button deletes the PDS RECORD instead of un-starring the entry. A
+        // scope filter must not change what is destroyed.
         let cached_urls: std::collections::HashSet<String> =
-            source.iter().filter_map(|e| e.url.clone()).collect();
+            starred.iter().filter_map(|e| e.url.clone()).collect();
         let cached_guids: std::collections::HashSet<String> =
-            source.iter().map(|e| e.guid.clone()).collect();
+            starred.iter().map(|e| e.guid.clone()).collect();
 
         match state.repo().list_saved_sorted(&did).await {
             Ok(saved) => {
@@ -1356,6 +1380,18 @@ async fn index(
                             .is_some_and(|g| cached_guids.contains(g));
                     if known {
                         continue;
+                    }
+                    // And the scope filter applies to these rows too. Without
+                    // it, `?feed=X` still listed saved records from every other
+                    // feed — the filter silently did nothing for them.
+                    if let Some(urls) = &scope_urls {
+                        match item.feed_url.as_deref() {
+                            Some(feed_url) if urls.iter().any(|u| u == feed_url) => {}
+                            // A saved record with no `feedUrl` cannot be placed
+                            // in any feed's scope, so it belongs only to the
+                            // unfiltered view.
+                            _ => continue,
+                        }
                     }
                     // Opportunistic re-fetch: if the reader still subscribes to
                     // the feed, make it due now. If the article is still inside
@@ -1379,6 +1415,17 @@ async fn index(
                             }
                         }
                     }
+                    // `safe_link` or nothing. `item.url` is attacker-controlled
+                    // — a saved record written by any client — and it lands in
+                    // an `href`. Askama escapes HTML metacharacters but not
+                    // SCHEMES, so `javascript:` survives escaping intact. This
+                    // project already built the helper for exactly that, and
+                    // `feed.rs` uses it on the equivalent link; this path was
+                    // simply not routed through it.
+                    let Some(link) = crate::net::safe_link(&item.url) else {
+                        tracing::debug!(%did, "skipping a saved record with an unusable URL");
+                        continue;
+                    };
                     entries.push(EntryRow {
                         id: 0,
                         title: item
@@ -1390,7 +1437,7 @@ async fn index(
                         published: display_date(Some(&item.created_at)),
                         read: false,
                         starred: true,
-                        link: item.url.clone(),
+                        link,
                         cached: false,
                         rkey,
                     });
@@ -6831,5 +6878,57 @@ mod tests {
             !body.contains("/entries/0/"),
             "an uncached row must not offer entry actions against a nonexistent id"
         );
+    }
+
+    /// **A PDS `createdAt` must not be able to panic the starred view.**
+    ///
+    /// `display_date` byte-sliced `p[..10]`. Every prior caller passed a
+    /// timestamp the feed parser produced; the saved-record path passes a bare
+    /// string off a PDS record, written by whatever client the reader used. A
+    /// multi-byte value panicked the handler, and with no catch-panic layer the
+    /// view stayed down until the record was removed — from that same view.
+    #[test]
+    fn a_multibyte_timestamp_does_not_panic_the_date_formatter() {
+        for hostile in [
+            "日本語日本語日本",
+            "é",
+            "",
+            "2026",
+            "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",
+        ] {
+            let out = display_date(Some(hostile));
+            assert!(out.chars().count() <= 10, "{hostile:?} -> {out:?}");
+        }
+        assert_eq!(display_date(Some("2026-01-01T00:00:00Z")), "2026-01-01");
+        assert_eq!(display_date(None), "");
+    }
+
+    /// A saved record's URL is attacker-controlled and lands in an `href`.
+    /// Askama escapes HTML metacharacters but not SCHEMES, so this must go
+    /// through the helper the project already built for exactly that.
+    #[test]
+    fn a_saved_record_url_is_scheme_checked() {
+        for hostile in [
+            "javascript:alert(document.domain)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "//evil.example/path",
+        ] {
+            assert!(
+                crate::net::safe_link(hostile).is_none(),
+                "{hostile:?} survived the scheme check"
+            );
+        }
+        assert!(crate::net::safe_link("https://ok.example/a").is_some());
+    }
+
+    /// Unsaving makes a DPoP-signed PDS round-trip, which is the stated reason
+    /// its neighbours are limited. It was added as a route and not added here.
+    #[test]
+    fn the_unsave_route_is_rate_limited() {
+        use axum::http::Method;
+        assert!(is_rate_limited_path("/saved/3abc/delete", &Method::POST));
+        // And the neighbours still are.
+        assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
     }
 }
