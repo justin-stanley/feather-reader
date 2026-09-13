@@ -734,39 +734,57 @@ async fn health(State(state): State<AppState>) -> Response {
         // starting a second one. See `RuntimeHealth::begin_db_probe`.
         Err(borrowed) => borrowed,
         Ok(probe) => {
-            // **`SELECT 1` was not a database probe.** It compiles to
-            // `Init/Integer/ResultRow/Halt` — there is no `OpenRead`, so it never
-            // touches a b-tree, never reads a page, and never consults the file.
-            // Against a deliberately corrupted database it returns success while
-            // every real query returns SQLITE_CORRUPT. Reading one row from a
-            // real table costs the same and actually proves what the check
-            // claims. `LIMIT 1` keeps it to a single page; an empty table still
-            // opens the b-tree root, which is the part that matters.
-            let verdict = match tokio::time::timeout(
-                HEALTH_DB_TIMEOUT,
-                sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
-                    .fetch_optional(&state.db),
-            )
-            .await
-            {
-                Ok(Ok(_)) => DbProbe::Ok,
-                // Coarse, not the raw error. An unauthenticated caller learning
-                // exactly which failure it hit is an attack-progress oracle; the
-                // detail belongs in the log, which gets it below.
-                Ok(Err(err)) => {
-                    warn!(%err, "health: database probe failed");
-                    DbProbe::Failed("unavailable".to_string())
-                }
-                Err(_) => {
-                    warn!(
-                        timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
-                        "health: database probe timed out (pool exhausted?)"
-                    );
-                    DbProbe::Failed("timeout".to_string())
-                }
-            };
-            probe.record(verdict.clone());
-            verdict
+            // **Spawned, so the probe cannot be cancelled by the caller.**
+            //
+            // Axum drops the handler future when a client disconnects. With the
+            // probe inline, that dropped it mid-flight and released the claim
+            // WITHOUT recording a verdict — which let an unauthenticated caller
+            // manufacture the no-verdict state on demand and freeze what every
+            // other caller, Fly's check included, reads. Running it detached
+            // means the verdict is always recorded and the claim is always
+            // released after it.
+            let pool = state.db.clone();
+            let task = tokio::spawn(async move {
+                // **`SELECT 1` was not a database probe.** It compiles to
+                // `Init/Integer/ResultRow/Halt` — there is no `OpenRead`, so it
+                // never touches a b-tree, never reads a page, and never consults
+                // the file. Against a corrupted database it returns success
+                // while every real query returns SQLITE_CORRUPT. Reading one row
+                // from a real table costs the same and actually proves what the
+                // check claims. `LIMIT 1` keeps it to a single page; an empty
+                // table still opens the b-tree root, which is the part that
+                // matters.
+                let verdict = match tokio::time::timeout(
+                    HEALTH_DB_TIMEOUT,
+                    sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
+                        .fetch_optional(&pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => DbProbe::Ok,
+                    // Coarse, not the raw error. An unauthenticated caller
+                    // learning exactly which failure it hit is an
+                    // attack-progress oracle; the detail belongs in the log,
+                    // which gets it here.
+                    Ok(Err(err)) => {
+                        warn!(%err, "health: database probe failed");
+                        DbProbe::Failed("unavailable".to_string())
+                    }
+                    Err(_) => {
+                        warn!(
+                            timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
+                            "health: database probe timed out (pool exhausted?)"
+                        );
+                        DbProbe::Failed("timeout".to_string())
+                    }
+                };
+                probe.record(verdict.clone());
+                verdict
+            });
+            // A panicking task drops the guard, which releases the claim without
+            // a verdict — the only remaining path to that state, and not one a
+            // caller can drive.
+            task.await.unwrap_or(DbProbe::Unknown)
         }
     };
 
@@ -807,9 +825,15 @@ async fn health(State(state): State<AppState>) -> Response {
             body.push_str("db: ok\n");
             StatusCode::OK
         }
+        // **Not `ok`.** The first token is the state, and this one is neither
+        // healthy nor failed. It used to print a line byte-identical to the
+        // healthy branch, which mattered because `fly.toml` tells operators to
+        // alert on the BODY for everything the status code deliberately ignores
+        // — so a monitor keying on `^ok` read green in exactly the state this
+        // enum exists to make visible.
         DbProbe::Unknown => {
-            body.push_str(&format!("ok featherreader/{VERSION}\n"));
-            body.push_str("db: unknown (probe in flight)\n");
+            body.push_str(&format!("unknown featherreader/{VERSION}\n"));
+            body.push_str("db: unknown (no probe has completed yet)\n");
             StatusCode::OK
         }
         DbProbe::Failed(why) => {
@@ -8190,6 +8214,16 @@ mod tests {
             "the unmeasured state must still be REPORTED: {body}"
         );
         assert!(!body.starts_with("FAIL"), "{body}");
+        // **And it must not read as `ok` either.** `fly.toml` tells operators to
+        // alert on the BODY for everything the status code ignores, so a first
+        // line identical to the healthy one makes a monitor keying on `^ok` read
+        // green in exactly the state this enum exists to surface.
+        assert!(
+            !body.starts_with("ok"),
+            "the unmeasured state is indistinguishable from healthy to a \
+             body-matching monitor: {body}"
+        );
+        assert!(body.starts_with("unknown"), "{body}");
 
         // And a measured failure still does fail it — the distinction is the
         // whole point, not an excuse to never 503.
@@ -8213,6 +8247,65 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a measured database failure must still fail the check"
         );
+    }
+
+    /// **A disconnected client must not be able to cancel the probe.**
+    ///
+    /// Axum drops the handler future when a caller goes away. With the probe
+    /// inline that dropped it mid-flight and released the claim WITHOUT
+    /// recording a verdict — which let an unauthenticated caller manufacture the
+    /// no-verdict state on demand and freeze what every other caller, including
+    /// Fly's own check, reads. The probe runs detached now, so the verdict is
+    /// recorded whatever happens to the request that started it.
+    #[tokio::test]
+    async fn an_abandoned_request_still_records_its_probe() {
+        use crate::runtime_health::DbProbe;
+        let state = test_state(&[]).await;
+        let rh = state.runtime_health.clone();
+
+        // Drive /health and abandon it immediately — the disconnect case.
+        let app = router(state.clone());
+        let fut = app.oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let handle = tokio::spawn(fut);
+        handle.abort();
+        let _ = handle.await;
+
+        // The detached probe still completes and publishes a verdict, so the
+        // claim is free and the next caller gets a MEASURED answer.
+        for _ in 0..50 {
+            if rh.begin_db_probe().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains("db: ok"),
+            "after an abandoned request the next caller still reads an \
+             unmeasured database — the probe was cancelled with it: {body}"
+        );
+        // Sanity: the type still distinguishes the three states.
+        assert_ne!(DbProbe::Unknown, DbProbe::Ok);
     }
 
     /// **The probe must read a real page.**

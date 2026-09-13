@@ -93,26 +93,37 @@ impl RuntimeHealth {
     /// Returns `Err(verdict)` when a probe is already running: the caller reports
     /// that instead of starting another. `Ok(guard)` means the caller owns the
     /// probe and must report it via the returned guard.
-    pub fn begin_db_probe(&self) -> Result<DbProbeGuard<'_>, DbProbe> {
+    pub fn begin_db_probe(self: &std::sync::Arc<Self>) -> Result<DbProbeGuard, DbProbe> {
         if self.db_probe_running.swap(true, Ordering::AcqRel) {
             // Someone else is probing. Borrow their last answer — or say we have
             // none, which is a THIRD state and not a synonym for either.
             //
-            // This has been wrong in both directions. It first answered "healthy"
-            // for a database nothing had read, which could publish `db: ok` on a
-            // boot with a dead volume. Correcting that to a failure string was
-            // worse: `/health` is the one path outside both the origin lock and
-            // the rate limiter, and `DbProbeGuard` releases the flag on drop
-            // WITHOUT recording a verdict — so a caller alternating aborted and
-            // concurrent requests could hold the verdict at "none" and make Fly's
-            // own check read a failure. That turns an unauthenticated request into
-            // a lever on the one signal the platform acts on.
+            // **This has now been wrong in both directions, and the enum was
+            // never the bug.** It first answered "healthy" for a database nothing
+            // had read. Correcting that to a failure made it worse: `/health` is
+            // outside both the origin lock and the rate limiter, so an
+            // unauthenticated caller could manufacture the no-verdict state and
+            // make Fly's own check read a failure — deregistering the only
+            // machine. Making that state return 200 again fixed the severe
+            // direction and left the mild one: a caller who keeps the claim
+            // occupied freezes the published verdict.
             //
-            // `Unknown` is neither. The handler reports it and does not fail the
-            // check, because only a MEASURED failure is evidence of one.
+            // The ROOT CAUSE was that the claim could be released without a
+            // verdict, which a client disconnect was enough to cause. The probe
+            // now runs in a spawned task that completes regardless of whether the
+            // request that started it survives, so the claim is released only
+            // AFTER a verdict is recorded. `Unknown` is consequently reachable
+            // only before the first probe of a process completes — a real,
+            // brief, un-manufacturable state.
+            //
+            // `Unknown` does not fail the check, because only a MEASURED failure
+            // is evidence of one — but it does not report `ok` either. See
+            // `web::health`.
             return Err(self.last_db_probe().unwrap_or(DbProbe::Unknown));
         }
-        Ok(DbProbeGuard { health: self })
+        Ok(DbProbeGuard {
+            health: std::sync::Arc::clone(self),
+        })
     }
 
     /// The most recent verdict, if any probe has completed.
@@ -169,8 +180,11 @@ impl RuntimeHealth {
 /// Held by whichever request owns the in-flight database probe. Recording the
 /// verdict — or being dropped without one — releases the claim, so a panicking
 /// or cancelled handler cannot wedge every later probe.
-pub struct DbProbeGuard<'a> {
-    health: &'a RuntimeHealth,
+/// Owns an `Arc` rather than borrowing, so the probe can be moved into a
+/// spawned task and survive the request that started it. See
+/// [`RuntimeHealth::begin_db_probe`] for why that matters.
+pub struct DbProbeGuard {
+    health: std::sync::Arc<RuntimeHealth>,
 }
 
 /// The outcome of a database probe, as `/health` reports it.
@@ -190,7 +204,7 @@ pub enum DbProbe {
     Unknown,
 }
 
-impl DbProbeGuard<'_> {
+impl DbProbeGuard {
     /// Publish the verdict this probe reached.
     pub fn record(self, verdict: DbProbe) {
         *self
@@ -201,7 +215,7 @@ impl DbProbeGuard<'_> {
     }
 }
 
-impl Drop for DbProbeGuard<'_> {
+impl Drop for DbProbeGuard {
     fn drop(&mut self) {
         self.health.db_probe_running.store(false, Ordering::Release);
     }
