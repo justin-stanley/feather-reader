@@ -113,12 +113,21 @@ the three capabilities outright.
   signal in `fly.toml`, proved the HTTP listener was up and nothing else.
 
   The parts of the constraint that were actually load-bearing are unchanged and
-  now enforced deliberately: the probe is a single `SELECT 1`, which in WAL mode
-  no writer can block, under a 2 s timeout that fires inside Fly's 3 s; and
-  **only** the database can change the status code. A stale heartbeat or a paused
-  poller is reported in the body and never fails the check, because Fly restarts
-  on a failed check and restarting fixes neither — it would convert "feeds are
-  behind" into "the site is down".
+  now enforced deliberately: the probe reads one real page (a bare `SELECT 1`
+  emits no `OpenRead` and so cannot detect a broken database), under a 2 s timeout
+  that fires inside Fly's 3 s; and **only** a measured database failure can change
+  the status code.
+
+  *Second correction, from research rather than reading.* The original reasoning
+  here was "Fly restarts on a failed check, and restarting fixes neither". That is
+  **false**: Fly's docs state three times that a failing service check does not
+  restart or stop a Machine — the proxy simply stops routing to it, and
+  re-registers automatically once the check passes. The restart-on-check
+  capability existed on Apps V1 (`restart_limit`) and has no successor on
+  Machines. The conclusion survives on a better premise: with ONE Machine a 503 is
+  not a failover but a total outage for the duration, and it additionally fails a
+  `fly deploy` with no auto-rollback. So the status code answers "can this process
+  serve a useful request at all", not "would a restart help".
 
   The rule this bullet was written to protect still stands for capabilities in
   this spec: **network state does not belong in `/health`** (§4.4). And the

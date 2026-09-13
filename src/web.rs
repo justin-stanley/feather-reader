@@ -697,11 +697,27 @@ const HEALTH_FIRST_TICK_GRACE_SECS: i64 = 5 * 60;
 ///
 /// **What is reported but never fails the check: everything else.** A stale poll
 /// heartbeat, a watermark pause, a missing OAuth runtime — all real problems,
-/// none of them fixed by killing the machine. Fly restarts on a failed check, so
-/// wiring these to the status code would convert "feeds are behind" into "the
-/// site is down", which is strictly worse than the condition being reported. The
-/// body carries them so a human or an external monitor can act; the status code
-/// stays the question Fly is actually able to answer.
+/// and none of them a reason to stop serving.
+///
+/// That last clause is the whole justification, and it is NOT the one this
+/// comment used to give. It said "Fly restarts on a failed check", which is
+/// false — verified against Fly's own docs, which state it three times: *"your
+/// Machines won't automatically restart or stop due to failing their health
+/// checks"*. A failing `[[http_service.checks]]` check makes Fly Proxy stop
+/// ROUTING to the Machine. Nothing restarts it. That capability existed on Apps
+/// V1 (`restart_limit`) and has no successor on Machines.
+///
+/// The corrected model makes the conclusion stronger, not weaker. With one
+/// Machine there is no healthy peer to shift traffic to, so a 503 here is not a
+/// failover — it is a total outage that lasts exactly as long as the condition,
+/// and it also fails a `fly deploy` (rolling strategy, no auto-rollback). So the
+/// question the status code answers is not "would a restart fix this" but **"can
+/// this process still serve a useful request at all"**. A stale poller can. A
+/// database it cannot read cannot.
+///
+/// Re-registration is automatic: the proxy keeps probing and routes again the
+/// moment the check passes. That is what makes a 503 recoverable without
+/// intervention — not a restart, which never comes.
 ///
 /// The body is machine facts only — no user counts, no DIDs, no feed URLs — so
 /// it is publishable on the same terms as `/stats`. It is also the non-session
@@ -7967,9 +7983,10 @@ mod tests {
         assert!(body.contains("backend:"), "{body}");
         assert!(body.contains("oauth-runtime:"), "{body}");
 
-        // A watermark pause is REPORTED but must not fail the check. Fly restarts
-        // the machine on a failed check, and restarting does not free disk — it
-        // would turn "feeds are behind" into "the site is down".
+        // A watermark pause is REPORTED but must not fail the check. A failed
+        // check DEREGISTERS this machine from the proxy — and it is the only
+        // machine — so it would turn "feeds are behind" into "the site is down"
+        // for as long as the disk stays full.
         state.runtime_health.set_watermark(true);
         state.runtime_health.set_schedulers_enabled(true);
         let (status, body) = body_of(state.clone()).await;

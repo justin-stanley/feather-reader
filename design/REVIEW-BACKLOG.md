@@ -278,7 +278,10 @@ change the status code.** The probe is one `SELECT 1`, which no writer can block
 in WAL mode, under a 2 s timeout inside Fly's 3 s — so a wedged pool yields a 503
 the app chose, with a reason, rather than a timeout Fly inferred. The heartbeat,
 the fetch-pause state and the live backend are reported in the body and never
-fail the check, because Fly restarts on failure and a restart fixes none of them.
+fail the check. (The reason given here at the time — "Fly restarts on failure" —
+was later found to be FALSE; a failing check only deregisters the Machine. See
+R17 in `REVIEW-ROUND-2.md`. The conclusion held on a corrected premise: with one
+Machine a 503 is a total outage rather than a failover, and it fails a deploy.)
 
 Two documents had to be corrected rather than quietly broken. `NETWORK-SPEC.md`
 §2.1 stated `/health` returns a literal string and that nothing may add a field

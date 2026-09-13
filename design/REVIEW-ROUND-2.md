@@ -199,19 +199,61 @@ whole on the last page. `ENTRIES_PER_PAGE` does not bound that response.
 
 **Fix.** Page them, or bound them explicitly and say so.
 
-## R17 — the premise the whole `/health` design rests on is unverified
+## R17 — the premise the whole `/health` design rests on — **ANSWERED: it was FALSE**
 
-`fly.toml`, the handler doc and the backlog all assert "Fly restarts the machine
-on a failed check". On Fly Machines, `[[http_service.checks]]` failures govern
-proxy routing and deploy gating; restarts come from the restart policy on process
-exit. There is no `[[restart]]` block.
+`fly.toml`, the handler doc and `NETWORK-SPEC.md` all asserted "Fly restarts the
+machine on a failed check". Researched against primary sources; it is false, and
+Fly's docs say so three times:
 
-If the assertion is wrong, the consequence inverts: with `min_machines_running =
-1`, a 503 pulls the ONLY machine from rotation and nothing brings it back. The
-design choice "only the database may fail the check" was made to avoid
-restart-thrash; if there is no restart, it should arguably fail on more.
+> Your Machines won't automatically restart or stop due to failing their health
+> checks, this needs to be done manually.
+> — [Health Checks · Fly Docs](https://fly.io/docs/reference/health-checks/)
 
-**This is a question for the operator, not a code change.** Flagged, not fixed.
+Fly staff confirm there is no successor to the capability: it existed on Apps V1
+as `restart_limit`, and on Machines *"there isn't a feature that has been
+implemented yet to restart an app when health checks fail"*. A failing
+`[[http_service.checks]]` check makes Fly Proxy stop ROUTING to the Machine, and
+**re-register automatically** once the check passes.
+
+**The conclusion survives on a better premise.** The old reasoning — "a restart
+would not fix a stale poller, so do not wire it to the status code" — used the
+wrong axis. The right one is *can this process still serve a useful request*:
+
+- With ONE Machine there is no healthy peer, so a 503 is not a failover. It is a
+  total outage lasting exactly as long as the condition (the proxy queues, then
+  503s; Fly's docs disagree with themselves on hang-vs-503 and do not document
+  the queue timeout).
+- A 503 **also fails a `fly deploy`** — rolling strategy, and there is no
+  auto-rollback on Machines. A database blip during a release leaves a stuck,
+  empty app. This is the sharper risk and nobody had noticed it.
+- Recovery needs no restart, because re-registration is automatic. That is what
+  makes a narrow 503 tolerable at all.
+
+So: keeping the poller, the watermark and the OAuth runtime OUT of the status
+code is *more* right than the original reasoning claimed, not less. Corrected in
+`web::health`, `fly.toml`, `NETWORK-SPEC.md` §2.1 and the backlog.
+
+**Two operational findings fell out of the research, neither of which was asked
+for:**
+
+1. **`auto_start_machines = false` plus the default `on-fail` restart policy is a
+   dead stop.** The policy retries a non-zero exit at most 10 times in 5 minutes
+   and then leaves the Machine STOPPED; with `auto_start_machines = false` the
+   proxy will not start it again. An OOM crash loop — realistic on 512 MB —
+   therefore ends in a permanent outage needing a manual `fly machine start`.
+   Set to `true`; it costs nothing while the machine is running.
+2. **`min_machines_running = 1` is inert.** It applies only when
+   `auto_stop_machines` is `"stop"` or `"suspend"`, and this deployment sets
+   `"off"`. It reads like a safety net and is not one. Kept, commented as such.
+
+**Recorded and NOT done:** the research recommends scaling to two Machines,
+which is what would make deregistration meaningful at all. That is not available
+here — the app owns a single 1 GB volume holding a SQLite database, and Fly
+volumes cannot be shared between Machines. Two Machines is a storage-architecture
+change, not a config change, and belongs with the 0.4.0 capacity work.
+
+**Still unverified, and cheap to measure on a throwaway app:** whether the edge
+hangs or 503s immediately when the only Machine is unhealthy, and for how long.
 
 ## R18 — a `set_var` data race in the test binary
 

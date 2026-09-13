@@ -147,8 +147,19 @@ kill_timeout = "45s"
   internal_port = 8080          # Caddy — the only off-loopback listener
   force_https = true
   auto_stop_machines = "off"    # the poller cannot scale to zero
-  auto_start_machines = false
-  min_machines_running = 1      # always exactly one machine
+  # TRUE, deliberately, even though auto_stop is off. These two are independent:
+  # auto_stop=off only means the proxy never STOPS a machine, and a machine can
+  # still end up stopped by the restart policy giving up. The default `on-fail`
+  # policy retries a non-zero exit at most 10 times in 5 minutes and then leaves
+  # the machine STOPPED — and with auto_start=false the proxy will not start it
+  # again, so an OOM crash loop (realistic on 512 MB) ends in a permanent outage
+  # needing a manual `fly machine start`. With auto_start=true a request brings it
+  # back. Costs nothing while the machine is already running.
+  auto_start_machines = true
+  # Inert with auto_stop_machines="off" — it only applies when that is "stop" or
+  # "suspend". Kept as documentation of intent, not as a safety net; it is not
+  # one.
+  min_machines_running = 1
   processes = ["app"]
 
   [http_service.concurrency]
@@ -168,9 +179,23 @@ kill_timeout = "45s"
   # database can fail this check:
   # the body also reports uptime, the
   # poll heartbeat, whether fetching is paused at the size watermark, and the
-  # live OAuth backend, but none of those affect the status code. Fly restarts on
-  # a failed check and a restart fixes none of them — wiring them here would turn
-  # "feeds are behind" into "the site is down". Alert on the BODY for those.
+  # live OAuth backend, but none of those affect the status code.
+  #
+  # WHAT A FAILED CHECK ACTUALLY DOES — this comment used to say "Fly restarts on
+  # a failed check", which is FALSE. Fly's docs state it three times: a failing
+  # service check does NOT restart or stop a Machine. Fly Proxy stops ROUTING to
+  # it, and re-registers automatically once the check passes. (That capability
+  # existed on Apps V1 as `restart_limit`; it has no successor on Machines.)
+  #
+  # With ONE machine there is no healthy peer to shift to, so a 503 here is not a
+  # failover — it is a total outage lasting exactly as long as the condition. It
+  # ALSO fails a `fly deploy`: the rolling strategy waits for the new machine to
+  # go healthy and there is no auto-rollback, so a database blip during a release
+  # leaves a stuck, empty app. Both are reasons to keep this check narrow.
+  #
+  # So the question the status code answers is "can this process serve a useful
+  # request at all", NOT "would a restart help". A stale poller can serve; a
+  # database it cannot read cannot. Alert on the BODY for everything else.
   # Reached through Caddy, so this also proves the edge + app path is up.
   [[http_service.checks]]
     interval = "15s"
