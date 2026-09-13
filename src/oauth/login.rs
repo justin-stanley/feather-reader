@@ -157,83 +157,117 @@ pub async fn complete(
 ) -> Result<CompletedLogin> {
     complete_with(
         runtime,
-        http,
         pool,
         params,
         presented_cookie,
         now,
-        |pds_url, auth_method, expected_issuer| async move {
-            discovery::discover(http, &pds_url, &auth_method, Some(&expected_issuer)).await
-        },
-        |url, token_params, dpop_jwk| async move {
-            // Rebuilt from the same JWK the caller unsealed. Passed as JSON
-            // rather than as the key because `SigningKey` is not `Clone` and a
-            // borrowed key in an async closure costs more in lifetime noise than
-            // one re-parse per login is worth.
-            let key = keys::SigningKey::from_jwk_json(&dpop_jwk, "session")
-                .context("unsealing the login's DPoP key")?;
-            post_form(
+        // **These three closures must contain NO decisions.** A review found the
+        // first cut had put `Some(&expected_issuer)` and the DPoP key
+        // reconstruction in here — outside the seam the tests drive — so both
+        // could be broken with the whole suite green. Changing the issuer
+        // argument to `None` disabled the authorization-server mix-up defence
+        // for every real login and 702 tests still passed.
+        //
+        // Everything decided is now decided in `complete_with` and arrives
+        // fully formed; these are transports.
+        |req: Discovery| async move {
+            discovery::discover(
                 http,
-                pool,
-                &url,
-                &key,
-                &token_params,
-                // A nonce challenge is rejected BEFORE the grant is processed, so
-                // the code is not consumed and the request is safe to resend. The
-                // nonce harvested at PAR is routinely stale by now — approval can
-                // take minutes and a server nonce lasts at most five.
-                request::Retry::Allowed,
+                &req.pds_url,
+                &req.auth_method,
+                req.expected_issuer.as_deref(),
             )
             .await
+        },
+        |req: TokenPost| async move {
+            post_form(http, pool, &req.url, &req.key, &req.params, req.retry).await
+        },
+        |did: String| async move {
+            super::resolve::resolve(&runtime.resolver, http, &did, &runtime.plc_directory).await
         },
     )
     .await
 }
 
-/// [`complete`] with the two network boundaries injected.
+/// What `complete_with` hands its discovery transport. Every field is already
+/// decided; the transport only performs the call.
+struct Discovery {
+    pds_url: String,
+    auth_method: String,
+    /// `Some(issuer)` arms the authorization-server mix-up re-check inside
+    /// `discovery::discover`. **The `Option` is constructed here, not in the
+    /// adapter**, so a test can see whether the defence is armed at all.
+    expected_issuer: Option<String>,
+}
+
+/// What `complete_with` hands its token transport.
+struct TokenPost {
+    url: String,
+    params: Vec<(&'static str, String)>,
+    /// The ACTUAL key, not a recipe for one. The first cut passed the JWK string
+    /// and let the adapter re-parse it, which meant a freshly generated key would
+    /// have been accepted — signing the grant under a thumbprint it was never
+    /// bound to — with a green suite. `Arc` rather than a borrow only because the
+    /// key is local to `complete_with`; the guarantee is the same.
+    key: std::sync::Arc<keys::SigningKey>,
+    retry: request::Retry,
+}
+
+/// [`complete`] with the three network boundaries injected.
 ///
 /// **The SEQUENCING is the thing worth testing, and it was unreachable.** Each
 /// guard in this function has its own unit test, but nothing drove the whole
-/// callback: `complete` needs discovery and a token endpoint, both over the
-/// network, and the SSRF guard rightly refuses loopback — while an issuer is
-/// required to be `https`, so even a local plain-HTTP server cannot stand in for
-/// an authorization server. Injecting the two calls is what makes the ORDER
-/// observable, which is where the mix-up defence actually lives: the value of
-/// the issuer re-check is entirely in it happening BEFORE the code, the PKCE
-/// verifier and a `private_key_jwt` assertion are posted anywhere.
+/// callback: it needs discovery, a token endpoint and handle resolution, all
+/// over the network — and an issuer is required to be `https`, so even a local
+/// plain-HTTP server cannot stand in for an authorization server. Injecting the
+/// three calls is what makes the ORDER observable, which is where the mix-up
+/// defence actually lives: the value of the issuer re-check is entirely in it
+/// happening BEFORE the code, the PKCE verifier and a `private_key_jwt`
+/// assertion are posted anywhere.
+///
+/// **Every decision lives here, not in the caller's closures.** A review of the
+/// first cut found the opposite: the `Some(issuer)` that arms the mix-up
+/// re-check and the DPoP key the grant is bound to were both assembled inside
+/// the adapters, where no test could see them — so either could be broken with
+/// the entire suite green. The transports now receive fully-formed arguments.
 ///
 /// Same shape as [`discovery::discover_with`], and for the same reason.
 #[allow(clippy::too_many_arguments)]
-async fn complete_with<D, DFut, P, PFut>(
+async fn complete_with<D, DFut, P, PFut, R, RFut>(
     runtime: &OauthRuntime,
-    _http: &reqwest::Client,
     pool: &sqlx::SqlitePool,
     params: &flow::CallbackParams,
     presented_cookie: Option<&str>,
     now: i64,
     discover: D,
     post: P,
+    resolve_handle: R,
 ) -> Result<CompletedLogin>
 where
-    D: Fn(String, String, String) -> DFut,
+    D: Fn(Discovery) -> DFut,
     DFut: std::future::Future<Output = Result<discovery::AuthorizationServer>>,
-    P: Fn(String, Vec<(&'static str, String)>, String) -> PFut,
+    P: Fn(TokenPost) -> PFut,
     PFut: std::future::Future<Output = Result<request::PostOutcome>>,
+    R: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = Result<super::resolve::ResolvedAccount>>,
 {
     // Consumes the pending row, checks the browser binding, and validates `iss`
     // — all three, or no code comes back.
     let (pending, code) =
         flow::complete_callback(pool, &runtime.codec, params, presented_cookie, now).await?;
 
-    // **Unsealed here purely to fail EARLY.** The key itself is rebuilt inside
-    // the injected POST (it is not `Clone`), so the value is discarded — but a
-    // DPoP key that will not parse must stop the login before discovery and the
-    // token exchange, not after the authorization code has already been sent.
-    // Deleting this line would move the failure to the other side of two network
-    // calls without changing the final outcome, which is exactly the kind of
-    // reordering these end-to-end tests exist to catch.
-    keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
-        .context("unsealing the login's DPoP key")?;
+    // **Unsealed HERE, before discovery and the exchange.** A DPoP key that will
+    // not parse must stop the login before the authorization code is sent
+    // anywhere, not after — the final outcome is a failed login either way, so
+    // only the absence of a POST distinguishes them.
+    //
+    // The key is then handed to the token transport by reference, so nothing
+    // downstream can substitute a different one: the grant is bound to this
+    // thumbprint and no other.
+    let key = std::sync::Arc::new(
+        keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
+            .context("unsealing the login's DPoP key")?,
+    );
 
     // The method the login was STARTED under, not whatever is configured now.
     // A deploy that flipped dev/production between the push and the callback
@@ -264,11 +298,12 @@ where
         );
     }
 
-    let server = discover(
-        pending.pds_url.clone(),
-        auth_method.as_str().to_string(),
-        pending.issuer.clone(),
-    )
+    let server = discover(Discovery {
+        pds_url: pending.pds_url.clone(),
+        auth_method: auth_method.as_str().to_string(),
+        // `Some`, decided here: this is what arms the mix-up re-check.
+        expected_issuer: Some(pending.issuer.clone()),
+    })
     .await?;
 
     // **The re-discovered issuer must be the one PAR was pushed under.**
@@ -289,11 +324,16 @@ where
     // from a network re-read.
     let token_params = token_exchange_params(runtime, &pending, &code, auth_method, now)?;
 
-    let outcome = post(
-        server.token_endpoint.clone(),
-        token_params,
-        pending.dpop_key_jwk.clone(),
-    )
+    let outcome = post(TokenPost {
+        url: server.token_endpoint.clone(),
+        params: token_params,
+        key: std::sync::Arc::clone(&key),
+        // A nonce challenge is rejected BEFORE the grant is processed, so the
+        // code is not consumed and the request is safe to resend. The nonce
+        // harvested at PAR is routinely stale by now — approval can take minutes
+        // and a server nonce lasts at most five.
+        retry: request::Retry::Allowed,
+    })
     .await?;
 
     let did = accept_token_response(pool, &runtime.codec, &pending, &outcome, now).await?;
@@ -302,15 +342,13 @@ where
     // form: what the user typed is not evidence, and `resolve` returns `None`
     // unless it round-trips. A failure here must not fail the login — the
     // account is already authenticated, and the handle is a display detail.
-    let handle =
-        match super::resolve::resolve(&runtime.resolver, _http, &did, &runtime.plc_directory).await
-        {
-            Ok(account) => account.handle,
-            Err(err) => {
-                tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
-                None
-            }
-        };
+    let handle = match resolve_handle(did.clone()).await {
+        Ok(account) => account.handle,
+        Err(err) => {
+            tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
+            None
+        }
+    };
 
     Ok(CompletedLogin { did, handle })
 }
@@ -719,6 +757,30 @@ mod tests {
     }
 
     /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
+    /// One DPoP key for the whole test run.
+    ///
+    /// Deterministic on purpose: a freshly generated key per fixture made it
+    /// impossible to assert WHICH key the token request was signed under, and a
+    /// review found that gap was live — substituting a generated key in the
+    /// transport passed the entire suite while binding the grant to a thumbprint
+    /// the `request_uri` was never issued against.
+    fn fixture_dpop_jwk() -> &'static str {
+        static JWK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        JWK.get_or_init(|| {
+            crate::oauth::keys::SigningKey::generate("session")
+                .to_jwk_json()
+                .unwrap()
+        })
+    }
+
+    /// The thumbprint every token request in these tests must carry.
+    fn fixture_thumbprint() -> String {
+        crate::oauth::keys::SigningKey::from_jwk_json(fixture_dpop_jwk(), "session")
+            .unwrap()
+            .thumbprint()
+            .unwrap()
+    }
+
     fn pending_auth(cookie_hash: &str) -> crate::oauth::store::PendingAuth {
         crate::oauth::store::PendingAuth {
             state: "state-value".into(),
@@ -728,9 +790,7 @@ mod tests {
             // compares redirects, so a placeholder here refuses the login one
             // step too early and the identity check never runs — which the
             // assertion below caught rather than tolerated.
-            dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session")
-                .to_jwk_json()
-                .unwrap(),
+            dpop_key_jwk: fixture_dpop_jwk().to_string(),
             issuer: PENDING_ISSUER.into(),
             pds_url: "https://pds.example.com".into(),
             did: PENDING_DID.into(),
@@ -937,13 +997,25 @@ mod tests {
     // What these assert is mostly what did NOT happen: a guard that fires only
     // after the authorization code has been posted somewhere is not a guard.
 
-    /// Records what the injected boundaries were asked to do.
+    /// Records what the injected boundaries were asked to do — including the
+    /// fields a review found were being decided in untested adapter code.
     #[derive(Default)]
     struct Calls {
-        discovered: Vec<(String, String)>,
-        posted: Vec<(String, Vec<(&'static str, String)>)>,
+        /// `(pds_url, expected_issuer, auth_method)`. The `Option` is the point:
+        /// `None` means the mix-up re-check was never armed.
+        discovered: Vec<(String, Option<String>, String)>,
+        posted: Vec<PostedCall>,
+        resolved: Vec<String>,
     }
     type Log = std::sync::Arc<std::sync::Mutex<Calls>>;
+
+    /// One recorded token POST: where, with what, under which key, retryable?
+    struct PostedCall {
+        url: String,
+        params: Vec<(&'static str, String)>,
+        dpop_thumbprint: String,
+        retry: request::Retry,
+    }
 
     fn server_at(issuer: &str) -> crate::oauth::discovery::AuthorizationServer {
         crate::oauth::discovery::AuthorizationServer {
@@ -955,8 +1027,8 @@ mod tests {
         }
     }
 
-    /// Drive `complete_with`, recording both boundaries. `discovered_issuer`
-    /// is what discovery *returns* — the lever for the mix-up case.
+    /// Drive `complete_with`, recording all three boundaries. Fully OFFLINE:
+    /// handle resolution is injected too, so no test here touches the network.
     async fn drive(
         pool: &sqlx::SqlitePool,
         runtime: &crate::oauth::runtime::OauthRuntime,
@@ -967,36 +1039,57 @@ mod tests {
         token_body: serde_json::Value,
     ) -> (Result<CompletedLogin>, Log) {
         let log: Log = Default::default();
-        let sink = std::sync::Arc::clone(&log);
-        let sink2 = std::sync::Arc::clone(&log);
+        let (s1, s2, s3) = (
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&log),
+        );
         let issuer = discovered_issuer.to_string();
         let body = serde_json::to_vec(&token_body).unwrap();
-        let http = reqwest::Client::builder().build().unwrap();
         let out = complete_with(
             runtime,
-            &http,
             pool,
             params,
             cookie,
-            1_000_000,
-            move |pds, method, expected| {
-                let sink = std::sync::Arc::clone(&sink);
+            1_700_000_000,
+            move |req| {
+                let sink = std::sync::Arc::clone(&s1);
                 let issuer = issuer.clone();
                 async move {
-                    sink.lock().unwrap().discovered.push((pds, expected));
-                    let _ = method;
+                    sink.lock().unwrap().discovered.push((
+                        req.pds_url,
+                        req.expected_issuer,
+                        req.auth_method,
+                    ));
                     Ok(server_at(&issuer))
                 }
             },
-            move |url, params, _jwk| {
-                let sink = std::sync::Arc::clone(&sink2);
+            move |req: TokenPost| {
+                let sink = std::sync::Arc::clone(&s2);
                 let body = body.clone();
                 async move {
-                    sink.lock().unwrap().posted.push((url, params));
+                    // The thumbprint is what the grant is bound to; recording it
+                    // is how a substituted key becomes visible.
+                    let tp = req.key.thumbprint().unwrap_or_default();
+                    sink.lock().unwrap().posted.push(PostedCall {
+                        url: req.url,
+                        params: req.params,
+                        dpop_thumbprint: tp,
+                        retry: req.retry,
+                    });
                     Ok(request::PostOutcome {
                         status: token_status,
                         body,
                     })
+                }
+            },
+            move |did| {
+                let sink = std::sync::Arc::clone(&s3);
+                async move {
+                    sink.lock().unwrap().resolved.push(did);
+                    // Offline: the handle lookup is allowed to fail, and the
+                    // login must survive it.
+                    Err(anyhow::anyhow!("handle resolution unavailable in tests"))
                 }
             },
         )
@@ -1036,22 +1129,48 @@ mod tests {
 
         // Copied out in a block so the guard is gone before the `await` below;
         // a MutexGuard held across an await is a clippy deny in CI.
-        let (discoveries, expected_issuer, posts, token_url) = {
+        let (discoveries, expected_issuer, posts, token_url, thumbprint, retry, token_params) = {
             let calls = log.lock().unwrap();
             (
                 calls.discovered.len(),
                 calls.discovered[0].1.clone(),
                 calls.posted.len(),
-                calls.posted[0].0.clone(),
+                calls.posted[0].url.clone(),
+                calls.posted[0].dpop_thumbprint.clone(),
+                calls.posted[0].retry,
+                calls.posted[0].params.clone(),
             )
         };
         assert_eq!(discoveries, 1, "discovery ran once");
         assert_eq!(
-            expected_issuer, PENDING_ISSUER,
-            "discovery was not told which issuer PAR was pushed under",
+            expected_issuer.as_deref(),
+            Some(PENDING_ISSUER),
+            "the mix-up re-check was not armed: discovery got {expected_issuer:?}",
         );
         assert_eq!(posts, 1, "the token exchange ran once");
         assert_eq!(token_url, format!("{PENDING_ISSUER}/token"));
+        assert_eq!(
+            retry,
+            request::Retry::Allowed,
+            "the token POST must be retryable: a nonce challenge is rejected \
+             before the grant is processed, so the code is not consumed",
+        );
+        // The grant is bound to the PENDING ROW's DPoP key and no other. A
+        // substituted key also has a non-empty thumbprint, so only an equality
+        // check catches it.
+        // The code from THIS callback is what gets exchanged.
+        assert!(
+            token_params
+                .iter()
+                .any(|(k, v)| *k == "code" && v == "the-code"),
+            "the token request did not carry the callback's authorization code: {token_params:?}",
+        );
+        assert_eq!(
+            thumbprint,
+            fixture_thumbprint(),
+            "the token request was signed under a different key than the one the \
+             authorization request was bound to",
+        );
 
         let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
         assert!(
@@ -1093,7 +1212,7 @@ mod tests {
         assert!(
             calls.posted.is_empty(),
             "the authorization code was posted despite a bad iss: {:?}",
-            calls.posted.iter().map(|p| &p.0).collect::<Vec<_>>(),
+            calls.posted.iter().map(|p| &p.url).collect::<Vec<_>>(),
         );
         assert!(
             calls.discovered.is_empty(),
@@ -1152,7 +1271,8 @@ mod tests {
 
         let calls = log.lock().unwrap();
         assert_eq!(
-            calls.discovered[0].1, PENDING_ISSUER,
+            calls.discovered[0].1.as_deref(),
+            Some(PENDING_ISSUER),
             "discovery was not told which issuer to expect; the mix-up defence \
              is disabled from the caller's side",
         );
