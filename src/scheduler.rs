@@ -1110,7 +1110,6 @@ async fn flush_all_dirty(state: &AppState, parked: &mut HashSet<String>) -> anyh
     Ok(())
 }
 
-
 /// Every DID that currently has at least one dirty read cursor.
 ///
 /// The store exposes `dirty_cursors(did)` (per-DID, the flusher's hot query) but
@@ -1417,7 +1416,10 @@ mod tests {
         let mut parked = HashSet::new();
 
         flush_all_dirty(&state, &mut parked).await.unwrap();
-        assert!(parked.contains(did), "precondition: parked while signed out");
+        assert!(
+            parked.contains(did),
+            "precondition: parked while signed out"
+        );
         assert_eq!(
             state
                 .metrics
