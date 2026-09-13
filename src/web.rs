@@ -659,8 +659,14 @@ fn configured_poll_tick() -> Duration {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
-        .map_or(Duration::from_secs(60), Duration::from_secs)
+        .map_or(DEFAULT_POLL_TICK_SECS, Duration::from_secs)
 }
+
+/// Mirrors `scheduler::DEFAULT_POLL_TICK`, which lives in the BINARY crate and
+/// so cannot be imported here. Duplicated deliberately and named, rather than
+/// left as a bare `60` inside the parse chain, so the drift is at least visible
+/// if the scheduler's value ever moves.
+const DEFAULT_POLL_TICK_SECS: Duration = Duration::from_secs(60);
 
 /// Grace period after boot before a poller that has never ticked is called
 /// `stale` rather than `not-yet-ticked`.
@@ -915,6 +921,39 @@ async fn unsave_record(
     Redirect::to("/?view=starred").into_response()
 }
 
+/// What the poller is doing, as one word for `/stats`.
+///
+/// **Parity with `/health` is the point.** `polling_paused` alone reported
+/// "running" for three different states including the two where nothing polls,
+/// on the page added to answer exactly that. The first attempt at fixing it
+/// added `off` and `starting` and claimed parity — but left out `stale`, so a
+/// poll loop that ticked once at boot and then WEDGED still read as running.
+/// That is the wedged-loop case `/health`'s heartbeat exists for, and the
+/// original finding's exact shape surviving its own fix.
+///
+/// Shares the staleness threshold with `/health` rather than picking its own, so
+/// the two pages cannot disagree about what "stale" means.
+fn fetching_state(rh: &crate::runtime_health::RuntimeHealth, now_unix: i64) -> &'static str {
+    if !rh.schedulers_enabled() {
+        return "off";
+    }
+    // Checked before the pause: a wedged poller cannot clear a pause either, so
+    // reporting "paused" would name the symptom and hide the cause.
+    match rh.secs_since_poll_tick(now_unix) {
+        None => {
+            // Never ticked. Benign at boot, a dead loop long after — read
+            // against uptime, exactly as `/health` does.
+            match rh.uptime_secs(now_unix) {
+                Some(up) if up > HEALTH_FIRST_TICK_GRACE_SECS => "stale",
+                _ => "starting",
+            }
+        }
+        Some(secs) if secs > health_tick_stale_secs(configured_poll_tick()) => "stale",
+        _ if rh.watermark_paused() => "paused",
+        _ => "running",
+    }
+}
+
 /// `GET /stats` — public poll health.
 async fn stats(State(state): State<AppState>) -> Response {
     let now = chrono::Utc::now();
@@ -966,24 +1005,7 @@ async fn stats(State(state): State<AppState>) -> Response {
         // detail, so they sit inside the page's stated contract.
         in_backoff: health.in_backoff,
         badly_broken: health.badly_broken,
-        // **Three-way, not two.** `polling_paused` alone reported "running" on an
-        // instance where nothing polls at all — schedulers disabled, or before
-        // the poller's now-delayed first tick — which is exactly the question
-        // this row was added to answer. `/health` already distinguished them;
-        // the page a reader can reach did not.
-        fetching: if !state.runtime_health.schedulers_enabled() {
-            "off"
-        } else if state.runtime_health.watermark_paused() {
-            "paused"
-        } else if state
-            .runtime_health
-            .secs_since_poll_tick(now.timestamp())
-            .is_none()
-        {
-            "starting"
-        } else {
-            "running"
-        },
+        fetching: fetching_state(&state.runtime_health, now.timestamp()),
     })
 }
 
@@ -1548,13 +1570,20 @@ const PREV_NEXT_MAX: i64 = 5_000;
 /// count, not as a routine bound.
 const STARRED_IDENTITY_MAX: i64 = 20_000;
 
-/// Most uncached PDS saved records rendered on the starred view's last page.
+/// Most uncached PDS saved records this handler will hold in memory for one
+/// request.
 ///
-/// They are appended whole rather than paged, so `ENTRIES_PER_PAGE` does not
-/// bound them and the PDS list ceiling (20,000) was the only limit on the
-/// response size. Generous enough that no ordinary reader meets it, small enough
-/// that the page stays a page.
-const MAX_UNCACHED_SAVED_ROWS: usize = 500;
+/// **A memory bound, not a visibility bound.** These rows are PAGED alongside
+/// the cached entries now, so `ENTRIES_PER_PAGE` decides how many are rendered
+/// and this only caps how many are collected before slicing. An earlier version
+/// used it to cap what was SHOWN, which left everything past it invisible and —
+/// because the un-save control lives on the row, and nothing else in the app
+/// lists these — unremovable.
+///
+/// Well above the PDS list ceiling's practical reach for one reader, so a reader
+/// meeting it has thousands of saved records and gets a logged, ordered prefix
+/// rather than a failure.
+const MAX_UNCACHED_SAVED_ROWS: usize = 5_000;
 
 /// A subscription resolved against the local cache: the PDS record + its
 /// (possibly-missing) cached feed row.
@@ -1759,78 +1788,13 @@ async fn index(
     // no `LIMIT`, article bodies included — and the "all" view additionally ran
     // one such query PER SUBSCRIBED FEED and merged the results in memory. None
     // of the row fields below read the body. See `store::EntryListRow`.
-    let total = store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
-    // Uncached PDS saved records appended to the last page — counted for the
-    // heading, and deliberately kept OUT of `total`, which the pager depends on.
-    let mut uncached_shown: i64 = 0;
-    // Clamped to the range that exists. Past the end the list is empty, and the
-    // empty state renders instead of the pager — which would strand a reader who
-    // typed a page number, or who paged to the end and then marked entries read
-    // out from under their own URL. Showing the last page is the answer to both.
-    let page = i64::from(q.page.unwrap_or(1).max(1)).min(page_count_for(total));
-    let offset = (page - 1) * ENTRIES_PER_PAGE;
-    let source = store::list_entries(
-        pool,
-        &did,
-        list_view,
-        scope_ids.as_deref(),
-        ENTRIES_PER_PAGE,
-        offset,
-    )
-    .await?;
-
-    // The scope/view suffix carried onto every entry link (built once).
-    let entry_scope_qs = {
-        let mut parts = Vec::new();
-        if let Some(f) = q.feed.as_deref() {
-            parts.push(format!("feed={}", qenc(f)));
-        }
-        if let Some(f) = q.folder.as_deref() {
-            parts.push(format!("folder={}", qenc(f)));
-        }
-        if view != "unread" {
-            parts.push(format!("view={}", qenc(&view)));
-        }
-        parts.join("&")
-    };
-    let entry_link = |id: i64| -> String {
-        if entry_scope_qs.is_empty() {
-            format!("/entries/{id}")
-        } else {
-            format!("/entries/{id}?{entry_scope_qs}")
-        }
-    };
-
-    let entries: Vec<EntryRow> = source
-        .iter()
-        .map(|e| EntryRow {
-            id: e.id,
-            title: e
-                .title
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| "(untitled)".to_string()),
-            feed_title: feed_title_by_id(e.feed_id),
-            published: display_date(e.published.as_deref()),
-            // Both bits ride along on the row's own `entry_state` join now. They
-            // used to be membership tests against the full unread and starred
-            // sets, which is why those two lists were fetched in their entirety
-            // on every render even when the page showed a hundred rows.
-            read: e.read,
-            starred: e.starred,
-            link: entry_link(e.id),
-            cached: true,
-            rkey: String::new(),
-        })
-        .collect();
-
     // **Saved records the cache cannot show.**
     //
     // The starred view is built from local `entries`, so a saved record whose
     // article was never cached here is invisible — the case that matters is
     // starring in ANOTHER atproto reader, which is the portability the shared
     // lexicon exists for. Those rows are rendered from the PDS record alone.
-    let mut entries = entries;
+    let mut uncached: Vec<EntryRow> = Vec::new();
     if view == "starred" {
         // **Match against every SUBSCRIBED cached starred entry, not `source`.**
         //
@@ -1906,7 +1870,6 @@ async fn index(
         // cap is generous — a reader with more saved-elsewhere records than this
         // is not the case being designed for — but a response has to have a size
         // an operator can reason about.
-        let mut uncached: Vec<EntryRow> = Vec::new();
         let mut uncached_dropped = 0usize;
         match state.repo().list_saved_sorted(&did).await {
             Ok(saved) if identities_ok => {
@@ -1971,6 +1934,17 @@ async fn index(
                     // row becomes a real entry on its own — no synthetic rows in
                     // the shared cache, which every subscriber would otherwise
                     // see as a content-less entry.
+                    // **Bound the WORK, not just the response.** This check sat
+                    // after the nudge and the `subs` scan below, so every render
+                    // still walked all ≤20,000 PDS records, ran a subs-length
+                    // string scan per record, and issued up to that many
+                    // `mark_feed_due` round-trips on a 5-connection pool — then
+                    // discarded everything past the cap. A cap that runs after
+                    // the expensive part is a cap on the output only.
+                    if uncached.len() >= MAX_UNCACHED_SAVED_ROWS {
+                        uncached_dropped += 1;
+                        continue;
+                    }
                     if let Some(feed_url) = item.feed_url.as_deref() {
                         if subs.iter().any(|s| s.sub.url == feed_url) {
                             // Bounded to one nudge per feed per poll interval —
@@ -1986,10 +1960,6 @@ async fn index(
                                 tracing::debug!(%err, %feed_url, "could not nudge a feed for a saved article");
                             }
                         }
-                    }
-                    if uncached.len() >= MAX_UNCACHED_SAVED_ROWS {
-                        uncached_dropped += 1;
-                        continue;
                     }
                     uncached.push(EntryRow {
                         id: 0,
@@ -2044,16 +2014,103 @@ async fn index(
                 %did,
                 dropped = uncached_dropped,
                 cap = MAX_UNCACHED_SAVED_ROWS,
-                "more uncached saved records than this page will render; the rest are \
-                 not shown"
+                "more saved records than this instance will hold in one response; the \
+                 rest are not reachable from here"
             );
         }
-        let last_page = page_count_for(total);
-        if page >= last_page {
-            uncached_shown = uncached.len() as i64;
-            entries.extend(uncached);
-        }
     }
+
+    // **One sequence, two sources.** The cached rows come from SQL, the uncached
+    // PDS records follow them, and the pager walks the concatenation.
+    //
+    // The first version appended the uncached rows to the last page only and
+    // kept them out of `total`, which left everything past a cap invisible AND
+    // unremovable — the un-save button lives on the row, and there is no other
+    // surface in the app that lists these. That is the same "unremovable FROM
+    // HERE" hazard the `safe_link` fix above exists to prevent, reintroduced
+    // forty lines later by a bound meant to protect memory.
+    //
+    // Paging the concatenation makes every record reachable and needs no cap on
+    // what is RENDERED — one page is one page either way. The version before
+    // that inflated `total` while clamping on the cached count, which advertised
+    // a page the clamp could never reach; both numbers come from the same total
+    // now, which is what makes that impossible rather than merely fixed.
+    let total_cached =
+        store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
+    let total = total_cached + uncached.len() as i64;
+    // Clamped to the range that exists. Past the end the list is empty, and the
+    // empty state renders instead of the pager — which would strand a reader who
+    // typed a page number, or who paged to the end and then marked entries read
+    // out from under their own URL. Showing the last page is the answer to both.
+    let page = i64::from(q.page.unwrap_or(1).max(1)).min(page_count_for(total));
+    let offset = (page - 1) * ENTRIES_PER_PAGE;
+    // Past the cached rows this returns nothing, which is exactly right: the
+    // page is then made up entirely of uncached ones.
+    let source = store::list_entries(
+        pool,
+        &did,
+        list_view,
+        scope_ids.as_deref(),
+        ENTRIES_PER_PAGE,
+        offset,
+    )
+    .await?;
+    // The uncached slice picks up where the cached rows stop.
+    let uncached_page: Vec<EntryRow> = {
+        let skip = (offset - total_cached).max(0) as usize;
+        let take = (ENTRIES_PER_PAGE as usize).saturating_sub(source.len());
+        uncached.into_iter().skip(skip).take(take).collect()
+    };
+    let uncached_shown = uncached_page.len() as i64;
+
+    // The scope/view suffix carried onto every entry link (built once).
+    let entry_scope_qs = {
+        let mut parts = Vec::new();
+        if let Some(f) = q.feed.as_deref() {
+            parts.push(format!("feed={}", qenc(f)));
+        }
+        if let Some(f) = q.folder.as_deref() {
+            parts.push(format!("folder={}", qenc(f)));
+        }
+        if view != "unread" {
+            parts.push(format!("view={}", qenc(&view)));
+        }
+        parts.join("&")
+    };
+    let entry_link = |id: i64| -> String {
+        if entry_scope_qs.is_empty() {
+            format!("/entries/{id}")
+        } else {
+            format!("/entries/{id}?{entry_scope_qs}")
+        }
+    };
+
+    let entries: Vec<EntryRow> = source
+        .iter()
+        .map(|e| EntryRow {
+            id: e.id,
+            title: e
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "(untitled)".to_string()),
+            feed_title: feed_title_by_id(e.feed_id),
+            published: display_date(e.published.as_deref()),
+            // Both bits ride along on the row's own `entry_state` join now. They
+            // used to be membership tests against the full unread and starred
+            // sets, which is why those two lists were fetched in their entirety
+            // on every render even when the page showed a hundred rows.
+            read: e.read,
+            starred: e.starred,
+            link: entry_link(e.id),
+            cached: true,
+            rkey: String::new(),
+        })
+        .collect();
+
+    // The uncached slice for this page follows the cached rows.
+    let mut entries = entries;
+    entries.extend(uncached_page);
     let entries = entries;
 
     let selected_feed = q.feed.as_deref();
@@ -8280,37 +8337,58 @@ mod tests {
             }
         };
 
-        let last = get("/?view=starred&page=3").await;
-        // The uncached rows land here, so this IS the last page.
+        // 250 cached + 80 uncached = 330 rows over 4 pages. The pager and the
+        // clamp must agree on that, and EVERY page it offers must have content —
+        // the original bug advertised a fourth page that clamped back to the
+        // third and re-rendered it, still offering the link.
+        let p3 = get("/?view=starred&page=3").await;
         assert!(
-            last.contains("Elsewhere 0"),
-            "the uncached saved records did not reach the last page"
-        );
-        assert!(
-            last.contains("Page 3 of 3"),
-            "the pager counted the uncached rows into its page total: {}",
-            last.split("pager-pos")
+            p3.contains("Page 3 of 4"),
+            "the pager and the clamp disagree on the total: {}",
+            p3.split("pager-pos")
                 .nth(1)
                 .unwrap_or("")
                 .chars()
                 .take(120)
                 .collect::<String>()
         );
+        // Page 3 is the boundary: the last 50 cached rows, then the first 50
+        // uncached ones.
         assert!(
-            !last.contains("page=4"),
-            "the pager offered a page the clamp cannot reach"
+            p3.contains("Elsewhere 0"),
+            "page 3 should start the uncached run"
         );
-        // And the count is honest about what the extras are.
-        assert!(
-            last.contains("250 entries") && last.contains("80 saved elsewhere"),
-            "the heading should separate cached entries from records the cache cannot show"
+        assert_eq!(
+            p3.matches("<li class=\"entry").count(),
+            ENTRIES_PER_PAGE as usize,
+            "the boundary page is not full"
         );
 
-        // Earlier pages must NOT carry the uncached rows.
+        let p4 = get("/?view=starred&page=4").await;
+        assert!(
+            p4.contains("Page 4 of 4"),
+            "page 4 was advertised but clamps somewhere else — the unreachable-page bug"
+        );
+        assert_eq!(
+            p4.matches("<li class=\"entry").count(),
+            30,
+            "page 4 should hold the remaining 30 uncached records"
+        );
+        assert!(
+            p4.contains("Elsewhere 79"),
+            "the LAST saved record is unreachable — it can only be removed from here"
+        );
+
+        // No uncached record appears on two pages.
+        assert!(
+            !p4.contains("Elsewhere 0"),
+            "an uncached record was rendered on more than one page"
+        );
+        // Page 1 is all cached.
         let first = get("/?view=starred").await;
         assert!(
-            !first.contains("Elsewhere 0"),
-            "uncached saved records were repeated on every page"
+            !first.contains("Elsewhere "),
+            "uncached saved records leaked onto the first page"
         );
     }
 

@@ -876,7 +876,13 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
             // sweep that created the freelist in the first place. Same shape as
             // `delete_in_batches`: a bounded unit of work, then an explicit
             // hand-off so a waiting writer actually gets in.
-            for _ in 0..RECLAIM_MAX_BATCHES {
+            // **Both early exits are LOUD.** Failing to reclaim is the failure
+            // this function exists to prevent: `db_size_bytes` stays high,
+            // `poll_due_once` keeps polling paused, and `/stats` says "paused"
+            // with nothing anywhere saying reclaim gave up. Exiting silently
+            // makes that indistinguishable from a sweep that had nothing to do.
+            let mut drained = true;
+            for batch in 0..RECLAIM_MAX_BATCHES {
                 let before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
                     .fetch_one(pool)
                     .await
@@ -897,12 +903,35 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
                     .fetch_one(pool)
                     .await
                     .context("PRAGMA freelist_count failed")?;
-                // No progress means there is nothing more this can free (pages
-                // pinned by an open read snapshot, say). Stop rather than spin.
+                // No progress. Usually "nothing more can be freed", but in WAL
+                // mode a long-lived read snapshot pins freelist pages, and a
+                // concurrent retention delete pushes `after` back up — so this
+                // also fires on runs that DID make progress and simply lost the
+                // race. Either way the pages stay allocated, which is what an
+                // operator needs to know.
                 if after >= before {
+                    tracing::warn!(
+                        freelist_pages = after,
+                        batches_run = batch,
+                        "reclaim stopped making progress with pages still on the \
+                         freelist; the file will not shrink and the DB-size watermark \
+                         may stay engaged until the next sweep"
+                    );
+                    drained = false;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                if batch + 1 == RECLAIM_MAX_BATCHES {
+                    tracing::warn!(
+                        batches_run = batch + 1,
+                        "reclaim hit its batch backstop with pages still on the \
+                         freelist; the rest waits for the next sweep"
+                    );
+                    drained = false;
+                }
+            }
+            if drained {
+                tracing::debug!("reclaim: freelist drained");
             }
         }
         // SQLite already returns freed pages at every commit in this mode.
@@ -944,15 +973,31 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
     // space this function can return at all.
     //
     // Best-effort: a TRUNCATE checkpoint yields to active readers rather than
-    // blocking them, and reports that as a row, not an error. A skipped
-    // checkpoint just means the next one does the work.
-    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(pool)
-        .await
-    {
+    // blocking them. The next sweep does the work instead.
+    if let Err(err) = checkpoint_wal(pool).await {
         tracing::debug!(%err, "wal checkpoint after reclaim did not run");
     }
     Ok(())
+}
+
+/// Run a truncating WAL checkpoint. `Ok(false)` means SQLite declined because a
+/// reader held the WAL.
+///
+/// **The busy case is a ROW, not an error.** `PRAGMA wal_checkpoint` returns
+/// `(busy, log_frames, checkpointed_frames)` and sets `busy = 1` when it could
+/// not run — measured: `(1, 3, 3)` with one open read transaction versus
+/// `(0, 0, 0)` without. So `if let Err(..)` never fires on the case it was
+/// written for, and a caller that depends on the WAL actually being truncated
+/// (the migration's size report does) would silently get the untruncated one.
+async fn checkpoint_wal<'e, E>(conn: E) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(conn)
+        .await
+        .context("PRAGMA wal_checkpoint(TRUNCATE) failed")?;
+    Ok(row.0 == 0)
 }
 
 /// A database's `auto_vacuum` mode.
@@ -1040,6 +1085,18 @@ pub async fn migrate_to_incremental_vacuum(
     // pages (that is what gets copied), but the report shows both.
     let bytes_before = db_size_bytes(pool).await?;
     let file_before = main_db_file_bytes(pool).await;
+    // Resolved BEFORE a connection is acquired below. Asking the pool for
+    // anything while holding one of its connections deadlocks a saturated pool —
+    // and a single-connection pool is always saturated. The first version of the
+    // temp-directory block did exactly that, and because `main_db_path` swallows
+    // errors into `None` it did not even fail loudly: it stalled for the full
+    // acquire timeout and then silently skipped setting the directory, which is
+    // the one thing it exists to do.
+    let temp_dir = main_db_path(pool).await.and_then(|p| {
+        std::path::Path::new(&p)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    });
     let needed = (bytes_before.max(0) as u64).saturating_mul(2);
     if let Some(available) = available_bytes {
         if available < needed {
@@ -1064,17 +1121,41 @@ pub async fn migrate_to_incremental_vacuum(
         .await
         .context("acquiring a connection for the auto_vacuum migration")?;
 
-    // Keep SQLite's temp storage on the DATABASE's volume. A VACUUM copies into
-    // a temporary database whose location follows `temp_store`, and nothing in
-    // this project sets it — so the copy landed on the container rootfs while
-    // the headroom check above measured the data volume. The check could pass
-    // and the VACUUM still fail, or fill the rootfs out from under everything
-    // else in the container. `temp_store = FILE` plus a directory beside the
-    // database makes the space checked the space used.
+    // **Put the temp copy on the DATABASE's volume — which takes TWO pragmas.**
+    //
+    // A VACUUM rebuilds through a temporary database, and the headroom check
+    // above measures the data volume. `temp_store = FILE` alone only chooses
+    // file-over-memory; it does NOT choose which filesystem, so the temp copy
+    // still resolved via `SQLITE_TMPDIR`/`TMPDIR`/`/var/tmp`/`/tmp` — the
+    // container rootfs. The check could pass on `/data` and the VACUUM still hit
+    // `SQLITE_FULL`, or fill the rootfs out from under Caddy. A comment here
+    // previously claimed this was handled "plus a directory beside the
+    // database"; there was no such directory. `temp_store_directory` is the one
+    // that actually decides, and it is deprecated but still honoured — there is
+    // no non-deprecated equivalent reachable from a connection.
     sqlx::query("PRAGMA temp_store = FILE")
         .execute(&mut *conn)
         .await
         .context("PRAGMA temp_store = FILE failed")?;
+    if let Some(dir) = temp_dir.clone() {
+        // The path comes from SQLite's own `database_list`, not from a caller.
+        let quoted = dir.display().to_string().replace('\'', "''");
+        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA temp_store_directory = '{quoted}'"
+        )))
+        .execute(&mut *conn)
+        .await
+        {
+            // Not fatal: the VACUUM can still succeed if the default temp
+            // location happens to have room. But the headroom check is then
+            // measuring the wrong filesystem, so say so.
+            tracing::warn!(
+                %err, dir = %dir.display(),
+                "could not point SQLite's temp storage at the database volume; the \
+                 headroom check may not cover where the VACUUM actually writes"
+            );
+        }
+    }
 
     // Order matters: the pragma records the INTENT, and the VACUUM is what
     // actually rewrites the file in the new mode. Reversed, the VACUUM would
@@ -1093,11 +1174,16 @@ pub async fn migrate_to_incremental_vacuum(
     // until a truncating checkpoint — and `db_size_bytes` now counts the WAL. So
     // the one number this command reports read as "the migration doubled my
     // database", which is the opposite of what it did.
-    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await
-    {
-        tracing::debug!(%err, "post-migration wal checkpoint did not run");
+    match checkpoint_wal(&mut *conn).await {
+        Ok(true) => {}
+        // Reported, because the size this function returns is computed straight
+        // after and would otherwise read as "the migration doubled my database"
+        // with nothing saying why.
+        Ok(false) => tracing::warn!(
+            "a reader held the WAL, so it was not truncated; the reported size below \
+             includes it"
+        ),
+        Err(err) => tracing::warn!(%err, "post-migration wal checkpoint failed"),
     }
 
     // Verified on the HELD connection, then released before anything that goes
@@ -1526,6 +1612,10 @@ async fn delete_in_batches(
         // that during an incident would go looking for a backlog that is not
         // there. `n < PRUNE_BATCH` means this batch found fewer rows than it
         // asked for, so there are none behind it.
+        // Still a 1-in-`PRUNE_BATCH` false positive when the final batch drains
+        // exactly a full batch with nothing behind it — distinguishing that
+        // needs another COUNT per sweep, which is not worth paying to make a
+        // backstop message that has never fired slightly more precise.
         if batch + 1 == PRUNE_MAX_BATCHES && n == PRUNE_BATCH as u64 {
             tracing::warn!(
                 label,
@@ -5692,6 +5782,67 @@ mod tests {
             bytes_after <= file_after * 2,
             "bytes_after ({bytes_after}) is inflated by an untruncated WAL against a \
              {file_after}-byte file"
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// **The migration must not ask the pool for anything while holding a
+    /// connection.** A single-connection pool is always saturated, so any such
+    /// call stalls for the full acquire timeout.
+    ///
+    /// This has now been introduced twice — once by acquiring a connection for
+    /// the pragma pair, and once by resolving the temp directory inside that
+    /// block. The second was worse than a stall: `main_db_path` swallows errors
+    /// into `None`, so it waited 30 s and then silently skipped the pragma it
+    /// existed to set. A wall-clock assertion is crude, but it is the only thing
+    /// that distinguishes "works" from "works after a 30-second timeout".
+    #[tokio::test]
+    async fn the_vacuum_migration_never_waits_on_its_own_pool() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-nodeadlock-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        // ONE connection: any pool call made while the migration holds it will
+        // block until the acquire timeout rather than deadlocking forever.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+
+        let t0 = std::time::Instant::now();
+        let outcome = migrate_to_incremental_vacuum(&pool, Some(u64::MAX)).await?;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            matches!(outcome, VacuumMigration::Migrated { .. }),
+            "expected a migration, got {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the migration took {elapsed:?} on an empty database — it is waiting on \
+             its own pool while holding a connection"
         );
 
         pool.close().await;

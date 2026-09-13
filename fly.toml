@@ -160,9 +160,12 @@ kill_timeout = "45s"
   # LIMIT 1`) under a 2 s timeout — inside the 3 s below, so a wedged pool yields
   # a 503 the app chose, with a reason, rather than a timeout Fly inferred. It
   # reads a real page deliberately: a bare `SELECT 1` emits no OpenRead opcode at
-  # all, so it returns success against a corrupted database. The verdict is cached
-  # for 5 s, so /health — which is origin-lock-exempt and unauthenticated — cannot
-  # be used to spend the 5-connection pool. Only the database can fail this check:
+  # all, so it returns success against a corrupted database. CONCURRENT probes are
+  # deduplicated — at most one is ever in flight, others reuse its predecessor's
+  # verdict — so /health, which is origin-lock-exempt and unauthenticated, cannot
+  # be used to spend the 5-connection pool. (There is no TIME cache: every
+  # sequential request, including Fly's own, gets a fresh answer.) Only the
+  # database can fail this check:
   # the body also reports uptime, the
   # poll heartbeat, whether fetching is paused at the size watermark, and the
   # live OAuth backend, but none of those affect the status code. Fly restarts on

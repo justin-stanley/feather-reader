@@ -15,7 +15,10 @@
 //! `feeds.consecutive_errors`), and is read from there.
 //!
 //! Everything here is a **machine fact** — no user counts, no DIDs, no feed
-//! URLs — so it can be published on the same terms as `/stats`.
+//! URLs — so it can be published on the same terms as `/stats`. Note the actual
+//! constraint is tighter than that: `/stats` sits behind the Cloudflare origin
+//! lock, while `/health` is the ONE path exempt from it, and `/health` is where
+//! most of this surfaces.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
@@ -92,11 +95,19 @@ impl RuntimeHealth {
     /// owns the probe and must report it via the returned guard.
     pub fn begin_db_probe(&self) -> Result<DbProbeGuard<'_>, Result<(), String>> {
         if self.db_probe_running.swap(true, Ordering::AcqRel) {
-            // Someone else is probing. Borrow their last answer; before the very
-            // first probe completes there is nothing to borrow, and optimism is
-            // right there — a machine that has served zero probes has shown no
-            // sign of being broken.
-            return Err(self.last_db_probe().unwrap_or(Ok(())));
+            // Someone else is probing. Borrow their last answer.
+            //
+            // Before the FIRST probe completes there is nothing to borrow, and
+            // this used to answer `Ok(())` — asserting health it had not
+            // measured. `/health` is the one path outside the origin lock and
+            // outside the rate limiter, so an unauthenticated caller can
+            // guarantee concurrency during that window, and a boot with a dead
+            // volume could publish `db: ok` to whichever check landed in it.
+            // "unknown" is the honest answer to a question nothing has answered
+            // yet; the caller decides what it means.
+            return Err(self
+                .last_db_probe()
+                .unwrap_or_else(|| Err("unknown".to_string())));
         }
         Ok(DbProbeGuard { health: self })
     }

@@ -45,7 +45,12 @@ fi
 
 # ── PHASE 2: unprivileged supervisor. ──────────────────────────────────────
 pids=""
+# Set by the trap below, so the exit log can tell a stop WE asked for from a
+# child dying on its own. Nothing else may set it.
+stopping=0
+
 term() {
+    stopping=1
     # Forward the stop signal to every child, then wait them out.
     for p in ${pids}; do kill -TERM "${p}" 2>/dev/null || true; done
 }
@@ -122,15 +127,26 @@ set -e
 # exit non-zero so the platform recreates the machine.
 term
 wait 2>/dev/null || true
-# Distinguish a SIGNAL-initiated stop from a crash. Both take the container
-# down, but only one of them is news: a normal `fly deploy` sends SIGTERM, the
-# children exit 143 (128 + 15), and this line used to report that in the same
-# words as an actual failure — so anyone alerting on the string paged on every
-# deploy. A shell reports a signalled child as 128 + signum.
-if [ "${first_status}" -gt 128 ]; then
-	echo "[entrypoint] a supervised process was signalled (status ${first_status}, signal $((first_status - 128))); shutting down container normally" 1>&2
+# Distinguish a stop WE were asked to make from a child dying on its own. Both
+# take the container down, but only one is news: a normal `fly deploy` sends
+# SIGTERM, the children exit 143, and this line used to report that in the same
+# words as a real failure — so anyone alerting on the string paged on every
+# deploy.
+#
+# The test is `${stopping}`, NOT "the status looks like a signal". A shell
+# reports ANY signalled child as 128 + signum, so `status > 128` also covers 137
+# (SIGKILL — the OOM killer, which on a 512 MB box is a leading failure mode) and
+# 139 (SIGSEGV) and 134 (abort). Calling those "normal" would hide exactly the
+# crashes this line exists to surface — the inverse of the problem being fixed.
+# Only the trap can attest that the stop was requested.
+if [ "${stopping}" -eq 1 ]; then
+    echo "[entrypoint] stop requested (child status ${first_status}); shutting down container normally" 1>&2
 else
-	echo "[entrypoint] a supervised process CRASHED (exit ${first_status}); shutting down container" 1>&2
+    if [ "${first_status}" -gt 128 ]; then
+        echo "[entrypoint] a supervised process was KILLED by signal $((first_status - 128)) (status ${first_status}); shutting down container" 1>&2
+    else
+        echo "[entrypoint] a supervised process CRASHED (exit ${first_status}); shutting down container" 1>&2
+    fi
 fi
 exit "${first_status}"
 

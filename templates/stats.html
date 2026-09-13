@@ -65,6 +65,8 @@
                 <strong>paused</strong> — the cache is at its size limit
               {% else if fetching == "off" %}
                 <strong>off</strong> — the poller is not running on this instance
+              {% else if fetching == "stale" %}
+                <strong>stalled</strong> — the poller has not completed a round in some time
               {% else if fetching == "starting" %}
                 starting — no poll has finished since this instance booted
               {% else %}
@@ -109,7 +111,9 @@
         protects the disk; nothing new arrives until the retention sweep frees
         space. <em>Off</em> means the poller is not running here at all, and
         <em>starting</em> means it has not finished a round since this instance
-        booted. Reading, searching and everything already cached keep working in
+        booted. <em>Stalled</em> means the poller is running but has not finished
+        a round in far longer than it should — the one state where the numbers
+        above keep looking plausible while nothing behind them moves. Reading, searching and everything already cached keep working in
         every case — but every other number on this page will drift while this
         row says anything but <em>running</em>, and this row is the reason.
       </p>
