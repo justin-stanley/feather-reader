@@ -9108,4 +9108,76 @@ mod tests {
         // And the neighbours still are.
         assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
     }
+
+    /// **#117 — signing out strands whatever read-state had not flushed yet.**
+    ///
+    /// `logout` removes the app session and calls `revoke_everywhere`, which
+    /// deletes the `oauth_session` row unconditionally. Nothing flushes pending
+    /// read-state first, and nothing clears the `dirty` flags that can no longer
+    /// be acted on. The cursor is then orphaned: the scheduler re-attempts it
+    /// every 60s forever with `no OAuth session for <did>`, and the reads it
+    /// holds never reach the user's PDS.
+    ///
+    /// This is one of the two candidate sequences for the production incident.
+    /// It is proven reachable here; the other (a dirty cursor written while no
+    /// session exists) is a separate question.
+    #[tokio::test]
+    async fn signing_out_strands_unflushed_read_state() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let state = test_state(&[]).await;
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        crate::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &crate::oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Unflushed reads, exactly as a mark-read leaves them.
+        crate::store::upsert_cursor(
+            &state.db,
+            &crate::store::ReadCursor {
+                did: did.to_string(),
+                feed_url: "https://example.com/feed.xml".into(),
+                read_through: None,
+                read_ids: "[\"1\"]".into(),
+                unread_ids: "[]".into(),
+                dirty: true,
+                pds_created: false,
+                updated_at: "2026-09-13T21:22:40Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        revoke_everywhere(&state, did).await;
+
+        assert!(
+            crate::oauth::store::get_session(&state.db, &runtime.codec, did)
+                .await
+                .unwrap()
+                .is_none(),
+            "fixture assumption: sign-out deletes the session",
+        );
+        let stranded = crate::store::dirty_cursors(&state.db, did).await.unwrap();
+        assert_eq!(
+            stranded.len(),
+            1,
+            "the dirty cursor was neither flushed nor cleared; it is now \
+             unflushable and will be retried forever",
+        );
+    }
 }
