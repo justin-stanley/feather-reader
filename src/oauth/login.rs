@@ -53,7 +53,8 @@ pub async fn start(
         .await
         .with_context(|| format!("resolving {subject:?}"))?;
 
-    let server = discovery::discover(http, &account.pds_url, runtime.auth_method.as_str())
+    // No prior issuer: this IS the login that establishes one.
+    let server = discovery::discover(http, &account.pds_url, runtime.auth_method.as_str(), None)
         .await
         .with_context(|| {
             format!(
@@ -193,7 +194,13 @@ pub async fn complete(
         );
     }
 
-    let server = discovery::discover(http, &pending.pds_url, auth_method.as_str()).await?;
+    let server = discovery::discover(
+        http,
+        &pending.pds_url,
+        auth_method.as_str(),
+        Some(&pending.issuer),
+    )
+    .await?;
 
     // **The re-discovered issuer must be the one PAR was pushed under.**
     //
@@ -211,10 +218,6 @@ pub async fn complete(
     // `store.rs` names this exact threat as the reason `issuer` is AAD-bound.
     // The AAD protects the column from local tampering; only this protects it
     // from a network re-read.
-    // Shared with the refresh path so the two cannot disagree about what
-    // "same authorization server" means, and so it is testable — see
-    // `session::same_issuer`.
-    super::session::same_issuer(&server.issuer, &pending.issuer)?;
     let mut token_params =
         token::token_request_params(&code, &pending.redirect_uri, &pending.pkce_verifier);
     let assertion = client_assertion(runtime, auth_method, &pending.issuer, now)?;

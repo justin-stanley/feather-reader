@@ -229,6 +229,21 @@ CREATE TABLE IF NOT EXISTS entry_state (
     PRIMARY KEY (did, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state_did_read ON entry_state (did, read);
+-- The FK child key. `entry_id` is the TRAILING column of the primary key, so
+-- without this index it is not the leading column of anything and SQLite must
+-- FULL SCAN entry_state for EVERY row deleted from `entries` to service
+-- ON DELETE CASCADE.
+--
+-- That is not theoretical. Measured on 600k entry_state rows: 500 deletes took
+-- 10.3s and 2,000 took 38.3s, against a busy_timeout of 5s — so any retention
+-- sweep removing more than roughly 260 entries made every concurrent writer
+-- (star, mark-read, OAuth session write) fail with SQLITE_BUSY. With this index
+-- the same 32,850-row delete goes from ~10 minutes to 0.7s.
+--
+-- It also fixes the per-feed trim, whose starred-sparing subquery scans
+-- entry_state on every poll of every feed and scales with TOTAL rows across all
+-- users rather than with the feed being trimmed (2ms -> 21ms at 1M rows).
+CREATE INDEX IF NOT EXISTS idx_entry_state_entry_id ON entry_state (entry_id);
 
 -- Per-DID subscription projection. The shared `feeds`/`entries` cache is
 -- deduped by URL and NOT owned by any single DID; `sub_ref` records which
@@ -519,6 +534,22 @@ async fn ensure_column(
 
 /// Insert a feed by URL, or update its metadata if the URL already exists.
 /// Returns the feed's row id (existing or newly assigned).
+///
+/// EVERY updatable column is COALESCE'd, so `None` means "leave alone" for all
+/// of them and a partial upsert cannot clobber a field it never mentioned.
+///
+/// `etag`/`last_modified` were the exception until now, and the exception was
+/// silently disabling conditional GET for the entire instance. `set_next_poll`
+/// in the scheduler supplies only `url` + `next_poll` after every single poll,
+/// which wrote both validators back to NULL — so `304 Not Modified` was
+/// unreachable and every feed was re-downloaded, re-parsed, re-sanitised and
+/// re-inserted in full, hourly, forever. `feed::touch_polled` had discovered the
+/// same trap earlier and worked around it in its own caller by re-reading the
+/// row first; that local fix is what let the next caller walk into it.
+///
+/// A stale validator is not a hazard: if the origin no longer issues one it
+/// ignores our `If-None-Match` and returns `200`, and if it still matches then
+/// `304` was the correct answer anyway.
 pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     let row = sqlx::query(
         r#"
@@ -527,8 +558,8 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
         ON CONFLICT (url) DO UPDATE SET
             title         = COALESCE(excluded.title, feeds.title),
             site_url      = COALESCE(excluded.site_url, feeds.site_url),
-            etag          = excluded.etag,
-            last_modified = excluded.last_modified,
+            etag          = COALESCE(excluded.etag, feeds.etag),
+            last_modified = COALESCE(excluded.last_modified, feeds.last_modified),
             last_polled   = COALESCE(excluded.last_polled, feeds.last_polled),
             next_poll     = COALESCE(excluded.next_poll, feeds.next_poll)
         RETURNING id
@@ -774,6 +805,9 @@ pub async fn insert_entries(
     // evicted first — otherwise a feed of undated items would trim its freshest
     // rows. This bounds a single firehose/misbehaving feed's storage footprint
     // independent of the global retention sweep. `<= 0` disables it.
+    //
+    // The bound is `2 * max_entries_per_feed`, not `max_entries_per_feed`: the
+    // newest N by date, plus up to N starred. See the sparing subquery below.
     if max_entries_per_feed > 0 {
         sqlx::query(
             r#"
@@ -792,7 +826,30 @@ pub async fn insert_entries(
               -- path, which runs on every poll of every feed rather than daily,
               -- the main producer of the very "starred but not cached" case the
               -- saved-record rendering exists to paper over.
-              AND id NOT IN (SELECT entry_id FROM entry_state WHERE starred = 1)
+              --
+              -- The sparing is BOUNDED and SCOPED, and both matter:
+              --
+              -- Bounded, because the first version spared every starred row
+              -- without limit, which did not weaken the cap so much as remove
+              -- it — measured at cap=5 with 50 starred rows, 55 survived, 11x
+              -- the cap. That is the same unbounded-sparing mistake the
+              -- retention hard ceiling was added to fix, reintroduced in the
+              -- other sweep. Worst case is now cap + cap.
+              --
+              -- Scoped, because `SELECT entry_id FROM entry_state WHERE
+              -- starred = 1` reads EVERY starred row on the instance, for every
+              -- poll of every feed — cost scaling with total users rather than
+              -- with the feed being trimmed.
+              AND id NOT IN (
+                  SELECT e2.id FROM entries e2
+                  WHERE e2.feed_id = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM entry_state s
+                        WHERE s.entry_id = e2.id AND s.starred = 1
+                    )
+                  ORDER BY COALESCE(e2.published, e2.fetched_at) DESC, e2.id DESC
+                  LIMIT ?2
+              )
             "#,
         )
         .bind(feed_id)
@@ -871,8 +928,36 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     }
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let hard_cutoff = (chrono::Utc::now() - chrono::Duration::days(hard_days.max(days)))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // The ceiling only means anything if it is STRICTLY OLDER than the window.
+    // At `hard_days <= days` the two cutoffs coincide, and since the hard delete
+    // spares nothing, it would delete exactly the rows the soft delete exists to
+    // spare — turning the whole starred/unread exception into a no-op.
+    //
+    // This used to be `hard_days.max(days)`, which clamps the wrong way: it made
+    // `0` — the value an operator reaches for to turn a ceiling OFF, and the
+    // documented "disabled" value for `RETENTION_DAYS` one line above it in the
+    // same table — the single most destructive setting available, silently
+    // purging starred and unread entries at the soft window. Measured: with
+    // `days=14`, `hard=0` deleted a 30-day starred entry and a 30-day unread one.
+    //
+    // `<= 0` now means disabled, consistently with `days`. A contradictory
+    // positive value is refused rather than reinterpreted downward.
+    let hard_cutoff = if hard_days > days {
+        Some(
+            (chrono::Utc::now() - chrono::Duration::days(hard_days))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    } else {
+        if hard_days > 0 {
+            tracing::warn!(
+                hard_days,
+                days,
+                "retention hard ceiling is not older than the retention window; \
+                 ignoring it — set it above the window or to 0 to disable"
+            );
+        }
+        None
+    };
 
     let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
 
@@ -895,13 +980,32 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     // whose entry is gone renders from the PDS record as a link card, so the
     // reader keeps the article's identity even when the cache does not keep its
     // text.
-    let hard = sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
-        .bind(&hard_cutoff)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("prune_old_entries hard ceiling (cutoff {hard_cutoff})"))?;
-    let hard_deleted = hard.rows_affected();
-    // **Starred and unread entries are kept, whatever their age.**
+    let hard_deleted = match &hard_cutoff {
+        Some(cutoff) => {
+            sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("prune_old_entries hard ceiling (cutoff {cutoff})"))?
+                .rows_affected()
+        }
+        None => 0,
+    };
+    // **Entries a reader has DELIBERATELY marked are kept, whatever their age.**
+    //
+    // Precisely: an entry is spared when some DID has an `entry_state` row for
+    // it with `starred = 1` or `read = 0`. An entry nobody has ever touched has
+    // no `entry_state` row at all and is NOT spared, even though every read path
+    // treats "no row" as unread.
+    //
+    // That asymmetry is deliberate and load-bearing. Sparing every never-touched
+    // entry would spare essentially the whole table — almost no entry is ever
+    // interacted with — which would make the window a no-op and leave the hard
+    // ceiling as the only bound. The window is for evicting cache nobody claimed;
+    // the exception is for the things a reader acted on.
+    //
+    // This comment used to read "starred and unread entries are kept", which is
+    // the reading that would motivate exactly that change.
     //
     // The window is a cache eviction policy, not a data-retention policy. The
     // PDS is the source of truth for what a reader CHOSE — subscriptions,
@@ -2297,6 +2401,168 @@ fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A partial upsert must not erase the conditional-GET validators.
+    ///
+    /// `set_next_poll` supplies only `url` + `next_poll` and runs after EVERY
+    /// poll of EVERY feed. While `upsert_feed` assigned etag/last_modified
+    /// unconditionally, that call wrote both back to NULL, so `If-None-Match`
+    /// was never sent, `304` was unreachable, and every feed was re-downloaded
+    /// and re-parsed in full on every cycle. Nothing failed; it was invisible.
+    #[tokio::test]
+    async fn validators_survive_a_partial_upsert() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://example.com/feed.xml";
+
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                etag: Some("\"abc123\"".to_string()),
+                last_modified: Some("Wed, 01 Jan 2026 00:00:00 GMT".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Exactly what `scheduler::set_next_poll` sends.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                next_poll: Some("2026-07-12T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let feed = get_feed_by_url(&pool, url).await?.expect("feed");
+        assert_eq!(
+            feed.etag.as_deref(),
+            Some("\"abc123\""),
+            "a partial upsert erased the ETag, disabling conditional GET"
+        );
+        assert_eq!(
+            feed.last_modified.as_deref(),
+            Some("Wed, 01 Jan 2026 00:00:00 GMT"),
+            "a partial upsert erased Last-Modified"
+        );
+        assert_eq!(feed.next_poll.as_deref(), Some("2026-07-12T00:00:00Z"));
+        Ok(())
+    }
+
+    /// A hard ceiling that is not strictly older than the window is IGNORED.
+    ///
+    /// `hard_days.max(days)` made `0` — the obvious "off" value, and the
+    /// documented disable value for `RETENTION_DAYS` — collapse the ceiling onto
+    /// the soft window, where the delete spares nothing. The starred and unread
+    /// rows the window exists to protect were purged at `retention_days`.
+    #[tokio::test]
+    async fn a_ceiling_inside_the_window_is_ignored_not_applied() -> Result<()> {
+        for hard in [0_i64, 1, 7, 14] {
+            let pool = init_url("sqlite::memory:").await?;
+            let feed_id = upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: "https://example.com/f.xml".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let old = (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            insert_entries(
+                &pool,
+                feed_id,
+                &[
+                    NewEntry {
+                        guid: "starred-30d".to_string(),
+                        published: Some(old.clone()),
+                        ..Default::default()
+                    },
+                    NewEntry {
+                        guid: "unread-30d".to_string(),
+                        published: Some(old.clone()),
+                        ..Default::default()
+                    },
+                ],
+                0,
+            )
+            .await?;
+            // Both need an explicit `entry_state` row: sparing keys off a
+            // DELIBERATE mark, and an entry with no row at all is unclaimed
+            // cache that the window is supposed to evict.
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+                 SELECT 'did:plc:x', id, 1, 1, '2026-01-01T00:00:00Z'
+                 FROM entries WHERE guid = 'starred-30d'",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+                 SELECT 'did:plc:x', id, 0, 0, '2026-01-01T00:00:00Z'
+                 FROM entries WHERE guid = 'unread-30d'",
+            )
+            .execute(&pool)
+            .await?;
+
+            prune_old_entries(&pool, 14, hard).await?;
+
+            let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(
+                left, 2,
+                "hard_days={hard} destroyed starred/unread rows at the soft window"
+            );
+        }
+        Ok(())
+    }
+
+    /// Starred sparing must not remove the per-feed cap.
+    ///
+    /// The first version spared every starred row without limit: at cap=5 with
+    /// 50 starred entries, 55 survived — 11x the cap, i.e. no cap at all.
+    #[tokio::test]
+    async fn per_feed_trim_stays_bounded_when_everything_is_starred() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..100)
+            .map(|i| NewEntry {
+                guid: format!("g-{i}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+             SELECT 'did:plc:x', id, 0, 1, '2026-01-01T00:00:00Z'
+             FROM entries LIMIT 50",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Re-run the trim with cap = 5.
+        insert_entries(&pool, feed_id, &[], 5).await?;
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await?;
+        assert!(
+            left <= 10,
+            "per-feed trim kept {left} rows for a cap of 5; sparing removed the bound"
+        );
+        Ok(())
+    }
 
     /// Init an in-memory SQLite, insert a feed + entries, read them back.
     #[tokio::test]

@@ -322,20 +322,43 @@ fn static_header_layer(
 // ---------------------------------------------------------------------------
 
 /// The abuse-prone paths the rate limiter guards (429 over the limit): the OAuth
-/// kick-off, the invite redeem, the mutating write endpoints, and mark-read/star
-/// /mark-all. Read-only navigation is intentionally *not* limited.
+/// kick-off and callback, the invite redeem, logout, the mutating write
+/// endpoints, and mark-read/star/mark-all. Plain read-only navigation is
+/// intentionally *not* limited.
+///
+/// The criterion is **does this path make an outbound request**, not "does it
+/// mutate" — the two diverge, and every miss so far has been on the outbound
+/// side. This is an allowlist a new route has to be added to by hand, which is
+/// exactly why it has now been missed three times: `/saved/` (fixed), then
+/// `/oauth/callback` and `/logout`. The callback was the bad one — it is the
+/// only path here reachable with no session at all.
+///
+/// Known and deliberate gaps: `GET /`, `GET /manage` and `GET /opml/export` each
+/// make PDS calls but are ordinary authenticated navigation, and throttling them
+/// would degrade normal reading. They are bounded by needing a valid session.
 fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
     use axum::http::Method;
     // `/claim` is a GET (a link the bot posts), but it consumes a reservation and
     // a claim token in a public URL is grabbable, so it MUST be per-IP limited
     // like the other abuse-prone entry points — not just `/login`.
-    if method != Method::POST && !(method == Method::GET && (path == "/login" || path == "/claim"))
+    // `/oauth/callback` is a GET, is UNAUTHENTICATED, and every hit performs a
+    // real outbound round-trip — a sidecar `resolve_session` or a full token
+    // exchange against a PDS. Anyone could spend one outbound request per hit.
+    // It is the only entry point here that needs no session at all.
+    if method != Method::POST
+        && !(method == Method::GET
+            && (path == "/login" || path == "/claim" || path == "/oauth/callback"))
     {
         return false;
     }
     match path {
-        "/login" | "/claim" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all"
-        | "/admin/invites" | "/bot/claims" | "/account/delete" | "/folders" => true,
+        // `/logout` and `/oauth/callback` are here because they make outbound
+        // calls, not because they mutate: logout revokes at the PDS (up to two
+        // round-trips) and the callback exchanges a code. The list is by
+        // *network cost*, which is what the limiter is actually for.
+        "/login" | "/claim" | "/oauth/callback" | "/logout" | "/beta/redeem" | "/subscriptions"
+        | "/opml" | "/read-all" | "/admin/invites" | "/bot/claims" | "/account/delete"
+        | "/folders" => true,
         // Every per-record subscription/folder mutation (delete/rename) and the
         // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
         p => {
@@ -1168,6 +1191,30 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
         let feed = match store::get_feed_by_url(pool, &sub.url).await {
             Ok(Some(f)) => Some(f),
             Ok(None) => {
+                // `sub.url` came out of an atproto record. The lexicon is open —
+                // ANY client can write a subscription into a user's repo — so
+                // this is untrusted input on the hot path of `GET /`, and it was
+                // being stored with none of the three checks the add and import
+                // paths apply. Two of those are capacity ceilings; this one is
+                // the invariant in `FeedPrivacy`'s doc comment, which promises a
+                // private feed URL is "never stored". Writing a
+                // `…/feed/private/<token>` into the SHARED `feeds` table breaks
+                // that promise even though `net::guarded_get` still refuses to
+                // fetch it.
+                if !feed::is_storable_feed_url(&sub.url)
+                    || feed::classify_feed_privacy(&sub.url).is_private()
+                {
+                    warn!(
+                        %did,
+                        "skipping cache row for a subscription URL that is private or not http(s)"
+                    );
+                    out.push(ResolvedSub {
+                        rkey,
+                        sub,
+                        feed: None,
+                    });
+                    continue;
+                }
                 // Upsert a cache row so the sidebar reflects the real follow-list.
                 let _ = store::upsert_feed(
                     pool,
@@ -3837,6 +3884,17 @@ async fn import_opml(
     let mut subs = Vec::with_capacity(feeds.len());
     let mut skipped_private: Vec<String> = Vec::new();
     for f in &feeds {
+        // `xmlUrl` is whatever the uploaded file says, and nothing on this path
+        // ever parsed it — the single-add path can't reach here because
+        // `resolve_feed_url` must parse AND successfully fetch first. So
+        // `javascript:alert(1)` and `file:///etc/passwd` were both accepted,
+        // cached, and published as records to the user's PUBLIC repo. Note that
+        // `classify_feed_privacy` does not catch these: both parse cleanly, and
+        // it returns `Public` for anything unparseable by design.
+        if !feed::is_storable_feed_url(&f.feed_url) {
+            info!(%did, "skipped an OPML entry whose xmlUrl is not an http(s) URL");
+            continue;
+        }
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
             info!(feed = %f.feed_url, %reason, %did, "skipped private/paid feed on OPML import (not stored)");
             // Report by title where we have one, else the (public-safe) host.

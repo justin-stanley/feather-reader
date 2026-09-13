@@ -84,7 +84,9 @@ impl RefreshLocks {
     /// Acquire the lock for one subject. Unrelated subjects never contend.
     pub async fn lock(&self, sub: &str) -> OwnedMutexGuard<()> {
         let entry = {
-            let mut locks = self.locks.lock().expect("refresh lock map poisoned");
+            // Recover rather than panic: this gates every token refresh, so a
+            // poisoned lock here would lock every user out until a restart.
+            let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
             Arc::clone(locks.entry(sub.to_string()).or_default())
         };
         entry.lock_owned().await

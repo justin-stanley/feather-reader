@@ -149,14 +149,18 @@ impl RepoMetrics {
 
     /// Record one call: into the live window, and into the write buffer.
     pub fn record(&self, backend: Backend, op: &'static str, micros: u64, ok: bool) {
+        // Same reasoning as the pinned-client cache: this is on the repo-call
+        // hot path, so panicking on a poisoned lock would convert one panic
+        // anywhere into a permanently broken instance. Metrics are the least
+        // important thing here and must never be the thing that kills it.
         self.stats
             .lock()
-            .expect("metrics table poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .entry((backend, op))
             .or_default()
             .record(micros, ok);
 
-        let mut pending = self.pending.lock().expect("metrics buffer poisoned");
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if pending.len() >= MAX_PENDING {
             pending.remove(0);
         }
@@ -173,7 +177,7 @@ impl RepoMetrics {
     /// Only ever one backend's rows, since a flip is a restart. Use
     /// [`persisted_rows`] for the cross-flip comparison.
     pub fn snapshot(&self) -> Vec<Row> {
-        let stats = self.stats.lock().expect("metrics table poisoned");
+        let stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows: Vec<Row> = stats
             .iter()
             .map(|((backend, op), stats)| Row {
@@ -188,7 +192,7 @@ impl RepoMetrics {
 
     /// Take everything buffered, leaving the buffer empty.
     fn drain(&self) -> Vec<Sample> {
-        std::mem::take(&mut *self.pending.lock().expect("metrics buffer poisoned"))
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 

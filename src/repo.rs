@@ -71,9 +71,16 @@ impl Repo<'_> {
         // re-reads under the subject lock, so a concurrent refresh that lands
         // between the check above and the lock below is handled there rather
         // than here.
-        let server =
-            oauth::discovery::discover(&self.state.http, &session.aud, rust.auth_method.as_str())
-                .await?;
+        let server = oauth::discovery::discover(
+            &self.state.http,
+            &session.aud,
+            rust.auth_method.as_str(),
+            // The grant's own issuer. Checked inside `discover` now, so no
+            // caller can omit it — this one and the callback remembered, and
+            // revocation did not.
+            Some(&session.issuer),
+        )
+        .await?;
 
         // **The re-discovered issuer must be the one this session was issued
         // by.** This is the worse of the two instances of the same hole: the
@@ -87,9 +94,6 @@ impl Repo<'_> {
         // column from local tampering, and only this protects it from a network
         // re-read.
         //
-        // The comparison lives in `oauth::session::same_issuer` so it can be
-        // tested: inline, deleting this whole block passed the entire suite.
-        oauth::session::same_issuer(&server.issuer, &session.issuer)?;
 
         let ctx = oauth::session::RefreshContext {
             token_endpoint: &server.token_endpoint,

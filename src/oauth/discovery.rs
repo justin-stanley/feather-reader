@@ -45,10 +45,20 @@ pub struct AuthorizationServer {
 /// is then required to agree — an authorization server that claims a different
 /// issuer than the one that pointed at it is the mix-up attack RFC 9207 exists
 /// for.
+///
+/// `expected_issuer` is a REQUIRED parameter, not an optional one, and that is
+/// the point.
+///
+/// The check it performs — that the re-discovered issuer is the one a grant
+/// already belongs to — was a free function every caller had to remember. It was
+/// applied to the callback and the refresh paths and forgotten on revocation,
+/// where the body carries the REFRESH TOKEN. A caller with no prior issuer must
+/// now say so explicitly with `None`, which cannot be done by accident.
 pub async fn discover(
     http: &reqwest::Client,
     pds_url: &str,
     auth_method: &str,
+    expected_issuer: Option<&str>,
 ) -> Result<AuthorizationServer> {
     discover_with(
         |url| async move {
@@ -58,6 +68,7 @@ pub async fn discover(
         },
         pds_url,
         auth_method,
+        expected_issuer,
     )
     .await
 }
@@ -78,6 +89,7 @@ pub async fn discover_with<F, Fut>(
     fetch: F,
     pds_url: &str,
     auth_method: &str,
+    expected_issuer: Option<&str>,
 ) -> Result<AuthorizationServer>
 where
     F: Fn(String) -> Fut,
@@ -91,7 +103,16 @@ where
     let asm_url = authorization_server_url(&issuer);
     let asm = fetch(asm_url.clone()).await?;
 
-    resolve_documents(&prm, &asm, &asm_url, pds_url, auth_method)
+    let server = resolve_documents(&prm, &asm, &asm_url, pds_url, auth_method)?;
+
+    // Enforced HERE rather than in `discover` so it is reachable with an
+    // injected fetch. Putting it in `discover` would have made the check
+    // untestable for exactly the reason this module was split up in the first
+    // place: `discover` needs a network, and the SSRF guard rejects loopback.
+    if let Some(expected) = expected_issuer {
+        super::session::same_issuer(&server.issuer, expected)?;
+    }
+    Ok(server)
 }
 
 /// Where a PDS's protected-resource document lives.
@@ -1027,7 +1048,7 @@ mod tests {
             (&authorization_server_url(ISS), as_metadata()),
         ]);
 
-        let server = discover_with(|url| fetcher.get(url), PDS, "none")
+        let server = discover_with(|url| fetcher.get(url), PDS, "none", None)
             .await
             .expect("the honest pair must resolve");
         assert_eq!(server.issuer, ISS);
@@ -1039,6 +1060,58 @@ mod tests {
                 authorization_server_url(ISS),
             ],
             "discovery asked for the wrong locations, or in the wrong order"
+        );
+    }
+
+    /// A PDS that repoints an EXISTING grant at a new authorization server is
+    /// refused — the check the revocation path did not have.
+    ///
+    /// Every other validation passes here: the pair is entirely self-consistent,
+    /// `resource` equals the PDS origin, exactly one AS is named, and the
+    /// metadata's `issuer` matches the location it was served from. The only
+    /// thing wrong is that it is not the issuer the grant belongs to, and the
+    /// only check that notices is this one.
+    ///
+    /// Why it mattered most on revocation: `revoke_params` prefers the REFRESH
+    /// token, and `bounded_then_delete` drops the local row whether or not the
+    /// revocation succeeded — so a repointed PDS would receive the refresh token
+    /// while the real authorization server was never told, leaving a live grant
+    /// that the app can no longer revoke. "Sign out everywhere" would silently
+    /// mean the opposite.
+    #[tokio::test]
+    async fn a_repointed_pds_cannot_move_an_existing_grant() {
+        // A FULLY self-consistent impostor: the attacker hosts every endpoint on
+        // its own origin, which is what the co-location check requires. Moving
+        // only `issuer` would be caught by a different check and would prove
+        // nothing about this one.
+        let attacker = "https://as.attacker.example";
+        let mut moved = as_metadata();
+        moved["issuer"] = json!(attacker);
+        moved["pushed_authorization_request_endpoint"] = json!(format!("{attacker}/par"));
+        moved["authorization_endpoint"] = json!(format!("{attacker}/authorize"));
+        moved["token_endpoint"] = json!(format!("{attacker}/token"));
+        moved["revocation_endpoint"] = json!(format!("{attacker}/revoke"));
+
+        let fetcher = Fetcher::new(&[
+            (
+                &protected_resource_url(PDS).unwrap(),
+                json!({ "resource": PDS, "authorization_servers": [attacker] }),
+            ),
+            (&authorization_server_url(attacker), moved),
+        ]);
+
+        // Sanity: with no prior issuer (a first login) this pair is legitimate.
+        discover_with(|url| fetcher.get(url), PDS, "none", None)
+            .await
+            .expect("a self-consistent pair must resolve when there is no grant yet");
+
+        let err = discover_with(|url| fetcher.get(url), PDS, "none", Some(ISS))
+            .await
+            .expect_err("a grant issued by ISS must not follow the PDS to a new issuer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(ISS) || msg.contains(attacker),
+            "the error should name the issuers it compared, got: {msg}"
         );
     }
 
@@ -1061,7 +1134,7 @@ mod tests {
             (&authorization_server_url(ISS), impostor),
         ]);
 
-        let err = match discover_with(|url| fetcher.get(url), PDS, "none").await {
+        let err = match discover_with(|url| fetcher.get(url), PDS, "none", None).await {
             Err(err) => err,
             Ok(_) => panic!("a document claiming a different issuer was accepted"),
         };
@@ -1077,13 +1150,13 @@ mod tests {
             &protected_resource_url(PDS).unwrap(),
             json!({ "resource": PDS, "authorization_servers": [ISS] }),
         )]);
-        assert!(discover_with(|url| fetcher.get(url), PDS, "none")
+        assert!(discover_with(|url| fetcher.get(url), PDS, "none", None)
             .await
             .is_err());
 
         // Neither exists.
         let empty = Fetcher::new(&[]);
-        assert!(discover_with(|url| empty.get(url), PDS, "none")
+        assert!(discover_with(|url| empty.get(url), PDS, "none", None)
             .await
             .is_err());
     }

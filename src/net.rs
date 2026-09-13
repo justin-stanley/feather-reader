@@ -213,7 +213,12 @@ impl PinnedClients {
     /// address is unchanged and the entry is fresh.
     fn get(&self, host: &str, addr: SocketAddr, now: Instant) -> Result<Client> {
         let key = (host.to_string(), addr);
-        let mut entries = self.entries.lock().expect("pinned client cache poisoned");
+        // A poisoned lock here is NOT fatal and must not be treated as fatal: the
+        // guard is held across a fallible builder, so one panic inside it would
+        // otherwise make EVERY subsequent outbound request panic, forever, with a
+        // live-looking process and a green /health. Recover the data like the rate
+        // limiter already does — a torn entry is a cache entry, worst case a rebuild.
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
 
         if let Some((client, last_used)) = entries.get_mut(&key) {
             if now.duration_since(*last_used) < PINNED_CLIENT_TTL {

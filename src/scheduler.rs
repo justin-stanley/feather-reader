@@ -421,7 +421,11 @@ async fn set_next_poll(pool: &Pool, url: &str, delay: Duration) -> anyhow::Resul
         + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
     let next_poll = next.to_rfc3339_opts(SecondsFormat::Secs, true);
     // upsert_feed COALESCEs unset fields, so supplying only url + next_poll bumps
-    // the schedule without clobbering title/validators/last_polled.
+    // the schedule without clobbering title/validators/last_polled. That claim
+    // was false when it was written — etag and last_modified were assigned
+    // unconditionally, so this call, which runs after EVERY poll of EVERY feed,
+    // erased both and made conditional GET dead code instance-wide. The store
+    // now COALESCEs them; `validators_survive_a_partial_upsert` pins it.
     let nf = store::NewFeed {
         url: url.to_string(),
         next_poll: Some(next_poll),

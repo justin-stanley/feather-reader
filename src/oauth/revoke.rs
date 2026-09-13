@@ -249,7 +249,18 @@ pub async fn sign_out_discovering(
     // is what independently bounding each phase costs.
     let endpoint = match tokio::time::timeout(
         REVOKE_DEADLINE,
-        super::discovery::discover(http, &session.aud, runtime.auth_method.as_str()),
+        // **The missed sibling.** This posts the REFRESH TOKEN to whatever
+        // `revocation_endpoint` comes back, and had no issuer check at all —
+        // while the callback and refresh paths both had one, and the comment
+        // that added them counted "the two instances" of a hole that had three.
+        // A repointed PDS could take the refresh token AND leave the real grant
+        // live, because the local row is deleted either way.
+        super::discovery::discover(
+            http,
+            &session.aud,
+            runtime.auth_method.as_str(),
+            Some(&session.issuer),
+        ),
     )
     .await
     {
