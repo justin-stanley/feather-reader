@@ -74,6 +74,44 @@ case "${backend}" in
         ;;
 esac
 
+# --- Origin lock secret ---------------------------------------------------
+# Caddy refuses every non-/health request whose `X-Origin-Auth` does not equal
+# this value, which is what makes `cf-connecting-ip` trustworthy for rate
+# limiting. It is checked HERE, before anything starts, because the failure modes
+# are otherwise silent:
+#
+#   * UNSET — Caddy compares against "" and 403s all real traffic, so the app
+#     looks comprehensively broken with nothing in the logs saying why. Worse,
+#     until the `@empty_origin_value` guard was added, a request sending the
+#     header with an EMPTY value was admitted: the lock failed OPEN.
+#   * CONTAINS `*` — Caddy's header matcher treats `*` as a glob, so a secret
+#     ending in one accepts every header sharing the prefix. Nothing warns; the
+#     lock just silently stops being a lock. `openssl rand -hex|-base64` cannot
+#     emit `*`, so this only bites a hand-picked value.
+#
+# This does NOT require Cloudflare specifically. Any trusted proxy in front may
+# inject the header — set this to a long random value and configure that proxy
+# to send it. What is not supported is running the supplied image with no
+# injecting proxy at all: Caddy would refuse everything and the app would appear
+# dead.
+if [ -z "${FEATHERREADER_ORIGIN_SECRET:-}" ]; then
+    echo "[entrypoint] FEATHERREADER_ORIGIN_SECRET is unset or empty." 1>&2
+    echo "[entrypoint] Caddy refuses every non-/health request without it, so the app" 1>&2
+    echo "[entrypoint] would boot and then serve 403 to all traffic. Set it to a long" 1>&2
+    echo "[entrypoint] random value (openssl rand -hex 32) and have your edge proxy send" 1>&2
+    echo "[entrypoint] it as the X-Origin-Auth header on every forwarded request." 1>&2
+    exit 64
+fi
+case "${FEATHERREADER_ORIGIN_SECRET}" in
+    *"*"*)
+        echo "[entrypoint] FEATHERREADER_ORIGIN_SECRET contains '*'." 1>&2
+        echo "[entrypoint] Caddy's header matcher treats '*' as a glob, so this value would" 1>&2
+        echo "[entrypoint] accept any header sharing its prefix — the lock silently stops" 1>&2
+        echo "[entrypoint] locking. Regenerate it with openssl rand -hex 32." 1>&2
+        exit 64
+        ;;
+esac
+
 # --- Rust app -------------------------------------------------------------
 # Runs from /app so its relative `ServeDir::new("static")` resolves /app/static.
 cd /app

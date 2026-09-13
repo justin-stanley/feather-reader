@@ -49,12 +49,72 @@
 		trusted_proxies static private_ranges
 	}
 	admin off
+
+	# **The redaction below must ALSO cover the error logger, not just the access
+	# log.** A site-level `log` directive configures only `http.log.access.*`.
+	# Errors during handling — every 502/503 from an upstream that is down, slow
+	# or restarting — are emitted by `http.log.error.*`, a DIFFERENT logger that
+	# inherits nothing from it and dumps the full request, headers and all.
+	#
+	# Measured, not assumed: with only the site-level filter in place, a request
+	# that failed upstream logged `"X-Origin-Auth":["<the secret>"]` verbatim from
+	# `http.log.error.log0` while `http.log.access.log0` correctly showed
+	# `REDACTED`. So the leak would have survived the fix, and would have fired on
+	# exactly the occasions an operator tails the logs — an outage.
+	# **Named, with `include http.log.error` — NOT a reconfigured `default`.** The
+	# adapter then adds `http.log.error` to `default`'s `exclude`, so there is no
+	# duplicate emission and `default` keeps its own writer and encoder.
+	#
+	# Reconfiguring `default` directly also redacted correctly, but it silently
+	# re-pointed EVERY runtime log line: stderr->stdout, JSON->console with raw
+	# ANSI colour embedded (measured 1 stdout / 15 stderr before, 17 / 0 after).
+	# Restating `default`'s real shape by hand fixes that only for as long as the
+	# restatement stays accurate. This form cannot drift out of sync with it.
+	log origin_errors {
+		output stderr
+		include http.log.error
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Origin-Auth replace REDACTED
+				request>headers>Cookie replace REDACTED
+			}
+		}
+	}
 }
 
 :8080 {
+	# **`X-Origin-Auth` must never reach the log.** It IS the origin lock — the
+	# shared secret Cloudflare injects and the matcher below compares against —
+	# and the console encoder writes every request header verbatim, so until this
+	# filter existed the secret appeared in full on EVERY access-log line. That
+	# put it in `fly logs`, in any log drain, and in the scrollback of anyone who
+	# ever tailed this app. A control whose key is published beside every request
+	# it guards is not a control.
+	#
+	# Caddy redacts the standard credential headers by default, which is exactly
+	# why this one slipped: `X-Origin-Auth` is a custom name, so nothing knew to
+	# treat it as a secret. `Cookie` is filtered here too rather than trusted to
+	# that default. Caddy's built-in redaction already covers `Cookie`,
+	# `Authorization`, `Proxy-Authorization` and `Set-Cookie`, as a literal
+	# `REDACTED` replacement rather than a hash — so this is belt-and-braces, not
+	# a fix. It uses `replace` to match that shape: `delete` drops the field
+	# entirely and loses the presence signal the next paragraph argues for.
+	#
+	# `replace`, not `delete`, for the origin header: it keeps the FIELD while
+	# losing the value, so a 403 still distinguishes "arrived without the header"
+	# (bypassed Cloudflare) from "arrived with the wrong one" (stale secret,
+	# mid-rotation). Deleting it would collapse those into the same log line, and
+	# they call for opposite responses.
 	log {
 		output stdout
-		format console
+		format filter {
+			wrap console
+			fields {
+				request>headers>X-Origin-Auth replace REDACTED
+				request>headers>Cookie replace REDACTED
+			}
+		}
 	}
 
 	# --- Origin lock: require Cloudflare's injected shared secret --------------
@@ -82,15 +142,39 @@
 	# exact code, so the backend name discloses nothing further. Anything outside
 	# that class must go behind the origin lock, not here.
 	#
-	# Placed FIRST so nothing below routes for a header-less request. If
-	# FEATHERREADER_ORIGIN_SECRET is unset the matcher value is empty and every
-	# non-/health request is refused — fail CLOSED (a missing secret locks the
-	# door rather than opening it).
+	# Placed FIRST so nothing below routes for a header-less request.
+	#
+	# This matcher alone does NOT fail closed, contrary to what this comment said
+	# for months: with the secret unset it compares against "", which an
+	# empty-valued header satisfies. The `@empty_origin_value` guard below is what
+	# actually makes a missing or mistyped secret lock the door.
 	@no_origin_secret {
 		not path /health
 		not header X-Origin-Auth {env.FEATHERREADER_ORIGIN_SECRET}
 	}
 	handle @no_origin_secret {
+		respond 403
+	}
+
+	# **An EMPTY header value is a third case, and it FAILED OPEN.**
+	#
+	# `not header X-Origin-Auth {env.FEATHERREADER_ORIGIN_SECRET}` expands to
+	# `not header X-Origin-Auth ""` when the secret is unset. An empty-valued
+	# header then MATCHES the empty expected value, `not` inverts it, the matcher
+	# above does not fire, and the request is proxied. Measured with the secret
+	# unset: no header -> 403, junk -> 403, but `X-Origin-Auth:` with no value
+	# -> **200**. The comment below claimed the opposite for months, and
+	# `oauth-sidecar/src/client-ip.ts` founds the whole `cf-connecting-ip` trust
+	# model on that claim.
+	#
+	# This makes the documented property true: an empty value is refused
+	# regardless of what the secret is, so a missing or mistyped
+	# FEATHERREADER_ORIGIN_SECRET locks the door rather than opening it.
+	@empty_origin_value {
+		not path /health
+		header_regexp X-Origin-Auth ^$
+	}
+	handle @empty_origin_value {
 		respond 403
 	}
 
@@ -126,7 +210,15 @@
 	# keys the rate limiter (not auth), so the residual risk if the lockdown lapses
 	# is rate-limit-bucket spoofing, not an auth bypass — but do the lockdown.
 	handle {
-		reverse_proxy 127.0.0.1:8082
+		reverse_proxy 127.0.0.1:8082 {
+			# The secret has done its job by here; no upstream reads it. Forwarding
+			# it means a future `RUST_LOG=debug`, or any header-dumping middleware,
+			# reopens exactly the leak this file closes. Repeated per proxy rather
+			# than one `request_header`, because that directive is ordered BEFORE
+			# `handle` and would strip the header before the lock's matcher reads
+			# it — disabling the lock outright.
+			header_up -X-Origin-Auth
+		}
 	}
 }
 

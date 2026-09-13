@@ -22,9 +22,23 @@
  *  - `cf-connecting-ip` is set by Cloudflare to the **true visitor**, with any
  *    client-supplied copy stripped at the edge. It is authoritative only because
  *    `deploy/Caddyfile` 403s any request lacking Cloudflare's injected
- *    `X-Origin-Auth` secret (and fails closed when that secret is unset), so a
- *    request reaching this sidecar provably transited Cloudflare. This is the
- *    value to configure for the deployed topology.
+ *    `X-Origin-Auth` secret, so a request reaching this sidecar provably
+ *    transited Cloudflare. This is the value to configure for the deployed
+ *    topology.
+ *
+ *    **This comment used to add "and fails closed when that secret is unset".
+ *    That was FALSE, and it is the kind of claim worth naming rather than
+ *    quietly deleting**, because the whole trust model above rests on it. With
+ *    the secret unset the matcher compared against `""`, which an EMPTY-valued
+ *    `X-Origin-Auth` satisfies — measured: no header 403, junk 403, but the
+ *    header sent empty was *admitted*. Anyone could then forge
+ *    `cf-connecting-ip` and the limiter keyed on whatever they chose.
+ *
+ *    It now holds, by two guards rather than by assertion: Caddy's
+ *    `@empty_origin_value` matcher refuses an empty value outright, and
+ *    `deploy/container-entrypoint.sh` refuses to boot at all when the secret is
+ *    unset, empty, or contains `*` (which Caddy's matcher would treat as a
+ *    glob). If either is removed, this paragraph becomes a lie again.
  *  - `fly-client-ip` is set by Fly to the peer **Fly** sees — behind Cloudflare
  *    that is the CF edge, not the visitor. Correct only where Fly is the
  *    outermost proxy.
