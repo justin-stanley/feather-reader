@@ -1365,7 +1365,16 @@ async fn index(
                     // see as a content-less entry.
                     if let Some(feed_url) = item.feed_url.as_deref() {
                         if subs.iter().any(|s| s.sub.url == feed_url) {
-                            if let Err(err) = store::mark_feed_due(pool, feed_url).await {
+                            // Bounded to one nudge per feed per poll interval —
+                            // see `mark_feed_due`. Unbounded, a reload loop here
+                            // becomes outbound amplification.
+                            let stale_before = (chrono::Utc::now()
+                                - chrono::Duration::from_std(state.config.poll_interval)
+                                    .unwrap_or_else(|_| chrono::Duration::hours(1)))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            if let Err(err) =
+                                store::mark_feed_due(pool, feed_url, &stale_before).await
+                            {
                                 tracing::debug!(%err, %feed_url, "could not nudge a feed for a saved article");
                             }
                         }

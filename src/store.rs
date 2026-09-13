@@ -814,13 +814,35 @@ pub async fn insert_entries(
 /// its own. Clearing `next_poll` is the whole mechanism — `due_feeds` treats
 /// NULL as due — so this adds no synthetic rows and no special-case fetch path.
 ///
+/// **Rate-limited by `not_polled_since`**, and that is not a nicety.
+///
+/// `due_feeds` treats a NULL `next_poll` as due immediately, so clearing it
+/// unconditionally from a page handler meant every reload of the starred view
+/// made those feeds due again — bypassing the poll interval entirely. That is
+/// outbound amplification against third-party feed origins, and it lets one
+/// reader's feeds monopolise a poll budget that is shared and already the
+/// binding constraint on how many readers an instance can serve.
+///
+/// A feed polled within the window is left alone: if the article was not in the
+/// feed a minute ago, another fetch now will not find it either. The nudge is
+/// therefore worth at most one extra poll per feed per interval, which is the
+/// cadence the poller already targets.
+///
 /// A no-op if the URL is not a known feed.
-pub async fn mark_feed_due(pool: &SqlitePool, feed_url: &str) -> Result<()> {
-    sqlx::query("UPDATE feeds SET next_poll = NULL WHERE url = ?1")
-        .bind(feed_url)
-        .execute(pool)
-        .await
-        .context("marking a feed due")?;
+pub async fn mark_feed_due(
+    pool: &SqlitePool,
+    feed_url: &str,
+    not_polled_since: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE feeds SET next_poll = NULL \
+         WHERE url = ?1 AND (last_polled IS NULL OR last_polled < ?2)",
+    )
+    .bind(feed_url)
+    .bind(not_polled_since)
+    .execute(pool)
+    .await
+    .context("marking a feed due")?;
     Ok(())
 }
 
@@ -4208,6 +4230,73 @@ mod tests {
         aged_entry(&pool, "untouched-old", 30).await;
         aged_entry(&pool, "untouched-new", 1).await;
         assert_eq!(prune_old_entries(&pool, 14).await?, 1);
+        Ok(())
+    }
+
+    /// **A recently-polled feed is NOT made due again.**
+    ///
+    /// `due_feeds` treats NULL as due immediately, so an unbounded nudge from a
+    /// page handler turned every reload of the starred view into another poll of
+    /// those feeds — outbound amplification against third-party origins, and one
+    /// reader monopolising a poll budget that is shared and already the binding
+    /// constraint on user count.
+    #[tokio::test]
+    async fn a_recently_polled_feed_is_not_nudged_again() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let recent = "2026-01-01T11:59:00Z";
+        let stale_before = "2026-01-01T11:00:00Z"; // one hour before "now"
+
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind("https://fresh.example/f")
+            .bind(recent)
+            .bind("2026-01-01T12:59:00Z")
+            .execute(&pool)
+            .await?;
+        // Polled long ago: this one SHOULD be nudged.
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind("https://stale.example/f")
+            .bind("2026-01-01T06:00:00Z")
+            .bind("2026-01-01T07:00:00Z")
+            .execute(&pool)
+            .await?;
+
+        mark_feed_due(&pool, "https://fresh.example/f", stale_before).await?;
+        mark_feed_due(&pool, "https://stale.example/f", stale_before).await?;
+
+        let fresh: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://fresh.example/f'")
+                .fetch_one(&pool)
+                .await?;
+        let stale: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://stale.example/f'")
+                .fetch_one(&pool)
+                .await?;
+
+        assert!(
+            fresh.is_some(),
+            "a feed polled a minute ago was made due again — a reload loop is an \
+             amplification vector"
+        );
+        assert!(stale.is_none(), "a long-unpolled feed should be nudged");
+        Ok(())
+    }
+
+    /// A feed that has never been polled is always nudgeable — there is no
+    /// recent fetch to argue it would be wasted.
+    #[tokio::test]
+    async fn a_never_polled_feed_is_nudged() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, NULL, ?2)")
+            .bind("https://new.example/f")
+            .bind("2026-01-01T12:59:00Z")
+            .execute(&pool)
+            .await?;
+        mark_feed_due(&pool, "https://new.example/f", "2026-01-01T11:00:00Z").await?;
+        let next: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://new.example/f'")
+                .fetch_one(&pool)
+                .await?;
+        assert!(next.is_none());
         Ok(())
     }
 }
