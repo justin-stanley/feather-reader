@@ -2120,3 +2120,31 @@ html[data-overlay="1"] .kbd-overlay {
     margin-top: var(--s7);
   }
 }
+
+/* Public /stats table. Follows `.prose table`'s conventions (UI font, small
+   type, collapsed borders) but is its own class: the figures are a data
+   readout, not prose, and the row label carries more weight than the value. */
+.stats-table {
+  width: 100%;
+  margin: var(--s5) 0 var(--s6);
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+}
+
+.stats-table th,
+.stats-table td {
+  padding: var(--s2) 0;
+  text-align: left;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.stats-table th {
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.stats-table td {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}

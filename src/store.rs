@@ -2119,6 +2119,67 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
     })
 }
 
+/// Aggregate poll health, for the public stats page.
+///
+/// **Deliberately aggregate-only.** No user counts, no error rates, no per-feed
+/// detail: this is published to anyone, and a reader does not need to know how
+/// many people use an instance or which feeds are failing. What it does answer
+/// is the only question the page exists for — is the poller keeping up?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollHealth {
+    /// Distinct feeds the poller is responsible for.
+    pub feeds_tracked: i64,
+    /// How many were polled within the last hour.
+    pub polled_last_hour: i64,
+    /// Feeds whose `next_poll` has passed — the backlog. A healthy instance
+    /// clears this every tick; a growing number is the signal that the poller
+    /// cannot keep up with the feed count.
+    pub overdue: i64,
+    /// Seconds since the most recent poll of any feed. `None` before the first.
+    pub last_poll_secs_ago: Option<i64>,
+    /// Seconds since the LEAST recently polled feed was polled — the worst
+    /// staleness any reader is currently seeing.
+    pub oldest_poll_secs_ago: Option<i64>,
+}
+
+/// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
+/// format the scheduler writes, so the comparisons are lexicographic).
+pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
+    let row: (i64, i64, i64, Option<String>, Option<String>) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN last_polled IS NOT NULL AND last_polled >= ?2 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN next_poll IS NULL OR next_poll <= ?1 THEN 1 ELSE 0 END), 0),
+            MAX(last_polled),
+            MIN(last_polled)
+        FROM feeds
+        "#,
+    )
+    .bind(now)
+    .bind(hour_ago)
+    .fetch_one(pool)
+    .await
+    .context("computing poll health")?;
+
+    Ok(PollHealth {
+        feeds_tracked: row.0,
+        polled_last_hour: row.1,
+        overdue: row.2,
+        last_poll_secs_ago: secs_between(row.3.as_deref(), now),
+        oldest_poll_secs_ago: secs_between(row.4.as_deref(), now),
+    })
+}
+
+/// Whole seconds from `then` to `now`, or `None` if `then` is absent or
+/// unparseable. Never negative: a clock skew that puts a poll in the future
+/// reads as "just now" rather than as a negative age.
+fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(then?).ok()?;
+    let now = chrono::DateTime::parse_from_rfc3339(now).ok()?;
+    Some((now - then).num_seconds().max(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3940,6 +4001,99 @@ mod tests {
         assert!(latest_network_stat(&pool, ADOPTION_STAT_KEY)
             .await?
             .is_none());
+        Ok(())
+    }
+
+    // ── poll health (the public stats page) ─────────────────────────────────
+
+    async fn feed_polled(
+        pool: &SqlitePool,
+        url: &str,
+        last_polled: Option<&str>,
+        next_poll: Option<&str>,
+    ) {
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind(url)
+            .bind(last_polled)
+            .bind(next_poll)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The numbers on the public page must describe the poller's actual state.
+    #[tokio::test]
+    async fn poll_health_counts_tracked_recent_and_overdue() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let now = "2026-01-01T12:00:00Z";
+        let hour_ago = "2026-01-01T11:00:00Z";
+
+        // Polled 10 minutes ago, due in 50 minutes: healthy.
+        feed_polled(
+            &pool,
+            "https://a.example/f",
+            Some("2026-01-01T11:50:00Z"),
+            Some("2026-01-01T12:50:00Z"),
+        )
+        .await;
+        // Polled 3 hours ago and overdue: the backlog case.
+        feed_polled(
+            &pool,
+            "https://b.example/f",
+            Some("2026-01-01T09:00:00Z"),
+            Some("2026-01-01T10:00:00Z"),
+        )
+        .await;
+        // Never polled: counts as overdue (next_poll IS NULL), and must not
+        // corrupt the "oldest poll" figure with a NULL.
+        feed_polled(&pool, "https://c.example/f", None, None).await;
+
+        let h = poll_health(&pool, now, hour_ago).await?;
+        assert_eq!(h.feeds_tracked, 3);
+        assert_eq!(
+            h.polled_last_hour, 1,
+            "only the 11:50 poll is within the hour"
+        );
+        assert_eq!(h.overdue, 2, "the stale feed and the never-polled one");
+        assert_eq!(
+            h.last_poll_secs_ago,
+            Some(600),
+            "most recent poll was 10 minutes ago"
+        );
+        assert_eq!(
+            h.oldest_poll_secs_ago,
+            Some(10_800),
+            "the worst staleness is 3 hours"
+        );
+        Ok(())
+    }
+
+    /// A fresh instance has no polls yet. The page must say so rather than
+    /// rendering a zero that reads as "polled just now".
+    #[tokio::test]
+    async fn poll_health_on_an_empty_instance_reports_no_polls() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        assert_eq!(h.feeds_tracked, 0);
+        assert_eq!(h.last_poll_secs_ago, None);
+        assert_eq!(h.oldest_poll_secs_ago, None);
+        Ok(())
+    }
+
+    /// A poll timestamped in the future — clock skew, or a restored backup —
+    /// reads as "just now", never as a negative age.
+    #[tokio::test]
+    async fn a_future_poll_timestamp_does_not_go_negative() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        feed_polled(
+            &pool,
+            "https://a.example/f",
+            Some("2026-01-01T13:00:00Z"),
+            None,
+        )
+        .await;
+        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        assert_eq!(h.last_poll_secs_ago, Some(0));
         Ok(())
     }
 }

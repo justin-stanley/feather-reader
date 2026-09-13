@@ -229,6 +229,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/about", get(about))
+        .route("/stats", get(stats))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/manage", get(manage))
@@ -558,6 +559,60 @@ async fn about(State(state): State<AppState>) -> Response {
     })
 }
 
+/// `GET /stats` — public poll health.
+async fn stats(State(state): State<AppState>) -> Response {
+    let now = chrono::Utc::now();
+    let health = match store::poll_health(
+        &state.db,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+    .await
+    {
+        Ok(health) => health,
+        Err(err) => {
+            warn!(%err, "could not compute poll health");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "stats unavailable\n").into_response();
+        }
+    };
+
+    // Percentage of a zero-feed instance is 100, not a divide-by-zero: a fresh
+    // instance is not behind on anything.
+    let polled_pct = if health.feeds_tracked == 0 {
+        100
+    } else {
+        health.polled_last_hour * 100 / health.feeds_tracked
+    };
+
+    render(&StatsTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+        feeds_tracked: health.feeds_tracked,
+        polled_last_hour: health.polled_last_hour,
+        polled_pct,
+        overdue: health.overdue,
+        last_poll: humanise_ago(health.last_poll_secs_ago),
+        oldest_poll: humanise_ago(health.oldest_poll_secs_ago),
+        poll_interval_mins: state.config.poll_interval.as_secs() as i64 / 60,
+    })
+}
+
+/// "3h 11m ago", or "never" when there has been no poll at all.
+///
+/// `None` must not render as `0` — on a fresh instance that would read as
+/// "polled just now", which is the opposite of the truth.
+fn humanise_ago(secs: Option<i64>) -> String {
+    let Some(secs) = secs else {
+        return "never".to_string();
+    };
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s => format!("{}h {}m ago", s / 3600, (s % 3600) / 60),
+    }
+}
+
 /// The `/about` adoption line's data, or `None` (no successful probe yet, an
 /// observation of zero, or a store failure).
 ///
@@ -739,6 +794,28 @@ struct AboutTemplate {
     repo_url: &'static str,
     kofi_url: &'static str,
     adoption: Option<AdoptionLine>,
+}
+
+/// The public `/stats` page — is the poller keeping up?
+///
+/// Aggregate only, deliberately. It is published to anyone, so it carries no
+/// user counts, no error rates and no per-feed detail: a reader does not need to
+/// know how many people use an instance or which feeds are failing. What it
+/// does answer is the question that decides whether an instance can take more
+/// readers — whether the poller is servicing the feeds it already has.
+#[derive(Template)]
+#[template(path = "stats.html")]
+struct StatsTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+    feeds_tracked: i64,
+    polled_last_hour: i64,
+    polled_pct: i64,
+    overdue: i64,
+    last_poll: String,
+    oldest_poll: String,
+    poll_interval_mins: i64,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -6485,5 +6562,68 @@ mod tests {
             html.contains(r#"<option value="" selected>No folder</option>"#),
             "loose feed must pre-select 'No folder': {html}"
         );
+    }
+
+    /// **The public stats page carries no user data.**
+    ///
+    /// It is reachable by anyone, so the thing worth pinning is what it does
+    /// NOT say: nothing about how many people use the instance, nothing about
+    /// which feeds fail, nothing about who reads what.
+    #[tokio::test]
+    async fn the_public_stats_page_exposes_no_user_data() {
+        let state = test_state(&[]).await;
+        store::ensure_seed(&state.db, &["did:plc:someone".to_string()])
+            .await
+            .unwrap();
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "stats must be public");
+
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Structural checks, not word checks. The page's own prose says it
+        // publishes no error rates, so searching for that PHRASE finds the
+        // disclaimer rather than a leak — the first version of this test failed
+        // on exactly that. What matters is whether identifiers or the
+        // admin-only figures are present.
+        assert!(
+            !body.contains("did:"),
+            "the public stats page leaked an identifier"
+        );
+        for admin_only in ["errp50ms", "p95ms", "live backend", "ok_count"] {
+            assert!(
+                !body.contains(admin_only),
+                "the public page is showing the admin metrics column {admin_only:?}"
+            );
+        }
+        // And it does render the aggregate it exists for.
+        assert!(body.contains("Feeds tracked"));
+        assert!(body.contains("Waiting to be polled"));
+    }
+
+    /// A fresh instance says "never", not "0" — which would read as "polled
+    /// just now", the opposite of the truth.
+    #[test]
+    fn an_instance_that_has_never_polled_says_so() {
+        assert_eq!(humanise_ago(None), "never");
+        assert_eq!(humanise_ago(Some(0)), "0s ago");
+        assert_eq!(humanise_ago(Some(59)), "59s ago");
+        assert_eq!(humanise_ago(Some(60)), "1m ago");
+        assert_eq!(humanise_ago(Some(3600)), "1h 0m ago");
+        assert_eq!(humanise_ago(Some(11_460)), "3h 11m ago");
     }
 }
