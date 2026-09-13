@@ -81,7 +81,27 @@ const DEFAULT_PAGE_DELAY: Duration = Duration::from_secs(1);
 /// redirect hops × 30 s plus 49 s of inter-page sleep is a worst case near two
 /// hours. This is what keeps a slow relay from leaving a detached task alive
 /// across the next daily tick.
-const DEFAULT_HOST_DEADLINE: Duration = Duration::from_secs(120);
+///
+/// This is a **soft** budget, checked between pages by [`RelayClient::walk_pages`],
+/// which stops and returns what it has with `truncated = true`. It is
+/// deliberately NOT sized to let the full [`MAX_PAGES`] budget run: 50 pages ×
+/// ([`DEFAULT_PAGE_DELAY`] + [`crate::net::FETCH_TIMEOUT`]) is ~26 minutes, far
+/// too long to hold a background task for an optional metric. The two limits
+/// bound different things — `MAX_PAGES` bounds a *pathological* relay,
+/// this bounds a merely *slow* one — and whichever binds first, the result is a
+/// recorded lower bound rather than a lost run.
+const DEFAULT_HOST_BUDGET: Duration = Duration::from_secs(120);
+
+/// Slack added to [`DEFAULT_HOST_BUDGET`] + [`crate::net::WORST_CASE_REQUEST`]
+/// to form the **hard** backstop deadline. See [`RelayClient::hard_deadline`].
+///
+/// The backstop should never actually fire: `walk_pages` bounds each page by
+/// what is left of the budget, so the walk cannot outlive it. The margin exists
+/// only so that a future which somehow fails to observe that timeout is still
+/// bounded, and it is deliberately measured against a WORST-CASE request
+/// (redirect chain included) rather than a single `FETCH_TIMEOUT` — budgeting
+/// one hop was the bug in the first cut of this fix.
+const HARD_DEADLINE_SLACK: Duration = Duration::from_secs(10);
 
 /// How much of a non-2xx body is quoted back in the error (the atproto envelope
 /// `{"error","message"}` is short; a hostile body must not fill the log).
@@ -137,8 +157,12 @@ pub struct AdoptionObservation {
     /// relay's index counts a repo that has since deleted its records is
     /// unverified, which is why this says "indexed as holding" and not "holds".
     pub repos: u64,
-    /// The [`MAX_PAGES`] cap was hit, so `repos` is a floor of a lower bound:
-    /// read it as "at least N".
+    /// The walk stopped early, so `repos` is a floor of a lower bound: read it
+    /// as "at least N".
+    ///
+    /// Set by EITHER bound — the [`MAX_PAGES`] cap (a pathological relay) or the
+    /// [`DEFAULT_HOST_BUDGET`] wall-clock budget (a merely slow one). They mean
+    /// the same thing to a consumer, which is why they share one flag.
     pub truncated: bool,
     /// When the observation was taken (RFC3339, UTC, seconds precision —
     /// the same shape every other TEXT timestamp in the DB uses).
@@ -244,11 +268,23 @@ pub enum RelayError {
     /// The relay rate-limited us. Distinct from [`RelayError::Http`] because the
     /// required behaviour differs: abort the run, log `Retry-After`, never retry
     /// tighter.
-    #[error("relay {host:?} rate-limited the probe (429)")]
+    ///
+    /// `retry_after` is rendered INTO the `Display` string rather than only held
+    /// as a field. The scheduler logs `err.to_string()`, so a field the message
+    /// omits is unreachable — the value was parsed, stored, and then silently
+    /// dropped, leaving the operator with no idea how long to back off and
+    /// NETWORK-SPEC §4.6 ("`warn!` with `Retry-After` if present") unmet.
+    #[error("relay {host:?} rate-limited the probe (429){}",
+        match retry_after {
+            Some(secs) => format!(", Retry-After: {secs}s"),
+            None => String::new(),
+        })]
     RateLimited {
         /// The relay base URL.
         host: String,
         /// `Retry-After` in seconds, when the delta-seconds form was sent.
+        /// `None` covers both "absent" and "sent as an HTTP-date", which is
+        /// deliberately not parsed — see [`retry_after_secs`].
         retry_after: Option<u64>,
     },
 
@@ -333,7 +369,8 @@ pub struct RelayClient {
     page_limit: u32,
     max_pages: usize,
     page_delay: Duration,
-    host_deadline: Duration,
+    /// Soft, checked between pages; see [`DEFAULT_HOST_BUDGET`].
+    host_budget: Duration,
 }
 
 impl RelayClient {
@@ -358,7 +395,7 @@ impl RelayClient {
             page_limit: DEFAULT_PAGE_LIMIT,
             max_pages: MAX_PAGES,
             page_delay: DEFAULT_PAGE_DELAY,
-            host_deadline: DEFAULT_HOST_DEADLINE,
+            host_budget: DEFAULT_HOST_BUDGET,
         })
     }
 
@@ -369,6 +406,24 @@ impl RelayClient {
     pub fn with_page_limit(mut self, limit: u32) -> Self {
         self.page_limit = limit.clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
         self
+    }
+
+    /// The hard per-host deadline — a pure backstop.
+    ///
+    /// `walk_pages` already bounds itself: each page is wrapped in a timeout of
+    /// whatever is LEFT of [`Self::host_budget`], so the walk cannot outlive its
+    /// budget and the partial count is always reachable. This exists only to
+    /// catch a future that somehow fails to observe that timeout.
+    ///
+    /// Sized against [`crate::net::WORST_CASE_REQUEST`] — `(MAX_REDIRECTS + 1) ×
+    /// FETCH_TIMEOUT`, i.e. **180 s**, not one `FETCH_TIMEOUT`. Budgeting a
+    /// single request cost was the mistake in the first cut of this fix: at
+    /// `soft + 30 s + 10 s` the backstop sat *below* the cost of one redirecting
+    /// page, so a relay behind a captive portal or a `302` chain still had its
+    /// walk killed mid-page and still produced no observation. Derived, not
+    /// configured, so the two cannot be tuned into crossing.
+    fn hard_deadline(&self) -> Duration {
+        self.host_budget + crate::net::WORST_CASE_REQUEST + HARD_DEADLINE_SLACK
     }
 
     /// The normalized relay base URLs this client will query, in order.
@@ -396,7 +451,11 @@ impl RelayClient {
         let mut failures = Vec::new();
 
         for host in &self.hosts {
-            match tokio::time::timeout(self.host_deadline, self.count_on_host(host, collection))
+            // The HARD backstop. Normally the soft budget inside `walk_pages`
+            // fires first and yields a truncated-but-RECORDED observation; this
+            // only catches a request still hanging past its own FETCH_TIMEOUT,
+            // where there is genuinely nothing to record.
+            match tokio::time::timeout(self.hard_deadline(), self.count_on_host(host, collection))
                 .await
             {
                 Ok(Ok(obs)) => observations.push(obs),
@@ -414,7 +473,7 @@ impl RelayClient {
                     host: host.clone(),
                     reason: RelayError::TimedOut {
                         host: host.clone(),
-                        after: self.host_deadline,
+                        after: self.hard_deadline(),
                     }
                     .to_string(),
                 }),
@@ -445,21 +504,45 @@ impl RelayClient {
     /// without a socket — which matters because the SSRF guard rightly refuses a
     /// loopback stub server, so an end-to-end fixture is not available.
     ///
-    /// Returns `(repos, truncated)`.
+    /// Returns `(repos, truncated)` — `truncated` is set by EITHER bound: the
+    /// [`MAX_PAGES`] cap or the [`DEFAULT_HOST_BUDGET`] wall-clock budget. Both
+    /// mean the same thing to the caller ("this count is a floor"), so they
+    /// share one flag and the `/about` copy reads "at least N" either way.
     async fn walk_pages<F, Fut>(&self, host: &str, mut fetch: F) -> Result<(u64, bool), RelayError>
     where
         F: FnMut(Option<String>) -> Fut,
         Fut: std::future::Future<Output = Result<ListReposByCollectionOut, RelayError>>,
     {
+        let started = tokio::time::Instant::now();
         let mut repos: u64 = 0;
         let mut cursor: Option<String> = None;
         for page_no in 0..self.max_pages {
+            // The SOFT budget. A slow relay used to blow the outer hard timeout
+            // and yield NO observation at all — every run, forever — because the
+            // timeout wrapped the whole walk and discarded its partial result.
+            // Stopping here keeps what we already counted and marks it truncated.
+            let remaining = self.host_budget.saturating_sub(started.elapsed());
+            if page_no > 0 && remaining.is_zero() {
+                return Ok((repos, true));
+            }
             // Politeness: one second between pages against the same host.
             if page_no > 0 && !self.page_delay.is_zero() {
                 tokio::time::sleep(self.page_delay).await;
             }
             let sent = cursor.take();
-            let page = fetch(sent.clone()).await?;
+            // Bound the page by what's LEFT of the budget, rather than trusting
+            // the outer deadline to be generous enough. One guarded request can
+            // cost `net::WORST_CASE_REQUEST` (redirects × FETCH_TIMEOUT), so a
+            // between-pages check alone can overshoot the budget by minutes and
+            // let the hard timeout kill the walk mid-page — silently restoring
+            // the very "no observation, ever" bug this exists to prevent. With
+            // the timeout scoped HERE, the walk cannot outlive its budget, so
+            // the partial count is always reachable and the outer deadline is a
+            // pure backstop rather than a number that has to be kept in sync.
+            let page = match tokio::time::timeout(remaining, fetch(sent.clone())).await {
+                Ok(res) => res?,
+                Err(_) => return Ok((repos, true)),
+            };
             // `repos` is fed by an untrusted peer; never panic on overflow.
             repos = repos.saturating_add(page.repos.len() as u64);
             match advance(&page) {
@@ -847,6 +930,132 @@ mod tests {
             .unwrap();
         assert_eq!(repos, 6, "3 pages × 2 repos");
         assert!(truncated, "hitting the cap makes the count a floor");
+    }
+
+    /// **Regression (v0.2.9 review).** A merely-SLOW relay used to produce no
+    /// observation at all: the hard `tokio::time::timeout` wrapped the entire
+    /// walk, so hitting it discarded every page already counted — and since the
+    /// deadline was reached the same way on every run, that host contributed
+    /// nothing, forever. The soft budget now stops between pages and keeps the
+    /// partial count, flagged `truncated` so it reads as "at least N".
+    ///
+    /// `start_paused` drives tokio's clock, so the simulated 6 s pages cost no
+    /// real time and the arithmetic is exact rather than timing-dependent.
+    #[tokio::test(start_paused = true)]
+    async fn walk_pages_keeps_a_partial_count_when_the_budget_runs_out() {
+        let mut c = instant_client(50);
+        c.host_budget = Duration::from_secs(10);
+
+        let mut n = 0usize;
+        let (repos, truncated) = c
+            .walk_pages("https://relay.example", |_| {
+                n += 1;
+                let body = format!(r#"{{"repos":[{{"did":"a"}},{{"did":"b"}}],"cursor":"c{n}"}}"#);
+                async move {
+                    // A slow relay: each page costs 6 s of the 10 s budget.
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    Ok(parse(&body))
+                }
+            })
+            .await
+            .unwrap();
+
+        // Page 1 spends 6 s of the 10 s budget. Page 2 is then handed only the
+        // REMAINING 4 s and cannot finish in 6 s, so it is cancelled: the walk
+        // never overshoots its budget. That is what lets the outer deadline be a
+        // backstop rather than a number that has to be kept in sync with
+        // net.rs's redirect arithmetic.
+        assert_eq!(repos, 2, "page 1's count survives; page 2 never completed");
+        assert!(
+            truncated,
+            "a budget stop makes the count a floor, not a loss"
+        );
+        assert_eq!(n, 2, "page 2 was attempted, then cut off at the budget");
+    }
+
+    /// **Regression (v0.2.9 review, second pass).** The first cut of this fix
+    /// sized the backstop as `soft + FETCH_TIMEOUT + slack` = 160 s. But ONE
+    /// guarded request costs up to `(MAX_REDIRECTS + 1) × FETCH_TIMEOUT` = 180 s,
+    /// because `net::guarded_get_inner` re-validates each hop through a freshly
+    /// built client carrying its own full timeout. So the backstop sat *below*
+    /// the cost of a single redirecting page: a relay behind a captive portal or
+    /// a `302` chain still had its walk killed mid-page and still produced no
+    /// observation — the exact bug, narrowed to the redirect case.
+    ///
+    /// Asserting against the real worst case rather than restating
+    /// `hard_deadline()`'s own definition, which is what let it through: the old
+    /// assertion was `hard >= soft + FETCH_TIMEOUT` against a value *defined* as
+    /// `soft + FETCH_TIMEOUT + slack`, so it could not fail for any input.
+    #[test]
+    fn the_hard_deadline_clears_one_worst_case_request() {
+        let c = test_client();
+        let worst = crate::net::FETCH_TIMEOUT * (crate::net::MAX_REDIRECTS as u32 + 1);
+        assert_eq!(
+            crate::net::WORST_CASE_REQUEST,
+            worst,
+            "worst-case arithmetic"
+        );
+        assert!(
+            c.hard_deadline() >= c.host_budget + worst,
+            "hard {:?} must clear soft {:?} + one worst-case request {:?}",
+            c.hard_deadline(),
+            c.host_budget,
+            worst
+        );
+    }
+
+    /// The structural half of the same fix: a single page that outruns the
+    /// remaining budget is cancelled and the partial count kept, rather than the
+    /// walk running on and being killed by the outer deadline. This is what makes
+    /// the backstop arithmetic a safety net instead of a load-bearing number.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_that_outruns_the_budget_still_yields_what_was_counted() {
+        let mut c = instant_client(50);
+        c.host_budget = Duration::from_secs(10);
+
+        let mut n = 0usize;
+        let (repos, truncated) = c
+            .walk_pages("https://relay.example", |_| {
+                n += 1;
+                let first = n == 1;
+                async move {
+                    if first {
+                        // Page 1 is fine.
+                        return Ok(parse(r#"{"repos":[{"did":"a"}],"cursor":"c1"}"#));
+                    }
+                    // Page 2 hangs far past the whole budget — as a redirect
+                    // chain would (up to 180 s for one request).
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    Ok(parse(r#"{"repos":[{"did":"b"}],"cursor":"c2"}"#))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(repos, 1, "page 1's count survives the hung page 2");
+        assert!(truncated, "and is reported as a floor");
+    }
+
+    /// **Regression (v0.2.9 review).** `Retry-After` was parsed into the error
+    /// and then unreachable: the scheduler logs `err.to_string()`, and the
+    /// `Display` string omitted the field. NETWORK-SPEC §4.6 requires it be
+    /// warned with, so it has to survive rendering, not just parsing.
+    #[test]
+    fn rate_limited_display_carries_retry_after() {
+        let with = RelayError::RateLimited {
+            host: "https://relay.example".to_string(),
+            retry_after: Some(120),
+        }
+        .to_string();
+        assert!(with.contains("Retry-After: 120s"), "{with}");
+
+        let without = RelayError::RateLimited {
+            host: "https://relay.example".to_string(),
+            retry_after: None,
+        }
+        .to_string();
+        assert!(!without.contains("Retry-After"), "{without}");
+        assert!(without.contains("rate-limited"), "{without}");
     }
 
     #[tokio::test]

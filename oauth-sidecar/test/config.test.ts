@@ -10,6 +10,7 @@ const KEYS = [
   'SIDECAR_SESSION_ABS_TTL_MS',
   'SIDECAR_SESSION_IDLE_TTL_MS',
   'SIDECAR_REAPER_INTERVAL_MS',
+  'SIDECAR_TRUSTED_IP_HEADER',
 ] as const;
 
 function withEnv(env: Record<string, string | undefined>, fn: () => void): void {
@@ -91,12 +92,14 @@ test('prod: strong secret + key boots and stays non-dev', () => {
       SIDECAR_PUBLIC_URL: 'https://reader.example.com/oauth',
       SIDECAR_INTERNAL_SECRET: STRONG,
       SIDECAR_ENC_KEY: STRONG,
+      SIDECAR_TRUSTED_IP_HEADER: 'cf-connecting-ip',
     },
     () => {
       const cfg = loadConfig();
       assert.equal(cfg.dev, false);
       assert.equal(cfg.internalSecret, STRONG);
       assert.equal(cfg.encKey, STRONG);
+      assert.equal(cfg.trustedIpHeader, 'cf-connecting-ip');
     },
   );
 });
@@ -126,5 +129,55 @@ test('TTL env overrides parse; bad values throw', () => {
   );
   withEnv({ SIDECAR_DEV: 'true', SIDECAR_REAPER_INTERVAL_MS: 'nope' }, () => {
     assert.throws(() => loadConfig(), /expected a positive integer/);
+  });
+});
+
+test('prod: missing trusted IP header refuses to boot', () => {
+  // Behind a proxy the socket peer is always loopback, so an unset header
+  // silently collapses every visitor into one rate-limit bucket. Refuse rather
+  // than default: which header carries the visitor is a deployment fact.
+  withEnv(
+    {
+      SIDECAR_PUBLIC_URL: 'https://reader.example.com/oauth',
+      SIDECAR_INTERNAL_SECRET: STRONG,
+      SIDECAR_ENC_KEY: STRONG,
+    },
+    () => {
+      assert.throws(() => loadConfig(), /SIDECAR_TRUSTED_IP_HEADER is required/);
+    },
+  );
+});
+
+test('prod: a blank trusted IP header is treated as unset, not as a header named ""', () => {
+  withEnv(
+    {
+      SIDECAR_PUBLIC_URL: 'https://reader.example.com/oauth',
+      SIDECAR_INTERNAL_SECRET: STRONG,
+      SIDECAR_ENC_KEY: STRONG,
+      SIDECAR_TRUSTED_IP_HEADER: '   ',
+    },
+    () => {
+      assert.throws(() => loadConfig(), /SIDECAR_TRUSTED_IP_HEADER is required/);
+    },
+  );
+});
+
+test('trusted IP header is normalised to lower case, matching Node header keys', () => {
+  withEnv(
+    {
+      SIDECAR_PUBLIC_URL: 'https://reader.example.com/oauth',
+      SIDECAR_INTERNAL_SECRET: STRONG,
+      SIDECAR_ENC_KEY: STRONG,
+      SIDECAR_TRUSTED_IP_HEADER: '  CF-Connecting-IP  ',
+    },
+    () => {
+      assert.equal(loadConfig().trustedIpHeader, 'cf-connecting-ip');
+    },
+  );
+});
+
+test('dev: an unset trusted IP header is allowed and yields null', () => {
+  withEnv({ SIDECAR_DEV: 'true' }, () => {
+    assert.equal(loadConfig().trustedIpHeader, null);
   });
 });

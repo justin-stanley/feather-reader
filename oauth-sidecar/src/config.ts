@@ -17,6 +17,7 @@
  * | `SIDECAR_HANDLE_RESOLVER`      | `https://bsky.social`                     | Bootstrap host for handle resolution. |
  * | `SIDECAR_PLC_DIRECTORY`        | `https://plc.directory`                   | PLC directory for did:plc resolution. |
  * | `SIDECAR_DEV`                  | auto (`true` when PUBLIC_URL is localhost)| Force the atproto localhost dev-client rules on/off. |
+ * | `SIDECAR_TRUSTED_IP_HEADER`     | *(required in prod)*                      | Header carrying the real client IP for rate-limit keying, e.g. `cf-connecting-ip` behind Cloudflare or `fly-client-ip` where Fly is outermost. Must be set by a proxy every request provably transits. |
  *
  * In "dev" mode (localhost `SIDECAR_PUBLIC_URL`) the client uses atproto's
  * special localhost development client: `client_id` is
@@ -40,6 +41,12 @@ export interface SidecarConfig {
   plcDirectory: string;
   /** True → atproto localhost dev-client rules (no JWKS, `http://localhost` client_id). */
   dev: boolean;
+  /**
+   * Lower-cased header name carrying the real client IP, used only to key the
+   * public rate limiter. `null` → fall back to the socket peer, which behind the
+   * in-container Caddy hop is always loopback. Required in prod; see `client-ip.ts`.
+   */
+  trustedIpHeader: string | null;
   /** The OAuth scope requested. FeatherReader needs generic read+write of its own repo records. */
   scope: string;
   /**
@@ -187,6 +194,39 @@ export function loadConfig(): SidecarConfig {
     encKey = rawEncKey;
   }
 
+  // --- trusted client-IP header (fail-loud in prod) -----------------------
+  // WHICH header carries the visitor is a property of the deployment, not of
+  // this code, so it is stated rather than guessed. Naming one is also asserting
+  // that every request provably transits the proxy that sets it — name a header
+  // an arbitrary client can set and the limiter becomes trivially evadable.
+  // Unset in prod is refused rather than defaulted: behind Caddy the socket peer
+  // is always loopback, so the fallback silently collapses every visitor into a
+  // single shared bucket, and a security control that fails silently is worse
+  // than one that fails loudly.
+  const rawTrustedIpHeader = envOpt('SIDECAR_TRUSTED_IP_HEADER');
+  let trustedIpHeader: string | null;
+  if (rawTrustedIpHeader === undefined || rawTrustedIpHeader.trim() === '') {
+    if (securityDev) {
+      trustedIpHeader = null;
+      // oxlint-disable-next-line no-console
+      console.warn(
+        '[config] SIDECAR_TRUSTED_IP_HEADER unset — rate limiting will key on the socket peer ' +
+          '(loopback behind a proxy), i.e. one shared bucket for everyone (SIDECAR_DEV set).',
+      );
+    } else {
+      throw new Error(
+        'SIDECAR_TRUSTED_IP_HEADER is required in production. Set the header your edge sets to ' +
+          'the real client IP — `cf-connecting-ip` behind Cloudflare, `fly-client-ip` where Fly ' +
+          'is the outermost proxy. It must be set by a proxy every request provably transits; ' +
+          'a client-settable header makes the rate limiter evadable. ' +
+          '(Or set SIDECAR_DEV=true for an explicit local dev stack.)',
+      );
+    }
+  } else {
+    // Node lower-cases incoming header names; match so lookups line up.
+    trustedIpHeader = rawTrustedIpHeader.trim().toLowerCase();
+  }
+
   // --- session TTLs + reaper cadence --------------------------------------
   const sessionAbsoluteTtlMs = envIntMs('SIDECAR_SESSION_ABS_TTL_MS', 90 * 24 * 60 * 60 * 1000); // 90d
   const sessionIdleTtlMs = envIntMs('SIDECAR_SESSION_IDLE_TTL_MS', 30 * 24 * 60 * 60 * 1000); // 30d
@@ -202,6 +242,7 @@ export function loadConfig(): SidecarConfig {
     handleResolver,
     plcDirectory,
     dev,
+    trustedIpHeader,
     scope,
     encKey,
     sessionAbsoluteTtlMs,
