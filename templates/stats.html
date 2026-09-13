@@ -81,50 +81,33 @@
         </tbody>
       </table>
 
-      <h2>Reading these</h2>
       <p>
-        <strong>Waiting to be polled</strong> is the backlog. A healthy instance
-        clears it every minute or so, and it should hover near zero. A number
-        that keeps climbing means the poller cannot service the feeds it already
-        has, and feeds will update less often than the target interval.
+        <strong>Waiting to be polled</strong> is the backlog. It should hover
+        near zero; a number that keeps climbing means the poller cannot keep up
+        and feeds update less often than the target interval.
+        <strong>Least recent poll</strong> is the worst staleness here — it
+        reads <em>never</em> if any feed has never been fetched, because that
+        is worse than any number.
       </p>
       <p>
-        <strong>Least recent poll</strong> is the worst staleness anyone here is
-        currently seeing. If it drifts far past the target interval, the backlog
-        above is the reason. It reads <em>never</em> whenever any feed has yet to
-        be fetched at all — that is a worse staleness than any number, so it wins
-        outright rather than being averaged away.
-      </p>
-
-      <p>
-        <strong>Failing</strong> counts feeds whose last fetch errored. These
-        retry on a widening delay rather than every interval, so they are
-        <em>not</em> part of the backlog above — which means a feed that breaks
-        makes the backlog look better, not worse. That is why the two numbers are
-        listed separately. The second figure, when present, is the feeds that
-        have failed often enough to be retrying hours apart: usually gone rather
-        than flaky.
+        <strong>Failing</strong> feeds retry on a widening delay, so they are
+        <em>not</em> in the backlog — a broken feed makes the backlog look
+        better, not worse, which is why the two are listed separately. The
+        second figure, when shown, is feeds retrying hours apart: usually gone
+        rather than flaky.
       </p>
       <p>
-        <strong>Fetching</strong> says whether new content is being pulled at
-        all. It reads <em>paused</em> when the cache has hit the size limit that
-        protects the disk; nothing new arrives until the retention sweep frees
-        space. <em>Off</em> means the poller is not running here at all, and
-        <em>starting</em> means it has not finished a round since this instance
-        booted. <em>Stalled</em> means the poller is running but has not finished
-        a round in far longer than it should — the one state where the numbers
-        above keep looking plausible while nothing behind them moves. Reading, searching and everything already cached keep working in
-        every case — but every other number on this page will drift while this
-        row says anything but <em>running</em>, and this row is the reason.
+        <strong>Fetching</strong> says whether new content arrives at all.
+        <em>Stalled</em> is the state to worry about: the poller is running but
+        has not finished a round in far longer than it should, and every other
+        number keeps looking plausible while nothing behind them moves.
+        Reading, searching and everything already cached keep working whatever
+        this row says.
       </p>
-
-      <h2>What is not here</h2>
       <p>
-        No user counts, no per-feed detail. This page is public, and none of that
-        is anyone else's business — it also says nothing about who reads what.
-        The failure counts above are totals: they say how many feeds are broken,
-        never which ones, and never whose. Everything here is about the machine,
-        not the people using it.
+        This page is public, so it counts machines, not people: no user counts,
+        no per-feed detail, nothing about who reads what. Failure counts are
+        totals — how many feeds are broken, never which, never whose.
       </p>
 
       {% include "footer.html" %}
