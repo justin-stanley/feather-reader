@@ -113,6 +113,79 @@ mod tests {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
     }
 
+    /// **A valid JWS with an extra segment appended must be refused.**
+    ///
+    /// `verify` requires EXACTLY three segments. Relaxing that to `>= 3` — a
+    /// plausible-looking loosening — left the whole suite green, because the one
+    /// test covering segment counts feeds `"a.b.c.d"`, which dies at base64
+    /// decoding long before the count is consulted. Under the relaxed check a
+    /// genuinely valid token with attacker-appended trailing data verifies.
+    ///
+    /// So this appends to a REAL signed JWS: every segment is well-formed and the
+    /// signature covers the first two, leaving the count as the only thing that
+    /// can reject it.
+    #[test]
+    fn a_valid_jws_with_a_trailing_segment_is_refused() {
+        let key = SigningKey::generate(KID);
+        let jws = sign(&key, &json!({"typ": "JWT"}), &json!({"iss": "x"})).unwrap();
+        verify(&key, &jws).expect("the unmodified JWS must verify");
+
+        let extended = format!("{jws}.AAAA");
+        let err =
+            verify(&key, &extended).expect_err("a JWS with a trailing segment must not verify");
+        assert!(
+            format!("{err:#}").contains("expected 3 segments"),
+            "refused, but not by the segment count — the relaxed check is what this \
+             test exists to catch: {err:#}",
+        );
+    }
+
+    /// **Algorithm confusion: a signature valid over the bytes, whose header
+    /// advertises a different algorithm, must not verify.**
+    ///
+    /// The existing pair of tests swap the header of an already-signed token,
+    /// which changes the signing input — so the ECDSA check fails and the `alg`
+    /// guard is never the reason. Deleting the guard entirely left all 664 tests
+    /// green.
+    ///
+    /// This builds the hostile token properly: the header says `RS256`, and the
+    /// ES256 signature is computed over THAT header, so the signature is
+    /// genuinely valid and only the `alg` check can reject it. `sign` cannot be
+    /// used here — it owns `alg` and overwrites it, which is the right production
+    /// behaviour and exactly why the token has to be assembled by hand.
+    #[test]
+    fn a_signature_valid_under_a_forged_alg_header_is_refused() {
+        let key = SigningKey::generate(KID);
+        let header = json!({"alg": "RS256", "typ": "JWT", "kid": KID});
+        let claims = json!({"iss": "https://x.example"});
+
+        let input = signing_input(&header, &claims).unwrap();
+        let signer = EcdsaSigningKey::from(key.secret());
+        let signature: Signature = signer.sign(input.as_bytes());
+        let forged = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+
+        // The signature really is valid over these bytes — swap the header to the
+        // honest algorithm and the same construction verifies.
+        let honest_input =
+            signing_input(&json!({"alg": "ES256", "typ": "JWT", "kid": KID}), &claims).unwrap();
+        let honest_sig: Signature = signer.sign(honest_input.as_bytes());
+        verify(
+            &key,
+            &format!(
+                "{honest_input}.{}",
+                URL_SAFE_NO_PAD.encode(honest_sig.to_bytes())
+            ),
+        )
+        .expect("the same construction with an honest alg must verify");
+
+        let err = verify(&key, &forged).expect_err("a forged alg header must not verify");
+        assert!(
+            format!("{err:#}").contains("unsupported JWS alg"),
+            "refused, but not by the alg check — if the signature merely failed, the \
+             guard could be deleted and this test would still pass: {err:#}",
+        );
+    }
+
     #[test]
     fn a_signed_jws_has_three_base64url_segments() {
         let key = SigningKey::generate(KID);

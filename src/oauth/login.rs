@@ -222,14 +222,7 @@ pub async fn complete(
     // `store.rs` names this exact threat as the reason `issuer` is AAD-bound.
     // The AAD protects the column from local tampering; only this protects it
     // from a network re-read.
-    let mut token_params =
-        token::token_request_params(&code, &pending.redirect_uri, &pending.pkce_verifier);
-    let assertion = client_assertion(runtime, auth_method, &pending.issuer, now)?;
-    token_params.extend(client_auth::credential_params(
-        auth_method,
-        &runtime.client_id,
-        assertion.as_deref(),
-    )?);
+    let token_params = token_exchange_params(runtime, &pending, &code, auth_method, now)?;
 
     let outcome = post_form(
         http,
@@ -244,6 +237,79 @@ pub async fn complete(
         request::Retry::Allowed,
     )
     .await?;
+
+    let did = accept_token_response(pool, &runtime.codec, &pending, &outcome, now).await?;
+
+    // The handle is resolved from the DID rather than remembered from the login
+    // form: what the user typed is not evidence, and `resolve` returns `None`
+    // unless it round-trips. A failure here must not fail the login — the
+    // account is already authenticated, and the handle is a display detail.
+    let handle = match super::resolve::resolve(
+        &runtime.resolver,
+        http,
+        &did,
+        &runtime.plc_directory,
+    )
+    .await
+    {
+        Ok(account) => account.handle,
+        Err(err) => {
+            tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
+            None
+        }
+    };
+
+    Ok(CompletedLogin { did, handle })
+}
+
+/// Assemble the token-endpoint form for this pending login.
+///
+/// **Split out of [`complete`] so it can be tested.** Every value here has to
+/// come from the PENDING ROW rather than from current configuration or a fresh
+/// computation: the code, the redirect and the PKCE verifier are all bound by
+/// the authorization server to the request that PAR pushed. Substituting any of
+/// them — which a refactor can do silently, since all three are plain strings —
+/// either breaks every login or, in the PKCE case, removes the proof that the
+/// party redeeming the code is the one that requested it.
+///
+/// A mutation replacing `pending.pkce_verifier` with a literal passed the entire
+/// suite, because nothing ever inspected the form this builds.
+fn token_exchange_params(
+    runtime: &OauthRuntime,
+    pending: &store::PendingAuth,
+    code: &str,
+    auth_method: client_auth::AuthMethod,
+    now: i64,
+) -> Result<Vec<(&'static str, String)>> {
+    let mut params =
+        token::token_request_params(code, &pending.redirect_uri, &pending.pkce_verifier);
+    let assertion = client_assertion(runtime, auth_method, &pending.issuer, now)?;
+    params.extend(client_auth::credential_params(
+        auth_method,
+        &runtime.client_id,
+        assertion.as_deref(),
+    )?);
+    Ok(params)
+}
+
+/// Validate a token-endpoint response and persist the session it grants.
+///
+/// **Split out of [`complete`] so these checks are reachable without a live
+/// authorization server**, which is why they had no tests: `complete` cannot
+/// reach a stub, because discovery requires `https` and the SSRF guard forbids
+/// loopback, so there is nowhere for a test to point it. Every guard below could
+/// be deleted with the whole suite green.
+///
+/// Returns the authenticated DID. Behaviour is identical to the inline version
+/// it replaces, including that the body is parsed only after the status check —
+/// a failed exchange must not have its body examined or echoed.
+async fn accept_token_response(
+    pool: &sqlx::SqlitePool,
+    codec: &super::crypto::Codec,
+    pending: &store::PendingAuth,
+    outcome: &request::PostOutcome,
+    now: i64,
+) -> Result<String> {
     if !outcome.is_success() {
         bail!("the token exchange failed with status {}", outcome.status);
     }
@@ -261,7 +327,7 @@ pub async fn complete(
 
     store::put_session(
         pool,
-        &runtime.codec,
+        codec,
         &store::OAuthSession {
             sub: tokens.sub.clone(),
             issuer: pending.issuer.clone(),
@@ -276,29 +342,7 @@ pub async fn complete(
     )
     .await?;
 
-    // The handle is resolved from the DID rather than remembered from the login
-    // form: what the user typed is not evidence, and `resolve` returns `None`
-    // unless it round-trips. A failure here must not fail the login — the
-    // account is already authenticated, and the handle is a display detail.
-    let handle = match super::resolve::resolve(
-        &runtime.resolver,
-        http,
-        &tokens.sub,
-        &runtime.plc_directory,
-    )
-    .await
-    {
-        Ok(account) => account.handle,
-        Err(err) => {
-            tracing::warn!(%err, did = %tokens.sub, "could not resolve a handle for the new session");
-            None
-        }
-    };
-
-    Ok(CompletedLogin {
-        did: tokens.sub,
-        handle,
-    })
+    Ok(tokens.sub)
 }
 
 /// Mint a client assertion when the negotiated method needs one.
@@ -358,13 +402,186 @@ mod tests {
     const PUSHED_REDIRECT: &str = "https://feather-reader.com/oauth/callback";
     const PENDING_ISSUER: &str = "https://auth.example.com";
 
-    /// A pool holding one pending login pushed under [`PUSHED_REDIRECT`], plus a
-    /// runtime whose codec matches it so the row is readable.
-    async fn pending_login(cookie_hash: &str) -> sqlx::SqlitePool {
+    const PENDING_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+
+    /// A well-formed token-endpoint response granting `sub`.
+    fn token_body(sub: &str) -> serde_json::Value {
+        serde_json::json!({
+            "access_token": "at-abc",
+            "token_type": "DPoP",
+            "scope": "atproto",
+            "sub": sub,
+            "expires_in": 3600,
+            "refresh_token": "rt-abc",
+        })
+    }
+
+    fn outcome(status: u16, body: &serde_json::Value) -> request::PostOutcome {
+        request::PostOutcome {
+            status,
+            body: serde_json::to_vec(body).unwrap(),
+        }
+    }
+
+    async fn empty_pool() -> sqlx::SqlitePool {
         let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
         crate::oauth::store::init_schema(&pool).await.unwrap();
+        pool
+    }
+
+    /// **The authorization server must not be able to log the user in as
+    /// somebody else.**
+    ///
+    /// `complete` pushes PAR for a DID it resolved itself, and the token response
+    /// carries a `sub`. If the two are allowed to differ, a hostile or buggy
+    /// server hands back a working session for an account the user never asked
+    /// for — and everything downstream (`put_session`, the cookie, every later
+    /// repo call) is keyed on that `sub`, so the whole app then acts as the wrong
+    /// identity.
+    ///
+    /// Deleting this check passed all 664 tests. It had no test because it sits
+    /// after a network round trip that a test cannot make: discovery requires
+    /// `https` and the SSRF guard forbids loopback, so there is nowhere to point
+    /// a stub. Splitting the response handling out of `complete` is what makes it
+    /// reachable — the guard is unchanged, it just no longer requires a live
+    /// authorization server to observe.
+    #[tokio::test]
+    async fn tokens_for_a_different_subject_are_refused() {
+        let pool = empty_pool().await;
         let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
-        let pending = crate::oauth::store::PendingAuth {
+        let pending = pending_auth("unused-hash");
+
+        let hostile = token_body("did:plc:zzzzzzzzzzzzzzzzzzzzzzzz");
+        let err = accept_token_response(
+            &pool,
+            &codec,
+            &pending,
+            &outcome(200, &hostile),
+            1_700_000_000,
+        )
+        .await
+        .expect_err("a token response for another DID must be refused");
+
+        assert!(
+            format!("{err:#}").contains("different subject"),
+            "refused, but not by the subject check: {err:#}",
+        );
+        assert!(
+            crate::oauth::store::get_session(&pool, &codec, "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")
+                .await
+                .unwrap()
+                .is_none(),
+            "no session may be stored for a subject the login did not start for",
+        );
+    }
+
+    /// The matching-subject case must still succeed and persist the session —
+    /// otherwise a check that refused every login would satisfy the test above.
+    #[tokio::test]
+    async fn tokens_for_the_pending_subject_are_accepted_and_stored() {
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let pending = pending_auth("unused-hash");
+
+        let did = accept_token_response(
+            &pool,
+            &codec,
+            &pending,
+            &outcome(200, &token_body(PENDING_DID)),
+            1_700_000_000,
+        )
+        .await
+        .expect("a token response for the pending DID must be accepted");
+
+        assert_eq!(did, PENDING_DID);
+        let stored = crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+            .await
+            .unwrap()
+            .expect("the session must be durable before complete() returns");
+        assert_eq!(stored.access_token, "at-abc");
+        assert_eq!(stored.issuer, PENDING_ISSUER);
+    }
+
+    /// **A non-2xx token response must not be parsed as a session.**
+    ///
+    /// The status check is what stops an error body being read as a grant, and
+    /// it also keeps the failure body from being examined at all — it may be an
+    /// arbitrary proxy or WAF page.
+    #[tokio::test]
+    async fn a_failed_token_exchange_stores_nothing() {
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let pending = pending_auth("unused-hash");
+
+        // A body that WOULD parse as a valid grant for the right DID, behind a
+        // failure status: only the status check stands between it and a session.
+        let err = accept_token_response(
+            &pool,
+            &codec,
+            &pending,
+            &outcome(400, &token_body(PENDING_DID)),
+            1_700_000_000,
+        )
+        .await
+        .expect_err("a 400 must not yield a session");
+
+        assert!(
+            format!("{err:#}").contains("failed with status 400"),
+            "refused, but not by the status check: {err:#}",
+        );
+        assert!(
+            crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed exchange must leave no session behind",
+        );
+    }
+
+    /// **The PKCE verifier sent must be the pending row's.**
+    ///
+    /// PKCE is what proves the party redeeming the code is the party that
+    /// requested it. The verifier is a plain `String` three fields away from two
+    /// other plain `String`s, so substituting it is a one-token edit — and a
+    /// mutation replacing it with a literal passed the whole suite, because
+    /// nothing ever looked at the form `complete` builds.
+    #[test]
+    fn the_token_request_carries_the_pending_rows_pkce_verifier_and_redirect() {
+        let runtime = runtime_at("https://feather-reader.com");
+        let pending = pending_auth("unused-hash");
+
+        let params = token_exchange_params(
+            &runtime,
+            &pending,
+            "the-code",
+            runtime.auth_method,
+            1_700_000_000,
+        )
+        .expect("building the token request");
+        let get = |k: &str| {
+            params
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(
+            get("code_verifier"),
+            Some(pending.pkce_verifier.as_str()),
+            "the verifier must come from the pending row; anything else forfeits PKCE",
+        );
+        assert_eq!(get("code"), Some("the-code"));
+        assert_eq!(
+            get("redirect_uri"),
+            Some(pending.redirect_uri.as_str()),
+            "the redirect must be the one PAR was pushed under",
+        );
+        assert_eq!(get("grant_type"), Some("authorization_code"));
+    }
+
+    /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
+    fn pending_auth(cookie_hash: &str) -> crate::oauth::store::PendingAuth {
+        crate::oauth::store::PendingAuth {
             state: "state-value".into(),
             browser_binding_hash: cookie_hash.into(),
             pkce_verifier: "verifier".into(),
@@ -377,7 +594,7 @@ mod tests {
                 .unwrap(),
             issuer: PENDING_ISSUER.into(),
             pds_url: "https://pds.example.com".into(),
-            did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
+            did: PENDING_DID.into(),
             auth_method: "private_key_jwt".into(),
             auth_kid: None,
             redirect_uri: PUSHED_REDIRECT.into(),
@@ -385,8 +602,15 @@ mod tests {
             request_uri: "urn:x".into(),
             app_return_to: None,
             expires_at: 2_000_000_000,
-        };
-        crate::oauth::store::put_pending(&pool, &codec, &pending)
+        }
+    }
+
+    /// A pool holding that pending login, for the tests that drive `complete`
+    /// end to end.
+    async fn pending_login(cookie_hash: &str) -> sqlx::SqlitePool {
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        crate::oauth::store::put_pending(&pool, &codec, &pending_auth(cookie_hash))
             .await
             .unwrap();
         pool
