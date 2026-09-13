@@ -101,6 +101,46 @@ and hundreds of batches, each carrying a full `entry_state` scan.
 **Fix.** Measure first. Then either an index that serves the predicate, or hoist
 the spare-set into a temp table computed once per sweep rather than per batch.
 
+### MEASURED — and the diagnosis was wrong
+
+Benchmarked against the real engine and the real code path, 500 feeds × 2,000
+entries = 1M rows, at two `entry_state` sizes. Kept as
+`store::tests::r6_measure_retention_sweep` (`#[ignore]`d) so the next candidate
+can be tried against the same fixture:
+
+| shape | 50k pinned | 600k pinned | disk |
+|---|---|---|---|
+| `id NOT IN (…)` — as shipped | 42.0 s | **104.3 s** | — |
+| + partial index on the pinned predicate | 41.5 s | 104.6 s | 0.5–6.9 MiB |
+| + expression index on entry age | 32.3 s | 100.1 s | 27.9 MiB |
+| **`NOT EXISTS` rewrite** | 33.3 s | **42.8 s** | — |
+| `NOT EXISTS` + age index | 23.7 s | 38.2 s | 27.9 MiB |
+
+**The index this finding asked for does nothing.** A partial index on
+`entry_state(entry_id) WHERE starred = 1 OR read = 0` changes the plan — `SCAN
+entry_state USING INDEX idx_es_pinned` — and changes the time by 0.3%, at either
+scale. The scan was never the cost.
+
+**The cost is re-materialising the list.** `id NOT IN (subquery)` builds the
+entire pinned set on EVERY batch, and that set scales with total users rather
+than with the feed being swept — which is why per-batch time went from 87 ms at
+50k to 522 ms at 600k while the row count went *down*. Rewriting it as a
+correlated `NOT EXISTS` probes `idx_entry_state_entry_id` per candidate row
+instead: **2.4× at realistic scale, zero disk, zero write amplification.**
+
+**The age index is rejected.** It buys a further 10% for 27.9 MiB against a 768
+MiB watermark and ~12% on every insert — the poller inserts constantly and the
+sweep runs once a day. Wrong side of the trade on this box. Recorded here so it
+is a decision rather than an omission.
+
+The rewrite is also strictly safer: `NOT IN` against a subquery containing a NULL
+evaluates to NULL for every row and silently deletes nothing. Equivalent today
+only because `entry_state.entry_id` is `NOT NULL` — an equivalence that depends
+on a constraint declared somewhere else.
+
+**Applied.** All 657 tests pass unchanged, including the ones pinning the sparing
+semantics, which is the equivalence argument made executable.
+
 ## R7 — `/stats` says "Fetching: running" on an instance where nothing polls
 
 `web.rs` — `polling_paused` is the only input to that row. With

@@ -1547,11 +1547,33 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         Some(cutoff) => {
             delete_in_batches(
                 pool,
-                "SELECT id FROM entries \
-                 WHERE COALESCE(published, fetched_at) < ?1 \
-                   AND id NOT IN ( \
-                       SELECT entry_id FROM entry_state \
-                       WHERE starred = 1 OR read = 0 \
+                // **`NOT EXISTS`, not `id NOT IN (…)` — measured, not guessed.**
+                //
+                // The list form materialises the ENTIRE pinned set on every
+                // batch, and that set scales with total users rather than with
+                // the feed being swept. Measured on 1M entries with 600k
+                // `entry_state` rows: 104.4 s as a list, 42.7 s as a correlated
+                // exists — 2.4x, for no disk and no write amplification, because
+                // it probes `idx_entry_state_entry_id` per candidate row instead
+                // of rebuilding a 300k-element list 200 times.
+                //
+                // The review that raised this proposed indexing the pinned
+                // predicate instead. Measured: a partial index on
+                // `entry_state(entry_id) WHERE starred = 1 OR read = 0` changed
+                // the plan and changed the time by nothing at all, at either
+                // scale. The scan was never the cost; the re-materialisation was.
+                //
+                // Also strictly safer. `NOT IN` against a subquery containing a
+                // NULL evaluates to NULL for every row, which would silently
+                // delete nothing. `entry_state.entry_id` is `NOT NULL` today, so
+                // the two are equivalent — but the equivalence depends on a
+                // column constraint somewhere else, and `NOT EXISTS` does not.
+                "SELECT e.id FROM entries e \
+                 WHERE COALESCE(e.published, e.fetched_at) < ?1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM entry_state s \
+                       WHERE s.entry_id = e.id \
+                         AND (s.starred = 1 OR s.read = 0) \
                    )",
                 cutoff,
                 "window",
@@ -5839,6 +5861,215 @@ mod tests {
             format!("{}-shm", path.display()),
         ] {
             std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// **R6 benchmark: what the retention sweep actually costs, and what fixes it.**
+    ///
+    /// `#[ignore]` — builds a ~1M-row database four times over, so it is a
+    /// measurement tool rather than a test. Run with:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored --nocapture r6_measure_retention_sweep
+    /// ```
+    ///
+    /// It exists because R6 was "every delete batch re-scans `entry_state`" and
+    /// the honest answer was "measure before changing an index". Kept so the next
+    /// candidate index can be tried against the same fixture rather than a new
+    /// one. Findings are recorded in `design/REVIEW-ROUND-2.md`.
+    #[tokio::test]
+    #[ignore]
+    async fn r6_measure_retention_sweep() -> Result<()> {
+        const FEEDS: i64 = 500;
+        const PER_FEED: i64 = 2_000; // matches `max_entries_per_feed`
+        const PINNED: i64 = 50_000; // entry_state rows a reader has touched
+
+        /// Build the fixture, apply `extra_indexes`, then plan and time a sweep.
+        async fn run(
+            label: &str,
+            extra_indexes: &[&str],
+            pinned: i64,
+            old_list_form: bool,
+        ) -> Result<()> {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("fr-r6-{}-{label}.db", std::process::id()));
+            let cleanup = |path: &std::path::Path| {
+                for p in [
+                    path.display().to_string(),
+                    format!("{}-wal", path.display()),
+                    format!("{}-shm", path.display()),
+                ] {
+                    std::fs::remove_file(&p).ok();
+                }
+            };
+            cleanup(&path);
+            let pool = init_url(&format!("sqlite://{}", path.display())).await?;
+
+            // Bulk-build with SQL: a million round trips would measure the
+            // fixture, not the sweep. Recursive CTE because `generate_series` is
+            // not compiled into the bundled SQLite.
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < ?1 \
+                 ) \
+                 INSERT INTO feeds (url) \
+                 SELECT 'https://f' || value || '.example/x.xml' FROM n",
+            )
+            .bind(FEEDS)
+            .execute(&pool)
+            .await
+            .context("seeding feeds")?;
+
+            // Half the entries older than the window, half inside it.
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < ?1 \
+                 ) \
+                 INSERT INTO entries (feed_id, guid, title, published, fetched_at) \
+                 SELECT f.id, \
+                        'g' || f.id || '-' || s.value, \
+                        'Entry ' || s.value, \
+                        CASE WHEN s.value % 2 = 0 THEN '2020-01-01T00:00:00Z' \
+                             ELSE '2099-01-01T00:00:00Z' END, \
+                        '2026-01-01T00:00:00Z' \
+                 FROM feeds f, n s",
+            )
+            .bind(PER_FEED)
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) \
+                 SELECT 'did:plc:reader', id, \
+                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
+                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
+                        '2026-01-01T00:00:00Z' \
+                 FROM entries LIMIT ?1",
+            )
+            .bind(pinned)
+            .execute(&pool)
+            .await?;
+
+            // Space is the other half of the trade: this is a 1 GB volume with a
+            // 768 MiB watermark, so an index that buys time and costs disk can be
+            // a net loss.
+            let pages_before: i64 = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&pool)
+                .await?;
+            let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                .fetch_one(&pool)
+                .await?;
+            for idx in extra_indexes {
+                sqlx::query(sqlx::AssertSqlSafe((*idx).to_string()))
+                    .execute(&pool)
+                    .await
+                    .with_context(|| format!("creating {idx}"))?;
+            }
+            let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&pool)
+                .await?;
+            let index_bytes = (pages_after - pages_before) * page_size;
+
+            // What the index costs on the WRITE path — the poller inserts
+            // constantly, the sweep runs once a day.
+            let t_ins = std::time::Instant::now();
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 10000 \
+                 ) \
+                 INSERT INTO entries (feed_id, guid, published, fetched_at) \
+                 SELECT 1, 'ins-' || value, '2099-06-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+                 FROM n",
+            )
+            .execute(&pool)
+            .await?;
+            let insert_10k = t_ins.elapsed();
+
+            // Give the planner statistics, as a long-lived instance would have.
+            sqlx::query("ANALYZE").execute(&pool).await?;
+
+            let plan: Vec<String> = sqlx::query(
+                "EXPLAIN QUERY PLAN SELECT id FROM entries \
+                 WHERE COALESCE(published, fetched_at) < '2026-06-01T00:00:00Z' \
+                   AND id NOT IN (SELECT entry_id FROM entry_state \
+                                  WHERE starred = 1 OR read = 0) \
+                 LIMIT 1000",
+            )
+            .fetch_all(&pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect();
+
+            // ONE variant per fixture — running both against the same database
+            // measured the second against an already-emptied table, which
+            // reported a 0-row "win" the first time this was written.
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let t = std::time::Instant::now();
+            let deleted = if old_list_form {
+                // The shape `prune_old_entries` used to have: the pinned set as
+                // an `IN` list, re-materialised on every batch.
+                let mut n = 0u64;
+                loop {
+                    let got = sqlx::query(
+                        "DELETE FROM entries WHERE id IN ( \
+                             SELECT id FROM entries \
+                             WHERE COALESCE(published, fetched_at) < ?1 \
+                               AND id NOT IN ( \
+                                   SELECT entry_id FROM entry_state \
+                                   WHERE starred = 1 OR read = 0 \
+                               ) \
+                             LIMIT 1000)",
+                    )
+                    .bind(&cutoff)
+                    .execute(&pool)
+                    .await?
+                    .rows_affected();
+                    n += got;
+                    if got == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                n
+            } else {
+                prune_old_entries(&pool, 30, 3650).await?
+            };
+            let elapsed = t.elapsed();
+
+            println!("\n=== {label}  (entry_state = {pinned}) ===");
+            println!(
+                "  index cost: {:.1} MiB on disk, 10k inserts in {insert_10k:?}",
+                index_bytes as f64 / 1024.0 / 1024.0
+            );
+            for l in &plan {
+                println!("  plan: {l}");
+            }
+            println!(
+                "  deleted {deleted} in {elapsed:?}  ({:?}/batch)",
+                elapsed / (deleted as u32 / PRUNE_BATCH as u32).max(1)
+            );
+
+            pool.close().await;
+            cleanup(&path);
+            Ok(())
+        }
+
+        // R6's own hypothesis was that the per-batch `entry_state` scan is the
+        // cost. Both scales are measured because that scan grows with TOTAL
+        // users, not with the feed being swept — 50k is one active reader,
+        // 600k is the figure the schema comment cites as realistic.
+        const AGE_IDX: &str =
+            "CREATE INDEX idx_entries_age ON entries(COALESCE(published, fetched_at))";
+        for pinned in [PINNED, 600_000] {
+            // `false` = the shipped `prune_old_entries`, whatever shape it
+            // currently uses; `true` = the raw `NOT IN` list form it replaced,
+            // kept so the regression stays measurable rather than remembered.
+            run("as shipped", &[], pinned, false).await?;
+            run("old NOT IN list form", &[], pinned, true).await?;
+            run("as shipped + age index", &[AGE_IDX], pinned, false).await?;
         }
         Ok(())
     }
