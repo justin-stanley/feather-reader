@@ -47,6 +47,38 @@ impl Repo<'_> {
             .context("the rust repo backend is selected but its OAuth runtime is not configured")
     }
 
+    /// Whether `did` has a session this backend could actually use.
+    ///
+    /// **A precondition check, not a repo operation — deliberately NOT wrapped
+    /// in `timed()`.** The background flusher calls this every round for every
+    /// DID holding dirty read-state; counting it would re-inflate the very
+    /// `flush_read_states` error count this exists to stop polluting (#117).
+    ///
+    /// Existence only: no decrypt, no staleness check, no refresh. A session
+    /// that is present but expired still counts as usable here, because the
+    /// refresh path is exactly what `session()` will do about it. The question
+    /// being answered is narrower — is there anything at all to work with, or
+    /// is this DID parked until the user signs in again?
+    ///
+    /// **The sidecar arm answers `true` unconditionally**, preserving today's
+    /// behaviour on that backend rather than guessing. The sidecar owns its own
+    /// session store and answering honestly would mean a loopback round trip per
+    /// DID per minute; prod runs `rust`, and that arm is deleted by #18.
+    pub async fn has_session(&self, did: &str) -> Result<bool> {
+        match self.backend() {
+            Backend::Sidecar => Ok(true),
+            Backend::Rust => {
+                let found: Option<(i64,)> =
+                    sqlx::query_as("SELECT 1 FROM oauth_session WHERE sub = ?1")
+                        .bind(did)
+                        .fetch_optional(&self.state.db)
+                        .await
+                        .with_context(|| format!("checking for an OAuth session for {did}"))?;
+                Ok(found.is_some())
+            }
+        }
+    }
+
     /// Load a usable session for `did`, refreshing only when it is actually
     /// stale.
     ///

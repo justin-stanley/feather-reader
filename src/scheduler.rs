@@ -51,6 +51,8 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use feather_reader::feed::{self, PollOutcome};
+use std::collections::HashSet;
+
 use feather_reader::lexicon::nsid;
 use feather_reader::network::RelayClient;
 use feather_reader::readstate::{flush_did, fnv1a_64};
@@ -1016,6 +1018,10 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
     let debounce = env_duration_secs("FEATHERREADER_FLUSH_DEBOUNCE_SECS", DEFAULT_FLUSH_DEBOUNCE);
     info!(?debounce, "read-state flusher started");
 
+    // Which DIDs we have already reported as parked, so the log line is once
+    // per DID per process rather than once per minute forever.
+    let mut parked: HashSet<String> = HashSet::new();
+
     let mut ticker = interval(debounce);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first `tick()` completes immediately; swallow it so the debounce window
@@ -1027,13 +1033,13 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
             _ = shutdown_fired(&mut shutdown) => {
                 info!("read-state flusher: shutdown signal received, final flush");
                 // Final drain so Ctrl-C never strands unsynced read-state.
-                if let Err(err) = flush_all_dirty(&state).await {
+                if let Err(err) = flush_all_dirty(&state, &mut parked).await {
                     error!(%err, "read-state flusher: final flush failed");
                 }
                 break;
             }
             _ = ticker.tick() => {
-                if let Err(err) = flush_all_dirty(&state).await {
+                if let Err(err) = flush_all_dirty(&state, &mut parked).await {
                     error!(%err, "read-state flusher: flush round failed");
                 }
             }
@@ -1044,7 +1050,7 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
 /// Flush every DID that has dirty cursors. Coalesces each DID's dirty cursors
 /// into a single `applyWrites` batch, then clears the `dirty` flag on the ones
 /// that flushed successfully.
-async fn flush_all_dirty(state: &AppState) -> anyhow::Result<()> {
+async fn flush_all_dirty(state: &AppState, parked: &mut HashSet<String>) -> anyhow::Result<()> {
     let dids = dids_with_dirty_cursors(&state.db).await?;
     if dids.is_empty() {
         debug!("read-state flusher: nothing dirty");
@@ -1056,9 +1062,48 @@ async fn flush_all_dirty(state: &AppState) -> anyhow::Result<()> {
     );
 
     for did in dids {
+        // **A DID with no session is PARKED, not failed (#117).**
+        //
+        // Attempting the flush anyway is what produced the production incident:
+        // `Repo::session` fails before any network call, the enclosing
+        // `flush_read_states` records an error, and the whole thing repeats
+        // every 60s forever. 20 failures in the first 20 minutes, and nothing
+        // about it could ever have succeeded — the user is signed out.
+        //
+        // The cursors stay DIRTY on purpose. The reads are not discarded; they
+        // wait, and flush on the user's next sign-in. Clearing the flag here
+        // would turn a stalled sync into silent data loss, which is strictly
+        // worse than the bug being fixed.
+        match state.repo().has_session(&did).await {
+            Ok(false) => {
+                // Once per DID per process: enough to diagnose, not enough to
+                // drown the log or mask a real failure during the soak.
+                if parked.insert(did.clone()) {
+                    info!(
+                        %did,
+                        "read-state flusher: no OAuth session; parking this DID's \
+                         read-state until it signs in again"
+                    );
+                }
+                continue;
+            }
+            Ok(true) => {
+                // It had a session and may have just got one back — stop
+                // suppressing its log line, so a LATER park is reported.
+                parked.remove(&did);
+            }
+            Err(err) => {
+                // The precondition check itself failed (a DB problem, not an
+                // absent session). Fall through and let the flush attempt
+                // produce the real error rather than silently skipping.
+                warn!(%did, %err, "read-state flusher: session check failed; attempting anyway");
+            }
+        }
+
         if let Err(err) = flush_did(state, &did).await {
             // One DID's PDS hiccup must not block the others — its cursors stay
-            // dirty and retry next round.
+            // dirty and retry next round. This arm is now genuinely transient
+            // failures only; the permanent case is parked above.
             warn!(%did, %err, "read-state flusher: DID flush failed; will retry");
         }
     }
@@ -1311,53 +1356,38 @@ mod tests {
         .unwrap();
     }
 
-    /// **#117 — a dirty cursor whose DID has no OAuth session retries FOREVER.**
+    /// **#117 — a DID with no OAuth session is PARKED, not retried.**
     ///
-    /// This is the production failure: one DID left a dirty `read_cursor` behind
-    /// with no `oauth_session` row, and the flusher re-attempted it every 60s
-    /// indefinitely — 20 failures in the first 20 minutes, climbing by one per
-    /// minute, each taking 0 ms because it fails before any network call.
+    /// The inverse of the characterization test this replaces. Before the fix,
+    /// five rounds produced five recorded failures and a `warn!` each; nothing
+    /// about them could ever have succeeded, because the user is signed out.
     ///
-    /// The per-DID `catch` is right for a transient PDS hiccup and wrong here:
-    /// nothing about this can succeed until the user logs in again, but the
-    /// flusher cannot tell the two apart, so it treats a permanent condition as
-    /// a retryable one. That unbounded warn loop will mask real failures for the
-    /// whole soak window.
+    /// Asserts the two properties the fix has to hold together:
+    ///   1. no error is recorded, however many rounds run — the soak is not
+    ///      polluted by a condition that is not a failure; and
+    ///   2. the cursor stays DIRTY — the reads are parked, not discarded.
     ///
-    /// Asserts the UNBOUNDED part specifically — not merely that one round
-    /// fails, which would also be true of a correctly-backed-off retry.
+    /// (2) is the one worth guarding. The cheapest way to silence the loop is to
+    /// clear the flag, and that would turn a stalled sync into silent data loss.
     #[tokio::test]
-    async fn an_orphaned_dirty_cursor_retries_without_bound() {
+    async fn a_did_with_no_session_is_parked_not_retried() {
         let state = rust_state().await;
         let did = "did:plc:orphanedreadstate00000000";
         dirty_cursor_for(&state, did).await;
-        assert!(
-            feather_reader::oauth::store::get_session(
-                &state.db,
-                &state.oauth.as_deref().expect("oauth runtime").codec,
-                did,
-            )
-            .await
-            .unwrap()
-            .is_none(),
-            "fixture must have NO oauth session; that is the whole point",
-        );
 
+        let mut parked = HashSet::new();
         const ROUNDS: usize = 5;
         for round in 1..=ROUNDS {
-            flush_all_dirty(&state)
+            flush_all_dirty(&state, &mut parked)
                 .await
-                .expect("a per-DID failure must not abort the whole sweep");
-            let still = store::dirty_cursors(&state.db, did).await.unwrap();
+                .expect("a parked DID must not abort the sweep");
             assert_eq!(
-                still.len(),
+                store::dirty_cursors(&state.db, did).await.unwrap().len(),
                 1,
-                "round {round}: the cursor was cleared despite never reaching the PDS",
+                "round {round}: the parked cursor was cleared — the reads are now lost",
             );
         }
 
-        // Every round produced a fresh failure: there is no attempt cap, no
-        // backoff, and no terminal state. A bounded design would stop counting.
         let err = state
             .metrics
             .snapshot()
@@ -1365,9 +1395,84 @@ mod tests {
             .find(|r| r.op == "flush_read_states")
             .map(|r| r.stats.err_count)
             .unwrap_or(0);
+        assert_eq!(err, 0, "a parked DID was counted as {err} flush failures");
+        assert_eq!(parked.len(), 1, "the DID should be recorded as parked once");
+    }
+
+    /// **The reads survive the gap: parking holds them until the user returns.**
+    ///
+    /// This is the test that makes parking defensible rather than merely quiet.
+    /// A cursor parked while signed out must still be there — and still flush —
+    /// once a session exists again.
+    ///
+    /// The flush itself fails here (the fixture PDS is unreachable), which is
+    /// the point: what is asserted is that the DID is no longer SKIPPED, so the
+    /// attempt is made at all. A fix that parked permanently would pass the test
+    /// above and fail this one.
+    #[tokio::test]
+    async fn a_parked_cursor_is_retried_once_the_user_signs_in_again() {
+        let state = rust_state().await;
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        dirty_cursor_for(&state, did).await;
+        let mut parked = HashSet::new();
+
+        flush_all_dirty(&state, &mut parked).await.unwrap();
+        assert!(parked.contains(did), "precondition: parked while signed out");
         assert_eq!(
-            err, ROUNDS as u64,
-            "expected one recorded failure per round with no bound; got {err}",
+            state
+                .metrics
+                .snapshot()
+                .into_iter()
+                .find(|r| r.op == "flush_read_states")
+                .map(|r| r.stats.ok_count + r.stats.err_count)
+                .unwrap_or(0),
+            0,
+            "precondition: no flush was attempted while parked",
+        );
+
+        // The user signs back in.
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        feather_reader::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &feather_reader::oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: feather_reader::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(Utc::now().timestamp() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+
+        flush_all_dirty(&state, &mut parked).await.unwrap();
+
+        assert!(
+            !parked.contains(did),
+            "the DID is still marked parked after regaining a session",
+        );
+        let attempts = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "flush_read_states")
+            .map(|r| r.stats.ok_count + r.stats.err_count)
+            .unwrap_or(0);
+        assert_eq!(
+            attempts, 1,
+            "the parked read-state was never re-attempted after sign-in",
+        );
+        assert_eq!(
+            store::dirty_cursors(&state.db, did).await.unwrap().len(),
+            1,
+            "the unflushed cursor must remain dirty after a failed attempt",
         );
     }
 }

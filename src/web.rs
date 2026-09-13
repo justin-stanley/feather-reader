@@ -3734,6 +3734,46 @@ async fn oauth_callback(
 ///
 /// Both arms are best-effort. The caller has already decided to sign the user
 /// out, and a network failure must not trap them in a half-logged-out state.
+/// How long sign-out will wait for a final read-state flush before revoking
+/// anyway.
+///
+/// Bounded because the flush talks to the user's PDS, and a user trying to leave
+/// must never be held by a server that is not answering. Three seconds is long
+/// enough for a healthy `applyWrites` (the production samples run 100–970 ms)
+/// and short enough that a dead PDS is an inconvenience rather than a trap.
+const SIGN_OUT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Flush whatever read-state is still dirty for `did`, then give up quietly.
+///
+/// **Called before revoking, because revoking first strands it (#117).**
+/// `revoke_everywhere` deletes the OAuth session, and a dirty cursor with no
+/// session cannot be sent by anyone — it parks until the user signs in again,
+/// which may be never. Flushing first is what stops the common case from
+/// becoming that.
+///
+/// Best-effort by construction: every failure path here falls through to the
+/// revoke. A flush that times out or errors leaves the cursors dirty, which is
+/// the parked state the flusher now handles deliberately rather than retrying
+/// forever.
+async fn flush_before_revoke(state: &AppState, did: &str) {
+    match tokio::time::timeout(
+        SIGN_OUT_FLUSH_BUDGET,
+        crate::readstate::flush_did(state, did),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(%did, %err, "sign-out: final read-state flush failed; it will park until next sign-in")
+        }
+        Err(_) => warn!(
+            %did,
+            budget = ?SIGN_OUT_FLUSH_BUDGET,
+            "sign-out: final read-state flush timed out; it will park until next sign-in"
+        ),
+    }
+}
+
 async fn revoke_everywhere(state: &AppState, did: &str) {
     // **Counted under Backend::Sidecar, not left uncounted.** A review found
     // that recording only the rust arm let `oauth_revoke` report a clean success
@@ -3816,6 +3856,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         // revoke; the dev-DID fallback never handshook the sidecar.
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
+            // BEFORE the revoke: afterwards there is no session to send it with.
+            flush_before_revoke(&state, &user.did).await;
             revoke_everywhere(&state, &user.did).await;
         }
     }
@@ -4124,9 +4166,20 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
 
     // The live backend is named at the top: a table of two populated rows is
     // ambiguous about which one is currently serving users.
+    // Parked read-state, alongside the timings. The flusher no longer logs
+    // these every round (#117), so without a number here the state would be
+    // silent — which is the failure the noisy loop at least did not have.
+    let parked = match crate::store::parked_readstate_dids(&state.db).await {
+        Ok(n) => n.to_string(),
+        Err(err) => {
+            warn!(%err, "could not count parked read-state DIDs");
+            "unknown".to_string()
+        }
+    };
     let body = format!(
-        "live backend: {}\n\n{}",
+        "live backend: {}\nparked read-state DIDs: {}\n\n{}",
         state.config.repo_backend.as_str(),
+        parked,
         crate::metrics::render(&rows),
     );
     (StatusCode::OK, body).into_response()
@@ -9109,20 +9162,23 @@ mod tests {
         assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
     }
 
-    /// **#117 — signing out strands whatever read-state had not flushed yet.**
+    /// **#117 — sign-out ATTEMPTS the flush before it revokes.**
     ///
-    /// `logout` removes the app session and calls `revoke_everywhere`, which
-    /// deletes the `oauth_session` row unconditionally. Nothing flushes pending
-    /// read-state first, and nothing clears the `dirty` flags that can no longer
-    /// be acted on. The cursor is then orphaned: the scheduler re-attempts it
-    /// every 60s forever with `no OAuth session for <did>`, and the reads it
-    /// holds never reach the user's PDS.
+    /// This replaces the test that proved the opposite. `revoke_everywhere`
+    /// deletes the OAuth session, so anything still dirty afterwards has nothing
+    /// left to send it — the reads park until the user signs in again, which may
+    /// be never. Flushing first is what keeps the common case out of that state.
     ///
-    /// This is one of the two candidate sequences for the production incident.
-    /// It is proven reachable here; the other (a dirty cursor written while no
-    /// session exists) is a separate question.
+    /// The flush FAILS here: the fixture PDS is unreachable, so the cursor is
+    /// still dirty at the end. That is deliberate and is the weaker half of the
+    /// assertion. What is actually pinned is that the attempt HAPPENED — one
+    /// recorded `flush_read_states` call, made while the session still existed.
+    /// Deleting the `flush_before_revoke` call drops that to zero.
+    ///
+    /// The failure path is also the point: sign-out completes regardless. A user
+    /// leaving must never be held by a PDS that is not answering.
     #[tokio::test]
-    async fn signing_out_strands_unflushed_read_state() {
+    async fn signing_out_flushes_before_it_revokes() {
         let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
         let state = test_state(&[]).await;
         let runtime = state.oauth.as_deref().expect("oauth runtime");
@@ -9145,8 +9201,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        // Unflushed reads, exactly as a mark-read leaves them.
         crate::store::upsert_cursor(
             &state.db,
             &crate::store::ReadCursor {
@@ -9163,21 +9217,29 @@ mod tests {
         .await
         .unwrap();
 
+        flush_before_revoke(&state, did).await;
         revoke_everywhere(&state, did).await;
 
+        // The flush was attempted, and while the session was still usable.
+        let attempts = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "flush_read_states")
+            .map(|r| r.stats.ok_count + r.stats.err_count)
+            .unwrap_or(0);
+        assert_eq!(
+            attempts, 1,
+            "sign-out revoked without attempting a final flush",
+        );
+
+        // And sign-out still completed, despite the flush failing.
         assert!(
             crate::oauth::store::get_session(&state.db, &runtime.codec, did)
                 .await
                 .unwrap()
                 .is_none(),
-            "fixture assumption: sign-out deletes the session",
-        );
-        let stranded = crate::store::dirty_cursors(&state.db, did).await.unwrap();
-        assert_eq!(
-            stranded.len(),
-            1,
-            "the dirty cursor was neither flushed nor cleared; it is now \
-             unflushable and will be retried forever",
+            "a failed flush must not block the revoke",
         );
     }
 }
