@@ -215,7 +215,22 @@ pub async fn sign_out_discovering(
     let session = match super::store::get_session(pool, &runtime.codec, sub).await {
         Ok(Some(session)) => session,
         Ok(None) => return Revocation::NoSession,
-        Err(err) => return Revocation::Failed(format!("reading the session: {err:#}")),
+        Err(err) => {
+            // **Delete it anyway.** This early return used to skip the delete,
+            // and `sign_out` was fixed for exactly that while this sibling was
+            // not — the same one-instance-fixed, sibling-missed pattern twice
+            // over.
+            //
+            // An unreadable row is not hypothetical: it is what every row
+            // written before this branch's AAD change now is, and what rotating
+            // `FEATHERREADER_OAUTH_ENCRYPTION_KEY` produces. Leaving it wedges
+            // the account — every repo call reads the same row — and because
+            // `purge_did_data` does not touch the OAuth tables, `POST
+            // /account/delete` relies on this path to clear it. Returning early
+            // here made "delete my account" leave the tokens behind.
+            let _ = super::store::delete_session(pool, sub).await;
+            return Revocation::Failed(format!("reading the session: {err:#}"));
+        }
     };
 
     // **Discovery is bounded too**, and separately.
@@ -577,6 +592,84 @@ mod tests {
             still_there, 0,
             "an unreadable row survived a sign-out, so the account stays wedged"
         );
+    }
+
+    // ── the function production actually calls ───────────────────────────────
+
+    /// A runtime whose codec matches the test database's, so a stored session is
+    /// readable. Loopback public URL => a public client, so no key file.
+    fn runtime() -> super::super::runtime::OauthRuntime {
+        super::super::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "http://127.0.0.1:8080".into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: Some(KEY.to_string()),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .expect("the test runtime must build")
+    }
+
+    /// **`sign_out_discovering` is what `/logout` and `/account/delete` call,
+    /// and it had no test of its own at all.**
+    ///
+    /// A mutation replacing this entire function with `return NoSession` — never
+    /// revoking, never deleting — passed all 575 tests. Every sign-out invariant
+    /// was pinned one layer below, on `sign_out`, which production reaches only
+    /// through this wrapper.
+    ///
+    /// The PDS here is unreachable (loopback, refused by the SSRF guard), which
+    /// is the case that matters: the local row must go even when the server
+    /// cannot be told.
+    #[tokio::test]
+    async fn the_production_sign_out_deletes_the_session() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+
+        let outcome =
+            sign_out_discovering(&runtime(), &reqwest::Client::new(), &pool, DID, NOW).await;
+
+        assert!(
+            matches!(outcome, Revocation::Failed(_)),
+            "an unreachable PDS must not report success: {outcome:?}"
+        );
+        assert!(
+            super::super::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the production sign-out left the session behind"
+        );
+    }
+
+    /// **An unreadable row is deleted by the production path too.**
+    ///
+    /// `sign_out` was fixed for this; its caller was not. The row is what every
+    /// pre-AAD-change row now is, and what rotating the encryption key produces
+    /// — and since `purge_did_data` does not touch the OAuth tables, `POST
+    /// /account/delete` depends on this path to clear it.
+    #[tokio::test]
+    async fn the_production_sign_out_deletes_an_unreadable_session() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        sqlx::query("UPDATE oauth_session SET issuer = ? WHERE sub = ?")
+            .bind("https://evil.example")
+            .bind(DID)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome =
+            sign_out_discovering(&runtime(), &reqwest::Client::new(), &pool, DID, NOW).await;
+        assert!(matches!(outcome, Revocation::Failed(_)), "got {outcome:?}");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session WHERE sub = ?")
+            .bind(DID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "account deletion would leave live tokens behind");
     }
 
     /// Logging out twice is not an error. The second call has nothing to revoke
