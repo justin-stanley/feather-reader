@@ -61,20 +61,23 @@
 	# `http.log.error.log0` while `http.log.access.log0` correctly showed
 	# `REDACTED`. So the leak would have survived the fix, and would have fired on
 	# exactly the occasions an operator tails the logs — an outage.
-	# `output stderr` + `wrap json` deliberately MATCH what the default logger did
-	# before this block existed. Adding a global `log` silently redirects the
-	# default logger stderr->stdout and re-encodes it console-instead-of-JSON,
-	# with raw ANSI colour embedded — measured: 1 stdout / 15 stderr line before,
-	# 17 stdout / 0 stderr after, all 17 carrying escape codes. Any drain that
-	# parses Caddy's JSON, or separates the two streams, would break silently.
-	# Redaction is the only intended change here.
-	log {
+	# **Named, with `include http.log.error` — NOT a reconfigured `default`.** The
+	# adapter then adds `http.log.error` to `default`'s `exclude`, so there is no
+	# duplicate emission and `default` keeps its own writer and encoder.
+	#
+	# Reconfiguring `default` directly also redacted correctly, but it silently
+	# re-pointed EVERY runtime log line: stderr->stdout, JSON->console with raw
+	# ANSI colour embedded (measured 1 stdout / 15 stderr before, 17 / 0 after).
+	# Restating `default`'s real shape by hand fixes that only for as long as the
+	# restatement stays accurate. This form cannot drift out of sync with it.
+	log origin_errors {
 		output stderr
+		include http.log.error
 		format filter {
 			wrap json
 			fields {
 				request>headers>X-Origin-Auth replace REDACTED
-				request>headers>Cookie delete
+				request>headers>Cookie replace REDACTED
 			}
 		}
 	}
@@ -92,8 +95,11 @@
 	# Caddy redacts the standard credential headers by default, which is exactly
 	# why this one slipped: `X-Origin-Auth` is a custom name, so nothing knew to
 	# treat it as a secret. `Cookie` is filtered here too rather than trusted to
-	# that default — it costs nothing, and session cookies in a log drain are a
-	# worse outcome than a redundant rule.
+	# that default. Caddy's built-in redaction already covers `Cookie`,
+	# `Authorization`, `Proxy-Authorization` and `Set-Cookie`, as a literal
+	# `REDACTED` replacement rather than a hash — so this is belt-and-braces, not
+	# a fix. It uses `replace` to match that shape: `delete` drops the field
+	# entirely and loses the presence signal the next paragraph argues for.
 	#
 	# `replace`, not `delete`, for the origin header: it keeps the FIELD while
 	# losing the value, so a 403 still distinguishes "arrived without the header"
@@ -106,7 +112,7 @@
 			wrap console
 			fields {
 				request>headers>X-Origin-Auth replace REDACTED
-				request>headers>Cookie delete
+				request>headers>Cookie replace REDACTED
 			}
 		}
 	}
@@ -204,7 +210,15 @@
 	# keys the rate limiter (not auth), so the residual risk if the lockdown lapses
 	# is rate-limit-bucket spoofing, not an auth bypass — but do the lockdown.
 	handle {
-		reverse_proxy 127.0.0.1:8082
+		reverse_proxy 127.0.0.1:8082 {
+			# The secret has done its job by here; no upstream reads it. Forwarding
+			# it means a future `RUST_LOG=debug`, or any header-dumping middleware,
+			# reopens exactly the leak this file closes. Repeated per proxy rather
+			# than one `request_header`, because that directive is ordered BEFORE
+			# `handle` and would strip the header before the lock's matcher reads
+			# it — disabling the lock outright.
+			header_up -X-Origin-Auth
+		}
 	}
 }
 
