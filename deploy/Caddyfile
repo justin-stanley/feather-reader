@@ -49,12 +49,59 @@
 		trusted_proxies static private_ranges
 	}
 	admin off
+
+	# **The redaction below must ALSO cover the error logger, not just the access
+	# log.** A site-level `log` directive configures only `http.log.access.*`.
+	# Errors during handling — every 502/503 from an upstream that is down, slow
+	# or restarting — are emitted by `http.log.error.*`, a DIFFERENT logger that
+	# inherits nothing from it and dumps the full request, headers and all.
+	#
+	# Measured, not assumed: with only the site-level filter in place, a request
+	# that failed upstream logged `"X-Origin-Auth":["<the secret>"]` verbatim from
+	# `http.log.error.log0` while `http.log.access.log0` correctly showed
+	# `REDACTED`. So the leak would have survived the fix, and would have fired on
+	# exactly the occasions an operator tails the logs — an outage.
+	log {
+		output stdout
+		format filter {
+			wrap console
+			fields {
+				request>headers>X-Origin-Auth replace REDACTED
+				request>headers>Cookie delete
+			}
+		}
+	}
 }
 
 :8080 {
+	# **`X-Origin-Auth` must never reach the log.** It IS the origin lock — the
+	# shared secret Cloudflare injects and the matcher below compares against —
+	# and the console encoder writes every request header verbatim, so until this
+	# filter existed the secret appeared in full on EVERY access-log line. That
+	# put it in `fly logs`, in any log drain, and in the scrollback of anyone who
+	# ever tailed this app. A control whose key is published beside every request
+	# it guards is not a control.
+	#
+	# Caddy redacts the standard credential headers by default, which is exactly
+	# why this one slipped: `X-Origin-Auth` is a custom name, so nothing knew to
+	# treat it as a secret. `Cookie` is filtered here too rather than trusted to
+	# that default — it costs nothing, and session cookies in a log drain are a
+	# worse outcome than a redundant rule.
+	#
+	# `replace`, not `delete`, for the origin header: it keeps the FIELD while
+	# losing the value, so a 403 still distinguishes "arrived without the header"
+	# (bypassed Cloudflare) from "arrived with the wrong one" (stale secret,
+	# mid-rotation). Deleting it would collapse those into the same log line, and
+	# they call for opposite responses.
 	log {
 		output stdout
-		format console
+		format filter {
+			wrap console
+			fields {
+				request>headers>X-Origin-Auth replace REDACTED
+				request>headers>Cookie delete
+			}
+		}
 	}
 
 	# --- Origin lock: require Cloudflare's injected shared secret --------------
