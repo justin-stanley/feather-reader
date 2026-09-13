@@ -136,9 +136,15 @@ term
 wait 2>/dev/null || true
 # Distinguish a stop WE were asked to make from a child dying on its own. Both
 # take the container down, but only one is news: a normal `fly deploy` sends
-# SIGTERM, the children exit 143, and this line used to report that in the same
-# words as a real failure — so anyone alerting on the string paged on every
-# deploy.
+# SIGTERM and this line used to report that in the same words as a real failure,
+# so anyone alerting on the string paged on every deploy.
+#
+# On a deploy `first_status` is 143 — but MEASURED, that is not the children
+# exiting 143. It is bash returning 128+SIGTERM from `wait -n` because OUR OWN
+# trapped signal interrupted it, before any child is reaped; the children go on
+# to trap SIGTERM and exit 0. Which is a second reason to key off the flag: 143
+# is ambiguous anyway, since a literal `exit 143` is indistinguishable from a
+# signalled death.
 #
 # The test is `${stopping}`, NOT "the status looks like a signal". A shell
 # reports ANY signalled child as 128 + signum, so `status > 128` also covers 137

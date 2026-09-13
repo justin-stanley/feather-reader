@@ -903,12 +903,17 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
                     .fetch_one(pool)
                     .await
                     .context("PRAGMA freelist_count failed")?;
-                // No progress. Usually "nothing more can be freed", but in WAL
-                // mode a long-lived read snapshot pins freelist pages, and a
-                // concurrent retention delete pushes `after` back up — so this
-                // also fires on runs that DID make progress and simply lost the
-                // race. Either way the pages stay allocated, which is what an
-                // operator needs to know.
+                // No progress: either nothing more can be freed, or a
+                // concurrent retention delete pushed `after` back up. Both leave
+                // pages allocated, which is what an operator needs to know.
+                //
+                // This comment previously also claimed "a long-lived WAL read
+                // snapshot pins freelist pages". MEASURED AND FALSE: with a
+                // reader holding a snapshot taken BEFORE the delete, the
+                // freelist still drained 2000 → 0 and `page_count` halved. A
+                // reader blocks the CHECKPOINT, not the incremental vacuum — so
+                // that case exits this loop through the SUCCESS path and is
+                // reported below, not here.
                 if after >= before {
                     tracing::warn!(
                         freelist_pages = after,
@@ -980,10 +985,26 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
     // rest. Worth doing even in the NONE branch above, where it is the only
     // space this function can return at all.
     //
-    // Best-effort: a TRUNCATE checkpoint yields to active readers rather than
-    // blocking them. The next sweep does the work instead.
-    if let Err(err) = checkpoint_wal(pool).await {
-        tracing::debug!(%err, "wal checkpoint after reclaim did not run");
+    // **A blocked checkpoint is the real way the file stays big, so it warns.**
+    //
+    // Measured: with a reader holding an open snapshot, `incremental_vacuum`
+    // still drains the freelist and `page_count` halves — but the main file
+    // stayed at 16.4 MB until the reader released and the checkpoint could
+    // truncate it to 8.2 MB. So a reader does not stop the reclaim; it stops the
+    // SHRINK. That is the operator-visible outcome (`db_size_bytes` counts the
+    // WAL, and the watermark is compared against a volume), and it used to be
+    // reported at `debug!` — below any realistic filter — while the loop above
+    // warned loudly about a mechanism that does not actually occur.
+    //
+    // Not an error: the next sweep checkpoints again once the reader is gone.
+    match checkpoint_wal(pool).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            "a reader held the WAL so it could not be truncated after reclaim; the \
+             freed pages are gone but the file has not shrunk yet, and the DB-size \
+             watermark may stay engaged until the next sweep"
+        ),
+        Err(err) => tracing::warn!(%err, "wal checkpoint after reclaim failed"),
     }
     Ok(())
 }
@@ -1129,18 +1150,29 @@ pub async fn migrate_to_incremental_vacuum(
         .await
         .context("acquiring a connection for the auto_vacuum migration")?;
 
-    // **Put the temp copy on the DATABASE's volume — which takes TWO pragmas.**
+    // **Put the temp copy on the DATABASE's volume.**
     //
     // A VACUUM rebuilds through a temporary database, and the headroom check
     // above measures the data volume. `temp_store = FILE` alone only chooses
     // file-over-memory; it does NOT choose which filesystem, so the temp copy
-    // still resolved via `SQLITE_TMPDIR`/`TMPDIR`/`/var/tmp`/`/tmp` — the
-    // container rootfs. The check could pass on `/data` and the VACUUM still hit
-    // `SQLITE_FULL`, or fill the rootfs out from under Caddy. A comment here
-    // previously claimed this was handled "plus a directory beside the
-    // database"; there was no such directory. `temp_store_directory` is the one
-    // that actually decides, and it is deprecated but still honoured — there is
-    // no non-deprecated equivalent reachable from a connection.
+    // resolved via `SQLITE_TMPDIR`/`TMPDIR`/`/var/tmp`/`/tmp` — the container
+    // rootfs. The check could pass on `/data` and the VACUUM still hit
+    // `SQLITE_FULL`, or fill the rootfs out from under Caddy.
+    //
+    // `temp_store_directory` is the pragma that actually decides — measured:
+    // setting it alone moves the file, setting `temp_store = FILE` alone does
+    // not. It is deprecated but fully functional in the bundled SQLite (3.51.3,
+    // built without `SQLITE_OMIT_DEPRECATED`), and there is no non-deprecated
+    // equivalent reachable from a connection.
+    //
+    // `temp_store = FILE` is kept as belt-and-braces rather than because it is
+    // needed: this build's compile-time default is already FILE, but a build
+    // defaulting to MEMORY would silently ignore the directory entirely.
+    //
+    // Note it sets the PROCESS-GLOBAL `sqlite3_temp_directory`, not connection
+    // state — visible on other connections and other pools. Harmless because
+    // this function is only reachable from the one-shot `--migrate-auto-vacuum`
+    // CLI path, which does nothing else.
     sqlx::query("PRAGMA temp_store = FILE")
         .execute(&mut *conn)
         .await
@@ -1973,6 +2005,14 @@ fn list_query_sql(
         // This used to emit one placeholder per feed id, so the SQL string and
         // the bind list both grew with the reader's subscription count — which
         // is PDS-supplied and bounded only by the 20,000-record list ceiling.
+        //
+        // That was reachable-broken, not merely ugly: `SQLITE_LIMIT_VARIABLE_NUMBER`
+        // is 32766 on the bundled build, and the ids were bound TWICE per render
+        // (the count query and the page query), so the effective ceiling was
+        // ~16,383 feeds — below the list ceiling. Past it, `prepare` fails with
+        // "too many SQL variables" and the reader's page 500s. Measured: 20,000
+        // ids through `json_each` is a 108 KB bind that runs in 9.9 ms; 32,767
+        // placeholders does not prepare at all.
         // The first attempt at bounding it truncated the subscription list
         // instead, which traded a query-shape problem for an access problem:
         // `sync_sub_refs` writes `sub_ref` from that list, so dropped feeds

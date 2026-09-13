@@ -303,6 +303,45 @@ first one — so it is written down here rather than left implicit.
 
 ---
 
+## Round 4: what an adversarial claim-verifier found
+
+A reviewer whose only job was to EMPIRICALLY test the factual assertions in the
+commit messages and comments — because four failures in this programme had
+already originated there, and reading the code cannot catch a claim about what
+SQLite does.
+
+It tested eight and verified seven, several more precisely than they were
+written. `temp_store_directory` really is the pragma that moves the VACUUM temp
+file (and `temp_store = FILE` alone really is a no-op). `wal_checkpoint` really
+does report busy as a successful row — and the old `.execute()` really did return
+`Ok(0)` on it. `SELECT 1` really emits no `OpenRead`, including against a
+corrupted EMPTY table, which was the load-bearing half. The pool deadlock
+reproduced at 30.003 s.
+
+**One refutation, and it was a comment justifying a log line.**
+
+`store.rs` claimed "in WAL mode a long-lived read snapshot pins freelist pages",
+as the reason `reclaim`'s no-progress branch warns. Measured with the reader's
+snapshot opened BEFORE the delete — the strongest form of the claim — the
+freelist still drained 2000 → 0 and `page_count` halved. A reader blocks the
+**checkpoint**, not the incremental vacuum.
+
+So the warning was justified by a mechanism that does not occur, and the case
+that DOES occur — reader open, pages freed, but the file stuck at 16.4 MB until a
+checkpoint can truncate it to 8.2 MB — was reported at `debug!`, below any
+realistic filter. Fixed: the blocked checkpoint warns, and the comment describes
+what was measured.
+
+**One finding that strengthened a fix beyond its own justification.** The
+`json_each` change was argued as avoiding an ugly query shape. It was avoiding a
+broken one: `SQLITE_LIMIT_VARIABLE_NUMBER` is 32766, the ids were bound twice per
+render, so the effective ceiling was ~16,383 feeds — BELOW the 20,000-record PDS
+list ceiling that motivated the work. Past it, `prepare` fails outright.
+
+**Two overstatements corrected.** "Takes TWO pragmas" — one decides; the other is
+belt-and-braces against a future build default. And `temp_store_directory` is
+process-global, not connection-scoped, which the surrounding comment implied.
+
 ## The loop
 
 Fix in batches, then review the batch COLD — a reviewer that has not seen the
