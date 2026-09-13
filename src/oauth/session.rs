@@ -119,11 +119,6 @@ pub struct RefreshContext<'a> {
     pub token_endpoint: &'a str,
     pub client_id: &'a str,
     pub auth_method: super::client_auth::AuthMethod,
-    /// Where the `oauth_refresh` counter lands. Carried here rather than as a
-    /// separate parameter because it IS part of the refresh's context, and
-    /// because an eighth positional argument is the point at which a signature
-    /// stops being readable.
-    pub metrics: &'a crate::metrics::RepoMetrics,
     /// The confidential client's signing key. Required for `private_key_jwt`,
     /// unused by the localhost dev client.
     pub client_key: Option<&'a super::keys::SigningKey>,
@@ -162,23 +157,12 @@ pub async fn valid_session(
         return Ok(session);
     }
 
-    // **Timed HERE, not around the whole function.** Both paths above return a
-    // still-fresh session without touching the network, so timing the caller
-    // would count every repo call and drown the thing we actually need to see.
-    // This is the only line on which a refresh happens, so `oauth_refresh`
-    // counts refreshes and nothing else.
-    //
-    // It goes through the same `timed`/`repo_timing` pipeline as the repo ops
-    // rather than a parallel one: /admin/metrics already renders it, the
-    // persistence and pruning already handle it, and `op` is free-form TEXT so
-    // a new name needs no migration.
-    crate::metrics::timed(
-        ctx.metrics,
-        crate::metrics::Backend::Rust,
-        "oauth_refresh",
-        refresh_locked(pool, codec, http, &session, ctx, now),
-    )
-    .await
+    // NOT timed here. `oauth_refresh` wraps this call AND the discovery that
+    // precedes it, in `Repo::session` — a review found that timing only this
+    // line missed every refresh that failed in discovery, which is where the two
+    // likeliest failures live (an unreachable PDS, and the issuer-mismatch
+    // check). See the span in `repo.rs`.
+    refresh_locked(pool, codec, http, &session, ctx, now).await
 }
 
 /// The refresh itself. Called with the subject's lock held.
@@ -415,104 +399,6 @@ mod tests {
         assert!(
             !futures_lite_poll_pending(&mut b),
             "an unrelated subject was blocked"
-        );
-    }
-
-    /// **A failed refresh must be COUNTED, not merely logged.**
-    ///
-    /// The soak criterion for the rust cutover is "a week with no refresh or
-    /// revocation failures". Before `oauth_refresh` existed, a refresh failure
-    /// surfaced only as an error on whatever repo call happened to trigger it —
-    /// so the criterion was satisfied by nobody having looked, which is a
-    /// different claim.
-    #[tokio::test]
-    async fn a_failed_refresh_is_counted() {
-        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
-        crate::oauth::store::init_schema(&pool).await.unwrap();
-        let codec = crate::oauth::crypto::Codec::new(Some(&"a".repeat(43))).unwrap();
-
-        // Already expired, so `valid_session` cannot take either early return
-        // and must actually attempt the refresh. A REAL DPoP key, so the failure
-        // is the unreachable endpoint rather than an unsealable key — otherwise
-        // this would pass without the refresh ever being attempted.
-        let mut stale = session();
-        stale.expires_at = Some(NOW - 1);
-        stale.dpop_key_jwk = super::super::keys::SigningKey::generate("session-dpop")
-            .to_jwk_json()
-            .unwrap();
-        crate::oauth::store::put_session(&pool, &codec, &stale)
-            .await
-            .unwrap();
-
-        let metrics = crate::metrics::RepoMetrics::new();
-        let ctx = RefreshContext {
-            token_endpoint: "https://token.invalid/oauth/token",
-            client_id: "https://feather-reader.com/oauth/client-metadata.json",
-            auth_method: super::super::client_auth::AuthMethod::None,
-            client_key: None,
-            metrics: &metrics,
-        };
-        let out = valid_session(
-            &pool,
-            &codec,
-            &reqwest::Client::new(),
-            &RefreshLocks::default(),
-            DID,
-            &ctx,
-            NOW,
-        )
-        .await;
-        assert!(out.is_err(), "an unreachable token endpoint must fail");
-
-        let row = metrics
-            .snapshot()
-            .into_iter()
-            .find(|r| r.op == "oauth_refresh")
-            .expect("the refresh attempt was not recorded at all");
-        assert_eq!(
-            row.stats.err_count, 1,
-            "a failed refresh must count as an error"
-        );
-        assert_eq!(row.stats.ok_count, 0);
-    }
-
-    /// **A session that is still fresh must NOT be counted as a refresh.**
-    ///
-    /// The metric is only meaningful if it counts refreshes rather than session
-    /// reads — `valid_session` runs on every repo call, and timing the whole
-    /// function would bury a rare failure under thousands of no-op successes.
-    #[tokio::test]
-    async fn reading_a_fresh_session_records_no_refresh() {
-        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
-        crate::oauth::store::init_schema(&pool).await.unwrap();
-        let codec = crate::oauth::crypto::Codec::new(Some(&"a".repeat(43))).unwrap();
-        crate::oauth::store::put_session(&pool, &codec, &session())
-            .await
-            .unwrap();
-
-        let metrics = crate::metrics::RepoMetrics::new();
-        let ctx = RefreshContext {
-            token_endpoint: "https://token.invalid/oauth/token",
-            client_id: "https://feather-reader.com/oauth/client-metadata.json",
-            auth_method: super::super::client_auth::AuthMethod::None,
-            client_key: None,
-            metrics: &metrics,
-        };
-        valid_session(
-            &pool,
-            &codec,
-            &reqwest::Client::new(),
-            &RefreshLocks::default(),
-            DID,
-            &ctx,
-            NOW,
-        )
-        .await
-        .expect("a fresh session needs no refresh and must succeed");
-
-        assert!(
-            metrics.snapshot().iter().all(|r| r.op != "oauth_refresh"),
-            "reading a fresh session recorded a refresh it never performed",
         );
     }
 
