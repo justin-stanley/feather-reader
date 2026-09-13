@@ -1033,8 +1033,6 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         return Ok(0);
     }
 
-    let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
-
     // **The hard ceiling — the bound that sparing would otherwise remove.**
     //
     // Sparing `read = 0` is not a small exception: "mark unread" is a one-click
@@ -1056,12 +1054,13 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     // text.
     let hard_deleted = match &hard_cutoff {
         Some(cutoff) => {
-            sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
-                .bind(cutoff)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| format!("prune_old_entries hard ceiling (cutoff {cutoff})"))?
-                .rows_affected()
+            delete_in_batches(
+                pool,
+                "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
+                cutoff,
+                "hard ceiling",
+            )
+            .await?
         }
         None => 0,
     };
@@ -1096,32 +1095,117 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     // This is what the documentation has always described; the query did not
     // implement it.
     let soft_deleted = match &cutoff {
-        Some(cutoff) => sqlx::query(
-            r#"
-                DELETE FROM entries
-                WHERE COALESCE(published, fetched_at) < ?1
-                  AND id NOT IN (
-                      SELECT entry_id FROM entry_state
-                      WHERE starred = 1 OR read = 0
-                  )
-                "#,
-        )
-        .bind(cutoff)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?
-        .rows_affected(),
+        Some(cutoff) => {
+            delete_in_batches(
+                pool,
+                "SELECT id FROM entries \
+                 WHERE COALESCE(published, fetched_at) < ?1 \
+                   AND id NOT IN ( \
+                       SELECT entry_id FROM entry_state \
+                       WHERE starred = 1 OR read = 0 \
+                   )",
+                cutoff,
+                "window",
+            )
+            .await?
+        }
         None => 0,
     };
     let deleted = soft_deleted + hard_deleted;
 
-    // Only touch cursors when rows actually went away.
+    // Only touch cursors when rows actually went away — and OUTSIDE the deletes.
+    //
+    // This used to run inside the one transaction that wrapped both deletes,
+    // which made the whole sweep a single write-lock hold: load every
+    // `read_cursor` row, then issue a fresh per-cursor `SELECT … JOIN … WHERE
+    // f.url = ?` returning up to `max_entries_per_feed` ids, all before the
+    // commit. SQLite is single-writer and `busy_timeout` is 5 s, so for that
+    // whole span every mark-read, every login write and every cursor flush
+    // failed.
+    //
+    // Correctness survives the move because the scrub is idempotent — it
+    // computes each cursor's surviving ids from what is in `entries` NOW, and
+    // rewrites only cursors that actually change. If the process dies between
+    // the deletes and the scrub, the next sweep finishes the job, and in the
+    // meantime a stale id in an exception set is inert: the flusher sends it,
+    // and it names an entry nobody can reach.
     if deleted > 0 {
-        prune_orphan_cursor_ids_tx(&mut tx, None).await?;
+        if let Err(err) = prune_orphan_cursor_ids(pool, None).await {
+            // The deletes already committed and are the point of this call.
+            // A failed scrub leaves stale ids to be cleaned up next sweep.
+            tracing::warn!(%err, "retention sweep: cursor id scrub failed after the deletes");
+        }
     }
 
-    tx.commit().await.context("commit prune_old_entries tx")?;
     Ok(deleted)
+}
+
+/// Rows deleted per statement by [`delete_in_batches`].
+///
+/// Small enough that one batch — including its `entry_state` FK cascade — is a
+/// short lock hold, large enough that a big sweep is tens of statements rather
+/// than thousands.
+const PRUNE_BATCH: i64 = 1_000;
+
+/// Backstop against a delete loop that never drains. `rows_affected == 0` is the
+/// real terminator; this only bounds the damage if a future predicate change
+/// makes that untrue. At [`PRUNE_BATCH`] this is 10M rows, far past anything a
+/// 1 GB volume holds.
+const PRUNE_MAX_BATCHES: usize = 10_000;
+
+/// Delete every entry matched by `select_ids` (a `SELECT id FROM entries …`
+/// bound to one `?1` cutoff), in bounded batches, **one implicit transaction per
+/// batch**.
+///
+/// The retention sweep used to be a single `DELETE` inside one explicit
+/// transaction. On a populated instance that is one unbroken write-lock hold
+/// covering tens of thousands of row deletes plus their `entry_state` cascades —
+/// measured at ~10 minutes before `idx_entry_state_entry_id` existed, and still
+/// a single indivisible span after it. Everything else that writes (mark-read,
+/// login, cursor flush) has a 5 s `busy_timeout` and simply fails for the
+/// duration.
+///
+/// Batching does not make the total work smaller; it makes it INTERRUPTIBLE. A
+/// writer waiting on the lock gets in between batches instead of timing out, and
+/// the short sleep below guarantees that window actually exists rather than
+/// leaving it to chance against a tight loop.
+///
+/// A partial sweep is safe: each batch commits on its own, and the predicate is
+/// a fixed cutoff, so a crash mid-sweep leaves fewer rows deleted and the next
+/// run finishes the job.
+async fn delete_in_batches(
+    pool: &SqlitePool,
+    select_ids: &str,
+    cutoff: &str,
+    label: &str,
+) -> Result<u64> {
+    let sql = format!("DELETE FROM entries WHERE id IN ({select_ids} LIMIT {PRUNE_BATCH})");
+    let mut total: u64 = 0;
+    for batch in 0..PRUNE_MAX_BATCHES {
+        let n = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(cutoff)
+            .execute(pool)
+            .await
+            .with_context(|| format!("prune_old_entries {label} (cutoff {cutoff})"))?
+            .rows_affected();
+        total += n;
+        if n == 0 {
+            return Ok(total);
+        }
+        // Hand the write lock over. Without this the loop can re-acquire it
+        // immediately and a waiting writer still starves — batching would then
+        // be bookkeeping rather than a fix. At `PRUNE_BATCH` rows per batch this
+        // adds ~10 ms per 1,000 deleted rows to a sweep that runs once a day.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if batch + 1 == PRUNE_MAX_BATCHES {
+            tracing::warn!(
+                label,
+                total,
+                "retention sweep hit its batch backstop; the rest waits for the next run"
+            );
+        }
+    }
+    Ok(total)
 }
 
 /// Scrub entry ids that no longer exist out of `read_cursor.read_ids` /
@@ -1136,6 +1220,13 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
 /// sets actually change is rewritten and marked `dirty` so the flusher resyncs
 /// it; unchanged cursors are left untouched (no spurious dirtying / PDS writes).
 /// Returns the number of cursor rows modified.
+///
+/// This is the TRANSACTIONAL variant, used by the per-feed trim inside
+/// `insert_entries`: it is scoped to one feed, examines that feed's cursors
+/// only, and genuinely wants to land atomically with the trim that created the
+/// orphans. The retention sweep uses [`prune_orphan_cursor_ids`] instead —
+/// global scope inside one transaction is what made the sweep a multi-minute
+/// write-lock hold.
 async fn prune_orphan_cursor_ids_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     feed_id: Option<i64>,
@@ -1214,6 +1305,99 @@ async fn prune_orphan_cursor_ids_tx(
         changed += 1;
     }
     Ok(changed)
+}
+
+/// [`prune_orphan_cursor_ids_tx`] over the pool — **no enclosing transaction**.
+///
+/// Same result, different locking. Each statement commits on its own, so the
+/// single write lock is taken for one cursor rewrite at a time and released
+/// between them, and the reads in between block nothing at all in WAL mode.
+/// That matters because this is the global pass: the retention sweep's version
+/// loads EVERY `read_cursor` row and then issues one live-ids query per cursor,
+/// and holding all of that inside a transaction is what made a daily sweep look
+/// like an outage to every writer on the instance.
+///
+/// Idempotent by construction — it recomputes each cursor's surviving ids from
+/// the current contents of `entries` — so interleaving with other writers, or
+/// dying partway and being re-run, is safe.
+///
+/// `feed_id = Some(..)` scopes to one feed; `None` scans every cursor. Returns
+/// the number of cursor rows modified.
+async fn prune_orphan_cursor_ids(pool: &SqlitePool, feed_id: Option<i64>) -> Result<u64> {
+    let feed_url = match feed_id {
+        Some(fid) => match sqlx::query_scalar::<_, String>("SELECT url FROM feeds WHERE id = ?1")
+            .bind(fid)
+            .fetch_optional(pool)
+            .await
+            .context("prune_orphan_cursor_ids: feed url")?
+        {
+            Some(u) => Some(u),
+            None => return Ok(0),
+        },
+        None => None,
+    };
+
+    let cursors: Vec<(String, String, String, String)> = match &feed_url {
+        Some(url) => sqlx::query_as(
+            "SELECT did, feed_url, read_ids, unread_ids FROM read_cursor WHERE feed_url = ?1",
+        )
+        .bind(url)
+        .fetch_all(pool)
+        .await
+        .context("prune_orphan_cursor_ids: load feed cursors")?,
+        None => sqlx::query_as("SELECT did, feed_url, read_ids, unread_ids FROM read_cursor")
+            .fetch_all(pool)
+            .await
+            .context("prune_orphan_cursor_ids: load all cursors")?,
+    };
+
+    let now = now_rfc3339();
+    let mut changed: u64 = 0;
+    for (did, curl, read_ids, unread_ids) in cursors {
+        // An empty exception set has nothing to orphan, and skipping it avoids
+        // the per-cursor live-ids query entirely — which is the dominant cost of
+        // this pass and the common case for a cursor at its high-water mark.
+        if is_empty_id_set(&read_ids) && is_empty_id_set(&unread_ids) {
+            continue;
+        }
+        let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
+            "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE f.url = ?1",
+        )
+        .bind(&curl)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("prune_orphan_cursor_ids: live ids for {curl}"))?
+        .into_iter()
+        .collect();
+
+        let new_read = filter_id_set_to_live(&read_ids, &live);
+        let new_unread = filter_id_set_to_live(&unread_ids, &live);
+        if new_read == read_ids && new_unread == unread_ids {
+            continue; // nothing orphaned — leave the cursor (and its dirty flag) alone
+        }
+        sqlx::query(
+            "UPDATE read_cursor SET read_ids = ?3, unread_ids = ?4, dirty = 1, updated_at = ?5 \
+             WHERE did = ?1 AND feed_url = ?2",
+        )
+        .bind(&did)
+        .bind(&curl)
+        .bind(&new_read)
+        .bind(&new_unread)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .with_context(|| format!("prune_orphan_cursor_ids: rewrite cursor {did}/{curl}"))?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Whether a stored id-set is empty — `[]`, blank, or unparseable. Deliberately
+/// textual: this is a fast pre-filter, and [`filter_id_set_to_live`] remains the
+/// authority on what the set actually contains.
+fn is_empty_id_set(raw: &str) -> bool {
+    let t = raw.trim();
+    t.is_empty() || t == "[]"
 }
 
 /// Filter a JSON id-array string down to only ids present in `live`, returning
@@ -4696,6 +4880,209 @@ mod tests {
             !ids.contains(&a_id.to_string()),
             "trimmed entry id must be scrubbed from the cursor"
         );
+        Ok(())
+    }
+
+    /// A sweep spanning several batches must still delete everything.
+    ///
+    /// The batching exists to make the write-lock hold interruptible, not to
+    /// make the sweep partial — so the obvious way to get it wrong is an
+    /// off-by-one that leaves a batch behind, or a loop that exits on the first
+    /// short batch instead of the first empty one.
+    #[tokio::test]
+    async fn a_sweep_larger_than_one_batch_still_drains() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://bulk.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Deliberately not a multiple of PRUNE_BATCH, so the final batch is
+        // short and the loop has to keep going to the empty one.
+        let count = (PRUNE_BATCH * 2 + 137) as usize;
+        let entries: Vec<NewEntry> = (0..count)
+            .map(|i| NewEntry {
+                guid: format!("bulk-{i}"),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        assert_eq!(count_entries(&pool).await? as usize, count);
+
+        let deleted = prune_old_entries(&pool, 30, 180).await?;
+        assert_eq!(deleted as usize, count, "the sweep left rows behind");
+        assert_eq!(count_entries(&pool).await?, 0);
+        Ok(())
+    }
+
+    /// **The sweep must not lock other writers out for its duration.**
+    ///
+    /// The whole sweep used to be one transaction — both deletes plus a global
+    /// cursor scrub that loads every `read_cursor` row and then issues a
+    /// per-cursor live-ids query. SQLite is single-writer with a 5 s
+    /// `busy_timeout`, so every mark-read, login write and cursor flush failed
+    /// for that whole span.
+    ///
+    /// On-disk (WAL, 5 connections) because the in-memory pool is deliberately
+    /// single-connection, which would make a concurrency test meaningless.
+    #[tokio::test]
+    async fn a_writer_gets_through_while_the_sweep_runs() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-sweeplock-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://lock.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let entries: Vec<NewEntry> = (0..(PRUNE_BATCH * 10) as usize)
+            .map(|i| NewEntry {
+                guid: format!("lock-{i}"),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+
+        // The discriminating measurement is LATENCY, not success. With only ten
+        // thousand rows the old single-transaction sweep would finish inside the
+        // 5 s `busy_timeout`, so the interleaved writes would still eventually
+        // land — they would just each have waited for the ENTIRE sweep. So the
+        // writer records the worst single-write wait, and the assertion is that
+        // no write waited for more than a fraction of the sweep.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_done = std::sync::Arc::clone(&done);
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let mut wrote = 0_u32;
+            let mut worst = std::time::Duration::ZERO;
+            while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
+                let t0 = std::time::Instant::now();
+                grant_access(
+                    &writer_pool,
+                    &format!("did:plc:writer{wrote}"),
+                    None,
+                    "sweep-test",
+                    None,
+                )
+                .await?;
+                worst = worst.max(t0.elapsed());
+                wrote += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            Ok::<(u32, std::time::Duration), anyhow::Error>((wrote, worst))
+        });
+
+        let t0 = std::time::Instant::now();
+        let deleted = prune_old_entries(&pool, 30, 180).await?;
+        let sweep = t0.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (wrote, worst) = writer.await??;
+
+        assert_eq!(deleted as usize, entries.len());
+        // Sanity: the sweep has to take long enough for "was a writer blocked
+        // for it" to be a meaningful question. Ten batches of inter-batch
+        // hand-off put this comfortably past the floor.
+        assert!(
+            sweep > std::time::Duration::from_millis(50),
+            "the sweep finished in {sweep:?}; too fast for this test to mean anything"
+        );
+        // The real property. Note this is asserted BEFORE the throughput check
+        // below: when the sweep does hold the lock, the writer is starved, so
+        // both assertions fail — and this one names the actual cause.
+        assert!(
+            worst * 3 < sweep,
+            "a single write waited {worst:?} of a {sweep:?} sweep ({wrote} writes \
+             landed) — the sweep is holding the write lock ACROSS batches rather \
+             than releasing it between them"
+        );
+        assert!(
+            wrote > 5,
+            "only {wrote} writes ran alongside a {sweep:?} sweep"
+        );
+
+        pool.close().await;
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+        Ok(())
+    }
+
+    /// The cursor scrub still happens — it just no longer rides inside the
+    /// delete transaction. Moving it out is only safe because it is idempotent;
+    /// this pins that it still runs at all, which is the thing a "move it out"
+    /// refactor can silently drop.
+    #[tokio::test]
+    async fn the_sweep_still_scrubs_orphaned_cursor_ids() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:scrub";
+        let feed_url = "https://scrub.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "doomed".to_string(),
+                published: Some(old),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let doomed = entries_for_feed(&pool, did, feed_id).await;
+        // `entries_for_feed` is sub_ref-scoped; read the id directly instead.
+        drop(doomed);
+        let doomed_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'doomed'")
+            .fetch_one(&pool)
+            .await?;
+
+        upsert_cursor(
+            &pool,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: feed_url.to_string(),
+                read_through: None,
+                read_ids: format!("[\"{doomed_id}\"]"),
+                unread_ids: "[]".to_string(),
+                dirty: false,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+
+        assert_eq!(prune_old_entries(&pool, 30, 180).await?, 1);
+
+        let cursor = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
+        assert!(
+            ids.is_empty(),
+            "the deleted entry's id survived in the cursor: {ids:?}"
+        );
+        assert!(cursor.dirty, "a rewritten cursor must be re-flushed");
         Ok(())
     }
 

@@ -389,7 +389,13 @@ struct RateLimitState {
 /// dependency → no network fetch at build, deterministic offline CI).
 #[derive(Clone)]
 struct RateLimiter {
-    inner: std::sync::Arc<Mutex<HashMap<IpAddr, Bucket>>>,
+    inner: std::sync::Arc<Mutex<RateLimiterState>>,
+}
+
+/// The limiter's shared state: the buckets plus when they were last swept.
+struct RateLimiterState {
+    buckets: HashMap<IpAddr, Bucket>,
+    last_sweep: Instant,
 }
 
 /// One IP's token bucket: a fractional token count + the last-refill instant.
@@ -405,27 +411,88 @@ const RATE_REFILL_PER_SEC: f64 = 1.0;
 /// Evict idle buckets older than this so the map can't grow unbounded.
 const RATE_IDLE_EVICT: Duration = Duration::from_secs(3600);
 
+/// How often the idle sweep may actually run.
+///
+/// The sweep used to run on EVERY guarded request — an O(n) scan of the whole
+/// map to find entries that, by construction, can only age out on an hour
+/// boundary. `GET /login` and `GET /claim` are guarded and unauthenticated, so
+/// under any volume of distinct source IPs the server spent its single shared
+/// core re-walking a map whose contents had not changed. Once a minute is
+/// plenty: it bounds bucket lifetime at `RATE_IDLE_EVICT + RATE_SWEEP_EVERY`.
+const RATE_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// Most buckets kept. At roughly 100 bytes each this is ~1 MB — a bound, not a
+/// target, sized so ordinary traffic never reaches it.
+///
+/// The idle eviction above was the only bound, and it is a TIME bound, which
+/// says nothing about how many distinct IPs can arrive inside one hour.
+/// `net.rs` bounds the equivalent structure by count (`MAX_PINNED_CLIENTS`);
+/// this one did not.
+const MAX_RATE_BUCKETS: usize = 10_000;
+
+/// When the cap is hit, evict down to this fraction of it rather than removing
+/// a single entry — so the O(n) eviction happens once per `cap/8` requests
+/// instead of once per request while the map sits full.
+const RATE_EVICT_DOWN_TO: usize = MAX_RATE_BUCKETS * 7 / 8;
+
 impl RateLimiter {
     /// A fresh, shared limiter (cloned into the middleware state).
     fn shared() -> Self {
         Self {
-            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            inner: std::sync::Arc::new(Mutex::new(RateLimiterState {
+                buckets: HashMap::new(),
+                last_sweep: Instant::now(),
+            })),
         }
     }
 
     /// Charge one token for `ip`; returns `true` if allowed, `false` if the
     /// bucket is empty (→ 429).
     fn check(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let mut map = match self.inner.lock() {
+        self.check_at(ip, Instant::now())
+    }
+
+    /// [`check`](Self::check) with the clock injected, so the sweep and eviction
+    /// paths below are reachable in a test without sleeping through an hour.
+    fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
+        let mut state = match self.inner.lock() {
             Ok(m) => m,
             // A poisoned lock shouldn't take the site down — fail open.
             Err(p) => p.into_inner(),
         };
-        // Opportunistic eviction of long-idle buckets (cheap, amortised).
-        map.retain(|_, b| now.duration_since(b.last) < RATE_IDLE_EVICT);
 
-        let bucket = map.entry(ip).or_insert(Bucket {
+        // Idle sweep, at most once per `RATE_SWEEP_EVERY`.
+        if now.duration_since(state.last_sweep) >= RATE_SWEEP_EVERY {
+            state
+                .buckets
+                .retain(|_, b| now.duration_since(b.last) < RATE_IDLE_EVICT);
+            state.last_sweep = now;
+        }
+
+        // Hard size bound, independent of the time bound above.
+        //
+        // Evicting LEAST-RECENTLY-USED is what makes this safe to do at all. An
+        // attacker cannot use eviction to clear their OWN throttled bucket: that
+        // bucket is by definition the most recently touched, so it is the last
+        // thing this removes. Going quiet long enough to become the oldest entry
+        // is exactly what the refill already grants for free.
+        if state.buckets.len() >= MAX_RATE_BUCKETS && !state.buckets.contains_key(&ip) {
+            let mut by_age: Vec<(IpAddr, Instant)> =
+                state.buckets.iter().map(|(k, b)| (*k, b.last)).collect();
+            by_age.sort_unstable_by_key(|(_, last)| *last);
+            for (victim, _) in by_age
+                .into_iter()
+                .take(state.buckets.len().saturating_sub(RATE_EVICT_DOWN_TO))
+            {
+                state.buckets.remove(&victim);
+            }
+            warn!(
+                buckets = state.buckets.len(),
+                "rate-limit bucket cap reached; evicted the least recently seen clients"
+            );
+        }
+
+        let bucket = state.buckets.entry(ip).or_insert(Bucket {
             tokens: RATE_BURST,
             last: now,
         });
@@ -4771,6 +4838,94 @@ mod tests {
         });
         let sc = cookie::sign_session(&sid, &state.config.cookie_secret);
         sc.split(';').next().unwrap().to_string()
+    }
+
+    /// The bucket map is bounded by COUNT, not only by idle time. An hour is a
+    /// long time to accept distinct source IPs on two unauthenticated guarded
+    /// routes.
+    #[test]
+    fn the_rate_limit_map_is_bounded() {
+        let rl = RateLimiter::shared();
+        let now = Instant::now();
+        for i in 0..(MAX_RATE_BUCKETS + 2_000) {
+            // Distinct IPv6 addresses, all "seen" at increasing times so the LRU
+            // ordering below is well-defined.
+            let ip: IpAddr = format!("2001:db8::{i:x}").parse().unwrap();
+            rl.check_at(ip, now + Duration::from_millis(i as u64));
+        }
+        let len = rl.inner.lock().unwrap().buckets.len();
+        assert!(
+            len <= MAX_RATE_BUCKETS,
+            "the rate-limit map grew to {len}, past its {MAX_RATE_BUCKETS} cap"
+        );
+    }
+
+    /// Eviction must not hand a throttled attacker a fresh burst.
+    ///
+    /// The bound is LRU, so the one bucket an attacker can never evict is their
+    /// own — it is the most recently touched thing in the map. If this inverted,
+    /// the size cap would become a rate-limit bypass: spray addresses until the
+    /// map overflows, then resume.
+    #[test]
+    fn flooding_the_map_does_not_reset_the_flooders_own_bucket() {
+        let rl = RateLimiter::shared();
+        let base = Instant::now();
+        let attacker: IpAddr = "203.0.113.7".parse().unwrap();
+        // Nanosecond steps: enough to keep the LRU ordering strictly increasing,
+        // far too little for `RATE_REFILL_PER_SEC` to hand back a token. A
+        // millisecond step made the whole flood take a second, and the refill —
+        // working correctly — then looked exactly like an eviction bypass.
+        let at = |n: u64| base + Duration::from_nanos(n);
+
+        // Spend the burst. `RATE_BURST` allowed, then refused.
+        for i in 0..(RATE_BURST as u64) {
+            assert!(rl.check_at(attacker, at(i)));
+        }
+        assert!(
+            !rl.check_at(attacker, at(RATE_BURST as u64)),
+            "burst was not exhausted; the rest of this test proves nothing"
+        );
+
+        // Now overflow the map from other addresses, interleaving the attacker
+        // so their bucket stays hot — the realistic shape of the attack.
+        for i in 0..(MAX_RATE_BUCKETS + 2_000) {
+            let t = at(100 + i as u64 * 2);
+            let ip: IpAddr = format!("2001:db8:1::{i:x}").parse().unwrap();
+            rl.check_at(ip, t);
+            assert!(
+                !rl.check_at(attacker, t),
+                "the attacker got a token back after evictions at i={i}"
+            );
+        }
+    }
+
+    /// The idle sweep is amortised, not per-request. It used to be an O(n) scan
+    /// of the whole map on every guarded request, on one shared core.
+    #[test]
+    fn the_idle_sweep_does_not_run_on_every_request() {
+        let rl = RateLimiter::shared();
+        let start = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+
+        rl.check_at(a, start);
+        // `b` arrives an hour later: `a` is now idle past `RATE_IDLE_EVICT`, but
+        // the sweep interval has elapsed too, so this request does sweep it.
+        rl.check_at(b, start + RATE_IDLE_EVICT + Duration::from_secs(1));
+        assert!(
+            !rl.inner.lock().unwrap().buckets.contains_key(&a),
+            "an idle bucket survived a sweep that was due"
+        );
+
+        // A second request moments later must NOT re-sweep — `b` is still there,
+        // and the recorded sweep time must not have moved.
+        let before = rl.inner.lock().unwrap().last_sweep;
+        rl.check_at(b, start + RATE_IDLE_EVICT + Duration::from_secs(2));
+        assert_eq!(
+            rl.inner.lock().unwrap().last_sweep,
+            before,
+            "the sweep ran again within the interval"
+        );
     }
 
     #[test]

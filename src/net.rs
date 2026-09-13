@@ -174,6 +174,14 @@ const PINNED_CLIENT_TTL: Duration = Duration::from_secs(300);
 /// talks to one PDS, while the poller talks to as many hosts as there are feeds.
 const MAX_PINNED_CLIENTS: usize = 256;
 
+/// How long a pinned client may hold an IDLE socket open.
+///
+/// Deliberately shorter than [`PINNED_CLIENT_TTL`] so a client releases its
+/// sockets before the cache releases the client — otherwise the last minute of
+/// an entry's life is pure socket rent. See [`build_pinned_client`] for why the
+/// pool needs bounding at all.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Pinned clients, keyed by the **vetted address** they are pinned to.
 ///
 /// ## Why this is safe to reuse
@@ -270,6 +278,26 @@ fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         // never-finishing upstream.
         .timeout(FETCH_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        // Bound the idle connection pool too.
+        //
+        // These clients are CACHED — up to `MAX_PINNED_CLIENTS` of them, each
+        // holding its own pool — and every entry keeps live keep-alive TLS
+        // connections open until it is evicted. With reqwest's defaults
+        // (unlimited idle per host, no idle timeout) a poller touching many
+        // distinct feed hosts drives the cache toward its bound and each entry
+        // toward an unbounded number of sockets, on a 512 MB box with one shared
+        // core. The cache was given a size bound for the same reason; its pools
+        // were not.
+        //
+        // One idle connection per host is the right number here: reuse across
+        // the ~300 s TTL is what the cache exists for (measured 91 ms cold
+        // versus 30 ms warm), and nothing in this codebase issues concurrent
+        // requests to the SAME host through one client — `guarded_get` walks
+        // redirect hops sequentially, and the poller's concurrency is across
+        // DIFFERENT feeds. The idle timeout is well under the cache TTL so
+        // sockets are released before the client itself is.
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         // Override reqwest's resolver for this host only: connect goes straight
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
@@ -851,6 +879,19 @@ pub(crate) mod tests {
             cache.builds.load(Ordering::Relaxed),
             1,
             "a continuously-used client was expired by age rather than idleness"
+        );
+    }
+
+    /// A client must release its idle sockets BEFORE the cache releases the
+    /// client. The other way round, every entry spends the tail of its life
+    /// holding connections nothing will reuse — which is the whole cost the pool
+    /// bound exists to avoid.
+    #[test]
+    fn idle_sockets_are_released_before_their_client_is() {
+        assert!(
+            POOL_IDLE_TIMEOUT < PINNED_CLIENT_TTL,
+            "pool idle timeout {POOL_IDLE_TIMEOUT:?} is not shorter than the \
+             client TTL {PINNED_CLIENT_TTL:?}"
         );
     }
 
