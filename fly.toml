@@ -213,6 +213,28 @@ kill_timeout = "45s"
   # it, and re-registers automatically once the check passes. (That capability
   # existed on Apps V1 as `restart_limit`; it has no successor on Machines.)
   #
+  # MEASURED on a throwaway app mirroring this config exactly — one machine,
+  # auto_stop off, same 15s/3s/10s check — by failing /health for 120 s:
+  #
+  #   t=  0s  200   0.21s     healthy
+  #   t=  2s  503  39.83s  <-- the edge HANGS ~40 s, THEN 503s
+  #   t= 44s  503  39.56s
+  #   t= 85s  503  39.67s
+  #   t=127s  200   0.30s     re-registered ~7 s after health returned
+  #
+  # Machine event log afterwards: `launch` and `start`, both at creation. No
+  # restart, no stop — the docs' claim holds, now verified rather than read.
+  #
+  # **The ~40 s is the part worth designing around, and it is undocumented.** A
+  # failed check does not fail requests fast; it makes every request hang for
+  # about forty seconds first. Browsers sit spinning, clients hit their own
+  # timeouts, and connections pile up against the 250 hard_limit for the whole
+  # outage. That is materially worse than an immediate 503 and it is the real
+  # argument for keeping this check NARROW: anything that can flap here converts
+  # a brief internal blip into forty-second hangs for every visitor. It is also
+  # why /health's DB probe uses a 2 s timeout inside this 3 s one — the app must
+  # answer with a reason before Fly infers a failure and the hang begins.
+  #
   # With ONE machine there is no healthy peer to shift to, so a 503 here is not a
   # failover — it is a total outage lasting exactly as long as the condition. It
   # ALSO fails a `fly deploy`: the rolling strategy waits for the new machine to
