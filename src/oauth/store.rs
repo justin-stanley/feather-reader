@@ -590,7 +590,9 @@ pub async fn get_nonce(pool: &SqlitePool, origin: &str) -> Result<Option<String>
 
 /// Record the latest DPoP nonce for an origin. Servers rotate nonces, so a
 /// later value replaces the earlier one.
-pub async fn put_nonce(pool: &SqlitePool, origin: &str, nonce: &str) -> Result<()> {
+/// `now` is passed in rather than read here, matching the rest of this module —
+/// and so the sweeper's age rule can be tested without waiting for a clock.
+pub async fn put_nonce(pool: &SqlitePool, origin: &str, nonce: &str, now: i64) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO oauth_nonce (origin, nonce, updated_at) VALUES (?1, ?2, ?3)
@@ -600,7 +602,7 @@ pub async fn put_nonce(pool: &SqlitePool, origin: &str, nonce: &str) -> Result<(
     )
     .bind(origin)
     .bind(nonce)
-    .bind(chrono::Utc::now().timestamp())
+    .bind(now)
     .execute(pool)
     .await
     .context("storing the DPoP nonce")?;
@@ -863,6 +865,29 @@ mod tests {
                 "tampering with `{column}` went undetected"
             );
         }
+        Ok(())
+    }
+
+    /// Stale nonces are swept; fresh ones are not.
+    ///
+    /// Its sibling `sweep_expired_pending` has a test and this had none —
+    /// replacing the whole body with `Ok(0)` passed. The origins come from
+    /// whatever handle a visitor types into the login form and are written
+    /// during PAR, before any authentication, so the table is a pre-auth write
+    /// primitive against the volume.
+    #[tokio::test]
+    async fn stale_nonces_are_swept_and_fresh_ones_kept() -> anyhow::Result<()> {
+        let (pool, _codec) = db().await;
+        put_nonce(&pool, "https://old.example", "n1", NOW - 10_000).await?;
+        put_nonce(&pool, "https://new.example", "n2", NOW).await?;
+
+        assert_eq!(sweep_stale_nonces(&pool, NOW - 5_000).await?, 1);
+        assert_eq!(get_nonce(&pool, "https://old.example").await?, None);
+        assert_eq!(
+            get_nonce(&pool, "https://new.example").await?.as_deref(),
+            Some("n2"),
+            "a nonce still in use was swept"
+        );
         Ok(())
     }
 
@@ -1180,8 +1205,8 @@ mod tests {
         let (pool, _) = db().await;
         assert_eq!(get_nonce(&pool, "https://a.example").await?, None);
 
-        put_nonce(&pool, "https://a.example", "n1").await?;
-        put_nonce(&pool, "https://b.example", "n2").await?;
+        put_nonce(&pool, "https://a.example", "n1", NOW).await?;
+        put_nonce(&pool, "https://b.example", "n2", NOW).await?;
         assert_eq!(
             get_nonce(&pool, "https://a.example").await?.as_deref(),
             Some("n1")
@@ -1192,7 +1217,7 @@ mod tests {
         );
 
         // Rotation: servers rotate nonces, so a later value replaces the earlier.
-        put_nonce(&pool, "https://a.example", "n3").await?;
+        put_nonce(&pool, "https://a.example", "n3", NOW).await?;
         assert_eq!(
             get_nonce(&pool, "https://a.example").await?.as_deref(),
             Some("n3")

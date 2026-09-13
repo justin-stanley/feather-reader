@@ -243,7 +243,7 @@ pub async fn send_with_dpop(
 
         if let Some(offered) = &offered {
             if Some(offered) != nonce.as_ref() {
-                store::put_nonce(pool, &origin, offered).await?;
+                store::put_nonce(pool, &origin, offered, chrono::Utc::now().timestamp()).await?;
             }
         }
 

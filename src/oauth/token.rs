@@ -372,6 +372,66 @@ mod tests {
         assert_eq!(parse_token_response(&body).unwrap().expires_in, None);
     }
 
+    /// **`expires_in` has an upper bound, and it is load-bearing.**
+    ///
+    /// Both consumers compute `now + seconds`, and release builds have overflow
+    /// checks off, so `i64::MAX` wraps to a large NEGATIVE expiry: `is_stale`
+    /// becomes permanently true and every request performs a full refresh round
+    /// trip to the server that sent it. The cap was added with a comment
+    /// explaining exactly that — and deleting it passed every test, because the
+    /// neighbouring case only covers `0`, `-1` and non-integers.
+    #[test]
+    fn an_absurd_expires_in_is_rejected() {
+        for absurd in [i64::MAX, MAX_EXPIRES_IN_SECS + 1] {
+            let body = json!({
+                "token_type": "DPoP",
+                "scope": "atproto",
+                "sub": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "access_token": "at",
+                "expires_in": absurd,
+            });
+            assert!(
+                parse_token_response(&body).is_err(),
+                "accepted expires_in={absurd}, which overflows `now + seconds`"
+            );
+        }
+        // The cap itself is still a valid value.
+        let ok = json!({
+            "token_type": "DPoP",
+            "scope": "atproto",
+            "sub": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+            "access_token": "at",
+            "expires_in": MAX_EXPIRES_IN_SECS,
+        });
+        assert_eq!(
+            parse_token_response(&ok).unwrap().expires_in,
+            Some(MAX_EXPIRES_IN_SECS)
+        );
+    }
+
+    /// **An EMPTY `refresh_token` is absent, not a value.**
+    ///
+    /// Only *absent* means "keep the one we have" downstream, so a server
+    /// answering `""` replaced a live token with nothing: the next refresh was
+    /// rejected as `invalid_grant` and the session deleted — the spurious logout
+    /// the refresh code is written to avoid. The existing test removes the key
+    /// entirely, which cannot see this.
+    #[test]
+    fn an_empty_refresh_token_is_treated_as_absent() {
+        let body = json!({
+            "token_type": "DPoP",
+            "scope": "atproto",
+            "sub": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+            "access_token": "at",
+            "refresh_token": "",
+        });
+        assert_eq!(
+            parse_token_response(&body).unwrap().refresh_token,
+            None,
+            "an empty refresh token would overwrite a live one and log the user out"
+        );
+    }
+
     #[test]
     fn a_nonsensical_expires_in_is_rejected() {
         for bad in [json!(0), json!(-1), json!("3600"), json!(3600.5)] {

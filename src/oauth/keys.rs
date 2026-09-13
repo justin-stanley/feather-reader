@@ -852,4 +852,101 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// **The race loser adopts the winner's key, not the one it threw away.**
+    ///
+    /// Two replicas starting together both find no file, both generate a key,
+    /// and both try to link. The loser must read back what is on disk — two
+    /// processes holding different keys under one `kid` is exactly the split the
+    /// no-clobber guard exists to prevent. A mutation returning `Ok(true)` on
+    /// EEXIST, so the loser keeps its own discarded key, passed the whole suite.
+    #[test]
+    fn a_lost_creation_race_adopts_the_key_on_disk() {
+        let dir = std::env::temp_dir().join(format!("fr-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.json");
+        let _ = std::fs::remove_file(&path);
+        let codec = Codec::new(None).unwrap();
+
+        // The winner.
+        let winner = load_or_create(&path, &codec, "kid").unwrap();
+        // A second caller now takes the same path: the file exists, so it must
+        // return the SAME key rather than minting one.
+        let loser = load_or_create(&path, &codec, "kid").unwrap();
+        assert_eq!(
+            winner.thumbprint().unwrap(),
+            loser.thumbprint().unwrap(),
+            "the second caller returned a different key than the one on disk"
+        );
+
+        // And the genuine race: many threads from nothing converge on one key.
+        let _ = std::fs::remove_file(&path);
+        let keys: Vec<String> = std::thread::scope(|s| {
+            (0..8)
+                .map(|_| {
+                    let p = path.clone();
+                    let c = &codec;
+                    s.spawn(move || load_or_create(&p, c, "kid").unwrap().thumbprint().unwrap())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), 1, "the racers ended up with different keys");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A key file with a trailing newline still loads.**
+    ///
+    /// A key file is something an operator may have written by hand or with
+    /// `echo`. The `trim` that tolerates it was added as a cold-review fix, and
+    /// removing it passed every test — no test ever wrote a file with a trailing
+    /// newline.
+    #[test]
+    fn a_key_file_with_trailing_whitespace_still_loads() {
+        let dir = std::env::temp_dir().join(format!("fr-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.json");
+        let codec = Codec::new(Some(&"a".repeat(43))).unwrap();
+
+        let key = SigningKey::generate("kid");
+        std::fs::write(
+            &path,
+            format!("{}\n", codec.encrypt(&key.to_jwk_json().unwrap())),
+        )
+        .unwrap();
+
+        let loaded =
+            load_or_create(&path, &codec, "kid").expect("a trailing newline is not a corrupt key");
+        assert_eq!(loaded.thumbprint().unwrap(), key.thumbprint().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CREATE path leaves no temporary file behind either. The two existing
+    /// cleanup tests both force the MIGRATE path by pre-writing plaintext, so a
+    /// leak on creation went unnoticed.
+    #[test]
+    fn creating_a_key_leaves_no_temporary_file_behind() {
+        let dir = std::env::temp_dir().join(format!("fr-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.json");
+        let codec = Codec::new(None).unwrap();
+
+        load_or_create(&path, &codec, "kid").unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "key.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

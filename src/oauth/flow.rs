@@ -782,6 +782,34 @@ mod tests {
         }
     }
 
+    /// **The expected issuer comes from the PENDING ROW, not from the callback.**
+    ///
+    /// Every existing test here stores `issuer: ISSUER` and sends
+    /// `iss: Some(ISSUER)` — the same constant on both sides, so none of them
+    /// can tell which one the check actually used. A mutation validating `iss`
+    /// against ITSELF passed all of them, which would defeat RFC 9207 entirely:
+    /// the point of the parameter is to notice that the response came from a
+    /// different authorization server than the one the request was pushed to.
+    #[tokio::test]
+    async fn complete_callback_validates_iss_against_the_stored_issuer() {
+        let cookie = new_binding_token();
+        let (pool, codec) = pending_db(&binding_hash(&cookie)).await;
+
+        // The row was pushed to ISSUER; the callback claims a different one.
+        let impostor = CallbackParams {
+            iss: Some("https://evil.example".into()),
+            ..ok_params()
+        };
+        let err = complete_callback(&pool, &codec, &impostor, Some(&cookie), 1_700_000_000)
+            .await
+            .expect_err("an `iss` from another authorization server must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("evil.example") || rendered.contains("iss"),
+            "failed for the wrong reason: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn complete_callback_rejects_an_unknown_or_expired_state() {
         let cookie = new_binding_token();

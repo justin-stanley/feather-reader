@@ -41,7 +41,6 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD
 use base64::Engine;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::digest::SHA256;
-use subtle::ConstantTimeEq;
 
 /// Unbound records: AAD is empty. **The sidecar-compatible format** — used for
 /// the signing-key file, where a rollback to the Node sidecar must still be able
@@ -320,14 +319,6 @@ impl Codec {
     }
 }
 
-/// Constant-time string compare, for secrets compared against user input.
-pub fn constant_time_equals(a: &str, b: &str) -> bool {
-    // Length is not secret here (and `verify_slices_are_equal` requires equal
-    // lengths), so the early return leaks nothing the caller did not already
-    // reveal by choosing the comparison.
-    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,13 +540,6 @@ mod tests {
         assert_eq!(c.maybe_decrypt(&ct).unwrap(), "secret");
         // A row written before encryption was switched on still reads back.
         assert_eq!(c.maybe_decrypt("legacy").unwrap(), "legacy");
-    }
-
-    #[test]
-    fn constant_time_equals_compares_by_value_and_length() {
-        assert!(constant_time_equals("abc", "abc"));
-        assert!(!constant_time_equals("abc", "abd"));
-        assert!(!constant_time_equals("abc", "abcd"));
     }
 
     // ── AAD-bound records (v2) ───────────────────────────────────────────────

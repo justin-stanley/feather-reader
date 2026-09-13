@@ -670,4 +670,50 @@ mod tests {
         let rows = persisted_rows(&pool).await.unwrap();
         assert_eq!(rows[0].stats.ok_count, 1, "the sample was counted twice");
     }
+
+    /// The buffer is bounded. Without the backstop a dead flusher turns a
+    /// metrics buffer into unbounded memory growth.
+    #[test]
+    fn the_pending_buffer_is_bounded() {
+        let metrics = RepoMetrics::new();
+        for _ in 0..(MAX_PENDING + 100) {
+            metrics.record(Backend::Rust, "op", 1, true);
+        }
+        assert!(
+            metrics.pending.lock().unwrap().len() <= MAX_PENDING,
+            "the write buffer grew past its bound"
+        );
+    }
+
+    /// An unknown backend name is SKIPPED, not guessed at. A row written by a
+    /// newer build must not silently be attributed to a backend this one knows,
+    /// which would put another deployment's numbers in your comparison.
+    #[test]
+    fn an_unknown_backend_name_is_not_guessed() {
+        assert_eq!(Backend::parse("sidecar"), Some(Backend::Sidecar));
+        assert_eq!(Backend::parse("rust"), Some(Backend::Rust));
+        for unknown in ["", "RUST", "postgres", "rust "] {
+            assert_eq!(Backend::parse(unknown), None, "guessed at {unknown:?}");
+        }
+    }
+
+    /// The p95 column renders p95, not a second p50. Nothing read that column,
+    /// so pointing it at p50 passed every test.
+    #[test]
+    fn the_rendered_table_distinguishes_p50_from_p95() {
+        let metrics = RepoMetrics::new();
+        // 1ms ninety times, 900ms ten times: p50 is 1ms, p95 is 900ms.
+        for _ in 0..90 {
+            metrics.record(Backend::Rust, "op", 1_000, true);
+        }
+        for _ in 0..10 {
+            metrics.record(Backend::Rust, "op", 900_000, true);
+        }
+        let table = render(&metrics.snapshot());
+        assert!(table.contains("1.0"), "p50 missing from:\n{table}");
+        assert!(
+            table.contains("900.0"),
+            "the p95 column is not showing p95:\n{table}"
+        );
+    }
 }

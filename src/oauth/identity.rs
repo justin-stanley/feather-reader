@@ -929,6 +929,35 @@ mod tests {
         }
     }
 
+    /// **A malformed FIRST claim must not fall through to the second.**
+    ///
+    /// The two neighbouring tests could not see this between them: this one's
+    /// sibling uses single-element arrays, so "reject" and "skip to the next"
+    /// look identical, and `only_the_first_at_uri_entry_counts` uses two VALID
+    /// entries, so nothing forces the first to be the one that fails.
+    ///
+    /// A mutation turning `find_map(strip).and_then(normalize)` into
+    /// `filter_map(strip).find_map(normalize)` — skip past an unusable claim —
+    /// passed the whole suite. Under it, an attacker document whose first entry
+    /// is junk verifies as whatever the SECOND entry says, which is precisely
+    /// what "only the first entry counts" exists to stop.
+    #[test]
+    fn a_malformed_first_claim_does_not_fall_through_to_the_second() {
+        for bad_first in ["at://", "at://not a handle", "at://alice.local"] {
+            let mut d = doc();
+            d["alsoKnownAs"] = json!([bad_first, "at://victim.com"]);
+            assert_eq!(
+                declared_handle(&d),
+                None,
+                "a malformed first claim ({bad_first}) was skipped and the second was taken"
+            );
+            assert!(
+                verify_handle_claim(&d, "victim.com").is_err(),
+                "({bad_first}) the second entry verified as the account's handle"
+            );
+        }
+    }
+
     #[test]
     fn verification_is_case_insensitive_on_both_sides() {
         let mut d = doc();
