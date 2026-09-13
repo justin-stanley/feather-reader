@@ -82,6 +82,17 @@
 # state, not a secret — the two cannot share /oauth/callback, and a mismatch
 # breaks every login. Rolling back is the same edit in reverse; the encryption
 # key can stay set, since the sidecar path never reads it.
+#
+# THE CUTOVER LOGS EVERY USER OUT. Nothing under src/ reads SIDECAR_DB: the rust
+# backend keeps its own `oauth_session` table inside FEATHERREADER_DB, separate
+# from the sidecar's /data/oauth-sidecar.db. No access token, refresh token or
+# DPoP key crosses the flip, so every signed-in reader must log in again — and
+# rolling BACK logs them out a second time, because the sidecar's store has gone
+# stale in the meantime. This is not the same cause as the key-rotation re-login
+# noted above; it happens even on a first flip with a freshly-set key. Prefer low
+# traffic and warn the cohort. Related and UNVERIFIED: the two backends publish
+# JWKS from different signing keys, so if a PDS caches our JWKS across the flip,
+# the first login after it may fail for that reason rather than for a code bug.
 
 app = "featherreader"
 primary_region = "ord"
