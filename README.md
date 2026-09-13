@@ -135,7 +135,8 @@ you choose (see [Choosing an OAuth backend](#choosing-an-oauth-backend)):
   client. No Node.
 
 **Prerequisites:** a recent stable Rust toolchain (see `rust-version` in
-`Cargo.toml`), plus Node.js **only if** you run the sidecar backend.
+`Cargo.toml`), plus Node.js **24 or newer only if** you run the sidecar backend
+(it uses the built-in `node:sqlite`, which is stable and flagless from 24).
 
 ```sh
 # 1. Build the server (always)
@@ -151,8 +152,9 @@ Both processes are configured entirely through environment variables — there i
 no config file. Every knob has a sensible default, so a bare run boots and works.
 
 - The **server** reads `FEATHERREADER_*` variables (bind address, database path,
-  poll interval, the sidecar URL and shared internal secret, …). See the table at
-  the top of [`src/config.rs`](src/config.rs).
+  poll interval, …), plus the `SIDECAR_*` URL and shared-secret pair it needs to
+  reach the sidecar. See the table at the top of
+  [`src/config.rs`](src/config.rs).
 - The **sidecar** reads `SIDECAR_*` variables (its public URL, storage path, the
   at-rest token-encryption key, the shared internal secret, …). See
   [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). Not used on the
@@ -191,11 +193,34 @@ SQLite, on the same volume as the feed cache and in every backup of it. An
 unrecognised backend name is also a startup failure rather than a silent
 fallback.
 
+**Put the signing key somewhere persistent.** `FEATHERREADER_OAUTH_KEY_PATH`
+defaults to the *relative* `oauth-signing-key.json`, which is fine for a local
+run and a trap in a container: the key lands in the working directory, is lost on
+every redeploy, and a new one is generated in its place. Your published JWKS then
+changes on each deploy, which breaks `private_key_jwt` against any authorization
+server still holding the old one. The supplied image already points it at the
+persistent volume; a custom image or bare-binary deployment must do the same:
+
+```sh
+FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json
+```
+
 ### What switching costs
 
-- **Everyone signs in again.** The two backends keep separate session stores, so
-  tokens obtained under one are not visible to the other. Browser sessions are
-  in-memory and already end on restart, so in practice this costs one login.
+- **Everyone signs in again — in both directions.** The two backends keep
+  separate session stores, and separate is literal: nothing under `src/` reads
+  `SIDECAR_DB`, because the Rust backend keeps its own `oauth_session` table
+  inside `FEATHERREADER_DB`, apart from the sidecar's own database. No access
+  token, refresh token or DPoP key crosses the flip, so every signed-in reader is
+  logged out by it — and **rolling back logs them out a second time**, off a
+  sidecar store that has gone stale in the meantime. Browser sessions are
+  in-memory and already end on restart, so nothing is lost; it is one login per
+  flip, which is worth timing for low traffic and telling people about.
+- **Unverified, but worth knowing:** the two backends publish JWKS from different
+  signing keys, so if a PDS caches our JWKS across the flip, the first login
+  after it may fail for that reason rather than because of a bug in the new path.
+  This has not been observed or reproduced — it is a thing to rule out before
+  concluding the backend is broken.
 - **`/oauth/*` routing must match the backend.** The two cannot share
   `/oauth/callback`: your PDS redirects there with identical
   `?code=&state=&iss=` in both cases, so nothing in the request distinguishes
@@ -205,13 +230,24 @@ fallback.
   on `rust`, to the sidecar on `sidecar`.
 - **Rolling back is unsetting the variable and restarting.** Nothing is migrated
   or destroyed by the switch, and both Caddy routings ship in every image, so a
-  rollback needs no rebuild.
+  rollback needs no rebuild. Cheap operationally — but not free for your readers,
+  who log in again (see above).
 
 ### Which should you run?
 
-If you are starting fresh, `rust` — one process, no Node, and it is the path
-being developed. If you have a working `sidecar` deployment, there is no urgency;
-it remains the default and is well tested.
+`sidecar` is the default and the option with production time behind it — it is
+what the hosted instance runs today. `rust` shipped in 0.3.0, but it has **no
+production time at all** yet: its login path is now covered by tests (the code
+exchange itself, and each of the security guards around it, are pinned by them),
+and that is a different claim from having been exercised against real PDSes under
+real traffic. `private_key_jwt` client authentication and RFC 7009 revocation in
+particular are implemented and unit-tested on the Rust path but have not run
+against a production PDS.
+
+So: if you want the smaller deployment — one process, no Node — and are content
+to be early, start fresh on `rust` and watch your logs through the first logins.
+Otherwise run the default. If you already have a working `sidecar` deployment,
+there is no urgency to move.
 
 The choice is **transitional**. Maintaining two implementations of the same
 surface has a real cost, and the intent is to remove the sidecar in a later
@@ -224,6 +260,16 @@ FeatherReader is designed to be run by anyone: a single static Rust binary
 (optionally plus the Node sidecar), an embedded SQLite cache, and no external
 database. Front it with your own reverse proxy / TLS. Teardown and
 data-ownership notes live in [`deploy/`](deploy/).
+
+`GET /health` is the unauthenticated liveness endpoint, and it reports machine
+facts only — no user counts, no DIDs, no feed URLs. The first token of the body
+is the state: `ok`, `unknown` or `FAIL`. Only a *measured* database failure is a
+failure (`FAIL`, HTTP 503); `unknown` means no probe has completed yet, which
+happens briefly at boot and is not an outage — so match the state token, not just
+the status code. The remaining lines (`db:`, `uptime:`, `poller:`,
+`polling-paused:`, `backend:`, `oauth-runtime:`) never change the status code, on
+the grounds that a stale poller can still serve pages while an unreadable
+database cannot. Alert on the body if you want to hear about those.
 
 ## Invite bot (optional)
 
