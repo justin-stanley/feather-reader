@@ -638,6 +638,19 @@ const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 /// fatal** — see the handler for why.
 const HEALTH_TICK_STALE_SECS: i64 = 15 * 60;
 
+/// Grace period after boot before a poller that has never ticked is called
+/// `stale` rather than `not-yet-ticked`.
+///
+/// Without this the two are indistinguishable forever, which matters precisely
+/// in the case the startup delays were added for: in a crash loop with 30 s+ boot
+/// cycles the poller never reaches its first tick, so `/health` reported the
+/// benign `not-yet-ticked` on every single probe and the heartbeat could not
+/// detect the failure mode it exists for. `run_poller` returning early — a failed
+/// HTTP client build — has the same shape and was equally invisible.
+///
+/// Sized off the poller's own startup delay plus its tick, with slack.
+const HEALTH_FIRST_TICK_GRACE_SECS: i64 = 5 * 60;
+
 /// `GET /health` — does this process still work, and what are its loops doing?
 ///
 /// This used to return a constant string, touching no database, no pool and no
@@ -669,24 +682,62 @@ async fn health(State(state): State<AppState>) -> Response {
     let now = chrono::Utc::now().timestamp();
     let rh = &state.runtime_health;
 
-    let db = match tokio::time::timeout(
-        HEALTH_DB_TIMEOUT,
-        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(format!("error: {err}")),
-        Err(_) => Err(format!("timeout after {}s", HEALTH_DB_TIMEOUT.as_secs())),
+    let db = match rh.begin_db_probe() {
+        // A probe is already in flight; report its predecessor rather than
+        // starting a second one. See `RuntimeHealth::begin_db_probe`.
+        Err(borrowed) => borrowed,
+        Ok(probe) => {
+            // **`SELECT 1` was not a database probe.** It compiles to
+            // `Init/Integer/ResultRow/Halt` — there is no `OpenRead`, so it never
+            // touches a b-tree, never reads a page, and never consults the file.
+            // Against a deliberately corrupted database it returns success while
+            // every real query returns SQLITE_CORRUPT. Reading one row from a
+            // real table costs the same and actually proves what the check
+            // claims. `LIMIT 1` keeps it to a single page; an empty table still
+            // opens the b-tree root, which is the part that matters.
+            let verdict = match tokio::time::timeout(
+                HEALTH_DB_TIMEOUT,
+                sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
+                    .fetch_optional(&state.db),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                // Coarse, not the raw error. An unauthenticated caller learning
+                // exactly which failure it hit is an attack-progress oracle; the
+                // detail belongs in the log, which gets it below.
+                Ok(Err(err)) => {
+                    warn!(%err, "health: database probe failed");
+                    Err("unavailable".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
+                        "health: database probe timed out (pool exhausted?)"
+                    );
+                    Err("timeout".to_string())
+                }
+            };
+            probe.record(verdict.clone());
+            verdict
+        }
     };
 
+    let uptime = rh.uptime_secs(now);
     let poller = if !rh.schedulers_enabled() {
         // Not a fault. Dev runs and the seam tests disable the loops on purpose,
         // and reporting that as "stale" would be a false alarm on every one.
         "disabled".to_string()
     } else {
         match rh.secs_since_poll_tick(now) {
-            None => "not-yet-ticked".to_string(),
+            // "Never ticked" is benign right after boot and alarming well after
+            // it — so it is read against UPTIME, not left permanently benign.
+            None => match uptime {
+                Some(up) if up > HEALTH_FIRST_TICK_GRACE_SECS => {
+                    format!("stale never-ticked {up}s")
+                }
+                _ => "not-yet-ticked".to_string(),
+            },
             Some(secs) if secs > HEALTH_TICK_STALE_SECS => format!("stale {secs}s"),
             Some(secs) => format!("ok {secs}s"),
         }
@@ -707,6 +758,16 @@ async fn health(State(state): State<AppState>) -> Response {
     if db.is_ok() {
         body.push_str("db: ok\n");
     }
+    // Uptime answers the first question anyone asks about a container under a
+    // supervisor that tears the machine down whenever a child exits: is this
+    // thing restarting? Nothing else on any surface could tell you.
+    body.push_str(&format!(
+        "uptime: {}\n",
+        match uptime {
+            Some(secs) => format!("{secs}s"),
+            None => "unknown".to_string(),
+        }
+    ));
     body.push_str(&format!("poller: {poller}\n"));
     body.push_str(&format!(
         "polling-paused: {}\n",
@@ -7672,11 +7733,22 @@ mod tests {
             (status, body)
         };
 
+        // The boot stamp is what `main` sets; the router alone does not, so this
+        // starts "unknown" and the uptime branch below drives it explicitly.
+        state
+            .runtime_health
+            .set_started_at(chrono::Utc::now().timestamp());
+
         let (status, body) = body_of(state.clone()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             body.contains("db: ok"),
             "health did not probe the DB: {body}"
+        );
+        assert!(
+            body.contains("uptime:"),
+            "no uptime — the first thing anyone asks about a container that may \
+             be restarting: {body}"
         );
         assert!(body.contains("poller:"), "no scheduler heartbeat: {body}");
         assert!(body.contains("polling-paused: no"), "{body}");
@@ -7713,6 +7785,23 @@ mod tests {
         );
         assert!(body.contains("poller: stale"), "{body}");
 
+        // **A poller that has never ticked stops being benign.**
+        //
+        // In a crash loop with 30 s+ boot cycles the poller never reaches its
+        // first tick, so `not-yet-ticked` was reported forever and the heartbeat
+        // could not detect the one failure mode the startup delays were added
+        // for. It is read against uptime now.
+        state.runtime_health.poll_tick_completed(0); // reset to "never"
+        state
+            .runtime_health
+            .set_started_at(chrono::Utc::now().timestamp() - (HEALTH_FIRST_TICK_GRACE_SECS + 60));
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("poller: stale never-ticked"),
+            "a poller that never ticked long after boot still reads as benign: {body}"
+        );
+
         // A closed pool is a real outage: nothing can be served, and a restart is
         // the correct response. THIS is what the status code is for.
         state.db.close().await;
@@ -7723,6 +7812,50 @@ mod tests {
             "an unreachable database must fail the check: {body}"
         );
         assert!(body.starts_with("FAIL"), "{body}");
+        // Coarse, not the raw sqlx error: an unauthenticated caller learning
+        // exactly which failure it hit is an attack-progress oracle, and this
+        // endpoint is exempt from the origin lock.
+        assert!(
+            !body.contains("PoolClosed") && !body.contains("sqlx"),
+            "health leaked the raw database error to an unauthenticated caller: {body}"
+        );
+    }
+
+    /// **The probe must read a real page.**
+    ///
+    /// `SELECT 1` compiles to `Init/Integer/ResultRow/Halt` — no `OpenRead`, so
+    /// it never touches a b-tree and returns success against a corrupted
+    /// database. Asserted by asking SQLite what the statement actually compiles
+    /// to, so it survives someone "simplifying" the query later.
+    #[tokio::test]
+    async fn the_health_probe_opens_a_real_table() {
+        use sqlx::Row;
+        let state = test_state(&[]).await;
+        // `EXPLAIN` lists the VM program; the `opcode` column is the second.
+        let opcodes = |sql: &'static str| {
+            let db = state.db.clone();
+            async move {
+                sqlx::query(sql)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("opcode"))
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        let probe = opcodes("EXPLAIN SELECT 1 FROM feeds LIMIT 1").await;
+        assert!(
+            probe.iter().any(|op| op == "OpenRead"),
+            "the health probe reads no page; it cannot detect a broken database: {probe:?}"
+        );
+        // And the bare form genuinely does not, which is the whole point.
+        let bare = opcodes("EXPLAIN SELECT 1").await;
+        assert!(
+            !bare.iter().any(|op| op == "OpenRead"),
+            "premise check failed: bare SELECT 1 now reads a page: {bare:?}"
+        );
     }
 
     /// A fresh instance says "never", not "0" — which would read as "polled

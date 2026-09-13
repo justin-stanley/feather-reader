@@ -77,6 +77,12 @@ async fn main() -> Result<()> {
     //    session registry.
     let bind = config.bind;
     let state = AppState::new(config, db).context("building application state")?;
+    // Stamp the boot time before anything can be served, so `/health` can answer
+    // "is this container restarting" — the first question about a process under a
+    // supervisor that tears the machine down whenever a child exits.
+    state
+        .runtime_health
+        .set_started_at(chrono::Utc::now().timestamp());
 
     // 5. Shutdown fan-out. SIGINT (Ctrl-C) or SIGTERM flips this watch channel;
     //    the HTTP server and both background tasks each hold a receiver and stop.

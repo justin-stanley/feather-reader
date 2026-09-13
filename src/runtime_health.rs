@@ -18,6 +18,7 @@
 //! URLs — so it can be published on the same terms as `/stats`.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Mutex;
 
 /// Shared record of background-loop state. Cheap to read from a handler.
 #[derive(Debug, Default)]
@@ -37,11 +38,75 @@ pub struct RuntimeHealth {
     /// started" look identical from a handler — and they call for completely
     /// different responses.
     schedulers_enabled: AtomicBool,
+    /// Unix seconds when this process started. `0` until stamped.
+    ///
+    /// Under a supervisor where ANY child exit tears the container down, "how
+    /// long has this process been alive" is the single most diagnostic number
+    /// about the system, and nothing exposed it: a crash-looping instance and a
+    /// healthy one both answered every question identically. It is also what
+    /// makes "the poller has not ticked yet" interpretable — benign twenty
+    /// seconds after boot, and a dead poller twenty minutes after it.
+    started_at: AtomicI64,
+    /// The most recent database-probe verdict, reused by requests that arrive
+    /// while another probe is already running.
+    db_probe: Mutex<Option<Result<(), String>>>,
+    /// Whether a database probe is in flight right now.
+    db_probe_running: AtomicBool,
 }
 
 impl RuntimeHealth {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stamp the process start time. Called once, from `main`.
+    pub fn set_started_at(&self, now_unix: i64) {
+        self.started_at.store(now_unix, Ordering::Relaxed);
+    }
+
+    /// Seconds this process has been alive, or `None` before it was stamped.
+    pub fn uptime_secs(&self, now_unix: i64) -> Option<i64> {
+        match self.started_at.load(Ordering::Relaxed) {
+            0 => None,
+            t => Some((now_unix - t).max(0)),
+        }
+    }
+
+    /// Claim the right to run a database probe, or borrow the last verdict.
+    ///
+    /// `/health` is exempt from the Cloudflare origin lock and is not in the rate
+    /// limiter's path list, so it answers unauthenticated requests at whatever
+    /// rate they arrive. Once it started touching the database, that became a way
+    /// to spend the 5-connection pool from outside — and the handler's own
+    /// timeout then returns the 503 that Fly's check reads.
+    ///
+    /// This deduplicates CONCURRENT probes rather than caching by time. A time
+    /// cache would also bound the cost, but it makes a genuinely dead database
+    /// invisible for the length of the window; this bounds in-flight database
+    /// work to exactly one probe while leaving every sequential request — Fly's
+    /// own, and any operator's `curl` — a fresh answer. It is also a better fix
+    /// than rate-limiting `/health`, which would risk refusing Fly's probe.
+    ///
+    /// Returns `Err(last_verdict)` when a probe is already running: the caller
+    /// reports that instead of starting another. `Ok(guard)` means the caller
+    /// owns the probe and must report it via the returned guard.
+    pub fn begin_db_probe(&self) -> Result<DbProbeGuard<'_>, Result<(), String>> {
+        if self.db_probe_running.swap(true, Ordering::AcqRel) {
+            // Someone else is probing. Borrow their last answer; before the very
+            // first probe completes there is nothing to borrow, and optimism is
+            // right there — a machine that has served zero probes has shown no
+            // sign of being broken.
+            return Err(self.last_db_probe().unwrap_or(Ok(())));
+        }
+        Ok(DbProbeGuard { health: self })
+    }
+
+    /// The most recent verdict, if any probe has completed.
+    fn last_db_probe(&self) -> Option<Result<(), String>> {
+        self.db_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Record that the background loops were (or were not) spawned.
@@ -84,6 +149,30 @@ impl RuntimeHealth {
     /// that has nothing to do with the poller being too slow.
     pub fn watermark_paused(&self) -> bool {
         self.watermark_paused.load(Ordering::Relaxed)
+    }
+}
+
+/// Held by whichever request owns the in-flight database probe. Recording the
+/// verdict — or being dropped without one — releases the claim, so a panicking
+/// or cancelled handler cannot wedge every later probe.
+pub struct DbProbeGuard<'a> {
+    health: &'a RuntimeHealth,
+}
+
+impl DbProbeGuard<'_> {
+    /// Publish the verdict this probe reached.
+    pub fn record(self, verdict: Result<(), String>) {
+        *self
+            .health
+            .db_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verdict);
+    }
+}
+
+impl Drop for DbProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.health.db_probe_running.store(false, Ordering::Release);
     }
 }
 

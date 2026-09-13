@@ -1506,9 +1506,23 @@ async fn prune_orphan_cursor_ids_tx(
 /// and holding all of that inside a transaction is what made a daily sweep look
 /// like an outage to every writer on the instance.
 ///
-/// Idempotent by construction — it recomputes each cursor's surviving ids from
-/// the current contents of `entries` — so interleaving with other writers, or
-/// dying partway and being re-run, is safe.
+/// **Each cursor's read-modify-write is one short transaction**, and that is not
+/// optional. The first version of this loaded every cursor into a snapshot, then
+/// walked them issuing an unguarded `UPDATE` per cursor from that snapshot. A
+/// `mark_read` landing during the walk — seconds, on a global pass — had its new
+/// id silently overwritten by the stale set, and the rewrite set `dirty = 1`, so
+/// the flusher then pushed the truncated set to the PDS as authoritative. Local
+/// `entry_state` still said read, so the loss was invisible here and visible
+/// only in every OTHER atproto client. The transactional predecessor did not
+/// have that bug: it held the write lock across the whole pass, so a concurrent
+/// `mark_read` blocked and applied on top.
+///
+/// So the lock is not eliminated, it is SCOPED: one cursor's live-ids query plus
+/// its update, rather than every cursor's. That keeps what T2.2 was for (a daily
+/// sweep must not look like an outage) without trading it for lost writes.
+///
+/// Re-running is still safe — surviving ids are recomputed from the current
+/// contents of `entries` — so dying partway just means the next sweep finishes.
 ///
 /// `feed_id = Some(..)` scopes to one feed; `None` scans every cursor. Returns
 /// the number of cursor rows modified.
@@ -1526,64 +1540,93 @@ async fn prune_orphan_cursor_ids(pool: &SqlitePool, feed_id: Option<i64>) -> Res
         None => None,
     };
 
-    let cursors: Vec<(String, String, String, String)> = match &feed_url {
-        Some(url) => sqlx::query_as(
-            "SELECT did, feed_url, read_ids, unread_ids FROM read_cursor WHERE feed_url = ?1",
-        )
-        .bind(url)
-        .fetch_all(pool)
-        .await
-        .context("prune_orphan_cursor_ids: load feed cursors")?,
-        None => sqlx::query_as("SELECT did, feed_url, read_ids, unread_ids FROM read_cursor")
+    // Only the KEYS come from this snapshot. The id-sets are deliberately not
+    // read here — they are re-read inside each cursor's own transaction below,
+    // because anything read out here is stale by the time it is written back.
+    let keys: Vec<(String, String)> = match &feed_url {
+        Some(url) => sqlx::query_as("SELECT did, feed_url FROM read_cursor WHERE feed_url = ?1")
+            .bind(url)
+            .fetch_all(pool)
+            .await
+            .context("prune_orphan_cursor_ids: load feed cursors")?,
+        None => sqlx::query_as("SELECT did, feed_url FROM read_cursor")
             .fetch_all(pool)
             .await
             .context("prune_orphan_cursor_ids: load all cursors")?,
     };
 
-    let now = now_rfc3339();
     let mut changed: u64 = 0;
-    for (did, curl, read_ids, unread_ids) in cursors {
-        // An empty exception set has nothing to orphan, and skipping it avoids
-        // the per-cursor live-ids query entirely — which is the dominant cost of
-        // this pass and the common case for a cursor at its high-water mark.
-        if is_empty_id_set(&read_ids) && is_empty_id_set(&unread_ids) {
-            continue;
+    for (did, curl) in keys {
+        // A cursor that vanished between the key snapshot and now is simply
+        // skipped; a cursor that APPEARED is missed until the next sweep. Both
+        // are fine — the scrub is housekeeping, not a correctness barrier.
+        match scrub_one_cursor(pool, &did, &curl).await {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            // One bad cursor must not abandon the rest of the pass.
+            Err(err) => tracing::warn!(%err, %did, feed = %curl, "cursor id scrub failed"),
         }
-        let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
-            "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE f.url = ?1",
-        )
-        .bind(&curl)
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("prune_orphan_cursor_ids: live ids for {curl}"))?
-        .into_iter()
-        .collect();
-
-        let new_read = filter_id_set_to_live(&read_ids, &live);
-        let new_unread = filter_id_set_to_live(&unread_ids, &live);
-        if new_read == read_ids && new_unread == unread_ids {
-            continue; // nothing orphaned — leave the cursor (and its dirty flag) alone
-        }
-        sqlx::query(
-            "UPDATE read_cursor SET read_ids = ?3, unread_ids = ?4, dirty = 1, updated_at = ?5 \
-             WHERE did = ?1 AND feed_url = ?2",
-        )
-        .bind(&did)
-        .bind(&curl)
-        .bind(&new_read)
-        .bind(&new_unread)
-        .bind(&now)
-        .execute(pool)
-        .await
-        .with_context(|| format!("prune_orphan_cursor_ids: rewrite cursor {did}/{curl}"))?;
-        changed += 1;
     }
     Ok(changed)
 }
 
-/// Whether a stored id-set is empty — `[]`, blank, or unparseable. Deliberately
-/// textual: this is a fast pre-filter, and [`filter_id_set_to_live`] remains the
-/// authority on what the set actually contains.
+/// Scrub one cursor's id-sets inside its own transaction. Returns whether the
+/// row changed.
+///
+/// The read of the id-sets, the live-ids query and the write all happen under
+/// one transaction, so a `mark_read` that lands mid-sweep either goes first (and
+/// is included) or waits (and applies on top). Reading the sets outside and
+/// writing them back later is the lost-update shape this function exists to
+/// avoid — see [`prune_orphan_cursor_ids`].
+async fn scrub_one_cursor(pool: &SqlitePool, did: &str, feed_url: &str) -> Result<bool> {
+    let mut tx = pool.begin().await.context("begin scrub_one_cursor tx")?;
+
+    let (_, read_ids, unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+    // An empty exception set has nothing to orphan, and skipping it avoids the
+    // live-ids query entirely — the dominant cost of this pass, and the common
+    // case for a cursor sitting at its high-water mark.
+    if is_empty_id_set(&read_ids) && is_empty_id_set(&unread_ids) {
+        return Ok(false);
+    }
+
+    let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE f.url = ?1",
+    )
+    .bind(feed_url)
+    .fetch_all(&mut *tx)
+    .await
+    .with_context(|| format!("prune_orphan_cursor_ids: live ids for {feed_url}"))?
+    .into_iter()
+    .collect();
+
+    let new_read = filter_id_set_to_live(&read_ids, &live);
+    let new_unread = filter_id_set_to_live(&unread_ids, &live);
+    if new_read == read_ids && new_unread == unread_ids {
+        return Ok(false); // nothing orphaned — leave the cursor (and its dirty flag) alone
+    }
+    sqlx::query(
+        "UPDATE read_cursor SET read_ids = ?3, unread_ids = ?4, dirty = 1, updated_at = ?5 \
+         WHERE did = ?1 AND feed_url = ?2",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(&new_read)
+    .bind(&new_unread)
+    .bind(now_rfc3339())
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("prune_orphan_cursor_ids: rewrite cursor {did}/{feed_url}"))?;
+    tx.commit().await.context("commit scrub_one_cursor tx")?;
+    Ok(true)
+}
+
+/// Whether a stored id-set is *textually* empty — `[]` or blank.
+///
+/// Deliberately NOT a parse: this is a fast pre-filter, and
+/// [`filter_id_set_to_live`] remains the authority on what a set contains. An
+/// unparseable value returns `false` here, so it goes through the full path and
+/// gets canonicalised to `[]` rather than being skipped — the pre-filter fails
+/// toward doing the work, which is the safe direction.
 fn is_empty_id_set(raw: &str) -> bool {
     let t = raw.trim();
     t.is_empty() || t == "[]"
@@ -5952,6 +5995,99 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.display())).ok();
         std::fs::remove_file(format!("{}-shm", path.display())).ok();
+        Ok(())
+    }
+
+    /// **A mark-read landing during the scrub must not be overwritten.**
+    ///
+    /// Moving the scrub out of the sweep's transaction removed a multi-minute
+    /// write-lock hold and introduced a lost update in its place: the id-sets
+    /// were read into a snapshot up front and written back unguarded, so a
+    /// `mark_read` arriving mid-pass had its id silently dropped — and the
+    /// rewrite set `dirty = 1`, so the flusher pushed the truncated set to the
+    /// PDS as authoritative. Local `entry_state` still said read, so the loss was
+    /// invisible here and visible only in every other atproto client.
+    ///
+    /// The race is a few milliseconds wide, so this does not try to hit it.
+    /// Instead it pins the property that makes it impossible: the scrub reads the
+    /// id-sets itself, inside the same transaction that writes them, so a set
+    /// written after the pass began is the one that gets filtered.
+    #[tokio::test]
+    async fn the_cursor_scrub_reads_the_ids_it_writes() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:race";
+        let feed_url = "https://race.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "live".to_string(),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "doomed".to_string(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let live_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'live'")
+            .fetch_one(&pool)
+            .await?;
+        let doomed_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'doomed'")
+            .fetch_one(&pool)
+            .await?;
+
+        // A cursor holding only the id that is about to be deleted.
+        upsert_cursor(
+            &pool,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: feed_url.to_string(),
+                read_through: None,
+                read_ids: format!("[\"{doomed_id}\"]"),
+                unread_ids: "[]".to_string(),
+                dirty: false,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        sqlx::query("DELETE FROM entries WHERE guid = 'doomed'")
+            .execute(&pool)
+            .await?;
+
+        // Now a reader marks the surviving entry read — the write that the old
+        // snapshot-then-write shape would have clobbered. It lands BEFORE the
+        // scrub, which is the deterministic stand-in for landing during it: a
+        // scrub that reads its own input sees it, one that reuses a snapshot
+        // taken earlier does not.
+        mark_read(&pool, did, live_id, true).await?;
+
+        assert_eq!(prune_orphan_cursor_ids(&pool, None).await?, 1);
+
+        let cursor = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
+        assert_eq!(
+            ids,
+            vec![live_id.to_string()],
+            "the scrub dropped a mark-read that landed after the pass began"
+        );
+        assert!(
+            !ids.contains(&doomed_id.to_string()),
+            "the orphaned id survived the scrub"
+        );
         Ok(())
     }
 

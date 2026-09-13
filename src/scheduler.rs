@@ -308,7 +308,9 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
                 break;
             }
             _ = ticker.tick() => {
-                if let Err(err) = poll_due_once(&state, &client, &limiter, batch, stagger).await {
+                if let Err(err) =
+                    poll_due_once(&state, &client, &limiter, batch, stagger, &shutdown).await
+                {
                     // A store-level error is worth logging, but must not kill the
                     // loop — the next tick retries.
                     error!(%err, "poll scheduler: tick failed");
@@ -333,6 +335,7 @@ async fn poll_due_once(
     limiter: &Arc<Semaphore>,
     batch: i64,
     stagger: Duration,
+    shutdown: &watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     // DB-size watermark: above it, stop pulling NEW content so a small box can't
     // be filled to a crash by the poller. Reads/serving continue; only fetching
@@ -379,7 +382,26 @@ async fn poll_due_once(
     info!(count = due.len(), "poll scheduler: polling due feeds");
 
     let mut handles = Vec::with_capacity(due.len());
+    let mut abandoned = 0usize;
     for feed in due {
+        // **Stop LAUNCHING once shutdown is asked for.**
+        //
+        // The loop above only checked shutdown between ticks, so once inside a
+        // tick this ran to completion: a full batch is 50 feeds at a 250 ms
+        // stagger — 12.5 s just to launch — against Fly's default 5 s
+        // `kill_timeout`. Every feed in the batch has already been leased an hour
+        // forward by `poll_and_reschedule`, and SIGKILL rolls nothing back, so a
+        // routine deploy landing mid-tick silently pushed up to 50 feeds out by
+        // an hour. Nobody would attribute that: it presents as "some feeds are
+        // behind after a deploy", and `/stats` cannot show it as overdue because
+        // `next_poll` was moved FORWARD.
+        //
+        // Feeds not launched keep whatever `next_poll` they had, so they stay due
+        // and the next boot picks them up immediately.
+        if shutdown.has_changed().unwrap_or(true) {
+            abandoned += 1;
+            continue;
+        }
         // Acquire a permit *before* launching so at most `concurrency` fetches
         // are ever in flight; the permit is released when the task ends.
         let permit = match Arc::clone(limiter).acquire_owned().await {
@@ -405,6 +427,14 @@ async fn poll_due_once(
         if !stagger.is_zero() {
             tokio::time::sleep(stagger).await;
         }
+    }
+
+    if abandoned > 0 {
+        info!(
+            abandoned,
+            "poll scheduler: shutdown requested mid-round; these feeds were not \
+             launched and stay due"
+        );
     }
 
     // Drain the batch so the next tick starts from a clean slate.

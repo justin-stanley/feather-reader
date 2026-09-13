@@ -21,8 +21,16 @@
 # disk pressure that triggers a retention sweep, so the app now refuses to run
 # one on its own and logs a warning instead. Switching modes needs that same full
 # VACUUM, so it is this deliberate, operator-timed step: run it while the volume
-# has headroom (it refuses itself if not), and expect writes to block for its
-# duration. Safe to run blindly — it exits 0 doing nothing if already migrated.
+# has headroom (it refuses itself if not). Safe to run blindly — it exits 0 doing
+# nothing if already migrated.
+#
+# RUN IT WITH THE APP STOPPED. The VACUUM holds an exclusive lock for minutes on
+# a large database, and the app's busy_timeout is 5 s — so writes do not queue,
+# they FAIL: mark-read and star return errors, and OAuth session writes fail, so
+# LOGINS BREAK for the duration. /health keeps returning 200 throughout, because
+# its probe is a read. Also note this command runs as root and applies the
+# binary's schema migrations before the VACUUM, so use the SAME image version
+# that is currently deployed.
 #
 # DEPLOY BY DIGEST (not by tag). The release workflow publishes signed provenance
 # bound to the image DIGEST; deploying a mutable tag (or :latest) can silently
@@ -78,6 +86,17 @@
 app = "featherreader"
 primary_region = "ord"
 
+# How long Fly waits after SIGTERM before SIGKILL. The default is 5 s, which is
+# shorter than a single poll round can take to even LAUNCH: a full batch is 50
+# feeds at a 250 ms stagger (12.5 s), and each feed is leased an hour forward
+# BEFORE its fetch so a crash cannot re-select it first. SIGKILL rolls no lease
+# back, so a deploy landing mid-round used to push up to 50 feeds an hour out —
+# invisible, because /stats cannot show a feed as overdue when next_poll was
+# moved forward. The poller now also stops launching new feeds the moment
+# shutdown is signalled; this is the other half, so the ones already in flight
+# can finish and the flusher can make its final read-state push.
+kill_timeout = "45s"
+
 [build]
   # Image is built + pushed by .github/workflows/release-image.yml to GHCR with
   # SLSA build-provenance (and optional SBOM) attestations bound to the DIGEST.
@@ -132,10 +151,14 @@ primary_region = "ord"
     soft_limit = 200
     hard_limit = 250
 
-  # Liveness. /health probes the DATABASE (one `SELECT 1`, which no writer can
-  # block in WAL mode) under a 2 s timeout — inside the 3 s below, so a wedged
-  # pool yields a 503 the app chose, with a reason, rather than a timeout Fly
-  # inferred. Only the database can fail this check: the body also reports the
+  # Liveness. /health reads one row from a real table (`SELECT 1 FROM feeds
+  # LIMIT 1`) under a 2 s timeout — inside the 3 s below, so a wedged pool yields
+  # a 503 the app chose, with a reason, rather than a timeout Fly inferred. It
+  # reads a real page deliberately: a bare `SELECT 1` emits no OpenRead opcode at
+  # all, so it returns success against a corrupted database. The verdict is cached
+  # for 5 s, so /health — which is origin-lock-exempt and unauthenticated — cannot
+  # be used to spend the 5-connection pool. Only the database can fail this check:
+  # the body also reports uptime, the
   # poll heartbeat, whether fetching is paused at the size watermark, and the
   # live OAuth backend, but none of those affect the status code. Fly restarts on
   # a failed check and a restart fixes none of them — wiring them here would turn

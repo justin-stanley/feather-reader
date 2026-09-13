@@ -12,7 +12,7 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Ignored (with a warning) unless strictly greater than the window below. |
+//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
@@ -576,8 +576,47 @@ impl Config {
         // repo-published dev secrets — those are known to any attacker, who could
         // then forge a session cookie offline. Refuse to boot instead.
         config.validate_secrets()?;
+        config.validate_retention()?;
 
         Ok(config)
+    }
+
+    /// Refuse a retention pair where the ceiling is inside the window.
+    ///
+    /// `prune_old_entries` ignores a hard ceiling that is not strictly older than
+    /// the rolling window, because applying it would delete exactly the starred
+    /// and unread rows the window exists to spare. That refusal is right, but the
+    /// fallback it lands on — no ceiling at all — is the UNBOUNDED one, and the
+    /// only signal was a `warn!` emitted once per daily sweep.
+    ///
+    /// The configuration that reaches it is not exotic. An operator who wants a
+    /// bigger cache sets `FEATHERREADER_RETENTION_DAYS=365` and leaves
+    /// `RETENTION_HARD_DAYS` at its 180-day default; `180 <= 365`, so the ceiling
+    /// silently disappears. The shared `entries` table then has no bound on rows
+    /// a reader has pinned by starring or marking unread — and `poll_due_once`
+    /// stops polling for EVERY reader once the database crosses the size
+    /// watermark, with the retention DELETE as the only release valve. One
+    /// reader can hold that valve shut permanently.
+    ///
+    /// So this is a boot refusal, matching how `FEATHERREADER_REPO_BACKEND`
+    /// treats an unrecognised value: a contradictory setting fails startup rather
+    /// than being reinterpreted into the most destructive reading available.
+    /// Both knobs off (`0`/`0`) is still allowed — that is an explicit choice to
+    /// run unbounded, not an accident of changing one variable.
+    fn validate_retention(&self) -> anyhow::Result<()> {
+        let (days, hard) = (self.retention_days, self.retention_hard_days);
+        if hard > 0 && days > 0 && hard <= days {
+            anyhow::bail!(
+                "FEATHERREADER_RETENTION_HARD_DAYS ({hard}) must be strictly greater than \
+                 FEATHERREADER_RETENTION_DAYS ({days}), or 0 to disable the ceiling. A ceiling \
+                 inside the window cannot be applied — it would delete exactly the starred and \
+                 unread entries the window exists to spare — so it would be ignored, leaving \
+                 the shared cache with NO bound on entries readers have pinned. Raise the \
+                 ceiling above the window (the default pair is 14/180), or set it to 0 if you \
+                 genuinely want no ceiling."
+            );
+        }
+        Ok(())
     }
 
     /// Whether this instance is "production-like" and therefore MUST have strong,
@@ -792,6 +831,56 @@ fn parse_bool(raw: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ceiling inside the window is refused at BOOT, not ignored at sweep time.
+    ///
+    /// `prune_old_entries` correctly refuses to apply such a ceiling — it would
+    /// delete exactly the starred and unread rows the window spares — but the
+    /// fallback is "no ceiling", which is the unbounded reading. The pair is
+    /// reachable by changing ONE variable: raise `RETENTION_DAYS` to 365 and the
+    /// default 180-day ceiling silently disappears.
+    #[test]
+    fn a_retention_ceiling_inside_the_window_is_refused_at_startup() {
+        let base = Config::default();
+        let with = |days: u32, hard: u32| Config {
+            retention_days: days,
+            retention_hard_days: hard,
+            ..base.clone()
+        };
+
+        // The one-variable footgun this exists for.
+        let err = with(365, 180)
+            .validate_retention()
+            .expect_err("365/180 must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RETENTION_HARD_DAYS"),
+            "unhelpful message: {msg}"
+        );
+        assert!(msg.contains("strictly greater"), "unhelpful message: {msg}");
+
+        // Equal is refused too — the two cutoffs coincide, so the ceiling would
+        // delete precisely what the window spares.
+        assert!(with(14, 14).validate_retention().is_err());
+        assert!(with(30, 7).validate_retention().is_err());
+
+        // Valid pairs.
+        assert!(
+            with(14, 180).validate_retention().is_ok(),
+            "the default pair"
+        );
+        assert!(
+            with(365, 400).validate_retention().is_ok(),
+            "a bigger cache with the ceiling raised to match"
+        );
+        // Ceiling deliberately off: allowed, because it is an explicit choice
+        // rather than a side effect of moving the window.
+        assert!(with(14, 0).validate_retention().is_ok());
+        // Window off, ceiling on: the T1.3 configuration.
+        assert!(with(0, 180).validate_retention().is_ok());
+        // Both off: unbounded, but explicitly so.
+        assert!(with(0, 0).validate_retention().is_ok());
+    }
 
     #[test]
     fn defaults_are_sane() {
