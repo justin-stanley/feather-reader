@@ -123,6 +123,13 @@ wait -n
 first_status=$?
 set -e
 
+# Snapshot the flag BEFORE the fan-out below, because `term` is both the trap
+# handler AND called directly on this path — so calling it first would set
+# `stopping=1` unconditionally and make every exit, crash included, report itself
+# as a requested stop. The branch would be dead and the log would be wrong in
+# exactly the direction the previous version was.
+requested_stop="${stopping}"
+
 # One child is gone => the instance is broken. Signal the survivors, drain, and
 # exit non-zero so the platform recreates the machine.
 term
@@ -138,8 +145,9 @@ wait 2>/dev/null || true
 # (SIGKILL — the OOM killer, which on a 512 MB box is a leading failure mode) and
 # 139 (SIGSEGV) and 134 (abort). Calling those "normal" would hide exactly the
 # crashes this line exists to surface — the inverse of the problem being fixed.
-# Only the trap can attest that the stop was requested.
-if [ "${stopping}" -eq 1 ]; then
+# Only the trap can attest that the stop was requested — hence the snapshot
+# above, taken before this path calls `term` itself.
+if [ "${requested_stop}" -eq 1 ]; then
     echo "[entrypoint] stop requested (child status ${first_status}); shutting down container normally" 1>&2
 else
     if [ "${first_status}" -gt 128 ]; then
