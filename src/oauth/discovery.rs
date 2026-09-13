@@ -532,8 +532,22 @@ mod live_pds {
             Some("https://evil.example"),
         )
         .await;
-        assert!(bad.is_err(), "a mismatched expected issuer must be refused");
-        println!("  mix-up defence: refused a mismatched issuer as expected");
+        // **Assert WHY it was refused, not merely that it was.** `is_err()` alone
+        // is satisfied by a transient network failure on this third call, so it
+        // would keep passing if the mix-up check stopped firing and something
+        // else errored instead — the defence would silently stop being tested
+        // while the test stayed green.
+        let err = format!(
+            "{:#}",
+            bad.expect_err("a mismatched issuer must be refused")
+        );
+        assert!(
+            err.contains("different authorization server")
+                && err.contains("refusing to send credentials"),
+            "refused, but not BY the mix-up defence — this test would not notice \
+             if that check stopped firing: {err}"
+        );
+        println!("  mix-up defence: refused a mismatched issuer, by `same_issuer`");
 
         // Revocation support is what decides whether logout can tell the PDS.
         match server.revocation_endpoint {

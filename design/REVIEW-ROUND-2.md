@@ -101,42 +101,66 @@ and hundreds of batches, each carrying a full `entry_state` scan.
 **Fix.** Measure first. Then either an index that serves the predicate, or hoist
 the spare-set into a temp table computed once per sweep rather than per batch.
 
-### MEASURED — and the diagnosis was wrong
+### MEASURED — the diagnosis was wrong, and so was the first measurement
 
 Benchmarked against the real engine and the real code path, 500 feeds × 2,000
 entries = 1M rows, at two `entry_state` sizes. Kept as
 `store::tests::r6_measure_retention_sweep` (`#[ignore]`d) so the next candidate
-can be tried against the same fixture:
+can be tried against the same fixture.
 
-| shape | 50k pinned | 600k pinned | disk |
+**The first run of this benchmark was invalid and its conclusions are retracted.**
+Its fixture gave every `entry_state` row `starred = 1 OR read = 0` — there were no
+read-and-unstarred rows at all, which is the commonest state a reader leaves
+behind. Two results followed from that and neither survives a realistic
+distribution:
+
+- The pinned set *was* the whole table, so the list form re-materialised 600k ids
+  per batch instead of 60k. That inflated `NOT IN`'s cost and with it the
+  rewrite's headline margin.
+- A **partial** index on `starred = 1 OR read = 0` covered 100% of rows, so it
+  could not be selective. It was measured at 0.3% and written up as doing
+  "nothing", when what was really shown is that the fixture could not tell.
+
+Re-measured with 10% of `entry_state` pinned:
+
+| shape | 50k state / 4k pinned | 600k state / 60k pinned | disk |
 |---|---|---|---|
-| `id NOT IN (…)` — as shipped | 42.0 s | **104.3 s** | — |
-| + partial index on the pinned predicate | 41.5 s | 104.6 s | 0.5–6.9 MiB |
-| + expression index on entry age | 32.3 s | 100.1 s | 27.9 MiB |
-| **`NOT EXISTS` rewrite** | 33.3 s | **42.8 s** | — |
-| `NOT EXISTS` + age index | 23.7 s | 38.2 s | 27.9 MiB |
+| `id NOT IN (…)` — the original | 32.7 s | 64.8 s | — |
+| + partial index on the pinned predicate | 30.7 s | **44.0 s** | 6.9 MiB |
+| **`NOT EXISTS` — as shipped** | 31.0 s | **43.6 s** | — |
+| `NOT EXISTS` + pinned index | 30.4 s | 38.5 s | 6.9 MiB |
+| `NOT EXISTS` + age index | 20.8 s | 33.9 s | 27.9 MiB |
 
-**The index this finding asked for does nothing.** A partial index on
-`entry_state(entry_id) WHERE starred = 1 OR read = 0` changes the plan — `SCAN
-entry_state USING INDEX idx_es_pinned` — and changes the time by 0.3%, at either
-scale. The scan was never the cost.
+**The rewrite is still the right change, and it is worth 1.49× — not 2.4×.** The
+mechanism claimed for it holds: `id NOT IN (subquery)` builds the entire pinned
+set on every batch and that set scales with total users rather than with the feed
+being swept, which is why the list form is the only row here that degrades sharply
+between the two scales. But it wins by half what was claimed.
 
-**The cost is re-materialising the list.** `id NOT IN (subquery)` builds the
-entire pinned set on EVERY batch, and that set scales with total users rather
-than with the feed being swept — which is why per-batch time went from 87 ms at
-50k to 522 ms at 600k while the row count went *down*. Rewriting it as a
-correlated `NOT EXISTS` probes `idx_entry_state_entry_id` per candidate row
-instead: **2.4× at realistic scale, zero disk, zero write amplification.**
+**This finding's proposed index was not useless.** On a realistic distribution it
+takes the list form from 64.8 s to 44.0 s — within 1% of what the rewrite
+achieves. Had it been measured against a fixture that could distinguish, it would
+have read as a near-equivalent fix rather than a refuted one. The rewrite remains
+preferable because it costs no disk and no insert throughput, which is a real
+advantage and a smaller one than "does nothing" implied.
 
-**The age index is rejected.** It buys a further 10% for 27.9 MiB against a 768
-MiB watermark and ~12% on every insert — the poller inserts constantly and the
-sweep runs once a day. Wrong side of the trade on this box. Recorded here so it
-is a decision rather than an omission.
+**Both indexes are still rejected, now on honest numbers.** Against the shipped
+`NOT EXISTS`, the pinned index buys 12% for 6.9 MiB and the age index 22% for 27.9
+MiB, both against a 768 MiB watermark and both adding write amplification to a
+poller that inserts constantly — while the beneficiary is a once-a-day sweep that
+is already batched, throttled and interruptible. Recorded so these are decisions
+rather than omissions.
 
 The rewrite is also strictly safer: `NOT IN` against a subquery containing a NULL
 evaluates to NULL for every row and silently deletes nothing. Equivalent today
 only because `entry_state.entry_id` is `NOT NULL` — an equivalence that depends
 on a constraint declared somewhere else.
+
+**Method note.** The failure mode here was not skipping measurement; it was
+measuring against a fixture chosen to make the sweep expensive rather than to make
+it realistic. Every number in the first table was real. The fixture just could not
+distinguish the hypotheses being tested, and a uniformly-pinned table is exactly
+the shape that hides a partial index's selectivity.
 
 **Applied.** All 657 tests pass unchanged, including the ones pinning the sparing
 semantics, which is the equivalence argument made executable.

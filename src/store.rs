@@ -1548,27 +1548,47 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         Some(cutoff) => {
             delete_in_batches(
                 pool,
-                // **`NOT EXISTS`, not `id NOT IN (…)` — measured, not guessed.**
+                // **`NOT EXISTS`, not `id NOT IN (…)`.**
                 //
                 // The list form materialises the ENTIRE pinned set on every
                 // batch, and that set scales with total users rather than with
-                // the feed being swept. Measured on 1M entries with 600k
-                // `entry_state` rows: 104.4 s as a list, 42.7 s as a correlated
-                // exists — 2.4x, for no disk and no write amplification, because
-                // it probes `idx_entry_state_entry_id` per candidate row instead
-                // of rebuilding a 300k-element list 200 times.
+                // the feed being swept; this probes `idx_entry_state_entry_id`
+                // per candidate row instead. Measured on 1M entries with 600k
+                // `entry_state` rows of which 10% are pinned: **64.8 s as a list,
+                // 43.6 s as a correlated exists — 1.49x, for no disk and no write
+                // amplification.**
                 //
-                // The review that raised this proposed indexing the pinned
-                // predicate instead. Measured: a partial index on
-                // `entry_state(entry_id) WHERE starred = 1 OR read = 0` changed
-                // the plan and changed the time by nothing at all, at either
-                // scale. The scan was never the cost; the re-materialisation was.
+                // **An earlier version of this comment claimed 2.4x, and that a
+                // partial index on the pinned predicate "changed the time by
+                // nothing at all". Both were artifacts of a bad fixture.** It
+                // made every `entry_state` row match `starred = 1 OR read = 0` —
+                // no "read and not starred" rows at all, which is the commonest
+                // state a reader leaves behind. That inflated the list form's
+                // cost (the materialised set was the whole table) and made a
+                // PARTIAL index on that predicate cover 100% of rows, so it could
+                // not be selective and duly did nothing.
+                //
+                // On a realistic distribution the review's proposed index is NOT
+                // useless: it takes the list form from 64.8 s to 44.0 s, most of
+                // the way to the rewrite. The rewrite is still the better change
+                // because it costs no disk and no insert throughput — but it wins
+                // by less than claimed, against an alternative that was dismissed
+                // on a measurement of the wrong thing.
+                //
+                // Indexes are still declined, now on honest numbers: the pinned
+                // index buys 12% (43.6 → 38.5 s) for 6.9 MiB, the age index 22%
+                // (→ 33.9 s) for 27.9 MiB, both with write amplification on a
+                // poller that inserts constantly, against a daily sweep that is
+                // already batched and interruptible. See
+                // `store::tests::r6_measure_retention_sweep`.
                 //
                 // Also strictly safer. `NOT IN` against a subquery containing a
                 // NULL evaluates to NULL for every row, which would silently
                 // delete nothing. `entry_state.entry_id` is `NOT NULL` today, so
                 // the two are equivalent — but the equivalence depends on a
                 // column constraint somewhere else, and `NOT EXISTS` does not.
+                // `sparing_honours_every_did_not_just_one` pins the multi-DID
+                // case, which is the only one where the forms could diverge.
                 "SELECT e.id FROM entries e \
                  WHERE COALESCE(e.published, e.fetched_at) < ?1 \
                    AND NOT EXISTS ( \
@@ -5951,11 +5971,23 @@ mod tests {
             .execute(&pool)
             .await?;
 
+            // **A REALISTIC pin distribution, which the first version did not
+            // have.** It made every row `read=0,starred=0` or `read=1,starred=1`,
+            // so 100% of `entry_state` matched `starred = 1 OR read = 0` — there
+            // were no "read and not starred" rows at all, which is the commonest
+            // state a reader leaves behind. That mattered: a PARTIAL index on the
+            // pinned predicate then covers the whole table and cannot be
+            // selective, so measuring one against that fixture measures nothing.
+            //
+            // 90% read-and-unstarred (evictable), 10% pinned, split between
+            // starred and unread.
             sqlx::query(
                 "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) \
                  SELECT 'did:plc:reader', id, \
-                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
-                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
+                        CASE WHEN id % 10 <> 0 THEN 1 \
+                             WHEN id % 20 = 0 THEN 1 ELSE 0 END, \
+                        CASE WHEN id % 10 <> 0 THEN 0 \
+                             WHEN id % 20 = 0 THEN 1 ELSE 0 END, \
                         '2026-01-01T00:00:00Z' \
                  FROM entries LIMIT ?1",
             )
@@ -6068,7 +6100,14 @@ mod tests {
             };
             let elapsed = t.elapsed();
 
-            println!("\n=== {label}  (entry_state = {pinned}) ===");
+            // State the fixture's shape, so a future reader cannot mistake a
+            // degenerate distribution for a representative one again.
+            let matching: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM entry_state WHERE starred = 1 OR read = 0",
+            )
+            .fetch_one(&pool)
+            .await?;
+            println!("\n=== {label}  (entry_state = {pinned}, pinned = {matching}) ===");
             println!(
                 "  index cost: {:.1} MiB on disk, 10k inserts in {insert_10k:?}",
                 index_bytes as f64 / 1024.0 / 1024.0
@@ -6105,7 +6144,10 @@ mod tests {
             run("as shipped (NOT EXISTS)", &[], pinned, false).await?;
             run("old NOT IN list form", &[], pinned, true).await?;
             run("old NOT IN + pinned index", &[PINNED_IDX], pinned, true).await?;
-            run("old NOT IN + age index", &[AGE_IDX], pinned, true).await?;
+            // The row that was never measured: the pinned index against the
+            // query that SHIPPED, rather than against the one being deleted.
+            // Rejecting it on the strength of the latter was the error.
+            run("as shipped + pinned index", &[PINNED_IDX], pinned, false).await?;
             run("as shipped + age index", &[AGE_IDX], pinned, false).await?;
         }
         Ok(())
@@ -6730,7 +6772,7 @@ mod tests {
         //
         // This used to require `worst * 3 < sweep`, which is a statement about
         // how fast the sweep is — and it broke the moment the sweep got faster
-        // (the `NOT EXISTS` rewrite, 2.4x), because shrinking the denominator
+        // (the `NOT EXISTS` rewrite, 1.49x), because shrinking the denominator
         // tightened a threshold that was calibrated against the slow version. A
         // performance improvement making a correctness test fail is the test's
         // fault, not the improvement's.
