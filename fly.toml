@@ -12,6 +12,18 @@
 # The container entrypoint chowns /data to the app uid on first boot (a fresh Fly
 # volume is root:root), so the non-root app can create these files.
 #
+# ONE-TIME MAINTENANCE — auto_vacuum (databases created before v0.3.0 only):
+#   fly ssh console -C "/app/featherreader --migrate-auto-vacuum"
+# Databases created from v0.3.0 on are already in INCREMENTAL mode. Older ones
+# are in SQLite's default NONE, where reclaiming freed pages requires a FULL
+# VACUUM — which writes a second complete copy of the database and so needs free
+# disk roughly equal to the live file. That is exactly what is missing under the
+# disk pressure that triggers a retention sweep, so the app now refuses to run
+# one on its own and logs a warning instead. Switching modes needs that same full
+# VACUUM, so it is this deliberate, operator-timed step: run it while the volume
+# has headroom (it refuses itself if not), and expect writes to block for its
+# duration. Safe to run blindly — it exits 0 doing nothing if already migrated.
+#
 # DEPLOY BY DIGEST (not by tag). The release workflow publishes signed provenance
 # bound to the image DIGEST; deploying a mutable tag (or :latest) can silently
 # roll prod backward or bypass the attestation. The runbook resolves the tag to a

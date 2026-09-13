@@ -47,6 +47,14 @@ async fn main() -> Result<()> {
         .await
         .context("initializing the SQLite store")?;
 
+    // Maintenance mode: run the one-off auto_vacuum migration and exit without
+    // ever binding a port or starting a scheduler. See `run_vacuum_migration`.
+    if std::env::args().any(|a| a == MIGRATE_AUTO_VACUUM_FLAG) {
+        let outcome = run_vacuum_migration(&db, &config).await;
+        db.close().await;
+        return outcome;
+    }
+
     // Startup safety: surface the effective DB-size watermark and warn the
     // operator if it can't actually protect the volume (watermark >= free space
     // means the disk fills before the poller ever pauses). Best-effort; never
@@ -108,6 +116,66 @@ async fn main() -> Result<()> {
     }
 
     info!("shutdown complete");
+    Ok(())
+}
+
+/// The one CLI flag this binary understands. Everything else is env-driven.
+const MIGRATE_AUTO_VACUUM_FLAG: &str = "--migrate-auto-vacuum";
+
+/// Run the one-off `auto_vacuum = NONE → INCREMENTAL` migration, then exit.
+///
+/// **Why a flag and not a boot step.** SQLite ignores `PRAGMA auto_vacuum` on a
+/// populated database unless it is followed by a full `VACUUM` — so the only way
+/// off the mode where `reclaim` cannot work is to run the exact operation that
+/// is unsafe under disk pressure. Doing that automatically at boot, on a
+/// supervisor that tears the machine down whenever a child exits, is the crash
+/// loop shape the poller lease was just written to remove. So it is deliberate,
+/// operator-timed, and refuses itself when the volume lacks headroom:
+///
+/// ```text
+/// fly ssh console -C "/app/featherreader --migrate-auto-vacuum"
+/// ```
+///
+/// Databases CREATED after this change are already INCREMENTAL (`store::init_url`
+/// sets it before the first table exists), so this exists only for instances
+/// that predate it. It reports `NotNeeded` and exits 0 on those, which makes it
+/// safe to run blindly.
+async fn run_vacuum_migration(db: &store::Pool, config: &Config) -> Result<()> {
+    info!(db = %config.db_path.display(), "auto_vacuum migration: starting");
+    // The VACUUM holds an exclusive lock for its whole duration, so a running
+    // instance will see its writes block. Say so before starting rather than
+    // leaving an operator to infer it from a stalled site.
+    info!(
+        "auto_vacuum migration: this rewrites the whole database file. Writes on a \
+         running instance will block until it finishes."
+    );
+    let available = available_disk_bytes(&config.db_path);
+    match store::migrate_to_incremental_vacuum(db, available).await? {
+        store::VacuumMigration::NotNeeded(mode) => {
+            info!(?mode, "auto_vacuum migration: nothing to do");
+        }
+        store::VacuumMigration::RefusedNoHeadroom { needed, available } => {
+            // Not an error exit: the operator asked a reasonable question and
+            // got a correct answer. Failing here would be indistinguishable from
+            // a broken binary in a deploy script.
+            tracing::warn!(
+                needed_bytes = needed,
+                available_bytes = available,
+                "auto_vacuum migration: REFUSED. A full VACUUM writes a second copy of \
+                 the database, so it needs roughly twice the live size free. Free space \
+                 on the volume (or grow it) and run this again."
+            );
+        }
+        store::VacuumMigration::Migrated {
+            bytes_before,
+            bytes_after,
+        } => {
+            info!(
+                bytes_before,
+                bytes_after, "auto_vacuum migration: complete; the database is now INCREMENTAL"
+            );
+        }
+    }
     Ok(())
 }
 

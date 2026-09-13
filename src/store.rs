@@ -439,6 +439,13 @@ pub async fn init(config: &Config) -> Result<Pool> {
 /// `sqlite::memory:` for an ephemeral in-memory database. The file is created
 /// if it does not exist; WAL journaling is enabled for on-disk databases and
 /// foreign keys are enforced on every connection.
+/// Ceiling the WAL is truncated back to at each checkpoint.
+///
+/// The WAL lives on the same volume as the database and counts against the same
+/// 1 GB, but nothing bounded it: SQLite grows the WAL to fit the largest
+/// transaction it has ever seen and never shrinks it again without this limit.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 pub async fn init_url(db_url: &str) -> Result<Pool> {
     // An in-memory DB must run on a SINGLE connection: each `:memory:` connection
     // is a *separate* database, and a multi-connection in-memory pool can also
@@ -454,6 +461,29 @@ pub async fn init_url(db_url: &str) -> Result<Pool> {
     // WAL is a no-op / unsupported for :memory:, so only request it on-disk.
     if !is_memory {
         opts = opts.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        // **Incremental auto-vacuum, set at CREATION.**
+        //
+        // `auto_vacuum` was read by `reclaim` and never set anywhere, so every
+        // database ran in SQLite's default NONE mode and `reclaim` always took
+        // its full-`VACUUM` branch — daily, and again after every prune. A full
+        // VACUUM needs free disk roughly equal to the live database because it
+        // writes a whole new file, which is exactly what is scarce under the
+        // disk pressure that triggers a sweep; on a ~700 MiB database on a 1 GB
+        // volume it cannot complete at all.
+        //
+        // This pragma only takes effect on a database with no tables yet, so it
+        // fixes NEW instances permanently and does nothing to existing ones —
+        // deliberately. Changing it on a populated database requires running the
+        // very full VACUUM that is unsafe here, so that is a separate,
+        // operator-invoked step: see [`migrate_to_incremental_vacuum`].
+        opts = opts.auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
+        // Truncate the WAL back down at checkpoints. Without a limit, a WAL
+        // grown once by a single large transaction stays that size for the life
+        // of the file — permanently occupying volume the watermark is trying to
+        // protect. The batched retention deletes keep transactions small now, so
+        // in practice the WAL should rarely approach this; the limit is what
+        // makes that a guarantee rather than a hope.
+        opts = opts.pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string());
     }
     // Under a concurrent write burst (the poller's insert_entries tx racing the
     // web layer's mark_read / redeem_code tx) SQLite would otherwise return
@@ -761,6 +791,13 @@ pub async fn count_feeds(pool: &SqlitePool) -> Result<i64> {
 /// live pages means a retention prune (which frees pages, see [`reclaim`]) is
 /// actually reflected here, so the watermark can drop back below its threshold
 /// and polling resumes. Cheap (three `PRAGMA` reads); works for file + `:memory:`.
+///
+/// **The WAL counts too.** This is the number the DB-size watermark compares
+/// against a VOLUME size, and in WAL mode the `-wal` sidecar sits on that same
+/// volume — so leaving it out understated exactly the quantity the watermark
+/// exists to bound. It is added back below, best-effort: a WAL that cannot be
+/// stat'd contributes zero rather than failing the check, since a watermark that
+/// errors is worse than one that is slightly optimistic.
 pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(pool)
@@ -775,7 +812,27 @@ pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
         .await
         .context("PRAGMA page_size failed")?;
     let used_pages = page_count.saturating_sub(freelist_count).max(0);
-    Ok(used_pages.saturating_mul(page_size))
+    Ok(used_pages
+        .saturating_mul(page_size)
+        .saturating_add(wal_bytes(pool).await))
+}
+
+/// Bytes the write-ahead log currently occupies on the database's volume, or 0
+/// when there is no WAL (`:memory:`, non-WAL journal modes) or it cannot be
+/// stat'd. Best-effort by design — see [`db_size_bytes`].
+async fn wal_bytes(pool: &SqlitePool) -> i64 {
+    // `database_list` gives the main database's file path; empty for :memory:.
+    let path: Option<String> = sqlx::query_scalar(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' AND file <> ''",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(path) = path else { return 0 };
+    std::fs::metadata(format!("{path}-wal"))
+        .map(|m| i64::try_from(m.len()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Reclaim freed pages so the database file (and its used-page accounting) can
@@ -789,25 +846,157 @@ pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
 /// is in `auto_vacuum = INCREMENTAL` mode (cheap, no full rewrite), and otherwise
 /// falls back to a full `VACUUM`.
 pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
-    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+    match auto_vacuum_mode(pool).await? {
+        AutoVacuum::Incremental => {
+            sqlx::query("PRAGMA incremental_vacuum")
+                .execute(pool)
+                .await
+                .context("PRAGMA incremental_vacuum failed")?;
+        }
+        // SQLite already returns freed pages at every commit in this mode.
+        // Nothing to do, and a VACUUM would be pure cost.
+        AutoVacuum::Full => {}
+        // **Deliberately a no-op, where this used to run a full VACUUM.**
+        //
+        // Nothing ever set `auto_vacuum`, so NONE was the mode every database
+        // actually ran in — which made the full-VACUUM branch the one that
+        // always executed, daily and after every prune. A full VACUUM writes a
+        // complete second copy of the database, so it needs free disk roughly
+        // equal to the live file; that is precisely what is missing under the
+        // disk pressure that triggers a retention sweep. `poll_due_once` already
+        // carries a comment explaining this danger and removed VACUUM from the
+        // poll path — while leaving it in the retention path that runs under the
+        // same pressure.
+        //
+        // Skipping it does NOT latch the DB-size watermark, which is the failure
+        // this branch was written to prevent: `db_size_bytes` subtracts the
+        // freelist, so a DELETE lowers the measured size with no VACUUM at all.
+        // What is lost is the FILE shrinking, and the fix for that is to get the
+        // database into INCREMENTAL mode — see `migrate_to_incremental_vacuum`,
+        // which is operator-invoked precisely because it needs the one operation
+        // that is unsafe to attempt automatically.
+        AutoVacuum::None => {
+            tracing::warn!(
+                "auto_vacuum=NONE: skipping reclaim. Freed pages stay allocated and \
+                 the file will not shrink. Run `featherreader --migrate-auto-vacuum` \
+                 once, while the volume has headroom, to move this database to \
+                 INCREMENTAL mode."
+            );
+        }
+    }
+
+    // Truncate the WAL as well. It lives on the same volume and is counted by
+    // `db_size_bytes`, so reclaiming database pages while leaving a WAL grown by
+    // the sweep that just ran would give back part of the space and hold the
+    // rest. Worth doing even in the NONE branch above, where it is the only
+    // space this function can return at all.
+    //
+    // Best-effort: a TRUNCATE checkpoint yields to active readers rather than
+    // blocking them, and reports that as a row, not an error. A skipped
+    // checkpoint just means the next one does the work.
+    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await
+    {
+        tracing::debug!(%err, "wal checkpoint after reclaim did not run");
+    }
+    Ok(())
+}
+
+/// A database's `auto_vacuum` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoVacuum {
+    /// 0 — freed pages stay on the freelist; only a full `VACUUM` returns them.
+    None,
+    /// 1 — SQLite returns freed pages at every commit.
+    Full,
+    /// 2 — freed pages are returned on demand by `PRAGMA incremental_vacuum`.
+    Incremental,
+}
+
+/// Read the database's `auto_vacuum` mode.
+pub async fn auto_vacuum_mode(pool: &SqlitePool) -> Result<AutoVacuum> {
+    let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
         .fetch_one(pool)
         .await
         .context("PRAGMA auto_vacuum failed")?;
-    // auto_vacuum: 0 = NONE, 1 = FULL, 2 = INCREMENTAL. `incremental_vacuum` only
-    // does anything in INCREMENTAL mode; in NONE mode a full VACUUM is required to
-    // return freed pages to the OS.
-    if auto_vacuum == 2 {
-        sqlx::query("PRAGMA incremental_vacuum")
-            .execute(pool)
-            .await
-            .context("PRAGMA incremental_vacuum failed")?;
-    } else {
-        sqlx::query("VACUUM")
-            .execute(pool)
-            .await
-            .context("VACUUM failed")?;
+    Ok(match mode {
+        1 => AutoVacuum::Full,
+        2 => AutoVacuum::Incremental,
+        _ => AutoVacuum::None,
+    })
+}
+
+/// What [`migrate_to_incremental_vacuum`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumMigration {
+    /// Already in a mode that reclaims; nothing was run.
+    NotNeeded(AutoVacuum),
+    /// Refused: not enough free space on the volume to hold the rebuilt file.
+    RefusedNoHeadroom { needed: u64, available: u64 },
+    /// Ran the pragma + full VACUUM; the database is now INCREMENTAL.
+    Migrated { bytes_before: i64, bytes_after: i64 },
+}
+
+/// Move a populated database from `auto_vacuum = NONE` to `INCREMENTAL`.
+///
+/// **Why this cannot happen at boot.** SQLite ignores `PRAGMA auto_vacuum` on a
+/// database that already has tables unless it is followed by a full `VACUUM`,
+/// which rebuilds the file. So the migration off the dangerous mode requires the
+/// exact operation that is dangerous — a genuine chicken-and-egg, and the reason
+/// this is an explicit operator step run when the volume has headroom rather
+/// than something attempted lazily on a machine that is already under pressure.
+///
+/// Doing it automatically would also reintroduce the failure shape T2.1 just
+/// removed: a boot-time VACUUM that cannot complete on a full volume, on a
+/// supervisor that restarts the machine whenever a child exits, is a crash loop.
+///
+/// `available_bytes` is the caller's measurement of free space on the database's
+/// volume (`None` where the platform cannot report it). The check is a refusal,
+/// not a warning: starting a VACUUM that cannot finish wastes I/O on a box that
+/// has none to spare. `VACUUM` itself is atomic — an interrupted one leaves the
+/// original database intact — so the risk being managed here is wasted work and
+/// a long write-lock hold, not corruption.
+pub async fn migrate_to_incremental_vacuum(
+    pool: &SqlitePool,
+    available_bytes: Option<u64>,
+) -> Result<VacuumMigration> {
+    let mode = auto_vacuum_mode(pool).await?;
+    if mode != AutoVacuum::None {
+        return Ok(VacuumMigration::NotNeeded(mode));
     }
-    Ok(())
+
+    // The rebuild needs room for a whole second copy. Ask for that plus a
+    // margin, since the WAL grows alongside it.
+    let bytes_before = db_size_bytes(pool).await?;
+    let needed = (bytes_before.max(0) as u64).saturating_mul(2);
+    if let Some(available) = available_bytes {
+        if available < needed {
+            return Ok(VacuumMigration::RefusedNoHeadroom { needed, available });
+        }
+    }
+
+    // Order matters: the pragma records the INTENT, and the VACUUM is what
+    // actually rewrites the file in the new mode. Reversed, the VACUUM would
+    // rebuild in NONE mode and the pragma would then be ignored again.
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(pool)
+        .await
+        .context("PRAGMA auto_vacuum = INCREMENTAL failed")?;
+    sqlx::query("VACUUM")
+        .execute(pool)
+        .await
+        .context("VACUUM failed during the auto_vacuum migration")?;
+
+    let after = auto_vacuum_mode(pool).await?;
+    anyhow::ensure!(
+        after == AutoVacuum::Incremental,
+        "the auto_vacuum migration ran but the database is still in {after:?} mode"
+    );
+    Ok(VacuumMigration::Migrated {
+        bytes_before,
+        bytes_after: db_size_bytes(pool).await?,
+    })
 }
 
 /// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`, then
@@ -4537,6 +4726,216 @@ mod tests {
     }
 
     // -- F3: db_size_bytes ignores freed pages and drops after reclaim -------
+
+    /// A new on-disk database must be created in INCREMENTAL mode.
+    ///
+    /// This is the whole fix for new instances: `auto_vacuum` was read by
+    /// `reclaim` and set nowhere, so every database ran in NONE and `reclaim`
+    /// always took its full-`VACUUM` branch — the one that cannot complete on a
+    /// volume under the pressure that triggered the sweep. The pragma only binds
+    /// on a database with no tables yet, so "at creation" is the load-bearing
+    /// part, not "somewhere in init".
+    #[tokio::test]
+    async fn a_new_database_is_created_in_incremental_vacuum_mode() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-autovac-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let pool = init_url(&format!("sqlite://{}", path.display())).await?;
+
+        assert_eq!(
+            auto_vacuum_mode(&pool).await?,
+            AutoVacuum::Incremental,
+            "a fresh database is still in the mode where reclaim needs a full VACUUM"
+        );
+        // And the WAL is bounded rather than growing to its high-water mark
+        // forever.
+        let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            limit, WAL_SIZE_LIMIT_BYTES,
+            "journal_size_limit not applied"
+        );
+
+        // Being INCREMENTAL, the migration is a no-op — which is what makes the
+        // flag safe for an operator to run without checking first.
+        assert_eq!(
+            migrate_to_incremental_vacuum(&pool, None).await?,
+            VacuumMigration::NotNeeded(AutoVacuum::Incremental)
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// The migration refuses itself when the volume cannot hold the rebuild.
+    ///
+    /// A full `VACUUM` writes a complete second copy, so attempting one without
+    /// headroom burns I/O on a box that has none and finishes nothing. Refusing
+    /// is the entire reason this is an operator step rather than something
+    /// `reclaim` does on its own.
+    #[tokio::test]
+    async fn the_vacuum_migration_refuses_without_headroom() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-autovac-none-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        // Build a database the way one that predates this change looks: create
+        // the file in NONE mode explicitly, then populate it.
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+        assert_eq!(auto_vacuum_mode(&pool).await?, AutoVacuum::None);
+
+        // Zero free space: refused, and the mode is untouched.
+        let refused = migrate_to_incremental_vacuum(&pool, Some(0)).await?;
+        assert!(
+            matches!(refused, VacuumMigration::RefusedNoHeadroom { .. }),
+            "expected a refusal, got {refused:?}"
+        );
+        assert_eq!(
+            auto_vacuum_mode(&pool).await?,
+            AutoVacuum::None,
+            "a refused migration must not have changed the mode"
+        );
+
+        // With headroom it runs, and the database ends up INCREMENTAL — which is
+        // what makes `reclaim` cheap from then on.
+        let done = migrate_to_incremental_vacuum(&pool, Some(u64::MAX)).await?;
+        assert!(
+            matches!(done, VacuumMigration::Migrated { .. }),
+            "expected a migration, got {done:?}"
+        );
+        assert_eq!(auto_vacuum_mode(&pool).await?, AutoVacuum::Incremental);
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// `reclaim` must NOT run a full VACUUM in NONE mode — the branch that used
+    /// to be the only one that ever executed, and the one that cannot finish on
+    /// a volume under the pressure that triggers a sweep.
+    ///
+    /// Observable without timing a VACUUM: a full VACUUM returns freed pages to
+    /// the OS, so `page_count` falls. Skipping it leaves the allocation in
+    /// place — while `db_size_bytes`, which subtracts the freelist, still drops.
+    /// That pairing is the actual claim: the watermark does not latch even
+    /// though the file does not shrink.
+    #[tokio::test]
+    async fn reclaim_does_not_full_vacuum_in_none_mode() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-noneclaim-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://none.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..1500)
+            .map(|i| NewEntry {
+                guid: format!("n-{i}"),
+                content_html: Some("x".repeat(800)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        // Fold the WAL in so the "full" baseline is file pages, not WAL churn.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await?;
+        let used_full = db_size_bytes(&pool).await?;
+
+        sqlx::query("DELETE FROM entries").execute(&pool).await?;
+        let pages_before: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await?;
+
+        reclaim(&pool).await?;
+
+        let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            pages_after, pages_before,
+            "reclaim shrank the file in NONE mode, so it ran the full VACUUM this \
+             branch exists to avoid"
+        );
+        // …and the watermark still falls, which is what makes skipping safe.
+        // `db_size_bytes` subtracts the freelist, so the delete alone lowers it
+        // even though the file kept every page it had allocated.
+        let used_after = db_size_bytes(&pool).await?;
+        assert!(
+            used_after < used_full,
+            "used size did not fall after the delete ({used_after} !< {used_full}); \
+             without a VACUUM the DB-size watermark would latch the poller off"
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn db_size_drops_after_prune_and_reclaim() -> Result<()> {

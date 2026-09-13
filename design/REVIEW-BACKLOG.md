@@ -13,11 +13,11 @@ looked at, not things I inherited.
 are the difference between an instance that fails loudly and one that fails at
 3am in a way nobody can attribute. Tier 4 is real but survivable.
 
-**Status.** Tier 1 is done — T1.2 and T1.3 in `ba9951a`, T1.1 in the commit that
-updated this line. Tiers 2–4 are open. The three Tier 1 entries are kept below
-rather than deleted, because each states a failure mode that its fix now has to
-keep closed, and that is worth having written down next to the tiers that are
-still open.
+**Status.** Tiers 1 and 2 are done — T1.2/T1.3 in `ba9951a`, T1.1 in `1cfae77`,
+T2.1/T2.2/T2.4/T2.5 in `1831bba`, T2.3 in the commit that updated this line.
+Tiers 3–4 are open. Completed entries are kept below rather than deleted, because
+each states a failure mode its fix now has to keep closed, and that is worth
+having written down next to the tiers that are still open.
 
 ---
 
@@ -115,9 +115,9 @@ confirming `a_disabled_window_does_not_disable_the_ceiling` fails against it.
 
 ---
 
-## Tier 2 — availability, fast follow
+## Tier 2 — availability, fast follow — **DONE**
 
-### T2.1 A process-killing feed is a permanent crash loop
+### T2.1 A process-killing feed is a permanent crash loop — FIXED
 
 Nothing is written to the feed row *before* the fetch: `bump_feed_errors` and
 `set_next_poll` both run only after `poll_feed` returns. `due_feeds` orders by
@@ -146,7 +146,14 @@ returns `Err` — and, more to the point, after one that never returns at all
 (simulate by asserting the write happens before the fetch is invoked, using the
 same dependency-injection shape the OAuth orchestrators now use).
 
-### T2.2 The retention sweep holds the single write lock too long
+**Done** in `1831bba`, both parts. The lease is the cadence the feed would have
+got had the poll succeeded, so a returning poll overwrites it and the common case
+is unchanged. Startup delays went on FIVE loops, not three: `run_pending_sweeper`
+also fired immediately and the review did not name it. Fixed distinct offsets
+rather than jitter — one machine, no fleet to de-synchronise, and fixed values
+stay reproducible in a test.
+
+### T2.2 The retention sweep holds the single write lock too long — FIXED
 
 `prune_old_entries` opens one transaction and calls `prune_orphan_cursor_ids_tx`,
 which loads every `read_cursor` row and then issues a fresh per-cursor `SELECT
@@ -163,7 +170,14 @@ per-cursor loop is untouched and is now the dominant term.
 the cursor scrub out of the delete transaction. Correctness is preserved
 because the scrub is idempotent and already gated on rows having changed.
 
-### T2.3 `reclaim()` runs a full `VACUUM`, and always will
+**Done** in `1831bba`. One detail the plan missed: batching alone is not enough —
+without an explicit hand-off between batches the loop re-acquires the write lock
+immediately and a waiting writer still starves, so the fix would have been
+bookkeeping. The test measures LATENCY rather than success, because at realistic
+test sizes the old shape still finished inside `busy_timeout` and the writes
+would have landed — each having waited for the entire sweep.
+
+### T2.3 `reclaim()` runs a full `VACUUM`, and always will — FIXED
 
 `store.rs:731-741` uses `PRAGMA incremental_vacuum` only when `PRAGMA
 auto_vacuum == 2`. Verified: `auto_vacuum` is **read** there and **never set**
@@ -190,7 +204,19 @@ the mode is NONE. Also set `journal_size_limit` (a WAL grown once by a large
 transaction is never truncated today) and make `db_size_bytes` account for the
 WAL's share of the volume, which it currently ignores.
 
-### T2.4 The rate-limit map is unbounded with O(n) eviction per request
+**Done**, all five parts. The migration is a CLI flag
+(`featherreader --migrate-auto-vacuum`) rather than a boot step, because a
+boot-time VACUUM that cannot complete on a full volume, under a supervisor that
+restarts on any child exit, is precisely the crash-loop shape T2.1 just removed;
+it refuses itself when the volume lacks headroom, and is a no-op on an
+already-migrated database so it is safe to run blindly. Skipping the VACUUM in
+NONE mode does NOT latch the watermark — `db_size_bytes` subtracts the freelist,
+so a DELETE lowers it with no VACUUM at all; what is lost is only the file
+shrinking. Counting the WAL then surfaced that `reclaim` was giving back database
+pages while leaving a WAL the sweep had just grown, so it now truncates the WAL
+too — the only space it can return at all in NONE mode.
+
+### T2.4 The rate-limit map is unbounded with O(n) eviction per request — FIXED
 
 `web.rs` keeps `HashMap<IpAddr, Bucket>` with a 1-hour idle eviction and **no
 size cap**, and calls `map.retain(…)` across the whole map on every guarded
@@ -203,7 +229,13 @@ and one shared core.
 **Fix.** Cap the map (evict oldest past the cap, as the pinned-client cache
 does) and amortize the sweep — only `retain` every N seconds, not per request.
 
-### T2.5 Pinned clients have unbounded idle connection pools
+**Done** in `1831bba`. LRU eviction is what makes a size cap safe rather than a
+bypass: an attacker cannot evict their own throttled bucket, because it is by
+definition the most recently touched entry. Writing that test surfaced that a
+millisecond clock step let the token REFILL hand back a token and masquerade as
+an eviction bypass; it steps in nanoseconds now.
+
+### T2.5 Pinned clients have unbounded idle connection pools — FIXED
 
 `build_pinned_client` sets neither `pool_max_idle_per_host` nor
 `pool_idle_timeout` (verified: neither appears in `net.rs`). With up to 256
@@ -213,6 +245,10 @@ keep-alive TLS connections. The measured "Rust app ~20 MB" likely predates a
 populated cache.
 
 **Fix.** Set both on the builder. Two lines.
+
+**Done** in `1831bba`, plus a test that the idle timeout stays under the client
+TTL — the reverse ordering makes every cached client pay socket rent for the tail
+of its life.
 
 ---
 
