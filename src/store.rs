@@ -1937,6 +1937,221 @@ pub async fn mark_starred(
     Ok(res.rows_affected() > 0)
 }
 
+/// Fold ids already covered by a high-water-mark into `read_through`, so the
+/// exception set stops growing. Returns the new `read_through` when it advanced.
+///
+/// **What was wrong.** `read_through` was never COMPUTED — `project_entry_into_cursor`
+/// only carried an existing value through, and it starts NULL, so in practice it
+/// was always NULL. That left `read_ids` as the sole mechanism, growing one id
+/// per article read, bounded only by `max_entries_per_feed` (2000) — while the
+/// flusher caps the record at `ReadState::MAX_IDS` (1000) keeping the TAIL, with
+/// no log line. Past 1000 read articles in one feed, the oldest read-state
+/// silently stopped syncing, and those articles came back UNREAD in any other
+/// atproto reader. The `cap` helper's own comment assumed "the exception sets
+/// are expected to stay well under the cap in normal use"; against a 2000-entry
+/// per-feed ceiling that does not hold.
+///
+/// **The rule.** `read_through` means "every entry at or before this time is
+/// read". So it may advance only to a point with no unread entry at or before
+/// it. That point is computed here as the newest entry timestamp STRICTLY OLDER
+/// than the oldest unread entry — strictly, because entries can share a
+/// timestamp, and a watermark equal to an unread entry's time would assert that
+/// entry is read.
+///
+/// Once the watermark moves, every `read_ids` entry at or before it is
+/// redundant and is dropped — that is the compaction. `unread_ids` is filtered
+/// the same way; by construction nothing unread sits at or below the new
+/// watermark, so it empties, but the filter is written rather than assumed so it
+/// stays correct if that invariant ever shifts.
+///
+/// Timestamps compare lexicographically because every writer normalises to UTC
+/// `...Z` at seconds precision (`feed::fmt_time`, `now_rfc3339`) — the same
+/// assumption `poll_health` and the retention window already make.
+pub async fn compact_cursor(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+) -> Result<Option<String>> {
+    let mut tx = pool.begin().await.context("begin compact_cursor tx")?;
+    let (read_through, read_ids, unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+
+    // The oldest entry on this feed that `did` has NOT read. `NULL` = nothing
+    // unread, in which case the watermark can cover the whole feed.
+    let oldest_unread: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT MIN(COALESCE(e.published, e.fetched_at))
+        FROM entries e
+        JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        WHERE f.url = ?2 AND COALESCE(s.read, 0) = 0
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .fetch_one(&mut *tx)
+    .await
+    .with_context(|| format!("compact_cursor: oldest unread for {did}/{feed_url}"))?;
+
+    let watermark: Option<String> = match &oldest_unread {
+        Some(oldest) => sqlx::query_scalar(
+            r#"
+            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            FROM entries e JOIN feeds f ON f.id = e.feed_id
+            WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) < ?2
+            "#,
+        )
+        .bind(feed_url)
+        .bind(oldest)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("compact_cursor: watermark for {did}/{feed_url}"))?,
+        None => sqlx::query_scalar(
+            r#"
+            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            FROM entries e JOIN feeds f ON f.id = e.feed_id
+            WHERE f.url = ?1
+            "#,
+        )
+        .bind(feed_url)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("compact_cursor: watermark for {did}/{feed_url}"))?,
+    };
+
+    // Nothing to cover, or the watermark is already at least this far along.
+    // Never move it BACKWARDS: that would re-assert articles as unread.
+    let Some(watermark) = watermark else {
+        return Ok(None);
+    };
+    if read_through
+        .as_deref()
+        .is_some_and(|rt| rt >= &watermark[..])
+    {
+        return Ok(None);
+    }
+
+    let keep_above = ids_published_after(&mut tx, feed_url, &read_ids, &watermark).await?;
+    let keep_unread =
+        ids_published_at_or_before(&mut tx, feed_url, &unread_ids, &watermark).await?;
+
+    write_cursor_sets(
+        &mut tx,
+        did,
+        feed_url,
+        Some(&watermark),
+        &keep_above,
+        &keep_unread,
+        &now_rfc3339(),
+    )
+    .await?;
+    tx.commit().await.context("commit compact_cursor tx")?;
+    Ok(Some(watermark))
+}
+
+/// The subset of `ids` whose entries are published strictly AFTER `watermark`,
+/// as the canonical JSON array-of-strings the cursor stores.
+async fn ids_published_after(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    ids: &str,
+    watermark: &str,
+) -> Result<String> {
+    let live = ids_matching_watermark(tx, feed_url, watermark, true).await?;
+    Ok(filter_id_set_to_live(ids, &live))
+}
+
+/// The subset of `ids` whose entries are published at or BEFORE `watermark`.
+async fn ids_published_at_or_before(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    ids: &str,
+    watermark: &str,
+) -> Result<String> {
+    let live = ids_matching_watermark(tx, feed_url, watermark, false).await?;
+    Ok(filter_id_set_to_live(ids, &live))
+}
+
+/// Entry ids on `feed_url` on one side of `watermark`. `after = true` selects
+/// strictly newer; `false` selects at-or-older.
+async fn ids_matching_watermark(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    watermark: &str,
+    after: bool,
+) -> Result<std::collections::HashSet<i64>> {
+    let sql = if after {
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
+         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) > ?2"
+    } else {
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
+         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) <= ?2"
+    };
+    Ok(sqlx::query_scalar::<_, i64>(sql)
+        .bind(feed_url)
+        .bind(watermark)
+        .fetch_all(&mut **tx)
+        .await
+        .context("compact_cursor: ids on one side of the watermark")?
+        .into_iter()
+        .collect())
+}
+
+/// Clear `did`'s star on any cached entry matching `url` or `guid`, **ignoring
+/// the subscription projection**. Returns the number of `entry_state` rows
+/// changed.
+///
+/// This closes a desync between the two places a star lives. The starred view
+/// matches PDS saved records against cached entries through `sub_ref`, so an
+/// entry that is cached AND starred in a feed the reader has since UNSUBSCRIBED
+/// from does not match: it renders as an uncached row whose button is
+/// `POST /saved/{rkey}/delete`. That deletes the PDS record and used to leave
+/// `entry_state.starred = 1` behind — invisible, because the starred list is
+/// `sub_ref`-scoped too, until the reader resubscribes and the star reappears
+/// with no record backing it.
+///
+/// **Why omitting `sub_ref` is safe here, when it is the per-DID isolation hook
+/// everywhere else.** Every row this can touch is keyed by `did` and this writes
+/// only `starred = 0`. The worst a caller can do with it is clear one of their
+/// OWN stars — which is what they just asked for. The predicate that matters for
+/// isolation is the `did` in the `WHERE`, and it is not optional.
+///
+/// Matching on `url` OR `guid` mirrors how the view decides a record is already
+/// cached, so the removal path and the render path agree on what "the same
+/// article" means.
+pub async fn clear_star_by_identity(
+    pool: &SqlitePool,
+    did: &str,
+    url: Option<&str>,
+    guid: Option<&str>,
+) -> Result<u64> {
+    // Neither identifier present: nothing to match on. Running the statement
+    // would compare NULL to NULL and match nothing, but returning early says so.
+    if url.is_none_or(str::is_empty) && guid.is_none_or(str::is_empty) {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        r#"
+        UPDATE entry_state
+        SET starred = 0, updated_at = ?4
+        WHERE did = ?1
+          AND starred = 1
+          AND entry_id IN (
+              SELECT id FROM entries
+              WHERE (?2 IS NOT NULL AND url = ?2)
+                 OR (?3 IS NOT NULL AND guid = ?3)
+          )
+        "#,
+    )
+    .bind(did)
+    .bind(url.filter(|u| !u.is_empty()))
+    .bind(guid.filter(|g| !g.is_empty()))
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .with_context(|| format!("clear_star_by_identity failed for {did}"))?;
+    Ok(res.rows_affected())
+}
+
 /// Mark every entry of a feed read (or unread) for a DID in one statement —
 /// backs the "mark-all-read (per feed)" action. Also projects the change into
 /// the feed's per-DID [`ReadCursor`] (dirty=1) so the batched flusher syncs the
@@ -3717,6 +3932,299 @@ mod tests {
         let counts = unread_counts_by_feed(&pool, did).await?;
         assert_eq!(counts.get(&a), None);
         assert_eq!(counts.get(&b).copied(), Some(2));
+        Ok(())
+    }
+
+    /// **Read-state compaction: the water-mark must absorb the id set.**
+    ///
+    /// `read_through` was never computed, so `read_ids` was the only mechanism
+    /// and grew one id per article read against a 2000-entry per-feed ceiling —
+    /// while the flusher truncates the record at 1000, keeping the tail. Past
+    /// 1000 read articles in a feed, the oldest read-state stopped syncing and
+    /// those articles came back UNREAD in every other atproto reader.
+    #[tokio::test]
+    async fn compaction_folds_read_ids_into_the_water_mark() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:compact";
+        let feed_url = "https://compact.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // 40 entries, oldest first by published date.
+        let entries: Vec<NewEntry> = (0..40)
+            .map(|i| NewEntry {
+                guid: format!("c-{i:03}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let all = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        // Oldest first, so the read prefix is contiguous from the start.
+        let mut oldest_first = all.clone();
+        oldest_first.reverse();
+        for row in oldest_first.iter().take(30) {
+            mark_read(&pool, did, row.id, true).await?;
+        }
+
+        let before = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert!(before.read_through.is_none(), "read_through starts unset");
+        let before_ids: Vec<String> = serde_json::from_str(&before.read_ids)?;
+        assert_eq!(before_ids.len(), 30, "every read is its own exception");
+
+        let watermark = compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("the water-mark must advance");
+
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert_eq!(after.read_through.as_deref(), Some(watermark.as_str()));
+        let after_ids: Vec<String> = serde_json::from_str(&after.read_ids)?;
+        assert!(
+            after_ids.is_empty(),
+            "a contiguous read prefix must fold entirely into the water-mark, left {after_ids:?}"
+        );
+        // The 30th entry is read and the 31st is not, so the mark sits on the
+        // 30th — STRICTLY below the oldest unread, never equal to it.
+        assert_eq!(watermark, "2026-01-30T00:00:00Z");
+        assert!(after.dirty, "a rewritten cursor must be re-flushed");
+        Ok(())
+    }
+
+    /// The water-mark may never cover an unread entry, and may never move
+    /// backwards. Both would re-assert articles as read that are not.
+    #[tokio::test]
+    async fn compaction_stops_below_the_oldest_unread_entry() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:gap";
+        let feed_url = "https://gap.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..10)
+            .map(|i| NewEntry {
+                guid: format!("g-{i:02}"),
+                published: Some(format!("2026-02-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let mut oldest_first = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        oldest_first.reverse();
+        // Read everything EXCEPT the third-oldest: a hole at 2026-02-03.
+        for (i, row) in oldest_first.iter().enumerate() {
+            if i != 2 {
+                mark_read(&pool, did, row.id, true).await?;
+            }
+        }
+
+        let watermark = compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("advances");
+        assert_eq!(
+            watermark, "2026-02-02T00:00:00Z",
+            "the water-mark jumped the unread hole"
+        );
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let kept: Vec<String> = serde_json::from_str(&after.read_ids)?;
+        assert_eq!(
+            kept.len(),
+            7,
+            "the 7 reads ABOVE the hole must stay as explicit exceptions"
+        );
+        // The unread hole is above the water-mark, so it needs no unread
+        // exception — everything above the mark is unread by default.
+        let unread: Vec<String> = serde_json::from_str(&after.unread_ids)?;
+        assert!(
+            unread.is_empty(),
+            "redundant unread exceptions survived: {unread:?}"
+        );
+
+        // Idempotent, and never backwards: re-running changes nothing.
+        assert_eq!(
+            compact_cursor(&pool, did, feed_url).await?,
+            None,
+            "a second compaction moved a water-mark that was already correct"
+        );
+        Ok(())
+    }
+
+    /// Nothing read yet, or nothing in the feed: compaction must be a no-op
+    /// rather than inventing a water-mark that asserts the backlog is read.
+    #[tokio::test]
+    async fn compaction_never_invents_a_water_mark() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:none";
+        let feed_url = "https://none.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        // Empty feed: no entries at all.
+        assert_eq!(compact_cursor(&pool, did, feed_url).await?, None);
+
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "n-1".to_string(),
+                    published: Some("2026-03-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "n-2".to_string(),
+                    published: Some("2026-03-02T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+
+        // Nothing read: the OLDEST entry is unread, so there is no timestamp
+        // strictly below it and the mark cannot move at all.
+        assert_eq!(
+            compact_cursor(&pool, did, feed_url).await?,
+            None,
+            "a water-mark appeared with nothing read — that asserts the backlog is read"
+        );
+        Ok(())
+    }
+
+    /// **The unsave desync: clearing a star must work for an UNSUBSCRIBED feed.**
+    ///
+    /// That is the whole case. Every other starred path is `sub_ref`-scoped, so
+    /// an entry that is cached AND starred in a feed the reader has since
+    /// unsubscribed from is invisible to all of them — including the starred
+    /// list itself. Its PDS record therefore renders as "not cached", and the
+    /// button on that row deletes the record. If clearing the local star were
+    /// `sub_ref`-scoped too, it would silently do nothing, and the star would
+    /// reappear with no record behind it the moment the reader resubscribed.
+    #[tokio::test]
+    async fn a_star_can_be_cleared_after_unsubscribing_from_its_feed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:unsub";
+        let feed_id = seed_big_entries(&pool, did, 3).await?;
+        let rows = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        let target = rows[0].clone();
+        mark_starred(&pool, did, target.id, true).await?;
+        assert_eq!(get_starred_for_did(&pool, did).await?.len(), 1);
+
+        // Unsubscribe. The entry stays cached and stays starred, but every
+        // sub_ref-scoped read now skips it.
+        replace_sub_refs(&pool, did, &[]).await?;
+        assert!(
+            get_starred_for_did(&pool, did).await?.is_empty(),
+            "fixture precondition: the star must be invisible to the scoped read"
+        );
+        assert!(
+            starred_identities(&pool, did, 1_000).await?.is_empty(),
+            "fixture precondition: the identity lookup must miss it too"
+        );
+        let still_starred: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            still_starred, 1,
+            "the star is still there, just unreachable"
+        );
+
+        // The removal path must reach it anyway.
+        let cleared =
+            clear_star_by_identity(&pool, did, target.url.as_deref(), Some(&target.guid)).await?;
+        assert_eq!(cleared, 1, "the star survived the unsave");
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(after, 0);
+
+        // Resubscribing must NOT bring it back.
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        assert!(
+            get_starred_for_did(&pool, did).await?.is_empty(),
+            "the star came back after resubscribing — the desync is still there"
+        );
+        Ok(())
+    }
+
+    /// It clears only the CALLER's star, and only for the matching article.
+    ///
+    /// Omitting `sub_ref` is safe precisely because `did` is not optional; this
+    /// pins that, and that a non-matching identity is a no-op rather than a
+    /// wildcard.
+    #[tokio::test]
+    async fn clearing_a_star_touches_only_that_did_and_that_article() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let mine = "did:plc:mine";
+        let theirs = "did:plc:theirs";
+        let feed_id = seed_big_entries(&pool, mine, 3).await?;
+        replace_sub_refs(&pool, theirs, &[feed_id]).await?;
+        let rows = list_entries(&pool, mine, ListView::All, None, 10, 0).await?;
+
+        for r in &rows {
+            mark_starred(&pool, mine, r.id, true).await?;
+            mark_starred(&pool, theirs, r.id, true).await?;
+        }
+
+        let target = &rows[1];
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, target.url.as_deref(), Some(&target.guid)).await?,
+            1
+        );
+
+        let count = |did: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1",
+                )
+                .bind(did)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(count(mine).await, 2, "it cleared more than the one article");
+        assert_eq!(count(theirs).await, 3, "it cleared another DID's stars");
+
+        // An identity that matches nothing is a no-op, not a wildcard.
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, Some("https://nope.example/x"), Some("nope"))
+                .await?,
+            0
+        );
+        assert_eq!(count(mine).await, 2);
+        // And neither identifier present does nothing at all.
+        assert_eq!(clear_star_by_identity(&pool, mine, None, None).await?, 0);
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, Some(""), Some("")).await?,
+            0
+        );
+        assert_eq!(count(mine).await, 2);
         Ok(())
     }
 

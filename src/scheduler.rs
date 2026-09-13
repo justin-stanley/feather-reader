@@ -1011,6 +1011,21 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
     // duplicate writes to the same key). Deterministic order for stable batches.
     let mut batch: BTreeMap<String, (ReadState, ReadCursor)> = BTreeMap::new();
     for cursor in cursors {
+        // **Compact before capping.**
+        //
+        // `read_ids` grows one id per article read and is bounded only by
+        // `max_entries_per_feed` (2000), while `cap` below truncates the record
+        // at `ReadState::MAX_IDS` (1000) keeping the TAIL. Past 1000 read
+        // articles in one feed the oldest read-state silently stopped syncing,
+        // and those articles came back UNREAD in every other atproto reader —
+        // the one thing the shared lexicon exists to prevent.
+        //
+        // `store::compact_cursor` folds the covered ids into the `read_through`
+        // high-water-mark, which is the field that exists for exactly this and
+        // was never being computed. Done here rather than on every mark-read
+        // because this is the moment the size actually matters, and it is per
+        // dirty cursor per flush rather than per click.
+        let cursor = compact_if_large(state, did, cursor).await;
         let rkey = read_state_rkey(&cursor.feed_url);
         let record = read_state_record(&cursor);
         batch.insert(rkey, (record, cursor));
@@ -1055,6 +1070,56 @@ async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
 
     info!(%did, feeds = flushed, "read-state flusher: flushed dirty cursors");
     Ok(())
+}
+
+/// `read_ids` length at which a cursor is compacted before flushing.
+///
+/// Half of [`ReadState::MAX_IDS`], so compaction happens well before the cap
+/// truncates anything, and the common cursor — a handful of ids — never pays for
+/// the two extra queries.
+const COMPACT_READ_IDS_THRESHOLD: usize = ReadState::MAX_IDS / 2;
+
+/// Fold covered ids into the `read_through` water-mark when the exception set has
+/// grown enough to matter, and return the rewritten cursor.
+///
+/// On ANY failure this returns the cursor it was given. Flushing an uncompacted
+/// cursor is the behaviour that shipped for months — a compaction problem must
+/// not become a read-state-sync problem.
+async fn compact_if_large(state: &AppState, did: &str, cursor: ReadCursor) -> ReadCursor {
+    if parse_id_array(&cursor.read_ids).len() < COMPACT_READ_IDS_THRESHOLD {
+        return cursor;
+    }
+    match store::compact_cursor(&state.db, did, &cursor.feed_url).await {
+        Ok(Some(watermark)) => {
+            // Re-read: `compact_cursor` rewrote the row, and the flusher's
+            // conditional dirty-clear compares `updated_at` against the version
+            // it flushed. Carrying the pre-compaction snapshot forward would
+            // clear a flag for a row that has since changed.
+            match store::get_cursor(&state.db, did, &cursor.feed_url).await {
+                Ok(Some(fresh)) => {
+                    info!(
+                        %did,
+                        feed = %cursor.feed_url,
+                        %watermark,
+                        before = parse_id_array(&cursor.read_ids).len(),
+                        after = parse_id_array(&fresh.read_ids).len(),
+                        "read-state compacted into readThrough"
+                    );
+                    fresh
+                }
+                Ok(None) => cursor,
+                Err(err) => {
+                    warn!(%err, %did, feed = %cursor.feed_url, "could not re-read a compacted cursor");
+                    cursor
+                }
+            }
+        }
+        Ok(None) => cursor,
+        Err(err) => {
+            warn!(%err, %did, feed = %cursor.feed_url, "read-state compaction failed; flushing uncompacted");
+            cursor
+        }
+    }
 }
 
 /// Turn a local [`ReadCursor`] row into the PDS [`ReadState`] lexicon record.
@@ -1108,13 +1173,29 @@ fn parse_id_array(raw: &str) -> Vec<String> {
     }
 }
 
-/// Truncate a set to `max`, keeping the most recent (tail) ids. This only
-/// enforces the lexicon's hard cap; it does not fold covered ids into the
-/// `read_through` water-mark (there is no compaction step yet — the exception
-/// sets are expected to stay well under the cap in normal use).
+/// Truncate a set to `max`, keeping the most recent (tail) ids — the lexicon's
+/// hard cap, and the LAST line of defence rather than the only one.
+///
+/// This used to be the only one, under the stated assumption that "the exception
+/// sets are expected to stay well under the cap in normal use". Against a 2000
+/// entry per-feed ceiling and one id per article read, that did not hold: past
+/// 1000 read articles in a feed this silently dropped the oldest read-state, and
+/// those articles came back UNREAD in every other atproto reader.
+///
+/// [`compact_if_large`] now folds covered ids into `read_through` before a cursor
+/// gets here, so reaching this truncation means compaction could not advance the
+/// water-mark — which happens only when the feed's oldest entry is genuinely
+/// unread. Losing the tail is still wrong in that case, but it is now a rare
+/// shape rather than the ordinary consequence of reading a busy feed.
 fn cap(mut ids: Vec<String>, max: usize) -> Vec<String> {
     if ids.len() > max {
         let drop = ids.len() - max;
+        warn!(
+            dropped = drop,
+            kept = max,
+            "read-state id set exceeded the lexicon cap even after compaction; \
+             the oldest marks will not sync"
+        );
         ids.drain(0..drop);
     }
     ids

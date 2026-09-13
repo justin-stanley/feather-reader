@@ -13,9 +13,13 @@ looked at, not things I inherited.
 are the difference between an instance that fails loudly and one that fails at
 3am in a way nobody can attribute. Tier 4 is real but survivable.
 
-**Status.** Tiers 1, 2 and 3 are done — T1.2/T1.3 in `ba9951a`, T1.1 in
-`1cfae77`, T2.1/T2.2/T2.4/T2.5 in `1831bba`, T2.3 in `75f1c53`, T3.1/T3.2 in the
-commit that updated this line. Tier 4 is open. Completed entries are kept below rather than deleted, because
+**Status.** All four tiers are done — T1.2/T1.3 in `ba9951a`, T1.1 in
+`1cfae77`, T2.1/T2.2/T2.4/T2.5 in `1831bba`, T2.3 in `75f1c53`, T3.1/T3.2 in
+`5f0b2c1`, and T4.1–T4.5 in the commit that updated this line. T4.6 is 0.4.0
+work and is recorded, not code.
+
+A second cold-review round over `efb1d3f..5f0b2c1` ran while Tier 4 was being
+written; its findings are NOT folded in here and are triaged separately. Completed entries are kept below rather than deleted, because
 each states a failure mode its fix now has to keep closed, and that is worth
 having written down next to the tiers that are still open.
 
@@ -317,9 +321,21 @@ runtime built — reachable with `curl` at exactly the moment the session-gated
 
 ---
 
-## Tier 4 — correctness and papercuts
+## Tier 4 — correctness and papercuts — **DONE**
 
-### T4.1 `starred` is scoped by subscription, so the unsave desync survives
+### T4.1 `starred` is scoped by subscription, so the unsave desync survives — FIXED
+
+**Done** at the DESTRUCTIVE end rather than the rendering end. `unsave_record`
+now reads the record's identity before deleting it and clears any local star for
+the same article (`store::clear_star_by_identity`, which deliberately omits the
+`sub_ref` predicate — every row it can touch is keyed by the caller's own DID and
+it only ever writes `starred = 0`).
+
+Dropping `sub_ref` from the RENDER path instead would have been wrong: the row
+would then link to `/entries/{id}`, which is `sub_ref`-scoped and would 404. An
+article in a feed you no longer follow genuinely is "held by the PDS record, not
+by any feed you read" — that rendering is correct, and what needed fixing was
+that removing it only removed half of it.
 
 **Still open after T1.1** — the identity lookup moved to
 `store::starred_identities`, but it shares `list_query_sql`, which carries the
@@ -334,7 +350,17 @@ still `POST /saved/{rkey}/delete` — which deletes the PDS record and leaves
 narrowed this case rather than closing it, and its comment ("match against ALL
 cached starred entries") is inaccurate as written.
 
-### T4.2 The `safe_link` skip is silent and in the wrong order
+### T4.2 The `safe_link` skip is silent and in the wrong order — FIXED
+
+**Done**, with one correction to the finding. The ordering was not exploitable:
+the nudge keys on `feed_url`, not on the `item.url` being rejected, and is
+already gated on the reader subscribing to that feed — so an unusable URL never
+reached it. The check moved above the nudge anyway as ordering hygiene.
+
+The real defect was the `continue`: the row vanished, and because the un-save
+button lives ON the row, the record became unremovable from this client. It now
+renders without an anchor and with an "unusable link" badge, and the title falls
+back to the rkey rather than to the URL `safe_link` just rejected.
 
 An unusable saved-record URL makes the row vanish entirely — no badge, no count,
 and the `tracing::debug!` is below any realistic filter — so the record can then
@@ -345,7 +371,14 @@ outbound poll nudge on every render.
 **Fix.** Reorder so the check precedes the nudge, and render the row without an
 anchor rather than dropping it, so it stays unsave-able.
 
-### T4.3 Server-controlled `error_description` is logged verbatim
+### T4.3 Server-controlled `error_description` is logged verbatim — FIXED
+
+**Done**, and the finding understated it: the raw `error` also went into the
+RENDERED login page (`login_error(&format!("Login failed: {err}"))`), so an
+attacker who could make a browser fetch the callback chose copy shown in the
+product's own voice. `known_error_slug` is now `pub(crate)` and both the log and
+the page carry only a `&'static str` from the fixed list; the description is
+dropped, keeping only its length.
 
 `web.rs:2839` logs it at `warn!`. `oauth/flow.rs:186-199` deliberately reduces
 the callback `error` to a known slug and drops the description for precisely
@@ -354,7 +387,20 @@ Attacker-controlled free text, including newlines, into the log stream.
 
 **Fix.** Apply the same reduction `flow.rs` already implements.
 
-### T4.4 Six swallowed errors that change what the user sees
+### T4.4 Six swallowed errors that change what the user sees — FIXED
+
+**Done.** Three now log with context (both `upsert_feed` sites, the
+`feeds_for_did` sidebar fallback), and three stopped reporting success for work
+that did not happen: a failed PDS `update_subscription` flashes instead of
+redirecting as though the rename landed; a failed OPML batch write returns
+"nothing was imported" rather than "Imported N feeds"; and an OPML PARSE failure
+is now distinguished from a valid-but-empty file, which used to be reported as
+"No feeds found in that OPML" and sent the reader looking for feeds that were
+right there in the export.
+
+One existing test asserted the rename handler redirects to `/` — which only held
+because the PDS failure was hidden, and there is no PDS in that test. It now
+asserts the property it was actually written for (not refused by the feed cap).
 
 `unwrap_or_default()` / `let _ =` on paths where failure is silent and
 user-visible. Two are literal support tickets: `let _ = store::upsert_feed(…)`
@@ -368,7 +414,18 @@ reported to the user as "No feeds found in that OPML".
 **Fix.** Log every one of them with context; correct the two that report success
 for work that did not happen.
 
-### T4.5 Read-state above 1000 ids per feed is silently discarded
+### T4.5 Read-state above 1000 ids per feed is silently discarded — FIXED
+
+**Done** as the finding prescribed: `store::compact_cursor` computes the
+water-mark `read_through` always lacked. The rule is that it may only advance to
+a point with no unread entry at or before it — implemented as the newest entry
+timestamp STRICTLY older than the oldest unread one, strictly because entries can
+share a timestamp and an equal water-mark would assert an unread entry is read.
+
+Run from the flusher once `read_ids` passes half the lexicon cap, so the common
+cursor never pays for it. `cap` remains as the last line of defence and now warns
+when it fires, which after compaction means only that the feed's oldest entry is
+genuinely unread.
 
 `read_through` is never *computed* — `project_entry_into_cursor` only carries an
 existing value through, and it starts NULL (verified: the only non-test

@@ -4,6 +4,20 @@
     PDS record alone: it links straight out, shows no excerpt, and offers no
     mark-read control, because there is no local entry to mark. #}
 <li class="entry entry-uncached" id="saved-{{ e.rkey }}">
+{#  An EMPTY link means `net::safe_link` refused the saved record's URL — a
+    `javascript:` scheme, say, which HTML escaping does not neutralise. The row
+    still renders, without an anchor: dropping it made the record unremovable
+    from here, because the un-save button below is attached to the row. #}
+{% if e.link.is_empty() %}
+  <div class="entry-main">
+    <span class="entry-title">{{ e.title }}</span>
+    <span class="entry-meta">
+      <span class="entry-badge" title="This item's saved link is not a usable web address, so it is shown without one">unusable link</span>
+      {% if !e.feed_title.is_empty() %}<span class="sep" aria-hidden="true">·</span><span class="entry-feed">{{ e.feed_title }}</span>{% endif %}
+      {% if !e.published.is_empty() %}<span class="sep" aria-hidden="true">·</span><time class="entry-time" datetime="{{ e.published }}">saved {{ e.published }}</time>{% endif %}
+    </span>
+  </div>
+{% else %}
   <a class="entry-main" href="{{ e.link }}" rel="noopener noreferrer">
     <span class="entry-title">{{ e.title }}</span>
     <span class="entry-meta">
@@ -12,6 +26,7 @@
       {% if !e.published.is_empty() %}<span class="sep" aria-hidden="true">·</span><time class="entry-time" datetime="{{ e.published }}">saved {{ e.published }}</time>{% endif %}
     </span>
   </a>
+{% endif %}
 
   <div class="entry-actions">
     <form

@@ -198,7 +198,13 @@ const KNOWN_ERRORS: [&str; 11] = [
 ];
 
 /// Reduce a server-supplied error code to a known slug.
-fn known_error_slug(raw: &str) -> &'static str {
+///
+/// The return type is the point: `&'static str` from a fixed list, so nothing a
+/// server sent can survive into a log line or a rendered page. `pub(crate)`
+/// because `web.rs` handles the sidecar-shaped callback, which arrives at the
+/// same route with the same attacker-reachable parameters and needs the same
+/// reduction.
+pub(crate) fn known_error_slug(raw: &str) -> &'static str {
     KNOWN_ERRORS
         .iter()
         .find(|known| **known == raw)

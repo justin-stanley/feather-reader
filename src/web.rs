@@ -765,7 +765,17 @@ async fn about(State(state): State<AppState>) -> Response {
 /// `POST /saved/:rkey/delete` — remove a saved record that has no local entry.
 ///
 /// The normal star toggle is keyed on an entry id, which a PDS-only saved row
-/// does not have. This deletes the record straight from the repo by its rkey.
+/// does not have. This deletes the record straight from the repo by its rkey,
+/// and then clears any LOCAL star for the same article.
+///
+/// That second step is not belt-and-braces. "Has no local entry" is how the
+/// starred view classifies a record, and it decides that through `sub_ref` — so
+/// an article that really is cached, and really is starred, lands here whenever
+/// the reader has unsubscribed from its feed. Deleting only the record left
+/// `entry_state.starred = 1` behind: invisible, because the starred list is
+/// `sub_ref`-scoped too, until a resubscribe brought the star back with nothing
+/// in the PDS backing it. A reader who clicks "remove" gets it removed from both
+/// places it lives.
 async fn unsave_record(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -774,11 +784,41 @@ async fn unsave_record(
     let Some(did) = current_did(&state, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response();
     };
+
+    // Read the record's identity BEFORE deleting it — afterwards there is
+    // nothing left to learn it from. Best-effort: a failure here must not block
+    // the deletion the reader actually asked for, so it degrades to the old
+    // behaviour (record gone, local star possibly stale) and says so.
+    let identity = match state.repo().list_saved(&did).await {
+        Ok(records) => records
+            .into_iter()
+            .find(|(k, _)| *k == rkey)
+            .map(|(_, rec)| (rec.url, rec.entry_id)),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not read the saved record before deleting it; \
+                                      a local star for the same article may survive");
+            None
+        }
+    };
+
     match state.repo().remove_saved(&did, &rkey).await {
         Ok(()) => info!(%did, %rkey, "removed a saved record with no cached entry"),
         Err(err) => {
             warn!(%err, %did, %rkey, "could not remove the saved record");
             return (StatusCode::BAD_GATEWAY, "could not remove that item\n").into_response();
+        }
+    }
+
+    // Deliberately AFTER the delete: the PDS is the source of truth for what was
+    // saved, so clearing the local star before knowing the record is gone would
+    // be the desync in the other direction.
+    if let Some((url, guid)) = identity {
+        match store::clear_star_by_identity(&state.db, &did, Some(&url), guid.as_deref()).await {
+            Ok(0) => {}
+            Ok(n) => {
+                info!(%did, %rkey, cleared = n, "cleared the local star for an unsaved record")
+            }
+            Err(err) => warn!(%err, %did, %rkey, "could not clear the local star after unsaving"),
         }
     }
     // htmx swaps the row out; a plain form post goes back to the starred list.
@@ -1417,7 +1457,18 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
             // `sub_ref` projection (its own feeds, possibly stale) and leave
             // `sub_ref` untouched — never synthesize from every cached feed,
             // which would grant cross-tenant read+mutate during any outage.
-            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_default();
+            // A DB failure here is NOT the same as "this DID follows nothing",
+            // but `unwrap_or_default` rendered it as exactly that: an empty
+            // sidebar and an empty reader, which arrives as "all my feeds
+            // vanished". It still degrades to empty — there is nothing better to
+            // show — but it says so, so the support ticket and the log line can
+            // be matched up.
+            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_else(|err| {
+                warn!(%err, %did, "the PDS is unreachable AND the local subscription \
+                                   projection could not be read; rendering an EMPTY \
+                                   feed list, which is not the same as having none");
+                Vec::new()
+            });
             return feeds
                 .into_iter()
                 .map(|f| ResolvedSub {
@@ -1459,7 +1510,13 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                     continue;
                 }
                 // Upsert a cache row so the sidebar reflects the real follow-list.
-                let _ = store::upsert_feed(
+                //
+                // A silent failure here is a support ticket with no evidence: no
+                // `feeds` row means the poller never selects this subscription,
+                // so the reader sees "I added a feed and it never updates" while
+                // the PDS record looks perfect. Logged with the URL so the
+                // failing subscription is identifiable.
+                if let Err(err) = store::upsert_feed(
                     pool,
                     &store::NewFeed {
                         url: sub.url.clone(),
@@ -1468,7 +1525,11 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                         ..Default::default()
                     },
                 )
-                .await;
+                .await
+                {
+                    warn!(%err, url = %sub.url, %did, "could not cache a subscribed feed; \
+                                                       it will not be polled");
+                }
                 store::get_feed_by_url(pool, &sub.url).await.ok().flatten()
             }
             Err(err) => {
@@ -1632,7 +1693,7 @@ async fn index(
     // lexicon exists for. Those rows are rendered from the PDS record alone.
     let mut entries = entries;
     if view == "starred" {
-        // **Match against ALL cached starred entries, not the scoped `source`.**
+        // **Match against every SUBSCRIBED cached starred entry, not `source`.**
         //
         // `source` has already been filtered by feed/folder. Matching against it
         // meant an entry that IS cached but sits outside the current filter
@@ -1643,6 +1704,17 @@ async fn index(
         // every cached article outside it look uncached. Hence a dedicated
         // identity query over the whole starred set — urls and guids only, no
         // bodies — rather than reusing `source`.
+        //
+        // One gap remains BY DESIGN, and is handled at the other end. This query
+        // still carries the `sub_ref` predicate, so a starred, cached entry in a
+        // feed the reader has UNSUBSCRIBED from is absent here and its record
+        // renders as uncached. That is the right rendering — the article is no
+        // longer part of any feed the reader follows, and the PDS record is what
+        // still holds it — but it means the un-save button is the record-deleting
+        // one. `unsave_record` therefore clears the local star too, so the two
+        // stores agree however the row got classified. Dropping the predicate
+        // here instead would have made the row link to `/entries/{id}`, which is
+        // `sub_ref`-scoped and would 404.
         let identities = store::starred_identities(pool, &did, STARRED_IDENTITY_MAX)
             .await
             .unwrap_or_else(|err| {
@@ -1690,6 +1762,40 @@ async fn index(
                             _ => continue,
                         }
                     }
+                    // **`safe_link` FIRST, and a failure no longer drops the row.**
+                    //
+                    // `item.url` is attacker-controlled — a saved record written
+                    // by any client — and it lands in an `href`. Askama escapes
+                    // HTML metacharacters but not SCHEMES, so `javascript:`
+                    // survives escaping intact. This project already built the
+                    // helper for exactly that, and `feed.rs` uses it on the
+                    // equivalent link; this path was simply not routed through it.
+                    //
+                    // The real defect was what a failure DID: it `continue`d, so
+                    // the row vanished entirely — no badge, no count, nothing —
+                    // and the only trace was a `debug!` below any realistic
+                    // filter. That makes the record unremovable FROM HERE, because
+                    // the un-save button lives on the row; the reader has to open
+                    // a different atproto client to get rid of it. A bad URL is a
+                    // reason to withhold the LINK, not the row.
+                    //
+                    // The check also moved ABOVE the poll nudge. That is ordering
+                    // hygiene rather than a fix: the nudge keys on `feed_url`, not
+                    // on the URL being rejected here, and is already gated on the
+                    // reader actually subscribing to that feed — so it was never
+                    // reachable by an unusable `item.url`. Deciding whether a
+                    // record is renderable before doing anything outbound on its
+                    // behalf is simply the order that stays correct if either of
+                    // those two facts later stops being true.
+                    let link = crate::net::safe_link(&item.url);
+                    if link.is_none() {
+                        warn!(
+                            %did, %rkey,
+                            "a saved record has an unusable URL; rendering it without a link \
+                             so it can still be removed"
+                        );
+                    }
+
                     // Opportunistic re-fetch: if the reader still subscribes to
                     // the feed, make it due now. If the article is still inside
                     // the feed's window the poller caches it normally and this
@@ -1712,29 +1818,31 @@ async fn index(
                             }
                         }
                     }
-                    // `safe_link` or nothing. `item.url` is attacker-controlled
-                    // — a saved record written by any client — and it lands in
-                    // an `href`. Askama escapes HTML metacharacters but not
-                    // SCHEMES, so `javascript:` survives escaping intact. This
-                    // project already built the helper for exactly that, and
-                    // `feed.rs` uses it on the equivalent link; this path was
-                    // simply not routed through it.
-                    let Some(link) = crate::net::safe_link(&item.url) else {
-                        tracing::debug!(%did, "skipping a saved record with an unusable URL");
-                        continue;
-                    };
                     uncached.push(EntryRow {
                         id: 0,
                         title: item
                             .title
                             .clone()
                             .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| item.url.clone()),
+                            // Falling back to the URL is fine for a link we are
+                            // willing to render, and wrong for one we are not:
+                            // it would put the exact string `safe_link` just
+                            // rejected into the page as the record's name. The
+                            // rkey is what the un-save button acts on, so it is
+                            // the honest identifier for a row that has nothing
+                            // else trustworthy to show.
+                            .unwrap_or_else(|| match &link {
+                                Some(_) => item.url.clone(),
+                                None => format!("Saved item {rkey}"),
+                            }),
                         feed_title: item.feed_url.clone().unwrap_or_default(),
                         published: display_date(Some(&item.created_at)),
                         read: false,
                         starred: true,
-                        link,
+                        // Empty = "render this row without an anchor". The
+                        // template branches on it, so the rejected URL never
+                        // reaches an `href` even as an escaped string.
+                        link: link.unwrap_or_default(),
                         cached: false,
                         rkey,
                     });
@@ -2698,7 +2806,7 @@ async fn rename_subscription(
         .filter(|f| !f.is_empty());
 
     // Keep the local cache title in step for the loose-feed fallback path.
-    let _ = store::upsert_feed(
+    if let Err(err) = store::upsert_feed(
         &state.db,
         &store::NewFeed {
             url: sub.url.clone(),
@@ -2707,13 +2815,34 @@ async fn rename_subscription(
             ..Default::default()
         },
     )
-    .await;
-
-    match state.repo().update_subscription(&did, &rkey, &sub).await {
-        Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription"),
-        Err(err) => warn!(%err, %did, %rkey, "PDS subscription update failed"),
+    .await
+    {
+        // Not fatal to the rename — the PDS record below is the source of truth
+        // — but a missing `feeds` row means this subscription is never polled.
+        warn!(%err, %did, url = %sub.url, "could not update the cached feed row on rename");
     }
-    Ok(Redirect::to("/").into_response())
+
+    // **The PDS write decides what the reader is told.**
+    //
+    // This used to `warn!` on failure and then redirect exactly as it does on
+    // success, so a rename that did not happen was indistinguishable from one
+    // that did — the reader saw their old title come back and had no reason to
+    // think anything had gone wrong. The PDS record IS the subscription; a
+    // failure here means nothing was renamed or moved.
+    match state.repo().update_subscription(&did, &rkey, &sub).await {
+        Ok(res) => {
+            info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription");
+            Ok(Redirect::to("/").into_response())
+        }
+        Err(err) => {
+            warn!(%err, %did, %rkey, "PDS subscription update failed");
+            Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("Could not save that change to your PDS — nothing was renamed or moved.")
+            ))
+            .into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,10 +3254,29 @@ async fn oauth_callback(
     let sidecar_handoff = sidecar_shape
         && (state.oauth.is_none() || state.config.repo_backend == crate::metrics::Backend::Sidecar);
     if let Some(err) = q.error.clone() {
-        let desc = q.error_description.clone().unwrap_or_default();
-        warn!(error = %err, desc = %desc, "OAuth callback returned an error");
+        // **Neither the code nor the description is echoed as sent.**
+        //
+        // Both are server-controlled free text arriving on a public GET, so
+        // anyone who can make a browser fetch this URL chooses them. The raw
+        // `error` used to go into a `warn!` AND into the rendered login page,
+        // and `error_description` — arbitrary text, newlines included — went
+        // into the log verbatim: a log-injection surface on one side and
+        // attacker-chosen copy in the product's own voice on the other.
+        //
+        // `oauth::flow` already decided this exact question for the Rust arm:
+        // reduce the code to a known slug, drop the description entirely. That
+        // reasoning is not specific to which arm handles the callback, and this
+        // one simply never got the same treatment. The description's LENGTH is
+        // kept, because "the server sent a 4 KB explanation" is occasionally
+        // worth knowing and cannot be used to inject anything.
+        let slug = crate::oauth::flow::known_error_slug(&err);
+        warn!(
+            error = slug,
+            desc_len = q.error_description.as_deref().map_or(0, str::len),
+            "OAuth callback returned an error"
+        );
         if sidecar_handoff || state.oauth.is_none() {
-            return login_error(&format!("Login failed: {err}"));
+            return login_error(&format!("Login failed: {slug}"));
         }
         // Fall through: the Rust arm consumes the pending row and validates
         // `iss` against it, and reports the failure afterwards.
@@ -4095,7 +4243,22 @@ async fn import_opml(
         }
     }
 
-    let feeds = opml::parse_opml(&opml_text).unwrap_or_default();
+    // A parse FAILURE and an empty-but-valid file are different things, and
+    // `unwrap_or_default` collapsed them: a malformed export was reported to the
+    // reader as "No feeds found in that OPML", which sends them looking at their
+    // old reader for feeds that are right there in the file.
+    let feeds =
+        match opml::parse_opml(&opml_text) {
+            Ok(feeds) => feeds,
+            Err(err) => {
+                warn!(%err, %did, "OPML import could not parse the uploaded file");
+                return Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("That file could not be read as OPML. Export it again from your other reader?")
+            ))
+                .into_response());
+            }
+        };
     if feeds.is_empty() {
         info!(%did, "OPML import found no feeds");
         return Ok(
@@ -4173,6 +4336,9 @@ async fn import_opml(
 
     let mut subs = Vec::with_capacity(feeds.len());
     let mut skipped_private: Vec<String> = Vec::new();
+    // Imported into the PDS but not cached locally, so not pollable until the
+    // next import touches them. Counted rather than only logged — see below.
+    let mut uncached: usize = 0;
     for f in &feeds {
         // `xmlUrl` is whatever the uploaded file says, and nothing on this path
         // ever parsed it — the single-add path can't reach here because
@@ -4243,7 +4409,12 @@ async fn import_opml(
             .as_ref()
             .and_then(|name| folder_uris.get(name).cloned());
         subs.push(sub);
-        let _ = store::upsert_feed(
+        // Same support ticket as the single-add path: no `feeds` row means the
+        // poller never selects this subscription, so the import looks like it
+        // worked and the feed silently never updates. Counted as well as logged,
+        // because one line per feed in a 200-feed import is not something anyone
+        // reads — the count goes to the reader.
+        if let Err(err) = store::upsert_feed(
             pool,
             &store::NewFeed {
                 url: f.feed_url.clone(),
@@ -4252,18 +4423,48 @@ async fn import_opml(
                 ..Default::default()
             },
         )
-        .await;
+        .await
+        {
+            warn!(%err, %did, url = %f.feed_url, "OPML import could not cache a feed; \
+                                                  it will not be polled");
+            uncached += 1;
+        }
     }
 
-    match state.repo().add_subscriptions_bulk(&did, &subs).await {
+    // **A failed PDS write is not an import.**
+    //
+    // The subscriptions live in the reader's repo; a local `feeds` row is just a
+    // poller hint. This used to `warn!` and then report "Imported N feeds"
+    // regardless, so a total failure read as a total success — and the reader
+    // would only discover otherwise on their next visit, with an empty sidebar.
+    let pds_written = match state.repo().add_subscriptions_bulk(&did, &subs).await {
         Ok(rkeys) => {
-            info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)")
+            info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)");
+            true
         }
-        Err(err) => warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)"),
+        Err(err) => {
+            warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)");
+            false
+        }
+    };
+    if !pds_written {
+        return Ok(Redirect::to(&format!(
+            "/?flash={}",
+            qenc(
+                "Could not save those subscriptions to your PDS, so nothing was imported. \
+                 Try again in a moment."
+            )
+        ))
+        .into_response());
     }
 
     // Report the import count, plus any private/paid feeds skipped as unsupported.
     let mut flash = format!("Imported {} feeds", subs.len());
+    if uncached > 0 {
+        flash.push_str(&format!(
+            ". {uncached} of them could not be cached locally and may not update until the next import."
+        ));
+    }
     if trimmed_over_cap > 0 {
         flash.push_str(&format!(
             ". {trimmed_over_cap} feed(s) not imported: your subscription limit ({sub_cap}) was reached."
@@ -7164,9 +7365,16 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(
-            loc, "/",
-            "retitle of an existing feed must succeed, got {loc}"
+        // What this test is about is the CAP, so assert on the cap. It used to
+        // assert `loc == "/"`, which passed only because a failed PDS write was
+        // silently reported as success — there is no PDS in this test. Now that
+        // the handler tells the truth, the plain "/" redirect is the
+        // everything-worked case and is not reachable here; the property that
+        // matters is that the request was not refused by the feed-capacity
+        // guard, and that no row was added.
+        assert!(
+            !loc.contains("feed%20capacity"),
+            "retitle of an EXISTING feed must not be refused by the global cap, got {loc}"
         );
         assert_eq!(
             store::count_feeds(&state.db).await.unwrap(),
