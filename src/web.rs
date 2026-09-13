@@ -1161,6 +1161,54 @@ struct FolderView {
 }
 
 /// One entry as shown in the article list / after an htmx swap.
+/// A string that is safe to place in an `href`.
+///
+/// **Structural, not procedural — and that distinction is the whole point.** The
+/// saved-record path takes an attacker-controlled URL (any atproto client can
+/// write the record), and Askama escapes HTML metacharacters but NOT schemes, so
+/// `javascript:` survives escaping intact.
+///
+/// The defence used to be "remember to call `net::safe_link` before assigning
+/// this field". A cold review measured what that was worth: deleting the call
+/// left **all 679 tests passing**, because every test either exercised the helper
+/// directly or never rendered this row. The control was real and completely
+/// unprotected.
+///
+/// So the field is no longer a `String`. There is no `From<String>`, no public
+/// member, and the only constructor that accepts foreign input is
+/// [`SafeLink::external`], which performs the scheme check itself. Forgetting the
+/// check is now a compile error instead of a silent hole. [`SafeLink::internal`]
+/// exists for app-built paths and is deliberately named so that handing it
+/// foreign input is an obviously wrong act rather than an easy omission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SafeLink(String);
+
+impl SafeLink {
+    /// An app-generated path such as `/entries/42`, built from a row id and our
+    /// own query string. Never attacker-controlled.
+    fn internal(path: String) -> Self {
+        Self(path)
+    }
+
+    /// Attacker-controlled input. Scheme-checked; an unusable URL yields an
+    /// EMPTY link, which the template renders as a row WITHOUT an anchor rather
+    /// than dropping the row — a dropped row is unremovable, because the un-save
+    /// button lives on it.
+    fn external(raw: &str) -> Self {
+        Self(crate::net::safe_link(raw).unwrap_or_default())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for SafeLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 struct EntryRow {
     id: i64,
     title: String,
@@ -1170,7 +1218,7 @@ struct EntryRow {
     starred: bool,
     /// The reader link href, already carrying the scope/view query so opening an
     /// entry and paging back stays within the list it came from.
-    link: String,
+    link: SafeLink,
     /// Whether the article itself is in this instance's cache.
     ///
     /// `false` for a saved record that exists in the reader's PDS but whose
@@ -1975,8 +2023,8 @@ async fn index(
                     // record is renderable before doing anything outbound on its
                     // behalf is simply the order that stays correct if either of
                     // those two facts later stops being true.
-                    let link = crate::net::safe_link(&item.url);
-                    if link.is_none() {
+                    let link = SafeLink::external(&item.url);
+                    if link.is_empty() {
                         warn!(
                             %did, %rkey,
                             "a saved record has an unusable URL; rendering it without a link \
@@ -2030,9 +2078,12 @@ async fn index(
                             // rkey is what the un-save button acts on, so it is
                             // the honest identifier for a row that has nothing
                             // else trustworthy to show.
-                            .unwrap_or_else(|| match &link {
-                                Some(_) => item.url.clone(),
-                                None => format!("Saved item {rkey}"),
+                            .unwrap_or_else(|| {
+                                if link.is_empty() {
+                                    format!("Saved item {rkey}")
+                                } else {
+                                    item.url.clone()
+                                }
                             }),
                         feed_title: item.feed_url.clone().unwrap_or_default(),
                         published: display_date(Some(&item.created_at)),
@@ -2041,7 +2092,7 @@ async fn index(
                         // Empty = "render this row without an anchor". The
                         // template branches on it, so the rejected URL never
                         // reaches an `href` even as an escaped string.
-                        link: link.unwrap_or_default(),
+                        link,
                         cached: false,
                         rkey,
                     });
@@ -2176,7 +2227,7 @@ async fn index(
             // on every render even when the page showed a hundred rows.
             read: e.read,
             starred: e.starred,
-            link: entry_link(e.id),
+            link: SafeLink::internal(entry_link(e.id)),
             cached: true,
             rkey: String::new(),
         })
@@ -5349,7 +5400,7 @@ async fn build_entry_row(
         published: display_date(entry.published.as_deref()),
         read,
         starred,
-        link: format!("/entries/{id}"),
+        link: SafeLink::internal(format!("/entries/{id}")),
         cached: true,
         rkey: String::new(),
     }))
@@ -7113,6 +7164,51 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
+    }
+
+    /// **The `href` defence is now carried by the TYPE, not by remembering.**
+    ///
+    /// `EntryRow.link` used to be a `String`, and the guard was "call
+    /// `net::safe_link` before assigning it". Deleting that call left all 679
+    /// tests passing — a live XSS defence with nothing protecting it.
+    ///
+    /// `SafeLink` has no `From<String>` and no public member, so the only way to
+    /// get foreign input into an `href` is `external`, which does the check
+    /// itself. This test pins that constructor; the *wiring* is now pinned by
+    /// the compiler, which is the part a test could never hold down.
+    ///
+    /// Note the empty-not-absent behaviour: a rejected URL yields an EMPTY link
+    /// so the template renders the row WITHOUT an anchor. Dropping the row
+    /// instead would make the record unremovable, because the un-save button
+    /// lives on it.
+    #[test]
+    fn a_hostile_scheme_cannot_reach_an_href_through_safelink() {
+        for hostile in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "  javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+        ] {
+            let link = SafeLink::external(hostile);
+            assert!(
+                link.is_empty(),
+                "{hostile:?} produced a non-empty href: {link}",
+            );
+            assert!(
+                !link.to_string().to_ascii_lowercase().contains("script"),
+                "{hostile:?} leaked into the rendered link",
+            );
+        }
+
+        // And the other direction: a check that rejects everything would satisfy
+        // the loop above while breaking every real saved record.
+        for good in ["https://example.com/a?b=c#d", "http://example.com/"] {
+            let link = SafeLink::external(good);
+            assert!(!link.is_empty(), "{good:?} was wrongly rejected");
+            assert_eq!(link.to_string(), good);
+        }
     }
 
     /// **The outage fallback must not widen what the caller can READ — and the
