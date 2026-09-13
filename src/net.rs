@@ -982,6 +982,220 @@ pub(crate) mod tests {
         assert_eq!(body, b"hello world");
     }
 
+    /// A raw HTTP server on loopback that answers `/final` with `200 arrived`
+    /// and **everything else** with `302 Location: /final`. Returns its bound
+    /// address, so a caller can pin a client to it by address rather than name.
+    ///
+    /// This is the fixture the two tests below need and that the module did not
+    /// previously have. Note it returns the `SocketAddr`, not a URL: the whole
+    /// point is to reach it under a hostname that does not resolve.
+    pub(crate) async fn serve_redirect_to_final() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET /final") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\narrived"
+                    } else {
+                        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// **The connect goes to the address the guard vetted — enforcement, not
+    /// decision.**
+    ///
+    /// `resolve_and_check` vets an address and `build_pinned_client` then
+    /// `.resolve()`s the host to exactly that address, so the TCP connect cannot
+    /// be rebound onto an internal one in the window between the two. That is
+    /// the DNS-rebinding defence the module doc spends 25 lines on.
+    ///
+    /// **Nothing observed it.** Deleting `.resolve(host, addr)` left all 659
+    /// tests green, because every other test either passes an IP literal — where
+    /// a second resolution is a no-op — or asserts on `is_forbidden_ip`
+    /// directly. `is_forbidden_ip` is thoroughly tested; what carries its verdict
+    /// to the socket was not tested at all.
+    ///
+    /// This pins it in the one way that cannot silently stop discriminating: the
+    /// host **resolves nowhere**. `.invalid` is reserved by RFC 2606 and is
+    /// guaranteed never to exist, so the only route to the stub is the pin. Drop
+    /// `.resolve()` and the client falls back to real DNS and cannot connect —
+    /// which is also why this test needs no network.
+    #[tokio::test]
+    async fn the_connect_is_pinned_to_the_vetted_address() {
+        let addr = serve_redirect_to_final().await;
+        let host = "pinned-target.invalid";
+        let client = pinned_client(host, addr).expect("building a pinned client");
+
+        let resp = client
+            .get(format!("http://{host}:{}/final", addr.port()))
+            .send()
+            .await
+            .expect(
+                "a pinned host must reach the vetted address without consulting DNS — \
+                 if this failed to connect, the `.resolve()` pin is gone",
+            );
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "arrived");
+    }
+
+    /// **The per-hop client must not follow redirects on its own.**
+    ///
+    /// `guarded_get_inner` follows redirects *manually* so it can re-run the
+    /// scheme check, the privacy check and `resolve_and_check` on every hop, and
+    /// so it can strip credential headers when a hop leaves the original origin.
+    /// All of that is bypassed if reqwest follows the redirect internally: the
+    /// connect to hop 2 happens inside reqwest, against an address nothing
+    /// vetted. For `guarded_post` it is worse still — reqwest would re-send a
+    /// `307`'s BODY (a client assertion, an auth code) to the new origin before
+    /// `guarded_post`'s own 3xx refusal ever ran.
+    ///
+    /// Flipping `Policy::none()` to `Policy::limited(10)` left all 659 tests
+    /// green. The existing redirect test could not catch it: it builds a 302 stub
+    /// and then discards the address with `let _ = addr`, because the guard
+    /// forbids loopback and the stub was therefore unreachable *through* the
+    /// guard. It asserts on a private URL passed directly in, so no redirect ever
+    /// occurs in it.
+    ///
+    /// Pinning by address sidesteps that — `pinned_client` does not consult the
+    /// guard, so the stub is reachable — and the assertion is on the status the
+    /// caller receives: `302`, handed back for the loop to re-validate, not the
+    /// `200` that reqwest would return after quietly following it.
+    #[tokio::test]
+    async fn the_pinned_client_does_not_follow_redirects_itself() {
+        let addr = serve_redirect_to_final().await;
+        let host = "redirector.invalid";
+        let client = pinned_client(host, addr).expect("building a pinned client");
+
+        let resp = client
+            .get(format!("http://{host}:{}/start", addr.port()))
+            .send()
+            .await
+            .expect("the stub must answer the first hop");
+
+        assert_eq!(
+            resp.status(),
+            302,
+            "the per-hop client must hand the 30x BACK to guarded_get_inner for \
+             re-validation; a 200 here means reqwest followed it internally and the \
+             second hop was connected to without passing resolve_and_check",
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/final"),
+            "the Location must reach the caller — it is what the next hop re-validates",
+        );
+    }
+
+    /// **Every branch of the v4/v6 blocklist is load-bearing.**
+    ///
+    /// Four branches were unreachable from the existing tests: `is_multicast()`
+    /// on both families, `192.0.0.0/24` ("this host on this network", IETF
+    /// protocol assignments) and `198.18.0.0/15` (benchmarking). Deleting all
+    /// four at once left the suite green, so a quarter of the blocklist could
+    /// have been dropped in a refactor without a single failure.
+    ///
+    /// These are not decorative: multicast to an internal group and the
+    /// benchmarking range are both reachable on a real network and neither can
+    /// host a legitimate public feed.
+    #[test]
+    fn every_blocklist_branch_is_load_bearing() {
+        for ip in [
+            "224.0.0.1",       // v4 multicast, all-systems group
+            "239.255.255.250", // v4 multicast, SSDP — a real LAN discovery target
+            "192.0.0.1",       // 192.0.0.0/24, IETF protocol assignments
+            "192.0.0.171",     // same /24
+            "198.18.0.1",      // 198.18/15 benchmarking
+            "198.19.255.255",  // top of the benchmarking range
+            "0.0.0.0",         // unspecified
+            "0.1.2.3",         // rest of 0/8
+            "255.255.255.255", // broadcast
+            "100.64.0.1",      // CGNAT floor
+            "100.127.255.255", // CGNAT ceiling
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} must be forbidden");
+        }
+        for ip in [
+            "ff02::1",                // v6 multicast, all-nodes
+            "::1",                    // v6 loopback
+            "::",                     // v6 unspecified
+            "fe80::1",                // v6 link-local
+            "fc00::1",                // v6 ULA
+            "fd00::1",                // v6 ULA
+            "::ffff:127.0.0.1",       // v4-mapped loopback
+            "::ffff:169.254.169.254", // v4-mapped cloud metadata
+            "::ffff:10.0.0.1",        // v4-mapped RFC1918
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} must be forbidden");
+        }
+    }
+
+    /// **The blocklist must not over-block, and only boundaries can show that.**
+    ///
+    /// A guard that refuses everything passes every all-negative test, and the
+    /// existing positive cases (`1.1.1.1`, `8.8.8.8`, `93.184.216.34`) sit
+    /// nowhere near a blocked range, so none of them would notice. Widening
+    /// `172.16/12` to all of `172/8` and `100.64/10` to all of `100/8` — which
+    /// would silently refuse Google and AWS address space — left the suite green.
+    ///
+    /// Each address here is the one immediately OUTSIDE a blocked range, so an
+    /// off-by-one in any CIDR boundary fails this test and nothing else.
+    #[test]
+    fn the_blocklist_does_not_over_block_adjacent_public_space() {
+        for ip in [
+            "9.255.255.255",   // just below 10/8
+            "11.0.0.0",        // just above 10/8
+            "172.15.255.255",  // just below 172.16/12
+            "172.32.0.0",      // just above 172.16/12 (172.217.x is Google)
+            "192.167.255.255", // just below 192.168/16
+            "192.169.0.0",     // just above 192.168/16
+            "169.253.255.255", // just below 169.254/16
+            "169.255.0.0",     // just above 169.254/16
+            "126.255.255.255", // just below 127/8
+            "128.0.0.0",       // just above 127/8
+            "100.63.255.255",  // just below 100.64/10 CGNAT
+            "100.128.0.0",     // just above 100.64/10 (100.20.x is AWS)
+            "192.0.1.0",       // just above 192.0.0.0/24
+            "198.17.255.255",  // just below 198.18/15
+            "198.20.0.0",      // just above 198.18/15
+            "223.255.255.255", // just below 224/4 multicast
+            "1.0.0.0",         // just above 0/8
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(&parsed),
+                "{ip} is public and adjacent to a blocked range — refusing it means a \
+                 CIDR boundary is wrong and real feeds are unreachable",
+            );
+        }
+        for ip in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(&parsed),
+                "{ip} is public and must be allowed"
+            );
+        }
+    }
+
     /// **Regression (v0.2.8):** the write-side guard must refuse the same targets
     /// the read-side one does — loopback, cloud metadata, RFC1918, ULA — *before*
     /// the connect, so a rebound PDS host never receives a request body carrying
