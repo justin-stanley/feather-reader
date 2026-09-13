@@ -1610,4 +1610,112 @@ mod tests {
         assert!(jittered(Duration::from_secs(1), "x") >= Duration::from_secs(1));
         assert!(jittered(Duration::from_millis(1), "x") >= Duration::from_secs(1));
     }
+
+    // ── #117: orphaned dirty read-state ──────────────────────────────────────
+
+    /// An `AppState` on the rust backend with an empty in-memory store.
+    ///
+    /// `key_path` is per-test: the default is the RELATIVE
+    /// `oauth-signing-key.json`, so a rust-backend test would write real
+    /// encrypted key material into the working directory and later runs would
+    /// fail to decrypt it under a fresh key.
+    async fn rust_state() -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        AppState::new(
+            feather_reader::config::Config {
+                repo_backend: feather_reader::metrics::Backend::Rust,
+                oauth: feather_reader::config::OauthConfig {
+                    key_path: std::env::temp_dir().join(format!(
+                        "fr-sched-oauth-key-{}-{:p}.json",
+                        std::process::id(),
+                        &db as *const _
+                    )),
+                    encryption_key: Some("a".repeat(43)),
+                    ..feather_reader::config::OauthConfig::default()
+                },
+                ..feather_reader::config::Config::default()
+            },
+            db,
+        )
+        .unwrap()
+    }
+
+    /// A dirty cursor for `did`, as a mark-read would leave it.
+    async fn dirty_cursor_for(state: &AppState, did: &str) {
+        store::upsert_cursor(
+            &state.db,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: "https://example.com/feed.xml".into(),
+                read_through: None,
+                read_ids: "[\"1\"]".into(),
+                unread_ids: "[]".into(),
+                dirty: true,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// **#117 — a dirty cursor whose DID has no OAuth session retries FOREVER.**
+    ///
+    /// This is the production failure: one DID left a dirty `read_cursor` behind
+    /// with no `oauth_session` row, and the flusher re-attempted it every 60s
+    /// indefinitely — 20 failures in the first 20 minutes, climbing by one per
+    /// minute, each taking 0 ms because it fails before any network call.
+    ///
+    /// The per-DID `catch` is right for a transient PDS hiccup and wrong here:
+    /// nothing about this can succeed until the user logs in again, but the
+    /// flusher cannot tell the two apart, so it treats a permanent condition as
+    /// a retryable one. That unbounded warn loop will mask real failures for the
+    /// whole soak window.
+    ///
+    /// Asserts the UNBOUNDED part specifically — not merely that one round
+    /// fails, which would also be true of a correctly-backed-off retry.
+    #[tokio::test]
+    async fn an_orphaned_dirty_cursor_retries_without_bound() {
+        let state = rust_state().await;
+        let did = "did:plc:orphanedreadstate00000000";
+        dirty_cursor_for(&state, did).await;
+        assert!(
+            feather_reader::oauth::store::get_session(
+                &state.db,
+                &state.oauth.as_deref().expect("oauth runtime").codec,
+                did,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "fixture must have NO oauth session; that is the whole point",
+        );
+
+        const ROUNDS: usize = 5;
+        for round in 1..=ROUNDS {
+            flush_all_dirty(&state)
+                .await
+                .expect("a per-DID failure must not abort the whole sweep");
+            let still = store::dirty_cursors(&state.db, did).await.unwrap();
+            assert_eq!(
+                still.len(),
+                1,
+                "round {round}: the cursor was cleared despite never reaching the PDS",
+            );
+        }
+
+        // Every round produced a fresh failure: there is no attempt cap, no
+        // backoff, and no terminal state. A bounded design would stop counting.
+        let err = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "flush_read_states")
+            .map(|r| r.stats.err_count)
+            .unwrap_or(0);
+        assert_eq!(
+            err, ROUNDS as u64,
+            "expected one recorded failure per round with no bound; got {err}",
+        );
+    }
 }
