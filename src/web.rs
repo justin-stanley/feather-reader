@@ -237,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         .route("/entries/{id}", get(entry_view))
         .route("/entries/{id}/read", post(mark_read))
         .route("/entries/{id}/star", post(toggle_star))
+        .route("/saved/{rkey}/delete", post(unsave_record))
         .route("/read-all", post(mark_all_read))
         .route("/subscriptions", post(add_subscription))
         .route("/subscriptions/{rkey}/delete", post(delete_subscription))
@@ -559,6 +560,32 @@ async fn about(State(state): State<AppState>) -> Response {
     })
 }
 
+/// `POST /saved/:rkey/delete` — remove a saved record that has no local entry.
+///
+/// The normal star toggle is keyed on an entry id, which a PDS-only saved row
+/// does not have. This deletes the record straight from the repo by its rkey.
+async fn unsave_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+) -> Response {
+    let Some(did) = current_did(&state, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response();
+    };
+    match state.repo().remove_saved(&did, &rkey).await {
+        Ok(()) => info!(%did, %rkey, "removed a saved record with no cached entry"),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not remove the saved record");
+            return (StatusCode::BAD_GATEWAY, "could not remove that item\n").into_response();
+        }
+    }
+    // htmx swaps the row out; a plain form post goes back to the starred list.
+    if is_htmx(&headers) {
+        return (StatusCode::OK, "").into_response();
+    }
+    Redirect::to("/?view=starred").into_response()
+}
+
 /// `GET /stats` — public poll health.
 async fn stats(State(state): State<AppState>) -> Response {
     let now = chrono::Utc::now();
@@ -708,6 +735,16 @@ struct EntryRow {
     /// The reader link href, already carrying the scope/view query so opening an
     /// entry and paging back stays within the list it came from.
     link: String,
+    /// Whether the article itself is in this instance's cache.
+    ///
+    /// `false` for a saved record that exists in the reader's PDS but whose
+    /// entry was never cached here — starred in another atproto reader, or
+    /// starred here and since evicted. There is no local row, so the row has no
+    /// usable `id`: it links straight out to the article and carries no
+    /// mark-read control, because there is nothing local to mark.
+    cached: bool,
+    /// The PDS record key, for un-saving a row that has no local entry.
+    rkey: String,
 }
 
 /// A folder as an option in the "move feed to folder" select.
@@ -1291,8 +1328,69 @@ async fn index(
             read: view != "unread" && !unread.iter().any(|u| u.id == e.id),
             starred: starred_ids.contains(&e.id),
             link: entry_link(e.id),
+            cached: true,
+            rkey: String::new(),
         })
         .collect();
+
+    // **Saved records the cache cannot show.**
+    //
+    // The starred view is built from local `entries`, so a saved record whose
+    // article was never cached here is invisible — the case that matters is
+    // starring in ANOTHER atproto reader, which is the portability the shared
+    // lexicon exists for. Those rows are rendered from the PDS record alone.
+    let mut entries = entries;
+    if view == "starred" {
+        let cached_urls: std::collections::HashSet<String> =
+            source.iter().filter_map(|e| e.url.clone()).collect();
+        let cached_guids: std::collections::HashSet<String> =
+            source.iter().map(|e| e.guid.clone()).collect();
+
+        match state.repo().list_saved_sorted(&did).await {
+            Ok(saved) => {
+                for (rkey, item) in saved {
+                    let known = cached_urls.contains(&item.url)
+                        || item
+                            .entry_id
+                            .as_ref()
+                            .is_some_and(|g| cached_guids.contains(g));
+                    if known {
+                        continue;
+                    }
+                    // Opportunistic re-fetch: if the reader still subscribes to
+                    // the feed, make it due now. If the article is still inside
+                    // the feed's window the poller caches it normally and this
+                    // row becomes a real entry on its own — no synthetic rows in
+                    // the shared cache, which every subscriber would otherwise
+                    // see as a content-less entry.
+                    if let Some(feed_url) = item.feed_url.as_deref() {
+                        if subs.iter().any(|s| s.sub.url == feed_url) {
+                            if let Err(err) = store::mark_feed_due(pool, feed_url).await {
+                                tracing::debug!(%err, %feed_url, "could not nudge a feed for a saved article");
+                            }
+                        }
+                    }
+                    entries.push(EntryRow {
+                        id: 0,
+                        title: item
+                            .title
+                            .clone()
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| item.url.clone()),
+                        feed_title: item.feed_url.clone().unwrap_or_default(),
+                        published: display_date(Some(&item.created_at)),
+                        read: false,
+                        starred: true,
+                        link: item.url.clone(),
+                        cached: false,
+                        rkey,
+                    });
+                }
+            }
+            Err(err) => warn!(%err, %did, "could not list saved records from the PDS"),
+        }
+    }
+    let entries = entries;
 
     let selected_feed = q.feed.as_deref();
     let selected_folder = q.folder.as_deref();
@@ -4315,6 +4413,8 @@ async fn build_entry_row(
         read,
         starred,
         link: format!("/entries/{id}"),
+        cached: true,
+        rkey: String::new(),
     }))
 }
 
@@ -6625,5 +6725,102 @@ mod tests {
         assert_eq!(humanise_ago(Some(60)), "1m ago");
         assert_eq!(humanise_ago(Some(3600)), "1h 0m ago");
         assert_eq!(humanise_ago(Some(11_460)), "3h 11m ago");
+    }
+
+    /// A sidecar mock that answers `/internal/repo` listRecords with one saved
+    /// record, and anything else with an empty list. Serves repeatedly.
+    async fn spawn_saved_sidecar(saved_url: &str, saved_title: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (url, title) = (saved_url.to_string(), saved_title.to_string());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let wants_saved = req.contains("community.lexicon.rss.saved");
+                let records = if wants_saved {
+                    serde_json::json!([{
+                        "uri": "at://did:plc:x/community.lexicon.rss.saved/rk1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": "community.lexicon.rss.saved",
+                            "url": url,
+                            "title": title,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body = serde_json::json!({
+                    "ok": true, "data": { "records": records }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// **A saved record whose article is not cached here is still shown.**
+    ///
+    /// The starred view is built from local `entries`, so before this a record
+    /// starred in ANOTHER atproto reader — the portability the shared lexicon
+    /// exists for — was simply invisible. It now renders from the PDS record,
+    /// visually distinct, linking straight out.
+    #[tokio::test]
+    async fn a_saved_record_with_no_cached_entry_is_shown_as_a_link() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let sidecar =
+            spawn_saved_sidecar("https://elsewhere.example/article", "Starred elsewhere").await;
+        let mut state = test_state_with_sidecar(&[did], &sidecar).await;
+        std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(did.to_string());
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/?view=starred")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(
+            body.contains("Starred elsewhere"),
+            "the saved record was not rendered at all"
+        );
+        assert!(
+            body.contains("entry-uncached"),
+            "it was not marked as uncached, so it looks like a normal entry"
+        );
+        assert!(
+            body.contains("https://elsewhere.example/article"),
+            "the row must link straight to the article"
+        );
+        assert!(
+            !body.contains("/entries/0/"),
+            "an uncached row must not offer entry actions against a nonexistent id"
+        );
     }
 }

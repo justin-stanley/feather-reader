@@ -807,6 +807,23 @@ pub async fn insert_entries(
     Ok(count)
 }
 
+/// Make a feed due for polling on the next tick.
+///
+/// Used when a saved article is missing from the cache: if the reader still
+/// subscribes to the feed, the poller may be able to bring the article back on
+/// its own. Clearing `next_poll` is the whole mechanism — `due_feeds` treats
+/// NULL as due — so this adds no synthetic rows and no special-case fetch path.
+///
+/// A no-op if the URL is not a known feed.
+pub async fn mark_feed_due(pool: &SqlitePool, feed_url: &str) -> Result<()> {
+    sqlx::query("UPDATE feeds SET next_poll = NULL WHERE url = ?1")
+        .bind(feed_url)
+        .execute(pool)
+        .await
+        .context("marking a feed due")?;
+    Ok(())
+}
+
 /// Delete entries whose age exceeds the retention window — the shared cache's
 /// **rolling window** — except those a reader has starred or not yet read. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
 /// entry falls back to when it was fetched (never NULL) rather than being treated

@@ -2148,3 +2148,27 @@ html[data-overlay="1"] .kbd-overlay {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* A saved item whose article is not cached here — it lives in the reader's PDS
+   but this instance has never had (or has evicted) the entry. Visually distinct
+   because it behaves differently: it leaves the site, and there is no excerpt,
+   no read state, and nothing to mark. A dashed leading rule reads as
+   "incomplete" without shouting. */
+.entry-uncached {
+  border-left: 2px dashed var(--line);
+  padding-left: var(--s3);
+}
+
+.entry-uncached .entry-title {
+  color: var(--muted);
+}
+
+.entry-badge {
+  font-size: 0.75em;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 0 var(--s2);
+}
