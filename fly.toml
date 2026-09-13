@@ -28,6 +28,17 @@
 #     SIDECAR_APP_CALLBACK_URL="https://feather-reader.com/oauth/callback" \
 #     FEATHERREADER_ALLOWED_DIDS="did:plc:..."
 #
+# REQUIRED ON THE RUST OAUTH BACKEND (see "BACKEND CUTOVER" below):
+#   fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+# Unset on FEATHERREADER_REPO_BACKEND=rust, config.rs::validate_secrets() REFUSES
+# TO BOOT — the app owns the OAuth flow there, so `oauth_session` holds every
+# user's access token, refresh token and DPoP private key, and without this key
+# the codec is a no-op and all three sit in plaintext in SQLite on the same
+# volume (and in every snapshot of it) as the feed cache. Not read at all on the
+# sidecar backend, which never writes those tables — so a rollback to `sidecar`
+# does not need it. Rotating it strands existing sessions: the old ciphertext
+# will not decrypt, and every reader must log in again.
+#
 # OPTIONAL SECRET — only if running the follow→invite bot (POST /bot/claims):
 #   fly secrets set FEATHERREADER_BOT_SECRET="$(openssl rand -base64 48)"
 # Unset ⇒ /bot/claims returns 503 (endpoint disabled). If set on this (public)
@@ -39,6 +50,18 @@
 # the image + set in [env] below, so /internal/* calls never egress the edge.
 # config.rs::validate_secrets() and the sidecar config FAIL LOUD at boot if the
 # cookie / internal / enc secrets are missing or weak on this (public) instance.
+#
+# BACKEND CUTOVER (sidecar -> rust). FEATHERREADER_REPO_BACKEND in [env] selects
+# which implementation performs the atproto calls and owns /oauth/*. Flipping it
+# is a TWO-part change and both parts must land in the same deploy:
+#   1. `fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY=...` (above) FIRST.
+#      Flipping the backend without it is an immediate, permanent boot loop.
+#   2. Change FEATHERREADER_REPO_BACKEND to "rust" in [env] and deploy.
+# The entrypoint reads the SAME variable to pick the Caddy OAuth routing and to
+# decide whether to start the Node sidecar at all, so it must be image/[env]
+# state, not a secret — the two cannot share /oauth/callback, and a mismatch
+# breaks every login. Rolling back is the same edit in reverse; the encryption
+# key can stay set, since the sidecar path never reads it.
 
 app = "featherreader"
 primary_region = "ord"
@@ -58,6 +81,12 @@ primary_region = "ord"
   FEATHERREADER_BIND = "127.0.0.1:8082"
   FEATHERREADER_DB = "/data/featherreader.db"
   FEATHERREADER_ENV = "prod"
+  # Which implementation serves com.atproto.repo.* and owns /oauth/* — "sidecar"
+  # (Node, two processes) or "rust" (in-process, one). Stated explicitly rather
+  # than left to the default so the live backend is visible in this file and the
+  # cutover is a one-line edit. See "BACKEND CUTOVER" in the header: "rust"
+  # additionally REQUIRES FEATHERREADER_OAUTH_ENCRYPTION_KEY as a secret.
+  FEATHERREADER_REPO_BACKEND = "sidecar"
   # Cloudflare fronts Fly, so the real client IP is CF-Connecting-IP. This is
   # authoritative ONLY if the origin is locked to Cloudflare (see Caddyfile note
   # + MANUAL STEP: CF-only origin allowlist).

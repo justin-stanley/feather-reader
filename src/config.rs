@@ -12,8 +12,8 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. |
-//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables eviction. |
+//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Ignored (with a warning) unless strictly greater than the window below. |
+//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
 //! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |

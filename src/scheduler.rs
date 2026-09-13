@@ -522,20 +522,35 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
 /// entry ids are scrubbed from the affected `read_cursor` id-sets inside the
 /// prune itself.
 ///
-/// `retention_days == 0` disables retention entirely: the loop logs once and
-/// returns, spawning no ticker. Failures are logged and never kill the loop — a
-/// missed sweep just means the window is enforced on the next tick.
+/// The loop runs if EITHER knob is on. `retention_days == 0` disables only the
+/// rolling window; `retention_hard_days` still evicts everything past the
+/// ceiling, and that is deliberate — the ceiling is what bounds the shared cache
+/// for entries a reader pinned by starring or marking unread, and the per-feed
+/// trim now spares those. Only when both are zero does the loop log once and
+/// return, spawning no ticker; that configuration has no bound at all and says
+/// so. Failures are logged and never kill the loop — a missed sweep just means
+/// the window is enforced on the next tick.
 pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
     let days = state.config.retention_days as i64;
-    if days <= 0 {
-        info!("retention sweeper: retention_days=0, retention disabled (no rolling window)");
+    let hard_days = state.config.retention_hard_days as i64;
+    if days <= 0 && hard_days <= 0 {
+        info!(
+            "retention sweeper: retention_days=0 and retention_hard_days=0, \
+             retention disabled entirely (no rolling window, NO ceiling — the \
+             shared cache is unbounded in this configuration)"
+        );
         return;
     }
     let period = env_duration_secs(
         "FEATHERREADER_RETENTION_SWEEP_SECS",
         DEFAULT_RETENTION_SWEEP,
     );
-    info!(retention_days = days, ?period, "retention sweeper started");
+    info!(
+        retention_days = days,
+        retention_hard_days = hard_days,
+        ?period,
+        "retention sweeper started"
+    );
 
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -548,10 +563,15 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
                 break;
             }
             _ = ticker.tick() => {
-                match store::prune_old_entries(&state.db, days, state.config.retention_hard_days as i64).await {
+                match store::prune_old_entries(&state.db, days, hard_days).await {
                     Ok(0) => debug!("retention sweeper: nothing past the retention window"),
                     Ok(n) => {
-                        info!(pruned = n, retention_days = days, "retention sweeper: pruned old entries");
+                        info!(
+                            pruned = n,
+                            retention_days = days,
+                            retention_hard_days = hard_days,
+                            "retention sweeper: pruned old entries"
+                        );
                         // Return the freed pages to the OS so the file actually
                         // shrinks and the DB-size watermark can fall back.
                         if let Err(err) = store::reclaim(&state.db).await {

@@ -920,18 +920,24 @@ pub async fn mark_feed_due(
 /// `read_cursor` exception sets (which have no FK to `entries`) so the id-sets do
 /// not grow without bound and the flushed PDS record never references a vanished
 /// entry. The caller (the retention sweep) should follow a non-zero return with
-/// [`reclaim`] so freed pages return to the OS. `days == 0` is a no-op (retention
-/// disabled). Returns the number of entry rows deleted.
+/// [`reclaim`] so freed pages return to the OS.
+///
+/// The two knobs are **independent**. `days == 0` disables the rolling window and
+/// nothing else; `hard_days == 0` disables the ceiling and nothing else. Only
+/// when both are off is this a no-op. Returns the number of entry rows deleted.
 pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> Result<u64> {
-    if days <= 0 {
-        return Ok(0);
-    }
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = chrono::Utc::now();
+    let at = |d: i64| {
+        (now - chrono::Duration::days(d)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+
+    let cutoff = (days > 0).then(|| at(days));
     // The ceiling only means anything if it is STRICTLY OLDER than the window.
-    // At `hard_days <= days` the two cutoffs coincide, and since the hard delete
-    // spares nothing, it would delete exactly the rows the soft delete exists to
-    // spare — turning the whole starred/unread exception into a no-op.
+    // At `0 < hard_days <= days` the two cutoffs coincide, and since the hard
+    // delete spares nothing, it would delete exactly the rows the soft delete
+    // exists to spare — turning the whole starred/unread exception into a no-op.
+    // With no window at all (`days <= 0`) there is nothing to be inside of, so a
+    // positive ceiling stands on its own.
     //
     // This used to be `hard_days.max(days)`, which clamps the wrong way: it made
     // `0` — the value an operator reaches for to turn a ceiling OFF, and the
@@ -942,11 +948,17 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     //
     // `<= 0` now means disabled, consistently with `days`. A contradictory
     // positive value is refused rather than reinterpreted downward.
-    let hard_cutoff = if hard_days > days {
-        Some(
-            (chrono::Utc::now() - chrono::Duration::days(hard_days))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        )
+    //
+    // The ceiling is deliberately NOT gated on the window being enabled. It used
+    // to be — this function returned on `days <= 0` before the ceiling was even
+    // computed — which made `RETENTION_DAYS=0` mean "no window AND no ceiling":
+    // the one configuration with no bound on the shared cache whatsoever. That
+    // became load-bearing when the per-feed trim started sparing starred entries.
+    // Before, the trim was a backstop for them; now nothing was. "I don't want a
+    // rolling window" and "I don't want any ceiling at all" are different
+    // statements, and are now configured separately.
+    let hard_cutoff = if hard_days > 0 && (days <= 0 || hard_days > days) {
+        Some(at(hard_days))
     } else {
         if hard_days > 0 {
             tracing::warn!(
@@ -958,6 +970,10 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         }
         None
     };
+
+    if cutoff.is_none() && hard_cutoff.is_none() {
+        return Ok(0);
+    }
 
     let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
 
@@ -1021,21 +1037,25 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     //
     // This is what the documentation has always described; the query did not
     // implement it.
-    let res = sqlx::query(
-        r#"
-        DELETE FROM entries
-        WHERE COALESCE(published, fetched_at) < ?1
-          AND id NOT IN (
-              SELECT entry_id FROM entry_state
-              WHERE starred = 1 OR read = 0
-          )
-        "#,
-    )
-    .bind(&cutoff)
-    .execute(&mut *tx)
-    .await
-    .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
-    let deleted = res.rows_affected() + hard_deleted;
+    let soft_deleted = match &cutoff {
+        Some(cutoff) => sqlx::query(
+            r#"
+                DELETE FROM entries
+                WHERE COALESCE(published, fetched_at) < ?1
+                  AND id NOT IN (
+                      SELECT entry_id FROM entry_state
+                      WHERE starred = 1 OR read = 0
+                  )
+                "#,
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?
+        .rows_affected(),
+        None => 0,
+    };
+    let deleted = soft_deleted + hard_deleted;
 
     // Only touch cursors when rows actually went away.
     if deleted > 0 {
@@ -2520,6 +2540,111 @@ mod tests {
         Ok(())
     }
 
+    /// Turning the rolling window off must NOT also turn the ceiling off.
+    ///
+    /// `prune_old_entries` used to return on `days <= 0` before the ceiling was
+    /// even computed, so `RETENTION_DAYS=0` — advertised as "disables eviction" —
+    /// meant no window AND no ceiling. That is the one configuration with no
+    /// bound on the shared cache at all, and it stopped being survivable when the
+    /// per-feed trim started sparing starred entries: nothing was left to catch
+    /// them. The two knobs are independent now.
+    #[tokio::test]
+    async fn a_disabled_window_does_not_disable_the_ceiling() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let age = |d: i64| {
+            (chrono::Utc::now() - chrono::Duration::days(d))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "starred-400d".to_string(),
+                    published: Some(age(400)),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "starred-30d".to_string(),
+                    published: Some(age(30)),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        // Star both, so only the ceiling can remove either one — the soft
+        // window's exception would spare them both even if it did run.
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+             SELECT 'did:plc:x', id, 1, 1, '2026-01-01T00:00:00Z' FROM entries",
+        )
+        .execute(&pool)
+        .await?;
+
+        // No rolling window; a 180-day ceiling.
+        let deleted = prune_old_entries(&pool, 0, 180).await?;
+
+        assert_eq!(
+            deleted, 1,
+            "retention_days=0 skipped the hard ceiling, leaving the cache unbounded"
+        );
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            left,
+            vec!["starred-30d".to_string()],
+            "the ceiling removed the wrong rows with the window disabled"
+        );
+        Ok(())
+    }
+
+    /// With BOTH knobs off, nothing is deleted — that is the documented
+    /// "no eviction at all" configuration, and it must stay a true no-op rather
+    /// than falling through to one of the two deletes with a degenerate cutoff.
+    #[tokio::test]
+    async fn both_knobs_off_deletes_nothing() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "ancient".to_string(),
+                published: Some(
+                    (chrono::Utc::now() - chrono::Duration::days(9999))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        assert_eq!(prune_old_entries(&pool, 0, 0).await?, 0);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(left, 1);
+        Ok(())
+    }
+
     /// Starred sparing must not remove the per-feed cap.
     ///
     /// The first version spared every starred row without limit: at cap=5 with
@@ -3897,7 +4022,9 @@ mod tests {
                 .await?;
         assert_eq!(state_after, 0, "entry_state must cascade on entry delete");
 
-        // days == 0 disables retention (no-op).
+        // days == 0 disables the rolling WINDOW. The 3650-day ceiling still runs
+        // (see `a_disabled_window_does_not_disable_the_ceiling`); it deletes
+        // nothing here because both survivors are fresh.
         assert_eq!(prune_old_entries(&pool, 0, 3650).await?, 0);
         assert_eq!(count_entries(&pool).await?, 2);
         Ok(())
