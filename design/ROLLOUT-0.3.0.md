@@ -148,6 +148,33 @@ fly ssh console -C "ls -l /data/featherreader.db"
 **This is the risky one and it is separately revertible. Do not combine it with
 Stage 1.**
 
+### BLOCKER: `login::complete` has no tests, and the cutover makes it the login path
+
+`src/oauth/login.rs` contains exactly two tests and **neither calls `complete`** —
+the function that performs the authorization-code exchange. It is reachable only
+on the rust backend (`web.rs:3449` gates it on `repo_backend`), so it is dormant
+today and Stage 1 does not touch it. Flipping to `rust` makes it every user's
+login path.
+
+Verified by mutation against the full suite, each run individually:
+
+| Guard deleted from `login::complete` | Suite |
+|---|---|
+| `tokens.sub != pending.did` — server may return tokens for **another account** | 664 pass |
+| the PKCE verifier actually sent in the token request | 664 pass |
+| the redirect/issuer identity check | 664 pass |
+| PAR failure check — a failed PAR proceeds to build an authorize URL | 664 pass |
+| the 10-minute `MAX_PENDING_SECS` cap on the pending row | 664 pass |
+
+Separately, in `jwt.rs`: relaxing `parts.len() != 3` to `< 3` — so a valid JWS with
+attacker-appended trailing segments verifies — also leaves 664 passing, as does
+deleting the algorithm-confusion guard entirely.
+
+**Do not flip the backend until `complete` has tests.** Stage 1 and Stage 2 are
+unaffected and can proceed. This is also why the Stage 4 prod tests cannot stand in
+for the gap: a successful login exercises the happy path only, and every guard above
+fires exclusively on a hostile or broken authorization server.
+
 ### It logs every user out
 
 Verified, and **not currently documented anywhere**: nothing under `src/` reads
