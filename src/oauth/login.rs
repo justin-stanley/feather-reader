@@ -137,6 +137,10 @@ pub async fn start(
 }
 
 /// Who logged in.
+///
+/// `Debug` carries a DID and an optional handle — both already public identity,
+/// and neither a credential. No token, key or code is reachable from here.
+#[derive(Debug)]
 pub struct CompletedLogin {
     pub did: String,
     /// Only present when it round-tripped: a handle that cannot be verified
@@ -348,6 +352,153 @@ async fn post_form(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const TEST_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUSHED_REDIRECT: &str = "https://feather-reader.com/oauth/callback";
+    const PENDING_ISSUER: &str = "https://auth.example.com";
+
+    /// A pool holding one pending login pushed under [`PUSHED_REDIRECT`], plus a
+    /// runtime whose codec matches it so the row is readable.
+    async fn pending_login(cookie_hash: &str) -> sqlx::SqlitePool {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::oauth::store::init_schema(&pool).await.unwrap();
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let pending = crate::oauth::store::PendingAuth {
+            state: "state-value".into(),
+            browser_binding_hash: cookie_hash.into(),
+            pkce_verifier: "verifier".into(),
+            // A REAL private JWK. `complete` unseals the DPoP key before it
+            // compares redirects, so a placeholder here refuses the login one
+            // step too early and the identity check never runs — which the
+            // assertion below caught rather than tolerated.
+            dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session")
+                .to_jwk_json()
+                .unwrap(),
+            issuer: PENDING_ISSUER.into(),
+            pds_url: "https://pds.example.com".into(),
+            did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
+            auth_method: "private_key_jwt".into(),
+            auth_kid: None,
+            redirect_uri: PUSHED_REDIRECT.into(),
+            requested_scope: "atproto".into(),
+            request_uri: "urn:x".into(),
+            app_return_to: None,
+            expires_at: 2_000_000_000,
+        };
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+        pool
+    }
+
+    /// A runtime serving `public_url`, with the same codec key as the pool.
+    fn runtime_at(public_url: &str) -> crate::oauth::runtime::OauthRuntime {
+        crate::oauth::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: public_url.into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: Some(TEST_KEY.to_string()),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .expect("the test runtime must build")
+    }
+
+    fn callback_params() -> flow::CallbackParams {
+        flow::CallbackParams {
+            code: Some("the-code".into()),
+            state: Some("state-value".into()),
+            iss: Some(PENDING_ISSUER.into()),
+            error: None,
+            error_description: None,
+            response: None,
+        }
+    }
+
+    /// **`complete` — the code exchange — had no test at all, and this is the
+    /// first one to actually call it.**
+    ///
+    /// `login.rs` contained exactly two tests and neither invoked `complete`;
+    /// both asserted that `metadata::redirect_uri` is a function of its input,
+    /// one of them as the literal tautology `f(x) == f(x)`. Five separate guards
+    /// inside `complete` could each be deleted with the whole suite still green,
+    /// including the check that the tokens belong to the DID the login started
+    /// for. The function is reachable only on the rust backend, so it is dormant
+    /// today — the cutover makes it every user's login path.
+    ///
+    /// This pins the identity check: the pending row was pushed under
+    /// `feather-reader.com`, the runtime now serves loopback, and the exchange
+    /// must be refused BY THAT CHECK.
+    ///
+    /// Asserting the specific message matters more than usual here. Discovery
+    /// against `pds.example.com` would fail anyway — so `is_err()` alone would
+    /// pass with the check deleted, which is exactly how the rest of this module
+    /// came to be untested. Matching the message is what makes the mutation
+    /// visible.
+    #[tokio::test]
+    async fn a_login_started_under_a_different_public_url_is_refused() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("http://127.0.0.1:8080");
+
+        let err = complete(
+            &runtime,
+            &reqwest::Client::new(),
+            &pool,
+            &callback_params(),
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await
+        .expect_err("a client-identity change mid-flight must refuse the exchange");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("started under a different public URL")
+                && rendered.contains(PUSHED_REDIRECT),
+            "refused, but not BY the client-identity check — this is the failure mode \
+             where discovery merely errored instead: {rendered}",
+        );
+    }
+
+    /// **The identity check must also let a MATCHING login through.**
+    ///
+    /// A check that refuses everything satisfies the test above, so this pins the
+    /// other direction: with the runtime serving the same public URL the row was
+    /// pushed under, `complete` must get PAST the redirect comparison and fail
+    /// later — at discovery, which cannot reach `pds.example.com` from a test.
+    ///
+    /// This is deliberately an assertion about WHICH error comes back, not about
+    /// success: a full exchange needs a stub authorization server, and the SSRF
+    /// guard forbids loopback, so one cannot be reached from here. That is the
+    /// same wall that left this function untested, and closing it properly needs
+    /// an injectable resolver rather than another test.
+    #[tokio::test]
+    async fn a_matching_public_url_passes_the_identity_check() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+
+        let err = complete(
+            &runtime,
+            &reqwest::Client::new(),
+            &pool,
+            &callback_params(),
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await
+        .expect_err("discovery cannot reach pds.example.com from a test");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("started under a different public URL"),
+            "a login whose public URL never changed must not be refused as though it \
+             had; the identity check is rejecting valid logins: {rendered}",
+        );
+    }
 
     /// **A login must complete under the identity it STARTED under.**
     ///
