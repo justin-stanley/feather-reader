@@ -49,8 +49,8 @@ recorded digest exactly.
 
 ## Blockers
 
-1. **`login::complete` has no tests** — see Stage 3. Blocks the cutover only;
-   Stages 1 and 2 are unaffected.
+**None outstanding.** The one that was open — `login::complete` having no tests —
+is cleared; see Stage 3.
 
 **Cleared 2026-09-13:**
 
@@ -183,32 +183,44 @@ fly ssh console -C "ls -l /data/featherreader.db"
 **This is the risky one and it is separately revertible. Do not combine it with
 Stage 1.**
 
-### BLOCKER: `login::complete` has no tests, and the cutover makes it the login path
+### CLEARED: the login path had no tests, and now has them
 
-`src/oauth/login.rs` contains exactly two tests and **neither calls `complete`** —
-the function that performs the authorization-code exchange. It is reachable only
-on the rust backend (`web.rs:3449` gates it on `repo_backend`), so it is dormant
-today and Stage 1 does not touch it. Flipping to `rust` makes it every user's
-login path.
+`src/oauth/login.rs` contained exactly two tests and **neither called `complete`**
+— the function that performs the authorization-code exchange. It is reachable only
+on the rust backend (`web.rs:3449` gates it on `repo_backend`), so it was dormant
+in production, but flipping to `rust` makes it every user's login path.
 
-Verified by mutation against the full suite, each run individually:
+Seven guards could each be deleted with the entire suite green. All seven now fail
+on that same mutation:
 
-| Guard deleted from `login::complete` | Suite |
-|---|---|
-| `tokens.sub != pending.did` — server may return tokens for **another account** | 664 pass |
-| the PKCE verifier actually sent in the token request | 664 pass |
-| the redirect/issuer identity check | 664 pass |
-| PAR failure check — a failed PAR proceeds to build an authorize URL | 664 pass |
-| the 10-minute `MAX_PENDING_SECS` cap on the pending row | 664 pass |
+| Guard | Was | Now |
+|---|---|---|
+| `tokens.sub != pending.did` — server may return tokens for **another account** | 664 pass | **fails** |
+| the PKCE verifier actually sent is the pending row's | 664 pass | **fails** |
+| the redirect/client-identity check | 664 pass | **fails** |
+| token-exchange failure status not parsed as a grant | 664 pass | **fails** |
+| PAR failure not parsed as a grant | 664 pass | **fails** |
+| the 10-minute `MAX_PENDING_SECS` cap on the pending row | 664 pass | **fails** |
+| `jwt.rs` exact segment count, and the algorithm-confusion guard | 664 pass | **fails** |
 
-Separately, in `jwt.rs`: relaxing `parts.len() != 3` to `< 3` — so a valid JWS with
-attacker-appended trailing segments verifies — also leaves 664 passing, as does
-deleting the algorithm-confusion guard entirely.
+**Why they were untestable, and what changed.** These guards sit after a network
+round trip a test cannot make: discovery requires `https` and the SSRF guard
+forbids loopback, so there is nowhere to point a stub. The alternative was a TLS
+stub plus an address bypass — two test-only hooks into production networking.
+Instead `complete`/`start` now delegate to `token_exchange_params`,
+`accept_token_response`, `accept_par_response` and `pending_expiry`, with
+behaviour unchanged, including that a response body is still parsed only after its
+status is checked. The guards did not move or weaken; they stopped requiring a
+live authorization server to observe.
 
-**Do not flip the backend until `complete` has tests.** Stage 1 and Stage 2 are
-unaffected and can proceed. This is also why the Stage 4 prod tests cannot stand in
-for the gap: a successful login exercises the happy path only, and every guard above
-fires exclusively on a hostile or broken authorization server.
+Note this is also why the Stage 4 prod tests could never have covered the gap: a
+successful login exercises the happy path, and every guard above fires only
+against a hostile or broken authorization server.
+
+**Still thin:** `start` and `complete` have no end-to-end test — nothing drives a
+full login. The individual guards are pinned; their *sequencing* is not. A
+follow-up wanting that needs the injectable-resolver work this deliberately
+avoided.
 
 ### It logs every user out
 
