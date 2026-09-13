@@ -13,11 +13,17 @@ looked at, not things I inherited.
 are the difference between an instance that fails loudly and one that fails at
 3am in a way nobody can attribute. Tier 4 is real but survivable.
 
+**Status.** Tier 1 is done — T1.2 and T1.3 in `ba9951a`, T1.1 in the commit that
+updated this line. Tiers 2–4 are open. The three Tier 1 entries are kept below
+rather than deleted, because each states a failure mode that its fix now has to
+keep closed, and that is worth having written down next to the tiers that are
+still open.
+
 ---
 
-## Tier 1 — before 0.3.0 ships
+## Tier 1 — before 0.3.0 ships — **DONE**
 
-### T1.1 The list queries are unbounded and select the article body
+### T1.1 The list queries are unbounded and select the article body — FIXED
 
 `get_unread_for_did` (`store.rs:1571`), `get_starred_for_did` (`:1593`) and
 `entries_for_feed` (`:1210`) all do `SELECT e.*` with **no `LIMIT`**. Verified:
@@ -50,7 +56,16 @@ is capped. Both fail against today's code.
 the template. The largest item in this file and the one the operator singled out
 as the one change it would want before deploying.
 
-### T1.2 `fly.toml` does not list the secret that gates the cutover
+**Done.** The three queries collapsed into one `store::list_entries` over a
+body-free `EntryListRow`, with `limit`/`offset` as required parameters — the same
+"make the guard structural" move `discover(expected_issuer)` got in `d67e7b9`,
+so there is no unbounded variant left to reach for. Scope moved inside the query
+(filtering after a `LIMIT` would have produced arbitrarily short pages), the
+sidebar counts in SQL instead of materializing every unread entry, prev/next
+fetches ids rather than rows, and `GET /` pages at 100. The single-entry reader
+keeps `SELECT e.*`, which is what it is for.
+
+### T1.2 `fly.toml` does not list the secret that gates the cutover — FIXED
 
 `config.rs:629-640` refuses to boot when `FEATHERREADER_REPO_BACKEND=rust` on a
 prod-like instance without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. Verified:
@@ -68,7 +83,11 @@ only on the `rust` backend. Doc-only.
 
 **Cost.** Minutes. Highest consequence-to-effort ratio in the file.
 
-### T1.3 `retention_days = 0` disables the hard ceiling too
+**Done** in `ba9951a`, with a BACKEND CUTOVER block stating both halves of the
+flip and their order, and `FEATHERREADER_REPO_BACKEND` now spelled out in `[env]`
+at its existing default so the live backend is visible in the file.
+
+### T1.3 `retention_days = 0` disables the hard ceiling too — FIXED
 
 `prune_old_entries` returns on `days <= 0` **before** the ceiling is computed
 (verified at `store.rs`), and `run_retention_sweeper` returns before starting a
@@ -88,6 +107,11 @@ configured separately. Then the claim is true again for every configuration.
 
 **Verify.** Extend `a_ceiling_inside_the_window_is_ignored_not_applied` with a
 `days = 0, hard = 180` case asserting a 400-day-old starred entry is removed.
+
+**Done** in `ba9951a`. The two knobs are independent, the sweeper runs if either
+is on, and the both-off log line now states outright that the cache is unbounded
+in that configuration. Verified by restoring the `days <= 0` early return and
+confirming `a_disabled_window_does_not_disable_the_ceiling` fails against it.
 
 ---
 
@@ -233,6 +257,11 @@ detail" contract. Add a non-session diagnostic for the OAuth-outage case.
 
 ### T4.1 `starred` is scoped by subscription, so the unsave desync survives
 
+**Still open after T1.1** — the identity lookup moved to
+`store::starred_identities`, but it shares `list_query_sql`, which carries the
+same `sub_ref` predicate. Unchanged in substance; only the function name below
+is now stale.
+
 `get_starred_for_did` requires `EXISTS (SELECT 1 FROM sub_ref …)`. An entry that
 is cached *and* starred, in a feed the reader has since unsubscribed from, is
 absent from `starred`, so it still renders as "not cached" and its button is
@@ -331,7 +360,10 @@ the unguarded subscription URL and the unguarded OPML URL both still failed
 closed at the fetch.
 
 `d67e7b9` applied that lesson once: `discover` now *takes* the expected issuer
-as a required parameter instead of trusting callers to call `same_issuer`. The
+as a required parameter instead of trusting callers to call `same_issuer`. T1.1
+applied it a second time: `list_entries` *takes* `limit` and `offset`, and the
+three unbounded functions it replaced were deleted rather than kept alongside it
+— an unbounded variant left in place is the same trap with a longer name. The
 remaining two are worth doing for the same reason:
 
 - **`upsert_feed` should take a validated newtype** that only

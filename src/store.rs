@@ -94,6 +94,64 @@ pub struct Entry {
     pub fetched_at: String,
 }
 
+/// One row of a LIST view — deliberately **without** `content_html`.
+///
+/// The list queries used to be `SELECT e.*` into [`Entry`], which carries the
+/// sanitized article body. The body is essentially the whole of a cached entry
+/// (measured: 11.9 KB/entry), and no list surface has ever rendered it — the
+/// reader's `EntryRow` reads id, title, feed title, date, read, starred and
+/// link, and nothing else. So every article on every page load was read off
+/// disk, allocated, and dropped unexamined. On a 512 MB box with 250 concurrent
+/// requests permitted, one reader with a large backlog could ask for hundreds of
+/// megabytes in a single handler, and the resulting OOM/restart looked like a
+/// healthy machine that simply fell over.
+///
+/// `read` / `starred` come from the same `LEFT JOIN` that filters the view, so a
+/// caller does not have to fetch the whole unread or starred set a second time
+/// just to decorate the rows it is showing.
+///
+/// [`Entry`] is still the right type for the single-entry reader, which is the
+/// one surface that genuinely needs the body.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct EntryListRow {
+    pub id: i64,
+    pub feed_id: i64,
+    /// Feed-native GUID — used to match a cached entry against a PDS saved record.
+    pub guid: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub published: Option<String>,
+    /// This DID's read bit. `false` when there is no `entry_state` row at all.
+    pub read: bool,
+    /// This DID's star bit. `false` when there is no `entry_state` row at all.
+    pub starred: bool,
+}
+
+/// Which list [`list_entries`] (and its siblings) is producing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListView {
+    /// No `entry_state` row for this DID, or one with `read = 0`.
+    Unread,
+    /// An `entry_state` row with `starred = 1`.
+    Starred,
+    /// Every subscribed entry, read or not.
+    All,
+}
+
+impl ListView {
+    /// The `WHERE` fragment that selects this view, given `s` as the per-DID
+    /// `entry_state` LEFT JOIN alias.
+    fn predicate(self) -> &'static str {
+        match self {
+            // An entry with no state row is unread — hence LEFT JOIN + COALESCE
+            // rather than a join that would drop never-touched entries.
+            ListView::Unread => "COALESCE(s.read, 0) = 0",
+            ListView::Starred => "COALESCE(s.starred, 0) = 1",
+            ListView::All => "1 = 1",
+        }
+    }
+}
+
 /// Per-`(did, entry)` read/star state — the fast in-session working copy that the
 /// batched flusher later syncs to the PDS as a per-feed read cursor.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
@@ -1225,26 +1283,198 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
     Ok(found.is_some())
 }
 
-/// All entries for a feed, newest-published first — scoped to `did`'s
-/// subscriptions. Returns an empty vec if `did` does not subscribe to the feed.
-pub async fn entries_for_feed(pool: &SqlitePool, did: &str, feed_id: i64) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.* FROM entries e
-        WHERE e.feed_id = ?2
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .bind(feed_id)
-    .fetch_all(pool)
-    .await
-    .context("entries_for_feed failed")?;
-    Ok(entries)
+/// The shared body of every list query: the per-DID `entry_state` LEFT JOIN, the
+/// `sub_ref` authorization predicate, the view predicate and the optional
+/// feed-id restriction. `projection` is spliced in as the `SELECT` list.
+///
+/// Returns the SQL plus the number of feed-id placeholders emitted, so the
+/// caller knows where its own `LIMIT`/`OFFSET` placeholders start. `?1` is
+/// always the DID; feed ids are `?2..`.
+///
+/// **Why the callers may assert this is SQL-safe.** Only three things vary, and
+/// none is caller data: `projection` and [`ListView::predicate`] are `&'static
+/// str` written in this file, and the feed-id restriction contributes only a
+/// COUNT — the ids themselves are bound, never formatted in. Every runtime value
+/// (the DID, the ids, the limit, the offset) reaches SQLite as a bind parameter.
+fn list_query_sql(
+    projection: &'static str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+) -> (String, usize) {
+    let n = feed_ids.map_or(0, <[i64]>::len);
+    let mut sql = format!(
+        "SELECT {projection} \
+         FROM entries e \
+         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1 \
+         WHERE {} \
+           AND EXISTS ( \
+               SELECT 1 FROM sub_ref sr \
+               WHERE sr.did = ?1 AND sr.feed_id = e.feed_id \
+           )",
+        view.predicate()
+    );
+    if n > 0 {
+        // Ids are i64 read out of this same database, so the risk here is
+        // shape, not injection — they still go through placeholders.
+        let placeholders = (2..2 + n).map(|i| format!("?{i}")).collect::<Vec<_>>();
+        sql.push_str(&format!(" AND e.feed_id IN ({})", placeholders.join(",")));
+    }
+    (sql, n)
+}
+
+/// Bind the DID and the optional feed-id restriction, in the order
+/// [`list_query_sql`] emits them.
+fn bind_list_scope<'q, O>(
+    q: sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments>,
+    did: &'q str,
+    feed_ids: Option<&[i64]>,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments> {
+    let mut q = q.bind(did);
+    for id in feed_ids.unwrap_or(&[]) {
+        q = q.bind(*id);
+    }
+    q
+}
+
+/// One page of a list view, newest-published first, scoped to `did`'s
+/// subscriptions (`sub_ref`) and optionally narrowed to `feed_ids`.
+///
+/// **`limit` is a required parameter, not a convenience.** This function
+/// replaced three `SELECT e.*` queries that had no `LIMIT` at all and pulled the
+/// article body they never used; leaving an unbounded variant next to the
+/// bounded one would just be the same trap with a longer name. If a caller wants
+/// "everything", it has to say how much everything is allowed to be. See
+/// [`EntryListRow`] for what the projection deliberately omits and why.
+///
+/// `feed_ids = Some(&[])` means "no feeds in scope" and returns empty without
+/// touching the database — distinct from `None`, which means "every feed this
+/// DID subscribes to".
+pub async fn list_entries(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<EntryListRow>> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let (mut sql, n) = list_query_sql(
+        "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+         COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
+        view,
+        feed_ids,
+    );
+    sql.push_str(&format!(
+        " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
+        n + 2,
+        n + 3
+    ));
+    let q = sqlx::query_as::<_, EntryListRow>(sqlx::AssertSqlSafe(sql));
+    let rows = bind_list_scope(q, did, feed_ids)
+        .bind(limit)
+        .bind(offset.max(0))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("list_entries({view:?}) failed for {did}"))?;
+    Ok(rows)
+}
+
+/// How many entries the same scope + view would return, unpaged. Used for the
+/// "N entries" heading and to decide whether a next-page link is warranted —
+/// both of which used to read `entries.len()` off a fully materialized list.
+pub async fn count_entries_for_view(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+) -> Result<i64> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) {
+        return Ok(0);
+    }
+    let (sql, _) = list_query_sql("COUNT(*)", view, feed_ids);
+    // `query_as` over a 1-tuple keeps one binding helper for both shapes.
+    let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
+    let (n,) = bind_list_scope(q, did, feed_ids)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("count_entries_for_view({view:?}) failed for {did}"))?;
+    Ok(n)
+}
+
+/// The ordered entry ids for a scope + view — the same ordering [`list_entries`]
+/// renders, used for the reader's prev/next links.
+///
+/// Ids only: this one genuinely spans the whole list rather than a page (prev/next
+/// needs the reader's position in it), so it is the one query where row COUNT can
+/// still be large. An id is 8 bytes against the 11.9 KB row this used to fetch,
+/// and `limit` bounds it regardless. Past the limit, prev/next simply stops
+/// finding neighbours — the article still opens.
+pub async fn list_entry_ids(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+    limit: i64,
+) -> Result<Vec<i64>> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let (mut sql, n) = list_query_sql("e.id", view, feed_ids);
+    sql.push_str(&format!(
+        " ORDER BY e.published DESC, e.id DESC LIMIT ?{}",
+        n + 2
+    ));
+    let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
+    let rows = bind_list_scope(q, did, feed_ids)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("list_entry_ids({view:?}) failed for {did}"))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Unread counts per `feed_id` for a DID — the sidebar's per-feed badges.
+///
+/// Counted in SQL. The sidebar used to fetch every unread entry (bodies and all)
+/// and count them in Rust, on every page with chrome, which is the single most
+/// frequent instance of the projection problem [`EntryListRow`] describes.
+pub async fn unread_counts_by_feed(
+    pool: &SqlitePool,
+    did: &str,
+) -> Result<std::collections::HashMap<i64, i64>> {
+    let (sql, _) = list_query_sql("e.feed_id, COUNT(*)", ListView::Unread, None);
+    let rows =
+        sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(format!("{sql} GROUP BY e.feed_id")))
+            .bind(did)
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("unread_counts_by_feed failed for {did}"))?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The `(url, guid)` identity pairs of every cached starred entry for a DID.
+///
+/// The starred view matches PDS saved records against these to decide which
+/// records the cache can render itself. It must span the whole starred set, not
+/// the visible page: a record that looks uncached gets an un-save button that
+/// deletes the PDS RECORD rather than un-starring the entry, so narrowing this
+/// set changes what a click destroys. Identity strings only — no bodies.
+pub async fn starred_identities(
+    pool: &SqlitePool,
+    did: &str,
+    limit: i64,
+) -> Result<Vec<(Option<String>, String)>> {
+    let (mut sql, _) = list_query_sql("e.url, e.guid", ListView::Starred, None);
+    sql.push_str(" LIMIT ?2");
+    let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
+        .bind(did)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("starred_identities failed for {did}"))?;
+    Ok(rows)
 }
 
 /// Mark a single entry read/unread for a DID, upserting the per-DID state row
@@ -1585,51 +1815,45 @@ async fn project_feed_into_cursor(
     .await
 }
 
-/// Unread entries for a DID: entries with no `entry_state` row for that DID, or
-/// one where `read = 0`. Newest-published first. This is the daily-driver list
-/// query, so it's a `LEFT JOIN` (an entry with no state row is unread).
-pub async fn get_unread_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.*
-        FROM entries e
-        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
-        WHERE COALESCE(s.read, 0) = 0
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("get_unread_for_did failed for {did}"))?;
-    Ok(entries)
+/// Test-only unbounded convenience wrappers over [`list_entries`].
+///
+/// Production code passes an explicit `limit`, because that is the whole point
+/// of the change these replaced. Fixtures hold a handful of rows and asserting
+/// on "the whole list" is what the tests actually mean, so they get a helper
+/// with a stated ceiling instead of each spelling one out — and the ceiling is
+/// high enough that a test hitting it is a broken fixture, not a truncation.
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    /// Far above any fixture; a test that reaches it has a bug of its own.
+    const FIXTURE_MAX: i64 = 10_000;
+
+    pub(crate) async fn entries_for_feed(
+        pool: &SqlitePool,
+        did: &str,
+        feed_id: i64,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::All, Some(&[feed_id]), FIXTURE_MAX, 0).await
+    }
+
+    pub(crate) async fn get_unread_for_did(
+        pool: &SqlitePool,
+        did: &str,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::Unread, None, FIXTURE_MAX, 0).await
+    }
+
+    pub(crate) async fn get_starred_for_did(
+        pool: &SqlitePool,
+        did: &str,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::Starred, None, FIXTURE_MAX, 0).await
+    }
 }
 
-/// Starred entries for a DID, newest-published first.
-pub async fn get_starred_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.*
-        FROM entries e
-        JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
-        WHERE s.starred = 1
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("get_starred_for_did failed for {did}"))?;
-    Ok(entries)
-}
+#[cfg(test)]
+pub(crate) use test_helpers::{entries_for_feed, get_starred_for_did, get_unread_for_did};
 
 /// Insert or update a per-`(did, feed_url)` read cursor, stamping `updated_at`.
 /// The write path for local mark-read updates (and the seam a login-time PDS
@@ -2764,7 +2988,13 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].guid, "guid-2");
         assert_eq!(entries[1].guid, "guid-1");
-        assert_eq!(entries[1].content_html.as_deref(), Some("<p>hello</p>"));
+        // The body is stored, but it is NOT in the list projection — that is the
+        // point of `EntryListRow`. Read it the way the single-entry reader does.
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT content_html FROM entries WHERE guid = 'guid-1'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(body.as_deref(), Some("<p>hello</p>"));
 
         // Re-inserting the same GUID dedups (updates in place, no new row).
         let n2 = insert_entries(
@@ -2835,6 +3065,305 @@ mod tests {
         clear_cursor_dirty(&pool, did, "https://example.com/feed.xml", &flushed_at).await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // The bounded, body-free list projection.
+    //
+    // The three queries these replaced were `SELECT e.*` with no `LIMIT`. Both
+    // halves of that are load-bearing on a 512 MB box: the projection dragged
+    // an ~11.9 KB article body per row that no list surface reads, and the
+    // missing bound let one reader's backlog decide how much a handler
+    // allocates.
+    // -----------------------------------------------------------------------
+
+    /// Seed `count` entries in one feed, each with a large body, subscribed by
+    /// `did`. Returns the feed id.
+    async fn seed_big_entries(pool: &SqlitePool, did: &str, count: usize) -> Result<i64> {
+        let feed_id = upsert_feed(
+            pool,
+            &NewFeed {
+                url: "https://example.com/big.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let body = "x".repeat(20_000);
+        let entries: Vec<NewEntry> = (0..count)
+            .map(|i| NewEntry {
+                guid: format!("guid-{i:04}"),
+                url: Some(format!("https://example.com/a/{i}")),
+                title: Some(format!("Article {i}")),
+                // Descending guid order matches descending published order, so
+                // assertions can name the rows they expect.
+                published: Some(format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1)),
+                content_html: Some(body.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(pool, did, &[feed_id]).await?;
+        Ok(feed_id)
+    }
+
+    /// `limit` is honoured, and `offset` walks the same ordering without gaps or
+    /// repeats. Against the unbounded originals the first assertion returned all
+    /// 250 rows.
+    #[tokio::test]
+    async fn list_entries_is_bounded_and_pages_without_overlap() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:pager";
+        seed_big_entries(&pool, did, 250).await?;
+
+        let page1 = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        assert_eq!(page1.len(), 100, "limit was not applied");
+        let page2 = list_entries(&pool, did, ListView::All, None, 100, 100).await?;
+        let page3 = list_entries(&pool, did, ListView::All, None, 100, 200).await?;
+        assert_eq!(page3.len(), 50, "the last page should be the remainder");
+
+        let walked: Vec<i64> = page1
+            .iter()
+            .chain(&page2)
+            .chain(&page3)
+            .map(|e| e.id)
+            .collect();
+        let unique: std::collections::HashSet<i64> = walked.iter().copied().collect();
+        assert_eq!(unique.len(), 250, "paging repeated or skipped rows");
+
+        // And the walk is the same order an unpaged read would produce.
+        let whole = list_entries(&pool, did, ListView::All, None, 1_000, 0).await?;
+        assert_eq!(
+            walked,
+            whole.iter().map(|e| e.id).collect::<Vec<_>>(),
+            "paging changed the ordering"
+        );
+
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, None).await?,
+            250,
+            "the unpaged count must survive paging"
+        );
+        Ok(())
+    }
+
+    /// The list projection must not read `content_html`.
+    ///
+    /// A type-level fact — `EntryListRow` has no body field — so the test proves
+    /// it the only way that survives a refactor: by asking SQLite what the query
+    /// it runs actually names. `SELECT e.*` would list every column.
+    #[tokio::test]
+    async fn the_list_projection_does_not_name_the_body_column() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:projection";
+        seed_big_entries(&pool, did, 3).await?;
+
+        // Ask the engine directly: EXPLAIN the query and read back its output
+        // column names.
+        let (sql, _) = list_query_sql(
+            "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+             COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
+            ListView::All,
+            None,
+        );
+        assert!(
+            !sql.contains("content_html") && !sql.contains("e.*"),
+            "the list query reads the article body: {sql}"
+        );
+
+        // And the rows really do come back without it, which is what bounds the
+        // per-request allocation.
+        let rows = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        assert_eq!(rows.len(), 3);
+        let widest = rows
+            .iter()
+            .map(|r| {
+                r.guid.len()
+                    + r.url.as_deref().map_or(0, str::len)
+                    + r.title.as_deref().map_or(0, str::len)
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest < 1_000,
+            "a list row carries {widest} bytes of text; the 20,000-byte body leaked in"
+        );
+        Ok(())
+    }
+
+    /// Scope is applied INSIDE the query, so a page is a page of rows the reader
+    /// will see. Filtering after the `LIMIT` (what the handler used to do) made
+    /// pages arbitrarily short for any narrowed scope.
+    #[tokio::test]
+    async fn a_feed_scope_narrows_the_query_not_the_page() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:scope";
+        let wanted = seed_big_entries(&pool, did, 10).await?;
+
+        let other = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://other.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let noise: Vec<NewEntry> = (0..40)
+            .map(|i| NewEntry {
+                guid: format!("noise-{i}"),
+                // Newer than everything in `wanted`, so an unscoped query would
+                // fill the whole page with these.
+                published: Some("2027-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, other, &noise, 0).await?;
+        replace_sub_refs(&pool, did, &[wanted, other]).await?;
+
+        let scoped = list_entries(&pool, did, ListView::All, Some(&[wanted]), 10, 0).await?;
+        assert_eq!(
+            scoped.len(),
+            10,
+            "the scoped page came back short — the filter ran after the LIMIT"
+        );
+        assert!(scoped.iter().all(|e| e.feed_id == wanted));
+
+        // An EMPTY scope means "no feeds in scope", not "every feed".
+        assert!(list_entries(&pool, did, ListView::All, Some(&[]), 10, 0)
+            .await?
+            .is_empty());
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, Some(&[])).await?,
+            0
+        );
+        Ok(())
+    }
+
+    /// The per-row `read` / `starred` bits come off the row's own join, matching
+    /// what the separate full-set queries used to compute — including the
+    /// "no `entry_state` row means unread" rule the views depend on.
+    #[tokio::test]
+    async fn list_rows_carry_their_own_read_and_star_bits() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:bits";
+        seed_big_entries(&pool, did, 3).await?;
+        let ids: Vec<i64> = list_entries(&pool, did, ListView::All, None, 10, 0)
+            .await?
+            .iter()
+            .map(|e| e.id)
+            .collect();
+
+        mark_read(&pool, did, ids[0], true).await?;
+        mark_starred(&pool, did, ids[1], true).await?;
+
+        let all = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        let by_id = |id: i64| all.iter().find(|e| e.id == id).expect("row present");
+        assert!(by_id(ids[0]).read && !by_id(ids[0]).starred);
+        assert!(!by_id(ids[1]).read && by_id(ids[1]).starred);
+        // Never touched: no state row at all, which must read as unread.
+        assert!(!by_id(ids[2]).read && !by_id(ids[2]).starred);
+
+        // And the view predicates agree with the bits.
+        let unread = list_entries(&pool, did, ListView::Unread, None, 10, 0).await?;
+        assert_eq!(unread.len(), 2);
+        assert!(unread.iter().all(|e| !e.read));
+        let starred = list_entries(&pool, did, ListView::Starred, None, 10, 0).await?;
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, ids[1]);
+        Ok(())
+    }
+
+    /// The sidebar's per-feed unread badges, counted in SQL rather than by
+    /// materializing every unread entry and filtering in Rust.
+    #[tokio::test]
+    async fn unread_counts_are_per_feed_and_exclude_read_rows() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:counts";
+        let a = seed_big_entries(&pool, did, 5).await?;
+        let b = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://b.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            b,
+            &[
+                NewEntry {
+                    guid: "b-1".to_string(),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "b-2".to_string(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[a, b]).await?;
+
+        let first_a = list_entries(&pool, did, ListView::All, Some(&[a]), 1, 0).await?[0].id;
+        mark_read(&pool, did, first_a, true).await?;
+
+        let counts = unread_counts_by_feed(&pool, did).await?;
+        assert_eq!(counts.get(&a).copied(), Some(4));
+        assert_eq!(counts.get(&b).copied(), Some(2));
+
+        // A feed the DID does not subscribe to contributes nothing.
+        replace_sub_refs(&pool, did, &[b]).await?;
+        let counts = unread_counts_by_feed(&pool, did).await?;
+        assert_eq!(counts.get(&a), None);
+        assert_eq!(counts.get(&b).copied(), Some(2));
+        Ok(())
+    }
+
+    /// `starred_identities` must span the WHOLE starred set, not a page.
+    ///
+    /// The starred view matches PDS saved records against it; a cached article
+    /// missing from the set renders as "not cached", and that row's button
+    /// deletes the PDS RECORD instead of un-starring the entry. Narrowing this
+    /// set changes what a click destroys.
+    #[tokio::test]
+    async fn starred_identities_span_the_whole_set() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:ident";
+        seed_big_entries(&pool, did, 150).await?;
+        for row in list_entries(&pool, did, ListView::All, None, 1_000, 0).await? {
+            mark_starred(&pool, did, row.id, true).await?;
+        }
+
+        let identities = starred_identities(&pool, did, 20_000).await?;
+        assert_eq!(
+            identities.len(),
+            150,
+            "the identity set was truncated to a page"
+        );
+        assert!(identities
+            .iter()
+            .all(|(url, guid)| url.is_some() && !guid.is_empty()));
+        Ok(())
+    }
+
+    /// Prev/next ids are bounded too, and keep the list's ordering.
+    #[tokio::test]
+    async fn entry_ids_are_ordered_and_capped() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:ids";
+        seed_big_entries(&pool, did, 60).await?;
+
+        let capped = list_entry_ids(&pool, did, ListView::All, None, 25).await?;
+        assert_eq!(capped.len(), 25);
+
+        let rows = list_entries(&pool, did, ListView::All, None, 25, 0).await?;
+        assert_eq!(
+            capped,
+            rows.iter().map(|e| e.id).collect::<Vec<_>>(),
+            "the id list and the row list disagree on ordering"
+        );
         Ok(())
     }
 

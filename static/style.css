@@ -703,6 +703,31 @@ kbd {
   list-style: none;
 }
 
+/* The list pager. Only rendered when a scope actually spans more than one page,
+   so it costs nothing on the common "nothing unread" view. Matches the entry
+   list's measure so the controls sit under the rows they page through. */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin: 0 auto;
+  padding: var(--s3) 0;
+  max-width: 46rem;
+}
+
+.pager-pos {
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+/* The edge cases keep their slot rather than collapsing, so "Older" does not
+   slide sideways when it becomes the only control on the last page. */
+.btn-quiet.is-disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 .entry {
   position: relative;
   display: flex;

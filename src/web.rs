@@ -823,6 +823,18 @@ struct IndexTemplate {
     heading: String,
     /// Whether a feed scope is active (enables per-feed mark-all-read).
     feed_scope: Option<String>,
+    /// Total entries in this scope + view across ALL pages. The count used to be
+    /// `entries.len()`, which was the same number only because the list was
+    /// unpaged — the thing this change exists to stop.
+    total: i64,
+    /// 1-based current page.
+    page: i64,
+    /// Total pages, at least 1 (an empty list is page 1 of 1).
+    page_count: i64,
+    /// Link to the previous (newer) page, or `None` on the first.
+    prev_href: Option<String>,
+    /// Link to the next (older) page, or `None` on the last.
+    next_href: Option<String>,
 }
 
 /// The feed-management page (`GET /manage`) — subscribe / your-feeds / OPML.
@@ -1146,10 +1158,45 @@ struct IndexQuery {
     /// `unread` (default) | `all` | `starred`.
     #[serde(default)]
     view: Option<String>,
+    /// 1-based page within the selected scope + view. Absent/0 means page 1.
+    #[serde(default)]
+    page: Option<u32>,
     /// Optional flash message (e.g. after an action redirect).
     #[serde(default)]
     flash: Option<String>,
 }
+
+/// Rows per page in the reader's list views.
+///
+/// The list projection no longer carries article bodies ([`store::EntryListRow`]),
+/// so a page is on the order of tens of kilobytes rather than the tens or
+/// hundreds of megabytes an unbounded list of full entries could reach. The page
+/// bound is the second half of that fix: without it, a reader with a long
+/// backlog still decides how much memory a single request allocates.
+const ENTRIES_PER_PAGE: i64 = 100;
+
+/// How many pages `total` entries occupy. An empty list is page 1 of 1, so the
+/// pager reads "1 / 1" rather than "1 / 0".
+fn page_count_for(total: i64) -> i64 {
+    ((total + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE).max(1)
+}
+
+/// Ceiling on the reader's prev/next id list.
+///
+/// Unlike the page above, this genuinely spans the whole list — prev/next is the
+/// reader's position within it — so it is bounded by count rather than paged. At
+/// 8 bytes per id this is ~40 KB at the cap. Past it the neighbour links stop
+/// resolving; the article itself still opens, and the list view still pages.
+const PREV_NEXT_MAX: i64 = 5_000;
+
+/// Ceiling on the cached-starred identity set matched against PDS saved records.
+///
+/// Deliberately generous: under-reading this set makes a cached article look
+/// uncached, and an uncached starred row's button deletes the PDS RECORD rather
+/// than un-starring the entry. Truncating here would change what a click
+/// destroys, so the cap exists only as a backstop against an absurd starred
+/// count, not as a routine bound.
+const STARRED_IDENTITY_MAX: i64 = 20_000;
 
 /// A subscription resolved against the local cache: the PDS record + its
 /// (possibly-missing) cached feed row.
@@ -1280,11 +1327,6 @@ async fn index(
 
     let subs = resolve_subscriptions(&state, &did).await;
 
-    // Per-DID working sets, once.
-    let unread = store::get_unread_for_did(pool, &did).await?;
-    let starred = store::get_starred_for_did(pool, &did).await?;
-    let starred_ids: std::collections::HashSet<i64> = starred.iter().map(|e| e.id).collect();
-
     // View: unread (default) | all | starred.
     let view = match q.view.as_deref() {
         Some("all") => "all",
@@ -1292,16 +1334,16 @@ async fn index(
         _ => "unread",
     }
     .to_string();
+    let list_view = list_view_of(q.view.as_deref());
 
     // Which feed URLs are in scope?
     let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
+    // …and the feed ids they resolve to. Scope is applied inside the query now,
+    // so a page is a page of rows the reader will actually see. Filtering after
+    // a `LIMIT` would have made pages arbitrarily short — sometimes empty — for
+    // any scope narrower than the whole subscription list.
+    let scope_ids = scoped_feed_ids(&subs, &scope_urls);
 
-    // Resolve feed_id → url once for row rendering + scope filtering.
-    let feed_url_by_id = |id: i64| -> Option<String> {
-        subs.iter()
-            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
-            .map(|s| s.sub.url.clone())
-    };
     let feed_title_by_id = |id: i64| -> String {
         subs.iter()
             .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
@@ -1317,44 +1359,29 @@ async fn index(
             .unwrap_or_default()
     };
 
-    let in_scope = |feed_id: i64| -> bool {
-        match &scope_urls {
-            None => true,
-            Some(urls) => feed_url_by_id(feed_id)
-                .map(|u| urls.contains(&u))
-                .unwrap_or(false),
-        }
-    };
-
-    // The source list for the chosen view.
-    let source = match view.as_str() {
-        "all" => {
-            // All entries across in-scope feeds, newest first.
-            let mut all = Vec::new();
-            for s in &subs {
-                if let Some(f) = &s.feed {
-                    if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, &did, f.id)
-                            .await
-                            .unwrap_or_default();
-                        all.append(&mut es);
-                    }
-                }
-            }
-            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
-            all
-        }
-        "starred" => starred
-            .iter()
-            .filter(|e| in_scope(e.feed_id))
-            .cloned()
-            .collect(),
-        _ => unread
-            .iter()
-            .filter(|e| in_scope(e.feed_id))
-            .cloned()
-            .collect(),
-    };
+    // **One page of the chosen view, filtered, ordered and bounded in SQL.**
+    //
+    // All three views used to materialize every matching entry — `SELECT e.*`,
+    // no `LIMIT`, article bodies included — and the "all" view additionally ran
+    // one such query PER SUBSCRIBED FEED and merged the results in memory. None
+    // of the row fields below read the body. See `store::EntryListRow`.
+    let mut total =
+        store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
+    // Clamped to the range that exists. Past the end the list is empty, and the
+    // empty state renders instead of the pager — which would strand a reader who
+    // typed a page number, or who paged to the end and then marked entries read
+    // out from under their own URL. Showing the last page is the answer to both.
+    let page = i64::from(q.page.unwrap_or(1).max(1)).min(page_count_for(total));
+    let offset = (page - 1) * ENTRIES_PER_PAGE;
+    let source = store::list_entries(
+        pool,
+        &did,
+        list_view,
+        scope_ids.as_deref(),
+        ENTRIES_PER_PAGE,
+        offset,
+    )
+    .await?;
 
     // The scope/view suffix carried onto every entry link (built once).
     let entry_scope_qs = {
@@ -1389,8 +1416,12 @@ async fn index(
                 .unwrap_or_else(|| "(untitled)".to_string()),
             feed_title: feed_title_by_id(e.feed_id),
             published: display_date(e.published.as_deref()),
-            read: view != "unread" && !unread.iter().any(|u| u.id == e.id),
-            starred: starred_ids.contains(&e.id),
+            // Both bits ride along on the row's own `entry_state` join now. They
+            // used to be membership tests against the full unread and starred
+            // sets, which is why those two lists were fetched in their entirety
+            // on every render even when the page showed a hundred rows.
+            read: e.read,
+            starred: e.starred,
             link: entry_link(e.id),
             cached: true,
             rkey: String::new(),
@@ -1411,19 +1442,42 @@ async fn index(
         // meant an entry that IS cached but sits outside the current filter
         // looked uncached — so it rendered as a "not cached" row whose star
         // button deletes the PDS RECORD instead of un-starring the entry. A
-        // scope filter must not change what is destroyed.
-        let cached_urls: std::collections::HashSet<String> =
-            starred.iter().filter_map(|e| e.url.clone()).collect();
-        let cached_guids: std::collections::HashSet<String> =
-            starred.iter().map(|e| e.guid.clone()).collect();
+        // scope filter must not change what is destroyed. Paging is the same
+        // hazard in a new form: matching against the visible PAGE would make
+        // every cached article outside it look uncached. Hence a dedicated
+        // identity query over the whole starred set — urls and guids only, no
+        // bodies — rather than reusing `source`.
+        let identities = store::starred_identities(pool, &did, STARRED_IDENTITY_MAX)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(%err, %did, "cached-starred identity lookup failed; \
+                                    suppressing uncached saved rows this render");
+                // Fail CLOSED. With no identities every cached article looks
+                // uncached, and each would render an un-save button that deletes
+                // the PDS record. Showing nothing loses rows for one render; the
+                // alternative loses data permanently.
+                Vec::new()
+            });
+        let identities_ok = !identities.is_empty() || total == 0;
+        let cached_urls: std::collections::HashSet<&str> = identities
+            .iter()
+            .filter_map(|(url, _)| url.as_deref())
+            .collect();
+        let cached_guids: std::collections::HashSet<&str> =
+            identities.iter().map(|(_, guid)| guid.as_str()).collect();
 
+        // Collected separately from `entries`: these rows sort after every
+        // cached one, so they belong on the LAST page. Appending them to each
+        // page would repeat them on all of them, and they have to be counted
+        // into the total before the last page can be identified.
+        let mut uncached: Vec<EntryRow> = Vec::new();
         match state.repo().list_saved_sorted(&did).await {
-            Ok(saved) => {
+            Ok(saved) if identities_ok => {
                 for (rkey, item) in saved {
-                    let known = cached_urls.contains(&item.url)
+                    let known = cached_urls.contains(item.url.as_str())
                         || item
                             .entry_id
-                            .as_ref()
+                            .as_deref()
                             .is_some_and(|g| cached_guids.contains(g));
                     if known {
                         continue;
@@ -1473,7 +1527,7 @@ async fn index(
                         tracing::debug!(%did, "skipping a saved record with an unusable URL");
                         continue;
                     };
-                    entries.push(EntryRow {
+                    uncached.push(EntryRow {
                         id: 0,
                         title: item
                             .title
@@ -1490,7 +1544,16 @@ async fn index(
                     });
                 }
             }
+            // Identity lookup failed — see the fail-closed note above.
+            Ok(_) => {}
             Err(err) => warn!(%err, %did, "could not list saved records from the PDS"),
+        }
+        // Which page is last is decided by the CACHED count, since those rows
+        // are what the pager walks; the uncached ones then extend that page.
+        let last_page = page_count_for(total);
+        total += uncached.len() as i64;
+        if page >= last_page {
+            entries.extend(uncached);
         }
     }
     let entries = entries;
@@ -1537,6 +1600,26 @@ async fn index(
     let feed_scope = selected_feed.map(str::to_string);
     let nav = build_nav(&user, &view, scope_qs, folder_views, loose_feeds, false);
 
+    // Pager links. `entry_scope_qs` already carries feed/folder/view, so the
+    // page number is the only thing appended — which keeps a paged link
+    // identical to an unpaged one in every other respect.
+    let page_href = |n: i64| -> String {
+        let mut parts = Vec::new();
+        if !entry_scope_qs.is_empty() {
+            parts.push(entry_scope_qs.clone());
+        }
+        if n > 1 {
+            parts.push(format!("page={n}"));
+        }
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/?{}", parts.join("&"))
+        }
+    };
+    let prev_href = (page > 1).then(|| page_href(page - 1));
+    let next_href = (page * ENTRIES_PER_PAGE < total).then(|| page_href(page + 1));
+
     let tmpl = IndexTemplate {
         version: VERSION,
         repo_url: REPO_URL,
@@ -1546,6 +1629,11 @@ async fn index(
         entries,
         heading,
         feed_scope,
+        total,
+        page,
+        page_count: page_count_for(total),
+        prev_href,
+        next_href,
     };
     Ok(render(&tmpl))
 }
@@ -1659,9 +1747,16 @@ async fn build_sidebar(
     selected_folder: Option<&str>,
 ) -> (Vec<FolderView>, Vec<FeedView>, Vec<FolderOption>) {
     let pool = &state.db;
-    let unread = store::get_unread_for_did(pool, did)
+    // Counted in SQL. This used to fetch every unread ENTRY — article bodies and
+    // all — purely to `.filter().count()` them in Rust, on every page that
+    // renders chrome, which made the sidebar the most frequently executed
+    // instance of the unbounded-projection problem.
+    let unread_counts = store::unread_counts_by_feed(pool, did)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|err| {
+            warn!(%err, %did, "sidebar unread counts failed; rendering zeroes");
+            Default::default()
+        });
     let folders = state
         .repo()
         .list_folders_sorted(did)
@@ -1669,10 +1764,9 @@ async fn build_sidebar(
         .unwrap_or_default();
 
     let unread_count = |feed_id: Option<i64>| -> i64 {
-        match feed_id {
-            Some(id) => unread.iter().filter(|e| e.feed_id == id).count() as i64,
-            None => 0,
-        }
+        feed_id
+            .and_then(|id| unread_counts.get(&id).copied())
+            .unwrap_or(0)
     };
     let mk_feed_view = |s: &ResolvedSub| FeedView {
         rkey: s.rkey.clone(),
@@ -1857,6 +1951,8 @@ async fn neighbors_in_scope(
         feed: q.feed.clone(),
         folder: q.folder.clone(),
         view: q.view.clone(),
+        // Neighbours span the whole list, not the page the reader arrived from.
+        page: None,
         flash: None,
     };
     let ids = list_entry_ids(state, did, &idx_q).await;
@@ -1878,51 +1974,49 @@ async fn list_entry_ids(state: &AppState, did: &str, q: &IndexQuery) -> Vec<i64>
     let subs = resolve_subscriptions(state, did).await;
 
     let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
-    let feed_url_by_id = |id: i64| -> Option<String> {
-        subs.iter()
-            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
-            .map(|s| s.sub.url.clone())
-    };
-    let in_scope = |feed_id: i64| -> bool {
-        match &scope_urls {
-            None => true,
-            Some(urls) => feed_url_by_id(feed_id)
-                .map(|u| urls.contains(&u))
-                .unwrap_or(false),
-        }
-    };
 
-    let view = q.view.as_deref().unwrap_or("unread");
-    let entries = match view {
-        "all" => {
-            let mut all = Vec::new();
-            for s in &subs {
-                if let Some(f) = &s.feed {
-                    if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, did, f.id)
-                            .await
-                            .unwrap_or_default();
-                        all.append(&mut es);
-                    }
-                }
-            }
-            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
-            all
-        }
-        "starred" => store::get_starred_for_did(pool, did)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| in_scope(e.feed_id))
+    // Ids only, and bounded. This used to fetch whole entries — bodies included
+    // — for all three views and then throw everything but `id` away; the "all"
+    // branch additionally ran one unbounded query PER FEED and sorted the union
+    // in memory. Scope is now a feed-id restriction inside the query, so the
+    // database does the filtering and the ordering exactly once.
+    store::list_entry_ids(
+        pool,
+        did,
+        list_view_of(q.view.as_deref()),
+        scoped_feed_ids(&subs, &scope_urls).as_deref(),
+        PREV_NEXT_MAX,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        warn!(%err, %did, "prev/next id list failed; the reader loses its neighbour links");
+        Vec::new()
+    })
+}
+
+/// Map the `?view=` query value onto the store's list view. Anything
+/// unrecognised is the unread default, matching `index`.
+fn list_view_of(view: Option<&str>) -> store::ListView {
+    match view {
+        Some("all") => store::ListView::All,
+        Some("starred") => store::ListView::Starred,
+        _ => store::ListView::Unread,
+    }
+}
+
+/// Translate a feed/folder scope into the feed ids to restrict a list query to.
+///
+/// `None` means unscoped (every subscribed feed). `Some(&[])` means the scope
+/// matched no local feed, which must return nothing rather than everything — so
+/// the empty vec is deliberately preserved, not collapsed back into `None`.
+fn scoped_feed_ids(subs: &[ResolvedSub], scope_urls: &Option<Vec<String>>) -> Option<Vec<i64>> {
+    let urls = scope_urls.as_ref()?;
+    Some(
+        subs.iter()
+            .filter(|s| urls.contains(&s.sub.url))
+            .filter_map(|s| s.feed.as_ref().map(|f| f.id))
             .collect(),
-        _ => store::get_unread_for_did(pool, did)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| in_scope(e.feed_id))
-            .collect(),
-    };
-    entries.into_iter().map(|e| e.id).collect()
+    )
 }
 
 /// Build a `?…` query string that preserves the reading scope + view for links.
@@ -4433,13 +4527,17 @@ mod cookie {
 // Small store helpers local to the web layer
 // ---------------------------------------------------------------------------
 
-/// Fetch a single cached entry by id.
 /// Fetch a single cached entry by id — SCOPED to `did`'s subscriptions.
 ///
 /// Returns `None` (→ 404 at the handler) if the entry does not exist OR if
 /// `did` does not subscribe to its feed. This is the per-DID read gate for the
 /// `GET /entries/:id` reader and the htmx row rebuild: the shared cache is
 /// deduped by URL, but no DID can read another DID's cached article.
+///
+/// **The only `SELECT e.*` left, and deliberately so.** This is the one surface
+/// that renders `content_html`, and it fetches exactly one row. The list views
+/// go through [`store::list_entries`], which is both paged and body-free — see
+/// [`store::EntryListRow`] for why they had to stop sharing this projection.
 async fn get_entry_by_id(
     pool: &store::Pool,
     did: &str,
@@ -6363,6 +6461,139 @@ mod tests {
         assert!(
             loc.contains("Subscription%20limit%20reached"),
             "expected sub-limit flash, got {loc}"
+        );
+    }
+
+    /// `GET /` renders at most one page of rows and offers a way to the rest.
+    ///
+    /// The handler used to materialize EVERY unread entry — `SELECT e.*`, no
+    /// `LIMIT`, article bodies included — and hand the lot to the template. With
+    /// 250 entries that is the whole list in one response; with a real backlog on
+    /// a 512 MB box it is the OOM the operator review flagged. Asserts the page
+    /// is capped, the heading still reports the true total, and page 2 is
+    /// reachable and disjoint.
+    #[tokio::test]
+    async fn the_reader_index_pages_instead_of_rendering_everything() {
+        let did = "did:plc:pager";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://pager.example/feed.xml".to_string(),
+                title: Some("Pager".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let total = 250_usize;
+        let entries: Vec<store::NewEntry> = (0..total)
+            .map(|i| store::NewEntry {
+                guid: format!("p-{i:04}"),
+                url: Some(format!("https://pager.example/{i}")),
+                title: Some(format!("Article {i:04}")),
+                published: Some(format!("2026-07-{:02}T00:00:00Z", (i % 28) + 1)),
+                content_html: Some("x".repeat(4_000)),
+                ..Default::default()
+            })
+            .collect();
+        store::insert_entries(&state.db, feed, &entries, 0)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let get = |uri: &str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            let uri = uri.to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        };
+
+        let page1 = get("/").await;
+        // One `<li class="entry…>` per rendered row. Counting "/entries/" would
+        // over-count: each row carries several (the link plus the read/star
+        // forms).
+        let rows1 = page1.matches("<li class=\"entry").count();
+        assert!(
+            rows1 <= ENTRIES_PER_PAGE as usize,
+            "page 1 rendered {rows1} entry links; the list is unbounded"
+        );
+        assert!(
+            rows1 > 0,
+            "page 1 rendered nothing at all: the page bound swallowed the list"
+        );
+        // The count is the TRUE total, not the page size — otherwise paging
+        // would quietly relabel a 250-entry backlog as a 100-entry one.
+        assert!(
+            page1.contains("250 entries"),
+            "heading must report the full total, not the page"
+        );
+        assert!(
+            page1.contains("page=2"),
+            "no way to reach the rest of the list: {}",
+            &page1[..page1.len().min(400)]
+        );
+        // The body never belongs in a list response.
+        assert!(
+            !page1.contains(&"x".repeat(4_000)),
+            "the list response carried an article body"
+        );
+
+        let page2 = get("/?page=2").await;
+        assert!(
+            page2.matches("<li class=\"entry").count() > 0,
+            "page 2 rendered no rows at all"
+        );
+        assert!(
+            page2.contains("page=1") || page2.contains("Newer"),
+            "page 2 offers no way back"
+        );
+        // Disjoint: an article on page 1 must not reappear on page 2.
+        let first_title = (0..total)
+            .map(|i| format!("Article {i:04}"))
+            .find(|t| page1.contains(t))
+            .expect("page 1 shows at least one titled article");
+        assert!(
+            !page2.contains(&first_title),
+            "{first_title} appears on both pages"
+        );
+
+        // A page past the end must not be a dead end. The empty state renders
+        // instead of the pager, so an out-of-range page would leave a reader
+        // with no link back — reachable by typing a number, and reachable
+        // WITHOUT typing anything by paging to the end and then marking entries
+        // read, which shrinks the list under the URL already in the address bar.
+        let past_end = get("/?page=999").await;
+        assert!(
+            past_end.matches("<li class=\"entry").count() > 0,
+            "an out-of-range page rendered nothing and offered no way back"
+        );
+        assert!(
+            past_end.contains("page=2"),
+            "the clamped page offers no pager"
         );
     }
 
