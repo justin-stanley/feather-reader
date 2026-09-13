@@ -6689,18 +6689,34 @@ mod tests {
             sweep > std::time::Duration::from_millis(50),
             "the sweep finished in {sweep:?}; too fast for this test to mean anything"
         );
-        // The real property. Note this is asserted BEFORE the throughput check
-        // below: when the sweep does hold the lock, the writer is starved, so
-        // both assertions fail — and this one names the actual cause.
+        // **Assert the SHAPE, not a ratio of durations.**
+        //
+        // This used to require `worst * 3 < sweep`, which is a statement about
+        // how fast the sweep is — and it broke the moment the sweep got faster
+        // (the `NOT EXISTS` rewrite, 2.4x), because shrinking the denominator
+        // tightened a threshold that was calibrated against the slow version. A
+        // performance improvement making a correctness test fail is the test's
+        // fault, not the improvement's.
+        //
+        // The discriminator with real margin is how many writes LAND. Measured
+        // against a deliberately reintroduced single-transaction sweep: 1 write
+        // landed, versus 30+ here. That is an order of magnitude, not a few
+        // percent, and it does not move when the sweep's absolute speed does.
         assert!(
-            worst * 3 < sweep,
+            wrote >= 10,
+            "only {wrote} writes landed during a {sweep:?} sweep — a sweep that \
+             releases the write lock between batches admits dozens; one that holds \
+             it across them admits about one"
+        );
+        // And no single write may span the WHOLE sweep, which is what a held
+        // lock looks like from the writer's side. Deliberately loose: on a noisy
+        // shared runner one write can wait several batches without anything
+        // being wrong.
+        assert!(
+            worst < sweep,
             "a single write waited {worst:?} of a {sweep:?} sweep ({wrote} writes \
              landed) — the sweep is holding the write lock ACROSS batches rather \
              than releasing it between them"
-        );
-        assert!(
-            wrote > 5,
-            "only {wrote} writes ran alongside a {sweep:?} sweep"
         );
 
         pool.close().await;
