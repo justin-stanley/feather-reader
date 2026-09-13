@@ -67,49 +67,71 @@ impl Repo<'_> {
             return Ok(session);
         }
 
-        // Stale: now the token endpoint is genuinely needed. `valid_session`
-        // re-reads under the subject lock, so a concurrent refresh that lands
-        // between the check above and the lock below is handled there rather
-        // than here.
-        let server = oauth::discovery::discover(
-            &self.state.http,
-            &session.aud,
-            rust.auth_method.as_str(),
-            // The grant's own issuer. Checked inside `discover` now, so no
-            // caller can omit it — this one and the callback remembered, and
-            // revocation did not.
-            Some(&session.issuer),
-        )
-        .await?;
-
-        // **The re-discovered issuer must be the one this session was issued
-        // by.** This is the worse of the two instances of the same hole: the
-        // refresh path sends the REFRESH TOKEN — long-lived, and the credential
-        // that mints every other one — to whatever endpoint discovery returns,
-        // and the session's stored issuer was being compared against nothing.
+        // **`oauth_refresh` is timed from HERE, and that placement is the whole
+        // point.** It sits after the `is_stale` early return, so it still counts
+        // refreshes rather than every repo call — but it now also covers
+        // DISCOVERY, which runs only on this branch and is therefore part of the
+        // refresh.
         //
-        // Discovery's own checks are all internally consistent, so a hostile
-        // pair of documents satisfies every one of them. `store.rs` names this
-        // exact threat as the reason `issuer` is AAD-bound; the AAD protects the
-        // column from local tampering, and only this protects it from a network
-        // re-read.
+        // A review found the earlier placement (inside `valid_session`) missed
+        // every refresh that failed in discovery: an unreachable PDS, and the
+        // issuer-mismatch check below. Those are the two likeliest refresh
+        // outages in production, and they recorded nothing at all — leaving
+        // exactly the situation this metric exists to end, where the only trace
+        // is an error on whatever repo call happened to trigger it.
         //
+        // The cost is that a caller which waits behind another task's refresh
+        // and then finds the session already fresh still records one. That is
+        // the right trade: it did perform a discovery round trip, and
+        // over-counting successes is harmless where under-counting failures is
+        // not.
+        let metrics = &self.state.metrics;
+        crate::metrics::timed(metrics, Backend::Rust, "oauth_refresh", async {
+            // Stale: now the token endpoint is genuinely needed. `valid_session`
+            // re-reads under the subject lock, so a concurrent refresh that lands
+            // between the check above and the lock below is handled there rather
+            // than here.
+            let server = oauth::discovery::discover(
+                &self.state.http,
+                &session.aud,
+                rust.auth_method.as_str(),
+                // The grant's own issuer. Checked inside `discover` now, so no
+                // caller can omit it — this one and the callback remembered, and
+                // revocation did not.
+                Some(&session.issuer),
+            )
+            .await?;
 
-        let ctx = oauth::session::RefreshContext {
-            token_endpoint: &server.token_endpoint,
-            client_id: &rust.client_id,
-            auth_method: rust.auth_method,
-            client_key: rust.client_key.as_ref(),
-        };
-        oauth::session::valid_session(
-            &self.state.db,
-            &rust.codec,
-            &self.state.http,
-            &rust.locks,
-            did,
-            &ctx,
-            now,
-        )
+            // **The re-discovered issuer must be the one this session was issued
+            // by.** This is the worse of the two instances of the same hole: the
+            // refresh path sends the REFRESH TOKEN — long-lived, and the credential
+            // that mints every other one — to whatever endpoint discovery returns,
+            // and the session's stored issuer was being compared against nothing.
+            //
+            // Discovery's own checks are all internally consistent, so a hostile
+            // pair of documents satisfies every one of them. `store.rs` names this
+            // exact threat as the reason `issuer` is AAD-bound; the AAD protects the
+            // column from local tampering, and only this protects it from a network
+            // re-read.
+            //
+
+            let ctx = oauth::session::RefreshContext {
+                token_endpoint: &server.token_endpoint,
+                client_id: &rust.client_id,
+                auth_method: rust.auth_method,
+                client_key: rust.client_key.as_ref(),
+            };
+            oauth::session::valid_session(
+                &self.state.db,
+                &rust.codec,
+                &self.state.http,
+                &rust.locks,
+                did,
+                &ctx,
+                now,
+            )
+            .await
+        })
         .await
     }
 
@@ -292,6 +314,25 @@ mod tests {
             Config {
                 repo_backend: backend,
                 public_url: public_url.to_string(),
+                oauth: crate::config::OauthConfig {
+                    // **A unique path per test, not the default.**
+                    //
+                    // `key_path` defaults to the RELATIVE `oauth-signing-key.json`,
+                    // so a rust-backend test run writes real (encrypted) key
+                    // material into whatever the working directory happens to be
+                    // — the repo root — and every later run then tries to decrypt
+                    // a file written under a different key and fails to boot.
+                    // Ambient filesystem state is not a thing a test should depend
+                    // on, and this is the same relative-path foot-gun the README
+                    // documents for containers.
+                    key_path: std::env::temp_dir().join(format!(
+                        "fr-test-oauth-key-{}-{:p}.json",
+                        std::process::id(),
+                        &db as *const _
+                    )),
+                    encryption_key: Some("a".repeat(43)),
+                    ..crate::config::OauthConfig::default()
+                },
                 ..Config::default()
             },
             db,
@@ -390,5 +431,100 @@ mod tests {
             .await
             .expect("the sidecar path must not be blocked by Rust-only config");
         assert!(state.oauth.is_none());
+    }
+    /// **A refresh that fails in DISCOVERY must be counted.**
+    ///
+    /// Regression test for the defect a review found in the first version of
+    /// this metric: the span sat inside `valid_session`, but `Repo::session`
+    /// runs discovery BEFORE that — only on the stale branch, so discovery is
+    /// part of the refresh — and a failure there propagated via `?` recording
+    /// nothing at all.
+    ///
+    /// That silently excluded the two likeliest refresh outages: an unreachable
+    /// PDS, and the issuer-mismatch check. Those are precisely the events
+    /// `err_count` exists to move on, and they left the metric flat while the
+    /// error surfaced only on whatever repo call happened to trigger it — the
+    /// exact situation this work set out to end.
+    #[tokio::test]
+    async fn a_refresh_that_fails_in_discovery_is_counted() {
+        let state = state_with(Backend::Rust, "https://feather-reader.com")
+            .await
+            .expect("state");
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+
+        // EXPIRED, so `Repo::session` takes the stale branch and reaches
+        // discovery. `pds.invalid` cannot resolve, so discovery fails.
+        oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() - 1),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = state.repo().session(did).await;
+        assert!(err.is_err(), "an unreachable PDS must fail the refresh");
+
+        let row = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "oauth_refresh" && r.backend == Backend::Rust)
+            .expect("a refresh that failed in discovery recorded nothing at all");
+        assert_eq!(row.stats.err_count, 1);
+        assert_eq!(row.stats.ok_count, 0);
+    }
+
+    /// A session that is still fresh must record NO refresh — the property that
+    /// keeps the metric meaningful, since `session()` runs on every repo call.
+    #[tokio::test]
+    async fn a_fresh_session_records_no_refresh() {
+        let state = state_with(Backend::Rust, "https://feather-reader.com")
+            .await
+            .expect("state");
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+
+        state.repo().session(did).await.expect("fresh session");
+        assert!(
+            state
+                .metrics
+                .snapshot()
+                .iter()
+                .all(|r| r.op != "oauth_refresh"),
+            "a fresh session recorded a refresh it never performed",
+        );
     }
 }

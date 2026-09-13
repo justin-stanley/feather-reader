@@ -3735,12 +3735,35 @@ async fn oauth_callback(
 /// Both arms are best-effort. The caller has already decided to sign the user
 /// out, and a network failure must not trap them in a half-logged-out state.
 async fn revoke_everywhere(state: &AppState, did: &str) {
-    match state.sidecar.revoke_session(did).await {
-        Ok(res) => info!(%did, revoked = res.revoked, "sidecar session revoked"),
-        Err(err) => warn!(%did, %err, "sidecar revoke failed; continuing"),
-    }
+    // **Counted under Backend::Sidecar, not left uncounted.** A review found
+    // that recording only the rust arm let `oauth_revoke` report a clean success
+    // while every sidecar revocation failed — and for anyone who logged in before
+    // the cutover, the sidecar store is the ONLY one that held tokens, so the
+    // rust arm correctly returns NoSession and the metric reads all-clear while
+    // live refresh tokens sit at the PDS.
+    //
+    // Same op name, different backend: the backend column is what distinguishes
+    // them, so "no revocation failures" means checking both rows, not one.
+    let sidecar_started = std::time::Instant::now();
+    let sidecar_ok = match state.sidecar.revoke_session(did).await {
+        Ok(res) => {
+            info!(%did, revoked = res.revoked, "sidecar session revoked");
+            true
+        }
+        Err(err) => {
+            warn!(%did, %err, "sidecar revoke failed; continuing");
+            false
+        }
+    };
+    state.metrics.record(
+        crate::metrics::Backend::Sidecar,
+        "oauth_revoke",
+        sidecar_started.elapsed().as_micros() as u64,
+        sidecar_ok,
+    );
 
     if let Some(runtime) = state.oauth.as_deref() {
+        let revoke_started = std::time::Instant::now();
         let outcome = crate::oauth::revoke::sign_out_discovering(
             runtime,
             &state.http,
@@ -3749,6 +3772,23 @@ async fn revoke_everywhere(state: &AppState, did: &str) {
             crate::store::now_unix(),
         )
         .await;
+        // **Counted, because a warn! nobody reads is not observability.** Until
+        // this existed, a revocation failure left exactly one trace: a log line.
+        // "No revocation failures this week" was therefore a statement about
+        // nobody having looked, which is not the same claim.
+        //
+        // NoSession counts as a SUCCESS, deliberately. Logout is idempotent —
+        // there being nothing to revoke is the correct outcome, not a failure,
+        // and counting it as an error would make the metric noisy in exactly
+        // the case that is fine. Only `Failed` means the PDS still holds live
+        // tokens we asked it to drop.
+        let revoke_ok = !matches!(outcome, crate::oauth::revoke::Revocation::Failed(_));
+        state.metrics.record(
+            crate::metrics::Backend::Rust,
+            "oauth_revoke",
+            revoke_started.elapsed().as_micros() as u64,
+            revoke_ok,
+        );
         match outcome {
             crate::oauth::revoke::Revocation::Revoked => {
                 info!(%did, "rust OAuth session revoked at the PDS")
@@ -7109,6 +7149,102 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
+    }
+
+    /// **A logout with nothing to revoke is a SUCCESS — on the arm that had
+    /// nothing. The other arm is counted separately.**
+    ///
+    /// Logout is idempotent, so `NoSession` must record as ok; counting it as an
+    /// error would make the metric noisy in exactly the case that is fine.
+    ///
+    /// But `revoke_everywhere` has TWO arms, and a review found that counting
+    /// only the rust one let `oauth_revoke` report all-clear while every sidecar
+    /// revocation failed. For anyone who logged in before the cutover the sidecar
+    /// store is the only one holding tokens, so the rust arm correctly says
+    /// NoSession and the metric said nothing was wrong. Both arms are now
+    /// recorded, distinguished by the backend column — so this test pins the
+    /// BACKEND as well as the outcome.
+    #[tokio::test]
+    async fn a_logout_with_no_session_counts_as_success() {
+        let did = "did:plc:aaaa";
+        let state = test_state(&[]).await;
+        assert!(
+            state.oauth.is_some(),
+            "meaningless without an oauth runtime; the revoke arm would be skipped",
+        );
+
+        revoke_everywhere(&state, did).await;
+        let rows = state.metrics.snapshot();
+        let find = |b: crate::metrics::Backend| {
+            rows.iter()
+                .find(|r| r.op == "oauth_revoke" && r.backend == b)
+                .unwrap_or_else(|| panic!("no oauth_revoke row for {b:?}"))
+        };
+
+        // Rust arm: nothing stored for this DID, so NoSession -> ok.
+        let rust = find(crate::metrics::Backend::Rust);
+        assert_eq!(
+            rust.stats.err_count, 0,
+            "NoSession was counted as a failure; logout is idempotent",
+        );
+        assert_eq!(rust.stats.ok_count, 1);
+
+        // Sidecar arm: unreachable in a test, so it must be recorded as an
+        // ERROR under its own backend — not silently dropped, and not folded
+        // into the rust row.
+        let sidecar = find(crate::metrics::Backend::Sidecar);
+        assert_eq!(
+            sidecar.stats.err_count, 1,
+            "a failed sidecar revoke was not counted",
+        );
+    }
+
+    /// **`Failed` must count as an error — the half the metric exists for.**
+    ///
+    /// A review found this unpinned: replacing the mapping with
+    /// `let revoke_ok = true;` passed all 682 tests. The only revoke test
+    /// asserted the `NoSession -> ok` half, so the branch that actually means
+    /// "the PDS still holds tokens we asked it to drop" was untested.
+    ///
+    /// Driven through the same handler, with a session present but the PDS
+    /// unreachable, so `sign_out_discovering` returns `Failed`.
+    #[tokio::test]
+    async fn a_failed_rust_revoke_counts_as_an_error() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let state = test_state(&[]).await;
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        crate::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &crate::oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+
+        revoke_everywhere(&state, did).await;
+
+        let rows = state.metrics.snapshot();
+        let rust = rows
+            .iter()
+            .find(|r| r.op == "oauth_revoke" && r.backend == crate::metrics::Backend::Rust)
+            .expect("no rust oauth_revoke row");
+        assert_eq!(
+            rust.stats.err_count, 1,
+            "an unreachable PDS must count as a revocation failure",
+        );
+        assert_eq!(rust.stats.ok_count, 0);
     }
 
     /// **The `href` defence is now carried by the TYPE, not by remembering.**

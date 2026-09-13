@@ -157,6 +157,11 @@ pub async fn valid_session(
         return Ok(session);
     }
 
+    // NOT timed here. `oauth_refresh` wraps this call AND the discovery that
+    // precedes it, in `Repo::session` — a review found that timing only this
+    // line missed every refresh that failed in discovery, which is where the two
+    // likeliest failures live (an unreachable PDS, and the issuer-mismatch
+    // check). See the span in `repo.rs`.
     refresh_locked(pool, codec, http, &session, ctx, now).await
 }
 
