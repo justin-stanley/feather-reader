@@ -2098,24 +2098,39 @@ async fn index(
         offset,
     )
     .await?;
-    // **The slice is derived from ONE snapshot, not two.**
+    // **Both halves of the page are computed from the COUNT alone.**
     //
     // `total_cached` (a COUNT) and `source` (a SELECT) are separate unsynchronised
-    // queries. Taking `skip` from the count and `take` from `source.len()` meant a
-    // star landing between them could leave uncached records on NO page: the count
-    // says 250 so page 4 starts at uncached[50], while the select already sees 260
-    // so page 3 has no room for uncached[0..50] — and the un-save button goes with
-    // them, which is the hazard paging was introduced to remove.
+    // queries, so they can disagree about how many cached rows exist. Any part of
+    // the page composition that reads `source.len()` inherits that disagreement.
     //
-    // Clamping `source` to what the count promised makes both halves agree. A row
-    // that appeared in between is simply not on this page; it is on the next one
-    // after the count catches up, which is ordinary paging behaviour rather than a
-    // hole.
-    let cached_here = ((total_cached - offset).max(0) as usize).min(source.len());
-    let source = &source[..cached_here];
+    // `cached_allotment` is this page's cached share according to the snapshot,
+    // and it is what the uncached `skip`/`take` are derived from — so consecutive
+    // pages tile the uncached list exactly, whichever way the count drifted.
+    // `source` is then truncated to it only to avoid rendering rows the next page
+    // will also claim.
+    //
+    // The previous version took `skip` from the count but `take` from
+    // `source.len()`, which agreed only when the count UNDERSTATED. Overstating —
+    // an un-star or a retention delete landing between the two queries — made
+    // page N render `uncached[0..70]` while page N+1 rendered `uncached[50..80]`,
+    // putting twenty rows, each carrying the record-DELETING un-save button, on
+    // two pages at once. The comment claimed that shape was impossible; it was
+    // merely rarer.
+    let cached_allotment = (total_cached - offset).clamp(0, ENTRIES_PER_PAGE) as usize;
+    let cached_here = cached_allotment.min(source.len());
+    // Only compose when there is something to compose WITH. `uncached` is empty
+    // on every view but `starred`, and truncating there just drops trailing rows
+    // that no page then shows — the poller inserting between the COUNT and the
+    // SELECT was enough to trigger it.
+    let source = if uncached_len == 0 {
+        &source[..]
+    } else {
+        &source[..cached_here]
+    };
     let uncached_page: Vec<EntryRow> = {
         let skip = (offset - total_cached).max(0) as usize;
-        let take = (ENTRIES_PER_PAGE as usize).saturating_sub(cached_here);
+        let take = (ENTRIES_PER_PAGE as usize) - cached_allotment;
         uncached.into_iter().skip(skip).take(take).collect()
     };
     // This page's slice, used only to append below. The heading needs the
@@ -2245,7 +2260,7 @@ async fn index(
         feed_scope,
         total,
         // Whole-list figure, so it sits beside `total` without double counting.
-        // `uncached_shown` is this PAGE's slice and is not a heading number.
+        // The per-page slice is composed above and is not a heading number.
         uncached_total,
         page,
         page_count: page_count_for(total),
@@ -8225,13 +8240,49 @@ mod tests {
         );
         assert!(body.starts_with("unknown"), "{body}");
 
-        // And a measured failure still does fail it — the distinction is the
-        // whole point, not an excuse to never 503.
-        state
+        // **A BORROWED failure must 503 too.**
+        //
+        // This previously recorded `Failed` and then closed the pool — but
+        // `record` consumes the guard and releases the claim, so the request won
+        // it, ran a live probe against the closed pool, and failed on its own.
+        // The 503 passed for the wrong reason and the borrow path — the whole
+        // point of the three-state enum on the read side — had no coverage.
+        //
+        // Holding the claim forces the borrow, so the recorded verdict is what
+        // gets reported.
+        let held = state
             .runtime_health
             .begin_db_probe()
-            .unwrap_or_else(|_| panic!("claim"))
-            .record(DbProbe::Failed("unavailable".to_string()));
+            .unwrap_or_else(|_| panic!("claim"));
+        state
+            .runtime_health
+            .record_for_test(DbProbe::Failed("unavailable".to_string()));
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a BORROWED failure verdict must fail the check, not just a freshly \
+             measured one: {body}"
+        );
+        assert!(body.starts_with("FAIL"), "{body}");
+
         state.db.close().await;
         let resp = router(state.clone())
             .oneshot(

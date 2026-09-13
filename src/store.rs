@@ -1000,9 +1000,10 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
     match checkpoint_wal(pool).await {
         Ok(true) => {}
         Ok(false) => tracing::warn!(
-            "a reader held the WAL so it could not be truncated after reclaim; the \
-             freed pages are gone but the file has not shrunk yet, and the DB-size \
-             watermark may stay engaged until the next sweep"
+            "the WAL could not be truncated after reclaim (busy: a concurrent reader \
+             OR writer held it); the freed pages are gone but the file has not \
+             shrunk yet, and the DB-size watermark may stay engaged until the next \
+             sweep"
         ),
         Err(err) => tracing::warn!(%err, "wal checkpoint after reclaim failed"),
     }
@@ -1220,8 +1221,8 @@ pub async fn migrate_to_incremental_vacuum(
         // after and would otherwise read as "the migration doubled my database"
         // with nothing saying why.
         Ok(false) => tracing::warn!(
-            "a reader held the WAL, so it was not truncated; the reported size below \
-             includes it"
+            "the WAL could not be truncated (a concurrent reader OR writer held it), \
+             so the reported size below includes it"
         ),
         Err(err) => tracing::warn!(%err, "post-migration wal checkpoint failed"),
     }
@@ -5867,8 +5868,8 @@ mod tests {
 
     /// **R6 benchmark: what the retention sweep actually costs, and what fixes it.**
     ///
-    /// `#[ignore]` — builds a ~1M-row database four times over, so it is a
-    /// measurement tool rather than a test. Run with:
+    /// `#[ignore]` — builds a ~1M-row database once per shape per scale (ten
+    /// times), so it is a measurement tool rather than a test. Run with:
     ///
     /// ```text
     /// cargo test --lib -- --ignored --nocapture r6_measure_retention_sweep
@@ -5894,16 +5895,27 @@ mod tests {
         ) -> Result<()> {
             let dir = std::env::temp_dir();
             let path = dir.join(format!("fr-r6-{}-{label}.db", std::process::id()));
-            let cleanup = |path: &std::path::Path| {
-                for p in [
-                    path.display().to_string(),
-                    format!("{}-wal", path.display()),
-                    format!("{}-shm", path.display()),
-                ] {
-                    std::fs::remove_file(&p).ok();
+            // RAII, because every `?` between here and the end used to leak a
+            // 1M-row fixture plus its -wal/-shm into the temp dir — six per run.
+            struct Fixture(std::path::PathBuf);
+            impl Fixture {
+                fn wipe(&self) {
+                    for p in [
+                        self.0.display().to_string(),
+                        format!("{}-wal", self.0.display()),
+                        format!("{}-shm", self.0.display()),
+                    ] {
+                        std::fs::remove_file(&p).ok();
+                    }
                 }
-            };
-            cleanup(&path);
+            }
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    self.wipe();
+                }
+            }
+            let fixture = Fixture(path.clone());
+            fixture.wipe();
             let pool = init_url(&format!("sqlite://{}", path.display())).await?;
 
             // Bulk-build with SQL: a million round trips would measure the
@@ -5989,18 +6001,30 @@ mod tests {
             // Give the planner statistics, as a long-lived instance would have.
             sqlx::query("ANALYZE").execute(&pool).await?;
 
-            let plan: Vec<String> = sqlx::query(
+            // The plan must describe the query this run actually TIMES. It used
+            // to be hardcoded to the `NOT IN` form regardless, so four of six
+            // runs printed a plan for a different query than the one measured —
+            // in the artifact kept precisely to be the evidence.
+            let planned = if old_list_form {
                 "EXPLAIN QUERY PLAN SELECT id FROM entries \
                  WHERE COALESCE(published, fetched_at) < '2026-06-01T00:00:00Z' \
                    AND id NOT IN (SELECT entry_id FROM entry_state \
                                   WHERE starred = 1 OR read = 0) \
-                 LIMIT 1000",
-            )
-            .fetch_all(&pool)
-            .await?
-            .into_iter()
-            .map(|r| r.get::<String, _>("detail"))
-            .collect();
+                 LIMIT 1000"
+            } else {
+                "EXPLAIN QUERY PLAN SELECT e.id FROM entries e \
+                 WHERE COALESCE(e.published, e.fetched_at) < '2026-06-01T00:00:00Z' \
+                   AND NOT EXISTS (SELECT 1 FROM entry_state s \
+                                   WHERE s.entry_id = e.id \
+                                     AND (s.starred = 1 OR s.read = 0)) \
+                 LIMIT 1000"
+            };
+            let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(planned))
+                .fetch_all(&pool)
+                .await?
+                .into_iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect();
 
             // ONE variant per fixture — running both against the same database
             // measured the second against an already-emptied table, which
@@ -6035,6 +6059,11 @@ mod tests {
                 }
                 n
             } else {
+                // NOTE the arms are not identical work: this one goes through the
+                // real `prune_old_entries`, which also runs the hard-ceiling pass
+                // and the cursor scrub. The bias therefore runs AGAINST the
+                // shipped form, so a win measured here is a lower bound — but the
+                // two numbers are not a like-for-like microbenchmark.
                 prune_old_entries(&pool, 30, 3650).await?
             };
             let elapsed = t.elapsed();
@@ -6053,7 +6082,7 @@ mod tests {
             );
 
             pool.close().await;
-            cleanup(&path);
+            drop(fixture);
             Ok(())
         }
 
@@ -6063,12 +6092,20 @@ mod tests {
         // 600k is the figure the schema comment cites as realistic.
         const AGE_IDX: &str =
             "CREATE INDEX idx_entries_age ON entries(COALESCE(published, fetched_at))";
+        // The index R6 actually asked for. Its row is the one the rejection
+        // turns on — "changes the plan, changes the time by nothing" — and an
+        // earlier version of this benchmark dropped it, leaving that claim
+        // resting on prose while the artifact kept to prove it could not.
+        const PINNED_IDX: &str = "CREATE INDEX idx_es_pinned ON entry_state(entry_id) \
+                                  WHERE starred = 1 OR read = 0";
         for pinned in [PINNED, 600_000] {
             // `false` = the shipped `prune_old_entries`, whatever shape it
             // currently uses; `true` = the raw `NOT IN` list form it replaced,
             // kept so the regression stays measurable rather than remembered.
-            run("as shipped", &[], pinned, false).await?;
+            run("as shipped (NOT EXISTS)", &[], pinned, false).await?;
             run("old NOT IN list form", &[], pinned, true).await?;
+            run("old NOT IN + pinned index", &[PINNED_IDX], pinned, true).await?;
+            run("old NOT IN + age index", &[AGE_IDX], pinned, true).await?;
             run("as shipped + age index", &[AGE_IDX], pinned, false).await?;
         }
         Ok(())
@@ -6723,6 +6760,99 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.display())).ok();
         std::fs::remove_file(format!("{}-shm", path.display())).ok();
+        Ok(())
+    }
+
+    /// **The sparing predicate must quantify over ALL DIDs, not just one.**
+    ///
+    /// `entry_state`'s primary key is `(did, entry_id)`, so several readers can
+    /// hold rows on the same shared entry. The window spares an entry when ANY of
+    /// them has starred it or left it unread — one person's star protects the
+    /// cached copy everyone reads.
+    ///
+    /// This is the ONLY case where `id NOT IN (…)` and the correlated
+    /// `NOT EXISTS` that replaced it could diverge, and it had no test. Every
+    /// other retention test writes one `entry_state` row per entry under a single
+    /// DID, where the two forms are trivially identical — so the claim that the
+    /// suite made the equivalence executable was false when it was written. It is
+    /// true now.
+    #[tokio::test]
+    async fn sparing_honours_every_did_not_just_one() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://shared.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let guids = [
+            "nobody-touched",      // no state row at all -> evicted
+            "both-read-unstarred", // two DIDs, both read+unstarred -> evicted
+            "one-starred",         // A read+unstarred, B starred -> SPARED by B
+            "one-unread",          // A read+unstarred, B unread   -> SPARED by B
+        ];
+        let entries: Vec<NewEntry> = guids
+            .iter()
+            .map(|g| NewEntry {
+                guid: (*g).to_string(),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+
+        let id_of = |g: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT id FROM entries WHERE guid = ?1")
+                    .bind(g)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        // (did, entry, read, starred)
+        let rows: [(&str, &'static str, i64, i64); 6] = [
+            ("did:plc:a", "both-read-unstarred", 1, 0),
+            ("did:plc:b", "both-read-unstarred", 1, 0),
+            ("did:plc:a", "one-starred", 1, 0),
+            ("did:plc:b", "one-starred", 1, 1),
+            ("did:plc:a", "one-unread", 1, 0),
+            ("did:plc:b", "one-unread", 0, 0),
+        ];
+        for (did, guid, read, starred) in rows {
+            let id = id_of(guid).await;
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+            )
+            .bind(did)
+            .bind(id)
+            .bind(read)
+            .bind(starred)
+            .execute(&pool)
+            .await?;
+        }
+
+        // Window only — no ceiling, so nothing is swept for age alone.
+        let deleted = prune_old_entries(&pool, 30, 0).await?;
+        assert_eq!(
+            deleted, 2,
+            "expected the untouched and the all-read entries to go"
+        );
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            left,
+            vec!["one-starred".to_string(), "one-unread".to_string()],
+            "a second reader's star or unread mark must spare the SHARED entry"
+        );
         Ok(())
     }
 

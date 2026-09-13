@@ -126,6 +126,18 @@ impl RuntimeHealth {
         })
     }
 
+    /// Publish a verdict WITHOUT owning the probe claim. Test-only: the
+    /// production path always records through [`DbProbeGuard::record`], which
+    /// consumes the guard so the claim cannot be released before the verdict is
+    /// written.
+    #[cfg(test)]
+    pub fn record_for_test(&self, verdict: DbProbe) {
+        *self
+            .db_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verdict);
+    }
+
     /// The most recent verdict, if any probe has completed.
     fn last_db_probe(&self) -> Option<DbProbe> {
         self.db_probe
