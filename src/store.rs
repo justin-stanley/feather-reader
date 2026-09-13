@@ -6746,30 +6746,42 @@ mod tests {
         let writer_done = std::sync::Arc::clone(&done);
         let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
-            let mut wrote = 0_u32;
+            // Record WHEN each write completed, not just how many did. See the
+            // assertion below for why the timestamps are the load-bearing part.
+            let mut completions: Vec<std::time::Instant> = Vec::new();
             let mut worst = std::time::Duration::ZERO;
             while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
                 let t0 = std::time::Instant::now();
                 grant_access(
                     &writer_pool,
-                    &format!("did:plc:writer{wrote}"),
+                    &format!("did:plc:writer{}", completions.len()),
                     None,
                     "sweep-test",
                     None,
                 )
                 .await?;
                 worst = worst.max(t0.elapsed());
-                wrote += 1;
+                completions.push(std::time::Instant::now());
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
-            Ok::<(u32, std::time::Duration), anyhow::Error>((wrote, worst))
+            Ok::<(Vec<std::time::Instant>, std::time::Duration), anyhow::Error>((
+                completions,
+                worst,
+            ))
         });
 
         let t0 = std::time::Instant::now();
         let deleted = prune_old_entries(&pool, 30, 180).await?;
         let sweep = t0.elapsed();
         done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (wrote, worst) = writer.await??;
+        let (completions, worst) = writer.await??;
+        let sweep_end = t0 + sweep;
+        // Writes that COMPLETED while the sweep was in flight.
+        let during = completions
+            .iter()
+            .filter(|t| **t > t0 && **t < sweep_end)
+            .count();
+        let wrote = completions.len();
 
         assert_eq!(deleted as usize, entries.len());
         // Sanity: the sweep has to take long enough for "was a writer blocked
@@ -6788,15 +6800,31 @@ mod tests {
         // performance improvement making a correctness test fail is the test's
         // fault, not the improvement's.
         //
-        // The discriminator with real margin is how many writes LAND. Measured
-        // against a deliberately reintroduced single-transaction sweep: 1 write
-        // landed, versus 30+ here. That is an order of magnitude, not a few
-        // percent, and it does not move when the sweep's absolute speed does.
+        // The discriminator is WHEN writes complete, not how many.
+        //
+        // **`wrote >= 10` was wrong and flaked on CI** (`only 4 writes landed
+        // during a 443ms sweep`). A raw count is writes-per-unit-time, so it
+        // measures the runner as much as the lock: the same correct code admits
+        // a hundred writes on a quiet laptop and four on a contended shared
+        // runner, where each write took ~110 ms. Loosening the number would only
+        // move the flake, since nothing about it is anchored to the behaviour
+        // under test.
+        //
+        // What IS anchored: a sweep holding one transaction across every batch
+        // blocks the writer for its whole duration, so **zero** writes complete
+        // inside the window — they queue on `busy_timeout` and land afterwards.
+        // Releasing the lock between batches lets writes complete THROUGHOUT it.
+        // That is a shape difference, not a rate, and it survives a slow runner:
+        // a machine ten times slower still interleaves, just less often.
+        // Threshold of 2 rather than 1 so a single boundary-straddling write
+        // cannot satisfy it. Verified against the reintroduced single-transaction
+        // sweep: `0 of 1 writes completed DURING the 155ms sweep`.
         assert!(
-            wrote >= 10,
-            "only {wrote} writes landed during a {sweep:?} sweep — a sweep that \
-             releases the write lock between batches admits dozens; one that holds \
-             it across them admits about one"
+            during >= 2,
+            "{during} of {wrote} writes completed DURING the {sweep:?} sweep — a \
+             sweep that releases the write lock between batches lets writes land \
+             throughout it; one that holds the lock across them blocks every \
+             writer until it finishes, so none complete inside the window"
         );
         // And no single write may span the WHOLE sweep, which is what a held
         // lock looks like from the writer's side. Deliberately loose: on a noisy
