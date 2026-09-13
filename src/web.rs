@@ -8006,6 +8006,17 @@ mod tests {
             .unwrap()
         };
 
+        // **The fixture must actually be RUNNING, or this test measures nothing.**
+        // `test_state` leaves `schedulers_enabled` false, and `fetching_state`
+        // checks that BEFORE the watermark — so without these two lines every
+        // render below reports "off" and the watermark can never surface. The
+        // assertions still passed, for reasons unrelated to what they name: see
+        // the two comments below.
+        state.runtime_health.set_schedulers_enabled(true);
+        state
+            .runtime_health
+            .poll_tick_completed(crate::store::now_unix());
+
         let body = render_stats(state.clone()).await;
         assert!(
             body.contains("Failing"),
@@ -8026,15 +8037,29 @@ mod tests {
         );
         // Not paused, and the backlog is genuinely empty — which is exactly the
         // reading that used to be indistinguishable from healthy.
-        assert!(body.contains("running"), "fetching state not rendered");
+        //
+        // **Asserted by EXCLUDING the other states, not by matching "running".**
+        // The `off` row reads "the poller is not running on this instance", which
+        // contains "running" — so the bare substring passed while the page was
+        // reporting the exact opposite of what this line claims to check.
+        assert!(
+            !body.contains("the poller is not running")
+                && !body.contains("the cache is at its size limit")
+                && !body.contains("has not completed a round"),
+            "expected the running state; the page reported a stopped one",
+        );
 
         // Now trip the watermark. Nothing in the database changes; only the
         // recorded runtime state does — which is the whole reason it needed a
         // home outside the log stream.
         state.runtime_health.set_watermark(true);
         let paused = render_stats(state.clone()).await;
+        // Matched on the paused row's OWN sentence. The bare word "paused" also
+        // appeared in the page's explanatory prose, so this assertion passed
+        // whether or not the row rendered — and trimming that prose is what
+        // exposed it. This phrase exists only inside the `paused` branch.
         assert!(
-            paused.contains("paused"),
+            paused.contains("the cache is at its size limit"),
             "a watermark pause is still invisible on the public page"
         );
 
