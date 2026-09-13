@@ -131,11 +131,46 @@ const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
 /// wait, so setting it cannot accidentally push a production loop out further
 /// than the constant above intends.
 fn startup_delay(default: Duration) -> Duration {
-    match std::env::var("FEATHERREADER_STARTUP_DELAY_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        Some(secs) => default.min(Duration::from_secs(secs)),
+    startup_delay_from(
+        default,
+        std::env::var("FEATHERREADER_STARTUP_DELAY_SECS").ok(),
+    )
+}
+
+/// [`startup_delay`] with the environment value passed in.
+///
+/// Split out so the ceiling behaviour is testable without `std::env::set_var`,
+/// which is a documented data race against the ~39 `std::env::var` reads
+/// elsewhere in this binary — and this was the only `set_var` in `src/`, in a
+/// 650-test multithreaded runner. Latent today because nothing else reads that
+/// key; a flaky crash the moment something does.
+fn startup_delay_from(default: Duration, raw: Option<String>) -> Duration {
+    match raw.as_deref().map(str::trim) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) => {
+                let requested = Duration::from_secs(secs);
+                if requested > default {
+                    // The variable is a CEILING, which is a good property and a
+                    // surprising one: setting it to 300 changes nothing. Saying
+                    // so beats leaving an operator to wonder why.
+                    info!(
+                        requested_secs = secs,
+                        effective_secs = default.as_secs(),
+                        "FEATHERREADER_STARTUP_DELAY_SECS is a ceiling and can only \
+                         SHORTEN a startup delay; using the built-in value"
+                    );
+                    return default;
+                }
+                requested
+            }
+            Err(_) => {
+                warn!(
+                    value = v,
+                    "FEATHERREADER_STARTUP_DELAY_SECS is not a number; ignoring it"
+                );
+                default
+            }
+        },
         None => default,
     }
 }
@@ -784,8 +819,10 @@ pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<(
         "adoption probe started"
     );
 
-    let mut ticker =
-        tokio::time::interval_at(tokio::time::Instant::now() + ADOPTION_STARTUP_DELAY, period);
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + startup_delay(ADOPTION_STARTUP_DELAY),
+        period,
+    );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -1382,28 +1419,22 @@ mod tests {
     /// The startup-delay override can only SHORTEN the wait. A deployment that
     /// sets an enormous value must not push a production loop further out than
     /// the constant intends.
+    ///
+    /// Tested through `startup_delay_from` rather than the environment: a
+    /// `set_var` here would be the only one in `src/`, racing ~39 `var` reads on
+    /// other test threads.
     #[test]
     fn the_startup_delay_override_is_a_ceiling() {
-        let key = "FEATHERREADER_STARTUP_DELAY_SECS";
-        let restore = std::env::var(key).ok();
+        let d = POLLER_STARTUP_DELAY;
+        let at = |v: &str| startup_delay_from(d, Some(v.to_string()));
 
-        std::env::set_var(key, "0");
-        assert_eq!(startup_delay(POLLER_STARTUP_DELAY), Duration::ZERO);
-        std::env::set_var(key, "5");
-        assert_eq!(startup_delay(POLLER_STARTUP_DELAY), Duration::from_secs(5));
-        std::env::set_var(key, "99999");
-        assert_eq!(
-            startup_delay(POLLER_STARTUP_DELAY),
-            POLLER_STARTUP_DELAY,
-            "the override lengthened the wait"
-        );
-        std::env::set_var(key, "not-a-number");
-        assert_eq!(startup_delay(POLLER_STARTUP_DELAY), POLLER_STARTUP_DELAY);
-
-        match restore {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
+        assert_eq!(at("0"), Duration::ZERO);
+        assert_eq!(at("5"), Duration::from_secs(5));
+        assert_eq!(at(" 5 "), Duration::from_secs(5), "surrounding space");
+        assert_eq!(at("99999"), d, "the override lengthened the wait");
+        assert_eq!(at("not-a-number"), d);
+        assert_eq!(at(""), d);
+        assert_eq!(startup_delay_from(d, None), d);
     }
 
     /// The four local loops must not land on the same instant at boot — that is

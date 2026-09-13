@@ -122,6 +122,15 @@ set -e
 # exit non-zero so the platform recreates the machine.
 term
 wait 2>/dev/null || true
-echo "[entrypoint] a supervised process exited (status ${first_status}); shutting down container" 1>&2
+# Distinguish a SIGNAL-initiated stop from a crash. Both take the container
+# down, but only one of them is news: a normal `fly deploy` sends SIGTERM, the
+# children exit 143 (128 + 15), and this line used to report that in the same
+# words as an actual failure — so anyone alerting on the string paged on every
+# deploy. A shell reports a signalled child as 128 + signum.
+if [ "${first_status}" -gt 128 ]; then
+	echo "[entrypoint] a supervised process was signalled (status ${first_status}, signal $((first_status - 128))); shutting down container normally" 1>&2
+else
+	echo "[entrypoint] a supervised process CRASHED (exit ${first_status}); shutting down container" 1>&2
+fi
 exit "${first_status}"
 

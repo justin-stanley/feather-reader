@@ -133,6 +133,11 @@ kill_timeout = "45s"
   SIDECAR_INTERNAL_URL = "http://127.0.0.1:8081"
   SIDECAR_DB = "/data/oauth-sidecar.db"
   RUST_LOG = "info"
+  # Background loops wait 30/45/60/90 s (and the relay probe 5 min) before their
+  # FIRST tick, so a crash-looping machine does not re-run every sweep on every
+  # restart. FEATHERREADER_STARTUP_DELAY_SECS shortens them for a dev or
+  # integration run — it is a CEILING, so setting it HIGHER changes nothing and
+  # logs that it was ignored. Not set here: production wants the built-in values.
 
 [[mounts]]
   source = "featherreader_data"

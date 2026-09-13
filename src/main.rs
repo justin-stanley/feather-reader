@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     // Maintenance mode: run the one-off auto_vacuum migration and exit without
     // ever binding a port or starting a scheduler. See `run_vacuum_migration`.
-    if std::env::args().any(|a| a == MIGRATE_AUTO_VACUUM_FLAG) {
+    if wants_vacuum_migration(std::env::args()) {
         let outcome = run_vacuum_migration(&db, &config).await;
         db.close().await;
         return outcome;
@@ -128,6 +128,19 @@ async fn main() -> Result<()> {
 /// The one CLI flag this binary understands. Everything else is env-driven.
 const MIGRATE_AUTO_VACUUM_FLAG: &str = "--migrate-auto-vacuum";
 
+/// Whether the invocation asked for the maintenance migration.
+///
+/// Skips `argv[0]`, which the previous `args().any(…)` scan included — so a
+/// binary that happened to be installed at a path containing the flag would have
+/// triggered it. Not remotely reachable, but this gate starts an operation that
+/// takes an exclusive whole-database write lock for minutes, and it should be
+/// exactly as loose as an argument match and no looser.
+fn wants_vacuum_migration<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|a| a == MIGRATE_AUTO_VACUUM_FLAG)
+}
+
 /// Run the one-off `auto_vacuum = NONE → INCREMENTAL` migration, then exit.
 ///
 /// **Why a flag and not a boot step.** SQLite ignores `PRAGMA auto_vacuum` on a
@@ -148,37 +161,57 @@ const MIGRATE_AUTO_VACUUM_FLAG: &str = "--migrate-auto-vacuum";
 /// safe to run blindly.
 async fn run_vacuum_migration(db: &store::Pool, config: &Config) -> Result<()> {
     info!(db = %config.db_path.display(), "auto_vacuum migration: starting");
-    // The VACUUM holds an exclusive lock for its whole duration, so a running
-    // instance will see its writes block. Say so before starting rather than
-    // leaving an operator to infer it from a stalled site.
+    // The VACUUM holds an exclusive lock for its whole duration. Against the
+    // app's 5 s `busy_timeout` that means concurrent writes do not queue, they
+    // FAIL — including the OAuth session writes, so logins break. Say so before
+    // starting rather than leaving an operator to infer it from a broken site.
     info!(
-        "auto_vacuum migration: this rewrites the whole database file. Writes on a \
-         running instance will block until it finishes."
+        "auto_vacuum migration: this rewrites the whole database file and holds an \
+         exclusive lock for minutes. Writes from a RUNNING instance will FAIL (not \
+         queue) for the duration, logins included. Stop the app first."
     );
     let available = available_disk_bytes(&config.db_path);
     match store::migrate_to_incremental_vacuum(db, available).await? {
         store::VacuumMigration::NotNeeded(mode) => {
             info!(?mode, "auto_vacuum migration: nothing to do");
         }
-        store::VacuumMigration::RefusedNoHeadroom { needed, available } => {
+        store::VacuumMigration::RefusedNoHeadroom {
+            needed,
+            available,
+            file_bytes,
+        } => {
             // Not an error exit: the operator asked a reasonable question and
             // got a correct answer. Failing here would be indistinguishable from
             // a broken binary in a deploy script.
             tracing::warn!(
                 needed_bytes = needed,
                 available_bytes = available,
+                // The on-disk size too: the requirement is computed from LIVE
+                // pages, and on exactly this population (NONE mode, big
+                // freelist) the file is materially larger — so an operator
+                // comparing the number to `ls -l` would otherwise distrust it.
+                file_bytes = file_bytes.unwrap_or(0),
                 "auto_vacuum migration: REFUSED. A full VACUUM writes a second copy of \
-                 the database, so it needs roughly twice the live size free. Free space \
-                 on the volume (or grow it) and run this again."
+                 the database, so it needs roughly twice the LIVE size free (the file on \
+                 disk is larger; the freelist is not copied). Free space on the volume \
+                 (or grow it) and run this again."
             );
         }
         store::VacuumMigration::Migrated {
             bytes_before,
             bytes_after,
+            file_before,
+            file_after,
         } => {
             info!(
                 bytes_before,
-                bytes_after, "auto_vacuum migration: complete; the database is now INCREMENTAL"
+                bytes_after,
+                // The file sizes are the pair that answers "did this help?".
+                // The live-page figures barely move — reclaiming the freelist is
+                // the whole point — so reporting only those read as a no-op.
+                file_before = file_before.unwrap_or(0),
+                file_after = file_after.unwrap_or(0),
+                "auto_vacuum migration: complete; the database is now INCREMENTAL"
             );
         }
     }

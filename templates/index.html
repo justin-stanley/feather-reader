@@ -37,7 +37,9 @@
 
     <div class="content-head">
       <h1 class="content-title">{{ heading }}</h1>
-      <span class="content-count">{{ total }} entries</span>
+      <span class="content-count">
+        {{ total }} entries{% if uncached_shown > 0 %}, plus {{ uncached_shown }} saved elsewhere{% endif %}
+      </span>
       <span class="content-spacer"></span>
       {% if !entries.is_empty() %}
         <form id="mark-all-form" method="post"

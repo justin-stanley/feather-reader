@@ -634,9 +634,33 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 /// log line that says why and one that says nothing.
 const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Above this, `/health` labels the poll heartbeat `stale`. **Reported, never
-/// fatal** — see the handler for why.
-const HEALTH_TICK_STALE_SECS: i64 = 15 * 60;
+/// Floor for the poll-heartbeat staleness threshold. **Reported, never fatal** —
+/// see the handler for why.
+///
+/// The threshold itself is derived from the configured tick
+/// ([`health_tick_stale_secs`]): hardcoding 15 minutes meant an operator who
+/// raised `FEATHERREADER_POLL_TICK_SECS` above 900 got a permanent `poller:
+/// stale` in the body the deployment docs now tell them to alert on.
+const HEALTH_TICK_STALE_FLOOR_SECS: i64 = 15 * 60;
+
+/// How long without a completed tick before the poller reads as stale: several
+/// tick intervals, floored, so a normally-paced loop never trips it and a
+/// genuinely wedged one always does.
+fn health_tick_stale_secs(tick: Duration) -> i64 {
+    let tick = i64::try_from(tick.as_secs()).unwrap_or(i64::MAX);
+    tick.saturating_mul(5).max(HEALTH_TICK_STALE_FLOOR_SECS)
+}
+
+/// The poll tick this instance is configured for. Read from the same env var
+/// `scheduler.rs` reads, because the scheduler lives in the binary crate and the
+/// handler cannot see its constants.
+fn configured_poll_tick() -> Duration {
+    std::env::var("FEATHERREADER_POLL_TICK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(Duration::from_secs(60), Duration::from_secs)
+}
 
 /// Grace period after boot before a poller that has never ticked is called
 /// `stale` rather than `not-yet-ticked`.
@@ -738,7 +762,9 @@ async fn health(State(state): State<AppState>) -> Response {
                 }
                 _ => "not-yet-ticked".to_string(),
             },
-            Some(secs) if secs > HEALTH_TICK_STALE_SECS => format!("stale {secs}s"),
+            Some(secs) if secs > health_tick_stale_secs(configured_poll_tick()) => {
+                format!("stale {secs}s")
+            }
             Some(secs) => format!("ok {secs}s"),
         }
     };
@@ -940,7 +966,24 @@ async fn stats(State(state): State<AppState>) -> Response {
         // detail, so they sit inside the page's stated contract.
         in_backoff: health.in_backoff,
         badly_broken: health.badly_broken,
-        polling_paused: state.runtime_health.watermark_paused(),
+        // **Three-way, not two.** `polling_paused` alone reported "running" on an
+        // instance where nothing polls at all — schedulers disabled, or before
+        // the poller's now-delayed first tick — which is exactly the question
+        // this row was added to answer. `/health` already distinguished them;
+        // the page a reader can reach did not.
+        fetching: if !state.runtime_health.schedulers_enabled() {
+            "off"
+        } else if state.runtime_health.watermark_paused() {
+            "paused"
+        } else if state
+            .runtime_health
+            .secs_since_poll_tick(now.timestamp())
+            .is_none()
+        {
+            "starting"
+        } else {
+            "running"
+        },
     })
 }
 
@@ -1110,10 +1153,18 @@ struct IndexTemplate {
     heading: String,
     /// Whether a feed scope is active (enables per-feed mark-all-read).
     feed_scope: Option<String>,
-    /// Total entries in this scope + view across ALL pages. The count used to be
-    /// `entries.len()`, which was the same number only because the list was
+    /// Total CACHED entries in this scope + view across ALL pages. The count used
+    /// to be `entries.len()`, which was the same number only because the list was
     /// unpaged — the thing this change exists to stop.
+    ///
+    /// The pager is derived from this, so it must not include the uncached PDS
+    /// rows below: they are appended to the last page rather than paged, and
+    /// counting them here advertised a page the clamp could never reach.
     total: i64,
+    /// Uncached PDS saved records shown on THIS page (the last one, in the
+    /// starred view; zero everywhere else). Reported separately because they are
+    /// records the cache cannot show, not more of the list.
+    uncached_shown: i64,
     /// 1-based current page.
     page: i64,
     /// Total pages, at least 1 (an empty list is page 1 of 1).
@@ -1193,8 +1244,10 @@ struct StatsTemplate {
     in_backoff: i64,
     /// Of those, the ones deep enough into backoff to be effectively dead.
     badly_broken: i64,
-    /// Whether the DB-size watermark is currently pausing ALL new fetching.
-    polling_paused: bool,
+    /// What the poller is actually doing: `running`, `paused` (at the size
+    /// watermark), `starting` (no tick completed yet) or `off` (schedulers
+    /// disabled). Three of those four used to render as "running".
+    fetching: &'static str,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -1495,6 +1548,14 @@ const PREV_NEXT_MAX: i64 = 5_000;
 /// count, not as a routine bound.
 const STARRED_IDENTITY_MAX: i64 = 20_000;
 
+/// Most uncached PDS saved records rendered on the starred view's last page.
+///
+/// They are appended whole rather than paged, so `ENTRIES_PER_PAGE` does not
+/// bound them and the PDS list ceiling (20,000) was the only limit on the
+/// response size. Generous enough that no ordinary reader meets it, small enough
+/// that the page stays a page.
+const MAX_UNCACHED_SAVED_ROWS: usize = 500;
+
 /// A subscription resolved against the local cache: the PDS record + its
 /// (possibly-missing) cached feed row.
 struct ResolvedSub {
@@ -1539,6 +1600,31 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                 })
                 .collect();
         }
+    };
+
+    // **Bound the set on the READ path, not just on the write paths.**
+    //
+    // `max_subs_per_did` is enforced when adding a feed and when importing OPML,
+    // and nowhere else — but this list comes from the PDS, which any client can
+    // write to, bounded only by the 20,000-record list-pages ceiling. Every
+    // render then turns it into one SQL placeholder per feed for the scope
+    // filter, twice, on a 512 MB box. `subscribed_feed_ids` claimed to be
+    // bounded by the cap and was not; this is where that becomes true.
+    //
+    // Truncation is loud and deterministic (the PDS list is already sorted), so
+    // a reader over the cap sees a stable prefix rather than a random one, and
+    // the operator gets told which DID to look at.
+    let cap = state.config.max_subs_per_did as usize;
+    let subs: Vec<_> = if cap > 0 && subs.len() > cap {
+        warn!(
+            %did,
+            found = subs.len(),
+            cap,
+            "this DID's PDS holds more subscriptions than the per-DID cap; rendering              the first {cap} and ignoring the rest"
+        );
+        subs.into_iter().take(cap).collect()
+    } else {
+        subs
     };
 
     let mut out = Vec::with_capacity(subs.len());
@@ -1683,8 +1769,10 @@ async fn index(
     // no `LIMIT`, article bodies included — and the "all" view additionally ran
     // one such query PER SUBSCRIBED FEED and merged the results in memory. None
     // of the row fields below read the body. See `store::EntryListRow`.
-    let mut total =
-        store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
+    let total = store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
+    // Uncached PDS saved records appended to the last page — counted for the
+    // heading, and deliberately kept OUT of `total`, which the pager depends on.
+    let mut uncached_shown: i64 = 0;
     // Clamped to the range that exists. Past the end the list is empty, and the
     // empty state renders instead of the pager — which would strand a reader who
     // typed a page number, or who paged to the end and then marked entries read
@@ -1776,18 +1864,41 @@ async fn index(
         // stores agree however the row got classified. Dropping the predicate
         // here instead would have made the row link to `/entries/{id}`, which is
         // `sub_ref`-scoped and would 404.
-        let identities = store::starred_identities(pool, &did, STARRED_IDENTITY_MAX)
-            .await
-            .unwrap_or_else(|err| {
+        //
+        // **Three ways this can be unusable, and all three fail CLOSED.** With an
+        // incomplete identity set, a cached article looks uncached and renders an
+        // un-save button that deletes the PDS RECORD. Showing no uncached rows
+        // loses rows for one render; getting this wrong loses data permanently,
+        // so every uncertain case suppresses them.
+        let identities = match store::starred_identities(pool, &did, STARRED_IDENTITY_MAX).await {
+            Ok(store::StarredIdentities::All(rows)) => Some(rows),
+            // The cap is a memory backstop, and reaching it means the set is an
+            // arbitrary subset. It used to return that subset with no way to
+            // tell, so every starred article outside it got the destructive
+            // button.
+            Ok(store::StarredIdentities::Truncated) => {
+                warn!(
+                    %did,
+                    cap = STARRED_IDENTITY_MAX,
+                    "cached-starred set exceeded its cap; suppressing uncached saved rows \
+                     rather than rendering record-deleting buttons for cached articles"
+                );
+                None
+            }
+            Err(err) => {
                 warn!(%err, %did, "cached-starred identity lookup failed; \
                                     suppressing uncached saved rows this render");
-                // Fail CLOSED. With no identities every cached article looks
-                // uncached, and each would render an un-save button that deletes
-                // the PDS record. Showing nothing loses rows for one render; the
-                // alternative loses data permanently.
-                Vec::new()
-            });
-        let identities_ok = !identities.is_empty() || total == 0;
+                None
+            }
+        };
+        // The escape hatch asks whether this DID has ANY cached starred entry —
+        // not whether the current SCOPE does. `total` is narrowed by
+        // `?feed=`/`?folder=` while the identity set spans every feed, so
+        // comparing them waved the fail-closed condition through for any narrow
+        // scope: a record whose `feedUrl` matched the filter while its cached
+        // entry lived under another feed rendered as uncached.
+        let identities_ok = identities.is_some();
+        let identities = identities.unwrap_or_default();
         let cached_urls: std::collections::HashSet<&str> = identities
             .iter()
             .filter_map(|(url, _)| url.as_deref())
@@ -1799,7 +1910,14 @@ async fn index(
         // cached one, so they belong on the LAST page. Appending them to each
         // page would repeat them on all of them, and they have to be counted
         // into the total before the last page can be identified.
+        // Bounded like everything else on this page. These come from the PDS
+        // (up to the 20,000-record list ceiling) and are appended whole to the
+        // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
+        // cap is generous — a reader with more saved-elsewhere records than this
+        // is not the case being designed for — but a response has to have a size
+        // an operator can reason about.
         let mut uncached: Vec<EntryRow> = Vec::new();
+        let mut uncached_dropped = 0usize;
         match state.repo().list_saved_sorted(&did).await {
             Ok(saved) if identities_ok => {
                 for (rkey, item) in saved {
@@ -1879,6 +1997,10 @@ async fn index(
                             }
                         }
                     }
+                    if uncached.len() >= MAX_UNCACHED_SAVED_ROWS {
+                        uncached_dropped += 1;
+                        continue;
+                    }
                     uncached.push(EntryRow {
                         id: 0,
                         title: item
@@ -1909,15 +2031,36 @@ async fn index(
                     });
                 }
             }
-            // Identity lookup failed — see the fail-closed note above.
+            // Identity lookup was unusable — see the fail-closed note above.
             Ok(_) => {}
             Err(err) => warn!(%err, %did, "could not list saved records from the PDS"),
         }
         // Which page is last is decided by the CACHED count, since those rows
         // are what the pager walks; the uncached ones then extend that page.
+        //
+        // `total` is deliberately NOT inflated by them. The page clamp above is
+        // computed from the cached count, so inflating the total here made
+        // `page_count` and the "Older →" link advertise a page the clamp could
+        // never reach: at 250 cached + 80 uncached, page 3 rendered the last
+        // page, reported "Page 3 of 4", and linked to page 4 — which clamped
+        // straight back to 3 and rendered the same thing, still offering the
+        // link. The pager and the clamp have to agree on what the last page is,
+        // and the clamp is the one that decides.
+        //
+        // The heading reports the extras separately instead, which is also more
+        // honest: they are records the cache cannot show, not more of the list.
+        if uncached_dropped > 0 {
+            warn!(
+                %did,
+                dropped = uncached_dropped,
+                cap = MAX_UNCACHED_SAVED_ROWS,
+                "more uncached saved records than this page will render; the rest are \
+                 not shown"
+            );
+        }
         let last_page = page_count_for(total);
-        total += uncached.len() as i64;
         if page >= last_page {
+            uncached_shown = uncached.len() as i64;
             entries.extend(uncached);
         }
     }
@@ -1995,6 +2138,7 @@ async fn index(
         heading,
         feed_scope,
         total,
+        uncached_shown,
         page,
         page_count: page_count_for(total),
         prev_href,
@@ -7775,7 +7919,8 @@ mod tests {
         );
 
         // A stale heartbeat is likewise reported, not fatal.
-        let long_ago = chrono::Utc::now().timestamp() - (HEALTH_TICK_STALE_SECS + 60);
+        let stale_after = health_tick_stale_secs(configured_poll_tick());
+        let long_ago = chrono::Utc::now().timestamp() - (stale_after + 60);
         state.runtime_health.poll_tick_completed(long_ago);
         let (status, body) = body_of(state.clone()).await;
         assert_eq!(
@@ -7818,6 +7963,93 @@ mod tests {
         assert!(
             !body.contains("PoolClosed") && !body.contains("sqlx"),
             "health leaked the raw database error to an unauthenticated caller: {body}"
+        );
+    }
+
+    /// The staleness threshold must track the configured tick.
+    ///
+    /// Hardcoded at 15 minutes, an operator who raised
+    /// `FEATHERREADER_POLL_TICK_SECS` above 900 got a permanent `poller: stale`
+    /// in the body the deployment docs tell them to alert on.
+    #[test]
+    fn the_stale_threshold_follows_the_poll_tick() {
+        // A fast tick keeps the floor — five 60 s ticks is 5 minutes, and
+        // alerting that early would fire on any brief hiccup.
+        assert_eq!(
+            health_tick_stale_secs(Duration::from_secs(60)),
+            HEALTH_TICK_STALE_FLOOR_SECS
+        );
+        // A slow tick raises it, so a legitimately-configured loop is never
+        // permanently "stale".
+        let slow = Duration::from_secs(30 * 60);
+        assert!(
+            health_tick_stale_secs(slow) > slow.as_secs() as i64,
+            "a 30-minute tick must not be stale after one interval"
+        );
+        assert_eq!(health_tick_stale_secs(slow), 30 * 60 * 5);
+        // And it cannot overflow into nonsense on an absurd value.
+        assert!(health_tick_stale_secs(Duration::from_secs(u64::MAX)) > 0);
+    }
+
+    /// `/stats` must distinguish "nothing is polling" from "polling is fine".
+    ///
+    /// `polling_paused` alone rendered "running" for three different states,
+    /// including the two where nothing polls at all — on the page added to
+    /// answer exactly that question.
+    #[tokio::test]
+    async fn stats_does_not_call_a_stopped_poller_running() {
+        let state = test_state(&[]).await;
+        let render = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        // Schedulers never started: not "running".
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("the poller is not running on this instance"),
+            "a disabled poller renders as healthy"
+        );
+
+        // Started, but no tick has finished yet.
+        state.runtime_health.set_schedulers_enabled(true);
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("no poll has finished since this instance booted"),
+            "a poller that has not ticked renders as healthy"
+        );
+
+        // Ticking: running.
+        state
+            .runtime_health
+            .poll_tick_completed(chrono::Utc::now().timestamp());
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("running"),
+            "a healthy poller must read as running"
+        );
+
+        // Paused at the watermark still wins over "running".
+        state.runtime_health.set_watermark(true);
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("the cache is at its size limit"),
+            "a watermark pause is hidden once the poller is ticking"
         );
     }
 
@@ -7915,6 +8147,181 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A sidecar mock serving `n` distinct saved records, none of them cached
+    /// locally — the shape that exercises the uncached-row append.
+    async fn spawn_saved_sidecar_many(n: usize, subscribed_feed: &str) -> String {
+        let feed = subscribed_feed.to_string();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(read) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..read]).to_string();
+                let records = if req.contains("community.lexicon.rss.saved") {
+                    serde_json::Value::Array(
+                        (0..n)
+                            .map(|i| {
+                                serde_json::json!({
+                                    "uri": format!("at://did:plc:x/community.lexicon.rss.saved/rk{i}"),
+                                    "cid": "bafy",
+                                    "value": {
+                                        "$type": "community.lexicon.rss.saved",
+                                        "url": format!("https://elsewhere.example/{i}"),
+                                        "title": format!("Elsewhere {i}"),
+                                        "createdAt": "2026-01-01T00:00:00Z"
+                                    }
+                                })
+                            })
+                            .collect(),
+                    )
+                } else if req.contains("community.lexicon.rss.subscription") {
+                    // Without this the handler's `sync_sub_refs` would REPLACE
+                    // sub_ref with an empty set on every render, and every
+                    // sub_ref-scoped read — including the cached starred list
+                    // this test is about — would come back empty.
+                    serde_json::json!([{
+                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/sub1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": "community.lexicon.rss.subscription",
+                            "url": feed,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body =
+                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// **The pager must not advertise a page the clamp cannot reach.**
+    ///
+    /// The page clamp is computed from the CACHED total; the uncached PDS rows
+    /// are appended to the last page rather than paged. Inflating `total` with
+    /// them made `page_count` and the "Older →" link point one page past the end:
+    /// requesting it clamped straight back, re-rendered the same last page, and
+    /// still offered the link. An infinite "next" that never advances.
+    #[tokio::test]
+    async fn the_starred_pager_does_not_advertise_an_unreachable_page() {
+        let did = "did:plc:pagerloop";
+        let sidecar = spawn_saved_sidecar_many(80, "https://loop.example/feed.xml").await;
+        let state = test_state_with_sidecar(&[], &sidecar).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://loop.example/feed.xml".to_string(),
+                title: Some("Loop".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // 250 cached starred entries: the last page holds 50, so 50 + 80 > 100
+        // and the old arithmetic reported a fourth page.
+        let entries: Vec<store::NewEntry> = (0..250)
+            .map(|i| store::NewEntry {
+                guid: format!("s-{i:04}"),
+                url: Some(format!("https://loop.example/{i}")),
+                title: Some(format!("Starred {i:04}")),
+                published: Some(format!("2026-06-{:02}T00:00:00Z", (i % 28) + 1)),
+                ..Default::default()
+            })
+            .collect();
+        store::insert_entries(&state.db, feed, &entries, 0)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        for row in store::list_entries(&state.db, did, store::ListView::All, None, 1_000, 0)
+            .await
+            .unwrap()
+        {
+            store::mark_starred(&state.db, did, row.id, true)
+                .await
+                .unwrap();
+        }
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let get = |uri: &str| {
+            let (app, cookie, uri) = (app.clone(), cookie.clone(), uri.to_string());
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                String::from_utf8(
+                    axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            }
+        };
+
+        let last = get("/?view=starred&page=3").await;
+        // The uncached rows land here, so this IS the last page.
+        assert!(
+            last.contains("Elsewhere 0"),
+            "the uncached saved records did not reach the last page"
+        );
+        assert!(
+            last.contains("Page 3 of 3"),
+            "the pager counted the uncached rows into its page total: {}",
+            last.split("pager-pos")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>()
+        );
+        assert!(
+            !last.contains("page=4"),
+            "the pager offered a page the clamp cannot reach"
+        );
+        // And the count is honest about what the extras are.
+        assert!(
+            last.contains("250 entries") && last.contains("80 saved elsewhere"),
+            "the heading should separate cached entries from records the cache cannot show"
+        );
+
+        // Earlier pages must NOT carry the uncached rows.
+        let first = get("/?view=starred").await;
+        assert!(
+            !first.contains("Elsewhere 0"),
+            "uncached saved records were repeated on every page"
+        );
     }
 
     /// **A saved record whose article is not cached here is still shown.**

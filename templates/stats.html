@@ -61,8 +61,12 @@
           <tr>
             <th scope="row">Fetching</th>
             <td>
-              {% if polling_paused %}
+              {% if fetching == "paused" %}
                 <strong>paused</strong> — the cache is at its size limit
+              {% else if fetching == "off" %}
+                <strong>off</strong> — the poller is not running on this instance
+              {% else if fetching == "starting" %}
+                starting — no poll has finished since this instance booted
               {% else %}
                 running
               {% endif %}
@@ -103,9 +107,11 @@
         <strong>Fetching</strong> says whether new content is being pulled at
         all. It reads <em>paused</em> when the cache has hit the size limit that
         protects the disk; nothing new arrives until the retention sweep frees
-        space. Reading, searching and everything already cached keep working —
-        but every other number on this page will drift while it says paused, and
-        this row is the reason.
+        space. <em>Off</em> means the poller is not running here at all, and
+        <em>starting</em> means it has not finished a round since this instance
+        booted. Reading, searching and everything already cached keep working in
+        every case — but every other number on this page will drift while this
+        row says anything but <em>running</em>, and this row is the reason.
       </p>
 
       <h2>What is not here</h2>

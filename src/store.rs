@@ -746,10 +746,15 @@ pub async fn feeds_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Feed>> {
     Ok(feeds)
 }
 
-/// The feed ids a `did` currently subscribes to (its `sub_ref` rows). Bounded by
-/// the per-DID subscription cap, so callers can safely iterate it — e.g. the
-/// global "mark all read" path fans out over feeds (bounded) rather than over
-/// unread entries (unbounded).
+/// The feed ids a `did` currently subscribes to (its `sub_ref` rows).
+///
+/// **Not bounded by `max_subs_per_did`.** This comment used to claim it was, and
+/// callers leaned on that: the cap is enforced on the ADD and OPML paths only,
+/// never on read, and `sub_ref` is rebuilt from whatever the PDS returns — which
+/// any client can write to, bounded only by the list-pages ceiling at 20,000
+/// records. A claim in a comment is not a bound. The read path now imposes its
+/// own ([`crate::web`]'s resolved-subscription cap), and this says what is
+/// actually true rather than what would be convenient.
 pub async fn subscribed_feed_ids(pool: &SqlitePool, did: &str) -> Result<Vec<i64>> {
     let ids: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM sub_ref WHERE did = ?1")
         .bind(did)
@@ -821,19 +826,32 @@ pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
 /// when there is no WAL (`:memory:`, non-WAL journal modes) or it cannot be
 /// stat'd. Best-effort by design — see [`db_size_bytes`].
 async fn wal_bytes(pool: &SqlitePool) -> i64 {
-    // `database_list` gives the main database's file path; empty for :memory:.
-    let path: Option<String> = sqlx::query_scalar(
-        "SELECT file FROM pragma_database_list WHERE name = 'main' AND file <> ''",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    let Some(path) = path else { return 0 };
+    let Some(path) = main_db_path(pool).await else {
+        return 0;
+    };
     std::fs::metadata(format!("{path}-wal"))
         .map(|m| i64::try_from(m.len()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
+
+/// The main database's file path, or `None` for `:memory:`.
+async fn main_db_path(pool: &SqlitePool) -> Option<String> {
+    sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main' AND file <> ''")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Freelist pages returned to the OS per `incremental_vacuum` step. At a 4 KiB
+/// page that is ~8 MiB per batch — a short lock hold, and few enough steps that
+/// a large reclaim is tens of statements rather than thousands.
+const RECLAIM_BATCH_PAGES: i64 = 2_000;
+
+/// Backstop on the reclaim loop. `freelist_count == 0` and the no-progress check
+/// are the real terminators; at [`RECLAIM_BATCH_PAGES`] this is 2M pages (~8 GiB),
+/// far past anything a 1 GB volume holds.
+const RECLAIM_MAX_BATCHES: usize = 1_000;
 
 /// Reclaim freed pages so the database file (and its used-page accounting) can
 /// actually shrink after a retention/prune sweep DELETEs rows.
@@ -848,10 +866,42 @@ async fn wal_bytes(pool: &SqlitePool) -> i64 {
 pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
     match auto_vacuum_mode(pool).await? {
         AutoVacuum::Incremental => {
-            sqlx::query("PRAGMA incremental_vacuum")
+            // **Bounded, like the deletes that precede it.**
+            //
+            // With no page argument this reclaims the ENTIRE freelist in one
+            // transaction — handing straight back the write-lock hold that
+            // batching the retention deletes had just won, immediately after the
+            // sweep that created the freelist in the first place. Same shape as
+            // `delete_in_batches`: a bounded unit of work, then an explicit
+            // hand-off so a waiting writer actually gets in.
+            for _ in 0..RECLAIM_MAX_BATCHES {
+                let before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(pool)
+                    .await
+                    .context("PRAGMA freelist_count failed")?;
+                if before == 0 {
+                    break;
+                }
+                // A PRAGMA argument cannot be a bind parameter, and this one is
+                // a `const i64` declared in this file — nothing external reaches
+                // it.
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "PRAGMA incremental_vacuum({RECLAIM_BATCH_PAGES})"
+                )))
                 .execute(pool)
                 .await
                 .context("PRAGMA incremental_vacuum failed")?;
+                let after: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(pool)
+                    .await
+                    .context("PRAGMA freelist_count failed")?;
+                // No progress means there is nothing more this can free (pages
+                // pinned by an open read snapshot, say). Stop rather than spin.
+                if after >= before {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
         // SQLite already returns freed pages at every commit in this mode.
         // Nothing to do, and a VACUUM would be pure cost.
@@ -933,9 +983,23 @@ pub enum VacuumMigration {
     /// Already in a mode that reclaims; nothing was run.
     NotNeeded(AutoVacuum),
     /// Refused: not enough free space on the volume to hold the rebuilt file.
-    RefusedNoHeadroom { needed: u64, available: u64 },
+    ///
+    /// `file_bytes` is the on-disk size, reported alongside the live-page figure
+    /// the requirement is computed from, because on exactly this population
+    /// (`NONE` mode, large freelist) the two differ a lot and only one of them
+    /// matches what `ls -l` says.
+    RefusedNoHeadroom {
+        needed: u64,
+        available: u64,
+        file_bytes: Option<u64>,
+    },
     /// Ran the pragma + full VACUUM; the database is now INCREMENTAL.
-    Migrated { bytes_before: i64, bytes_after: i64 },
+    Migrated {
+        bytes_before: i64,
+        bytes_after: i64,
+        file_before: Option<u64>,
+        file_after: Option<u64>,
+    },
 }
 
 /// Move a populated database from `auto_vacuum = NONE` to `INCREMENTAL`.
@@ -966,29 +1030,88 @@ pub async fn migrate_to_incremental_vacuum(
         return Ok(VacuumMigration::NotNeeded(mode));
     }
 
-    // The rebuild needs room for a whole second copy. Ask for that plus a
-    // margin, since the WAL grows alongside it.
+    // **The on-disk file, not the live-page count.** `db_size_bytes` subtracts
+    // the freelist, and the population this migration exists for is precisely
+    // `auto_vacuum = NONE` with a large freelist — so the live size can be far
+    // smaller than the file, and an operator comparing the refusal message to
+    // `ls -l` would not trust either number. The rebuild is sized by the LIVE
+    // pages (that is what gets copied), but the report shows both.
     let bytes_before = db_size_bytes(pool).await?;
+    let file_before = main_db_file_bytes(pool).await;
     let needed = (bytes_before.max(0) as u64).saturating_mul(2);
     if let Some(available) = available_bytes {
         if available < needed {
-            return Ok(VacuumMigration::RefusedNoHeadroom { needed, available });
+            return Ok(VacuumMigration::RefusedNoHeadroom {
+                needed,
+                available,
+                file_bytes: file_before,
+            });
         }
     }
+
+    // **One connection for both statements.**
+    //
+    // `PRAGMA auto_vacuum` on a populated database is connection-scoped INTENT
+    // that only takes effect when the SAME connection runs the VACUUM. Issued
+    // against the pool they can land on different connections, and the rebuild
+    // then happens in NONE mode — caught by the `ensure!` below, so loud rather
+    // than silent, but the operator has paid a whole-file rewrite for nothing on
+    // a box chosen for being short of disk.
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquiring a connection for the auto_vacuum migration")?;
+
+    // Keep SQLite's temp storage on the DATABASE's volume. A VACUUM copies into
+    // a temporary database whose location follows `temp_store`, and nothing in
+    // this project sets it — so the copy landed on the container rootfs while
+    // the headroom check above measured the data volume. The check could pass
+    // and the VACUUM still fail, or fill the rootfs out from under everything
+    // else in the container. `temp_store = FILE` plus a directory beside the
+    // database makes the space checked the space used.
+    sqlx::query("PRAGMA temp_store = FILE")
+        .execute(&mut *conn)
+        .await
+        .context("PRAGMA temp_store = FILE failed")?;
 
     // Order matters: the pragma records the INTENT, and the VACUUM is what
     // actually rewrites the file in the new mode. Reversed, the VACUUM would
     // rebuild in NONE mode and the pragma would then be ignored again.
     sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("PRAGMA auto_vacuum = INCREMENTAL failed")?;
     sqlx::query("VACUUM")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("VACUUM failed during the auto_vacuum migration")?;
 
-    let after = auto_vacuum_mode(pool).await?;
+    // Fold the WAL back in BEFORE measuring. A VACUUM in WAL mode writes the
+    // entire rebuilt database through the WAL, which keeps that high-water size
+    // until a truncating checkpoint — and `db_size_bytes` now counts the WAL. So
+    // the one number this command reports read as "the migration doubled my
+    // database", which is the opposite of what it did.
+    if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::debug!(%err, "post-migration wal checkpoint did not run");
+    }
+
+    // Verified on the HELD connection, then released before anything that goes
+    // back to the pool. The test pool is single-connection, and so is a
+    // production pool that happens to be saturated — reaching for a second one
+    // while still holding the first is a deadlock waiting for a busy moment.
+    let after_raw: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await
+        .context("PRAGMA auto_vacuum failed after the migration")?;
+    drop(conn);
+    let after = match after_raw {
+        1 => AutoVacuum::Full,
+        2 => AutoVacuum::Incremental,
+        _ => AutoVacuum::None,
+    };
     anyhow::ensure!(
         after == AutoVacuum::Incremental,
         "the auto_vacuum migration ran but the database is still in {after:?} mode"
@@ -996,7 +1119,16 @@ pub async fn migrate_to_incremental_vacuum(
     Ok(VacuumMigration::Migrated {
         bytes_before,
         bytes_after: db_size_bytes(pool).await?,
+        file_before,
+        file_after: main_db_file_bytes(pool).await,
     })
+}
+
+/// Size of the main database FILE on disk, or `None` for `:memory:` / an
+/// unstattable path. Distinct from [`db_size_bytes`], which reports live pages.
+async fn main_db_file_bytes(pool: &SqlitePool) -> Option<u64> {
+    let path = main_db_path(pool).await?;
+    std::fs::metadata(path).ok().map(|m| m.len())
 }
 
 /// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`, then
@@ -1386,7 +1518,13 @@ async fn delete_in_batches(
         // be bookkeeping rather than a fix. At `PRUNE_BATCH` rows per batch this
         // adds ~10 ms per 1,000 deleted rows to a sweep that runs once a day.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if batch + 1 == PRUNE_MAX_BATCHES {
+        // Only warn if the backstop actually cut the sweep short. A final batch
+        // that happened to drain the last rows would otherwise log "the rest
+        // waits for the next run" with nothing left — and an operator who reads
+        // that during an incident would go looking for a backlog that is not
+        // there. `n < PRUNE_BATCH` means this batch found fewer rows than it
+        // asked for, so there are none behind it.
+        if batch + 1 == PRUNE_MAX_BATCHES && n == PRUNE_BATCH as u64 {
             tracing::warn!(
                 label,
                 total,
@@ -1877,20 +2015,42 @@ pub async fn unread_counts_by_feed(
 /// the visible page: a record that looks uncached gets an un-save button that
 /// deletes the PDS RECORD rather than un-starring the entry, so narrowing this
 /// set changes what a click destroys. Identity strings only — no bodies.
+///
+/// **Truncation is reported, not absorbed.** The `limit` is a memory backstop,
+/// but hitting it violates the invariant above — and the first version had no
+/// way to say so and no `ORDER BY`, so it silently returned an ARBITRARY subset
+/// and every starred article outside it rendered with a record-destroying
+/// button. `Truncated` lets the caller fail closed instead, and the ordering
+/// makes the subset at least deterministic across renders rather than
+/// whatever the query planner felt like returning.
+pub enum StarredIdentities {
+    /// The complete set for this DID.
+    All(Vec<(Option<String>, String)>),
+    /// `limit` was reached, so this is a partial set and MUST NOT be used to
+    /// decide that a record is uncached.
+    Truncated,
+}
+
 pub async fn starred_identities(
     pool: &SqlitePool,
     did: &str,
     limit: i64,
-) -> Result<Vec<(Option<String>, String)>> {
+) -> Result<StarredIdentities> {
     let (mut sql, _) = list_query_sql("e.url, e.guid", ListView::Starred, None);
-    sql.push_str(" LIMIT ?2");
+    // One past the limit, so reaching it is distinguishable from landing on it
+    // exactly. Ordered by id so the rows are stable; `url`/`guid` are not
+    // guaranteed unique or non-NULL, and the id is both.
+    sql.push_str(" ORDER BY e.id LIMIT ?2");
     let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
         .bind(did)
-        .bind(limit)
+        .bind(limit.saturating_add(1))
         .fetch_all(pool)
         .await
         .with_context(|| format!("starred_identities failed for {did}"))?;
-    Ok(rows)
+    if rows.len() as i64 > limit {
+        return Ok(StarredIdentities::Truncated);
+    }
+    Ok(StarredIdentities::All(rows))
 }
 
 /// Mark a single entry read/unread for a DID, upserting the per-DID state row
@@ -4181,7 +4341,10 @@ mod tests {
             "fixture precondition: the star must be invisible to the scoped read"
         );
         assert!(
-            starred_identities(&pool, did, 1_000).await?.is_empty(),
+            matches!(
+                starred_identities(&pool, did, 1_000).await?,
+                StarredIdentities::All(ref v) if v.is_empty()
+            ),
             "fixture precondition: the identity lookup must miss it too"
         );
         let still_starred: i64 =
@@ -4286,7 +4449,10 @@ mod tests {
             mark_starred(&pool, did, row.id, true).await?;
         }
 
-        let identities = starred_identities(&pool, did, 20_000).await?;
+        let identities = match starred_identities(&pool, did, 20_000).await? {
+            StarredIdentities::All(v) => v,
+            StarredIdentities::Truncated => panic!("150 rows must not read as truncated"),
+        };
         assert_eq!(
             identities.len(),
             150,
@@ -4295,6 +4461,27 @@ mod tests {
         assert!(identities
             .iter()
             .all(|(url, guid)| url.is_some() && !guid.is_empty()));
+
+        // **Hitting the cap must be REPORTED, not absorbed.** It used to return
+        // an arbitrary subset with no way to tell, and every starred article
+        // outside that subset then rendered an un-save button that deletes the
+        // PDS record rather than un-starring the entry.
+        assert!(
+            matches!(
+                starred_identities(&pool, did, 10).await?,
+                StarredIdentities::Truncated
+            ),
+            "a truncated identity set reported itself as complete"
+        );
+        // Landing EXACTLY on the cap is complete, not truncated — the query asks
+        // for one extra row precisely so the two are distinguishable.
+        assert!(
+            matches!(
+                starred_identities(&pool, did, 150).await?,
+                StarredIdentities::All(ref v) if v.len() == 150
+            ),
+            "a set exactly at the cap was misreported as truncated"
+        );
         Ok(())
     }
 
@@ -5406,11 +5593,26 @@ mod tests {
         // With headroom it runs, and the database ends up INCREMENTAL — which is
         // what makes `reclaim` cheap from then on.
         let done = migrate_to_incremental_vacuum(&pool, Some(u64::MAX)).await?;
-        assert!(
-            matches!(done, VacuumMigration::Migrated { .. }),
-            "expected a migration, got {done:?}"
-        );
+        let VacuumMigration::Migrated {
+            bytes_after,
+            file_after,
+            ..
+        } = done
+        else {
+            panic!("expected a migration, got {done:?}");
+        };
         assert_eq!(auto_vacuum_mode(&pool).await?, AutoVacuum::Incremental);
+        // The reported size must not include the WAL the VACUUM just filled. In
+        // WAL mode a VACUUM writes the whole rebuilt database through the WAL,
+        // so without the truncating checkpoint this reads as roughly double —
+        // "the migration doubled my database", from the one line the command
+        // prints.
+        let file_after = file_after.expect("an on-disk database has a file size") as i64;
+        assert!(
+            bytes_after <= file_after * 2,
+            "bytes_after ({bytes_after}) is inflated by an untruncated WAL against a \
+             {file_after}-byte file"
+        );
 
         pool.close().await;
         for p in [
