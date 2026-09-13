@@ -132,8 +132,15 @@ primary_region = "ord"
     soft_limit = 200
     hard_limit = 250
 
-  # Liveness: the Rust app's /health returns `200 ok featherreader/<ver>`,
-  # reached through Caddy (so this also proves the edge + app path is up).
+  # Liveness. /health probes the DATABASE (one `SELECT 1`, which no writer can
+  # block in WAL mode) under a 2 s timeout — inside the 3 s below, so a wedged
+  # pool yields a 503 the app chose, with a reason, rather than a timeout Fly
+  # inferred. Only the database can fail this check: the body also reports the
+  # poll heartbeat, whether fetching is paused at the size watermark, and the
+  # live OAuth backend, but none of those affect the status code. Fly restarts on
+  # a failed check and a restart fixes none of them — wiring them here would turn
+  # "feeds are behind" into "the site is down". Alert on the BODY for those.
+  # Reached through Caddy, so this also proves the edge + app path is up.
   [[http_service.checks]]
     interval = "15s"
     timeout = "3s"

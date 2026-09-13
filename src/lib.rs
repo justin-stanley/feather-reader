@@ -36,6 +36,7 @@ pub mod net;
 pub mod network;
 pub mod oauth;
 pub mod repo;
+pub mod runtime_health;
 pub mod store;
 pub mod web;
 
@@ -160,6 +161,11 @@ pub struct AppState {
     /// tolerated only while the sidecar is the selected backend, and refused at
     /// startup otherwise.
     pub oauth: Option<Arc<oauth::runtime::OauthRuntime>>,
+    /// What the background loops are doing right now — the poll heartbeat and
+    /// the watermark pause. Written by the scheduler, read by `/health` and
+    /// `/stats`. See [`runtime_health`] for why these two states needed a home
+    /// outside the log stream.
+    pub runtime_health: Arc<runtime_health::RuntimeHealth>,
 }
 
 impl AppState {
@@ -203,6 +209,7 @@ impl AppState {
             sessions: SessionRegistry::new(),
             metrics: Arc::new(metrics::RepoMetrics::new()),
             oauth,
+            runtime_health: Arc::new(runtime_health::RuntimeHealth::new()),
         })
     }
 }

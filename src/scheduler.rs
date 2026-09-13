@@ -206,8 +206,12 @@ pub fn schedulers_enabled() -> bool {
 pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task::JoinHandle<()>> {
     if !schedulers_enabled() {
         info!("background schedulers disabled (FEATHERREADER_DISABLE_SCHEDULER)");
+        // Recorded so a handler can tell "never started" from "started and
+        // stopped ticking" — identical from the outside, opposite responses.
+        state.runtime_health.set_schedulers_enabled(false);
         return Vec::new();
     }
+    state.runtime_health.set_schedulers_enabled(true);
 
     info!(
         "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
@@ -309,6 +313,12 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
                     // loop — the next tick retries.
                     error!(%err, "poll scheduler: tick failed");
                 }
+                // Heartbeat, stamped on COMPLETION — including after a failed
+                // tick, which is the honest reading: the loop is alive and
+                // erroring, which is a different condition from the loop being
+                // wedged, and `/health` reports them differently. A tick that
+                // hangs forever never reaches here, which is the point.
+                state.runtime_health.poll_tick_completed(Utc::now().timestamp());
             }
         }
     }
@@ -346,9 +356,16 @@ async fn poll_due_once(
                 // free disk ~= the live DB size to write the new file, which is
                 // exactly what's scarce under the disk pressure that tripped the
                 // watermark.
+                //
+                // Recorded, not just logged. This is one of the two states that
+                // stop feeds updating, and until now the per-tick `warn!` was its
+                // ONLY trace — so `/stats` showed `overdue` climbing and
+                // `polled_last_hour` falling with nothing to say which of the two
+                // causes was responsible. See `runtime_health`.
+                state.runtime_health.set_watermark(true);
                 return Ok(());
             }
-            Ok(_) => {}
+            Ok(_) => state.runtime_health.set_watermark(false),
             Err(err) => warn!(%err, "could not read DB size for watermark check; polling anyway"),
         }
     }

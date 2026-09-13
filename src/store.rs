@@ -2967,12 +2967,33 @@ pub struct PollHealth {
     pub oldest_poll_secs_ago: Option<i64>,
     /// How many feeds have never been polled at all.
     pub never_polled: i64,
+    /// Feeds currently in error backoff (`consecutive_errors > 0`).
+    ///
+    /// One of the two states that stop feeds updating, and previously visible
+    /// nowhere: `consecutive_errors` was written by `bump_feed_errors` and read
+    /// by nothing outside the backoff calculation — no page, no endpoint. Worse,
+    /// a feed in backoff is NOT counted in `overdue`, because backoff is applied
+    /// by pushing `next_poll` forward. So the one number a reader might have
+    /// checked moved the wrong way: a feed failing every fetch made `overdue`
+    /// look BETTER.
+    pub in_backoff: i64,
+    /// Of those, how many have failed enough times to be at or near the backoff
+    /// ceiling — the ones that will not recover on their own.
+    pub badly_broken: i64,
 }
+
+/// `consecutive_errors` at or above which a feed counts as `badly_broken`.
+///
+/// Chosen to mean "this is not a transient blip": `feed::backoff_for` climbs
+/// exponentially, so by this many consecutive failures a feed is being retried
+/// hours apart and is almost certainly gone rather than flaky.
+const BADLY_BROKEN_ERRORS: i64 = 6;
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
 /// format the scheduler writes, so the comparisons are lexicographic).
 pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
-    let row: (i64, i64, i64, Option<String>, Option<String>, i64) = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let row: (i64, i64, i64, Option<String>, Option<String>, i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT
             COUNT(*),
@@ -2986,12 +3007,15 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
             -- the worst staleness, so it wins outright.
             CASE WHEN SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END) > 0
                  THEN NULL ELSE MIN(last_polled) END,
-            SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END)
+            SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END),
+            COALESCE(SUM(CASE WHEN consecutive_errors > 0 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN consecutive_errors >= ?3 THEN 1 ELSE 0 END), 0)
         FROM feeds
         "#,
     )
     .bind(now)
     .bind(hour_ago)
+    .bind(BADLY_BROKEN_ERRORS)
     .fetch_one(pool)
     .await
     .context("computing poll health")?;
@@ -3003,6 +3027,8 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
         last_poll_secs_ago: secs_between(row.3.as_deref(), now),
         oldest_poll_secs_ago: secs_between(row.4.as_deref(), now),
         never_polled: row.5,
+        in_backoff: row.6,
+        badly_broken: row.7,
     })
 }
 

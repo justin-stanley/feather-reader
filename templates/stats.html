@@ -53,6 +53,22 @@
             <td>{{ never_polled }}</td>
           </tr>
           <tr>
+            <th scope="row">Failing (backing off)</th>
+            <td>
+              {{ in_backoff }}{% if badly_broken > 0 %}, {{ badly_broken }} badly{% endif %}
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">Fetching</th>
+            <td>
+              {% if polling_paused %}
+                <strong>paused</strong> — the cache is at its size limit
+              {% else %}
+                running
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
             <th scope="row">Target interval</th>
             <td>every {{ poll_interval_mins }} minutes</td>
           </tr>
@@ -74,12 +90,31 @@
         outright rather than being averaged away.
       </p>
 
+      <p>
+        <strong>Failing</strong> counts feeds whose last fetch errored. These
+        retry on a widening delay rather than every interval, so they are
+        <em>not</em> part of the backlog above — which means a feed that breaks
+        makes the backlog look better, not worse. That is why the two numbers are
+        listed separately. The second figure, when present, is the feeds that
+        have failed often enough to be retrying hours apart: usually gone rather
+        than flaky.
+      </p>
+      <p>
+        <strong>Fetching</strong> says whether new content is being pulled at
+        all. It reads <em>paused</em> when the cache has hit the size limit that
+        protects the disk; nothing new arrives until the retention sweep frees
+        space. Reading, searching and everything already cached keep working —
+        but every other number on this page will drift while it says paused, and
+        this row is the reason.
+      </p>
+
       <h2>What is not here</h2>
       <p>
-        No user counts, no error rates, no per-feed detail. This page is public,
-        and none of that is anyone else's business — it also says nothing about
-        who reads what. Everything above is about the machine, not the people
-        using it.
+        No user counts, no per-feed detail. This page is public, and none of that
+        is anyone else's business — it also says nothing about who reads what.
+        The failure counts above are totals: they say how many feeds are broken,
+        never which ones, and never whose. Everything here is about the machine,
+        not the people using it.
       </p>
 
       {% include "footer.html" %}

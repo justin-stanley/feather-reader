@@ -627,9 +627,117 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 // Health
 // ---------------------------------------------------------------------------
 
-/// `GET /health` — a cheap liveness probe returning `200 ok` + the crate version.
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, format!("ok featherreader/{VERSION}\n"))
+/// How long `/health` will wait for its database ping before calling it broken.
+///
+/// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
+/// handler chose rather than a timeout Fly inferred — the difference between a
+/// log line that says why and one that says nothing.
+const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Above this, `/health` labels the poll heartbeat `stale`. **Reported, never
+/// fatal** — see the handler for why.
+const HEALTH_TICK_STALE_SECS: i64 = 15 * 60;
+
+/// `GET /health` — does this process still work, and what are its loops doing?
+///
+/// This used to return a constant string, touching no database, no pool and no
+/// scheduler state — while being the ONLY automated signal in `fly.toml`, whose
+/// sole other failure detector is a child process exiting. It proved the HTTP
+/// listener was up and nothing else.
+///
+/// **What can fail the check: the database, and only the database.** A process
+/// that cannot reach its store serves nothing, so a restart is the right
+/// response and this returns 503. The probe is a read (`SELECT 1`), which in WAL
+/// mode is not blocked by any writer — so the retention sweep, the poller and a
+/// login burst cannot make this flap. That property is the reason it is a read
+/// and not, say, a write canary.
+///
+/// **What is reported but never fails the check: everything else.** A stale poll
+/// heartbeat, a watermark pause, a missing OAuth runtime — all real problems,
+/// none of them fixed by killing the machine. Fly restarts on a failed check, so
+/// wiring these to the status code would convert "feeds are behind" into "the
+/// site is down", which is strictly worse than the condition being reported. The
+/// body carries them so a human or an external monitor can act; the status code
+/// stays the question Fly is actually able to answer.
+///
+/// The body is machine facts only — no user counts, no DIDs, no feed URLs — so
+/// it is publishable on the same terms as `/stats`. It is also the non-session
+/// diagnostic for an OAuth outage: when nobody can log in, `/admin/metrics`
+/// (which needs a live admin session) is exactly as unreachable as the thing it
+/// would diagnose, while this is reachable with `curl`.
+async fn health(State(state): State<AppState>) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    let rh = &state.runtime_health;
+
+    let db = match tokio::time::timeout(
+        HEALTH_DB_TIMEOUT,
+        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(format!("error: {err}")),
+        Err(_) => Err(format!("timeout after {}s", HEALTH_DB_TIMEOUT.as_secs())),
+    };
+
+    let poller = if !rh.schedulers_enabled() {
+        // Not a fault. Dev runs and the seam tests disable the loops on purpose,
+        // and reporting that as "stale" would be a false alarm on every one.
+        "disabled".to_string()
+    } else {
+        match rh.secs_since_poll_tick(now) {
+            None => "not-yet-ticked".to_string(),
+            Some(secs) if secs > HEALTH_TICK_STALE_SECS => format!("stale {secs}s"),
+            Some(secs) => format!("ok {secs}s"),
+        }
+    };
+
+    let mut body = String::new();
+    let status = match &db {
+        Ok(()) => {
+            body.push_str(&format!("ok featherreader/{VERSION}\n"));
+            StatusCode::OK
+        }
+        Err(why) => {
+            body.push_str(&format!("FAIL featherreader/{VERSION}\n"));
+            body.push_str(&format!("db: {why}\n"));
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    if db.is_ok() {
+        body.push_str("db: ok\n");
+    }
+    body.push_str(&format!("poller: {poller}\n"));
+    body.push_str(&format!(
+        "polling-paused: {}\n",
+        if rh.watermark_paused() { "yes" } else { "no" }
+    ));
+    // Deliberately NOT the measured database size. `/health` is the one path
+    // exempted from the Caddy origin lock, so it answers direct hits to the Fly
+    // IP that never passed Cloudflare — which caps what belongs here at the
+    // class of facts `/stats` already publishes to anyone. "Polling is paused"
+    // is that; the exact byte count is a precise internal number that adds
+    // nothing an operator cannot get from `/stats` or the logs.
+    body.push_str(&format!(
+        "backend: {}\n",
+        state.config.repo_backend.as_str()
+    ));
+    body.push_str(&format!(
+        "oauth-runtime: {}\n",
+        if state.oauth.is_some() {
+            "built"
+        } else {
+            "absent"
+        }
+    ));
+
+    // Never cached: a stale health response is worse than none, and Cloudflare
+    // sits in front of this.
+    let mut resp = (status, body).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str("no-store") {
+        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
+    }
+    resp
 }
 
 /// `GET /about` — the public-experiment page: the full disclaimer (experimental,
@@ -721,6 +829,17 @@ async fn stats(State(state): State<AppState>) -> Response {
         },
         never_polled: health.never_polled,
         poll_interval_mins: state.config.poll_interval.as_secs() as i64 / 60,
+        // **The two states that actually stop feeds updating.**
+        //
+        // Neither was visible anywhere. `overdue` and `polled_last_hour` move in
+        // both and distinguish neither — and `overdue` moves the WRONG WAY for
+        // backoff, since backoff is applied by pushing `next_poll` forward, so a
+        // feed failing every fetch drops out of the backlog and makes the page
+        // read healthier. Both of these are machine facts with no per-feed
+        // detail, so they sit inside the page's stated contract.
+        in_backoff: health.in_backoff,
+        badly_broken: health.badly_broken,
+        polling_paused: state.runtime_health.watermark_paused(),
     })
 }
 
@@ -947,10 +1066,14 @@ struct AboutTemplate {
 /// The public `/stats` page — is the poller keeping up?
 ///
 /// Aggregate only, deliberately. It is published to anyone, so it carries no
-/// user counts, no error rates and no per-feed detail: a reader does not need to
-/// know how many people use an instance or which feeds are failing. What it
-/// does answer is the question that decides whether an instance can take more
-/// readers — whether the poller is servicing the feeds it already has.
+/// user counts and no per-feed detail: a reader does not need to know how many
+/// people use an instance or which feeds are failing. What it does answer is the
+/// question that decides whether an instance can take more readers — whether the
+/// poller is servicing the feeds it already has.
+///
+/// The counts below are aggregate machine facts, which is why they fit that
+/// contract: "12 feeds are in backoff" names no feed and no reader, while
+/// answering the question the page was previously unable to answer at all.
 #[derive(Template)]
 #[template(path = "stats.html")]
 struct StatsTemplate {
@@ -965,6 +1088,12 @@ struct StatsTemplate {
     oldest_poll: String,
     never_polled: i64,
     poll_interval_mins: i64,
+    /// Feeds in error backoff. Invisible before, and excluded from `overdue`.
+    in_backoff: i64,
+    /// Of those, the ones deep enough into backoff to be effectively dead.
+    badly_broken: i64,
+    /// Whether the DB-size watermark is currently pausing ALL new fetching.
+    polling_paused: bool,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -7213,6 +7342,179 @@ mod tests {
         // And it does render the aggregate it exists for.
         assert!(body.contains("Feeds tracked"));
         assert!(body.contains("Waiting to be polled"));
+    }
+
+    /// **The two states that stop feeds updating must be visible.**
+    ///
+    /// `overdue` and `polled_last_hour` move in BOTH and distinguish neither —
+    /// and `overdue` moves the WRONG WAY for backoff, because backoff is applied
+    /// by pushing `next_poll` forward, so a feed failing every fetch drops out of
+    /// the backlog and makes the page read healthier. That inversion is what this
+    /// test pins: a broken feed must raise a number, not lower one.
+    #[tokio::test]
+    async fn stats_distinguishes_backoff_from_a_watermark_pause() {
+        let state = test_state(&[]).await;
+        // Three feeds: one healthy, one flaky, one long dead.
+        for (url, errors) in [
+            ("https://ok.example/f.xml", 0),
+            ("https://flaky.example/f.xml", 2),
+            ("https://dead.example/f.xml", 9),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    // Pushed forward, exactly as backoff does — so none of these
+                    // are counted as `overdue`.
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..errors {
+                store::bump_feed_errors(&state.db, url).await.unwrap();
+            }
+        }
+
+        let render_stats = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        let body = render_stats(state.clone()).await;
+        assert!(
+            body.contains("Failing"),
+            "backoff is still invisible on the public page"
+        );
+        // 2 failing, 1 of them badly (>= BADLY_BROKEN_ERRORS). Matched on the
+        // value rather than on surrounding whitespace, so re-indenting the
+        // template cannot break this.
+        assert!(
+            body.contains("2, 1 badly"),
+            "expected '2, 1 badly' in the failing row; got:\n{}",
+            body.split("Failing")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
+        // Not paused, and the backlog is genuinely empty — which is exactly the
+        // reading that used to be indistinguishable from healthy.
+        assert!(body.contains("running"), "fetching state not rendered");
+
+        // Now trip the watermark. Nothing in the database changes; only the
+        // recorded runtime state does — which is the whole reason it needed a
+        // home outside the log stream.
+        state.runtime_health.set_watermark(true);
+        let paused = render_stats(state.clone()).await;
+        assert!(
+            paused.contains("paused"),
+            "a watermark pause is still invisible on the public page"
+        );
+
+        // Still no identifiers: these are counts, not feeds.
+        for leak in ["ok.example", "flaky.example", "dead.example", "did:"] {
+            assert!(
+                !paused.contains(leak),
+                "the public page leaked {leak:?} while reporting failures"
+            );
+        }
+    }
+
+    /// `/health` must prove the process can reach its database, and must report
+    /// the loop state without letting it change the status code.
+    #[tokio::test]
+    async fn health_checks_the_database_and_reports_the_loops() {
+        let state = test_state(&[]).await;
+        let body_of = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        };
+
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("db: ok"),
+            "health did not probe the DB: {body}"
+        );
+        assert!(body.contains("poller:"), "no scheduler heartbeat: {body}");
+        assert!(body.contains("polling-paused: no"), "{body}");
+        assert!(body.contains("backend:"), "{body}");
+        assert!(body.contains("oauth-runtime:"), "{body}");
+
+        // A watermark pause is REPORTED but must not fail the check. Fly restarts
+        // the machine on a failed check, and restarting does not free disk — it
+        // would turn "feeds are behind" into "the site is down".
+        state.runtime_health.set_watermark(true);
+        state.runtime_health.set_schedulers_enabled(true);
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a watermark pause must not fail the liveness check: {body}"
+        );
+        assert!(body.contains("polling-paused: yes"), "{body}");
+        // Schedulers on but no tick yet — and that must not read as "0s ago",
+        // which is the healthiest possible answer to an unanswered question.
+        assert!(
+            body.contains("poller: not-yet-ticked"),
+            "a never-ticked poller must say so: {body}"
+        );
+
+        // A stale heartbeat is likewise reported, not fatal.
+        let long_ago = chrono::Utc::now().timestamp() - (HEALTH_TICK_STALE_SECS + 60);
+        state.runtime_health.poll_tick_completed(long_ago);
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a stale poller must not 503: {body}"
+        );
+        assert!(body.contains("poller: stale"), "{body}");
+
+        // A closed pool is a real outage: nothing can be served, and a restart is
+        // the correct response. THIS is what the status code is for.
+        state.db.close().await;
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unreachable database must fail the check: {body}"
+        );
+        assert!(body.starts_with("FAIL"), "{body}");
     }
 
     /// A fresh instance says "never", not "0" — which would read as "polled

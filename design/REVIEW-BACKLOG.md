@@ -13,9 +13,9 @@ looked at, not things I inherited.
 are the difference between an instance that fails loudly and one that fails at
 3am in a way nobody can attribute. Tier 4 is real but survivable.
 
-**Status.** Tiers 1 and 2 are done — T1.2/T1.3 in `ba9951a`, T1.1 in `1cfae77`,
-T2.1/T2.2/T2.4/T2.5 in `1831bba`, T2.3 in the commit that updated this line.
-Tiers 3–4 are open. Completed entries are kept below rather than deleted, because
+**Status.** Tiers 1, 2 and 3 are done — T1.2/T1.3 in `ba9951a`, T1.1 in
+`1cfae77`, T2.1/T2.2/T2.4/T2.5 in `1831bba`, T2.3 in `75f1c53`, T3.1/T3.2 in the
+commit that updated this line. Tier 4 is open. Completed entries are kept below rather than deleted, because
 each states a failure mode its fix now has to keep closed, and that is worth
 having written down next to the tiers that are still open.
 
@@ -252,13 +252,13 @@ of its life.
 
 ---
 
-## Tier 3 — diagnosability
+## Tier 3 — diagnosability — **DONE**
 
 The operator's framing: the two states that actually stop feeds from updating
 produce no operator-facing signal, so every degraded-but-running state presents
 as a green machine.
 
-### T3.1 `/health` proves only that the process is alive
+### T3.1 `/health` proves only that the process is alive — FIXED
 
 It returns a constant string, touching no DB, no pool and no scheduler state —
 and it is the only automated signal in `fly.toml`. The supervisor's only other
@@ -269,7 +269,23 @@ heartbeat timestamp. Deliberately keep it cheap and avoid making it flap — a
 health check that fails on transient load turns a degradation into an outage,
 which is worse than the problem.
 
-### T3.2 Nothing surfaces the two states that stop polling
+**Done**, with the anti-flap requirement taken literally: **only the database can
+change the status code.** The probe is one `SELECT 1`, which no writer can block
+in WAL mode, under a 2 s timeout inside Fly's 3 s — so a wedged pool yields a 503
+the app chose, with a reason, rather than a timeout Fly inferred. The heartbeat,
+the fetch-pause state and the live backend are reported in the body and never
+fail the check, because Fly restarts on failure and a restart fixes none of them.
+
+Two documents had to be corrected rather than quietly broken. `NETWORK-SPEC.md`
+§2.1 stated `/health` returns a literal string and that nothing may add a field
+to it; that bullet is now marked superseded, with the parts of it that were
+actually load-bearing (fast, non-flapping, network state stays out) restated and
+enforced. `deploy/Caddyfile` justified exempting `/health` from the origin lock
+on the grounds that it "only returns a static string" — the exemption now
+explicitly BOUNDS what the body may contain, which is why the measured database
+size was dropped from it.
+
+### T3.2 Nothing surfaces the two states that stop polling — FIXED
 
 `feeds.consecutive_errors` is written and read by nothing outside the backoff
 calculation — it appears on no page and no endpoint. The watermark pause emits a
@@ -286,6 +302,18 @@ and nothing else.
 and whether the watermark pause is currently engaged. Both are machine facts,
 not user data, so they fit the page's stated "no user counts, no per-feed
 detail" contract. Add a non-session diagnostic for the OAuth-outage case.
+
+**Done.** `/stats` gains a "Failing (backing off)" count — with a second figure
+for feeds deep enough into backoff to be effectively dead — and a "Fetching:
+running / paused" row. The prose explains the inversion that made this
+invisible: backoff is applied by pushing `next_poll` forward, so a feed that
+breaks DROPS OUT of `overdue` and makes the page read healthier. A new
+`runtime_health` module holds the two things SQLite cannot answer (the poll
+heartbeat and the pause verdict); it is deliberately process-local and lossy,
+since the question is "what is the loop doing right now". The non-session
+OAuth diagnostic is `/health` reporting the live backend and whether the OAuth
+runtime built — reachable with `curl` at exactly the moment the session-gated
+`/admin/metrics` is not.
 
 ---
 
