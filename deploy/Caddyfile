@@ -61,10 +61,17 @@
 	# `http.log.error.log0` while `http.log.access.log0` correctly showed
 	# `REDACTED`. So the leak would have survived the fix, and would have fired on
 	# exactly the occasions an operator tails the logs — an outage.
+	# `output stderr` + `wrap json` deliberately MATCH what the default logger did
+	# before this block existed. Adding a global `log` silently redirects the
+	# default logger stderr->stdout and re-encodes it console-instead-of-JSON,
+	# with raw ANSI colour embedded — measured: 1 stdout / 15 stderr line before,
+	# 17 stdout / 0 stderr after, all 17 carrying escape codes. Any drain that
+	# parses Caddy's JSON, or separates the two streams, would break silently.
+	# Redaction is the only intended change here.
 	log {
-		output stdout
+		output stderr
 		format filter {
-			wrap console
+			wrap json
 			fields {
 				request>headers>X-Origin-Auth replace REDACTED
 				request>headers>Cookie delete
@@ -129,15 +136,39 @@
 	# exact code, so the backend name discloses nothing further. Anything outside
 	# that class must go behind the origin lock, not here.
 	#
-	# Placed FIRST so nothing below routes for a header-less request. If
-	# FEATHERREADER_ORIGIN_SECRET is unset the matcher value is empty and every
-	# non-/health request is refused — fail CLOSED (a missing secret locks the
-	# door rather than opening it).
+	# Placed FIRST so nothing below routes for a header-less request.
+	#
+	# This matcher alone does NOT fail closed, contrary to what this comment said
+	# for months: with the secret unset it compares against "", which an
+	# empty-valued header satisfies. The `@empty_origin_value` guard below is what
+	# actually makes a missing or mistyped secret lock the door.
 	@no_origin_secret {
 		not path /health
 		not header X-Origin-Auth {env.FEATHERREADER_ORIGIN_SECRET}
 	}
 	handle @no_origin_secret {
+		respond 403
+	}
+
+	# **An EMPTY header value is a third case, and it FAILED OPEN.**
+	#
+	# `not header X-Origin-Auth {env.FEATHERREADER_ORIGIN_SECRET}` expands to
+	# `not header X-Origin-Auth ""` when the secret is unset. An empty-valued
+	# header then MATCHES the empty expected value, `not` inverts it, the matcher
+	# above does not fire, and the request is proxied. Measured with the secret
+	# unset: no header -> 403, junk -> 403, but `X-Origin-Auth:` with no value
+	# -> **200**. The comment below claimed the opposite for months, and
+	# `oauth-sidecar/src/client-ip.ts` founds the whole `cf-connecting-ip` trust
+	# model on that claim.
+	#
+	# This makes the documented property true: an empty value is refused
+	# regardless of what the secret is, so a missing or mistyped
+	# FEATHERREADER_ORIGIN_SECRET locks the door rather than opening it.
+	@empty_origin_value {
+		not path /health
+		header_regexp X-Origin-Auth ^$
+	}
+	handle @empty_origin_value {
 		respond 403
 	}
 
