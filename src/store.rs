@@ -2898,6 +2898,35 @@ pub async fn get_cursor(
 
 /// The flusher's hot query: every cursor with `dirty = 1` for a DID — the ones
 /// whose read-state changed since the last batched PDS flush.
+/// How many DIDs hold read-state that cannot currently be flushed: dirty
+/// cursors with no OAuth session to send them with.
+///
+/// **The visible form of the parked state (#117).** The flusher deliberately
+/// stops warning about these every round, and quiet-and-invisible would be a
+/// worse bug than the noisy loop it replaces — so the count is surfaced on
+/// `/admin/metrics`. A non-zero number is not itself an alarm: it is the normal
+/// state of anyone signed out with unsynced reads. A number that only ever
+/// grows is the thing to look at.
+///
+/// Rust-backend shaped: it asks about `oauth_session`, which is the Rust
+/// backend's store. On the sidecar backend it over-reports, since those
+/// sessions live in the sidecar's own database. Prod runs `rust` and the
+/// sidecar is removed by #18.
+pub async fn parked_readstate_dids(pool: &SqlitePool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(DISTINCT rc.did)
+          FROM read_cursor rc
+         WHERE rc.dirty = 1
+           AND NOT EXISTS (SELECT 1 FROM oauth_session s WHERE s.sub = rc.did)
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("counting parked read-state DIDs")?;
+    Ok(row.0)
+}
+
 pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCursor>> {
     let cursors =
         sqlx::query_as::<_, ReadCursor>("SELECT * FROM read_cursor WHERE did = ?1 AND dirty = 1")
