@@ -50,20 +50,70 @@ pub async fn discover(
     pds_url: &str,
     auth_method: &str,
 ) -> Result<AuthorizationServer> {
-    let prm_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        origin_of(pds_url)?
-    );
+    let prm_url = protected_resource_url(pds_url)?;
     let prm = super::fetch::get_json(http, &prm_url, super::fetch::JSON)
         .await
         .with_context(|| format!("fetching {prm_url}"))?;
-    let issuer = validate_protected_resource(&prm, pds_url)?;
 
-    let asm_url = format!("{issuer}/.well-known/oauth-authorization-server");
+    // The issuer named by the PDS decides where the second document comes from.
+    let issuer = validate_protected_resource(&prm, pds_url)?;
+    let asm_url = authorization_server_url(&issuer);
     let asm = super::fetch::get_json(http, &asm_url, super::fetch::JSON)
         .await
         .with_context(|| format!("fetching {asm_url}"))?;
-    validate_authorization_server(&asm, &issuer, pds_url, auth_method)
+
+    resolve_documents(&prm, &asm, &asm_url, pds_url, auth_method)
+}
+
+/// Where a PDS's protected-resource document lives.
+pub fn protected_resource_url(pds_url: &str) -> Result<String> {
+    Ok(format!(
+        "{}/.well-known/oauth-protected-resource",
+        origin_of(pds_url)?
+    ))
+}
+
+/// Where an issuer's authorization-server metadata lives.
+///
+/// Derived from the ISSUER, never from the PDS. The mix-up defence is
+/// `metadata.issuer == the URL we fetched from`; fetch from anywhere else and
+/// that comparison is checking a document against a location it did not come
+/// from.
+pub fn authorization_server_url(issuer: &str) -> String {
+    format!("{issuer}/.well-known/oauth-authorization-server")
+}
+
+/// Validate an already-fetched pair of discovery documents.
+///
+/// The decision half of [`discover`], split out because the WIRING is where the
+/// mix-up defence actually lives and it had no coverage: two mutations passed
+/// the whole suite — one feeding the authorization server's own `issuer` claim
+/// in as the expected value (so the check became `declared == declared`), and
+/// one fetching the second document from the PDS instead of the issuer.
+///
+/// `asm_fetched_from` is required rather than assumed: the comparison only means
+/// anything if the document really came from the issuer's own well-known
+/// location, so that precondition is checked here instead of trusted.
+pub fn resolve_documents(
+    prm: &Value,
+    asm: &Value,
+    asm_fetched_from: &str,
+    pds_url: &str,
+    auth_method: &str,
+) -> Result<AuthorizationServer> {
+    let issuer = validate_protected_resource(prm, pds_url)?;
+
+    let expected = authorization_server_url(&issuer);
+    if asm_fetched_from != expected {
+        bail!(
+            "the authorization-server metadata was fetched from {asm_fetched_from:?}, not from \
+             the issuer's own {expected:?}; the issuer comparison would be meaningless"
+        );
+    }
+
+    // The expected issuer comes from the PROTECTED-RESOURCE document — i.e. the
+    // URL this metadata was fetched from — never from the metadata's own claim.
+    validate_authorization_server(asm, &issuer, pds_url, auth_method)
 }
 
 /// The origin of a URL: scheme + host + non-default port, and nothing else.
@@ -809,5 +859,94 @@ mod tests {
                 Some("https://pds.justin-stanley.com/oauth/revoke")
             );
         }
+    }
+
+    // ── the WIRING, which is where the mix-up defence actually lives ─────────
+
+    fn prm_naming(issuer: &str) -> serde_json::Value {
+        json!({ "resource": PDS, "authorization_servers": [issuer] })
+    }
+
+    /// **The expected issuer comes from the PDS's document, never from the
+    /// authorization server's own claim.**
+    ///
+    /// Feeding the AS document's `issuer` in as the expected value turns the
+    /// mix-up check into `declared == declared` — and that mutation passed all
+    /// 575 tests, because every test of the check sat on
+    /// `validate_authorization_server` and nothing exercised how `discover`
+    /// called it.
+    #[test]
+    fn the_expected_issuer_comes_from_the_protected_resource_document() {
+        // The PDS names ISS. The metadata claims to be a DIFFERENT issuer — and
+        // is internally consistent about it, endpoints and all.
+        let other = "https://evil.example";
+        let mut asm = as_metadata();
+        asm["issuer"] = json!(other);
+        for field in [
+            "pushed_authorization_request_endpoint",
+            "authorization_endpoint",
+            "token_endpoint",
+        ] {
+            asm[field] = json!(format!("{other}/x"));
+        }
+
+        let err = match resolve_documents(
+            &prm_naming(ISS),
+            &asm,
+            &authorization_server_url(ISS),
+            PDS,
+            "none",
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a self-consistent impostor was accepted"),
+        };
+        assert!(
+            format!("{err:#}").contains("issuer"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **The metadata must have been fetched from the issuer's own location.**
+    ///
+    /// `metadata.issuer == the URL we fetched from` is only a defence if the
+    /// second fetch really went to the issuer. Building that URL from the PDS
+    /// instead passed the whole suite.
+    #[test]
+    fn metadata_fetched_from_the_wrong_place_is_refused() {
+        let err = match resolve_documents(
+            &prm_naming(ISS),
+            &as_metadata(),
+            // What the mutation did: derive it from the PDS.
+            &authorization_server_url(PDS),
+            PDS,
+            "none",
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("metadata from the wrong origin was accepted"),
+        };
+        assert!(format!("{err:#}").contains("issuer's own"), "{err:#}");
+
+        // Fetched from the right place: accepted.
+        resolve_documents(
+            &prm_naming(ISS),
+            &as_metadata(),
+            &authorization_server_url(ISS),
+            PDS,
+            "none",
+        )
+        .expect("the honest pair must resolve");
+    }
+
+    /// The second URL is built from the ISSUER, and the first from the PDS.
+    #[test]
+    fn the_discovery_urls_come_from_the_right_inputs() {
+        assert_eq!(
+            protected_resource_url("https://pds.example.com/xrpc/x").unwrap(),
+            "https://pds.example.com/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            authorization_server_url(ISS),
+            format!("{ISS}/.well-known/oauth-authorization-server")
+        );
     }
 }
