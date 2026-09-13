@@ -225,7 +225,14 @@ where
     let (pending, code) =
         flow::complete_callback(pool, &runtime.codec, params, presented_cookie, now).await?;
 
-    let key = keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
+    // **Unsealed here purely to fail EARLY.** The key itself is rebuilt inside
+    // the injected POST (it is not `Clone`), so the value is discarded — but a
+    // DPoP key that will not parse must stop the login before discovery and the
+    // token exchange, not after the authorization code has already been sent.
+    // Deleting this line would move the failure to the other side of two network
+    // calls without changing the final outcome, which is exactly the kind of
+    // reordering these end-to-end tests exist to catch.
+    keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
         .context("unsealing the login's DPoP key")?;
 
     // The method the login was STARTED under, not whatever is configured now.
@@ -1027,15 +1034,24 @@ mod tests {
             "the handle lookup was expected to fail offline"
         );
 
-        let calls = log.lock().unwrap();
-        assert_eq!(calls.discovered.len(), 1, "discovery ran once");
+        // Copied out in a block so the guard is gone before the `await` below;
+        // a MutexGuard held across an await is a clippy deny in CI.
+        let (discoveries, expected_issuer, posts, token_url) = {
+            let calls = log.lock().unwrap();
+            (
+                calls.discovered.len(),
+                calls.discovered[0].1.clone(),
+                calls.posted.len(),
+                calls.posted[0].0.clone(),
+            )
+        };
+        assert_eq!(discoveries, 1, "discovery ran once");
         assert_eq!(
-            calls.discovered[0].1, PENDING_ISSUER,
+            expected_issuer, PENDING_ISSUER,
             "discovery was not told which issuer PAR was pushed under",
         );
-        assert_eq!(calls.posted.len(), 1, "the token exchange ran once");
-        assert_eq!(calls.posted[0].0, format!("{PENDING_ISSUER}/token"));
-        drop(calls);
+        assert_eq!(posts, 1, "the token exchange ran once");
+        assert_eq!(token_url, format!("{PENDING_ISSUER}/token"));
 
         let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
         assert!(
