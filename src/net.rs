@@ -157,25 +157,84 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
             Ok(SocketAddr::new(IpAddr::V6(ip), port))
         }
         Host::Domain(name) => {
-            let mut vetted: Option<SocketAddr> = None;
+            // **Test seam — `#[cfg(test)]`, so it does not exist in a release
+            // build at all.** Not a parameter, not an env var, not a feature
+            // flag: the compiler removes it, so there is no runtime bypass to
+            // reason about. It exists because the guard is otherwise untestable
+            // end-to-end — a local test server lives on loopback, which
+            // `is_forbidden_ip` correctly refuses, so nothing could ever drive a
+            // real redirect through this function. See `test_host_override`.
+            #[cfg(test)]
+            if let Some(addr) = test_override_for(name, port) {
+                return Ok(addr);
+            }
             let addrs = tokio::net::lookup_host((name, port))
                 .await
                 .with_context(|| format!("resolving host {name:?}"))?;
-            for sa in addrs {
-                let ip = sa.ip();
-                if is_forbidden_ip(&ip) {
-                    bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
-                }
-                // Keep the FIRST vetted answer as the address to pin the connect
-                // to. Every answer is still checked (loop continues), so a mixed
-                // A/AAAA record set with any forbidden entry is rejected wholesale.
-                if vetted.is_none() {
-                    vetted = Some(sa);
-                }
-            }
-            vetted.ok_or_else(|| anyhow::anyhow!("host {name:?} did not resolve to any address"))
+            first_vetted(name, addrs)
         }
     }
+}
+
+/// Pick the address to pin to from a host's DNS answers, rejecting the whole
+/// set if ANY answer is forbidden.
+///
+/// **Extracted so it can be tested.** Inline in the resolver it was unreachable
+/// without real DNS returning a mixed answer set, and a mutation that checked
+/// only the FIRST answer left the entire suite green — a DNS-rebinding style
+/// attack that publishes `1.2.3.4, 127.0.0.1` would have been accepted on the
+/// strength of the first record.
+///
+/// Rejecting wholesale rather than filtering is deliberate: a host that resolves
+/// to any internal address is not a host we want to talk to, even on the answers
+/// that look fine.
+fn first_vetted(name: &str, addrs: impl Iterator<Item = SocketAddr>) -> Result<SocketAddr> {
+    let mut vetted: Option<SocketAddr> = None;
+    for sa in addrs {
+        let ip = sa.ip();
+        if is_forbidden_ip(&ip) {
+            bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
+        }
+        // Keep the FIRST vetted answer as the address to pin the connect to.
+        // Every answer is still checked (the loop continues), so a mixed A/AAAA
+        // set with any forbidden entry is rejected wholesale.
+        if vetted.is_none() {
+            vetted = Some(sa);
+        }
+    }
+    vetted.ok_or_else(|| anyhow::anyhow!("host {name:?} did not resolve to any address"))
+}
+
+/// Test-only host→address overrides, consulted by [`resolve_and_check`] before
+/// real DNS. Keyed by host so tests using distinct hostnames never collide, and
+/// gone entirely from a release build.
+#[cfg(test)]
+static TEST_HOSTS: std::sync::Mutex<Option<std::collections::HashMap<String, SocketAddr>>> =
+    std::sync::Mutex::new(None);
+
+/// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the
+/// forbidden-IP check for that host only.
+///
+/// Bypassing the IP check is the entire point: the test server is on loopback,
+/// which the guard is right to refuse. Only the registered host is exempt —
+/// anything else in the same test, including every redirect target, still goes
+/// through the real check. That is what makes a redirect test meaningful.
+#[cfg(test)]
+pub(crate) fn test_host_override(host: &str, addr: SocketAddr) {
+    TEST_HOSTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(host.to_string(), addr);
+}
+
+#[cfg(test)]
+fn test_override_for(name: &str, port: u16) -> Option<SocketAddr> {
+    let guard = TEST_HOSTS.lock().unwrap();
+    let map = guard.as_ref()?;
+    map.get(name)
+        .copied()
+        .or_else(|| map.get(&format!("{name}:{port}")).copied())
 }
 
 /// How long an idle pinned client may be kept before it is rebuilt.
@@ -1475,5 +1534,205 @@ pub(crate) mod tests {
         );
         assert!(s.contains("%26"), "the `&` was not encoded: {s}");
         assert!(s.contains("%3A%2F%2F"), "the `://` was not encoded: {s}");
+    }
+
+    // ── SSRF ENFORCEMENT (not just the decision) ─────────────────────────────
+    //
+    // Everything below drives a REAL redirect through `guarded_get_inner`
+    // against a real HTTP server. None of it was possible before the
+    // `test_host_override` seam: the guard correctly refuses loopback, so a
+    // local test server was unreachable through it, and three enforcement
+    // properties had no coverage at all. Each had a mutation that left the
+    // whole suite green.
+
+    /// A tiny HTTP server that replays canned responses and records every raw
+    /// request it received. Returns its address and the request log.
+    async fn spawn_http(
+        responses: Vec<String>,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = responses
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| responses.last().cloned().unwrap_or_default());
+                i += 1;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, log)
+    }
+
+    fn ok_200() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_string()
+    }
+    fn redirect_to(loc: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    /// **A redirect to a forbidden address is refused — the marquee SSRF
+    /// property, and until now it had no end-to-end test.**
+    ///
+    /// `guarded_get_refuses_private_redirect_target` builds a 302 stub and then
+    /// throws it away (`let _ = addr;`), asserting on a private URL passed in
+    /// directly. Nothing drove a redirect through the guard, and a mutation that
+    /// validated only the first hop — resolving redirect targets with a bare
+    /// `lookup_host` and no `is_forbidden_ip` — left all 679 tests passing.
+    ///
+    /// Here a real server really 302s to the cloud metadata endpoint. Only the
+    /// test server's own host is exempted from the IP check; the redirect target
+    /// is an IP literal and goes through the real one.
+    #[tokio::test]
+    async fn a_redirect_to_a_forbidden_address_is_refused() {
+        let (addr, log) = spawn_http(vec![redirect_to(
+            "http://169.254.169.254/latest/meta-data/",
+        )])
+        .await;
+        test_host_override("hop-forbidden.test", addr);
+
+        let err = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://hop-forbidden.test:{}/feed.xml", addr.port()),
+            &[],
+        )
+        .await
+        .expect_err("a 302 to the metadata endpoint was followed");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("169.254.169.254") && msg.contains("forbidden"),
+            "refused, but not by the address check: {msg}",
+        );
+        // The hop happened; the SECOND hop is what was stopped.
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    /// **Credentials do not follow a redirect off the original origin.**
+    ///
+    /// `hop_headers` is tested as a pure function; nothing tested that
+    /// `guarded_get_inner` actually calls it. Swapping the call for a plain
+    /// `extra_headers` — so a bearer token rides to whatever host an upstream
+    /// names — left the whole suite green.
+    ///
+    /// Two real servers on two hosts. The first 302s to the second; the second
+    /// records what it was sent.
+    #[tokio::test]
+    async fn credentials_are_dropped_when_a_redirect_leaves_the_origin() {
+        let (b_addr, b_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("cred-b.test", b_addr);
+        let (a_addr, _a_log) = spawn_http(vec![redirect_to(&format!(
+            "http://cred-b.test:{}/next",
+            b_addr.port()
+        ))])
+        .await;
+        test_host_override("cred-a.test", a_addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://cred-a.test:{}/feed.xml", a_addr.port()),
+            &[(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer super-secret"),
+            )],
+        )
+        .await
+        .expect("the cross-origin hop should still succeed, just without the token");
+        assert!(resp.status().is_success());
+
+        let seen = b_log.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(
+            !seen.contains("super-secret"),
+            "the bearer token was forwarded across origins:\n{seen}",
+        );
+        assert!(
+            !seen.contains("authorization:"),
+            "the Authorization header survived a cross-origin redirect:\n{seen}",
+        );
+    }
+
+    /// **...but they DO survive a same-origin redirect.**
+    ///
+    /// The other direction, without which the test above is satisfied by a guard
+    /// that strips every header always — which would quietly break every
+    /// authenticated fetch in the app.
+    ///
+    /// A RELATIVE `Location` keeps the hop on the same origin without the
+    /// response needing to know its own port.
+    #[tokio::test]
+    async fn credentials_survive_a_same_origin_redirect() {
+        let (addr, log) = spawn_http(vec![redirect_to("/second"), ok_200()]).await;
+        test_host_override("cred-same.test", addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://cred-same.test:{}/feed.xml", addr.port()),
+            &[(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer keep-me"),
+            )],
+        )
+        .await
+        .expect("a same-origin redirect should be followed");
+        assert!(resp.status().is_success());
+
+        let reqs = log.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the redirect was not followed");
+        assert!(
+            reqs[1].to_ascii_lowercase().contains("keep-me"),
+            "the token was stripped on a SAME-origin redirect — over-stripping \
+             would break every authenticated fetch:\n{}",
+            reqs[1],
+        );
+    }
+
+    /// **Every DNS answer is checked, not just the first.**
+    ///
+    /// A host that publishes `1.2.3.4, 127.0.0.1` must be rejected wholesale.
+    /// Checking only the first answer left the suite green, because nothing
+    /// exercised a multi-answer set — real DNS in a test cannot be made to
+    /// return one.
+    #[test]
+    fn a_mixed_dns_answer_set_is_rejected_wholesale() {
+        let public: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let private: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let link_local: SocketAddr = "169.254.169.254:80".parse().unwrap();
+
+        // All public: the first is pinned.
+        assert_eq!(
+            first_vetted(
+                "ok.example",
+                [public, "5.6.7.8:80".parse().unwrap()].into_iter()
+            )
+            .unwrap(),
+            public,
+        );
+        // A forbidden answer ANYWHERE rejects the set — including last, which is
+        // exactly what a first-answer-only check would miss.
+        for bad in [private, link_local] {
+            assert!(
+                first_vetted("evil.example", [public, bad].into_iter()).is_err(),
+                "{bad} in the answer set was accepted because a good answer came first",
+            );
+            assert!(first_vetted("evil.example", [bad, public].into_iter()).is_err());
+        }
+        // No answers at all is an error, not a silent pass.
+        assert!(first_vetted("empty.example", std::iter::empty()).is_err());
     }
 }
