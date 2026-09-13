@@ -124,10 +124,31 @@ pub async fn did_for_handle(
     http: &Client,
     handle: &str,
 ) -> Result<String> {
-    if let Some(did) = did_from_dns(resolver, handle).await? {
-        return Ok(did);
+    let dns = did_from_dns(resolver, handle).await?;
+    prefer_dns(dns, || did_from_well_known(http, handle)).await
+}
+
+/// Apply the precedence rule: DNS wins, and the well-known lookup runs **only**
+/// when DNS returned no record at all.
+///
+/// `well_known` is a closure rather than a value so the property that matters is
+/// observable: that it is never CALLED when DNS answered. With the two lookups
+/// inline, swapping their order passed the whole suite — the rule was documented
+/// in the module header and pinned by nothing.
+///
+/// Note what the caller has already done: `did_from_dns` returns `Err` for a
+/// resolver FAILURE and `Ok(None)` only for a genuine absence, so the `?` above
+/// means a SERVFAIL never reaches this fallback. An attacker who can induce a
+/// resolver error must not get to choose the weaker mechanism.
+pub async fn prefer_dns<F, Fut>(dns: Option<String>, well_known: F) -> Result<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    match dns {
+        Some(did) => Ok(did),
+        None => well_known().await,
     }
-    did_from_well_known(http, handle).await
 }
 
 /// Fetch and validate a DID document.
@@ -159,32 +180,66 @@ pub async fn resolve(
 ) -> Result<ResolvedAccount> {
     if identity::is_atproto_did(subject) {
         let document = did_document(http, subject, plc_directory).await?;
-        let claimed = identity::declared_handle(&document);
-        // The reverse round trip. A document can claim any handle; only the
-        // handle's own DNS/well-known record can confirm it.
-        let handle = match &claimed {
-            Some(handle) => match did_for_handle(resolver, http, handle).await {
-                Ok(did) if did == subject => claimed.clone(),
-                _ => None,
-            },
+        // The reverse round trip is I/O; deciding what it MEANS is not.
+        let reverse = match identity::declared_handle(&document) {
+            Some(handle) => did_for_handle(resolver, http, &handle).await.ok(),
             None => None,
         };
-        return Ok(ResolvedAccount {
-            pds_url: identity::pds_endpoint(&document, subject)?,
-            did: subject.to_string(),
-            handle,
-        });
+        return account_from_did(&document, subject, reverse.as_deref());
     }
 
     let handle = identity::normalize_handle(subject)?;
     let did = did_for_handle(resolver, http, &handle).await?;
     let document = did_document(http, &did, plc_directory).await?;
-    // Mandatory: the document must claim the handle we started from.
-    identity::verify_handle_claim(&document, &handle)?;
+    account_from_handle(&document, &handle, &did)
+}
+
+/// The decision half of a HANDLE-first resolution.
+///
+/// Split out from the I/O so it can be tested: with the fetching inline, a
+/// mutation that dropped the `?` from `verify_handle_claim` — deleting the
+/// verification the spec calls mandatory — passed the entire suite, because
+/// every test of that rule sat one layer below on `verify_handle_claim` itself
+/// and nothing proved `resolve` called it.
+pub fn account_from_handle(
+    document: &serde_json::Value,
+    handle: &str,
+    did: &str,
+) -> Result<ResolvedAccount> {
+    // MANDATORY. Without it, whoever controls a DNS name can point it at any
+    // DID at all and we would serve that account under this handle.
+    identity::verify_handle_claim(document, handle)?;
     Ok(ResolvedAccount {
-        pds_url: identity::pds_endpoint(&document, &did)?,
-        did,
-        handle: Some(handle),
+        pds_url: identity::pds_endpoint(document, did)?,
+        did: did.to_string(),
+        handle: Some(handle.to_string()),
+    })
+}
+
+/// The decision half of a DID-first resolution.
+///
+/// `reverse` is the DID that re-resolving the document's claimed handle
+/// returned, or `None` if there was no claim or the lookup failed. The handle is
+/// reported ONLY when that round trip came back to the same DID — a document can
+/// claim any handle it likes, and only the handle's own DNS or well-known record
+/// can confirm it.
+pub fn account_from_did(
+    document: &serde_json::Value,
+    did: &str,
+    reverse: Option<&str>,
+) -> Result<ResolvedAccount> {
+    let claimed = identity::declared_handle(document);
+    let handle = match (&claimed, reverse) {
+        (Some(_), Some(back)) if back == did => claimed.clone(),
+        // Claimed but unconfirmed, or never claimed: absent, not "probably
+        // right". An unverified handle displayed beside an account is a lie
+        // with a UI around it.
+        _ => None,
+    };
+    Ok(ResolvedAccount {
+        pds_url: identity::pds_endpoint(document, did)?,
+        did: did.to_string(),
+        handle,
     })
 }
 
@@ -281,5 +336,113 @@ mod tests {
         .await
         .expect_err("must refuse a reserved TLD");
         assert!(format!("{err:#}").contains("reserved TLD"));
+    }
+
+    // ── the decisions `resolve` makes, now that they are reachable ───────────
+
+    const SUBJECT_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+
+    fn doc_claiming(handle: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": SUBJECT_DID,
+            "alsoKnownAs": [format!("at://{handle}")],
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://pds.example.com"
+            }]
+        })
+    }
+
+    /// **The document must claim the handle we started from.**
+    ///
+    /// Dropping the `?` from `verify_handle_claim` inside `resolve` passed the
+    /// entire suite: every test of that rule sat on `verify_handle_claim`
+    /// itself, and nothing proved the resolution path called it. Without it,
+    /// whoever controls a DNS name can point it at any DID at all.
+    #[test]
+    fn a_handle_the_document_does_not_claim_is_refused() {
+        let document = doc_claiming("someone-else.com");
+        let err = account_from_handle(&document, "victim.com", SUBJECT_DID)
+            .expect_err("a document that claims a different handle must be refused");
+        assert!(
+            format!("{err:#}").contains("victim.com"),
+            "failed for the wrong reason: {err:#}"
+        );
+
+        // The matching claim still resolves.
+        let ok = account_from_handle(&doc_claiming("alice.com"), "alice.com", SUBJECT_DID)
+            .expect("a matching claim must resolve");
+        assert_eq!(ok.handle.as_deref(), Some("alice.com"));
+        assert_eq!(ok.pds_url, "https://pds.example.com");
+    }
+
+    /// **A DID-first handle is reported only when it round-trips back.**
+    ///
+    /// Relaxing the comparison to accept ANY reverse result passed the suite. A
+    /// handle shown beside an account it does not belong to is a lie with a UI
+    /// around it.
+    #[test]
+    fn a_did_first_handle_must_round_trip_to_the_same_did() {
+        let document = doc_claiming("alice.com");
+
+        // Came back to us: reported.
+        let ok = account_from_did(&document, SUBJECT_DID, Some(SUBJECT_DID)).unwrap();
+        assert_eq!(ok.handle.as_deref(), Some("alice.com"));
+
+        // Came back to someone ELSE: withheld.
+        let other = account_from_did(
+            &document,
+            SUBJECT_DID,
+            Some("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .unwrap();
+        assert_eq!(
+            other.handle, None,
+            "a handle that resolves to a DIFFERENT did was reported as verified"
+        );
+
+        // Did not come back at all: withheld.
+        let none = account_from_did(&document, SUBJECT_DID, None).unwrap();
+        assert_eq!(none.handle, None);
+
+        // Every case still yields the PDS — withholding the handle must not
+        // break the login.
+        assert_eq!(none.pds_url, "https://pds.example.com");
+    }
+
+    /// **DNS wins, and the well-known lookup is not even attempted.**
+    ///
+    /// Swapping the order passed the whole suite. The rule is not a tie-break:
+    /// a real handle was found during the live spike whose
+    /// `/.well-known/atproto-did` 404s and which resolves by TXT alone, so an
+    /// HTTP-first implementation simply fails on it — and the weaker mechanism
+    /// must never be reachable while the stronger one has answered.
+    #[tokio::test]
+    async fn dns_wins_and_the_well_known_lookup_is_never_called() {
+        let called = std::sync::atomic::AtomicUsize::new(0);
+
+        let did = prefer_dns(Some(SUBJECT_DID.to_string()), || async {
+            called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(did, SUBJECT_DID, "the DNS answer must win");
+        assert_eq!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the well-known lookup ran even though DNS had answered"
+        );
+    }
+
+    /// And it IS called when DNS found nothing — the fallback has to work.
+    #[tokio::test]
+    async fn the_well_known_lookup_runs_when_dns_has_no_record() {
+        let did = prefer_dns(None, || async { Ok(SUBJECT_DID.to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(did, SUBJECT_DID);
     }
 }

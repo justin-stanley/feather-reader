@@ -86,14 +86,10 @@ impl Repo<'_> {
         // exact threat as the reason `issuer` is AAD-bound; the AAD protects the
         // column from local tampering, and only this protects it from a network
         // re-read.
-        if server.issuer != session.issuer {
-            anyhow::bail!(
-                "the PDS now names a different authorization server ({:?}) than this session \
-                 was issued by ({:?}); refusing to send the refresh token to it",
-                server.issuer,
-                session.issuer
-            );
-        }
+        //
+        // The comparison lives in `oauth::session::same_issuer` so it can be
+        // tested: inline, deleting this whole block passed the entire suite.
+        oauth::session::same_issuer(&server.issuer, &session.issuer)?;
 
         let ctx = oauth::session::RefreshContext {
             token_endpoint: &server.token_endpoint,

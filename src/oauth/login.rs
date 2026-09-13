@@ -211,14 +211,10 @@ pub async fn complete(
     // `store.rs` names this exact threat as the reason `issuer` is AAD-bound.
     // The AAD protects the column from local tampering; only this protects it
     // from a network re-read.
-    if server.issuer != pending.issuer {
-        bail!(
-            "the PDS now names a different authorization server ({:?}) than the login was \
-             pushed to ({:?}); refusing to send the authorization code to it",
-            server.issuer,
-            pending.issuer
-        );
-    }
+    // Shared with the refresh path so the two cannot disagree about what
+    // "same authorization server" means, and so it is testable — see
+    // `session::same_issuer`.
+    super::session::same_issuer(&server.issuer, &pending.issuer)?;
     let mut token_params =
         token::token_request_params(&code, &pending.redirect_uri, &pending.pkce_verifier);
     let assertion = client_assertion(runtime, auth_method, &pending.issuer, now)?;

@@ -91,6 +91,27 @@ impl RefreshLocks {
     }
 }
 
+/// Refuse a re-discovered issuer that is not the one the grant belongs to.
+///
+/// Discovery runs again from the network on both the callback and the refresh
+/// path, and the token endpoint comes out of THAT document. Every discovery
+/// check is internally consistent, so a hostile pair of documents satisfies all
+/// of them; only this comparison notices that the pair describes a different
+/// authorization server than the one that issued the grant.
+///
+/// A free function so it is reachable from a test. The refresh path's copy was
+/// written inline, and deleting it — the single most serious defect found in
+/// this branch, on the path that carries the REFRESH TOKEN — passed every test.
+pub fn same_issuer(discovered: &str, expected: &str) -> Result<()> {
+    if discovered != expected {
+        anyhow::bail!(
+            "the PDS now names a different authorization server ({discovered:?}) than this \
+             grant was issued by ({expected:?}); refusing to send credentials to it"
+        );
+    }
+    Ok(())
+}
+
 /// What a refresh needs beyond the session itself.
 pub struct RefreshContext<'a> {
     pub token_endpoint: &'a str,
@@ -379,5 +400,36 @@ mod tests {
         use std::task::{Context, Poll, Waker};
         let mut cx = Context::from_waker(Waker::noop());
         matches!(fut.as_mut().poll(&mut cx), Poll::Pending)
+    }
+
+    /// **The re-discovered issuer must be the one the grant belongs to.**
+    ///
+    /// This was written inline on both the callback and the refresh path, and
+    /// deleting the refresh copy — which sends the REFRESH TOKEN, the credential
+    /// that mints every other one — passed all 575 tests. A hostile pair of
+    /// documents satisfies every discovery check, because those checks only ask
+    /// whether the documents agree with each other.
+    #[test]
+    fn a_re_discovered_issuer_must_match_the_grants_own() {
+        same_issuer("https://pds.example.com", "https://pds.example.com")
+            .expect("the same issuer must pass");
+
+        let err = same_issuer("https://evil.example", "https://pds.example.com")
+            .expect_err("a different authorization server must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("evil.example") && rendered.contains("pds.example.com"),
+            "the error must name both, or an operator cannot tell what moved: {rendered}"
+        );
+    }
+
+    /// Exact comparison. Issuers are canonicalised by `validate_issuer_form`
+    /// before they are ever stored, so a trailing slash or a case difference is
+    /// a DIFFERENT issuer, not a spelling of the same one.
+    #[test]
+    fn the_issuer_comparison_is_exact() {
+        assert!(same_issuer("https://pds.example.com/", "https://pds.example.com").is_err());
+        assert!(same_issuer("https://PDS.example.com", "https://pds.example.com").is_err());
+        assert!(same_issuer("", "https://pds.example.com").is_err());
     }
 }
