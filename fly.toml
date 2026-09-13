@@ -128,7 +128,7 @@ kill_timeout = "45s"
   # than left to the default so the live backend is visible in this file and the
   # cutover is a one-line edit. See "BACKEND CUTOVER" in the header: "rust"
   # additionally REQUIRES FEATHERREADER_OAUTH_ENCRYPTION_KEY as a secret.
-  FEATHERREADER_REPO_BACKEND = "sidecar"
+  FEATHERREADER_REPO_BACKEND = "rust"
   # Cloudflare fronts Fly, so the real client IP is CF-Connecting-IP. This is
   # authoritative ONLY if the origin is locked to Cloudflare (see Caddyfile note
   # + MANUAL STEP: CF-only origin allowlist).
