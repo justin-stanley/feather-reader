@@ -70,6 +70,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::lexicon::{self, Folder, Saved, Subscription};
+use crate::safe_link::SafeLink;
 use crate::{feed, store, AppState, Session, VERSION};
 
 // The OPML import/export module lives at `src/opml.rs` but isn't declared in the
@@ -1161,54 +1162,6 @@ struct FolderView {
 }
 
 /// One entry as shown in the article list / after an htmx swap.
-/// A string that is safe to place in an `href`.
-///
-/// **Structural, not procedural — and that distinction is the whole point.** The
-/// saved-record path takes an attacker-controlled URL (any atproto client can
-/// write the record), and Askama escapes HTML metacharacters but NOT schemes, so
-/// `javascript:` survives escaping intact.
-///
-/// The defence used to be "remember to call `net::safe_link` before assigning
-/// this field". A cold review measured what that was worth: deleting the call
-/// left **all 679 tests passing**, because every test either exercised the helper
-/// directly or never rendered this row. The control was real and completely
-/// unprotected.
-///
-/// So the field is no longer a `String`. There is no `From<String>`, no public
-/// member, and the only constructor that accepts foreign input is
-/// [`SafeLink::external`], which performs the scheme check itself. Forgetting the
-/// check is now a compile error instead of a silent hole. [`SafeLink::internal`]
-/// exists for app-built paths and is deliberately named so that handing it
-/// foreign input is an obviously wrong act rather than an easy omission.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SafeLink(String);
-
-impl SafeLink {
-    /// An app-generated path such as `/entries/42`, built from a row id and our
-    /// own query string. Never attacker-controlled.
-    fn internal(path: String) -> Self {
-        Self(path)
-    }
-
-    /// Attacker-controlled input. Scheme-checked; an unusable URL yields an
-    /// EMPTY link, which the template renders as a row WITHOUT an anchor rather
-    /// than dropping the row — a dropped row is unremovable, because the un-save
-    /// button lives on it.
-    fn external(raw: &str) -> Self {
-        Self(crate::net::safe_link(raw).unwrap_or_default())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl std::fmt::Display for SafeLink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 struct EntryRow {
     id: i64,
     title: String,
@@ -2202,14 +2155,6 @@ async fn index(
         }
         parts.join("&")
     };
-    let entry_link = |id: i64| -> String {
-        if entry_scope_qs.is_empty() {
-            format!("/entries/{id}")
-        } else {
-            format!("/entries/{id}?{entry_scope_qs}")
-        }
-    };
-
     let entries: Vec<EntryRow> = source
         .iter()
         .map(|e| EntryRow {
@@ -2227,7 +2172,7 @@ async fn index(
             // on every render even when the page showed a hundred rows.
             read: e.read,
             starred: e.starred,
-            link: SafeLink::internal(entry_link(e.id)),
+            link: SafeLink::entry(e.id, &entry_scope_qs),
             cached: true,
             rkey: String::new(),
         })
@@ -5400,7 +5345,7 @@ async fn build_entry_row(
         published: display_date(entry.published.as_deref()),
         read,
         starred,
-        link: SafeLink::internal(format!("/entries/{id}")),
+        link: SafeLink::entry(id, ""),
         cached: true,
         rkey: String::new(),
     }))
@@ -7190,6 +7135,10 @@ mod tests {
             "data:text/html;base64,PHNjcmlwdD4=",
             "vbscript:msgbox(1)",
             "file:///etc/passwd",
+            // Protocol-relative: inherits the page's scheme, so it is an
+            // off-site link wearing a same-site costume. Carried over from the
+            // test this one replaces, which was its only unique input.
+            "//evil.example/path",
         ] {
             let link = SafeLink::external(hostile);
             assert!(
@@ -7209,6 +7158,59 @@ mod tests {
             assert!(!link.is_empty(), "{good:?} was wrongly rejected");
             assert_eq!(link.to_string(), good);
         }
+    }
+
+    /// **The WIRING, not the helper — this is the one that catches the real
+    /// mistake.**
+    ///
+    /// `a_hostile_scheme_cannot_reach_an_href_through_safelink` pins what
+    /// `SafeLink::external` *does*. It cannot pin that the saved-record path
+    /// *calls* it, and a review proved that gap was live twice over: swapping
+    /// `external` for the app-path constructor, and constructing the tuple
+    /// directly, both restored the whole `javascript:` hole with every test
+    /// green. The type now blocks both — `entry` takes an `i64`, and the field
+    /// lives in another module — but the wiring deserves a test of its own
+    /// rather than resting on the shape of a signature.
+    ///
+    /// Renders the actual row through the actual handler, from a record whose
+    /// URL is hostile.
+    #[tokio::test]
+    async fn a_saved_record_with_a_hostile_url_renders_no_anchor() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let sidecar = spawn_saved_sidecar("javascript:alert(1)", "Hostile record").await;
+        let mut state = test_state_with_sidecar(&[did], &sidecar).await;
+        std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(did.to_string());
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/?view=starred")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Not in an href, and not as the title either — the title falls back to
+        // the URL for links we DO render, so both paths must withhold it.
+        assert!(
+            !body.to_ascii_lowercase().contains("javascript:"),
+            "the hostile scheme reached the rendered page",
+        );
+        // But the row must survive: the un-save button lives on it, so dropping
+        // the row would make the record unremovable from here.
+        assert!(
+            body.contains("unusable link"),
+            "the row was dropped instead of rendering without an anchor",
+        );
     }
 
     /// **The outage fallback must not widen what the caller can READ — and the
@@ -8959,25 +8961,6 @@ mod tests {
         }
         assert_eq!(display_date(Some("2026-01-01T00:00:00Z")), "2026-01-01");
         assert_eq!(display_date(None), "");
-    }
-
-    /// A saved record's URL is attacker-controlled and lands in an `href`.
-    /// Askama escapes HTML metacharacters but not SCHEMES, so this must go
-    /// through the helper the project already built for exactly that.
-    #[test]
-    fn a_saved_record_url_is_scheme_checked() {
-        for hostile in [
-            "javascript:alert(document.domain)",
-            "data:text/html,<script>alert(1)</script>",
-            "file:///etc/passwd",
-            "//evil.example/path",
-        ] {
-            assert!(
-                crate::net::safe_link(hostile).is_none(),
-                "{hostile:?} survived the scheme check"
-            );
-        }
-        assert!(crate::net::safe_link("https://ok.example/a").is_some());
     }
 
     /// Unsaving makes a DPoP-signed PDS round-trip, which is the stated reason
