@@ -155,6 +155,71 @@ pub async fn complete(
     presented_cookie: Option<&str>,
     now: i64,
 ) -> Result<CompletedLogin> {
+    complete_with(
+        runtime,
+        http,
+        pool,
+        params,
+        presented_cookie,
+        now,
+        |pds_url, auth_method, expected_issuer| async move {
+            discovery::discover(http, &pds_url, &auth_method, Some(&expected_issuer)).await
+        },
+        |url, token_params, dpop_jwk| async move {
+            // Rebuilt from the same JWK the caller unsealed. Passed as JSON
+            // rather than as the key because `SigningKey` is not `Clone` and a
+            // borrowed key in an async closure costs more in lifetime noise than
+            // one re-parse per login is worth.
+            let key = keys::SigningKey::from_jwk_json(&dpop_jwk, "session")
+                .context("unsealing the login's DPoP key")?;
+            post_form(
+                http,
+                pool,
+                &url,
+                &key,
+                &token_params,
+                // A nonce challenge is rejected BEFORE the grant is processed, so
+                // the code is not consumed and the request is safe to resend. The
+                // nonce harvested at PAR is routinely stale by now — approval can
+                // take minutes and a server nonce lasts at most five.
+                request::Retry::Allowed,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// [`complete`] with the two network boundaries injected.
+///
+/// **The SEQUENCING is the thing worth testing, and it was unreachable.** Each
+/// guard in this function has its own unit test, but nothing drove the whole
+/// callback: `complete` needs discovery and a token endpoint, both over the
+/// network, and the SSRF guard rightly refuses loopback — while an issuer is
+/// required to be `https`, so even a local plain-HTTP server cannot stand in for
+/// an authorization server. Injecting the two calls is what makes the ORDER
+/// observable, which is where the mix-up defence actually lives: the value of
+/// the issuer re-check is entirely in it happening BEFORE the code, the PKCE
+/// verifier and a `private_key_jwt` assertion are posted anywhere.
+///
+/// Same shape as [`discovery::discover_with`], and for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn complete_with<D, DFut, P, PFut>(
+    runtime: &OauthRuntime,
+    _http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    params: &flow::CallbackParams,
+    presented_cookie: Option<&str>,
+    now: i64,
+    discover: D,
+    post: P,
+) -> Result<CompletedLogin>
+where
+    D: Fn(String, String, String) -> DFut,
+    DFut: std::future::Future<Output = Result<discovery::AuthorizationServer>>,
+    P: Fn(String, Vec<(&'static str, String)>, String) -> PFut,
+    PFut: std::future::Future<Output = Result<request::PostOutcome>>,
+{
     // Consumes the pending row, checks the browser binding, and validates `iss`
     // — all three, or no code comes back.
     let (pending, code) =
@@ -192,11 +257,10 @@ pub async fn complete(
         );
     }
 
-    let server = discovery::discover(
-        http,
-        &pending.pds_url,
-        auth_method.as_str(),
-        Some(&pending.issuer),
+    let server = discover(
+        pending.pds_url.clone(),
+        auth_method.as_str().to_string(),
+        pending.issuer.clone(),
     )
     .await?;
 
@@ -218,17 +282,10 @@ pub async fn complete(
     // from a network re-read.
     let token_params = token_exchange_params(runtime, &pending, &code, auth_method, now)?;
 
-    let outcome = post_form(
-        http,
-        pool,
-        &server.token_endpoint,
-        &key,
-        &token_params,
-        // A nonce challenge is rejected BEFORE the grant is processed, so the
-        // code is not consumed and the request is safe to resend. The nonce
-        // harvested at PAR is routinely stale by now — approval can take
-        // minutes and a server nonce lasts at most five.
-        request::Retry::Allowed,
+    let outcome = post(
+        server.token_endpoint.clone(),
+        token_params,
+        pending.dpop_key_jwk.clone(),
     )
     .await?;
 
@@ -238,20 +295,15 @@ pub async fn complete(
     // form: what the user typed is not evidence, and `resolve` returns `None`
     // unless it round-trips. A failure here must not fail the login — the
     // account is already authenticated, and the handle is a display detail.
-    let handle = match super::resolve::resolve(
-        &runtime.resolver,
-        http,
-        &did,
-        &runtime.plc_directory,
-    )
-    .await
-    {
-        Ok(account) => account.handle,
-        Err(err) => {
-            tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
-            None
-        }
-    };
+    let handle =
+        match super::resolve::resolve(&runtime.resolver, _http, &did, &runtime.plc_directory).await
+        {
+            Ok(account) => account.handle,
+            Err(err) => {
+                tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
+                None
+            }
+        };
 
     Ok(CompletedLogin { did, handle })
 }
@@ -703,6 +755,13 @@ mod tests {
             public_url: public_url.into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(TEST_KEY.to_string()),
+                // **Offline.** The default is the real PLC directory, and
+                // PENDING_DID is a real Bluesky DID — so handle resolution in
+                // these tests was making a live internet call, which is slow,
+                // flaky in CI, and quietly makes the assertion below depend on
+                // someone else's uptime. `.invalid` never resolves (RFC 2606),
+                // so it fails immediately and offline.
+                plc_directory: "https://plc.invalid".to_string(),
                 ..crate::config::OauthConfig::default()
             },
             ..crate::config::Config::default()
@@ -857,6 +916,271 @@ mod tests {
         assert_eq!(
             super::super::metadata::redirect_uri(&cfg),
             super::super::metadata::redirect_uri(&cfg)
+        );
+    }
+
+    // ── END-TO-END: the SEQUENCING, not the individual guards ────────────────
+    //
+    // Every guard in `complete` has its own unit test. Nothing drove the whole
+    // callback, because it needs discovery and a token endpoint over the
+    // network — and an issuer must be `https`, so a local plain-HTTP server
+    // cannot stand in for an authorization server either. `complete_with`
+    // injects those two calls so the ORDER becomes observable.
+    //
+    // What these assert is mostly what did NOT happen: a guard that fires only
+    // after the authorization code has been posted somewhere is not a guard.
+
+    /// Records what the injected boundaries were asked to do.
+    #[derive(Default)]
+    struct Calls {
+        discovered: Vec<(String, String)>,
+        posted: Vec<(String, Vec<(&'static str, String)>)>,
+    }
+    type Log = std::sync::Arc<std::sync::Mutex<Calls>>;
+
+    fn server_at(issuer: &str) -> crate::oauth::discovery::AuthorizationServer {
+        crate::oauth::discovery::AuthorizationServer {
+            issuer: issuer.into(),
+            par_endpoint: format!("{issuer}/par"),
+            authorization_endpoint: format!("{issuer}/authorize"),
+            token_endpoint: format!("{issuer}/token"),
+            revocation_endpoint: None,
+        }
+    }
+
+    /// Drive `complete_with`, recording both boundaries. `discovered_issuer`
+    /// is what discovery *returns* — the lever for the mix-up case.
+    async fn drive(
+        pool: &sqlx::SqlitePool,
+        runtime: &crate::oauth::runtime::OauthRuntime,
+        params: &flow::CallbackParams,
+        cookie: Option<&str>,
+        discovered_issuer: &str,
+        token_status: u16,
+        token_body: serde_json::Value,
+    ) -> (Result<CompletedLogin>, Log) {
+        let log: Log = Default::default();
+        let sink = std::sync::Arc::clone(&log);
+        let sink2 = std::sync::Arc::clone(&log);
+        let issuer = discovered_issuer.to_string();
+        let body = serde_json::to_vec(&token_body).unwrap();
+        let http = reqwest::Client::builder().build().unwrap();
+        let out = complete_with(
+            runtime,
+            &http,
+            pool,
+            params,
+            cookie,
+            1_000_000,
+            move |pds, method, expected| {
+                let sink = std::sync::Arc::clone(&sink);
+                let issuer = issuer.clone();
+                async move {
+                    sink.lock().unwrap().discovered.push((pds, expected));
+                    let _ = method;
+                    Ok(server_at(&issuer))
+                }
+            },
+            move |url, params, _jwk| {
+                let sink = std::sync::Arc::clone(&sink2);
+                let body = body.clone();
+                async move {
+                    sink.lock().unwrap().posted.push((url, params));
+                    Ok(request::PostOutcome {
+                        status: token_status,
+                        body,
+                    })
+                }
+            },
+        )
+        .await;
+        (out, log)
+    }
+
+    /// **The happy path, start to finish — the first test that drives one.**
+    ///
+    /// Consumes the pending row, checks the browser binding and `iss`, unseals
+    /// the DPoP key, re-discovers, exchanges, and stores a session. The handle
+    /// lookup is left to fail (the runtime points at a `.invalid` PLC host, so
+    /// it fails offline and fast) which also pins that a handle failure does NOT
+    /// fail the login.
+    #[tokio::test]
+    async fn a_full_callback_stores_a_session() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        let done = out.expect("the full callback should complete");
+        assert_eq!(done.did, PENDING_DID);
+        assert!(
+            done.handle.is_none(),
+            "the handle lookup was expected to fail offline"
+        );
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.discovered.len(), 1, "discovery ran once");
+        assert_eq!(
+            calls.discovered[0].1, PENDING_ISSUER,
+            "discovery was not told which issuer PAR was pushed under",
+        );
+        assert_eq!(calls.posted.len(), 1, "the token exchange ran once");
+        assert_eq!(calls.posted[0].0, format!("{PENDING_ISSUER}/token"));
+        drop(calls);
+
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        assert!(
+            crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+                .await
+                .unwrap()
+                .is_some(),
+            "no session was stored for a successful login",
+        );
+    }
+
+    /// **A wrong `iss` stops the flow BEFORE anything is posted.**
+    ///
+    /// RFC 9207. The check itself is unit-tested; what was not pinned is that it
+    /// runs early enough to matter. A version that validated `iss` after the
+    /// exchange would still "reject the login" while having already handed the
+    /// code and a client assertion to the wrong server.
+    #[tokio::test]
+    async fn a_mismatched_iss_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some("https://evil.example.com".into());
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &params,
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a mismatched iss completed the login");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.posted.is_empty(),
+            "the authorization code was posted despite a bad iss: {:?}",
+            calls.posted.iter().map(|p| &p.0).collect::<Vec<_>>(),
+        );
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the iss check",
+        );
+    }
+
+    /// **The browser binding is checked before anything is posted.**
+    ///
+    /// A callback replayed from a different browser must not reach the token
+    /// endpoint with a valid code.
+    #[tokio::test]
+    async fn a_foreign_browser_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some("a-different-browser"),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a foreign browser completed the login");
+        assert!(log.lock().unwrap().posted.is_empty());
+    }
+
+    /// **Discovery is told which issuer PAR was pushed under.**
+    ///
+    /// The mix-up defence itself lives INSIDE `discovery::discover` — which this
+    /// seam stubs — and is tested there. What belongs at THIS layer is the
+    /// contract that makes it reachable: `complete` must hand discovery the
+    /// issuer from the *pending row*, which is AAD-bound in storage. Passing
+    /// `None`, or the issuer off the callback, would disable the check without
+    /// changing a line inside `discover`.
+    #[tokio::test]
+    async fn discovery_is_given_the_stored_issuer_to_expect() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok());
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.discovered[0].1, PENDING_ISSUER,
+            "discovery was not told which issuer to expect; the mix-up defence \
+             is disabled from the caller's side",
+        );
+        assert_eq!(
+            calls.discovered[0].0, "https://pds.example.com",
+            "discovery was pointed at something other than the stored PDS",
+        );
+    }
+
+    /// **The pending row is consumed: the same callback cannot be replayed.**
+    ///
+    /// Single-use is what makes a leaked `state` worthless. The second attempt
+    /// must fail, and must not reach the token endpoint.
+    #[tokio::test]
+    async fn a_replayed_callback_is_refused_and_posts_nothing() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let first = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(first.0.is_ok(), "the first callback should succeed");
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_err(), "the callback was replayable");
+        assert!(
+            log.lock().unwrap().posted.is_empty(),
+            "a replayed callback still reached the token endpoint",
         );
     }
 }
