@@ -1199,4 +1199,47 @@ mod tests {
             "a replayed callback still reached the token endpoint",
         );
     }
+
+    /// **A DPoP key that will not unseal posts nothing anywhere.**
+    ///
+    /// Added because a comment claimed this ordering mattered and no test held
+    /// it down: moving the unseal to AFTER the token exchange left the whole
+    /// suite green, because every other fixture carries a valid JWK. The final
+    /// outcome is identical either way — the login fails — so only the absence
+    /// of a POST distinguishes them, and that is the whole point. A corrupt key
+    /// must not cost the authorization code a trip to the token endpoint.
+    #[tokio::test]
+    async fn a_corrupt_dpop_key_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.dpop_key_jwk = "{\"kty\":\"EC\",\"crv\":\"bogus\"}".into();
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a corrupt DPoP key completed the login");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.posted.is_empty(),
+            "the authorization code was posted before the DPoP key was checked",
+        );
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the DPoP key was checked",
+        );
+    }
 }
