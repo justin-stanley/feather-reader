@@ -52,7 +52,7 @@ pub struct RuntimeHealth {
     started_at: AtomicI64,
     /// The most recent database-probe verdict, reused by requests that arrive
     /// while another probe is already running.
-    db_probe: Mutex<Option<Result<(), String>>>,
+    db_probe: Mutex<Option<DbProbe>>,
     /// Whether a database probe is in flight right now.
     db_probe_running: AtomicBool,
 }
@@ -90,30 +90,33 @@ impl RuntimeHealth {
     /// own, and any operator's `curl` — a fresh answer. It is also a better fix
     /// than rate-limiting `/health`, which would risk refusing Fly's probe.
     ///
-    /// Returns `Err(last_verdict)` when a probe is already running: the caller
-    /// reports that instead of starting another. `Ok(guard)` means the caller
-    /// owns the probe and must report it via the returned guard.
-    pub fn begin_db_probe(&self) -> Result<DbProbeGuard<'_>, Result<(), String>> {
+    /// Returns `Err(verdict)` when a probe is already running: the caller reports
+    /// that instead of starting another. `Ok(guard)` means the caller owns the
+    /// probe and must report it via the returned guard.
+    pub fn begin_db_probe(&self) -> Result<DbProbeGuard<'_>, DbProbe> {
         if self.db_probe_running.swap(true, Ordering::AcqRel) {
-            // Someone else is probing. Borrow their last answer.
+            // Someone else is probing. Borrow their last answer — or say we have
+            // none, which is a THIRD state and not a synonym for either.
             //
-            // Before the FIRST probe completes there is nothing to borrow, and
-            // this used to answer `Ok(())` — asserting health it had not
-            // measured. `/health` is the one path outside the origin lock and
-            // outside the rate limiter, so an unauthenticated caller can
-            // guarantee concurrency during that window, and a boot with a dead
-            // volume could publish `db: ok` to whichever check landed in it.
-            // "unknown" is the honest answer to a question nothing has answered
-            // yet; the caller decides what it means.
-            return Err(self
-                .last_db_probe()
-                .unwrap_or_else(|| Err("unknown".to_string())));
+            // This has been wrong in both directions. It first answered "healthy"
+            // for a database nothing had read, which could publish `db: ok` on a
+            // boot with a dead volume. Correcting that to a failure string was
+            // worse: `/health` is the one path outside both the origin lock and
+            // the rate limiter, and `DbProbeGuard` releases the flag on drop
+            // WITHOUT recording a verdict — so a caller alternating aborted and
+            // concurrent requests could hold the verdict at "none" and make Fly's
+            // own check read a failure. That turns an unauthenticated request into
+            // a lever on the one signal the platform acts on.
+            //
+            // `Unknown` is neither. The handler reports it and does not fail the
+            // check, because only a MEASURED failure is evidence of one.
+            return Err(self.last_db_probe().unwrap_or(DbProbe::Unknown));
         }
         Ok(DbProbeGuard { health: self })
     }
 
     /// The most recent verdict, if any probe has completed.
-    fn last_db_probe(&self) -> Option<Result<(), String>> {
+    fn last_db_probe(&self) -> Option<DbProbe> {
         self.db_probe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -170,9 +173,26 @@ pub struct DbProbeGuard<'a> {
     health: &'a RuntimeHealth,
 }
 
+/// The outcome of a database probe, as `/health` reports it.
+///
+/// Three states, deliberately — "we have not measured yet" is not a synonym for
+/// either "fine" or "broken", and collapsing it into one of them has been a bug
+/// in both directions. Only [`DbProbe::Failed`] may fail the health check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbProbe {
+    /// A probe completed and read a page.
+    Ok,
+    /// A probe completed and could not. The string is a COARSE reason — the
+    /// detail goes to the log, because this body answers unauthenticated
+    /// callers.
+    Failed(String),
+    /// No probe has completed yet. Reported, never fatal.
+    Unknown,
+}
+
 impl DbProbeGuard<'_> {
     /// Publish the verdict this probe reached.
-    pub fn record(self, verdict: Result<(), String>) {
+    pub fn record(self, verdict: DbProbe) {
         *self
             .health
             .db_probe

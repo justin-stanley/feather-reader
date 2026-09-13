@@ -712,6 +712,7 @@ async fn health(State(state): State<AppState>) -> Response {
     let now = chrono::Utc::now().timestamp();
     let rh = &state.runtime_health;
 
+    use crate::runtime_health::DbProbe;
     let db = match rh.begin_db_probe() {
         // A probe is already in flight; report its predecessor rather than
         // starting a second one. See `RuntimeHealth::begin_db_probe`.
@@ -732,20 +733,20 @@ async fn health(State(state): State<AppState>) -> Response {
             )
             .await
             {
-                Ok(Ok(_)) => Ok(()),
+                Ok(Ok(_)) => DbProbe::Ok,
                 // Coarse, not the raw error. An unauthenticated caller learning
                 // exactly which failure it hit is an attack-progress oracle; the
                 // detail belongs in the log, which gets it below.
                 Ok(Err(err)) => {
                     warn!(%err, "health: database probe failed");
-                    Err("unavailable".to_string())
+                    DbProbe::Failed("unavailable".to_string())
                 }
                 Err(_) => {
                     warn!(
                         timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
                         "health: database probe timed out (pool exhausted?)"
                     );
-                    Err("timeout".to_string())
+                    DbProbe::Failed("timeout".to_string())
                 }
             };
             probe.record(verdict.clone());
@@ -775,21 +776,32 @@ async fn health(State(state): State<AppState>) -> Response {
         }
     };
 
+    // **Only a MEASURED failure fails the check.**
+    //
+    // `Unknown` means no probe has completed — a concurrent request arrived
+    // before the first one finished, or a previous owner was cancelled before
+    // recording. It is reported and returns 200, because an unmeasured database
+    // is not evidence of a broken one, and this endpoint is reachable by
+    // unauthenticated callers who can manufacture that state. Treating it as a
+    // failure handed them a lever on the only signal the platform acts on.
     let mut body = String::new();
     let status = match &db {
-        Ok(()) => {
+        DbProbe::Ok => {
             body.push_str(&format!("ok featherreader/{VERSION}\n"));
+            body.push_str("db: ok\n");
             StatusCode::OK
         }
-        Err(why) => {
+        DbProbe::Unknown => {
+            body.push_str(&format!("ok featherreader/{VERSION}\n"));
+            body.push_str("db: unknown (probe in flight)\n");
+            StatusCode::OK
+        }
+        DbProbe::Failed(why) => {
             body.push_str(&format!("FAIL featherreader/{VERSION}\n"));
             body.push_str(&format!("db: {why}\n"));
             StatusCode::SERVICE_UNAVAILABLE
         }
     };
-    if db.is_ok() {
-        body.push_str("db: ok\n");
-    }
     // Uptime answers the first question anyone asks about a container under a
     // supervisor that tears the machine down whenever a child exits: is this
     // thing restarting? Nothing else on any surface could tell you.
@@ -1183,10 +1195,14 @@ struct IndexTemplate {
     /// rows below: they are appended to the last page rather than paged, and
     /// counting them here advertised a page the clamp could never reach.
     total: i64,
-    /// Uncached PDS saved records shown on THIS page (the last one, in the
-    /// starred view; zero everywhere else). Reported separately because they are
-    /// records the cache cannot show, not more of the list.
-    uncached_shown: i64,
+    /// How many of `total` are PDS saved records the cache cannot show.
+    ///
+    /// A subset of `total`, not an addition to it — the heading says "N entries
+    /// (M saved elsewhere)". An earlier version rendered "N entries, plus M",
+    /// which double counted once `total` started including them, against an M
+    /// that had become page-local in the same commit while the template stayed
+    /// put.
+    uncached_total: i64,
     /// 1-based current page.
     page: i64,
     /// Total pages, at least 1 (an empty list is page 1 of 1).
@@ -1574,9 +1590,9 @@ const STARRED_IDENTITY_MAX: i64 = 20_000;
 /// request.
 ///
 /// **A memory bound, not a visibility bound.** These rows are PAGED alongside
-/// the cached entries now, so `ENTRIES_PER_PAGE` decides how many are rendered
-/// and this only caps how many are collected before slicing. An earlier version
-/// used it to cap what was SHOWN, which left everything past it invisible and —
+/// the cached entries, so `ENTRIES_PER_PAGE` decides how many are rendered and
+/// this only caps how many are collected before slicing. An earlier version used
+/// it to cap what was SHOWN, which left everything past it invisible and —
 /// because the un-save control lives on the row, and nothing else in the app
 /// lists these — unremovable.
 ///
@@ -1860,10 +1876,10 @@ async fn index(
         let cached_guids: std::collections::HashSet<&str> =
             identities.iter().map(|(_, guid)| guid.as_str()).collect();
 
-        // Collected separately from `entries`: these rows sort after every
-        // cached one, so they belong on the LAST page. Appending them to each
-        // page would repeat them on all of them, and they have to be counted
-        // into the total before the last page can be identified.
+        // Collected in full here, sliced per page later. They sort after every
+        // cached row, so the two lists form one sequence that the pager walks —
+        // see the slice below. Collected BEFORE the page is chosen because the
+        // page count depends on how many there are.
         // Bounded like everything else on this page. These come from the PDS
         // (up to the 20,000-record list ceiling) and are appended whole to the
         // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
@@ -1995,20 +2011,6 @@ async fn index(
             Ok(_) => {}
             Err(err) => warn!(%err, %did, "could not list saved records from the PDS"),
         }
-        // Which page is last is decided by the CACHED count, since those rows
-        // are what the pager walks; the uncached ones then extend that page.
-        //
-        // `total` is deliberately NOT inflated by them. The page clamp above is
-        // computed from the cached count, so inflating the total here made
-        // `page_count` and the "Older →" link advertise a page the clamp could
-        // never reach: at 250 cached + 80 uncached, page 3 rendered the last
-        // page, reported "Page 3 of 4", and linked to page 4 — which clamped
-        // straight back to 3 and rendered the same thing, still offering the
-        // link. The pager and the clamp have to agree on what the last page is,
-        // and the clamp is the one that decides.
-        //
-        // The heading reports the extras separately instead, which is also more
-        // honest: they are records the cache cannot show, not more of the list.
         if uncached_dropped > 0 {
             warn!(
                 %did,
@@ -2037,7 +2039,8 @@ async fn index(
     // now, which is what makes that impossible rather than merely fixed.
     let total_cached =
         store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
-    let total = total_cached + uncached.len() as i64;
+    let uncached_len = uncached.len();
+    let total = total_cached + uncached_len as i64;
     // Clamped to the range that exists. Past the end the list is empty, and the
     // empty state renders instead of the pager — which would strand a reader who
     // typed a page number, or who paged to the end and then marked entries read
@@ -2055,13 +2058,29 @@ async fn index(
         offset,
     )
     .await?;
-    // The uncached slice picks up where the cached rows stop.
+    // **The slice is derived from ONE snapshot, not two.**
+    //
+    // `total_cached` (a COUNT) and `source` (a SELECT) are separate unsynchronised
+    // queries. Taking `skip` from the count and `take` from `source.len()` meant a
+    // star landing between them could leave uncached records on NO page: the count
+    // says 250 so page 4 starts at uncached[50], while the select already sees 260
+    // so page 3 has no room for uncached[0..50] — and the un-save button goes with
+    // them, which is the hazard paging was introduced to remove.
+    //
+    // Clamping `source` to what the count promised makes both halves agree. A row
+    // that appeared in between is simply not on this page; it is on the next one
+    // after the count catches up, which is ordinary paging behaviour rather than a
+    // hole.
+    let cached_here = ((total_cached - offset).max(0) as usize).min(source.len());
+    let source = &source[..cached_here];
     let uncached_page: Vec<EntryRow> = {
         let skip = (offset - total_cached).max(0) as usize;
-        let take = (ENTRIES_PER_PAGE as usize).saturating_sub(source.len());
+        let take = (ENTRIES_PER_PAGE as usize).saturating_sub(cached_here);
         uncached.into_iter().skip(skip).take(take).collect()
     };
-    let uncached_shown = uncached_page.len() as i64;
+    // This page's slice, used only to append below. The heading needs the
+    // WHOLE-list figure, which is the set's size before slicing.
+    let uncached_total = uncached_len as i64;
 
     // The scope/view suffix carried onto every entry link (built once).
     let entry_scope_qs = {
@@ -2185,7 +2204,9 @@ async fn index(
         heading,
         feed_scope,
         total,
-        uncached_shown,
+        // Whole-list figure, so it sits beside `total` without double counting.
+        // `uncached_shown` is this PAGE's slice and is not a heading number.
+        uncached_total,
         page,
         page_count: page_count_for(total),
         prev_href,
@@ -8100,6 +8121,83 @@ mod tests {
         );
     }
 
+    /// **An UNMEASURED database must not fail the check.**
+    ///
+    /// `/health` is the one path exempt from the Cloudflare origin lock and
+    /// absent from the rate limiter, and `DbProbeGuard` releases its claim on
+    /// drop WITHOUT recording a verdict — so a cancelled request (a client
+    /// disconnect is enough) leaves the verdict at "none", and a concurrent
+    /// caller reads it. Treating that as a failure turned an unauthenticated
+    /// request into a lever on the only signal the platform acts on. The
+    /// previous version of this code had the opposite bug and reported `ok` for
+    /// a database nothing had read; "unknown" is neither.
+    #[tokio::test]
+    async fn health_reports_an_unmeasured_database_without_failing() {
+        use crate::runtime_health::DbProbe;
+        let state = test_state(&[]).await;
+
+        // Hold the probe claim, exactly as an in-flight request would, and never
+        // record a verdict — the cancelled-request state.
+        let held = state
+            .runtime_health
+            .begin_db_probe()
+            .unwrap_or_else(|_| panic!("a fresh RuntimeHealth must grant the first claim"));
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        drop(held);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unmeasured database failed the check, which an unauthenticated \
+             caller can cause on demand: {body}"
+        );
+        assert!(
+            body.contains("db: unknown"),
+            "the unmeasured state must still be REPORTED: {body}"
+        );
+        assert!(!body.starts_with("FAIL"), "{body}");
+
+        // And a measured failure still does fail it — the distinction is the
+        // whole point, not an excuse to never 503.
+        state
+            .runtime_health
+            .begin_db_probe()
+            .unwrap_or_else(|_| panic!("claim"))
+            .record(DbProbe::Failed("unavailable".to_string()));
+        state.db.close().await;
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a measured database failure must still fail the check"
+        );
+    }
+
     /// **The probe must read a real page.**
     ///
     /// `SELECT 1` compiles to `Init/Integer/ResultRow/Halt` — no `OpenRead`, so
@@ -8364,6 +8462,44 @@ mod tests {
             "the boundary page is not full"
         );
 
+        // **The heading, which the previous round broke by deleting this.**
+        //
+        // `total` includes the uncached records, so the parenthetical is a
+        // SUBSET of it, not an addition — "330 entries (80 saved elsewhere)".
+        // The version that said "plus N" double counted once `total` started
+        // including them, and N had become page-local in the same commit while
+        // the template stayed put. It shipped because this assertion was deleted
+        // rather than updated.
+        {
+            let body = &p3;
+            assert!(
+                body.contains("330 entries"),
+                "the heading must count the whole sequence: {}",
+                body.split("content-count")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            assert!(
+                body.contains("(80 saved elsewhere)"),
+                "the heading must say how many of the total the cache cannot show, \
+                 as a whole-list figure and not a per-page one: {}",
+                body.split("content-count")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            assert!(
+                !body.contains("plus 50") && !body.contains("plus 80"),
+                "the heading is adding the uncached rows to a total that already \
+                 includes them"
+            );
+        }
+
         let p4 = get("/?view=starred&page=4").await;
         assert!(
             p4.contains("Page 4 of 4"),
@@ -8384,8 +8520,13 @@ mod tests {
             !p4.contains("Elsewhere 0"),
             "an uncached record was rendered on more than one page"
         );
-        // Page 1 is all cached.
+        // Page 1 is all cached — and still reports the same whole-list heading,
+        // because the parenthetical describes the LIST, not the page.
         let first = get("/?view=starred").await;
+        assert!(
+            first.contains("330 entries") && first.contains("(80 saved elsewhere)"),
+            "the heading changed between pages; it describes the list, not the page"
+        );
         assert!(
             !first.contains("Elsewhere "),
             "uncached saved records leaked onto the first page"

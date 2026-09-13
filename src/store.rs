@@ -912,7 +912,7 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
                 if after >= before {
                     tracing::warn!(
                         freelist_pages = after,
-                        batches_run = batch,
+                        batches_run = batch + 1,
                         "reclaim stopped making progress with pages still on the \
                          freelist; the file will not shrink and the DB-size watermark \
                          may stay engaged until the next sweep"
@@ -921,9 +921,17 @@ pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                if batch + 1 == RECLAIM_MAX_BATCHES {
+                // `after > 0` matters: the final batch can drain the freelist
+                // completely, in which case the loop reaches here having
+                // SUCCEEDED and would otherwise log "with pages still on the
+                // freelist" for an empty one — and suppress the success line.
+                // This is the same guard `delete_in_batches` carries, and the
+                // same defect it already had; reproduced here verbatim by
+                // copying the loop's shape without its condition.
+                if batch + 1 == RECLAIM_MAX_BATCHES && after > 0 {
                     tracing::warn!(
                         batches_run = batch + 1,
+                        freelist_pages = after,
                         "reclaim hit its batch backstop with pages still on the \
                          freelist; the rest waits for the next sweep"
                     );
