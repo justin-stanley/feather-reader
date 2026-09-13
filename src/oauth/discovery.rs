@@ -457,6 +457,94 @@ pub fn validate_authorization_server(
 }
 
 #[cfg(test)]
+mod live_pds {
+    //! **Live discovery against a real atproto PDS.**
+    //!
+    //! `#[ignore]` — it talks to the network. Run with:
+    //!
+    //! ```text
+    //! cargo test --lib -- --ignored --nocapture live_pds
+    //! ```
+    //!
+    //! Closes part of "never validated against a live PDS": handle resolution,
+    //! the protected-resource document, AS metadata, and BOTH mix-up defences
+    //! (issuer self-description and endpoint co-location) run against a server
+    //! that pushes back. Read-only and unauthenticated — no account, no consent,
+    //! no tokens, no side effects on the PDS.
+    //!
+    //! What it does NOT cover: PAR, `private_key_jwt`, the code exchange and
+    //! revocation. Those need our client metadata to be fetchable by the PDS at
+    //! the `client_id` URL, which means the cutover itself.
+    use super::*;
+
+    const SUBJECT: &str = "justin-stanley.com";
+    const PLC: &str = "https://plc.directory";
+
+    #[tokio::test]
+    #[ignore]
+    async fn discovery_round_trips_against_a_live_pds() -> anyhow::Result<()> {
+        let http = crate::feed::build_client()?;
+        let resolver = crate::oauth::resolve::resolver()?;
+
+        let account = crate::oauth::resolve::resolve(&resolver, &http, SUBJECT, PLC).await?;
+        println!("resolved {SUBJECT}");
+        println!("  did: {}", account.did);
+        println!("  handle verified: {:?}", account.handle);
+        println!("  pds: {}", account.pds_url);
+
+        let server = discover(&http, &account.pds_url, "private_key_jwt", None).await?;
+        println!("discovery:");
+        println!("  issuer:        {}", server.issuer);
+        println!("  par:           {}", server.par_endpoint);
+        println!("  authorization: {}", server.authorization_endpoint);
+        println!("  token:         {}", server.token_endpoint);
+        println!(
+            "  revocation:    {}",
+            server.revocation_endpoint.as_deref().unwrap_or("(absent)")
+        );
+
+        // A real server must satisfy the mix-up defences, not just parse.
+        assert!(
+            server.issuer.starts_with("https://"),
+            "issuer must be https"
+        );
+        assert!(
+            !server.par_endpoint.is_empty() && !server.token_endpoint.is_empty(),
+            "a PDS must advertise PAR and token endpoints"
+        );
+        // Re-running with the issuer we just learned must be accepted — this is
+        // the check the refresh and revoke paths make on every call.
+        let again = discover(
+            &http,
+            &account.pds_url,
+            "private_key_jwt",
+            Some(&server.issuer),
+        )
+        .await?;
+        assert_eq!(again.issuer, server.issuer);
+
+        // And an impostor issuer must be REFUSED. This is the mix-up defence
+        // running against real metadata rather than a fixture.
+        let bad = discover(
+            &http,
+            &account.pds_url,
+            "private_key_jwt",
+            Some("https://evil.example"),
+        )
+        .await;
+        assert!(bad.is_err(), "a mismatched expected issuer must be refused");
+        println!("  mix-up defence: refused a mismatched issuer as expected");
+
+        // Revocation support is what decides whether logout can tell the PDS.
+        match server.revocation_endpoint {
+            Some(ref r) => println!("\n  => this PDS SUPPORTS RFC 7009 revocation at {r}"),
+            None => println!("\n  => this PDS advertises NO revocation endpoint"),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
