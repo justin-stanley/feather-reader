@@ -80,7 +80,7 @@ lexicon.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="design/architecture/runtime-dark.png">
-    <img alt="Runtime: the browser reaches Cloudflare (proxy, cache, origin lock), which forwards to a single Fly.io container running Caddy on :8080 as the edge — routing /oauth/* to a Node OAuth sidecar on :8081 and everything else to the Rust axum app on :8082, which holds a disposable SQLite cache on /data. The app makes SSRF-guarded conditional-GET fetches to feed origins and com.atproto.repo.* calls to your atproto PDS; the sidecar handles the OAuth handshake and tokens with the PDS." src="design/architecture/runtime-light.png" width="620">
+    <img alt="Runtime: the browser reaches Cloudflare (proxy, cache, origin lock), which forwards to a single Fly.io container running Caddy on :8080 as the edge. Caddy sends everything to the Rust axum app on :8082, which holds a disposable SQLite cache on /data, makes SSRF-guarded conditional-GET fetches to feed origins, and makes com.atproto.repo.* calls to your atproto PDS. The OAuth handshake is handled either by the app itself (FEATHERREADER_REPO_BACKEND=rust, one process) or by a Node OAuth sidecar on :8081 that Caddy routes /oauth/* to (the sidecar backend, the default, two processes); exactly one of the two is live." src="design/architecture/runtime-light.png" width="620">
   </picture>
 </p>
 
@@ -90,11 +90,10 @@ the mounted volume is disposable; all durable state lives in your PDS. An
 [optional follow→invite bot](#invite-bot-optional) runs *outside* this container
 and reaches the app over `POST /bot/claims`; it isn't part of the core app.
 
-> **Note — the diagram shows the sidecar topology**, which is still the default.
-> Since 0.3.0 the Rust server can own the OAuth flow itself
-> (`FEATHERREADER_REPO_BACKEND=rust`), in which case `/oauth/*` is served by the
-> app on `:8082` and the `:8081` process is not started. See
-> [Choosing an OAuth backend](#choosing-an-oauth-backend).
+The dashed links are the Node sidecar, used only on the default `sidecar`
+backend. On `FEATHERREADER_REPO_BACKEND=rust` the app owns the OAuth flow itself,
+those links do not exist, and the `:8081` process is not started — see
+[Choosing an OAuth backend](#choosing-an-oauth-backend).
 
 <sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
 
