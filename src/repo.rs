@@ -100,6 +100,7 @@ impl Repo<'_> {
             client_id: &rust.client_id,
             auth_method: rust.auth_method,
             client_key: rust.client_key.as_ref(),
+            metrics: &self.state.metrics,
         };
         oauth::session::valid_session(
             &self.state.db,

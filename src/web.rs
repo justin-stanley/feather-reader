@@ -3745,6 +3745,7 @@ async fn revoke_everywhere(state: &AppState, did: &str) {
     }
 
     if let Some(runtime) = state.oauth.as_deref() {
+        let revoke_started = std::time::Instant::now();
         let outcome = crate::oauth::revoke::sign_out_discovering(
             runtime,
             &state.http,
@@ -3753,6 +3754,23 @@ async fn revoke_everywhere(state: &AppState, did: &str) {
             crate::store::now_unix(),
         )
         .await;
+        // **Counted, because a warn! nobody reads is not observability.** Until
+        // this existed, a revocation failure left exactly one trace: a log line.
+        // "No revocation failures this week" was therefore a statement about
+        // nobody having looked, which is not the same claim.
+        //
+        // NoSession counts as a SUCCESS, deliberately. Logout is idempotent —
+        // there being nothing to revoke is the correct outcome, not a failure,
+        // and counting it as an error would make the metric noisy in exactly
+        // the case that is fine. Only `Failed` means the PDS still holds live
+        // tokens we asked it to drop.
+        let revoke_ok = !matches!(outcome, crate::oauth::revoke::Revocation::Failed(_));
+        state.metrics.record(
+            crate::metrics::Backend::Rust,
+            "oauth_revoke",
+            revoke_started.elapsed().as_micros() as u64,
+            revoke_ok,
+        );
         match outcome {
             crate::oauth::revoke::Revocation::Revoked => {
                 info!(%did, "rust OAuth session revoked at the PDS")
@@ -7113,6 +7131,39 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
+    }
+
+    /// **A logout with nothing to revoke is a SUCCESS, not a failure.**
+    ///
+    /// `oauth_revoke` exists so the soak criterion ("no revocation failures this
+    /// week") is falsifiable — before it, a failed revoke left exactly one
+    /// trace, a `warn!` nobody was watching. But the metric is only useful if it
+    /// counts the right thing: logout is idempotent, so `NoSession` must record
+    /// as ok. Counting it as an error would make the number noisy in precisely
+    /// the case that is fine, and a noisy error count is one nobody reads.
+    #[tokio::test]
+    async fn a_logout_with_no_session_counts_as_success() {
+        let did = "did:plc:aaaa";
+        let state = test_state(&[]).await;
+        assert!(
+            state.oauth.is_some(),
+            "this test is meaningless without an oauth runtime; the revoke arm would be skipped",
+        );
+
+        // No session was ever stored, so the rust arm returns NoSession.
+        revoke_everywhere(&state, did).await;
+
+        let row = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "oauth_revoke")
+            .expect("the revoke attempt was not recorded at all");
+        assert_eq!(
+            row.stats.err_count, 0,
+            "NoSession was counted as a failure; logout is idempotent",
+        );
+        assert_eq!(row.stats.ok_count, 1);
     }
 
     /// **The outage fallback must not widen what the caller can READ — and the
