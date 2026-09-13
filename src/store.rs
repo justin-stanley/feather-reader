@@ -808,7 +808,7 @@ pub async fn insert_entries(
 }
 
 /// Delete entries whose age exceeds the retention window — the shared cache's
-/// **rolling window**. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
+/// **rolling window** — except those a reader has starred or not yet read. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
 /// entry falls back to when it was fetched (never NULL) rather than being treated
 /// as infinitely old. `entry_state` cascades via its `ON DELETE CASCADE` FK.
 ///
@@ -826,11 +826,36 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
-    let res = sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
-        .bind(&cutoff)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
+    // **Starred and unread entries are kept, whatever their age.**
+    //
+    // The window is a cache eviction policy, not a data-retention policy. The
+    // PDS is the source of truth for what a reader CHOSE — subscriptions,
+    // folders, stars, read-state — but the entry CONTENT was never there. It
+    // exists here and at the origin feed, and a feed typically serves only its
+    // last few dozen items, so a pruned article is usually unrecoverable.
+    //
+    // Deleting indiscriminately therefore lost two things a reader would notice:
+    // a starred article vanished from the starred view entirely (the view joins
+    // `entries`, and `entry_state` cascades on the delete, so the star went with
+    // it), and anything still unread disappeared before it was ever read. Both
+    // are the opposite of a cache.
+    //
+    // This is what the documentation has always described; the query did not
+    // implement it.
+    let res = sqlx::query(
+        r#"
+        DELETE FROM entries
+        WHERE COALESCE(published, fetched_at) < ?1
+          AND id NOT IN (
+              SELECT entry_id FROM entry_state
+              WHERE starred = 1 OR read = 0
+          )
+        "#,
+    )
+    .bind(&cutoff)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
     let deleted = res.rows_affected();
 
     // Only touch cursors when rows actually went away.
@@ -4094,6 +4119,78 @@ mod tests {
         .await;
         let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
         assert_eq!(h.last_poll_secs_ago, Some(0));
+        Ok(())
+    }
+
+    // ── retention is a CACHE policy, not a data-retention policy ────────────
+
+    async fn aged_entry(pool: &SqlitePool, url: &str, days_old: i64) -> i64 {
+        let when = (chrono::Utc::now() - chrono::Duration::days(days_old))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        sqlx::query("INSERT INTO feeds (url) VALUES (?1) ON CONFLICT(url) DO NOTHING")
+            .bind("https://f.example/feed")
+            .execute(pool)
+            .await
+            .unwrap();
+        let feed_id: i64 = sqlx::query_scalar("SELECT id FROM feeds WHERE url = ?1")
+            .bind("https://f.example/feed")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO entries (feed_id, guid, url, title, published, fetched_at) VALUES (?1,?2,?3,'t',?4,?4)")
+            .bind(feed_id).bind(url).bind(url).bind(&when)
+            .execute(pool).await.unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE guid = ?1")
+            .bind(url)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn mark(pool: &SqlitePool, entry_id: i64, read: i64, starred: i64) {
+        sqlx::query("INSERT INTO entry_state (did, entry_id, read, starred, updated_at) VALUES ('did:plc:x',?1,?2,?3,'2026-01-01T00:00:00Z')")
+            .bind(entry_id).bind(read).bind(starred)
+            .execute(pool).await.unwrap();
+    }
+
+    /// **A STARRED article is never evicted, however old.**
+    ///
+    /// The starred view joins `entries`, and `entry_state` cascades on delete,
+    /// so pruning a starred entry removed it from the starred list entirely —
+    /// and the content is not recoverable, because a feed serves only its last
+    /// few dozen items. The PDS keeps the saved RECORD; it has never held the
+    /// article.
+    #[tokio::test]
+    async fn retention_keeps_starred_and_unread_entries() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let old_read = aged_entry(&pool, "old-read", 30).await;
+        let old_starred = aged_entry(&pool, "old-starred", 30).await;
+        let old_unread = aged_entry(&pool, "old-unread", 30).await;
+        let recent_read = aged_entry(&pool, "recent-read", 1).await;
+        mark(&pool, old_read, 1, 0).await;
+        mark(&pool, old_starred, 1, 1).await; // read AND starred
+        mark(&pool, old_unread, 0, 0).await;
+        mark(&pool, recent_read, 1, 0).await;
+
+        let deleted = prune_old_entries(&pool, 14).await?;
+        assert_eq!(deleted, 1, "only the old, read, unstarred entry should go");
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(left, vec!["old-starred", "old-unread", "recent-read"]);
+        Ok(())
+    }
+
+    /// An entry nobody has interacted with at all — no `entry_state` row — is
+    /// still evicted once it ages out. Otherwise the cache never shrinks, since
+    /// most entries are never opened.
+    #[tokio::test]
+    async fn retention_evicts_entries_with_no_reader_state() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        aged_entry(&pool, "untouched-old", 30).await;
+        aged_entry(&pool, "untouched-new", 1).await;
+        assert_eq!(prune_old_entries(&pool, 14).await?, 1);
         Ok(())
     }
 }

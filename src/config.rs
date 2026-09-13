@@ -12,7 +12,7 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_RETENTION_DAYS`| `90`                    | Prune read, unstarred entries older than this. |
+//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this from the cache. Starred and unread entries are never evicted. `0` disables eviction. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
 //! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |
@@ -73,7 +73,14 @@ pub struct Config {
     pub allowed_dids: Vec<String>,
     /// The default per-feed poll interval.
     pub poll_interval: Duration,
-    /// Retention window: read, unstarred entries older than this are pruned.
+    /// Cache eviction window, in days: a READ, UNSTARRED entry older than this
+    /// is dropped from the local cache. Starred and still-unread entries are
+    /// kept whatever their age — the PDS holds the reader's choices, but the
+    /// entry CONTENT lives only here and at the origin feed, which usually
+    /// serves just its last few dozen items.
+    ///
+    /// Two weeks by default. The cache exists to render a feed list quickly,
+    /// not to archive the web.
     pub retention_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
@@ -299,7 +306,7 @@ impl Default for Config {
             public_url: "http://localhost:8080".to_string(),
             allowed_dids: Vec::new(),
             poll_interval: Duration::from_secs(3600),
-            retention_days: 90,
+            retention_days: 14,
             proxy_images: false,
             beta_cap: 100,
             trusted_ip_header: None,
@@ -767,7 +774,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.bind.port(), 8080);
         assert_eq!(c.poll_interval, Duration::from_secs(3600));
-        assert_eq!(c.retention_days, 90);
+        assert_eq!(c.retention_days, 14);
         assert!(!c.proxy_images);
         assert!(c.allowed_dids.is_empty());
         assert_eq!(c.beta_cap, 100);
