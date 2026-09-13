@@ -7115,6 +7115,79 @@ mod tests {
         assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
     }
 
+    /// **The outage fallback must not widen what the caller can READ — and the
+    /// sibling test above can only see what it WRITES.**
+    ///
+    /// `pds_outage_does_not_widen_cross_did_access` asserts on `sub_ref` rows and
+    /// on `entry_state`: the fallback's side effects. But the fail-open it names
+    /// returns **early**, before `sync_sub_refs` runs, so it touches neither. It
+    /// leaks through the list it *hands back* — the sidebar and the reader render
+    /// from that list, so a caller sees another DID's feeds while `sub_ref` stays
+    /// perfectly honest and every existing assertion stays green.
+    ///
+    /// Measured, not assumed: replacing `feeds_for_did(pool, did)` with
+    /// `due_feeds(pool, "9999-…", 10_000)` over the whole shared cache — the
+    /// exact historical bug the fallback's comment describes — left **all 663
+    /// tests passing**. Cross-tenant isolation is the one property this project
+    /// cannot regress quietly, and nothing observed it.
+    ///
+    /// So this asserts on the RETURN VALUE, which is the thing that reaches the
+    /// user, and it deliberately does not look at `sub_ref` at all — that half is
+    /// already covered above.
+    #[tokio::test]
+    async fn the_outage_fallback_returns_only_the_callers_own_feeds() {
+        let did_a = "did:plc:aaaa";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did_a, None, "test", None)
+            .await
+            .unwrap();
+
+        let feed_a = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://a.example/feed.xml".to_string(),
+                title: Some("A".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let _feed_b = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://b.example/feed.xml".to_string(),
+                title: Some("B".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A subscribes ONLY to feed_a. feed_b is in the shared cache and belongs
+        // to nobody — exactly the row a whole-cache fallback would hand to A.
+        store::replace_sub_refs(&state.db, did_a, &[feed_a])
+            .await
+            .unwrap();
+
+        // No sidecar and no PDS are reachable from a test, so
+        // `list_subscriptions_sorted` fails and this IS the outage path. Assert
+        // that, rather than assuming it: if the repo ever starts succeeding here,
+        // this test would silently stop exercising the fallback at all.
+        assert!(
+            state.repo().list_subscriptions_sorted(did_a).await.is_err(),
+            "this test is only meaningful on the outage path; the repo answered",
+        );
+
+        let resolved = resolve_subscriptions(&state, did_a).await;
+
+        let urls: Vec<&str> = resolved.iter().map(|r| r.sub.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://a.example/feed.xml"],
+            "the outage fallback must return the caller's OWN subscriptions only; \
+             any other feed here is cross-tenant read access granted by an outage",
+        );
+    }
+
     /// Build an [`AppState`] over a fresh in-memory DB with explicit feed caps,
     /// seeding `did` a beta seat + session-capable state.
     async fn test_state_with_caps(
