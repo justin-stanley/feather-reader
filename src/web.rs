@@ -91,6 +91,18 @@ const SESSION_COOKIE: &str = "fr_session";
 /// signed with the same key as the session cookie.
 const INVITE_COOKIE: &str = "fr_invite";
 
+/// Browser-binding cookie for an in-flight OAuth login (Rust backend only).
+///
+/// `state` alone cannot stop a login CSRF: it lives in a server-global table, so
+/// a stolen `state` replayed from ANOTHER browser matches just as well as from
+/// the one that started the flow. This cookie is what makes the callback
+/// browser-specific — the pending row stores only its hash, and a callback that
+/// cannot present it is refused.
+const OAUTH_BINDING_COOKIE: &str = "fr_oauth";
+
+/// How long an in-flight login may sit, matching the pending row's own TTL.
+const OAUTH_BINDING_MAX_AGE_SECS: i64 = 600;
+
 /// TTL (seconds) for a minted invite code and for the reserving invite cookie.
 /// Short enough that a reserved-but-unclaimed seat frees quickly.
 const INVITE_TTL_SECS: i64 = 1800;
@@ -217,6 +229,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/about", get(about))
+        .route("/stats", get(stats))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/manage", get(manage))
@@ -224,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         .route("/entries/{id}", get(entry_view))
         .route("/entries/{id}/read", post(mark_read))
         .route("/entries/{id}/star", post(toggle_star))
+        .route("/saved/{rkey}/delete", post(unsave_record))
         .route("/read-all", post(mark_all_read))
         .route("/subscriptions", post(add_subscription))
         .route("/subscriptions/{rkey}/delete", post(delete_subscription))
@@ -250,6 +264,9 @@ pub fn router(state: AppState) -> Router {
         // code + returns its token/url for the bot to post.
         .route("/bot/claims", post(bot_mint_claim))
         .route("/admin/invites", post(admin_mint_invites))
+        .route("/admin/metrics", get(admin_metrics))
+        .route("/oauth/client-metadata.json", get(oauth_client_metadata))
+        .route("/oauth/jwks.json", get(oauth_jwks))
         .route("/account/delete", post(account_delete))
         .route("/oauth/callback", get(oauth_callback))
         .route("/logout", post(logout))
@@ -305,24 +322,51 @@ fn static_header_layer(
 // ---------------------------------------------------------------------------
 
 /// The abuse-prone paths the rate limiter guards (429 over the limit): the OAuth
-/// kick-off, the invite redeem, the mutating write endpoints, and mark-read/star
-/// /mark-all. Read-only navigation is intentionally *not* limited.
+/// kick-off and callback, the invite redeem, logout, the mutating write
+/// endpoints, and mark-read/star/mark-all. Plain read-only navigation is
+/// intentionally *not* limited.
+///
+/// The criterion is **does this path make an outbound request**, not "does it
+/// mutate" — the two diverge, and every miss so far has been on the outbound
+/// side. This is an allowlist a new route has to be added to by hand, which is
+/// exactly why it has now been missed three times: `/saved/` (fixed), then
+/// `/oauth/callback` and `/logout`. The callback was the bad one — it is the
+/// only path here reachable with no session at all.
+///
+/// Known and deliberate gaps: `GET /`, `GET /manage` and `GET /opml/export` each
+/// make PDS calls but are ordinary authenticated navigation, and throttling them
+/// would degrade normal reading. They are bounded by needing a valid session.
 fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
     use axum::http::Method;
     // `/claim` is a GET (a link the bot posts), but it consumes a reservation and
     // a claim token in a public URL is grabbable, so it MUST be per-IP limited
     // like the other abuse-prone entry points — not just `/login`.
-    if method != Method::POST && !(method == Method::GET && (path == "/login" || path == "/claim"))
+    // `/oauth/callback` is a GET, is UNAUTHENTICATED, and every hit performs a
+    // real outbound round-trip — a sidecar `resolve_session` or a full token
+    // exchange against a PDS. Anyone could spend one outbound request per hit.
+    // It is the only entry point here that needs no session at all.
+    if method != Method::POST
+        && !(method == Method::GET
+            && (path == "/login" || path == "/claim" || path == "/oauth/callback"))
     {
         return false;
     }
     match path {
-        "/login" | "/claim" | "/beta/redeem" | "/subscriptions" | "/opml" | "/read-all"
-        | "/admin/invites" | "/bot/claims" | "/account/delete" | "/folders" => true,
+        // `/logout` and `/oauth/callback` are here because they make outbound
+        // calls, not because they mutate: logout revokes at the PDS (up to two
+        // round-trips) and the callback exchanges a code. The list is by
+        // *network cost*, which is what the limiter is actually for.
+        "/login" | "/claim" | "/oauth/callback" | "/logout" | "/beta/redeem" | "/subscriptions"
+        | "/opml" | "/read-all" | "/admin/invites" | "/bot/claims" | "/account/delete"
+        | "/folders" => true,
         // Every per-record subscription/folder mutation (delete/rename) and the
         // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
         p => {
             (p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")))
+                // Unsaving makes a DPoP-signed deleteRecord round-trip to the
+                // PDS, which is exactly the reason the neighbours above are
+                // limited. It was added as a new route and not added here.
+                || p.starts_with("/saved/")
                 || p.starts_with("/subscriptions/")
                 || p.starts_with("/folders/")
         }
@@ -345,7 +389,13 @@ struct RateLimitState {
 /// dependency → no network fetch at build, deterministic offline CI).
 #[derive(Clone)]
 struct RateLimiter {
-    inner: std::sync::Arc<Mutex<HashMap<IpAddr, Bucket>>>,
+    inner: std::sync::Arc<Mutex<RateLimiterState>>,
+}
+
+/// The limiter's shared state: the buckets plus when they were last swept.
+struct RateLimiterState {
+    buckets: HashMap<IpAddr, Bucket>,
+    last_sweep: Instant,
 }
 
 /// One IP's token bucket: a fractional token count + the last-refill instant.
@@ -361,27 +411,88 @@ const RATE_REFILL_PER_SEC: f64 = 1.0;
 /// Evict idle buckets older than this so the map can't grow unbounded.
 const RATE_IDLE_EVICT: Duration = Duration::from_secs(3600);
 
+/// How often the idle sweep may actually run.
+///
+/// The sweep used to run on EVERY guarded request — an O(n) scan of the whole
+/// map to find entries that, by construction, can only age out on an hour
+/// boundary. `GET /login` and `GET /claim` are guarded and unauthenticated, so
+/// under any volume of distinct source IPs the server spent its single shared
+/// core re-walking a map whose contents had not changed. Once a minute is
+/// plenty: it bounds bucket lifetime at `RATE_IDLE_EVICT + RATE_SWEEP_EVERY`.
+const RATE_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// Most buckets kept. At roughly 100 bytes each this is ~1 MB — a bound, not a
+/// target, sized so ordinary traffic never reaches it.
+///
+/// The idle eviction above was the only bound, and it is a TIME bound, which
+/// says nothing about how many distinct IPs can arrive inside one hour.
+/// `net.rs` bounds the equivalent structure by count (`MAX_PINNED_CLIENTS`);
+/// this one did not.
+const MAX_RATE_BUCKETS: usize = 10_000;
+
+/// When the cap is hit, evict down to this fraction of it rather than removing
+/// a single entry — so the O(n) eviction happens once per `cap/8` requests
+/// instead of once per request while the map sits full.
+const RATE_EVICT_DOWN_TO: usize = MAX_RATE_BUCKETS * 7 / 8;
+
 impl RateLimiter {
     /// A fresh, shared limiter (cloned into the middleware state).
     fn shared() -> Self {
         Self {
-            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            inner: std::sync::Arc::new(Mutex::new(RateLimiterState {
+                buckets: HashMap::new(),
+                last_sweep: Instant::now(),
+            })),
         }
     }
 
     /// Charge one token for `ip`; returns `true` if allowed, `false` if the
     /// bucket is empty (→ 429).
     fn check(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let mut map = match self.inner.lock() {
+        self.check_at(ip, Instant::now())
+    }
+
+    /// [`check`](Self::check) with the clock injected, so the sweep and eviction
+    /// paths below are reachable in a test without sleeping through an hour.
+    fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
+        let mut state = match self.inner.lock() {
             Ok(m) => m,
             // A poisoned lock shouldn't take the site down — fail open.
             Err(p) => p.into_inner(),
         };
-        // Opportunistic eviction of long-idle buckets (cheap, amortised).
-        map.retain(|_, b| now.duration_since(b.last) < RATE_IDLE_EVICT);
 
-        let bucket = map.entry(ip).or_insert(Bucket {
+        // Idle sweep, at most once per `RATE_SWEEP_EVERY`.
+        if now.duration_since(state.last_sweep) >= RATE_SWEEP_EVERY {
+            state
+                .buckets
+                .retain(|_, b| now.duration_since(b.last) < RATE_IDLE_EVICT);
+            state.last_sweep = now;
+        }
+
+        // Hard size bound, independent of the time bound above.
+        //
+        // Evicting LEAST-RECENTLY-USED is what makes this safe to do at all. An
+        // attacker cannot use eviction to clear their OWN throttled bucket: that
+        // bucket is by definition the most recently touched, so it is the last
+        // thing this removes. Going quiet long enough to become the oldest entry
+        // is exactly what the refill already grants for free.
+        if state.buckets.len() >= MAX_RATE_BUCKETS && !state.buckets.contains_key(&ip) {
+            let mut by_age: Vec<(IpAddr, Instant)> =
+                state.buckets.iter().map(|(k, b)| (*k, b.last)).collect();
+            by_age.sort_unstable_by_key(|(_, last)| *last);
+            for (victim, _) in by_age
+                .into_iter()
+                .take(state.buckets.len().saturating_sub(RATE_EVICT_DOWN_TO))
+            {
+                state.buckets.remove(&victim);
+            }
+            warn!(
+                buckets = state.buckets.len(),
+                "rate-limit bucket cap reached; evicted the least recently seen clients"
+            );
+        }
+
+        let bucket = state.buckets.entry(ip).or_insert(Bucket {
             tokens: RATE_BURST,
             last: now,
         });
@@ -516,9 +627,238 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 // Health
 // ---------------------------------------------------------------------------
 
-/// `GET /health` — a cheap liveness probe returning `200 ok` + the crate version.
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, format!("ok featherreader/{VERSION}\n"))
+/// How long `/health` will wait for its database ping before calling it broken.
+///
+/// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
+/// handler chose rather than a timeout Fly inferred — the difference between a
+/// log line that says why and one that says nothing.
+const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Floor for the poll-heartbeat staleness threshold. **Reported, never fatal** —
+/// see the handler for why.
+///
+/// The threshold itself is derived from the configured tick
+/// ([`health_tick_stale_secs`]): hardcoding 15 minutes meant an operator who
+/// raised `FEATHERREADER_POLL_TICK_SECS` above 900 got a permanent `poller:
+/// stale` in the body the deployment docs now tell them to alert on.
+const HEALTH_TICK_STALE_FLOOR_SECS: i64 = 15 * 60;
+
+/// How long without a completed tick before the poller reads as stale: several
+/// tick intervals, floored, so a normally-paced loop never trips it and a
+/// genuinely wedged one always does.
+fn health_tick_stale_secs(tick: Duration) -> i64 {
+    let tick = i64::try_from(tick.as_secs()).unwrap_or(i64::MAX);
+    tick.saturating_mul(5).max(HEALTH_TICK_STALE_FLOOR_SECS)
+}
+
+/// The poll tick this instance is configured for. Read from the same env var
+/// `scheduler.rs` reads, because the scheduler lives in the binary crate and the
+/// handler cannot see its constants.
+fn configured_poll_tick() -> Duration {
+    std::env::var("FEATHERREADER_POLL_TICK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(DEFAULT_POLL_TICK_SECS, Duration::from_secs)
+}
+
+/// Mirrors `scheduler::DEFAULT_POLL_TICK`, which lives in the BINARY crate and
+/// so cannot be imported here. Duplicated deliberately and named, rather than
+/// left as a bare `60` inside the parse chain, so the drift is at least visible
+/// if the scheduler's value ever moves.
+const DEFAULT_POLL_TICK_SECS: Duration = Duration::from_secs(60);
+
+/// Grace period after boot before a poller that has never ticked is called
+/// `stale` rather than `not-yet-ticked`.
+///
+/// Without this the two are indistinguishable forever, which matters precisely
+/// in the case the startup delays were added for: in a crash loop with 30 s+ boot
+/// cycles the poller never reaches its first tick, so `/health` reported the
+/// benign `not-yet-ticked` on every single probe and the heartbeat could not
+/// detect the failure mode it exists for. `run_poller` returning early — a failed
+/// HTTP client build — has the same shape and was equally invisible.
+///
+/// Sized off the poller's own startup delay plus its tick, with slack.
+const HEALTH_FIRST_TICK_GRACE_SECS: i64 = 5 * 60;
+
+/// `GET /health` — does this process still work, and what are its loops doing?
+///
+/// This used to return a constant string, touching no database, no pool and no
+/// scheduler state — while being the ONLY automated signal in `fly.toml`, whose
+/// sole other failure detector is a child process exiting. It proved the HTTP
+/// listener was up and nothing else.
+///
+/// **What can fail the check: the database, and only the database.** A process
+/// that cannot reach its store serves nothing, so a restart is the right
+/// response and this returns 503. The probe is a read (`SELECT 1`), which in WAL
+/// mode is not blocked by any writer — so the retention sweep, the poller and a
+/// login burst cannot make this flap. That property is the reason it is a read
+/// and not, say, a write canary.
+///
+/// **What is reported but never fails the check: everything else.** A stale poll
+/// heartbeat, a watermark pause, a missing OAuth runtime — all real problems,
+/// and none of them a reason to stop serving.
+///
+/// That last clause is the whole justification, and it is NOT the one this
+/// comment used to give. It said "Fly restarts on a failed check", which is
+/// false — verified against Fly's own docs, which state it three times: *"your
+/// Machines won't automatically restart or stop due to failing their health
+/// checks"*. A failing `[[http_service.checks]]` check makes Fly Proxy stop
+/// ROUTING to the Machine. Nothing restarts it. That capability existed on Apps
+/// V1 (`restart_limit`) and has no successor on Machines.
+///
+/// The corrected model makes the conclusion stronger, not weaker. With one
+/// Machine there is no healthy peer to shift traffic to, so a 503 here is not a
+/// failover — it is a total outage that lasts exactly as long as the condition,
+/// and it also fails a `fly deploy` (rolling strategy, no auto-rollback). So the
+/// question the status code answers is not "would a restart fix this" but **"can
+/// this process still serve a useful request at all"**. A stale poller can. A
+/// database it cannot read cannot.
+///
+/// Re-registration is automatic: the proxy keeps probing and routes again the
+/// moment the check passes. That is what makes a 503 recoverable without
+/// intervention — not a restart, which never comes.
+///
+/// The body is machine facts only — no user counts, no DIDs, no feed URLs — so
+/// it is publishable on the same terms as `/stats`. It is also the non-session
+/// diagnostic for an OAuth outage: when nobody can log in, `/admin/metrics`
+/// (which needs a live admin session) is exactly as unreachable as the thing it
+/// would diagnose, while this is reachable with `curl`.
+async fn health(State(state): State<AppState>) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    let rh = &state.runtime_health;
+
+    use crate::runtime_health::DbProbe;
+    let db = match rh.begin_db_probe() {
+        // A probe is already in flight; report its predecessor rather than
+        // starting a second one. See `RuntimeHealth::begin_db_probe`.
+        Err(borrowed) => borrowed,
+        Ok(probe) => {
+            // **`SELECT 1` was not a database probe.** It compiles to
+            // `Init/Integer/ResultRow/Halt` — there is no `OpenRead`, so it never
+            // touches a b-tree, never reads a page, and never consults the file.
+            // Against a deliberately corrupted database it returns success while
+            // every real query returns SQLITE_CORRUPT. Reading one row from a
+            // real table costs the same and actually proves what the check
+            // claims. `LIMIT 1` keeps it to a single page; an empty table still
+            // opens the b-tree root, which is the part that matters.
+            let verdict = match tokio::time::timeout(
+                HEALTH_DB_TIMEOUT,
+                sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
+                    .fetch_optional(&state.db),
+            )
+            .await
+            {
+                Ok(Ok(_)) => DbProbe::Ok,
+                // Coarse, not the raw error. An unauthenticated caller learning
+                // exactly which failure it hit is an attack-progress oracle; the
+                // detail belongs in the log, which gets it below.
+                Ok(Err(err)) => {
+                    warn!(%err, "health: database probe failed");
+                    DbProbe::Failed("unavailable".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
+                        "health: database probe timed out (pool exhausted?)"
+                    );
+                    DbProbe::Failed("timeout".to_string())
+                }
+            };
+            probe.record(verdict.clone());
+            verdict
+        }
+    };
+
+    let uptime = rh.uptime_secs(now);
+    let poller = if !rh.schedulers_enabled() {
+        // Not a fault. Dev runs and the seam tests disable the loops on purpose,
+        // and reporting that as "stale" would be a false alarm on every one.
+        "disabled".to_string()
+    } else {
+        match rh.secs_since_poll_tick(now) {
+            // "Never ticked" is benign right after boot and alarming well after
+            // it — so it is read against UPTIME, not left permanently benign.
+            None => match uptime {
+                Some(up) if up > HEALTH_FIRST_TICK_GRACE_SECS => {
+                    format!("stale never-ticked {up}s")
+                }
+                _ => "not-yet-ticked".to_string(),
+            },
+            Some(secs) if secs > health_tick_stale_secs(configured_poll_tick()) => {
+                format!("stale {secs}s")
+            }
+            Some(secs) => format!("ok {secs}s"),
+        }
+    };
+
+    // **Only a MEASURED failure fails the check.**
+    //
+    // `Unknown` means no probe has completed — a concurrent request arrived
+    // before the first one finished, or a previous owner was cancelled before
+    // recording. It is reported and returns 200, because an unmeasured database
+    // is not evidence of a broken one, and this endpoint is reachable by
+    // unauthenticated callers who can manufacture that state. Treating it as a
+    // failure handed them a lever on the only signal the platform acts on.
+    let mut body = String::new();
+    let status = match &db {
+        DbProbe::Ok => {
+            body.push_str(&format!("ok featherreader/{VERSION}\n"));
+            body.push_str("db: ok\n");
+            StatusCode::OK
+        }
+        DbProbe::Unknown => {
+            body.push_str(&format!("ok featherreader/{VERSION}\n"));
+            body.push_str("db: unknown (probe in flight)\n");
+            StatusCode::OK
+        }
+        DbProbe::Failed(why) => {
+            body.push_str(&format!("FAIL featherreader/{VERSION}\n"));
+            body.push_str(&format!("db: {why}\n"));
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    // Uptime answers the first question anyone asks about a container under a
+    // supervisor that tears the machine down whenever a child exits: is this
+    // thing restarting? Nothing else on any surface could tell you.
+    body.push_str(&format!(
+        "uptime: {}\n",
+        match uptime {
+            Some(secs) => format!("{secs}s"),
+            None => "unknown".to_string(),
+        }
+    ));
+    body.push_str(&format!("poller: {poller}\n"));
+    body.push_str(&format!(
+        "polling-paused: {}\n",
+        if rh.watermark_paused() { "yes" } else { "no" }
+    ));
+    // Deliberately NOT the measured database size. `/health` is the one path
+    // exempted from the Caddy origin lock, so it answers direct hits to the Fly
+    // IP that never passed Cloudflare — which caps what belongs here at the
+    // class of facts `/stats` already publishes to anyone. "Polling is paused"
+    // is that; the exact byte count is a precise internal number that adds
+    // nothing an operator cannot get from `/stats` or the logs.
+    body.push_str(&format!(
+        "backend: {}\n",
+        state.config.repo_backend.as_str()
+    ));
+    body.push_str(&format!(
+        "oauth-runtime: {}\n",
+        if state.oauth.is_some() {
+            "built"
+        } else {
+            "absent"
+        }
+    ));
+
+    // Never cached: a stale health response is worse than none, and Cloudflare
+    // sits in front of this.
+    let mut resp = (status, body).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str("no-store") {
+        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
+    }
+    resp
 }
 
 /// `GET /about` — the public-experiment page: the full disclaimer (experimental,
@@ -541,6 +881,175 @@ async fn about(State(state): State<AppState>) -> Response {
         kofi_url: KOFI_URL,
         adoption,
     })
+}
+
+/// `POST /saved/:rkey/delete` — remove a saved record that has no local entry.
+///
+/// The normal star toggle is keyed on an entry id, which a PDS-only saved row
+/// does not have. This deletes the record straight from the repo by its rkey,
+/// and then clears any LOCAL star for the same article.
+///
+/// That second step is not belt-and-braces. "Has no local entry" is how the
+/// starred view classifies a record, and it decides that through `sub_ref` — so
+/// an article that really is cached, and really is starred, lands here whenever
+/// the reader has unsubscribed from its feed. Deleting only the record left
+/// `entry_state.starred = 1` behind: invisible, because the starred list is
+/// `sub_ref`-scoped too, until a resubscribe brought the star back with nothing
+/// in the PDS backing it. A reader who clicks "remove" gets it removed from both
+/// places it lives.
+async fn unsave_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(rkey): Path<String>,
+) -> Response {
+    let Some(did) = current_did(&state, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response();
+    };
+
+    // Read the record's identity BEFORE deleting it — afterwards there is
+    // nothing left to learn it from. Best-effort: a failure here must not block
+    // the deletion the reader actually asked for, so it degrades to the old
+    // behaviour (record gone, local star possibly stale) and says so.
+    let identity = match state.repo().list_saved(&did).await {
+        Ok(records) => records
+            .into_iter()
+            .find(|(k, _)| *k == rkey)
+            .map(|(_, rec)| (rec.url, rec.entry_id)),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not read the saved record before deleting it; \
+                                      a local star for the same article may survive");
+            None
+        }
+    };
+
+    match state.repo().remove_saved(&did, &rkey).await {
+        Ok(()) => info!(%did, %rkey, "removed a saved record with no cached entry"),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not remove the saved record");
+            return (StatusCode::BAD_GATEWAY, "could not remove that item\n").into_response();
+        }
+    }
+
+    // Deliberately AFTER the delete: the PDS is the source of truth for what was
+    // saved, so clearing the local star before knowing the record is gone would
+    // be the desync in the other direction.
+    if let Some((url, guid)) = identity {
+        match store::clear_star_by_identity(&state.db, &did, Some(&url), guid.as_deref()).await {
+            Ok(0) => {}
+            Ok(n) => {
+                info!(%did, %rkey, cleared = n, "cleared the local star for an unsaved record")
+            }
+            Err(err) => warn!(%err, %did, %rkey, "could not clear the local star after unsaving"),
+        }
+    }
+    // htmx swaps the row out; a plain form post goes back to the starred list.
+    if is_htmx(&headers) {
+        return (StatusCode::OK, "").into_response();
+    }
+    Redirect::to("/?view=starred").into_response()
+}
+
+/// What the poller is doing, as one word for `/stats`.
+///
+/// **Parity with `/health` is the point.** `polling_paused` alone reported
+/// "running" for three different states including the two where nothing polls,
+/// on the page added to answer exactly that. The first attempt at fixing it
+/// added `off` and `starting` and claimed parity — but left out `stale`, so a
+/// poll loop that ticked once at boot and then WEDGED still read as running.
+/// That is the wedged-loop case `/health`'s heartbeat exists for, and the
+/// original finding's exact shape surviving its own fix.
+///
+/// Shares the staleness threshold with `/health` rather than picking its own, so
+/// the two pages cannot disagree about what "stale" means.
+fn fetching_state(rh: &crate::runtime_health::RuntimeHealth, now_unix: i64) -> &'static str {
+    if !rh.schedulers_enabled() {
+        return "off";
+    }
+    // Checked before the pause: a wedged poller cannot clear a pause either, so
+    // reporting "paused" would name the symptom and hide the cause.
+    match rh.secs_since_poll_tick(now_unix) {
+        None => {
+            // Never ticked. Benign at boot, a dead loop long after — read
+            // against uptime, exactly as `/health` does.
+            match rh.uptime_secs(now_unix) {
+                Some(up) if up > HEALTH_FIRST_TICK_GRACE_SECS => "stale",
+                _ => "starting",
+            }
+        }
+        Some(secs) if secs > health_tick_stale_secs(configured_poll_tick()) => "stale",
+        _ if rh.watermark_paused() => "paused",
+        _ => "running",
+    }
+}
+
+/// `GET /stats` — public poll health.
+async fn stats(State(state): State<AppState>) -> Response {
+    let now = chrono::Utc::now();
+    let health = match store::poll_health(
+        &state.db,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+    .await
+    {
+        Ok(health) => health,
+        Err(err) => {
+            warn!(%err, "could not compute poll health");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "stats unavailable\n").into_response();
+        }
+    };
+
+    // Percentage of a zero-feed instance is 100, not a divide-by-zero: a fresh
+    // instance is not behind on anything.
+    let polled_pct = if health.feeds_tracked == 0 {
+        100
+    } else {
+        health.polled_last_hour * 100 / health.feeds_tracked
+    };
+
+    render(&StatsTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+        feeds_tracked: health.feeds_tracked,
+        polled_last_hour: health.polled_last_hour,
+        polled_pct,
+        overdue: health.overdue,
+        last_poll: humanise_ago(health.last_poll_secs_ago),
+        oldest_poll: if health.never_polled > 0 {
+            "never".to_string()
+        } else {
+            humanise_ago(health.oldest_poll_secs_ago)
+        },
+        never_polled: health.never_polled,
+        poll_interval_mins: state.config.poll_interval.as_secs() as i64 / 60,
+        // **The two states that actually stop feeds updating.**
+        //
+        // Neither was visible anywhere. `overdue` and `polled_last_hour` move in
+        // both and distinguish neither — and `overdue` moves the WRONG WAY for
+        // backoff, since backoff is applied by pushing `next_poll` forward, so a
+        // feed failing every fetch drops out of the backlog and makes the page
+        // read healthier. Both of these are machine facts with no per-feed
+        // detail, so they sit inside the page's stated contract.
+        in_backoff: health.in_backoff,
+        badly_broken: health.badly_broken,
+        fetching: fetching_state(&state.runtime_health, now.timestamp()),
+    })
+}
+
+/// "3h 11m ago", or "never" when there has been no poll at all.
+///
+/// `None` must not render as `0` — on a fresh instance that would read as
+/// "polled just now", which is the opposite of the truth.
+fn humanise_ago(secs: Option<i64>) -> String {
+    let Some(secs) = secs else {
+        return "never".to_string();
+    };
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s => format!("{}h {}m ago", s / 3600, (s % 3600) / 60),
+    }
 }
 
 /// The `/about` adoption line's data, or `None` (no successful probe yet, an
@@ -638,6 +1147,16 @@ struct EntryRow {
     /// The reader link href, already carrying the scope/view query so opening an
     /// entry and paging back stays within the list it came from.
     link: String,
+    /// Whether the article itself is in this instance's cache.
+    ///
+    /// `false` for a saved record that exists in the reader's PDS but whose
+    /// entry was never cached here — starred in another atproto reader, or
+    /// starred here and since evicted. There is no local row, so the row has no
+    /// usable `id`: it links straight out to the article and carries no
+    /// mark-read control, because there is nothing local to mark.
+    cached: bool,
+    /// The PDS record key, for un-saving a row that has no local entry.
+    rkey: String,
 }
 
 /// A folder as an option in the "move feed to folder" select.
@@ -684,6 +1203,30 @@ struct IndexTemplate {
     heading: String,
     /// Whether a feed scope is active (enables per-feed mark-all-read).
     feed_scope: Option<String>,
+    /// Total CACHED entries in this scope + view across ALL pages. The count used
+    /// to be `entries.len()`, which was the same number only because the list was
+    /// unpaged — the thing this change exists to stop.
+    ///
+    /// The pager is derived from this, so it must not include the uncached PDS
+    /// rows below: they are appended to the last page rather than paged, and
+    /// counting them here advertised a page the clamp could never reach.
+    total: i64,
+    /// How many of `total` are PDS saved records the cache cannot show.
+    ///
+    /// A subset of `total`, not an addition to it — the heading says "N entries
+    /// (M saved elsewhere)". An earlier version rendered "N entries, plus M",
+    /// which double counted once `total` started including them, against an M
+    /// that had become page-local in the same commit while the template stayed
+    /// put.
+    uncached_total: i64,
+    /// 1-based current page.
+    page: i64,
+    /// Total pages, at least 1 (an empty list is page 1 of 1).
+    page_count: i64,
+    /// Link to the previous (newer) page, or `None` on the first.
+    prev_href: Option<String>,
+    /// Link to the next (older) page, or `None` on the last.
+    next_href: Option<String>,
 }
 
 /// The feed-management page (`GET /manage`) — subscribe / your-feeds / OPML.
@@ -724,6 +1267,41 @@ struct AboutTemplate {
     repo_url: &'static str,
     kofi_url: &'static str,
     adoption: Option<AdoptionLine>,
+}
+
+/// The public `/stats` page — is the poller keeping up?
+///
+/// Aggregate only, deliberately. It is published to anyone, so it carries no
+/// user counts and no per-feed detail: a reader does not need to know how many
+/// people use an instance or which feeds are failing. What it does answer is the
+/// question that decides whether an instance can take more readers — whether the
+/// poller is servicing the feeds it already has.
+///
+/// The counts below are aggregate machine facts, which is why they fit that
+/// contract: "12 feeds are in backoff" names no feed and no reader, while
+/// answering the question the page was previously unable to answer at all.
+#[derive(Template)]
+#[template(path = "stats.html")]
+struct StatsTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+    feeds_tracked: i64,
+    polled_last_hour: i64,
+    polled_pct: i64,
+    overdue: i64,
+    last_poll: String,
+    oldest_poll: String,
+    never_polled: i64,
+    poll_interval_mins: i64,
+    /// Feeds in error backoff. Invisible before, and excluded from `overdue`.
+    in_backoff: i64,
+    /// Of those, the ones deep enough into backoff to be effectively dead.
+    badly_broken: i64,
+    /// What the poller is actually doing: `running`, `paused` (at the size
+    /// watermark), `starting` (no tick completed yet) or `off` (schedulers
+    /// disabled). Three of those four used to render as "running".
+    fetching: &'static str,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -938,9 +1516,16 @@ fn avatar_initials(handle: Option<&str>, did: &str) -> String {
 /// Trim a stored RFC3339 timestamp down to the `YYYY-MM-DD` date for calm,
 /// low-noise display. Falls back to the raw string if it doesn't look like one.
 fn display_date(published: Option<&str>) -> String {
+    // CHARACTERS, not bytes. `p[..10]` panics when byte 10 lands inside a
+    // multi-byte character, and every caller used to pass a timestamp the feed
+    // parser had produced. The saved-record path passes `createdAt` straight off
+    // a PDS record, which the lexicon types as a bare string with no validation
+    // — written by whatever atproto client the reader used. A `createdAt` of
+    // "日本語日本語日本" took down the whole starred view, and there is no
+    // catch-panic layer in the stack, so the page stayed down until the record
+    // was removed from the very view that would not render.
     match published {
-        Some(p) if p.len() >= 10 => p[..10].to_string(),
-        Some(p) => p.to_string(),
+        Some(p) => p.chars().take(10).collect(),
         None => String::new(),
     }
 }
@@ -977,10 +1562,60 @@ struct IndexQuery {
     /// `unread` (default) | `all` | `starred`.
     #[serde(default)]
     view: Option<String>,
+    /// 1-based page within the selected scope + view. Absent/0 means page 1.
+    #[serde(default)]
+    page: Option<u32>,
     /// Optional flash message (e.g. after an action redirect).
     #[serde(default)]
     flash: Option<String>,
 }
+
+/// Rows per page in the reader's list views.
+///
+/// The list projection no longer carries article bodies ([`store::EntryListRow`]),
+/// so a page is on the order of tens of kilobytes rather than the tens or
+/// hundreds of megabytes an unbounded list of full entries could reach. The page
+/// bound is the second half of that fix: without it, a reader with a long
+/// backlog still decides how much memory a single request allocates.
+const ENTRIES_PER_PAGE: i64 = 100;
+
+/// How many pages `total` entries occupy. An empty list is page 1 of 1, so the
+/// pager reads "1 / 1" rather than "1 / 0".
+fn page_count_for(total: i64) -> i64 {
+    ((total + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE).max(1)
+}
+
+/// Ceiling on the reader's prev/next id list.
+///
+/// Unlike the page above, this genuinely spans the whole list — prev/next is the
+/// reader's position within it — so it is bounded by count rather than paged. At
+/// 8 bytes per id this is ~40 KB at the cap. Past it the neighbour links stop
+/// resolving; the article itself still opens, and the list view still pages.
+const PREV_NEXT_MAX: i64 = 5_000;
+
+/// Ceiling on the cached-starred identity set matched against PDS saved records.
+///
+/// Deliberately generous: under-reading this set makes a cached article look
+/// uncached, and an uncached starred row's button deletes the PDS RECORD rather
+/// than un-starring the entry. Truncating here would change what a click
+/// destroys, so the cap exists only as a backstop against an absurd starred
+/// count, not as a routine bound.
+const STARRED_IDENTITY_MAX: i64 = 20_000;
+
+/// Most uncached PDS saved records this handler will hold in memory for one
+/// request.
+///
+/// **A memory bound, not a visibility bound.** These rows are PAGED alongside
+/// the cached entries, so `ENTRIES_PER_PAGE` decides how many are rendered and
+/// this only caps how many are collected before slicing. An earlier version used
+/// it to cap what was SHOWN, which left everything past it invisible and —
+/// because the un-save control lives on the row, and nothing else in the app
+/// lists these — unremovable.
+///
+/// Well above the PDS list ceiling's practical reach for one reader, so a reader
+/// meeting it has thousands of saved records and gets a logged, ordered prefix
+/// rather than a failure.
+const MAX_UNCACHED_SAVED_ROWS: usize = 5_000;
 
 /// A subscription resolved against the local cache: the PDS record + its
 /// (possibly-missing) cached feed row.
@@ -995,7 +1630,7 @@ struct ResolvedSub {
 /// on the sidecar: a failure falls back to the local cache alone.
 async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> {
     let pool = &state.db;
-    let subs = match state.sidecar.list_subscriptions_sorted(did).await {
+    let subs = match state.repo().list_subscriptions_sorted(did).await {
         Ok(s) => s,
         Err(err) => {
             warn!(%err, %did, "could not list PDS subscriptions; showing this DID's cached subscriptions only");
@@ -1005,7 +1640,18 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
             // `sub_ref` projection (its own feeds, possibly stale) and leave
             // `sub_ref` untouched — never synthesize from every cached feed,
             // which would grant cross-tenant read+mutate during any outage.
-            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_default();
+            // A DB failure here is NOT the same as "this DID follows nothing",
+            // but `unwrap_or_default` rendered it as exactly that: an empty
+            // sidebar and an empty reader, which arrives as "all my feeds
+            // vanished". It still degrades to empty — there is nothing better to
+            // show — but it says so, so the support ticket and the log line can
+            // be matched up.
+            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_else(|err| {
+                warn!(%err, %did, "the PDS is unreachable AND the local subscription \
+                                   projection could not be read; rendering an EMPTY \
+                                   feed list, which is not the same as having none");
+                Vec::new()
+            });
             return feeds
                 .into_iter()
                 .map(|f| ResolvedSub {
@@ -1017,13 +1663,58 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
         }
     };
 
+    // **Deliberately NOT truncated to `max_subs_per_did`.**
+    //
+    // The PDS list is unbounded in practice — any client can write subscription
+    // records, and only the 20,000-record list ceiling stops it — and the first
+    // attempt at bounding it truncated the list right here. That was the wrong
+    // place: `sync_sub_refs` below writes `sub_ref` from exactly this set, and
+    // `sub_ref` is THE per-DID authorization hook, so dropping entries silently
+    // removed the reader's ability to read OR mutate those feeds. A query-shape
+    // problem would have become an access problem.
+    //
+    // The shape problem was the scope filter emitting one SQL placeholder per
+    // feed; `store::list_query_sql` now passes the whole set as a single
+    // `json_each` bind, so there is no size to defend against here and nothing
+    // to truncate. `max_subs_per_did` stays what it is — a policy cap on ADDING
+    // feeds — rather than becoming a silent read-time filter.
     let mut out = Vec::with_capacity(subs.len());
     for (rkey, sub) in subs {
         let feed = match store::get_feed_by_url(pool, &sub.url).await {
             Ok(Some(f)) => Some(f),
             Ok(None) => {
+                // `sub.url` came out of an atproto record. The lexicon is open —
+                // ANY client can write a subscription into a user's repo — so
+                // this is untrusted input on the hot path of `GET /`, and it was
+                // being stored with none of the three checks the add and import
+                // paths apply. Two of those are capacity ceilings; this one is
+                // the invariant in `FeedPrivacy`'s doc comment, which promises a
+                // private feed URL is "never stored". Writing a
+                // `…/feed/private/<token>` into the SHARED `feeds` table breaks
+                // that promise even though `net::guarded_get` still refuses to
+                // fetch it.
+                if !feed::is_storable_feed_url(&sub.url)
+                    || feed::classify_feed_privacy(&sub.url).is_private()
+                {
+                    warn!(
+                        %did,
+                        "skipping cache row for a subscription URL that is private or not http(s)"
+                    );
+                    out.push(ResolvedSub {
+                        rkey,
+                        sub,
+                        feed: None,
+                    });
+                    continue;
+                }
                 // Upsert a cache row so the sidebar reflects the real follow-list.
-                let _ = store::upsert_feed(
+                //
+                // A silent failure here is a support ticket with no evidence: no
+                // `feeds` row means the poller never selects this subscription,
+                // so the reader sees "I added a feed and it never updates" while
+                // the PDS record looks perfect. Logged with the URL so the
+                // failing subscription is identifiable.
+                if let Err(err) = store::upsert_feed(
                     pool,
                     &store::NewFeed {
                         url: sub.url.clone(),
@@ -1032,7 +1723,11 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                         ..Default::default()
                     },
                 )
-                .await;
+                .await
+                {
+                    warn!(%err, url = %sub.url, %did, "could not cache a subscribed feed; \
+                                                       it will not be polled");
+                }
                 store::get_feed_by_url(pool, &sub.url).await.ok().flatten()
             }
             Err(err) => {
@@ -1087,11 +1782,6 @@ async fn index(
 
     let subs = resolve_subscriptions(&state, &did).await;
 
-    // Per-DID working sets, once.
-    let unread = store::get_unread_for_did(pool, &did).await?;
-    let starred = store::get_starred_for_did(pool, &did).await?;
-    let starred_ids: std::collections::HashSet<i64> = starred.iter().map(|e| e.id).collect();
-
     // View: unread (default) | all | starred.
     let view = match q.view.as_deref() {
         Some("all") => "all",
@@ -1099,16 +1789,16 @@ async fn index(
         _ => "unread",
     }
     .to_string();
+    let list_view = list_view_of(q.view.as_deref());
 
     // Which feed URLs are in scope?
     let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
+    // …and the feed ids they resolve to. Scope is applied inside the query now,
+    // so a page is a page of rows the reader will actually see. Filtering after
+    // a `LIMIT` would have made pages arbitrarily short — sometimes empty — for
+    // any scope narrower than the whole subscription list.
+    let scope_ids = scoped_feed_ids(&subs, &scope_urls);
 
-    // Resolve feed_id → url once for row rendering + scope filtering.
-    let feed_url_by_id = |id: i64| -> Option<String> {
-        subs.iter()
-            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
-            .map(|s| s.sub.url.clone())
-    };
     let feed_title_by_id = |id: i64| -> String {
         subs.iter()
             .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
@@ -1124,44 +1814,289 @@ async fn index(
             .unwrap_or_default()
     };
 
-    let in_scope = |feed_id: i64| -> bool {
-        match &scope_urls {
-            None => true,
-            Some(urls) => feed_url_by_id(feed_id)
-                .map(|u| urls.contains(&u))
-                .unwrap_or(false),
-        }
-    };
+    // **One page of the chosen view, filtered, ordered and bounded in SQL.**
+    //
+    // All three views used to materialize every matching entry — `SELECT e.*`,
+    // no `LIMIT`, article bodies included — and the "all" view additionally ran
+    // one such query PER SUBSCRIBED FEED and merged the results in memory. None
+    // of the row fields below read the body. See `store::EntryListRow`.
+    // **Saved records the cache cannot show.**
+    //
+    // The starred view is built from local `entries`, so a saved record whose
+    // article was never cached here is invisible — the case that matters is
+    // starring in ANOTHER atproto reader, which is the portability the shared
+    // lexicon exists for. Those rows are rendered from the PDS record alone.
+    let mut uncached: Vec<EntryRow> = Vec::new();
+    if view == "starred" {
+        // **Match against every SUBSCRIBED cached starred entry, not `source`.**
+        //
+        // `source` has already been filtered by feed/folder. Matching against it
+        // meant an entry that IS cached but sits outside the current filter
+        // looked uncached — so it rendered as a "not cached" row whose star
+        // button deletes the PDS RECORD instead of un-starring the entry. A
+        // scope filter must not change what is destroyed. Paging is the same
+        // hazard in a new form: matching against the visible PAGE would make
+        // every cached article outside it look uncached. Hence a dedicated
+        // identity query over the whole starred set — urls and guids only, no
+        // bodies — rather than reusing `source`.
+        //
+        // One gap remains BY DESIGN, and is handled at the other end. This query
+        // still carries the `sub_ref` predicate, so a starred, cached entry in a
+        // feed the reader has UNSUBSCRIBED from is absent here and its record
+        // renders as uncached. That is the right rendering — the article is no
+        // longer part of any feed the reader follows, and the PDS record is what
+        // still holds it — but it means the un-save button is the record-deleting
+        // one. `unsave_record` therefore clears the local star too, so the two
+        // stores agree however the row got classified. Dropping the predicate
+        // here instead would have made the row link to `/entries/{id}`, which is
+        // `sub_ref`-scoped and would 404.
+        //
+        // **Three ways this can be unusable, and all three fail CLOSED.** With an
+        // incomplete identity set, a cached article looks uncached and renders an
+        // un-save button that deletes the PDS RECORD. Showing no uncached rows
+        // loses rows for one render; getting this wrong loses data permanently,
+        // so every uncertain case suppresses them.
+        let identities = match store::starred_identities(pool, &did, STARRED_IDENTITY_MAX).await {
+            Ok(store::StarredIdentities::All(rows)) => Some(rows),
+            // The cap is a memory backstop, and reaching it means the set is an
+            // arbitrary subset. It used to return that subset with no way to
+            // tell, so every starred article outside it got the destructive
+            // button.
+            Ok(store::StarredIdentities::Truncated) => {
+                warn!(
+                    %did,
+                    cap = STARRED_IDENTITY_MAX,
+                    "cached-starred set exceeded its cap; suppressing uncached saved rows \
+                     rather than rendering record-deleting buttons for cached articles"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(%err, %did, "cached-starred identity lookup failed; \
+                                    suppressing uncached saved rows this render");
+                None
+            }
+        };
+        // The escape hatch asks whether this DID has ANY cached starred entry —
+        // not whether the current SCOPE does. `total` is narrowed by
+        // `?feed=`/`?folder=` while the identity set spans every feed, so
+        // comparing them waved the fail-closed condition through for any narrow
+        // scope: a record whose `feedUrl` matched the filter while its cached
+        // entry lived under another feed rendered as uncached.
+        let identities_ok = identities.is_some();
+        let identities = identities.unwrap_or_default();
+        let cached_urls: std::collections::HashSet<&str> = identities
+            .iter()
+            .filter_map(|(url, _)| url.as_deref())
+            .collect();
+        let cached_guids: std::collections::HashSet<&str> =
+            identities.iter().map(|(_, guid)| guid.as_str()).collect();
 
-    // The source list for the chosen view.
-    let source = match view.as_str() {
-        "all" => {
-            // All entries across in-scope feeds, newest first.
-            let mut all = Vec::new();
-            for s in &subs {
-                if let Some(f) = &s.feed {
-                    if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, &did, f.id)
-                            .await
-                            .unwrap_or_default();
-                        all.append(&mut es);
+        // Collected in full here, sliced per page later. They sort after every
+        // cached row, so the two lists form one sequence that the pager walks —
+        // see the slice below. Collected BEFORE the page is chosen because the
+        // page count depends on how many there are.
+        // Bounded like everything else on this page. These come from the PDS
+        // (up to the 20,000-record list ceiling) and are appended whole to the
+        // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
+        // cap is generous — a reader with more saved-elsewhere records than this
+        // is not the case being designed for — but a response has to have a size
+        // an operator can reason about.
+        let mut uncached_dropped = 0usize;
+        match state.repo().list_saved_sorted(&did).await {
+            Ok(saved) if identities_ok => {
+                for (rkey, item) in saved {
+                    let known = cached_urls.contains(item.url.as_str())
+                        || item
+                            .entry_id
+                            .as_deref()
+                            .is_some_and(|g| cached_guids.contains(g));
+                    if known {
+                        continue;
                     }
+                    // And the scope filter applies to these rows too. Without
+                    // it, `?feed=X` still listed saved records from every other
+                    // feed — the filter silently did nothing for them.
+                    if let Some(urls) = &scope_urls {
+                        match item.feed_url.as_deref() {
+                            Some(feed_url) if urls.iter().any(|u| u == feed_url) => {}
+                            // A saved record with no `feedUrl` cannot be placed
+                            // in any feed's scope, so it belongs only to the
+                            // unfiltered view.
+                            _ => continue,
+                        }
+                    }
+                    // **`safe_link` FIRST, and a failure no longer drops the row.**
+                    //
+                    // `item.url` is attacker-controlled — a saved record written
+                    // by any client — and it lands in an `href`. Askama escapes
+                    // HTML metacharacters but not SCHEMES, so `javascript:`
+                    // survives escaping intact. This project already built the
+                    // helper for exactly that, and `feed.rs` uses it on the
+                    // equivalent link; this path was simply not routed through it.
+                    //
+                    // The real defect was what a failure DID: it `continue`d, so
+                    // the row vanished entirely — no badge, no count, nothing —
+                    // and the only trace was a `debug!` below any realistic
+                    // filter. That makes the record unremovable FROM HERE, because
+                    // the un-save button lives on the row; the reader has to open
+                    // a different atproto client to get rid of it. A bad URL is a
+                    // reason to withhold the LINK, not the row.
+                    //
+                    // The check also moved ABOVE the poll nudge. That is ordering
+                    // hygiene rather than a fix: the nudge keys on `feed_url`, not
+                    // on the URL being rejected here, and is already gated on the
+                    // reader actually subscribing to that feed — so it was never
+                    // reachable by an unusable `item.url`. Deciding whether a
+                    // record is renderable before doing anything outbound on its
+                    // behalf is simply the order that stays correct if either of
+                    // those two facts later stops being true.
+                    let link = crate::net::safe_link(&item.url);
+                    if link.is_none() {
+                        warn!(
+                            %did, %rkey,
+                            "a saved record has an unusable URL; rendering it without a link \
+                             so it can still be removed"
+                        );
+                    }
+
+                    // Opportunistic re-fetch: if the reader still subscribes to
+                    // the feed, make it due now. If the article is still inside
+                    // the feed's window the poller caches it normally and this
+                    // row becomes a real entry on its own — no synthetic rows in
+                    // the shared cache, which every subscriber would otherwise
+                    // see as a content-less entry.
+                    // **Bound the WORK, not just the response.** This check sat
+                    // after the nudge and the `subs` scan below, so every render
+                    // still walked all ≤20,000 PDS records, ran a subs-length
+                    // string scan per record, and issued up to that many
+                    // `mark_feed_due` round-trips on a 5-connection pool — then
+                    // discarded everything past the cap. A cap that runs after
+                    // the expensive part is a cap on the output only.
+                    if uncached.len() >= MAX_UNCACHED_SAVED_ROWS {
+                        uncached_dropped += 1;
+                        continue;
+                    }
+                    if let Some(feed_url) = item.feed_url.as_deref() {
+                        if subs.iter().any(|s| s.sub.url == feed_url) {
+                            // Bounded to one nudge per feed per poll interval —
+                            // see `mark_feed_due`. Unbounded, a reload loop here
+                            // becomes outbound amplification.
+                            let stale_before = (chrono::Utc::now()
+                                - chrono::Duration::from_std(state.config.poll_interval)
+                                    .unwrap_or_else(|_| chrono::Duration::hours(1)))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            if let Err(err) =
+                                store::mark_feed_due(pool, feed_url, &stale_before).await
+                            {
+                                tracing::debug!(%err, %feed_url, "could not nudge a feed for a saved article");
+                            }
+                        }
+                    }
+                    uncached.push(EntryRow {
+                        id: 0,
+                        title: item
+                            .title
+                            .clone()
+                            .filter(|t| !t.trim().is_empty())
+                            // Falling back to the URL is fine for a link we are
+                            // willing to render, and wrong for one we are not:
+                            // it would put the exact string `safe_link` just
+                            // rejected into the page as the record's name. The
+                            // rkey is what the un-save button acts on, so it is
+                            // the honest identifier for a row that has nothing
+                            // else trustworthy to show.
+                            .unwrap_or_else(|| match &link {
+                                Some(_) => item.url.clone(),
+                                None => format!("Saved item {rkey}"),
+                            }),
+                        feed_title: item.feed_url.clone().unwrap_or_default(),
+                        published: display_date(Some(&item.created_at)),
+                        read: false,
+                        starred: true,
+                        // Empty = "render this row without an anchor". The
+                        // template branches on it, so the rejected URL never
+                        // reaches an `href` even as an escaped string.
+                        link: link.unwrap_or_default(),
+                        cached: false,
+                        rkey,
+                    });
                 }
             }
-            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
-            all
+            // Identity lookup was unusable — see the fail-closed note above.
+            Ok(_) => {}
+            Err(err) => warn!(%err, %did, "could not list saved records from the PDS"),
         }
-        "starred" => starred
-            .iter()
-            .filter(|e| in_scope(e.feed_id))
-            .cloned()
-            .collect(),
-        _ => unread
-            .iter()
-            .filter(|e| in_scope(e.feed_id))
-            .cloned()
-            .collect(),
+        if uncached_dropped > 0 {
+            warn!(
+                %did,
+                dropped = uncached_dropped,
+                cap = MAX_UNCACHED_SAVED_ROWS,
+                "more saved records than this instance will hold in one response; the \
+                 rest are not reachable from here"
+            );
+        }
+    }
+
+    // **One sequence, two sources.** The cached rows come from SQL, the uncached
+    // PDS records follow them, and the pager walks the concatenation.
+    //
+    // The first version appended the uncached rows to the last page only and
+    // kept them out of `total`, which left everything past a cap invisible AND
+    // unremovable — the un-save button lives on the row, and there is no other
+    // surface in the app that lists these. That is the same "unremovable FROM
+    // HERE" hazard the `safe_link` fix above exists to prevent, reintroduced
+    // forty lines later by a bound meant to protect memory.
+    //
+    // Paging the concatenation makes every record reachable and needs no cap on
+    // what is RENDERED — one page is one page either way. The version before
+    // that inflated `total` while clamping on the cached count, which advertised
+    // a page the clamp could never reach; both numbers come from the same total
+    // now, which is what makes that impossible rather than merely fixed.
+    let total_cached =
+        store::count_entries_for_view(pool, &did, list_view, scope_ids.as_deref()).await?;
+    let uncached_len = uncached.len();
+    let total = total_cached + uncached_len as i64;
+    // Clamped to the range that exists. Past the end the list is empty, and the
+    // empty state renders instead of the pager — which would strand a reader who
+    // typed a page number, or who paged to the end and then marked entries read
+    // out from under their own URL. Showing the last page is the answer to both.
+    let page = i64::from(q.page.unwrap_or(1).max(1)).min(page_count_for(total));
+    let offset = (page - 1) * ENTRIES_PER_PAGE;
+    // Past the cached rows this returns nothing, which is exactly right: the
+    // page is then made up entirely of uncached ones.
+    let source = store::list_entries(
+        pool,
+        &did,
+        list_view,
+        scope_ids.as_deref(),
+        ENTRIES_PER_PAGE,
+        offset,
+    )
+    .await?;
+    // **The slice is derived from ONE snapshot, not two.**
+    //
+    // `total_cached` (a COUNT) and `source` (a SELECT) are separate unsynchronised
+    // queries. Taking `skip` from the count and `take` from `source.len()` meant a
+    // star landing between them could leave uncached records on NO page: the count
+    // says 250 so page 4 starts at uncached[50], while the select already sees 260
+    // so page 3 has no room for uncached[0..50] — and the un-save button goes with
+    // them, which is the hazard paging was introduced to remove.
+    //
+    // Clamping `source` to what the count promised makes both halves agree. A row
+    // that appeared in between is simply not on this page; it is on the next one
+    // after the count catches up, which is ordinary paging behaviour rather than a
+    // hole.
+    let cached_here = ((total_cached - offset).max(0) as usize).min(source.len());
+    let source = &source[..cached_here];
+    let uncached_page: Vec<EntryRow> = {
+        let skip = (offset - total_cached).max(0) as usize;
+        let take = (ENTRIES_PER_PAGE as usize).saturating_sub(cached_here);
+        uncached.into_iter().skip(skip).take(take).collect()
     };
+    // This page's slice, used only to append below. The heading needs the
+    // WHOLE-list figure, which is the set's size before slicing.
+    let uncached_total = uncached_len as i64;
 
     // The scope/view suffix carried onto every entry link (built once).
     let entry_scope_qs = {
@@ -1196,11 +2131,22 @@ async fn index(
                 .unwrap_or_else(|| "(untitled)".to_string()),
             feed_title: feed_title_by_id(e.feed_id),
             published: display_date(e.published.as_deref()),
-            read: view != "unread" && !unread.iter().any(|u| u.id == e.id),
-            starred: starred_ids.contains(&e.id),
+            // Both bits ride along on the row's own `entry_state` join now. They
+            // used to be membership tests against the full unread and starred
+            // sets, which is why those two lists were fetched in their entirety
+            // on every render even when the page showed a hundred rows.
+            read: e.read,
+            starred: e.starred,
             link: entry_link(e.id),
+            cached: true,
+            rkey: String::new(),
         })
         .collect();
+
+    // The uncached slice for this page follows the cached rows.
+    let mut entries = entries;
+    entries.extend(uncached_page);
+    let entries = entries;
 
     let selected_feed = q.feed.as_deref();
     let selected_folder = q.folder.as_deref();
@@ -1244,6 +2190,26 @@ async fn index(
     let feed_scope = selected_feed.map(str::to_string);
     let nav = build_nav(&user, &view, scope_qs, folder_views, loose_feeds, false);
 
+    // Pager links. `entry_scope_qs` already carries feed/folder/view, so the
+    // page number is the only thing appended — which keeps a paged link
+    // identical to an unpaged one in every other respect.
+    let page_href = |n: i64| -> String {
+        let mut parts = Vec::new();
+        if !entry_scope_qs.is_empty() {
+            parts.push(entry_scope_qs.clone());
+        }
+        if n > 1 {
+            parts.push(format!("page={n}"));
+        }
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/?{}", parts.join("&"))
+        }
+    };
+    let prev_href = (page > 1).then(|| page_href(page - 1));
+    let next_href = (page * ENTRIES_PER_PAGE < total).then(|| page_href(page + 1));
+
     let tmpl = IndexTemplate {
         version: VERSION,
         repo_url: REPO_URL,
@@ -1253,6 +2219,14 @@ async fn index(
         entries,
         heading,
         feed_scope,
+        total,
+        // Whole-list figure, so it sits beside `total` without double counting.
+        // `uncached_shown` is this PAGE's slice and is not a heading number.
+        uncached_total,
+        page,
+        page_count: page_count_for(total),
+        prev_href,
+        next_href,
     };
     Ok(render(&tmpl))
 }
@@ -1366,20 +2340,26 @@ async fn build_sidebar(
     selected_folder: Option<&str>,
 ) -> (Vec<FolderView>, Vec<FeedView>, Vec<FolderOption>) {
     let pool = &state.db;
-    let unread = store::get_unread_for_did(pool, did)
+    // Counted in SQL. This used to fetch every unread ENTRY — article bodies and
+    // all — purely to `.filter().count()` them in Rust, on every page that
+    // renders chrome, which made the sidebar the most frequently executed
+    // instance of the unbounded-projection problem.
+    let unread_counts = store::unread_counts_by_feed(pool, did)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|err| {
+            warn!(%err, %did, "sidebar unread counts failed; rendering zeroes");
+            Default::default()
+        });
     let folders = state
-        .sidecar
+        .repo()
         .list_folders_sorted(did)
         .await
         .unwrap_or_default();
 
     let unread_count = |feed_id: Option<i64>| -> i64 {
-        match feed_id {
-            Some(id) => unread.iter().filter(|e| e.feed_id == id).count() as i64,
-            None => 0,
-        }
+        feed_id
+            .and_then(|id| unread_counts.get(&id).copied())
+            .unwrap_or(0)
     };
     let mk_feed_view = |s: &ResolvedSub| FeedView {
         rkey: s.rkey.clone(),
@@ -1564,6 +2544,8 @@ async fn neighbors_in_scope(
         feed: q.feed.clone(),
         folder: q.folder.clone(),
         view: q.view.clone(),
+        // Neighbours span the whole list, not the page the reader arrived from.
+        page: None,
         flash: None,
     };
     let ids = list_entry_ids(state, did, &idx_q).await;
@@ -1585,51 +2567,49 @@ async fn list_entry_ids(state: &AppState, did: &str, q: &IndexQuery) -> Vec<i64>
     let subs = resolve_subscriptions(state, did).await;
 
     let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
-    let feed_url_by_id = |id: i64| -> Option<String> {
-        subs.iter()
-            .find(|s| s.feed.as_ref().map(|f| f.id) == Some(id))
-            .map(|s| s.sub.url.clone())
-    };
-    let in_scope = |feed_id: i64| -> bool {
-        match &scope_urls {
-            None => true,
-            Some(urls) => feed_url_by_id(feed_id)
-                .map(|u| urls.contains(&u))
-                .unwrap_or(false),
-        }
-    };
 
-    let view = q.view.as_deref().unwrap_or("unread");
-    let entries = match view {
-        "all" => {
-            let mut all = Vec::new();
-            for s in &subs {
-                if let Some(f) = &s.feed {
-                    if in_scope(f.id) {
-                        let mut es = store::entries_for_feed(pool, did, f.id)
-                            .await
-                            .unwrap_or_default();
-                        all.append(&mut es);
-                    }
-                }
-            }
-            all.sort_by(|a, b| b.published.cmp(&a.published).then(b.id.cmp(&a.id)));
-            all
-        }
-        "starred" => store::get_starred_for_did(pool, did)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| in_scope(e.feed_id))
+    // Ids only, and bounded. This used to fetch whole entries — bodies included
+    // — for all three views and then throw everything but `id` away; the "all"
+    // branch additionally ran one unbounded query PER FEED and sorted the union
+    // in memory. Scope is now a feed-id restriction inside the query, so the
+    // database does the filtering and the ordering exactly once.
+    store::list_entry_ids(
+        pool,
+        did,
+        list_view_of(q.view.as_deref()),
+        scoped_feed_ids(&subs, &scope_urls).as_deref(),
+        PREV_NEXT_MAX,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        warn!(%err, %did, "prev/next id list failed; the reader loses its neighbour links");
+        Vec::new()
+    })
+}
+
+/// Map the `?view=` query value onto the store's list view. Anything
+/// unrecognised is the unread default, matching `index`.
+fn list_view_of(view: Option<&str>) -> store::ListView {
+    match view {
+        Some("all") => store::ListView::All,
+        Some("starred") => store::ListView::Starred,
+        _ => store::ListView::Unread,
+    }
+}
+
+/// Translate a feed/folder scope into the feed ids to restrict a list query to.
+///
+/// `None` means unscoped (every subscribed feed). `Some(&[])` means the scope
+/// matched no local feed, which must return nothing rather than everything — so
+/// the empty vec is deliberately preserved, not collapsed back into `None`.
+fn scoped_feed_ids(subs: &[ResolvedSub], scope_urls: &Option<Vec<String>>) -> Option<Vec<i64>> {
+    let urls = scope_urls.as_ref()?;
+    Some(
+        subs.iter()
+            .filter(|s| urls.contains(&s.sub.url))
+            .filter_map(|s| s.feed.as_ref().map(|f| f.id))
             .collect(),
-        _ => store::get_unread_for_did(pool, did)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| in_scope(e.feed_id))
-            .collect(),
-    };
-    entries.into_iter().map(|e| e.id).collect()
+    )
 }
 
 /// Build a `?…` query string that preserves the reading scope + view for links.
@@ -1762,16 +2742,16 @@ async fn toggle_star(
                 saved.title = entry.title.clone();
                 saved.feed_url = feed_url_for_id(pool, entry.feed_id).await;
                 saved.entry_id = Some(entry.guid.clone());
-                match state.sidecar.add_saved(&did, &saved).await {
+                match state.repo().add_saved(&did, &saved).await {
                     Ok(rkey) => info!(%did, url = %entry_url, %rkey, "wrote saved record to PDS"),
                     Err(err) => warn!(%err, %did, "PDS saved write failed (starred locally)"),
                 }
             } else {
                 // Un-star: find and delete the matching saved record by URL.
-                match state.sidecar.list_saved(&did).await {
+                match state.repo().list_saved(&did).await {
                     Ok(records) => {
                         for (rkey, _rec) in records.iter().filter(|(_, r)| r.url == entry_url) {
-                            if let Err(err) = state.sidecar.remove_saved(&did, rkey).await {
+                            if let Err(err) = state.repo().remove_saved(&did, rkey).await {
                                 warn!(%err, %did, %rkey, "PDS saved delete failed");
                             }
                         }
@@ -2002,7 +2982,7 @@ async fn add_subscription(
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
 
-    match state.sidecar.add_subscription(&did, &sub).await {
+    match state.repo().add_subscription(&did, &sub).await {
         Ok(rkey) => info!(feed = %feed_url, %rkey, %did, "wrote subscription record to PDS"),
         Err(err) => {
             warn!(%err, feed = %feed_url, %did, "PDS subscription write failed (cached locally)")
@@ -2022,7 +3002,7 @@ async fn delete_subscription(
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    match state.sidecar.remove_subscription(&did, &rkey).await {
+    match state.repo().remove_subscription(&did, &rkey).await {
         Ok(()) => info!(%did, %rkey, "unsubscribed (deleted PDS subscription record)"),
         Err(err) => warn!(%err, %did, %rkey, "PDS unsubscribe failed"),
     }
@@ -2115,7 +3095,7 @@ async fn rename_subscription(
         .filter(|f| !f.is_empty());
 
     // Keep the local cache title in step for the loose-feed fallback path.
-    let _ = store::upsert_feed(
+    if let Err(err) = store::upsert_feed(
         &state.db,
         &store::NewFeed {
             url: sub.url.clone(),
@@ -2124,13 +3104,34 @@ async fn rename_subscription(
             ..Default::default()
         },
     )
-    .await;
-
-    match state.sidecar.update_subscription(&did, &rkey, &sub).await {
-        Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription"),
-        Err(err) => warn!(%err, %did, %rkey, "PDS subscription update failed"),
+    .await
+    {
+        // Not fatal to the rename — the PDS record below is the source of truth
+        // — but a missing `feeds` row means this subscription is never polled.
+        warn!(%err, %did, url = %sub.url, "could not update the cached feed row on rename");
     }
-    Ok(Redirect::to("/").into_response())
+
+    // **The PDS write decides what the reader is told.**
+    //
+    // This used to `warn!` on failure and then redirect exactly as it does on
+    // success, so a rename that did not happen was indistinguishable from one
+    // that did — the reader saw their old title come back and had no reason to
+    // think anything had gone wrong. The PDS record IS the subscription; a
+    // failure here means nothing was renamed or moved.
+    match state.repo().update_subscription(&did, &rkey, &sub).await {
+        Ok(res) => {
+            info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription");
+            Ok(Redirect::to("/").into_response())
+        }
+        Err(err) => {
+            warn!(%err, %did, %rkey, "PDS subscription update failed");
+            Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("Could not save that change to your PDS — nothing was renamed or moved.")
+            ))
+            .into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2158,7 +3159,7 @@ async fn create_folder(
         return Ok(Redirect::to("/").into_response());
     }
     let folder = Folder::new(name.to_string(), now_rfc3339());
-    match state.sidecar.add_folder(&did, &folder).await {
+    match state.repo().add_folder(&did, &folder).await {
         Ok(rkey) => info!(%did, %rkey, name, "created folder record"),
         Err(err) => warn!(%err, %did, "PDS folder create failed"),
     }
@@ -2181,7 +3182,7 @@ async fn rename_folder(
         return Ok(Redirect::to("/").into_response());
     }
     let folder = Folder::new(name.to_string(), now_rfc3339());
-    match state.sidecar.rename_folder(&did, &rkey, &folder).await {
+    match state.repo().rename_folder(&did, &rkey, &folder).await {
         Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed folder"),
         Err(err) => warn!(%err, %did, %rkey, "PDS folder rename failed"),
     }
@@ -2199,7 +3200,7 @@ async fn delete_folder(
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    match state.sidecar.remove_folder(&did, &rkey).await {
+    match state.repo().remove_folder(&did, &rkey).await {
         Ok(()) => info!(%did, %rkey, "deleted folder record"),
         Err(err) => warn!(%err, %did, %rkey, "PDS folder delete failed"),
     }
@@ -2287,7 +3288,7 @@ async fn login_form(
         if !may_start_oauth(&state, &headers, &handle).await {
             return Redirect::to("/beta/redeem").into_response();
         }
-        return start_oauth(&state, &handle);
+        return start_oauth(&state, &handle).await;
     }
     render(&LoginTemplate {
         repo_url: REPO_URL,
@@ -2310,7 +3311,7 @@ async fn login_submit(
     if !may_start_oauth(&state, &headers, handle).await {
         return Redirect::to("/beta/redeem").into_response();
     }
-    start_oauth(&state, handle)
+    start_oauth(&state, handle).await
 }
 
 /// Whether this visitor is allowed to *start* the OAuth handshake. The gate
@@ -2384,11 +3385,81 @@ where
     }
 }
 
-/// Redirect the browser to the sidecar's public `/login` for `handle`.
-fn start_oauth(state: &AppState, handle: &str) -> Response {
-    let url = state.sidecar.login_url(handle, None);
-    info!(%handle, "redirecting to OAuth sidecar login");
-    Redirect::to(&url).into_response()
+/// Begin the OAuth handshake for `handle`, on whichever backend is live.
+///
+/// **On `form-action 'self'` and this redirect.** The Rust arm answers a form
+/// POST with a redirect straight to the PDS — cross-origin — while the app's CSP
+/// carries `form-action 'self'`. Browsers have historically disagreed about
+/// whether that directive applies to redirects following a form submission, and
+/// if it did here, login would break in a browser while every test passed.
+///
+/// It does not, and the evidence is the SIDECAR path, which is live in
+/// production today: `POST /login` -> 303 to the same-origin `/oauth/login` ->
+/// 302 to the PDS, cross-origin, under this same CSP. A browser checking the
+/// whole redirect chain would already be blocking that. One checking only the
+/// form's action URL sees `/login` in both cases. The two arms differ only in
+/// how many same-origin hops precede the cross-origin one, so any policy that
+/// permits the sidecar flow permits this one.
+///
+/// The two arms differ in SHAPE, not just in implementation. The sidecar owns
+/// its own `/login` and its own callback, so starting a login is one redirect
+/// and nothing is stored here. The Rust backend pushes the authorization
+/// request itself, which means this app now holds the pending login — and must
+/// set the browser-binding cookie that the callback will be checked against.
+async fn start_oauth(state: &AppState, handle: &str) -> Response {
+    match state.config.repo_backend {
+        crate::metrics::Backend::Sidecar => {
+            let url = state.sidecar.login_url(handle, None);
+            info!(%handle, "redirecting to OAuth sidecar login");
+            Redirect::to(&url).into_response()
+        }
+        crate::metrics::Backend::Rust => {
+            let Some(runtime) = state.oauth.as_deref() else {
+                warn!("the rust backend is live but its OAuth runtime is absent");
+                return login_error("Login is not available right now.");
+            };
+            match crate::oauth::login::start(
+                runtime,
+                &state.http,
+                &state.db,
+                handle,
+                crate::store::now_unix(),
+            )
+            .await
+            {
+                Ok(started) => {
+                    info!(%handle, "pushed authorization request; redirecting to the PDS");
+                    let mut resp = Redirect::to(&started.authorize_url).into_response();
+                    set_cookie(
+                        &mut resp,
+                        &cookie::sign_value(
+                            OAUTH_BINDING_COOKIE,
+                            &started.binding_token,
+                            &state.config.cookie_secret,
+                            OAUTH_BINDING_MAX_AGE_SECS,
+                        ),
+                    );
+                    resp
+                }
+                Err(err) => {
+                    // The handle the user typed is logged; the error is not shown
+                    // to them verbatim, since it can name internal hosts.
+                    warn!(%err, %handle, "could not start the OAuth login");
+                    login_error("Could not start login for that handle.")
+                }
+            }
+        }
+    }
+}
+
+/// Clear the browser-binding cookie. Called on every terminal outcome of a
+/// callback, successful or not: the pending row is consumed either way, so a
+/// lingering cookie can only ever match a login that no longer exists.
+fn clear_binding_cookie(resp: &mut Response) {
+    set_cookie(
+        resp,
+        &format!("{OAUTH_BINDING_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+    );
 }
 
 /// Form body for `POST /login`.
@@ -2398,10 +3469,29 @@ struct LoginForm {
 }
 
 /// Query for `GET /oauth/callback`.
+///
+/// Carries BOTH shapes, because the two backends deliver different things to
+/// the same URL: the sidecar hands back a one-shot `session_id` it has already
+/// exchanged, while the PDS redirects here directly with `code`/`state`/`iss`
+/// for this app to exchange itself. Which fields are populated is decided by
+/// which backend started the login, not by which is live now — so a flip with a
+/// login already in flight still lands in the right arm.
 #[derive(Debug, Deserialize, Default)]
 struct CallbackQuery {
+    /// Sidecar backend: the handoff id.
     #[serde(default)]
     session_id: Option<String>,
+    /// Rust backend: the authorization code and its envelope.
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    iss: Option<String>,
+    /// JARM, which is not supported — carried only so it can be refused
+    /// explicitly rather than read as "no code".
+    #[serde(default)]
+    response: Option<String>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -2419,26 +3509,123 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    if let Some(err) = q.error {
-        let desc = q.error_description.unwrap_or_default();
-        warn!(error = %err, desc = %desc, "OAuth callback returned an error");
-        return login_error(&format!("Login failed: {err}"));
+    // An error response is handled by the SAME arm that would have handled a
+    // success, not short-circuited here.
+    //
+    // Returning early looks obviously right and is wrong on the Rust path: it
+    // skips `verify_callback`, which validates `iss` BEFORE reporting the error
+    // precisely because RFC 9207 §2.4 says a client "MUST NOT assume that the
+    // error originates from the intended AS". It also leaves the pending row
+    // unconsumed, so a `state` that has already produced a callback stays usable
+    // until it expires.
+    //
+    // The sidecar arm has no such check to reach, so it is short-circuited
+    // below, preserving exactly what it did before.
+    // **The arm is chosen by what the SERVER knows, not by what the caller
+    // sent.** A `session_id` in the query used to select the sidecar arm on its
+    // own — so a caller could pick which code path ran, and the sidecar arm has
+    // no browser-binding check at all. It also short-circuited the error path
+    // below, skipping the `iss` validation.
+    //
+    // Requiring the Rust runtime to be absent, or a sidecar backend to be the
+    // configured one, means the selection follows this deployment's own
+    // configuration. A login started before a flip still completes, because the
+    // Rust arm is reached whenever the Rust runtime exists and can match the
+    // `state` against a pending row it actually wrote.
+    // The sidecar hands off in TWO shapes, not one: `?session_id=…` on success
+    // and `?error=…&error_description=…` on its own failure. Keying only on
+    // `session_id` sent the failure shape down the Rust arm, which then failed
+    // with "no `state`" and replaced the specific reason with a generic one —
+    // and `error_description` is exactly what the sidecar Caddy routing matches
+    // to send that request here in the first place.
+    let sidecar_shape =
+        q.session_id.as_deref().is_some_and(|s| !s.is_empty()) || q.error_description.is_some();
+    let sidecar_handoff = sidecar_shape
+        && (state.oauth.is_none() || state.config.repo_backend == crate::metrics::Backend::Sidecar);
+    if let Some(err) = q.error.clone() {
+        // **Neither the code nor the description is echoed as sent.**
+        //
+        // Both are server-controlled free text arriving on a public GET, so
+        // anyone who can make a browser fetch this URL chooses them. The raw
+        // `error` used to go into a `warn!` AND into the rendered login page,
+        // and `error_description` — arbitrary text, newlines included — went
+        // into the log verbatim: a log-injection surface on one side and
+        // attacker-chosen copy in the product's own voice on the other.
+        //
+        // `oauth::flow` already decided this exact question for the Rust arm:
+        // reduce the code to a known slug, drop the description entirely. That
+        // reasoning is not specific to which arm handles the callback, and this
+        // one simply never got the same treatment. The description's LENGTH is
+        // kept, because "the server sent a 4 KB explanation" is occasionally
+        // worth knowing and cannot be used to inject anything.
+        let slug = crate::oauth::flow::known_error_slug(&err);
+        warn!(
+            error = slug,
+            desc_len = q.error_description.as_deref().map_or(0, str::len),
+            "OAuth callback returned an error"
+        );
+        if sidecar_handoff || state.oauth.is_none() {
+            return login_error(&format!("Login failed: {slug}"));
+        }
+        // Fall through: the Rust arm consumes the pending row and validates
+        // `iss` against it, and reports the failure afterwards.
     }
 
-    let session_id = match q.session_id {
-        Some(s) if !s.is_empty() => s,
-        _ => return login_error("Login failed: the callback carried no session."),
-    };
-
-    let session = match state.sidecar.resolve_session(&session_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            warn!("OAuth callback session_id did not resolve (expired/unknown)");
-            return login_error("Login session expired — please try again.");
+    // Which arm runs is decided by WHAT ARRIVED, not by which backend is
+    // currently selected: a login started before a flip must still complete.
+    let session = if sidecar_handoff {
+        let session_id = q.session_id.clone().unwrap_or_default();
+        match state.sidecar.resolve_session(&session_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                warn!("OAuth callback session_id did not resolve (expired/unknown)");
+                return login_error("Login session expired — please try again.");
+            }
+            Err(err) => {
+                warn!(%err, "failed to resolve OAuth session via the sidecar");
+                return login_error("Login failed talking to the auth service.");
+            }
         }
-        Err(err) => {
-            warn!(%err, "failed to resolve OAuth session via the sidecar");
-            return login_error("Login failed talking to the auth service.");
+    } else {
+        let Some(runtime) = state.oauth.as_deref() else {
+            warn!("an OAuth callback arrived with no sidecar session and no Rust runtime");
+            return login_error("Login failed: this login could not be completed.");
+        };
+        let params = crate::oauth::flow::CallbackParams {
+            code: q.code.clone(),
+            state: q.state.clone(),
+            iss: q.iss.clone(),
+            // Passed through, NOT dropped: `verify_callback` checks `iss`
+            // against the pending row's issuer before it reports the error, and
+            // it cannot do that for an error it never sees.
+            error: q.error.clone(),
+            error_description: q.error_description.clone(),
+            response: q.response.clone(),
+        };
+        let binding =
+            cookie::verify_value(&headers, OAUTH_BINDING_COOKIE, &state.config.cookie_secret);
+        match crate::oauth::login::complete(
+            runtime,
+            &state.http,
+            &state.db,
+            &params,
+            binding.as_deref(),
+            crate::store::now_unix(),
+        )
+        .await
+        {
+            Ok(done) => crate::atproto::SidecarSession {
+                did: done.did,
+                handle: done.handle,
+            },
+            Err(err) => {
+                // Never echoed to the browser: the message can name the issuer,
+                // the PDS, and why a binding check failed.
+                warn!(%err, "could not complete the OAuth callback");
+                let mut resp = login_error("Login failed — please try again.");
+                clear_binding_cookie(&mut resp);
+                return resp;
+            }
         }
     };
 
@@ -2495,10 +3682,48 @@ async fn oauth_callback(
 
     let mut resp = Redirect::to("/").into_response();
     set_cookie(&mut resp, &cookie);
+    clear_binding_cookie(&mut resp);
     if clear_invite {
         clear_invite_cookie(&mut resp);
     }
     resp
+}
+
+/// Revoke a DID's OAuth session on BOTH backends, best-effort.
+///
+/// Not "whichever backend is live": during a cutover a user's tokens can be in
+/// either store — they logged in under one backend and are logging out under
+/// the other. Revoking only the live one would leave a live refresh token
+/// behind in the other, which is the exact failure sign-out exists to prevent,
+/// and it would be invisible because the sign-out itself looks successful.
+///
+/// Both arms are best-effort. The caller has already decided to sign the user
+/// out, and a network failure must not trap them in a half-logged-out state.
+async fn revoke_everywhere(state: &AppState, did: &str) {
+    match state.sidecar.revoke_session(did).await {
+        Ok(res) => info!(%did, revoked = res.revoked, "sidecar session revoked"),
+        Err(err) => warn!(%did, %err, "sidecar revoke failed; continuing"),
+    }
+
+    if let Some(runtime) = state.oauth.as_deref() {
+        let outcome = crate::oauth::revoke::sign_out_discovering(
+            runtime,
+            &state.http,
+            &state.db,
+            did,
+            crate::store::now_unix(),
+        )
+        .await;
+        match outcome {
+            crate::oauth::revoke::Revocation::Revoked => {
+                info!(%did, "rust OAuth session revoked at the PDS")
+            }
+            crate::oauth::revoke::Revocation::NoSession => {}
+            crate::oauth::revoke::Revocation::Failed(reason) => {
+                warn!(%did, %reason, "rust OAuth revoke failed; the local session is gone regardless")
+            }
+        }
+    }
 }
 
 /// `POST /logout` — end the session everywhere, not just in this browser.
@@ -2516,14 +3741,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         // revoke; the dev-DID fallback never handshook the sidecar.
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
-            match state.sidecar.revoke_session(&user.did).await {
-                Ok(res) => {
-                    info!(did = %user.did, revoked = res.revoked, "logout: sidecar session revoked");
-                }
-                Err(err) => {
-                    warn!(did = %user.did, %err, "logout: sidecar revoke failed; clearing cookie anyway");
-                }
-            }
+            revoke_everywhere(&state, &user.did).await;
         }
     }
     let mut resp = Redirect::to("/login").into_response();
@@ -2594,12 +3812,7 @@ async fn account_delete(
 
     // 2. Revoke the OAuth session at the sidecar/PDS (best-effort — the local
     //    rows are already gone; a network blip must not block the sign-out).
-    match state.sidecar.revoke_session(&did).await {
-        Ok(res) => info!(%did, revoked = res.revoked, "account/delete: sidecar session revoked"),
-        Err(err) => {
-            warn!(%did, %err, "account/delete: sidecar revoke failed; local data already purged")
-        }
-    }
+    revoke_everywhere(&state, &did).await;
 
     // 3. Drop the in-memory session and clear the cookie: sign the user out.
     if let Some(sid) = user.sid {
@@ -2759,6 +3972,91 @@ struct MintQuery {
 
 /// `POST /admin/invites?n=N` — mint N invite codes.
 ///
+/// `GET /oauth/client-metadata.json` — the client's published identity.
+///
+/// **This URL IS the `client_id`.** The PDS fetches it during every login and
+/// caches it against every existing grant, so it must keep answering at exactly
+/// this path across the cutover — the sidecar serves the same document at the
+/// same URL today, proxied by the edge.
+///
+/// Served whatever backend is live: a request that arrives here is from a PDS
+/// resolving our identity, and it has no idea which of our two implementations
+/// is currently answering repo calls.
+async fn oauth_client_metadata(State(state): State<AppState>) -> Response {
+    let Some(runtime) = state.oauth.as_deref() else {
+        // The sidecar is serving this path in front of us, or nothing is.
+        return (StatusCode::NOT_FOUND, "no client metadata\n").into_response();
+    };
+    axum::Json(crate::oauth::metadata::client_metadata(&runtime.client)).into_response()
+}
+
+/// `GET /oauth/jwks.json` — the client's public signing key.
+///
+/// Production only. The localhost dev client is a PUBLIC client: it registers no
+/// key and signs no assertions, so publishing a JWKS there would advertise a
+/// credential that is never used — and would make a dev deployment look like a
+/// confidential client to anyone reading it.
+async fn oauth_jwks(State(state): State<AppState>) -> Response {
+    let Some(runtime) = state.oauth.as_deref() else {
+        return (StatusCode::NOT_FOUND, "no jwks\n").into_response();
+    };
+    match runtime.client_key.as_ref() {
+        Some(key) => match key.jwks_document() {
+            Ok(doc) => axum::Json(doc).into_response(),
+            Err(err) => {
+                warn!(%err, "could not render the client JWKS");
+                (StatusCode::INTERNAL_SERVER_ERROR, "jwks unavailable\n").into_response()
+            }
+        },
+        None => (StatusCode::NOT_FOUND, "this client publishes no jwks\n").into_response(),
+    }
+}
+
+/// `GET /admin/metrics` — repo-op latency for both backends, as plain text.
+///
+/// Admin-gated on the same rule as the invite minter: the table names every
+/// operation the reader performs and how often each fails, which is an
+/// operational picture rather than public information.
+///
+/// Text, not JSON or HTML: it is read by a person deciding whether the cutover
+/// is safe, and the comparison is two rows side by side.
+async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let did = match current_did(&state, &headers).await {
+        Some(d) => d,
+        None => return (StatusCode::UNAUTHORIZED, "sign in first\n").into_response(),
+    };
+    if !state.config.admin_seed_dids().iter().any(|d| d == &did) {
+        warn!(%did, "admin metrics denied: not an admin-seed DID");
+        return (StatusCode::FORBIDDEN, "not an admin\n").into_response();
+    }
+
+    // Flush first, so the table includes this process's traffic up to now.
+    // Then read the PERSISTED rows, which is the only place both backends can
+    // appear at once -- a flip is a restart, and in-process memory only ever
+    // holds the backend currently running.
+    if let Err(err) =
+        crate::metrics::flush(&state.metrics, &state.db, crate::store::now_unix()).await
+    {
+        warn!(%err, "could not flush repo timings before rendering");
+    }
+    let rows = match crate::metrics::persisted_rows(&state.db).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(%err, "could not read persisted repo timings");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n").into_response();
+        }
+    };
+
+    // The live backend is named at the top: a table of two populated rows is
+    // ambiguous about which one is currently serving users.
+    let body = format!(
+        "live backend: {}\n\n{}",
+        state.config.repo_backend.as_str(),
+        crate::metrics::render(&rows),
+    );
+    (StatusCode::OK, body).into_response()
+}
+
 /// Authorized ONLY for a live session whose DID is in the `ALLOWED_DIDS` admin
 /// seed (`config.admin_seed_dids`). Returns the freshly-minted codes as
 /// newline-separated `text/plain`. Deliberately minimal (no HTML UI).
@@ -3234,7 +4532,22 @@ async fn import_opml(
         }
     }
 
-    let feeds = opml::parse_opml(&opml_text).unwrap_or_default();
+    // A parse FAILURE and an empty-but-valid file are different things, and
+    // `unwrap_or_default` collapsed them: a malformed export was reported to the
+    // reader as "No feeds found in that OPML", which sends them looking at their
+    // old reader for feeds that are right there in the file.
+    let feeds =
+        match opml::parse_opml(&opml_text) {
+            Ok(feeds) => feeds,
+            Err(err) => {
+                warn!(%err, %did, "OPML import could not parse the uploaded file");
+                return Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("That file could not be read as OPML. Export it again from your other reader?")
+            ))
+                .into_response());
+            }
+        };
     if feeds.is_empty() {
         info!(%did, "OPML import found no feeds");
         return Ok(
@@ -3249,7 +4562,7 @@ async fn import_opml(
     let mut folder_uris: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     // Reuse existing folders where the name already exists.
-    if let Ok(existing) = state.sidecar.list_folders_sorted(&did).await {
+    if let Ok(existing) = state.repo().list_folders_sorted(&did).await {
         for (rkey, folder) in existing {
             folder_uris
                 .entry(folder.name.clone())
@@ -3268,7 +4581,7 @@ async fn import_opml(
             continue;
         }
         let folder = Folder::new(name.clone(), now.clone());
-        match state.sidecar.add_folder(&did, &folder).await {
+        match state.repo().add_folder(&did, &folder).await {
             Ok(rkey) => {
                 folder_uris.insert(name, folder_uri(&did, &rkey));
             }
@@ -3312,7 +4625,21 @@ async fn import_opml(
 
     let mut subs = Vec::with_capacity(feeds.len());
     let mut skipped_private: Vec<String> = Vec::new();
+    // Imported into the PDS but not cached locally, so not pollable until the
+    // next import touches them. Counted rather than only logged — see below.
+    let mut uncached: usize = 0;
     for f in &feeds {
+        // `xmlUrl` is whatever the uploaded file says, and nothing on this path
+        // ever parsed it — the single-add path can't reach here because
+        // `resolve_feed_url` must parse AND successfully fetch first. So
+        // `javascript:alert(1)` and `file:///etc/passwd` were both accepted,
+        // cached, and published as records to the user's PUBLIC repo. Note that
+        // `classify_feed_privacy` does not catch these: both parse cleanly, and
+        // it returns `Public` for anything unparseable by design.
+        if !feed::is_storable_feed_url(&f.feed_url) {
+            info!(%did, "skipped an OPML entry whose xmlUrl is not an http(s) URL");
+            continue;
+        }
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
             info!(feed = %f.feed_url, %reason, %did, "skipped private/paid feed on OPML import (not stored)");
             // Report by title where we have one, else the (public-safe) host.
@@ -3371,7 +4698,12 @@ async fn import_opml(
             .as_ref()
             .and_then(|name| folder_uris.get(name).cloned());
         subs.push(sub);
-        let _ = store::upsert_feed(
+        // Same support ticket as the single-add path: no `feeds` row means the
+        // poller never selects this subscription, so the import looks like it
+        // worked and the feed silently never updates. Counted as well as logged,
+        // because one line per feed in a 200-feed import is not something anyone
+        // reads — the count goes to the reader.
+        if let Err(err) = store::upsert_feed(
             pool,
             &store::NewFeed {
                 url: f.feed_url.clone(),
@@ -3380,18 +4712,48 @@ async fn import_opml(
                 ..Default::default()
             },
         )
-        .await;
+        .await
+        {
+            warn!(%err, %did, url = %f.feed_url, "OPML import could not cache a feed; \
+                                                  it will not be polled");
+            uncached += 1;
+        }
     }
 
-    match state.sidecar.add_subscriptions_bulk(&did, &subs).await {
+    // **A failed PDS write is not an import.**
+    //
+    // The subscriptions live in the reader's repo; a local `feeds` row is just a
+    // poller hint. This used to `warn!` and then report "Imported N feeds"
+    // regardless, so a total failure read as a total success — and the reader
+    // would only discover otherwise on their next visit, with an empty sidebar.
+    let pds_written = match state.repo().add_subscriptions_bulk(&did, &subs).await {
         Ok(rkeys) => {
-            info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)")
+            info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)");
+            true
         }
-        Err(err) => warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)"),
+        Err(err) => {
+            warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)");
+            false
+        }
+    };
+    if !pds_written {
+        return Ok(Redirect::to(&format!(
+            "/?flash={}",
+            qenc(
+                "Could not save those subscriptions to your PDS, so nothing was imported. \
+                 Try again in a moment."
+            )
+        ))
+        .into_response());
     }
 
     // Report the import count, plus any private/paid feeds skipped as unsupported.
     let mut flash = format!("Imported {} feeds", subs.len());
+    if uncached > 0 {
+        flash.push_str(&format!(
+            ". {uncached} of them could not be cached locally and may not update until the next import."
+        ));
+    }
     if trimmed_over_cap > 0 {
         flash.push_str(&format!(
             ". {trimmed_over_cap} feed(s) not imported: your subscription limit ({sub_cap}) was reached."
@@ -3432,12 +4794,12 @@ async fn export_opml(
     };
 
     let subs = state
-        .sidecar
+        .repo()
         .list_subscriptions_sorted(&did)
         .await
         .unwrap_or_default();
     let folders = state
-        .sidecar
+        .repo()
         .list_folders_sorted(&did)
         .await
         .unwrap_or_default();
@@ -3851,13 +5213,17 @@ mod cookie {
 // Small store helpers local to the web layer
 // ---------------------------------------------------------------------------
 
-/// Fetch a single cached entry by id.
 /// Fetch a single cached entry by id — SCOPED to `did`'s subscriptions.
 ///
 /// Returns `None` (→ 404 at the handler) if the entry does not exist OR if
 /// `did` does not subscribe to its feed. This is the per-DID read gate for the
 /// `GET /entries/:id` reader and the htmx row rebuild: the shared cache is
 /// deduped by URL, but no DID can read another DID's cached article.
+///
+/// **The only `SELECT e.*` left, and deliberately so.** This is the one surface
+/// that renders `content_html`, and it fetches exactly one row. The list views
+/// go through [`store::list_entries`], which is both paged and body-free — see
+/// [`store::EntryListRow`] for why they had to stop sharing this projection.
 async fn get_entry_by_id(
     pool: &store::Pool,
     did: &str,
@@ -3945,6 +5311,8 @@ async fn build_entry_row(
         read,
         starred,
         link: format!("/entries/{id}"),
+        cached: true,
+        rkey: String::new(),
     }))
 }
 
@@ -4089,6 +5457,94 @@ mod tests {
         });
         let sc = cookie::sign_session(&sid, &state.config.cookie_secret);
         sc.split(';').next().unwrap().to_string()
+    }
+
+    /// The bucket map is bounded by COUNT, not only by idle time. An hour is a
+    /// long time to accept distinct source IPs on two unauthenticated guarded
+    /// routes.
+    #[test]
+    fn the_rate_limit_map_is_bounded() {
+        let rl = RateLimiter::shared();
+        let now = Instant::now();
+        for i in 0..(MAX_RATE_BUCKETS + 2_000) {
+            // Distinct IPv6 addresses, all "seen" at increasing times so the LRU
+            // ordering below is well-defined.
+            let ip: IpAddr = format!("2001:db8::{i:x}").parse().unwrap();
+            rl.check_at(ip, now + Duration::from_millis(i as u64));
+        }
+        let len = rl.inner.lock().unwrap().buckets.len();
+        assert!(
+            len <= MAX_RATE_BUCKETS,
+            "the rate-limit map grew to {len}, past its {MAX_RATE_BUCKETS} cap"
+        );
+    }
+
+    /// Eviction must not hand a throttled attacker a fresh burst.
+    ///
+    /// The bound is LRU, so the one bucket an attacker can never evict is their
+    /// own — it is the most recently touched thing in the map. If this inverted,
+    /// the size cap would become a rate-limit bypass: spray addresses until the
+    /// map overflows, then resume.
+    #[test]
+    fn flooding_the_map_does_not_reset_the_flooders_own_bucket() {
+        let rl = RateLimiter::shared();
+        let base = Instant::now();
+        let attacker: IpAddr = "203.0.113.7".parse().unwrap();
+        // Nanosecond steps: enough to keep the LRU ordering strictly increasing,
+        // far too little for `RATE_REFILL_PER_SEC` to hand back a token. A
+        // millisecond step made the whole flood take a second, and the refill —
+        // working correctly — then looked exactly like an eviction bypass.
+        let at = |n: u64| base + Duration::from_nanos(n);
+
+        // Spend the burst. `RATE_BURST` allowed, then refused.
+        for i in 0..(RATE_BURST as u64) {
+            assert!(rl.check_at(attacker, at(i)));
+        }
+        assert!(
+            !rl.check_at(attacker, at(RATE_BURST as u64)),
+            "burst was not exhausted; the rest of this test proves nothing"
+        );
+
+        // Now overflow the map from other addresses, interleaving the attacker
+        // so their bucket stays hot — the realistic shape of the attack.
+        for i in 0..(MAX_RATE_BUCKETS + 2_000) {
+            let t = at(100 + i as u64 * 2);
+            let ip: IpAddr = format!("2001:db8:1::{i:x}").parse().unwrap();
+            rl.check_at(ip, t);
+            assert!(
+                !rl.check_at(attacker, t),
+                "the attacker got a token back after evictions at i={i}"
+            );
+        }
+    }
+
+    /// The idle sweep is amortised, not per-request. It used to be an O(n) scan
+    /// of the whole map on every guarded request, on one shared core.
+    #[test]
+    fn the_idle_sweep_does_not_run_on_every_request() {
+        let rl = RateLimiter::shared();
+        let start = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+
+        rl.check_at(a, start);
+        // `b` arrives an hour later: `a` is now idle past `RATE_IDLE_EVICT`, but
+        // the sweep interval has elapsed too, so this request does sweep it.
+        rl.check_at(b, start + RATE_IDLE_EVICT + Duration::from_secs(1));
+        assert!(
+            !rl.inner.lock().unwrap().buckets.contains_key(&a),
+            "an idle bucket survived a sweep that was due"
+        );
+
+        // A second request moments later must NOT re-sweep — `b` is still there,
+        // and the recorded sweep time must not have moved.
+        let before = rl.inner.lock().unwrap().last_sweep;
+        rl.check_at(b, start + RATE_IDLE_EVICT + Duration::from_secs(2));
+        assert_eq!(
+            rl.inner.lock().unwrap().last_sweep,
+            before,
+            "the sweep ran again within the interval"
+        );
     }
 
     #[test]
@@ -5427,7 +6883,15 @@ mod tests {
         assert!(set_cookie.contains("Max-Age=0"), "cookie must be cleared");
 
         // The sidecar revoke was called for exactly this DID.
-        let revoked_did = revoke_rx.await.unwrap();
+        //
+        // BOUNDED. A bare `await` here meant a broken `revoke_everywhere` — one
+        // that simply never called the sidecar — hung this test forever instead
+        // of failing it: a wedged CI job rather than a red one, which is the
+        // worse of the two signals because nobody reads it as a defect.
+        let revoked_did = tokio::time::timeout(std::time::Duration::from_secs(10), revoke_rx)
+            .await
+            .expect("the sidecar revoke never fired; revoke_everywhere did not call it")
+            .unwrap();
         assert_eq!(
             revoked_did, did,
             "sidecar revoke must fire for the caller DID"
@@ -5774,6 +7238,139 @@ mod tests {
         );
     }
 
+    /// `GET /` renders at most one page of rows and offers a way to the rest.
+    ///
+    /// The handler used to materialize EVERY unread entry — `SELECT e.*`, no
+    /// `LIMIT`, article bodies included — and hand the lot to the template. With
+    /// 250 entries that is the whole list in one response; with a real backlog on
+    /// a 512 MB box it is the OOM the operator review flagged. Asserts the page
+    /// is capped, the heading still reports the true total, and page 2 is
+    /// reachable and disjoint.
+    #[tokio::test]
+    async fn the_reader_index_pages_instead_of_rendering_everything() {
+        let did = "did:plc:pager";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://pager.example/feed.xml".to_string(),
+                title: Some("Pager".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let total = 250_usize;
+        let entries: Vec<store::NewEntry> = (0..total)
+            .map(|i| store::NewEntry {
+                guid: format!("p-{i:04}"),
+                url: Some(format!("https://pager.example/{i}")),
+                title: Some(format!("Article {i:04}")),
+                published: Some(format!("2026-07-{:02}T00:00:00Z", (i % 28) + 1)),
+                content_html: Some("x".repeat(4_000)),
+                ..Default::default()
+            })
+            .collect();
+        store::insert_entries(&state.db, feed, &entries, 0)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let get = |uri: &str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            let uri = uri.to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        };
+
+        let page1 = get("/").await;
+        // One `<li class="entry…>` per rendered row. Counting "/entries/" would
+        // over-count: each row carries several (the link plus the read/star
+        // forms).
+        let rows1 = page1.matches("<li class=\"entry").count();
+        assert!(
+            rows1 <= ENTRIES_PER_PAGE as usize,
+            "page 1 rendered {rows1} entry links; the list is unbounded"
+        );
+        assert!(
+            rows1 > 0,
+            "page 1 rendered nothing at all: the page bound swallowed the list"
+        );
+        // The count is the TRUE total, not the page size — otherwise paging
+        // would quietly relabel a 250-entry backlog as a 100-entry one.
+        assert!(
+            page1.contains("250 entries"),
+            "heading must report the full total, not the page"
+        );
+        assert!(
+            page1.contains("page=2"),
+            "no way to reach the rest of the list: {}",
+            &page1[..page1.len().min(400)]
+        );
+        // The body never belongs in a list response.
+        assert!(
+            !page1.contains(&"x".repeat(4_000)),
+            "the list response carried an article body"
+        );
+
+        let page2 = get("/?page=2").await;
+        assert!(
+            page2.matches("<li class=\"entry").count() > 0,
+            "page 2 rendered no rows at all"
+        );
+        assert!(
+            page2.contains("page=1") || page2.contains("Newer"),
+            "page 2 offers no way back"
+        );
+        // Disjoint: an article on page 1 must not reappear on page 2.
+        let first_title = (0..total)
+            .map(|i| format!("Article {i:04}"))
+            .find(|t| page1.contains(t))
+            .expect("page 1 shows at least one titled article");
+        assert!(
+            !page2.contains(&first_title),
+            "{first_title} appears on both pages"
+        );
+
+        // A page past the end must not be a dead end. The empty state renders
+        // instead of the pager, so an out-of-range page would leave a reader
+        // with no link back — reachable by typing a number, and reachable
+        // WITHOUT typing anything by paging to the end and then marking entries
+        // read, which shrinks the list under the URL already in the address bar.
+        let past_end = get("/?page=999").await;
+        assert!(
+            past_end.matches("<li class=\"entry").count() > 0,
+            "an out-of-range page rendered nothing and offered no way back"
+        );
+        assert!(
+            past_end.contains("page=2"),
+            "the clamped page offers no pager"
+        );
+    }
+
     /// Reader-view mark-read (a request tagged `X-FR-Reader: 1`) must return the
     /// out-of-band action-bar fragment with FRESHLY re-read state so a second
     /// keypress reverses the toggle: `hx-swap-oob="outerHTML"` is present, and
@@ -6057,9 +7654,16 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(
-            loc, "/",
-            "retitle of an existing feed must succeed, got {loc}"
+        // What this test is about is the CAP, so assert on the cap. It used to
+        // assert `loc == "/"`, which passed only because a failed PDS write was
+        // silently reported as success — there is no PDS in this test. Now that
+        // the handler tells the truth, the plain "/" redirect is the
+        // everything-worked case and is not reachable here; the property that
+        // matters is that the request was not refused by the feed-capacity
+        // guard, and that no row was added.
+        assert!(
+            !loc.contains("feed%20capacity"),
+            "retitle of an EXISTING feed must not be refused by the global cap, got {loc}"
         );
         assert_eq!(
             store::count_feeds(&state.db).await.unwrap(),
@@ -6184,5 +7788,867 @@ mod tests {
             html.contains(r#"<option value="" selected>No folder</option>"#),
             "loose feed must pre-select 'No folder': {html}"
         );
+    }
+
+    /// **The public stats page carries no user data.**
+    ///
+    /// It is reachable by anyone, so the thing worth pinning is what it does
+    /// NOT say: nothing about how many people use the instance, nothing about
+    /// which feeds fail, nothing about who reads what.
+    #[tokio::test]
+    async fn the_public_stats_page_exposes_no_user_data() {
+        let state = test_state(&[]).await;
+        store::ensure_seed(&state.db, &["did:plc:someone".to_string()])
+            .await
+            .unwrap();
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "stats must be public");
+
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Structural checks, not word checks. The page's own prose says it
+        // publishes no error rates, so searching for that PHRASE finds the
+        // disclaimer rather than a leak — the first version of this test failed
+        // on exactly that. What matters is whether identifiers or the
+        // admin-only figures are present.
+        assert!(
+            !body.contains("did:"),
+            "the public stats page leaked an identifier"
+        );
+        for admin_only in ["errp50ms", "p95ms", "live backend", "ok_count"] {
+            assert!(
+                !body.contains(admin_only),
+                "the public page is showing the admin metrics column {admin_only:?}"
+            );
+        }
+        // And it does render the aggregate it exists for.
+        assert!(body.contains("Feeds tracked"));
+        assert!(body.contains("Waiting to be polled"));
+    }
+
+    /// **The two states that stop feeds updating must be visible.**
+    ///
+    /// `overdue` and `polled_last_hour` move in BOTH and distinguish neither —
+    /// and `overdue` moves the WRONG WAY for backoff, because backoff is applied
+    /// by pushing `next_poll` forward, so a feed failing every fetch drops out of
+    /// the backlog and makes the page read healthier. That inversion is what this
+    /// test pins: a broken feed must raise a number, not lower one.
+    #[tokio::test]
+    async fn stats_distinguishes_backoff_from_a_watermark_pause() {
+        let state = test_state(&[]).await;
+        // Three feeds: one healthy, one flaky, one long dead.
+        for (url, errors) in [
+            ("https://ok.example/f.xml", 0),
+            ("https://flaky.example/f.xml", 2),
+            ("https://dead.example/f.xml", 9),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    // Pushed forward, exactly as backoff does — so none of these
+                    // are counted as `overdue`.
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..errors {
+                store::bump_feed_errors(&state.db, url).await.unwrap();
+            }
+        }
+
+        let render_stats = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        let body = render_stats(state.clone()).await;
+        assert!(
+            body.contains("Failing"),
+            "backoff is still invisible on the public page"
+        );
+        // 2 failing, 1 of them badly (>= BADLY_BROKEN_ERRORS). Matched on the
+        // value rather than on surrounding whitespace, so re-indenting the
+        // template cannot break this.
+        assert!(
+            body.contains("2, 1 badly"),
+            "expected '2, 1 badly' in the failing row; got:\n{}",
+            body.split("Failing")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
+        // Not paused, and the backlog is genuinely empty — which is exactly the
+        // reading that used to be indistinguishable from healthy.
+        assert!(body.contains("running"), "fetching state not rendered");
+
+        // Now trip the watermark. Nothing in the database changes; only the
+        // recorded runtime state does — which is the whole reason it needed a
+        // home outside the log stream.
+        state.runtime_health.set_watermark(true);
+        let paused = render_stats(state.clone()).await;
+        assert!(
+            paused.contains("paused"),
+            "a watermark pause is still invisible on the public page"
+        );
+
+        // Still no identifiers: these are counts, not feeds.
+        for leak in ["ok.example", "flaky.example", "dead.example", "did:"] {
+            assert!(
+                !paused.contains(leak),
+                "the public page leaked {leak:?} while reporting failures"
+            );
+        }
+    }
+
+    /// `/health` must prove the process can reach its database, and must report
+    /// the loop state without letting it change the status code.
+    #[tokio::test]
+    async fn health_checks_the_database_and_reports_the_loops() {
+        let state = test_state(&[]).await;
+        let body_of = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        };
+
+        // The boot stamp is what `main` sets; the router alone does not, so this
+        // starts "unknown" and the uptime branch below drives it explicitly.
+        state
+            .runtime_health
+            .set_started_at(chrono::Utc::now().timestamp());
+
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("db: ok"),
+            "health did not probe the DB: {body}"
+        );
+        assert!(
+            body.contains("uptime:"),
+            "no uptime — the first thing anyone asks about a container that may \
+             be restarting: {body}"
+        );
+        assert!(body.contains("poller:"), "no scheduler heartbeat: {body}");
+        assert!(body.contains("polling-paused: no"), "{body}");
+        assert!(body.contains("backend:"), "{body}");
+        assert!(body.contains("oauth-runtime:"), "{body}");
+
+        // A watermark pause is REPORTED but must not fail the check. A failed
+        // check DEREGISTERS this machine from the proxy — and it is the only
+        // machine — so it would turn "feeds are behind" into "the site is down"
+        // for as long as the disk stays full.
+        state.runtime_health.set_watermark(true);
+        state.runtime_health.set_schedulers_enabled(true);
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a watermark pause must not fail the liveness check: {body}"
+        );
+        assert!(body.contains("polling-paused: yes"), "{body}");
+        // Schedulers on but no tick yet — and that must not read as "0s ago",
+        // which is the healthiest possible answer to an unanswered question.
+        assert!(
+            body.contains("poller: not-yet-ticked"),
+            "a never-ticked poller must say so: {body}"
+        );
+
+        // A stale heartbeat is likewise reported, not fatal.
+        let stale_after = health_tick_stale_secs(configured_poll_tick());
+        let long_ago = chrono::Utc::now().timestamp() - (stale_after + 60);
+        state.runtime_health.poll_tick_completed(long_ago);
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a stale poller must not 503: {body}"
+        );
+        assert!(body.contains("poller: stale"), "{body}");
+
+        // **A poller that has never ticked stops being benign.**
+        //
+        // In a crash loop with 30 s+ boot cycles the poller never reaches its
+        // first tick, so `not-yet-ticked` was reported forever and the heartbeat
+        // could not detect the one failure mode the startup delays were added
+        // for. It is read against uptime now.
+        state.runtime_health.poll_tick_completed(0); // reset to "never"
+        state
+            .runtime_health
+            .set_started_at(chrono::Utc::now().timestamp() - (HEALTH_FIRST_TICK_GRACE_SECS + 60));
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("poller: stale never-ticked"),
+            "a poller that never ticked long after boot still reads as benign: {body}"
+        );
+
+        // A closed pool is a real outage: nothing can be served, and a restart is
+        // the correct response. THIS is what the status code is for.
+        state.db.close().await;
+        let (status, body) = body_of(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unreachable database must fail the check: {body}"
+        );
+        assert!(body.starts_with("FAIL"), "{body}");
+        // Coarse, not the raw sqlx error: an unauthenticated caller learning
+        // exactly which failure it hit is an attack-progress oracle, and this
+        // endpoint is exempt from the origin lock.
+        assert!(
+            !body.contains("PoolClosed") && !body.contains("sqlx"),
+            "health leaked the raw database error to an unauthenticated caller: {body}"
+        );
+    }
+
+    /// The staleness threshold must track the configured tick.
+    ///
+    /// Hardcoded at 15 minutes, an operator who raised
+    /// `FEATHERREADER_POLL_TICK_SECS` above 900 got a permanent `poller: stale`
+    /// in the body the deployment docs tell them to alert on.
+    #[test]
+    fn the_stale_threshold_follows_the_poll_tick() {
+        // A fast tick keeps the floor — five 60 s ticks is 5 minutes, and
+        // alerting that early would fire on any brief hiccup.
+        assert_eq!(
+            health_tick_stale_secs(Duration::from_secs(60)),
+            HEALTH_TICK_STALE_FLOOR_SECS
+        );
+        // A slow tick raises it, so a legitimately-configured loop is never
+        // permanently "stale".
+        let slow = Duration::from_secs(30 * 60);
+        assert!(
+            health_tick_stale_secs(slow) > slow.as_secs() as i64,
+            "a 30-minute tick must not be stale after one interval"
+        );
+        assert_eq!(health_tick_stale_secs(slow), 30 * 60 * 5);
+        // And it cannot overflow into nonsense on an absurd value.
+        assert!(health_tick_stale_secs(Duration::from_secs(u64::MAX)) > 0);
+    }
+
+    /// `/stats` must distinguish "nothing is polling" from "polling is fine".
+    ///
+    /// `polling_paused` alone rendered "running" for three different states,
+    /// including the two where nothing polls at all — on the page added to
+    /// answer exactly that question.
+    #[tokio::test]
+    async fn stats_does_not_call_a_stopped_poller_running() {
+        let state = test_state(&[]).await;
+        let render = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        // Schedulers never started: not "running".
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("the poller is not running on this instance"),
+            "a disabled poller renders as healthy"
+        );
+
+        // Started, but no tick has finished yet.
+        state.runtime_health.set_schedulers_enabled(true);
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("no poll has finished since this instance booted"),
+            "a poller that has not ticked renders as healthy"
+        );
+
+        // Ticking: running.
+        state
+            .runtime_health
+            .poll_tick_completed(chrono::Utc::now().timestamp());
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("running"),
+            "a healthy poller must read as running"
+        );
+
+        // Paused at the watermark still wins over "running".
+        state.runtime_health.set_watermark(true);
+        let body = render(state.clone()).await;
+        assert!(
+            body.contains("the cache is at its size limit"),
+            "a watermark pause is hidden once the poller is ticking"
+        );
+    }
+
+    /// **An UNMEASURED database must not fail the check.**
+    ///
+    /// `/health` is the one path exempt from the Cloudflare origin lock and
+    /// absent from the rate limiter, and `DbProbeGuard` releases its claim on
+    /// drop WITHOUT recording a verdict — so a cancelled request (a client
+    /// disconnect is enough) leaves the verdict at "none", and a concurrent
+    /// caller reads it. Treating that as a failure turned an unauthenticated
+    /// request into a lever on the only signal the platform acts on. The
+    /// previous version of this code had the opposite bug and reported `ok` for
+    /// a database nothing had read; "unknown" is neither.
+    #[tokio::test]
+    async fn health_reports_an_unmeasured_database_without_failing() {
+        use crate::runtime_health::DbProbe;
+        let state = test_state(&[]).await;
+
+        // Hold the probe claim, exactly as an in-flight request would, and never
+        // record a verdict — the cancelled-request state.
+        let held = state
+            .runtime_health
+            .begin_db_probe()
+            .unwrap_or_else(|_| panic!("a fresh RuntimeHealth must grant the first claim"));
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        drop(held);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unmeasured database failed the check, which an unauthenticated \
+             caller can cause on demand: {body}"
+        );
+        assert!(
+            body.contains("db: unknown"),
+            "the unmeasured state must still be REPORTED: {body}"
+        );
+        assert!(!body.starts_with("FAIL"), "{body}");
+
+        // And a measured failure still does fail it — the distinction is the
+        // whole point, not an excuse to never 503.
+        state
+            .runtime_health
+            .begin_db_probe()
+            .unwrap_or_else(|_| panic!("claim"))
+            .record(DbProbe::Failed("unavailable".to_string()));
+        state.db.close().await;
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a measured database failure must still fail the check"
+        );
+    }
+
+    /// **The probe must read a real page.**
+    ///
+    /// `SELECT 1` compiles to `Init/Integer/ResultRow/Halt` — no `OpenRead`, so
+    /// it never touches a b-tree and returns success against a corrupted
+    /// database. Asserted by asking SQLite what the statement actually compiles
+    /// to, so it survives someone "simplifying" the query later.
+    #[tokio::test]
+    async fn the_health_probe_opens_a_real_table() {
+        use sqlx::Row;
+        let state = test_state(&[]).await;
+        // `EXPLAIN` lists the VM program; the `opcode` column is the second.
+        let opcodes = |sql: &'static str| {
+            let db = state.db.clone();
+            async move {
+                sqlx::query(sql)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("opcode"))
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        let probe = opcodes("EXPLAIN SELECT 1 FROM feeds LIMIT 1").await;
+        assert!(
+            probe.iter().any(|op| op == "OpenRead"),
+            "the health probe reads no page; it cannot detect a broken database: {probe:?}"
+        );
+        // And the bare form genuinely does not, which is the whole point.
+        let bare = opcodes("EXPLAIN SELECT 1").await;
+        assert!(
+            !bare.iter().any(|op| op == "OpenRead"),
+            "premise check failed: bare SELECT 1 now reads a page: {bare:?}"
+        );
+    }
+
+    /// A fresh instance says "never", not "0" — which would read as "polled
+    /// just now", the opposite of the truth.
+    #[test]
+    fn an_instance_that_has_never_polled_says_so() {
+        assert_eq!(humanise_ago(None), "never");
+        assert_eq!(humanise_ago(Some(0)), "0s ago");
+        assert_eq!(humanise_ago(Some(59)), "59s ago");
+        assert_eq!(humanise_ago(Some(60)), "1m ago");
+        assert_eq!(humanise_ago(Some(3600)), "1h 0m ago");
+        assert_eq!(humanise_ago(Some(11_460)), "3h 11m ago");
+    }
+
+    /// A sidecar mock that answers `/internal/repo` listRecords with one saved
+    /// record, and anything else with an empty list. Serves repeatedly.
+    async fn spawn_saved_sidecar(saved_url: &str, saved_title: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (url, title) = (saved_url.to_string(), saved_title.to_string());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let wants_saved = req.contains("community.lexicon.rss.saved");
+                let records = if wants_saved {
+                    serde_json::json!([{
+                        "uri": "at://did:plc:x/community.lexicon.rss.saved/rk1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": "community.lexicon.rss.saved",
+                            "url": url,
+                            "title": title,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body = serde_json::json!({
+                    "ok": true, "data": { "records": records }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A sidecar mock serving `n` distinct saved records, none of them cached
+    /// locally — the shape that exercises the uncached-row append.
+    async fn spawn_saved_sidecar_many(n: usize, subscribed_feed: &str) -> String {
+        let feed = subscribed_feed.to_string();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(read) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..read]).to_string();
+                let records = if req.contains("community.lexicon.rss.saved") {
+                    serde_json::Value::Array(
+                        (0..n)
+                            .map(|i| {
+                                serde_json::json!({
+                                    "uri": format!("at://did:plc:x/community.lexicon.rss.saved/rk{i}"),
+                                    "cid": "bafy",
+                                    "value": {
+                                        "$type": "community.lexicon.rss.saved",
+                                        "url": format!("https://elsewhere.example/{i}"),
+                                        "title": format!("Elsewhere {i}"),
+                                        "createdAt": "2026-01-01T00:00:00Z"
+                                    }
+                                })
+                            })
+                            .collect(),
+                    )
+                } else if req.contains("community.lexicon.rss.subscription") {
+                    // Without this the handler's `sync_sub_refs` would REPLACE
+                    // sub_ref with an empty set on every render, and every
+                    // sub_ref-scoped read — including the cached starred list
+                    // this test is about — would come back empty.
+                    serde_json::json!([{
+                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/sub1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": "community.lexicon.rss.subscription",
+                            "url": feed,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body =
+                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// **The pager must not advertise a page the clamp cannot reach.**
+    ///
+    /// The page clamp is computed from the CACHED total; the uncached PDS rows
+    /// are appended to the last page rather than paged. Inflating `total` with
+    /// them made `page_count` and the "Older →" link point one page past the end:
+    /// requesting it clamped straight back, re-rendered the same last page, and
+    /// still offered the link. An infinite "next" that never advances.
+    #[tokio::test]
+    async fn the_starred_pager_does_not_advertise_an_unreachable_page() {
+        let did = "did:plc:pagerloop";
+        let sidecar = spawn_saved_sidecar_many(80, "https://loop.example/feed.xml").await;
+        let state = test_state_with_sidecar(&[], &sidecar).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://loop.example/feed.xml".to_string(),
+                title: Some("Loop".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // 250 cached starred entries: the last page holds 50, so 50 + 80 > 100
+        // and the old arithmetic reported a fourth page.
+        let entries: Vec<store::NewEntry> = (0..250)
+            .map(|i| store::NewEntry {
+                guid: format!("s-{i:04}"),
+                url: Some(format!("https://loop.example/{i}")),
+                title: Some(format!("Starred {i:04}")),
+                published: Some(format!("2026-06-{:02}T00:00:00Z", (i % 28) + 1)),
+                ..Default::default()
+            })
+            .collect();
+        store::insert_entries(&state.db, feed, &entries, 0)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        for row in store::list_entries(&state.db, did, store::ListView::All, None, 1_000, 0)
+            .await
+            .unwrap()
+        {
+            store::mark_starred(&state.db, did, row.id, true)
+                .await
+                .unwrap();
+        }
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let get = |uri: &str| {
+            let (app, cookie, uri) = (app.clone(), cookie.clone(), uri.to_string());
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                String::from_utf8(
+                    axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            }
+        };
+
+        // 250 cached + 80 uncached = 330 rows over 4 pages. The pager and the
+        // clamp must agree on that, and EVERY page it offers must have content —
+        // the original bug advertised a fourth page that clamped back to the
+        // third and re-rendered it, still offering the link.
+        let p3 = get("/?view=starred&page=3").await;
+        assert!(
+            p3.contains("Page 3 of 4"),
+            "the pager and the clamp disagree on the total: {}",
+            p3.split("pager-pos")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>()
+        );
+        // Page 3 is the boundary: the last 50 cached rows, then the first 50
+        // uncached ones.
+        assert!(
+            p3.contains("Elsewhere 0"),
+            "page 3 should start the uncached run"
+        );
+        assert_eq!(
+            p3.matches("<li class=\"entry").count(),
+            ENTRIES_PER_PAGE as usize,
+            "the boundary page is not full"
+        );
+
+        // **The heading, which the previous round broke by deleting this.**
+        //
+        // `total` includes the uncached records, so the parenthetical is a
+        // SUBSET of it, not an addition — "330 entries (80 saved elsewhere)".
+        // The version that said "plus N" double counted once `total` started
+        // including them, and N had become page-local in the same commit while
+        // the template stayed put. It shipped because this assertion was deleted
+        // rather than updated.
+        {
+            let body = &p3;
+            assert!(
+                body.contains("330 entries"),
+                "the heading must count the whole sequence: {}",
+                body.split("content-count")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            assert!(
+                body.contains("(80 saved elsewhere)"),
+                "the heading must say how many of the total the cache cannot show, \
+                 as a whole-list figure and not a per-page one: {}",
+                body.split("content-count")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            assert!(
+                !body.contains("plus 50") && !body.contains("plus 80"),
+                "the heading is adding the uncached rows to a total that already \
+                 includes them"
+            );
+        }
+
+        let p4 = get("/?view=starred&page=4").await;
+        assert!(
+            p4.contains("Page 4 of 4"),
+            "page 4 was advertised but clamps somewhere else — the unreachable-page bug"
+        );
+        assert_eq!(
+            p4.matches("<li class=\"entry").count(),
+            30,
+            "page 4 should hold the remaining 30 uncached records"
+        );
+        assert!(
+            p4.contains("Elsewhere 79"),
+            "the LAST saved record is unreachable — it can only be removed from here"
+        );
+
+        // No uncached record appears on two pages.
+        assert!(
+            !p4.contains("Elsewhere 0"),
+            "an uncached record was rendered on more than one page"
+        );
+        // Page 1 is all cached — and still reports the same whole-list heading,
+        // because the parenthetical describes the LIST, not the page.
+        let first = get("/?view=starred").await;
+        assert!(
+            first.contains("330 entries") && first.contains("(80 saved elsewhere)"),
+            "the heading changed between pages; it describes the list, not the page"
+        );
+        assert!(
+            !first.contains("Elsewhere "),
+            "uncached saved records leaked onto the first page"
+        );
+    }
+
+    /// **A saved record whose article is not cached here is still shown.**
+    ///
+    /// The starred view is built from local `entries`, so before this a record
+    /// starred in ANOTHER atproto reader — the portability the shared lexicon
+    /// exists for — was simply invisible. It now renders from the PDS record,
+    /// visually distinct, linking straight out.
+    #[tokio::test]
+    async fn a_saved_record_with_no_cached_entry_is_shown_as_a_link() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let sidecar =
+            spawn_saved_sidecar("https://elsewhere.example/article", "Starred elsewhere").await;
+        let mut state = test_state_with_sidecar(&[did], &sidecar).await;
+        std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(did.to_string());
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/?view=starred")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(
+            body.contains("Starred elsewhere"),
+            "the saved record was not rendered at all"
+        );
+        assert!(
+            body.contains("entry-uncached"),
+            "it was not marked as uncached, so it looks like a normal entry"
+        );
+        assert!(
+            body.contains("https://elsewhere.example/article"),
+            "the row must link straight to the article"
+        );
+        assert!(
+            !body.contains("/entries/0/"),
+            "an uncached row must not offer entry actions against a nonexistent id"
+        );
+    }
+
+    /// **A PDS `createdAt` must not be able to panic the starred view.**
+    ///
+    /// `display_date` byte-sliced `p[..10]`. Every prior caller passed a
+    /// timestamp the feed parser produced; the saved-record path passes a bare
+    /// string off a PDS record, written by whatever client the reader used. A
+    /// multi-byte value panicked the handler, and with no catch-panic layer the
+    /// view stayed down until the record was removed — from that same view.
+    #[test]
+    fn a_multibyte_timestamp_does_not_panic_the_date_formatter() {
+        for hostile in [
+            "日本語日本語日本",
+            "é",
+            "",
+            "2026",
+            "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",
+        ] {
+            let out = display_date(Some(hostile));
+            assert!(out.chars().count() <= 10, "{hostile:?} -> {out:?}");
+        }
+        assert_eq!(display_date(Some("2026-01-01T00:00:00Z")), "2026-01-01");
+        assert_eq!(display_date(None), "");
+    }
+
+    /// A saved record's URL is attacker-controlled and lands in an `href`.
+    /// Askama escapes HTML metacharacters but not SCHEMES, so this must go
+    /// through the helper the project already built for exactly that.
+    #[test]
+    fn a_saved_record_url_is_scheme_checked() {
+        for hostile in [
+            "javascript:alert(document.domain)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "//evil.example/path",
+        ] {
+            assert!(
+                crate::net::safe_link(hostile).is_none(),
+                "{hostile:?} survived the scheme check"
+            );
+        }
+        assert!(crate::net::safe_link("https://ok.example/a").is_some());
+    }
+
+    /// Unsaving makes a DPoP-signed PDS round-trip, which is the stated reason
+    /// its neighbours are limited. It was added as a route and not added here.
+    #[test]
+    fn the_unsave_route_is_rate_limited() {
+        use axum::http::Method;
+        assert!(is_rate_limited_path("/saved/3abc/delete", &Method::POST));
+        // And the neighbours still are.
+        assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
     }
 }

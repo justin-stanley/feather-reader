@@ -703,6 +703,31 @@ kbd {
   list-style: none;
 }
 
+/* The list pager. Only rendered when a scope actually spans more than one page,
+   so it costs nothing on the common "nothing unread" view. Matches the entry
+   list's measure so the controls sit under the rows they page through. */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin: 0 auto;
+  padding: var(--s3) 0;
+  max-width: 46rem;
+}
+
+.pager-pos {
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+/* The edge cases keep their slot rather than collapsing, so "Older" does not
+   slide sideways when it becomes the only control on the last page. */
+.btn-quiet.is-disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 .entry {
   position: relative;
   display: flex;
@@ -2119,4 +2144,56 @@ html[data-overlay="1"] .kbd-overlay {
   .shot {
     margin-top: var(--s7);
   }
+}
+
+/* Public /stats table. Follows `.prose table`'s conventions (UI font, small
+   type, collapsed borders) but is its own class: the figures are a data
+   readout, not prose, and the row label carries more weight than the value. */
+.stats-table {
+  width: 100%;
+  margin: var(--s5) 0 var(--s6);
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+}
+
+.stats-table th,
+.stats-table td {
+  padding: var(--s2) 0;
+  text-align: left;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.stats-table th {
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.stats-table td {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A saved item whose article is not cached here — it lives in the reader's PDS
+   but this instance has never had (or has evicted) the entry. Visually distinct
+   because it behaves differently: it leaves the site, and there is no excerpt,
+   no read state, and nothing to mark. A dashed leading rule reads as
+   "incomplete" without shouting. */
+.entry-uncached {
+  border-left: 2px dashed var(--line);
+  padding-left: var(--s3);
+}
+
+.entry-uncached .entry-title {
+  color: var(--muted);
+}
+
+.entry-badge {
+  font-size: 0.75em;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 0 var(--s2);
 }

@@ -1,6 +1,6 @@
 [package]
 name = "feather-reader"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.94"
 description = "A minimalist, atproto-native RSS/Atom reader in Rust — your feed subscriptions live in your own PDS."
@@ -87,6 +87,61 @@ url = "2"
 # Already in the dependency tree transitively; pinned here as a direct dep so
 # the session-id minting reads from the OS CSPRNG rather than a home-rolled RNG.
 getrandom = "0.4"
+
+# --- at-rest encryption for OAuth secrets --------------------------------
+# AES-256-GCM + SHA-256 for the `enc.v1.gcm.` codec that wraps OAuth tokens,
+# DPoP key material and the confidential-client signing JWK before they touch
+# the SQLite volume. `ring` is ALREADY in the tree (rustls pulls it); pinned as
+# a direct dep rather than adding a second AEAD implementation. base64 0.22 is
+# likewise already present transitively — pin 0.22, NOT 0.21, so the lock keeps
+# a single copy (`deny.toml` sets multiple-versions = "warn", which would not
+# catch a duplicate).
+ring = "0.17"
+base64 = "0.22"
+# Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
+# internal-only helper; `subtle` is the maintained option and is already in the
+# tree, so this adds no package to the lock either.
+subtle = "2"
+
+# --- P-256 for the OAuth confidential-client signing key -----------------
+# The `jwk` feature is the reason for this dep: it gives first-class JWK
+# import/export, so the key file stays in the SAME format the Node sidecar
+# writes and a rollback can still read it. The alternative was hand-parsing
+# PKCS#8 DER out of `ring` to recover the private scalar — more code, in the
+# one place where a silent bug is worst.
+#
+# NOT `atproto-oauth`/`atproto-identity`: their `jwk`/`dpop`/`pkce` primitives
+# are exactly what is wanted, but `reqwest` is a NON-optional dependency of
+# both, so depending on either would compile a second HTTP stack (reqwest 0.12
+# beside our 0.13) plus hickory-dns into the binary — a network path the SSRF
+# guard does not cover — for functions that never touch the network. Version
+# 0.13 is the same one `atproto-identity` itself pins.
+#
+# Cost, stated plainly: 20 pure crypto/encoding packages, and it newly
+# duplicates `hmac` and `rand_core` (the RustCrypto 0.10-era stack beside the
+# newer one already present). `deny.toml` only warns on multiple versions, so
+# this is recorded here rather than left for it to catch.
+p256 = { version = "0.13", features = ["jwk"] }
+# --- DNS, for atproto handle resolution ----------------------------------
+# Handle -> DID resolves by `_atproto.<handle>` TXT record, and DNS is the
+# PREFERRED method per the handle spec -- not a fallback. This is not optional:
+# a live PDS test found a real handle whose /.well-known/atproto-did returns 404
+# and which resolves by TXT alone, so an HTTP-only client simply cannot log it
+# in. `tokio::net::lookup_host` does A/AAAA only, so a resolver is required.
+#
+# Worth noting against the p256 comment above, which rejected
+# atproto-identity partly for pulling hickory: the objection there was never
+# hickory itself but reqwest 0.12 riding along with it -- a SECOND HTTP stack
+# the SSRF guard does not cover. A DNS resolver adds no such path.
+#
+# Cost: 21 packages (incl. `moka`, `crossbeam-*`, `ipconfig`), and it newly
+# duplicates `core-foundation`. default-features are already the minimum
+# (`tokio` + `system-config`); using the host's own resolver configuration is
+# the correct behaviour for handle resolution.
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
+    "tokio",
+    "system-config",
+] }
 
 # --- filesystem stat (startup disk-headroom check) -----------------------
 # Already in the tree transitively; pinned as a direct dep so the startup

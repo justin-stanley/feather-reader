@@ -251,6 +251,32 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
 /// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
 /// a malformed URL downstream anyway, and we don't want a parse quirk to
 /// misclassify.
+/// Whether a URL may be **stored or published** as a feed URL at all.
+///
+/// This is the storage-side twin of the scheme check `net::check_scheme` applies
+/// before fetching. The fetch side has always been safe, because nothing can
+/// reach the network except through `net.rs` — but "safe to fetch" and "safe to
+/// write down" are different questions, and only the first had an answer.
+///
+/// Two paths took a URL from outside and stored it with no validation at all:
+/// `resolve_subscriptions` (any atproto client can write a subscription record
+/// into a user's repo) and the OPML import (`xmlUrl` is whatever the file says).
+/// `classify_feed_privacy` does not cover this — it deliberately returns
+/// `Public` for an unparseable URL, on the stated assumption that "the add path
+/// will reject it as malformed regardless", and those two paths are the ones
+/// that never had an add path to do the rejecting.
+///
+/// Note that `javascript:alert(1)` and `file:///etc/passwd` both *parse* cleanly
+/// as URLs, so parsing is not the check — the scheme is.
+pub fn is_storable_feed_url(url: &str) -> bool {
+    match Url::parse(url) {
+        Ok(u) => {
+            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     let parsed = match Url::parse(url) {
         Ok(u) => u,
@@ -689,14 +715,12 @@ async fn touch_polled(
     etag: Option<String>,
     last_modified: Option<String>,
 ) -> Result<()> {
-    // upsert_feed's ON CONFLICT overwrites etag/last_modified unconditionally,
-    // so on a 304 we re-supply the existing validators (fetched from the row) to
-    // avoid clobbering them. The caller passes `None` to mean "keep current".
-    let existing = store::get_feed_by_url(pool, url).await?;
-    let (etag, last_modified) = match existing {
-        Some(f) => (etag.or(f.etag), last_modified.or(f.last_modified)),
-        None => (etag, last_modified),
-    };
+    // `None` means "keep current" — upsert_feed COALESCEs the validators, so a
+    // 304 that repeats no headers leaves the stored ones untouched. This used to
+    // re-read the row and re-supply them by hand because the upsert clobbered
+    // unconditionally; the read-modify-write is gone now that the upsert is
+    // honest, and with it a race where a concurrent poll's validators could be
+    // read here and written back stale.
     let nf = NewFeed {
         url: url.to_string(),
         etag,

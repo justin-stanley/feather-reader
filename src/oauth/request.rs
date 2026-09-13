@@ -1,0 +1,425 @@
+//! DPoP-authenticated form POSTs, with nonce persistence and a bounded retry.
+//!
+//! Every OAuth POST this client makes goes through here: PAR, token exchange,
+//! refresh. Three behaviours matter and all three are easy to get subtly wrong:
+//!
+//! * **The nonce is persisted per origin and harvested from EVERY response**,
+//!   including successes. Using one only for an immediate retry means every
+//!   request pays a wasted round trip.
+//! * **The retry is bounded at one.** A server that answers every request with
+//!   `use_dpop_nonce` would otherwise spin forever.
+//! * **The endpoint kind is passed, not inferred.** The authorization server
+//!   signals a nonce requirement with `400` + a JSON body; a resource server
+//!   uses `401` + `WWW-Authenticate`. Reading only one of those misses every
+//!   challenge from the other.
+
+use anyhow::{Context as _, Result};
+use reqwest::Client;
+use sqlx::SqlitePool;
+
+use super::discovery::origin_of;
+use super::dpop::{self, Endpoint};
+use super::keys::SigningKey;
+use super::store;
+use crate::net;
+
+/// A completed request: what the server said, and what it said it with.
+pub struct PostOutcome {
+    pub status: u16,
+    /// The raw body. **Public, so the `Debug` impl below is a default rather
+    /// than a barrier**: `{:?}` on this field prints everything. On a success
+    /// this holds the access and refresh tokens, so it must not be logged,
+    /// formatted into an error, or echoed on any path that is not already known
+    /// to be a failure response.
+    pub body: Vec<u8>,
+}
+
+/// Hand-written, NOT derived. A token-endpoint body holds the access and refresh
+/// tokens; a derived `Debug` would put them into any log line, panic message or
+/// `{:?}` that ever touches this value.
+impl std::fmt::Debug for PostOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostOutcome")
+            .field("status", &self.status)
+            .field(
+                "body",
+                &format_args!("<{} bytes redacted>", self.body.len()),
+            )
+            .finish()
+    }
+}
+
+impl PostOutcome {
+    /// Parse the body as JSON.
+    ///
+    /// The body is NEVER echoed into the error, not even an excerpt. This is
+    /// called on the SUCCESSFUL token response, so a 200 that fails to parse —
+    /// truncated by a proxy, a WAF interstitial appended to JSON — would
+    /// otherwise put the access and refresh tokens into whatever logs the error.
+    /// Status and length carry the same diagnostic value.
+    pub fn json(&self) -> Result<serde_json::Value> {
+        serde_json::from_slice(&self.body).with_context(|| {
+            format!(
+                "response (status {}, {} bytes) is not valid JSON",
+                self.status,
+                self.body.len()
+            )
+        })
+    }
+
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// Whether this request may be repeated if the server demands a nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// Safe to repeat: PAR, refresh, resource reads.
+    Allowed,
+    /// **Must not be repeated**, because the body cannot be sent again — a
+    /// consumed stream, say.
+    ///
+    /// This is NOT the right setting for the authorization-code exchange, which
+    /// an earlier revision assumed. A `use_dpop_nonce` challenge means the
+    /// server rejected the request BEFORE processing the grant, so the code was
+    /// never consumed and resending it is safe. Refusing the retry there cost a
+    /// real login against a live PDS: the server rotated its nonce between PAR
+    /// and the token request (nonces last at most five minutes, and user
+    /// approval can take longer), and the flow died with the user already
+    /// approved. The reference declines a retry only when the request body has
+    /// been consumed, which a buffered form body never is.
+    Forbidden,
+}
+
+/// The nonce to retry with, or `None` to stop.
+///
+/// Pure so the policy is testable: the SSRF guard forbids pointing any of this
+/// at a loopback test server, so the round trip itself cannot be exercised.
+fn next_nonce(
+    attempt: usize,
+    retry: Retry,
+    challenge: Option<String>,
+    already_sent: Option<&str>,
+) -> Option<String> {
+    if attempt != 0 || retry == Retry::Forbidden {
+        return None;
+    }
+    let fresh = challenge?;
+    // Retrying with the nonce we already sent is a guaranteed-wasted round trip.
+    if Some(fresh.as_str()) == already_sent {
+        return None;
+    }
+    Some(fresh)
+}
+
+/// The headers for one attempt.
+///
+/// A resource request carries BOTH the proof and the token. The proof's `ath`
+/// binds to an access token the server never sees otherwise, so omitting the
+/// `Authorization` header makes the request unauthenticated — and the resulting
+/// 401 carries no `use_dpop_nonce`, so the retry cannot recover it either. The
+/// scheme is `DPoP`, not `Bearer`: presenting a DPoP-bound token as a bearer
+/// token discards the binding.
+fn request_headers(
+    proof: &str,
+    access_token: Option<&str>,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>> {
+    let mut headers = vec![(
+        reqwest::header::HeaderName::from_static("dpop"),
+        reqwest::header::HeaderValue::from_str(proof)
+            .context("DPoP proof is not a valid header value")?,
+    )];
+    if let Some(token) = access_token {
+        headers.push((
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("DPoP {token}"))
+                .context("access token is not a valid header value")?,
+        ));
+    }
+    Ok(headers)
+}
+
+/// What this request carries, and therefore which method it uses.
+///
+/// The method is DERIVED rather than passed alongside the body. A DPoP proof
+/// binds `htm` to the HTTP method, so a mismatch between the two produces a
+/// proof the server rejects — and keeping them in one value makes that
+/// mismatch unrepresentable.
+pub enum DpopBody<'a> {
+    /// A GET; any parameters are already in the URL.
+    Query,
+    /// `application/x-www-form-urlencoded` — the OAuth endpoints.
+    Form(&'a [(&'a str, &'a str)]),
+    /// `application/json` — the XRPC write endpoints.
+    Json(Vec<u8>),
+}
+
+impl DpopBody<'_> {
+    pub(crate) fn method(&self) -> &'static str {
+        match self {
+            DpopBody::Query => "GET",
+            DpopBody::Form(_) | DpopBody::Json(_) => "POST",
+        }
+    }
+}
+
+/// One DPoP-authenticated request.
+///
+/// Grouped rather than passed positionally so a call site reads as a
+/// description of the request — `Retry::Forbidden` for a request whose body cannot be replayed is
+/// the kind of thing that should be visible at the call, not buried in an
+/// argument list.
+pub struct DpopRequest<'a> {
+    pub endpoint: Endpoint,
+    pub url: &'a str,
+    /// The session's DPoP key — the same one used from PAR onward.
+    pub key: &'a SigningKey,
+    /// Binds the proof via `ath` and is sent as `Authorization: DPoP …`.
+    /// `None` for the authorization-server endpoints.
+    pub access_token: Option<&'a str>,
+    pub body: DpopBody<'a>,
+    pub retry: Retry,
+}
+
+/// Send a request with a DPoP proof, retrying once if the server demands a
+/// nonce and [`Retry`] permits it.
+pub async fn send_with_dpop(
+    client: &Client,
+    pool: &SqlitePool,
+    request: &DpopRequest<'_>,
+) -> Result<PostOutcome> {
+    let DpopRequest {
+        endpoint,
+        url,
+        key,
+        access_token,
+        retry,
+        ref body,
+    } = *request;
+    let method = body.method();
+    let origin = origin_of(url)?;
+    let mut nonce = store::get_nonce(pool, &origin).await?;
+
+    for attempt in 0..2 {
+        let proof = dpop::proof(key, method, url, access_token, nonce.as_deref())?;
+        let headers = request_headers(&proof, access_token)?;
+
+        let response = match body {
+            // NO REDIRECTS on a DPoP GET. A proof's `htu` names the URL it was
+            // minted for, so the request cannot succeed after a cross-origin
+            // redirect anyway — following one buys nothing and costs two things:
+            // the `DPoP-Nonce` is harvested from the FINAL response and stored
+            // under the ORIGINAL origin, letting a redirect poison the nonce for
+            // the real PDS; and the proof itself is re-sent to the redirect
+            // target, since `net`'s cross-host header stripping covers
+            // `Authorization` but not `DPoP`.
+            DpopBody::Query => net::guarded_get_no_redirect(client, url, &headers).await,
+            DpopBody::Form(params) => net::guarded_post_form(client, url, &headers, params).await,
+            DpopBody::Json(bytes) => {
+                net::guarded_post_json(client, url, &headers, bytes.clone()).await
+            }
+        }
+        .with_context(|| format!("{method} {url}"))?;
+
+        let status = response.status().as_u16();
+        let www_authenticate = response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Harvest from EVERY response, success included: the server rotates
+        // nonces, and carrying the newest one forward is what keeps the retry
+        // exceptional rather than routine.
+        let offered = response
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let body = net::read_capped(response)
+            .await
+            .with_context(|| format!("reading the response from {url}"))?;
+
+        if let Some(offered) = &offered {
+            if Some(offered) != nonce.as_ref() {
+                store::put_nonce(pool, &origin, offered, chrono::Utc::now().timestamp()).await?;
+            }
+        }
+
+        let challenge = dpop::nonce_challenge(
+            endpoint,
+            status,
+            www_authenticate.as_deref(),
+            &body,
+            offered.as_deref(),
+        );
+        if let Some(fresh) = next_nonce(attempt, retry, challenge, nonce.as_deref()) {
+            // Logged because a nonce challenge DOUBLES the round trips for that
+            // request, and nothing else makes that visible: the call is recorded
+            // once by the metrics either way. A server that challenges every
+            // request would halve throughput silently.
+            tracing::debug!(%url, status, "DPoP nonce challenge; retrying once with a fresh nonce");
+            nonce = Some(fresh);
+            continue;
+        }
+        return Ok(PostOutcome { status, body });
+    }
+    unreachable!("the loop returns on its second pass")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Like every other outbound path, this must fail closed on an internal
+    /// target — asserted on the guard's own error, not merely `is_err()`.
+    #[tokio::test]
+    async fn a_dpop_post_fails_closed_on_an_internal_target() {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+
+        let err = send_with_dpop(
+            &Client::new(),
+            &pool,
+            &DpopRequest {
+                endpoint: Endpoint::AuthorizationServer,
+                url: "http://127.0.0.1/oauth/token",
+                key: &key,
+                access_token: None,
+                body: DpopBody::Form(&[("grant_type", "refresh_token")]),
+                retry: Retry::Allowed,
+            },
+        )
+        .await
+        .expect_err("must refuse a loopback token endpoint");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("forbidden (internal) address"),
+            "failed for the wrong reason: {rendered}"
+        );
+    }
+
+    /// **The body must never reach an error message.** `json()` is called on the
+    /// SUCCESSFUL token response, so a 200 whose body fails to parse — truncated
+    /// by a proxy, a WAF interstitial appended to JSON — would put
+    /// `{"access_token":"eyJ…` into whatever logs the error. That is exactly the
+    /// disclosure the hand-written `Debug` exists to prevent, and echoing an
+    /// "excerpt" reopens it through a different door.
+    #[test]
+    fn a_non_json_body_is_never_echoed_into_the_error() {
+        let outcome = PostOutcome {
+            status: 200,
+            body: br#"{"access_token":"eyJhbGciOiJFUzI1NiJ9.SECRET-TOKEN-VALUE"#.to_vec(),
+        };
+        let rendered = format!("{:#}", outcome.json().unwrap_err());
+        assert!(rendered.contains("200"), "status is the useful diagnostic");
+        assert!(
+            !rendered.contains("SECRET-TOKEN-VALUE") && !rendered.contains("eyJhbGciOiJ"),
+            "the body leaked into the error: {rendered}"
+        );
+    }
+
+    // ── the retry decision ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_nonce_challenge_on_the_first_attempt_is_retried() {
+        assert_eq!(
+            next_nonce(0, Retry::Allowed, Some("fresh".into()), None).as_deref(),
+            Some("fresh")
+        );
+    }
+
+    /// Bounded at one. A server answering every request with `use_dpop_nonce`
+    /// must not make this spin.
+    #[test]
+    fn a_second_attempt_never_retries() {
+        assert!(next_nonce(1, Retry::Allowed, Some("fresh".into()), None).is_none());
+    }
+
+    /// **A request marked `Forbidden` is never retried, whatever the server
+    /// says.**
+    ///
+    /// NOTE: nothing currently passes `Forbidden`, and the authorization-code
+    /// exchange deliberately does NOT — a nonce challenge is rejected before the
+    /// grant is processed, so the code is not consumed and the request is safe
+    /// to resend. An earlier round of review marked that call site `Forbidden`
+    /// on the reasoning below and it killed a real login against a live PDS.
+    ///
+    /// The reference draws the line at whether the request BODY can be re-read,
+    /// not at what the request means; a buffered form always can. This variant
+    /// is kept for a body that cannot be replayed, and the original reasoning is
+    /// preserved here only so it is not rediscovered and re-applied: re-POSTing `grant_type=authorization_code` can burn the
+    /// authorization code, and the login then dies AFTER the user approved,
+    /// presenting as intermittent "login just doesn't work".
+    #[test]
+    fn a_request_that_must_not_repeat_is_never_retried() {
+        assert!(next_nonce(0, Retry::Forbidden, Some("fresh".into()), None).is_none());
+    }
+
+    /// Retrying with the nonce we already sent is a guaranteed-wasted round
+    /// trip; the reference short-circuits it too.
+    #[test]
+    fn an_unchanged_nonce_is_not_worth_retrying() {
+        assert!(next_nonce(0, Retry::Allowed, Some("same".into()), Some("same")).is_none());
+        assert_eq!(
+            next_nonce(0, Retry::Allowed, Some("new".into()), Some("old")).as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn no_challenge_means_no_retry() {
+        assert!(next_nonce(0, Retry::Allowed, None, None).is_none());
+    }
+
+    // ── request shape ────────────────────────────────────────────────────────
+
+    /// The DPoP proof's `htm` must match the method actually sent, so the method
+    /// is derived from the body rather than passed alongside it — there is no
+    /// way for the two to disagree.
+    #[test]
+    fn the_method_follows_the_body_kind() {
+        assert_eq!(DpopBody::Query.method(), "GET");
+        assert_eq!(DpopBody::Form(&[("a", "b")]).method(), "POST");
+        assert_eq!(DpopBody::Json(b"{}".to_vec()).method(), "POST");
+    }
+
+    // ── headers ──────────────────────────────────────────────────────────────
+
+    /// **`ath` without the token is useless.** The proof binds to an access
+    /// token the server never receives, so a resource request arrives
+    /// unauthenticated — and the resulting 401 carries no `use_dpop_nonce`, so
+    /// even the retry cannot recover it.
+    #[test]
+    fn a_resource_request_carries_the_token_as_well_as_the_proof() {
+        let headers = request_headers("the-proof", Some("the-token")).unwrap();
+        let names: Vec<String> = headers.iter().map(|(n, _)| n.to_string()).collect();
+        assert!(names.contains(&"dpop".to_string()));
+        assert!(names.contains(&"authorization".to_string()));
+
+        let auth = headers
+            .iter()
+            .find(|(n, _)| n.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .unwrap();
+        // The scheme is DPoP, not Bearer: a DPoP-bound token presented as a
+        // bearer token is a downgrade the server should reject.
+        assert_eq!(auth, "DPoP the-token");
+    }
+
+    #[test]
+    fn an_authorization_server_request_carries_only_the_proof() {
+        let headers = request_headers("the-proof", None).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "dpop");
+    }
+
+    /// A token with a newline would otherwise split the header.
+    #[test]
+    fn a_malformed_token_is_rejected_rather_than_injected() {
+        assert!(request_headers("proof", Some("tok\r\nX-Evil: 1")).is_err());
+        assert!(request_headers("pro\nof", None).is_err());
+    }
+}

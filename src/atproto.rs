@@ -1377,14 +1377,9 @@ impl SidecarClient {
         did: &str,
     ) -> Result<Vec<(String, Subscription)>> {
         let mut subs = self.list_subscriptions(did).await?;
-        subs.sort_by(|(a_key, a), (b_key, b)| {
-            let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
-            let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
-            a_title
-                .cmp(&b_title)
-                .then_with(|| a.url.cmp(&b.url))
-                .then_with(|| a_key.cmp(b_key))
-        });
+        // The comparator is SHARED with the Rust-native client so the two
+        // cannot order the list differently across the cutover.
+        subs.sort_by(lexicon::sort::subscriptions);
         Ok(subs)
     }
 
@@ -1450,13 +1445,7 @@ impl SidecarClient {
     /// then rkey — so the sidebar order is stable.
     pub async fn list_folders_sorted(&self, did: &str) -> Result<Vec<(String, Folder)>> {
         let mut folders = self.list_folders(did).await?;
-        folders.sort_by(|(a_key, a), (b_key, b)| {
-            a.position
-                .unwrap_or(u64::MAX)
-                .cmp(&b.position.unwrap_or(u64::MAX))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then_with(|| a_key.cmp(b_key))
-        });
+        folders.sort_by(lexicon::sort::folders);
         Ok(folders)
     }
 
@@ -1481,11 +1470,7 @@ impl SidecarClient {
     /// "saved for later" list reads most-recent-first and is stable.
     pub async fn list_saved_sorted(&self, did: &str) -> Result<Vec<(String, Saved)>> {
         let mut saved = self.list_saved(did).await?;
-        saved.sort_by(|(a_key, a), (b_key, b)| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a_key.cmp(b_key))
-        });
+        saved.sort_by(lexicon::sort::saved);
         Ok(saved)
     }
 
@@ -1528,7 +1513,7 @@ impl SidecarClient {
 /// not-yet-created cursor in the batch would drop the whole DID's flush. Emitting
 /// a `create` for those makes a feed's first flush succeed while keeping every
 /// op in ONE batch. Shared by both the sidecar and direct-PDS flush paths.
-fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
+pub(crate) fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
     cursors
         .iter()
         .map(|(rkey, state, pds_created)| {
@@ -1585,7 +1570,11 @@ pub enum WriteOp {
 
 impl WriteOp {
     /// Render this op as the tagged JSON `com.atproto.repo.applyWrites` expects.
-    fn to_json(&self) -> Value {
+    ///
+    /// `pub(crate)` so [`crate::oauth::xrpc`] can build the same batch body.
+    /// Sharing the rendering rather than reimplementing it is what keeps the two
+    /// clients wire-identical across the cutover.
+    pub(crate) fn to_json(&self) -> Value {
         match self {
             WriteOp::Create {
                 collection,
@@ -1681,7 +1670,7 @@ const S32_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 /// Monotonicity within one generator is guaranteed by tracking the last value
 /// and bumping to `last + 1` if the clock hasn't advanced — so a burst of
 /// same-microsecond calls still yields strictly increasing, ordered rkeys.
-struct TidGenerator {
+pub(crate) struct TidGenerator {
     /// The last raw 64-bit TID value emitted (0 = none yet).
     last: u64,
     /// The low-10-bit clock id, randomized once per generator to avoid
@@ -1693,7 +1682,7 @@ impl TidGenerator {
     /// A fresh generator with a per-instance clock id derived from the current
     /// nanosecond clock (no extra deps; uniqueness only needs to hold within a
     /// single import batch, and the timestamp bits carry the ordering).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
@@ -1705,7 +1694,7 @@ impl TidGenerator {
     }
 
     /// The next monotonic TID rkey (13 `s32` chars).
-    fn next(&mut self) -> String {
+    pub(crate) fn next(&mut self) -> String {
         let micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)

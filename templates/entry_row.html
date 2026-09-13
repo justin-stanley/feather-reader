@@ -1,3 +1,52 @@
+{% if !e.cached %}
+{#  A saved record whose article is not in this instance's cache — starred in
+    another atproto reader, or starred here and since evicted. Rendered from the
+    PDS record alone: it links straight out, shows no excerpt, and offers no
+    mark-read control, because there is no local entry to mark. #}
+<li class="entry entry-uncached" id="saved-{{ e.rkey }}">
+{#  An EMPTY link means `net::safe_link` refused the saved record's URL — a
+    `javascript:` scheme, say, which HTML escaping does not neutralise. The row
+    still renders, without an anchor: dropping it made the record unremovable
+    from here, because the un-save button below is attached to the row. #}
+{% if e.link.is_empty() %}
+  <div class="entry-main">
+    <span class="entry-title">{{ e.title }}</span>
+    <span class="entry-meta">
+      <span class="entry-badge" title="This item's saved link is not a usable web address, so it is shown without one">unusable link</span>
+      {% if !e.feed_title.is_empty() %}<span class="sep" aria-hidden="true">·</span><span class="entry-feed">{{ e.feed_title }}</span>{% endif %}
+      {% if !e.published.is_empty() %}<span class="sep" aria-hidden="true">·</span><time class="entry-time" datetime="{{ e.published }}">saved {{ e.published }}</time>{% endif %}
+    </span>
+  </div>
+{% else %}
+  <a class="entry-main" href="{{ e.link }}" rel="noopener noreferrer">
+    <span class="entry-title">{{ e.title }}</span>
+    <span class="entry-meta">
+      <span class="entry-badge" title="Saved in your PDS; the article is not cached here">not cached</span>
+      {% if !e.feed_title.is_empty() %}<span class="sep" aria-hidden="true">·</span><span class="entry-feed">{{ e.feed_title }}</span>{% endif %}
+      {% if !e.published.is_empty() %}<span class="sep" aria-hidden="true">·</span><time class="entry-time" datetime="{{ e.published }}">saved {{ e.published }}</time>{% endif %}
+    </span>
+  </a>
+{% endif %}
+
+  <div class="entry-actions">
+    <form
+      class="star-form"
+      method="post"
+      action="/saved/{{ e.rkey }}/delete"
+      hx-post="/saved/{{ e.rkey }}/delete"
+      hx-target="#saved-{{ e.rkey }}"
+      hx-swap="outerHTML"
+    >
+      <button type="submit" class="star-btn" aria-pressed="true" aria-label="Remove from saved">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
+        </svg>
+      </button>
+    </form>
+  </div>
+</li>
+{% else %}
 <li class="entry{% if e.read %} is-read{% endif %}" id="entry-{{ e.id }}">
   <a class="entry-main" href="{{ e.link }}">
     <span class="entry-title">{{ e.title }}</span>
@@ -46,3 +95,4 @@
     </form>
   </div>
 </li>
+{% endif %}

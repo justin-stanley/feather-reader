@@ -30,8 +30,8 @@ Please include, where you can:
 
 ## Scope
 
-In scope: the FeatherReader server (Rust) and the OAuth sidecar
-(`oauth-sidecar/`) in this repository — e.g. authentication/session handling,
+In scope: the FeatherReader server (Rust) — including its built-in atproto OAuth
+client — and the OAuth sidecar (`oauth-sidecar/`) in this repository — e.g. authentication/session handling,
 SSRF, injection, secret handling, per-user data isolation.
 
 Out of scope: vulnerabilities in third-party dependencies (report those

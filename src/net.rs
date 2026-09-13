@@ -29,8 +29,11 @@
 //! attacker-controlled resolver cannot answer "public IP" for the check and
 //! "127.0.0.1" for the connect, because there is no second resolution.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{
@@ -175,6 +178,103 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
     }
 }
 
+/// How long an idle pinned client may be kept before it is rebuilt.
+///
+/// Not a security boundary — the address is re-resolved and re-checked on every
+/// single request, and a changed address misses the cache by construction. This
+/// only bounds how long a pooled connection to a once-vetted address may live,
+/// and keeps the map from holding entries for hosts nobody fetches any more.
+const PINNED_CLIENT_TTL: Duration = Duration::from_secs(300);
+
+/// Most distinct (host, address) pairs kept. A bound, not a target: the reader
+/// talks to one PDS, while the poller talks to as many hosts as there are feeds.
+const MAX_PINNED_CLIENTS: usize = 256;
+
+/// How long a pinned client may hold an IDLE socket open.
+///
+/// Deliberately shorter than [`PINNED_CLIENT_TTL`] so a client releases its
+/// sockets before the cache releases the client — otherwise the last minute of
+/// an entry's life is pure socket rent. See [`build_pinned_client`] for why the
+/// pool needs bounding at all.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pinned clients, keyed by the **vetted address** they are pinned to.
+///
+/// ## Why this is safe to reuse
+///
+/// Building a fresh client per request meant a fresh connection pool, so every
+/// PDS call paid a full TCP + TLS handshake: measured at 91 ms against this
+/// project's PDS versus 30 ms on a warm connection. That is most of why the
+/// Rust repo backend measured ~3x slower than the Node sidecar, which pools.
+///
+/// Reuse does NOT weaken the DNS-rebinding defence, because the defence does not
+/// live in the client's lifetime:
+///
+/// * every request still resolves the host and runs [`is_forbidden_ip`] over
+///   EVERY answer before this cache is consulted — a host that now resolves to
+///   an internal address is refused before a pooled client could be returned;
+/// * the key includes the vetted [`SocketAddr`], so a host that legitimately
+///   moves to a different address MISSES the cache and gets a client pinned to
+///   the new one. A pooled connection can only ever be reused for an address
+///   that was just re-vetted this request.
+struct PinnedClients {
+    entries: Mutex<HashMap<(String, SocketAddr), (Client, Instant)>>,
+    /// How many clients have actually been constructed. Test-only bookkeeping:
+    /// it is the only way to observe that a hit avoided a rebuild, since
+    /// `reqwest::Client` exposes no identity.
+    builds: AtomicUsize,
+}
+
+impl PinnedClients {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            builds: AtomicUsize::new(0),
+        }
+    }
+
+    /// A client pinned to `addr` for `host`, reusing a pooled one when the
+    /// address is unchanged and the entry is fresh.
+    fn get(&self, host: &str, addr: SocketAddr, now: Instant) -> Result<Client> {
+        let key = (host.to_string(), addr);
+        // A poisoned lock here is NOT fatal and must not be treated as fatal: the
+        // guard is held across a fallible builder, so one panic inside it would
+        // otherwise make EVERY subsequent outbound request panic, forever, with a
+        // live-looking process and a green /health. Recover the data like the rate
+        // limiter already does — a torn entry is a cache entry, worst case a rebuild.
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some((client, last_used)) = entries.get_mut(&key) {
+            if now.duration_since(*last_used) < PINNED_CLIENT_TTL {
+                *last_used = now;
+                // Cloning a `reqwest::Client` shares its connection pool, which
+                // is the entire point — a clone is a handle, not a new pool.
+                return Ok(client.clone());
+            }
+        }
+
+        let client = build_pinned_client(host, addr)?;
+        self.builds.fetch_add(1, Ordering::Relaxed);
+
+        // Drop anything idle past the TTL before considering the bound, so a
+        // burst of one-off hosts does not evict the PDS client we use constantly.
+        entries.retain(|_, (_, last_used)| now.duration_since(*last_used) < PINNED_CLIENT_TTL);
+        if entries.len() >= MAX_PINNED_CLIENTS {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (client.clone(), now));
+        Ok(client)
+    }
+}
+
+static PINNED_CLIENTS: LazyLock<PinnedClients> = LazyLock::new(PinnedClients::new);
+
 /// Build a per-hop client that **pins** DNS for `host` to the already-vetted
 /// `addr`, so reqwest's `connect` reuses the exact IP that passed the SSRF check
 /// instead of doing its own second resolution (the DNS-rebinding fix). The pin is
@@ -184,7 +284,7 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
 /// its slowloris / slow-upstream defence even though each hop is a freshly built
 /// client), and auto-redirect off — [`guarded_get`] follows + re-validates each
 /// hop itself.
-fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
     Client::builder()
         .user_agent(crate::USER_AGENT)
         // Bound each hop the same way the feed client is bounded: a total
@@ -194,6 +294,26 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         // never-finishing upstream.
         .timeout(FETCH_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        // Bound the idle connection pool too.
+        //
+        // These clients are CACHED — up to `MAX_PINNED_CLIENTS` of them, each
+        // holding its own pool — and every entry keeps live keep-alive TLS
+        // connections open until it is evicted. With reqwest's defaults
+        // (unlimited idle per host, no idle timeout) a poller touching many
+        // distinct feed hosts drives the cache toward its bound and each entry
+        // toward an unbounded number of sockets, on a 512 MB box with one shared
+        // core. The cache was given a size bound for the same reason; its pools
+        // were not.
+        //
+        // One idle connection per host is the right number here: reuse across
+        // the ~300 s TTL is what the cache exists for (measured 91 ms cold
+        // versus 30 ms warm), and nothing in this codebase issues concurrent
+        // requests to the SAME host through one client — `guarded_get` walks
+        // redirect hops sequentially, and the poller's concurrency is across
+        // DIFFERENT feeds. The idle timeout is well under the cache TTL so
+        // sockets are released before the client itself is.
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         // Override reqwest's resolver for this host only: connect goes straight
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
@@ -201,6 +321,15 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build IP-pinned fetch client")
+}
+
+/// The per-hop client for an already-vetted `(host, addr)`, pooled.
+///
+/// Callers must have run [`resolve_and_check`] for THIS request before calling
+/// this — the cache trusts its key, and the key is only as good as the check
+/// that produced it.
+fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+    PINNED_CLIENTS.get(host, addr, Instant::now())
 }
 
 /// Fetch a user-supplied URL through the full SSRF guard: scheme + IP checks on
@@ -225,7 +354,7 @@ pub async fn guarded_get(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, true).await
+    guarded_get_inner(client, url, extra_headers, true, MAX_REDIRECTS).await
 }
 
 /// The SSRF core of [`guarded_get`] **without** the feed-privacy layer: scheme +
@@ -244,7 +373,30 @@ pub async fn guarded_get_no_privacy(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, false).await
+    guarded_get_inner(client, url, extra_headers, false, MAX_REDIRECTS).await
+}
+
+/// Like [`guarded_get_no_privacy`] but **refuses redirects outright**.
+///
+/// For the OAuth discovery and DID documents, following a redirect is not a
+/// convenience — it is a hole. The mix-up defence rests on comparing a
+/// document's `issuer` against *the URL it was fetched from*; if a `302` can move
+/// the fetch to another origin, that comparison is against the original URL while
+/// the bytes came from somewhere else, and the check silently stops meaning
+/// anything. The reference client sets `redirect: 'manual'`/`'error'` on every
+/// one of these fetches for the same reason.
+///
+/// Applies to: `/.well-known/oauth-protected-resource`,
+/// `/.well-known/oauth-authorization-server`, `plc.directory/<did>`, `did:web`
+/// `did.json`, and the client-metadata self-fetch. It deliberately does NOT
+/// apply to `/.well-known/atproto-did`, where the handle spec explicitly permits
+/// redirects.
+pub async fn guarded_get_no_redirect(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<Response> {
+    guarded_get_inner(client, url, extra_headers, false, 0).await
 }
 
 /// Whether a header carries credentials that must never follow a redirect onto a
@@ -292,6 +444,7 @@ async fn guarded_get_inner(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
     check_privacy: bool,
+    max_redirects: usize,
 ) -> Result<Response> {
     // `client` is retained in the signature for API stability + as the policy
     // template; the actual send goes through a per-hop IP-pinned client.
@@ -300,7 +453,7 @@ async fn guarded_get_inner(
     // The origin the caller's credentials belong to; a hop off it drops them.
     let original = current.clone();
 
-    for _ in 0..=MAX_REDIRECTS {
+    for _ in 0..=max_redirects {
         check_scheme(&current)?;
         // Re-validate PRIVACY on EVERY hop: a public URL can `30x` to a
         // secret-bearing private feed (Substack/Patreon/tokened podcast). Without
@@ -338,6 +491,13 @@ async fn guarded_get_inner(
             .with_context(|| format!("fetching {current}"))?;
 
         if resp.status().is_redirection() {
+            if max_redirects == 0 {
+                bail!(
+                    "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
+                     this document's origin is load-bearing and must not be moved",
+                    resp.status()
+                );
+            }
             let location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -354,7 +514,7 @@ async fn guarded_get_inner(
         return Ok(resp);
     }
 
-    bail!("too many redirects (> {MAX_REDIRECTS}) while fetching {url:?}")
+    bail!("too many redirects (> {max_redirects}) while fetching {url:?}")
 }
 
 /// POST a JSON body to a **user-influenced** URL through the SSRF guard.
@@ -384,6 +544,78 @@ pub async fn guarded_post_json(
     extra_headers: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response> {
+    guarded_post(client, url, extra_headers, PostBody::Json(body)).await
+}
+
+/// A request body together with the content type that describes it.
+///
+/// The two travel as ONE value deliberately. Passing the content type alongside
+/// the bytes made it possible to send a JSON body labelled as a form, or the
+/// reverse — a swap no test could see without a live server, and the SSRF guard
+/// forbids pointing one of these at loopback. Deriving the header from the same
+/// value that produces the bytes removes the failure mode instead of watching
+/// for it.
+pub(crate) enum PostBody<'a> {
+    Json(Vec<u8>),
+    Form(&'a [(&'a str, &'a str)]),
+}
+
+impl PostBody<'_> {
+    fn content_type(&self) -> HeaderValue {
+        match self {
+            PostBody::Json(_) => HeaderValue::from_static("application/json"),
+            PostBody::Form(_) => HeaderValue::from_static("application/x-www-form-urlencoded"),
+        }
+    }
+
+    /// Every form value goes through the serializer rather than string
+    /// interpolation: an OAuth form carries the authorization code, the PKCE
+    /// verifier and the client assertion, and a raw `&` or `=` in any of them
+    /// would otherwise splice an extra parameter into the request.
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            PostBody::Json(bytes) => bytes,
+            PostBody::Form(params) => {
+                let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                for (k, v) in params {
+                    ser.append_pair(k, v);
+                }
+                ser.finish().into_bytes()
+            }
+        }
+    }
+}
+
+/// POST a form-encoded body to a **user-influenced** URL through the SSRF guard.
+///
+/// The OAuth counterpart to [`guarded_post_json`]: PAR, token exchange and
+/// refresh are all `application/x-www-form-urlencoded`. It matters more here
+/// than anywhere else that the guard applies — these are the requests that
+/// carry the client assertion and the authorization code, so an issuer URL
+/// that resolves to loopback or RFC1918 has to fail closed *before* the
+/// credential leaves the process.
+///
+/// Redirects are refused for the same reason as [`guarded_post_json`], and more
+/// acutely: a `307` would re-send the assertion and code to the new host.
+pub async fn guarded_post_form(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    params: &[(&str, &str)],
+) -> Result<Response> {
+    guarded_post(client, url, extra_headers, PostBody::Form(params)).await
+}
+
+/// The shared body of [`guarded_post_json`] and [`guarded_post_form`]. Kept as
+/// one function so the guard cannot drift between the two content types.
+async fn guarded_post(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    body: PostBody<'_>,
+) -> Result<Response> {
+    let content_type = body.content_type();
+    let body = body.into_bytes();
     // As in `guarded_get_inner`: `client` is the policy template; the send goes
     // through a freshly built, IP-pinned client.
     let _ = client;
@@ -395,7 +627,7 @@ pub async fn guarded_post_json(
 
     let mut req = hop_client
         .post(target.clone())
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(CONTENT_TYPE, content_type)
         .body(body);
     for (name, value) in extra_headers {
         req = req.header(name.clone(), value.clone());
@@ -553,6 +785,145 @@ pub(crate) mod tests {
         assert_eq!(
             addr,
             "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    // ── the pinned-client cache ──────────────────────────────────────────────
+
+    const V4: &str = "93.184.216.34:443";
+    const V4_OTHER: &str = "93.184.216.35:443";
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    /// A repeat request to the same vetted address REUSES the client, so the
+    /// connection pool survives and the TLS handshake is paid once.
+    ///
+    /// Measured motivation: a fresh connection to this project's PDS costs 91 ms
+    /// against 30 ms warm, which was most of the ~3x gap between the Rust repo
+    /// backend and the Node sidecar.
+    #[test]
+    fn the_same_vetted_address_reuses_one_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for i in 0..5 {
+            cache.get("example.com", addr, at(now, i)).unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "each request rebuilt the client, so every call pays a TLS handshake"
+        );
+    }
+
+    /// **A CHANGED ADDRESS MUST NOT REUSE THE POOL.**
+    ///
+    /// This is the property that makes the cache safe. The DNS-rebinding defence
+    /// is that we connect only to an address vetted for THIS request; a cache
+    /// keyed on the host alone would hand back a connection pinned to an address
+    /// vetted minutes ago, quietly undoing it. The key includes the address, so
+    /// a move is a miss.
+    #[test]
+    fn a_changed_address_does_not_reuse_the_pooled_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+
+        cache.get("example.com", V4.parse().unwrap(), now).unwrap();
+        cache
+            .get("example.com", V4_OTHER.parse().unwrap(), at(now, 1))
+            .unwrap();
+
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            2,
+            "the same host at a DIFFERENT address reused a connection pinned to the old one"
+        );
+        assert_eq!(cache.entries.lock().unwrap().len(), 2);
+    }
+
+    /// Two hosts that happen to resolve to the same address still get their own
+    /// clients — the pin is per host, and SNI/Host differ.
+    #[test]
+    fn different_hosts_at_one_address_are_separate_clients() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("a.example.com", addr, now).unwrap();
+        cache.get("b.example.com", addr, now).unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// An entry idle past the TTL is rebuilt, bounding how long a pooled
+    /// connection to a once-vetted address can live.
+    #[test]
+    fn an_idle_entry_is_rebuilt_after_the_ttl() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("example.com", addr, now).unwrap();
+        cache
+            .get(
+                "example.com",
+                addr,
+                now + PINNED_CLIENT_TTL + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// Use keeps an entry alive: a client fetched every minute must not be
+    /// rebuilt just because it was first created more than a TTL ago. The TTL is
+    /// idle time, not total age — otherwise the busiest client in the process
+    /// would be the one thrown away on a schedule.
+    #[test]
+    fn continued_use_keeps_an_entry_alive() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for minute in 0..20 {
+            cache
+                .get("example.com", addr, at(now, minute * 60))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "a continuously-used client was expired by age rather than idleness"
+        );
+    }
+
+    /// A client must release its idle sockets BEFORE the cache releases the
+    /// client. The other way round, every entry spends the tail of its life
+    /// holding connections nothing will reuse — which is the whole cost the pool
+    /// bound exists to avoid.
+    #[test]
+    fn idle_sockets_are_released_before_their_client_is() {
+        assert!(
+            POOL_IDLE_TIMEOUT < PINNED_CLIENT_TTL,
+            "pool idle timeout {POOL_IDLE_TIMEOUT:?} is not shorter than the \
+             client TTL {PINNED_CLIENT_TTL:?}"
+        );
+    }
+
+    /// The map is bounded. The poller talks to as many hosts as there are feeds,
+    /// so an unbounded map would be a slow leak of connection pools.
+    #[test]
+    fn the_cache_is_bounded() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        for i in 0..(MAX_PINNED_CLIENTS + 50) {
+            let addr: SocketAddr = format!("93.184.216.34:{}", 1024 + i).parse().unwrap();
+            cache.get(&format!("h{i}.example.com"), addr, now).unwrap();
+        }
+        assert!(
+            cache.entries.lock().unwrap().len() <= MAX_PINNED_CLIENTS,
+            "the cache grew past its bound"
         );
     }
 
@@ -784,5 +1155,111 @@ pub(crate) mod tests {
         assert_eq!(safe_link("   "), None);
         // A relative/naked path isn't an absolute http(s) URL → dropped.
         assert_eq!(safe_link("/relative/path"), None);
+    }
+
+    /// The OAuth token/PAR calls are form POSTs carrying a client assertion and,
+    /// on the token call, the authorization code. They must go through the SAME
+    /// SSRF guard as everything else: a PDS or issuer URL that resolves to
+    /// loopback/RFC1918 has to fail closed BEFORE the credential is sent.
+    #[tokio::test]
+    async fn guarded_post_form_fails_closed_on_a_forbidden_target() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1:2583/oauth/token",
+            "http://[::1]:2583/oauth/token",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/oauth/token",
+        ] {
+            let err = guarded_post_form(&client, url, &[], &[("grant_type", "authorization_code")])
+                .await
+                .expect_err("must refuse {url}");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("forbidden") || msg.contains("refus") || msg.contains("resolve"),
+                "unexpected error for {url}: {err:#}"
+            );
+        }
+    }
+
+    /// A non-http(s) scheme must be rejected before any DNS work.
+    #[tokio::test]
+    async fn guarded_post_form_rejects_non_http_schemes() {
+        let client = Client::new();
+        assert!(
+            guarded_post_form(&client, "file:///etc/passwd", &[], &[("a", "b")])
+                .await
+                .is_err()
+        );
+    }
+
+    /// OAuth metadata and DID documents must be fetched WITHOUT following
+    /// redirects, and still through the SSRF guard.
+    /// Asserts on the GUARD's error, not merely `is_err()`. Connecting to
+    /// `127.0.0.1` fails anyway (refused, or a slow timeout for an unrouted
+    /// RFC1918 address), so an `is_err()`-only assertion passes with
+    /// `resolve_and_check` deleted and proves nothing.
+    #[tokio::test]
+    async fn guarded_get_no_redirect_still_fails_closed_on_forbidden_targets() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1/.well-known/oauth-authorization-server",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/.well-known/did.json",
+            "http://[::1]/.well-known/did.json",
+        ] {
+            let err = guarded_get_no_redirect(&client, url, &[])
+                .await
+                .expect_err("must refuse");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("forbidden (internal) address"),
+                "{url} failed for the wrong reason: {rendered}"
+            );
+        }
+        // And the scheme check, which is a different branch entirely.
+        let err = guarded_get_no_redirect(&client, "file:///etc/passwd", &[])
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("non-http(s) URL scheme"));
+    }
+
+    /// The content type must follow the body it describes. Because both come
+    /// from the same value, a JSON body can never be labelled as a form.
+    #[test]
+    fn the_content_type_follows_the_body_kind() {
+        assert_eq!(
+            PostBody::Json(b"{}".to_vec()).content_type(),
+            "application/json"
+        );
+        assert_eq!(
+            PostBody::Form(&[("a", "b")]).content_type(),
+            "application/x-www-form-urlencoded"
+        );
+        // And the bytes are encoded to match.
+        assert_eq!(
+            PostBody::Json(b"{\"a\":1}".to_vec()).into_bytes(),
+            b"{\"a\":1}"
+        );
+        assert_eq!(PostBody::Form(&[("a", "b c")]).into_bytes(), b"a=b+c");
+    }
+
+    /// Form encoding must percent-encode values; a value containing `&` or `=`
+    /// must not be able to inject an extra parameter into the body.
+    #[test]
+    fn form_body_percent_encodes_and_cannot_inject_parameters() {
+        let body = PostBody::Form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "abc&scope=evil"),
+            ("redirect_uri", "https://x.example/oauth/callback"),
+        ])
+        .into_bytes();
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains("grant_type=authorization_code"));
+        assert!(
+            s.matches("scope=").count() == 0,
+            "a `&` in a value injected a parameter: {s}"
+        );
+        assert!(s.contains("%26"), "the `&` was not encoded: {s}");
+        assert!(s.contains("%3A%2F%2F"), "the `://` was not encoded: {s}");
     }
 }

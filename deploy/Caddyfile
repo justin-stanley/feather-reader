@@ -5,6 +5,10 @@
 # Caddy itself serves plain HTTP on :8080 with automatic HTTPS turned off.
 #
 # Routing (grounded in the source):
+#   * OAuth routing is SPLIT into two importable files, one per backend, chosen
+#     by FEATHERREADER_REPO_BACKEND at container start
+#     (deploy/caddy-oauth-sidecar.conf and deploy/caddy-oauth-rust.conf). The
+#     notes below describe the sidecar variant, which is the default.
 #   * The sidecar's PUBLIC OAuth endpoints live at its ROOT (/login, /callback,
 #     /client-metadata.json, /jwks.json). In prod SIDECAR_PUBLIC_URL is
 #     https://feather-reader.com/oauth, so client_id/redirect_uri are under
@@ -63,8 +67,20 @@
 	#
 	# `/health` is EXEMPT: Fly's internal health probe hits it directly (not
 	# through Cloudflare, so no header) — gating it would flap the machine
-	# unhealthy. It only returns a static "ok featherreader/<ver>" string, so
-	# leaving it open to direct origin hits is harmless.
+	# unhealthy.
+	#
+	# That exemption BOUNDS what /health may say. It used to return only a static
+	# "ok featherreader/<ver>" string; it now also reports whether the database is
+	# reachable, whether the poll loop is ticking, whether fetching is paused, and
+	# which OAuth backend is live — so an operator can diagnose an instance whose
+	# feeds have stopped, including during an OAuth outage when the session-gated
+	# /admin/metrics is exactly as unreachable as the thing it would diagnose.
+	#
+	# Every one of those is a machine fact of the same class /stats already
+	# publishes to anyone: no user counts, no DIDs, no feed URLs, and no precise
+	# internal numbers. The version string in the same response already pins the
+	# exact code, so the backend name discloses nothing further. Anything outside
+	# that class must go behind the origin lock, not here.
 	#
 	# Placed FIRST so nothing below routes for a header-less request. If
 	# FEATHERREADER_ORIGIN_SECRET is unset the matcher value is empty and every
@@ -87,34 +103,13 @@
 		respond 404
 	}
 
-	# --- The Rust app's own post-login callback -------------------------------
-	# Must be matched BEFORE the generic /oauth/* -> sidecar rule below. The
-	# sidecar->app hop is the ONLY /oauth/callback that carries session_id (success)
-	# or error_description (the sidecar's own failure hand-off). The PDS->sidecar
-	# hop (?code=&state= or ?error=&state=) has neither and correctly falls through.
-	@app_callback_ok {
-		path /oauth/callback
-		query session_id=*
-	}
-	handle @app_callback_ok {
-		reverse_proxy 127.0.0.1:8082
-	}
-	@app_callback_err {
-		path /oauth/callback
-		query error_description=*
-	}
-	handle @app_callback_err {
-		reverse_proxy 127.0.0.1:8082
-	}
-
-	# --- Sidecar PUBLIC OAuth endpoints: /oauth/* -> :8081 (prefix stripped) ---
-	# e.g. /oauth/client-metadata.json -> /client-metadata.json,
-	#      /oauth/callback?code=... (PDS success) -> /callback,
-	#      /oauth/callback?error=access_denied&state=... (PDS deny) -> /callback,
-	#      /oauth/login, /oauth/jwks.json, etc.
-	handle_path /oauth/* {
-		reverse_proxy 127.0.0.1:8081
-	}
+	# --- OAuth routing: selected by FEATHERREADER_REPO_BACKEND ----------------
+	# container-entrypoint.sh installs ONE of deploy/caddy-oauth-{sidecar,rust}.conf
+	# as /etc/caddy/oauth-routes.conf before Caddy starts. The two backends cannot
+	# share /oauth/callback -- the PDS sends identical `?code=&state=&iss=` to both,
+	# so nothing in the request distinguishes them and one process must own the
+	# path. See either conf file for the full reasoning.
+	import /etc/caddy/oauth-routes.conf
 
 	# --- Everything else: the Rust featherreader app --------------------------
 	# The UI, /health, and /static/* all live here.

@@ -94,6 +94,64 @@ pub struct Entry {
     pub fetched_at: String,
 }
 
+/// One row of a LIST view — deliberately **without** `content_html`.
+///
+/// The list queries used to be `SELECT e.*` into [`Entry`], which carries the
+/// sanitized article body. The body is essentially the whole of a cached entry
+/// (measured: 11.9 KB/entry), and no list surface has ever rendered it — the
+/// reader's `EntryRow` reads id, title, feed title, date, read, starred and
+/// link, and nothing else. So every article on every page load was read off
+/// disk, allocated, and dropped unexamined. On a 512 MB box with 250 concurrent
+/// requests permitted, one reader with a large backlog could ask for hundreds of
+/// megabytes in a single handler, and the resulting OOM/restart looked like a
+/// healthy machine that simply fell over.
+///
+/// `read` / `starred` come from the same `LEFT JOIN` that filters the view, so a
+/// caller does not have to fetch the whole unread or starred set a second time
+/// just to decorate the rows it is showing.
+///
+/// [`Entry`] is still the right type for the single-entry reader, which is the
+/// one surface that genuinely needs the body.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct EntryListRow {
+    pub id: i64,
+    pub feed_id: i64,
+    /// Feed-native GUID — used to match a cached entry against a PDS saved record.
+    pub guid: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub published: Option<String>,
+    /// This DID's read bit. `false` when there is no `entry_state` row at all.
+    pub read: bool,
+    /// This DID's star bit. `false` when there is no `entry_state` row at all.
+    pub starred: bool,
+}
+
+/// Which list [`list_entries`] (and its siblings) is producing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListView {
+    /// No `entry_state` row for this DID, or one with `read = 0`.
+    Unread,
+    /// An `entry_state` row with `starred = 1`.
+    Starred,
+    /// Every subscribed entry, read or not.
+    All,
+}
+
+impl ListView {
+    /// The `WHERE` fragment that selects this view, given `s` as the per-DID
+    /// `entry_state` LEFT JOIN alias.
+    fn predicate(self) -> &'static str {
+        match self {
+            // An entry with no state row is unread — hence LEFT JOIN + COALESCE
+            // rather than a join that would drop never-touched entries.
+            ListView::Unread => "COALESCE(s.read, 0) = 0",
+            ListView::Starred => "COALESCE(s.starred, 0) = 1",
+            ListView::All => "1 = 1",
+        }
+    }
+}
+
 /// Per-`(did, entry)` read/star state — the fast in-session working copy that the
 /// batched flusher later syncs to the PDS as a per-feed read cursor.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
@@ -229,6 +287,21 @@ CREATE TABLE IF NOT EXISTS entry_state (
     PRIMARY KEY (did, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state_did_read ON entry_state (did, read);
+-- The FK child key. `entry_id` is the TRAILING column of the primary key, so
+-- without this index it is not the leading column of anything and SQLite must
+-- FULL SCAN entry_state for EVERY row deleted from `entries` to service
+-- ON DELETE CASCADE.
+--
+-- That is not theoretical. Measured on 600k entry_state rows: 500 deletes took
+-- 10.3s and 2,000 took 38.3s, against a busy_timeout of 5s — so any retention
+-- sweep removing more than roughly 260 entries made every concurrent writer
+-- (star, mark-read, OAuth session write) fail with SQLITE_BUSY. With this index
+-- the same 32,850-row delete goes from ~10 minutes to 0.7s.
+--
+-- It also fixes the per-feed trim, whose starred-sparing subquery scans
+-- entry_state on every poll of every feed and scales with TOTAL rows across all
+-- users rather than with the feed being trimmed (2ms -> 21ms at 1M rows).
+CREATE INDEX IF NOT EXISTS idx_entry_state_entry_id ON entry_state (entry_id);
 
 -- Per-DID subscription projection. The shared `feeds`/`entries` cache is
 -- deduped by URL and NOT owned by any single DID; `sub_ref` records which
@@ -308,6 +381,36 @@ CREATE TABLE IF NOT EXISTS network_stat (
     observed_at TEXT NOT NULL,
     PRIMARY KEY (key, source)
 );
+-- Repo-operation timings, for comparing the two backends across a CUTOVER.
+--
+-- Persisted rather than held in memory because flipping the backend requires a
+-- restart, and an in-memory table would lose the outgoing backend's numbers at
+-- exactly the moment they became worth comparing against. These rows are the
+-- only reason a "side by side" table can show two backends at once.
+--
+-- `repo_timing` is a bounded window of recent samples (pruned per backend+op);
+-- `repo_timing_total` carries the all-time counts, which must survive that
+-- pruning or a long-running backend would appear to have served fewer calls
+-- than a fresh one.
+CREATE TABLE IF NOT EXISTS repo_timing (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend  TEXT    NOT NULL,
+    op       TEXT    NOT NULL,
+    micros   INTEGER NOT NULL,
+    ok       INTEGER NOT NULL,
+    at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_repo_timing_key ON repo_timing(backend, op, id);
+
+CREATE TABLE IF NOT EXISTS repo_timing_total (
+    backend    TEXT    NOT NULL,
+    op         TEXT    NOT NULL,
+    ok_count   INTEGER NOT NULL DEFAULT 0,
+    err_count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (backend, op)
+);
+
 "#;
 
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
@@ -336,6 +439,13 @@ pub async fn init(config: &Config) -> Result<Pool> {
 /// `sqlite::memory:` for an ephemeral in-memory database. The file is created
 /// if it does not exist; WAL journaling is enabled for on-disk databases and
 /// foreign keys are enforced on every connection.
+/// Ceiling the WAL is truncated back to at each checkpoint.
+///
+/// The WAL lives on the same volume as the database and counts against the same
+/// 1 GB, but nothing bounded it: SQLite grows the WAL to fit the largest
+/// transaction it has ever seen and never shrinks it again without this limit.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 pub async fn init_url(db_url: &str) -> Result<Pool> {
     // An in-memory DB must run on a SINGLE connection: each `:memory:` connection
     // is a *separate* database, and a multi-connection in-memory pool can also
@@ -351,6 +461,29 @@ pub async fn init_url(db_url: &str) -> Result<Pool> {
     // WAL is a no-op / unsupported for :memory:, so only request it on-disk.
     if !is_memory {
         opts = opts.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        // **Incremental auto-vacuum, set at CREATION.**
+        //
+        // `auto_vacuum` was read by `reclaim` and never set anywhere, so every
+        // database ran in SQLite's default NONE mode and `reclaim` always took
+        // its full-`VACUUM` branch — daily, and again after every prune. A full
+        // VACUUM needs free disk roughly equal to the live database because it
+        // writes a whole new file, which is exactly what is scarce under the
+        // disk pressure that triggers a sweep; on a ~700 MiB database on a 1 GB
+        // volume it cannot complete at all.
+        //
+        // This pragma only takes effect on a database with no tables yet, so it
+        // fixes NEW instances permanently and does nothing to existing ones —
+        // deliberately. Changing it on a populated database requires running the
+        // very full VACUUM that is unsafe here, so that is a separate,
+        // operator-invoked step: see [`migrate_to_incremental_vacuum`].
+        opts = opts.auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
+        // Truncate the WAL back down at checkpoints. Without a limit, a WAL
+        // grown once by a single large transaction stays that size for the life
+        // of the file — permanently occupying volume the watermark is trying to
+        // protect. The batched retention deletes keep transactions small now, so
+        // in practice the WAL should rarely approach this; the limit is what
+        // makes that a guarantee rather than a hope.
+        opts = opts.pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string());
     }
     // Under a concurrent write burst (the poller's insert_entries tx racing the
     // web layer's mark_read / redeem_code tx) SQLite would otherwise return
@@ -386,6 +519,14 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
         .await
         .context("failed to create schema")?;
     apply_migrations(pool).await?;
+    // The Rust OAuth client's tables live in the same database. Created
+    // UNCONDITIONALLY, not only when that backend is selected: the tables are
+    // empty and harmless under the sidecar, whereas creating them lazily would
+    // make the first request after a cutover flip fail with "no such table" --
+    // at the one moment nobody wants to discover a migration was missed.
+    crate::oauth::store::init_schema(pool)
+        .await
+        .context("failed to create the OAuth schema")?;
     Ok(())
 }
 
@@ -481,6 +622,22 @@ async fn ensure_column(
 
 /// Insert a feed by URL, or update its metadata if the URL already exists.
 /// Returns the feed's row id (existing or newly assigned).
+///
+/// EVERY updatable column is COALESCE'd, so `None` means "leave alone" for all
+/// of them and a partial upsert cannot clobber a field it never mentioned.
+///
+/// `etag`/`last_modified` were the exception until now, and the exception was
+/// silently disabling conditional GET for the entire instance. `set_next_poll`
+/// in the scheduler supplies only `url` + `next_poll` after every single poll,
+/// which wrote both validators back to NULL — so `304 Not Modified` was
+/// unreachable and every feed was re-downloaded, re-parsed, re-sanitised and
+/// re-inserted in full, hourly, forever. `feed::touch_polled` had discovered the
+/// same trap earlier and worked around it in its own caller by re-reading the
+/// row first; that local fix is what let the next caller walk into it.
+///
+/// A stale validator is not a hazard: if the origin no longer issues one it
+/// ignores our `If-None-Match` and returns `200`, and if it still matches then
+/// `304` was the correct answer anyway.
 pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     let row = sqlx::query(
         r#"
@@ -489,8 +646,8 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
         ON CONFLICT (url) DO UPDATE SET
             title         = COALESCE(excluded.title, feeds.title),
             site_url      = COALESCE(excluded.site_url, feeds.site_url),
-            etag          = excluded.etag,
-            last_modified = excluded.last_modified,
+            etag          = COALESCE(excluded.etag, feeds.etag),
+            last_modified = COALESCE(excluded.last_modified, feeds.last_modified),
             last_polled   = COALESCE(excluded.last_polled, feeds.last_polled),
             next_poll     = COALESCE(excluded.next_poll, feeds.next_poll)
         RETURNING id
@@ -589,10 +746,17 @@ pub async fn feeds_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Feed>> {
     Ok(feeds)
 }
 
-/// The feed ids a `did` currently subscribes to (its `sub_ref` rows). Bounded by
-/// the per-DID subscription cap, so callers can safely iterate it — e.g. the
-/// global "mark all read" path fans out over feeds (bounded) rather than over
-/// unread entries (unbounded).
+/// The feed ids a `did` currently subscribes to (its `sub_ref` rows).
+///
+/// **Not bounded by `max_subs_per_did`.** This comment used to claim it was, and
+/// callers leaned on that: the cap is enforced on the ADD and OPML paths only,
+/// never on read, and `sub_ref` is rebuilt from whatever the PDS returns — which
+/// any client can write to, bounded only by the list-pages ceiling at 20,000
+/// records. A claim in a comment is not a bound.
+///
+/// Callers must therefore not assume a small result. The one that cared — the
+/// list views' scope filter — no longer does: it passes the whole set as a
+/// single `json_each` bind rather than one SQL placeholder per feed.
 pub async fn subscribed_feed_ids(pool: &SqlitePool, did: &str) -> Result<Vec<i64>> {
     let ids: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM sub_ref WHERE did = ?1")
         .bind(did)
@@ -634,6 +798,13 @@ pub async fn count_feeds(pool: &SqlitePool) -> Result<i64> {
 /// live pages means a retention prune (which frees pages, see [`reclaim`]) is
 /// actually reflected here, so the watermark can drop back below its threshold
 /// and polling resumes. Cheap (three `PRAGMA` reads); works for file + `:memory:`.
+///
+/// **The WAL counts too.** This is the number the DB-size watermark compares
+/// against a VOLUME size, and in WAL mode the `-wal` sidecar sits on that same
+/// volume — so leaving it out understated exactly the quantity the watermark
+/// exists to bound. It is added back below, best-effort: a WAL that cannot be
+/// stat'd contributes zero rather than failing the check, since a watermark that
+/// errors is worse than one that is slightly optimistic.
 pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(pool)
@@ -648,8 +819,41 @@ pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
         .await
         .context("PRAGMA page_size failed")?;
     let used_pages = page_count.saturating_sub(freelist_count).max(0);
-    Ok(used_pages.saturating_mul(page_size))
+    Ok(used_pages
+        .saturating_mul(page_size)
+        .saturating_add(wal_bytes(pool).await))
 }
+
+/// Bytes the write-ahead log currently occupies on the database's volume, or 0
+/// when there is no WAL (`:memory:`, non-WAL journal modes) or it cannot be
+/// stat'd. Best-effort by design — see [`db_size_bytes`].
+async fn wal_bytes(pool: &SqlitePool) -> i64 {
+    let Some(path) = main_db_path(pool).await else {
+        return 0;
+    };
+    std::fs::metadata(format!("{path}-wal"))
+        .map(|m| i64::try_from(m.len()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The main database's file path, or `None` for `:memory:`.
+async fn main_db_path(pool: &SqlitePool) -> Option<String> {
+    sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main' AND file <> ''")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Freelist pages returned to the OS per `incremental_vacuum` step. At a 4 KiB
+/// page that is ~8 MiB per batch — a short lock hold, and few enough steps that
+/// a large reclaim is tens of statements rather than thousands.
+const RECLAIM_BATCH_PAGES: i64 = 2_000;
+
+/// Backstop on the reclaim loop. `freelist_count == 0` and the no-progress check
+/// are the real terminators; at [`RECLAIM_BATCH_PAGES`] this is 2M pages (~8 GiB),
+/// far past anything a 1 GB volume holds.
+const RECLAIM_MAX_BATCHES: usize = 1_000;
 
 /// Reclaim freed pages so the database file (and its used-page accounting) can
 /// actually shrink after a retention/prune sweep DELETEs rows.
@@ -662,25 +866,397 @@ pub async fn db_size_bytes(pool: &SqlitePool) -> Result<i64> {
 /// is in `auto_vacuum = INCREMENTAL` mode (cheap, no full rewrite), and otherwise
 /// falls back to a full `VACUUM`.
 pub async fn reclaim(pool: &SqlitePool) -> Result<()> {
-    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+    match auto_vacuum_mode(pool).await? {
+        AutoVacuum::Incremental => {
+            // **Bounded, like the deletes that precede it.**
+            //
+            // With no page argument this reclaims the ENTIRE freelist in one
+            // transaction — handing straight back the write-lock hold that
+            // batching the retention deletes had just won, immediately after the
+            // sweep that created the freelist in the first place. Same shape as
+            // `delete_in_batches`: a bounded unit of work, then an explicit
+            // hand-off so a waiting writer actually gets in.
+            // **Both early exits are LOUD.** Failing to reclaim is the failure
+            // this function exists to prevent: `db_size_bytes` stays high,
+            // `poll_due_once` keeps polling paused, and `/stats` says "paused"
+            // with nothing anywhere saying reclaim gave up. Exiting silently
+            // makes that indistinguishable from a sweep that had nothing to do.
+            let mut drained = true;
+            for batch in 0..RECLAIM_MAX_BATCHES {
+                let before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(pool)
+                    .await
+                    .context("PRAGMA freelist_count failed")?;
+                if before == 0 {
+                    break;
+                }
+                // A PRAGMA argument cannot be a bind parameter, and this one is
+                // a `const i64` declared in this file — nothing external reaches
+                // it.
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "PRAGMA incremental_vacuum({RECLAIM_BATCH_PAGES})"
+                )))
+                .execute(pool)
+                .await
+                .context("PRAGMA incremental_vacuum failed")?;
+                let after: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(pool)
+                    .await
+                    .context("PRAGMA freelist_count failed")?;
+                // No progress: either nothing more can be freed, or a
+                // concurrent retention delete pushed `after` back up. Both leave
+                // pages allocated, which is what an operator needs to know.
+                //
+                // This comment previously also claimed "a long-lived WAL read
+                // snapshot pins freelist pages". MEASURED AND FALSE: with a
+                // reader holding a snapshot taken BEFORE the delete, the
+                // freelist still drained 2000 → 0 and `page_count` halved. A
+                // reader blocks the CHECKPOINT, not the incremental vacuum — so
+                // that case exits this loop through the SUCCESS path and is
+                // reported below, not here.
+                if after >= before {
+                    tracing::warn!(
+                        freelist_pages = after,
+                        batches_run = batch + 1,
+                        "reclaim stopped making progress with pages still on the \
+                         freelist; the file will not shrink and the DB-size watermark \
+                         may stay engaged until the next sweep"
+                    );
+                    drained = false;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                // `after > 0` matters: the final batch can drain the freelist
+                // completely, in which case the loop reaches here having
+                // SUCCEEDED and would otherwise log "with pages still on the
+                // freelist" for an empty one — and suppress the success line.
+                // This is the same guard `delete_in_batches` carries, and the
+                // same defect it already had; reproduced here verbatim by
+                // copying the loop's shape without its condition.
+                if batch + 1 == RECLAIM_MAX_BATCHES && after > 0 {
+                    tracing::warn!(
+                        batches_run = batch + 1,
+                        freelist_pages = after,
+                        "reclaim hit its batch backstop with pages still on the \
+                         freelist; the rest waits for the next sweep"
+                    );
+                    drained = false;
+                }
+            }
+            if drained {
+                tracing::debug!("reclaim: freelist drained");
+            }
+        }
+        // SQLite already returns freed pages at every commit in this mode.
+        // Nothing to do, and a VACUUM would be pure cost.
+        AutoVacuum::Full => {}
+        // **Deliberately a no-op, where this used to run a full VACUUM.**
+        //
+        // Nothing ever set `auto_vacuum`, so NONE was the mode every database
+        // actually ran in — which made the full-VACUUM branch the one that
+        // always executed, daily and after every prune. A full VACUUM writes a
+        // complete second copy of the database, so it needs free disk roughly
+        // equal to the live file; that is precisely what is missing under the
+        // disk pressure that triggers a retention sweep. `poll_due_once` already
+        // carries a comment explaining this danger and removed VACUUM from the
+        // poll path — while leaving it in the retention path that runs under the
+        // same pressure.
+        //
+        // Skipping it does NOT latch the DB-size watermark, which is the failure
+        // this branch was written to prevent: `db_size_bytes` subtracts the
+        // freelist, so a DELETE lowers the measured size with no VACUUM at all.
+        // What is lost is the FILE shrinking, and the fix for that is to get the
+        // database into INCREMENTAL mode — see `migrate_to_incremental_vacuum`,
+        // which is operator-invoked precisely because it needs the one operation
+        // that is unsafe to attempt automatically.
+        AutoVacuum::None => {
+            tracing::warn!(
+                "auto_vacuum=NONE: skipping reclaim. Freed pages stay allocated and \
+                 the file will not shrink. Run `featherreader --migrate-auto-vacuum` \
+                 once, while the volume has headroom, to move this database to \
+                 INCREMENTAL mode."
+            );
+        }
+    }
+
+    // Truncate the WAL as well. It lives on the same volume and is counted by
+    // `db_size_bytes`, so reclaiming database pages while leaving a WAL grown by
+    // the sweep that just ran would give back part of the space and hold the
+    // rest. Worth doing even in the NONE branch above, where it is the only
+    // space this function can return at all.
+    //
+    // **A blocked checkpoint is the real way the file stays big, so it warns.**
+    //
+    // Measured: with a reader holding an open snapshot, `incremental_vacuum`
+    // still drains the freelist and `page_count` halves — but the main file
+    // stayed at 16.4 MB until the reader released and the checkpoint could
+    // truncate it to 8.2 MB. So a reader does not stop the reclaim; it stops the
+    // SHRINK. That is the operator-visible outcome (`db_size_bytes` counts the
+    // WAL, and the watermark is compared against a volume), and it used to be
+    // reported at `debug!` — below any realistic filter — while the loop above
+    // warned loudly about a mechanism that does not actually occur.
+    //
+    // Not an error: the next sweep checkpoints again once the reader is gone.
+    match checkpoint_wal(pool).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            "a reader held the WAL so it could not be truncated after reclaim; the \
+             freed pages are gone but the file has not shrunk yet, and the DB-size \
+             watermark may stay engaged until the next sweep"
+        ),
+        Err(err) => tracing::warn!(%err, "wal checkpoint after reclaim failed"),
+    }
+    Ok(())
+}
+
+/// Run a truncating WAL checkpoint. `Ok(false)` means SQLite declined because a
+/// reader held the WAL.
+///
+/// **The busy case is a ROW, not an error.** `PRAGMA wal_checkpoint` returns
+/// `(busy, log_frames, checkpointed_frames)` and sets `busy = 1` when it could
+/// not run — measured: `(1, 3, 3)` with one open read transaction versus
+/// `(0, 0, 0)` without. So `if let Err(..)` never fires on the case it was
+/// written for, and a caller that depends on the WAL actually being truncated
+/// (the migration's size report does) would silently get the untruncated one.
+async fn checkpoint_wal<'e, E>(conn: E) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(conn)
+        .await
+        .context("PRAGMA wal_checkpoint(TRUNCATE) failed")?;
+    Ok(row.0 == 0)
+}
+
+/// A database's `auto_vacuum` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoVacuum {
+    /// 0 — freed pages stay on the freelist; only a full `VACUUM` returns them.
+    None,
+    /// 1 — SQLite returns freed pages at every commit.
+    Full,
+    /// 2 — freed pages are returned on demand by `PRAGMA incremental_vacuum`.
+    Incremental,
+}
+
+/// Read the database's `auto_vacuum` mode.
+pub async fn auto_vacuum_mode(pool: &SqlitePool) -> Result<AutoVacuum> {
+    let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
         .fetch_one(pool)
         .await
         .context("PRAGMA auto_vacuum failed")?;
-    // auto_vacuum: 0 = NONE, 1 = FULL, 2 = INCREMENTAL. `incremental_vacuum` only
-    // does anything in INCREMENTAL mode; in NONE mode a full VACUUM is required to
-    // return freed pages to the OS.
-    if auto_vacuum == 2 {
-        sqlx::query("PRAGMA incremental_vacuum")
-            .execute(pool)
-            .await
-            .context("PRAGMA incremental_vacuum failed")?;
-    } else {
-        sqlx::query("VACUUM")
-            .execute(pool)
-            .await
-            .context("VACUUM failed")?;
+    Ok(match mode {
+        1 => AutoVacuum::Full,
+        2 => AutoVacuum::Incremental,
+        _ => AutoVacuum::None,
+    })
+}
+
+/// What [`migrate_to_incremental_vacuum`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumMigration {
+    /// Already in a mode that reclaims; nothing was run.
+    NotNeeded(AutoVacuum),
+    /// Refused: not enough free space on the volume to hold the rebuilt file.
+    ///
+    /// `file_bytes` is the on-disk size, reported alongside the live-page figure
+    /// the requirement is computed from, because on exactly this population
+    /// (`NONE` mode, large freelist) the two differ a lot and only one of them
+    /// matches what `ls -l` says.
+    RefusedNoHeadroom {
+        needed: u64,
+        available: u64,
+        file_bytes: Option<u64>,
+    },
+    /// Ran the pragma + full VACUUM; the database is now INCREMENTAL.
+    Migrated {
+        bytes_before: i64,
+        bytes_after: i64,
+        file_before: Option<u64>,
+        file_after: Option<u64>,
+    },
+}
+
+/// Move a populated database from `auto_vacuum = NONE` to `INCREMENTAL`.
+///
+/// **Why this cannot happen at boot.** SQLite ignores `PRAGMA auto_vacuum` on a
+/// database that already has tables unless it is followed by a full `VACUUM`,
+/// which rebuilds the file. So the migration off the dangerous mode requires the
+/// exact operation that is dangerous — a genuine chicken-and-egg, and the reason
+/// this is an explicit operator step run when the volume has headroom rather
+/// than something attempted lazily on a machine that is already under pressure.
+///
+/// Doing it automatically would also reintroduce the failure shape T2.1 just
+/// removed: a boot-time VACUUM that cannot complete on a full volume, on a
+/// supervisor that restarts the machine whenever a child exits, is a crash loop.
+///
+/// `available_bytes` is the caller's measurement of free space on the database's
+/// volume (`None` where the platform cannot report it). The check is a refusal,
+/// not a warning: starting a VACUUM that cannot finish wastes I/O on a box that
+/// has none to spare. `VACUUM` itself is atomic — an interrupted one leaves the
+/// original database intact — so the risk being managed here is wasted work and
+/// a long write-lock hold, not corruption.
+pub async fn migrate_to_incremental_vacuum(
+    pool: &SqlitePool,
+    available_bytes: Option<u64>,
+) -> Result<VacuumMigration> {
+    let mode = auto_vacuum_mode(pool).await?;
+    if mode != AutoVacuum::None {
+        return Ok(VacuumMigration::NotNeeded(mode));
     }
-    Ok(())
+
+    // **The on-disk file, not the live-page count.** `db_size_bytes` subtracts
+    // the freelist, and the population this migration exists for is precisely
+    // `auto_vacuum = NONE` with a large freelist — so the live size can be far
+    // smaller than the file, and an operator comparing the refusal message to
+    // `ls -l` would not trust either number. The rebuild is sized by the LIVE
+    // pages (that is what gets copied), but the report shows both.
+    let bytes_before = db_size_bytes(pool).await?;
+    let file_before = main_db_file_bytes(pool).await;
+    // Resolved BEFORE a connection is acquired below. Asking the pool for
+    // anything while holding one of its connections deadlocks a saturated pool —
+    // and a single-connection pool is always saturated. The first version of the
+    // temp-directory block did exactly that, and because `main_db_path` swallows
+    // errors into `None` it did not even fail loudly: it stalled for the full
+    // acquire timeout and then silently skipped setting the directory, which is
+    // the one thing it exists to do.
+    let temp_dir = main_db_path(pool).await.and_then(|p| {
+        std::path::Path::new(&p)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    });
+    let needed = (bytes_before.max(0) as u64).saturating_mul(2);
+    if let Some(available) = available_bytes {
+        if available < needed {
+            return Ok(VacuumMigration::RefusedNoHeadroom {
+                needed,
+                available,
+                file_bytes: file_before,
+            });
+        }
+    }
+
+    // **One connection for both statements.**
+    //
+    // `PRAGMA auto_vacuum` on a populated database is connection-scoped INTENT
+    // that only takes effect when the SAME connection runs the VACUUM. Issued
+    // against the pool they can land on different connections, and the rebuild
+    // then happens in NONE mode — caught by the `ensure!` below, so loud rather
+    // than silent, but the operator has paid a whole-file rewrite for nothing on
+    // a box chosen for being short of disk.
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquiring a connection for the auto_vacuum migration")?;
+
+    // **Put the temp copy on the DATABASE's volume.**
+    //
+    // A VACUUM rebuilds through a temporary database, and the headroom check
+    // above measures the data volume. `temp_store = FILE` alone only chooses
+    // file-over-memory; it does NOT choose which filesystem, so the temp copy
+    // resolved via `SQLITE_TMPDIR`/`TMPDIR`/`/var/tmp`/`/tmp` — the container
+    // rootfs. The check could pass on `/data` and the VACUUM still hit
+    // `SQLITE_FULL`, or fill the rootfs out from under Caddy.
+    //
+    // `temp_store_directory` is the pragma that actually decides — measured:
+    // setting it alone moves the file, setting `temp_store = FILE` alone does
+    // not. It is deprecated but fully functional in the bundled SQLite (3.51.3,
+    // built without `SQLITE_OMIT_DEPRECATED`), and there is no non-deprecated
+    // equivalent reachable from a connection.
+    //
+    // `temp_store = FILE` is kept as belt-and-braces rather than because it is
+    // needed: this build's compile-time default is already FILE, but a build
+    // defaulting to MEMORY would silently ignore the directory entirely.
+    //
+    // Note it sets the PROCESS-GLOBAL `sqlite3_temp_directory`, not connection
+    // state — visible on other connections and other pools. Harmless because
+    // this function is only reachable from the one-shot `--migrate-auto-vacuum`
+    // CLI path, which does nothing else.
+    sqlx::query("PRAGMA temp_store = FILE")
+        .execute(&mut *conn)
+        .await
+        .context("PRAGMA temp_store = FILE failed")?;
+    if let Some(dir) = temp_dir.clone() {
+        // The path comes from SQLite's own `database_list`, not from a caller.
+        let quoted = dir.display().to_string().replace('\'', "''");
+        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA temp_store_directory = '{quoted}'"
+        )))
+        .execute(&mut *conn)
+        .await
+        {
+            // Not fatal: the VACUUM can still succeed if the default temp
+            // location happens to have room. But the headroom check is then
+            // measuring the wrong filesystem, so say so.
+            tracing::warn!(
+                %err, dir = %dir.display(),
+                "could not point SQLite's temp storage at the database volume; the \
+                 headroom check may not cover where the VACUUM actually writes"
+            );
+        }
+    }
+
+    // Order matters: the pragma records the INTENT, and the VACUUM is what
+    // actually rewrites the file in the new mode. Reversed, the VACUUM would
+    // rebuild in NONE mode and the pragma would then be ignored again.
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&mut *conn)
+        .await
+        .context("PRAGMA auto_vacuum = INCREMENTAL failed")?;
+    sqlx::query("VACUUM")
+        .execute(&mut *conn)
+        .await
+        .context("VACUUM failed during the auto_vacuum migration")?;
+
+    // Fold the WAL back in BEFORE measuring. A VACUUM in WAL mode writes the
+    // entire rebuilt database through the WAL, which keeps that high-water size
+    // until a truncating checkpoint — and `db_size_bytes` now counts the WAL. So
+    // the one number this command reports read as "the migration doubled my
+    // database", which is the opposite of what it did.
+    match checkpoint_wal(&mut *conn).await {
+        Ok(true) => {}
+        // Reported, because the size this function returns is computed straight
+        // after and would otherwise read as "the migration doubled my database"
+        // with nothing saying why.
+        Ok(false) => tracing::warn!(
+            "a reader held the WAL, so it was not truncated; the reported size below \
+             includes it"
+        ),
+        Err(err) => tracing::warn!(%err, "post-migration wal checkpoint failed"),
+    }
+
+    // Verified on the HELD connection, then released before anything that goes
+    // back to the pool. The test pool is single-connection, and so is a
+    // production pool that happens to be saturated — reaching for a second one
+    // while still holding the first is a deadlock waiting for a busy moment.
+    let after_raw: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await
+        .context("PRAGMA auto_vacuum failed after the migration")?;
+    drop(conn);
+    let after = match after_raw {
+        1 => AutoVacuum::Full,
+        2 => AutoVacuum::Incremental,
+        _ => AutoVacuum::None,
+    };
+    anyhow::ensure!(
+        after == AutoVacuum::Incremental,
+        "the auto_vacuum migration ran but the database is still in {after:?} mode"
+    );
+    Ok(VacuumMigration::Migrated {
+        bytes_before,
+        bytes_after: db_size_bytes(pool).await?,
+        file_before,
+        file_after: main_db_file_bytes(pool).await,
+    })
+}
+
+/// Size of the main database FILE on disk, or `None` for `:memory:` / an
+/// unstattable path. Distinct from [`db_size_bytes`], which reports live pages.
+async fn main_db_file_bytes(pool: &SqlitePool) -> Option<u64> {
+    let path = main_db_path(pool).await?;
+    std::fs::metadata(path).ok().map(|m| m.len())
 }
 
 /// Insert a batch of entries for `feed_id`, deduping on `(feed_id, guid)`, then
@@ -736,6 +1312,9 @@ pub async fn insert_entries(
     // evicted first — otherwise a feed of undated items would trim its freshest
     // rows. This bounds a single firehose/misbehaving feed's storage footprint
     // independent of the global retention sweep. `<= 0` disables it.
+    //
+    // The bound is `2 * max_entries_per_feed`, not `max_entries_per_feed`: the
+    // newest N by date, plus up to N starred. See the sparing subquery below.
     if max_entries_per_feed > 0 {
         sqlx::query(
             r#"
@@ -745,6 +1324,37 @@ pub async fn insert_entries(
                   SELECT id FROM entries
                   WHERE feed_id = ?1
                   ORDER BY COALESCE(published, fetched_at) DESC, id DESC
+                  LIMIT ?2
+              )
+              -- Starred entries survive the per-feed trim, exactly as they
+              -- survive the retention sweep. This predicate was added to the
+              -- sweep and NOT here, which left the documented guarantee
+              -- ("starred entries are never evicted") false — and made this
+              -- path, which runs on every poll of every feed rather than daily,
+              -- the main producer of the very "starred but not cached" case the
+              -- saved-record rendering exists to paper over.
+              --
+              -- The sparing is BOUNDED and SCOPED, and both matter:
+              --
+              -- Bounded, because the first version spared every starred row
+              -- without limit, which did not weaken the cap so much as remove
+              -- it — measured at cap=5 with 50 starred rows, 55 survived, 11x
+              -- the cap. That is the same unbounded-sparing mistake the
+              -- retention hard ceiling was added to fix, reintroduced in the
+              -- other sweep. Worst case is now cap + cap.
+              --
+              -- Scoped, because `SELECT entry_id FROM entry_state WHERE
+              -- starred = 1` reads EVERY starred row on the instance, for every
+              -- poll of every feed — cost scaling with total users rather than
+              -- with the feed being trimmed.
+              AND id NOT IN (
+                  SELECT e2.id FROM entries e2
+                  WHERE e2.feed_id = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM entry_state s
+                        WHERE s.entry_id = e2.id AND s.starred = 1
+                    )
+                  ORDER BY COALESCE(e2.published, e2.fetched_at) DESC, e2.id DESC
                   LIMIT ?2
               )
             "#,
@@ -769,8 +1379,47 @@ pub async fn insert_entries(
     Ok(count)
 }
 
+/// Make a feed due for polling on the next tick.
+///
+/// Used when a saved article is missing from the cache: if the reader still
+/// subscribes to the feed, the poller may be able to bring the article back on
+/// its own. Clearing `next_poll` is the whole mechanism — `due_feeds` treats
+/// NULL as due — so this adds no synthetic rows and no special-case fetch path.
+///
+/// **Rate-limited by `not_polled_since`**, and that is not a nicety.
+///
+/// `due_feeds` treats a NULL `next_poll` as due immediately, so clearing it
+/// unconditionally from a page handler meant every reload of the starred view
+/// made those feeds due again — bypassing the poll interval entirely. That is
+/// outbound amplification against third-party feed origins, and it lets one
+/// reader's feeds monopolise a poll budget that is shared and already the
+/// binding constraint on how many readers an instance can serve.
+///
+/// A feed polled within the window is left alone: if the article was not in the
+/// feed a minute ago, another fetch now will not find it either. The nudge is
+/// therefore worth at most one extra poll per feed per interval, which is the
+/// cadence the poller already targets.
+///
+/// A no-op if the URL is not a known feed.
+pub async fn mark_feed_due(
+    pool: &SqlitePool,
+    feed_url: &str,
+    not_polled_since: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE feeds SET next_poll = NULL \
+         WHERE url = ?1 AND (last_polled IS NULL OR last_polled < ?2)",
+    )
+    .bind(feed_url)
+    .bind(not_polled_since)
+    .execute(pool)
+    .await
+    .context("marking a feed due")?;
+    Ok(())
+}
+
 /// Delete entries whose age exceeds the retention window — the shared cache's
-/// **rolling window**. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
+/// **rolling window** — except those a reader has starred or not yet read. "Age" is `COALESCE(published, fetched_at)` so an UNDATED
 /// entry falls back to when it was fetched (never NULL) rather than being treated
 /// as infinitely old. `entry_state` cascades via its `ON DELETE CASCADE` FK.
 ///
@@ -778,30 +1427,266 @@ pub async fn insert_entries(
 /// `read_cursor` exception sets (which have no FK to `entries`) so the id-sets do
 /// not grow without bound and the flushed PDS record never references a vanished
 /// entry. The caller (the retention sweep) should follow a non-zero return with
-/// [`reclaim`] so freed pages return to the OS. `days == 0` is a no-op (retention
-/// disabled). Returns the number of entry rows deleted.
-pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
-    if days <= 0 {
+/// [`reclaim`] so freed pages return to the OS.
+///
+/// The two knobs are **independent**. `days == 0` disables the rolling window and
+/// nothing else; `hard_days == 0` disables the ceiling and nothing else. Only
+/// when both are off is this a no-op. Returns the number of entry rows deleted.
+pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> Result<u64> {
+    let now = chrono::Utc::now();
+    let at = |d: i64| {
+        (now - chrono::Duration::days(d)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+
+    let cutoff = (days > 0).then(|| at(days));
+    // The ceiling only means anything if it is STRICTLY OLDER than the window.
+    // At `0 < hard_days <= days` the two cutoffs coincide, and since the hard
+    // delete spares nothing, it would delete exactly the rows the soft delete
+    // exists to spare — turning the whole starred/unread exception into a no-op.
+    // With no window at all (`days <= 0`) there is nothing to be inside of, so a
+    // positive ceiling stands on its own.
+    //
+    // This used to be `hard_days.max(days)`, which clamps the wrong way: it made
+    // `0` — the value an operator reaches for to turn a ceiling OFF, and the
+    // documented "disabled" value for `RETENTION_DAYS` one line above it in the
+    // same table — the single most destructive setting available, silently
+    // purging starred and unread entries at the soft window. Measured: with
+    // `days=14`, `hard=0` deleted a 30-day starred entry and a 30-day unread one.
+    //
+    // `<= 0` now means disabled, consistently with `days`. A contradictory
+    // positive value is refused rather than reinterpreted downward.
+    //
+    // The ceiling is deliberately NOT gated on the window being enabled. It used
+    // to be — this function returned on `days <= 0` before the ceiling was even
+    // computed — which made `RETENTION_DAYS=0` mean "no window AND no ceiling":
+    // the one configuration with no bound on the shared cache whatsoever. That
+    // became load-bearing when the per-feed trim started sparing starred entries.
+    // Before, the trim was a backstop for them; now nothing was. "I don't want a
+    // rolling window" and "I don't want any ceiling at all" are different
+    // statements, and are now configured separately.
+    let hard_cutoff = if hard_days > 0 && (days <= 0 || hard_days > days) {
+        Some(at(hard_days))
+    } else {
+        if hard_days > 0 {
+            tracing::warn!(
+                hard_days,
+                days,
+                "retention hard ceiling is not older than the retention window; \
+                 ignoring it — set it above the window or to 0 to disable"
+            );
+        }
+        None
+    };
+
+    if cutoff.is_none() && hard_cutoff.is_none() {
         return Ok(0);
     }
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let mut tx = pool.begin().await.context("begin prune_old_entries tx")?;
-    let res = sqlx::query("DELETE FROM entries WHERE COALESCE(published, fetched_at) < ?1")
-        .bind(&cutoff)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("prune_old_entries delete (cutoff {cutoff})"))?;
-    let deleted = res.rows_affected();
+    // **The hard ceiling — the bound that sparing would otherwise remove.**
+    //
+    // Sparing `read = 0` is not a small exception: "mark unread" is a one-click
+    // UI control, and `entries` is SHARED across every reader on the instance.
+    // Without a ceiling, one person can pin unbounded rows, and the pins are
+    // permanent.
+    //
+    // That matters beyond disk. `poll_due_once` stops ALL polling once the
+    // database crosses `db_size_watermark_bytes`, and the retention DELETE is
+    // the documented release valve. Pinned rows can hold the valve shut
+    // forever, so the failure mode is: one reader pins enough content, the DB
+    // latches above the watermark, and polling stops for EVERY reader with no
+    // self-healing path. The window used to be an unconditional bound; sparing
+    // removed it, and this restores it.
+    //
+    // Starred entries go too at this age, and that is now safe: a saved record
+    // whose entry is gone renders from the PDS record as a link card, so the
+    // reader keeps the article's identity even when the cache does not keep its
+    // text.
+    let hard_deleted = match &hard_cutoff {
+        Some(cutoff) => {
+            delete_in_batches(
+                pool,
+                "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
+                cutoff,
+                "hard ceiling",
+            )
+            .await?
+        }
+        None => 0,
+    };
+    // **Entries a reader has DELIBERATELY marked are kept, whatever their age.**
+    //
+    // Precisely: an entry is spared when some DID has an `entry_state` row for
+    // it with `starred = 1` or `read = 0`. An entry nobody has ever touched has
+    // no `entry_state` row at all and is NOT spared, even though every read path
+    // treats "no row" as unread.
+    //
+    // That asymmetry is deliberate and load-bearing. Sparing every never-touched
+    // entry would spare essentially the whole table — almost no entry is ever
+    // interacted with — which would make the window a no-op and leave the hard
+    // ceiling as the only bound. The window is for evicting cache nobody claimed;
+    // the exception is for the things a reader acted on.
+    //
+    // This comment used to read "starred and unread entries are kept", which is
+    // the reading that would motivate exactly that change.
+    //
+    // The window is a cache eviction policy, not a data-retention policy. The
+    // PDS is the source of truth for what a reader CHOSE — subscriptions,
+    // folders, stars, read-state — but the entry CONTENT was never there. It
+    // exists here and at the origin feed, and a feed typically serves only its
+    // last few dozen items, so a pruned article is usually unrecoverable.
+    //
+    // Deleting indiscriminately therefore lost two things a reader would notice:
+    // a starred article vanished from the starred view entirely (the view joins
+    // `entries`, and `entry_state` cascades on the delete, so the star went with
+    // it), and anything still unread disappeared before it was ever read. Both
+    // are the opposite of a cache.
+    //
+    // This is what the documentation has always described; the query did not
+    // implement it.
+    let soft_deleted = match &cutoff {
+        Some(cutoff) => {
+            delete_in_batches(
+                pool,
+                // **`NOT EXISTS`, not `id NOT IN (…)` — measured, not guessed.**
+                //
+                // The list form materialises the ENTIRE pinned set on every
+                // batch, and that set scales with total users rather than with
+                // the feed being swept. Measured on 1M entries with 600k
+                // `entry_state` rows: 104.4 s as a list, 42.7 s as a correlated
+                // exists — 2.4x, for no disk and no write amplification, because
+                // it probes `idx_entry_state_entry_id` per candidate row instead
+                // of rebuilding a 300k-element list 200 times.
+                //
+                // The review that raised this proposed indexing the pinned
+                // predicate instead. Measured: a partial index on
+                // `entry_state(entry_id) WHERE starred = 1 OR read = 0` changed
+                // the plan and changed the time by nothing at all, at either
+                // scale. The scan was never the cost; the re-materialisation was.
+                //
+                // Also strictly safer. `NOT IN` against a subquery containing a
+                // NULL evaluates to NULL for every row, which would silently
+                // delete nothing. `entry_state.entry_id` is `NOT NULL` today, so
+                // the two are equivalent — but the equivalence depends on a
+                // column constraint somewhere else, and `NOT EXISTS` does not.
+                "SELECT e.id FROM entries e \
+                 WHERE COALESCE(e.published, e.fetched_at) < ?1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM entry_state s \
+                       WHERE s.entry_id = e.id \
+                         AND (s.starred = 1 OR s.read = 0) \
+                   )",
+                cutoff,
+                "window",
+            )
+            .await?
+        }
+        None => 0,
+    };
+    let deleted = soft_deleted + hard_deleted;
 
-    // Only touch cursors when rows actually went away.
+    // Only touch cursors when rows actually went away — and OUTSIDE the deletes.
+    //
+    // This used to run inside the one transaction that wrapped both deletes,
+    // which made the whole sweep a single write-lock hold: load every
+    // `read_cursor` row, then issue a fresh per-cursor `SELECT … JOIN … WHERE
+    // f.url = ?` returning up to `max_entries_per_feed` ids, all before the
+    // commit. SQLite is single-writer and `busy_timeout` is 5 s, so for that
+    // whole span every mark-read, every login write and every cursor flush
+    // failed.
+    //
+    // Correctness survives the move because the scrub is idempotent — it
+    // computes each cursor's surviving ids from what is in `entries` NOW, and
+    // rewrites only cursors that actually change. If the process dies between
+    // the deletes and the scrub, the next sweep finishes the job, and in the
+    // meantime a stale id in an exception set is inert: the flusher sends it,
+    // and it names an entry nobody can reach.
     if deleted > 0 {
-        prune_orphan_cursor_ids_tx(&mut tx, None).await?;
+        if let Err(err) = prune_orphan_cursor_ids(pool, None).await {
+            // The deletes already committed and are the point of this call.
+            // A failed scrub leaves stale ids to be cleaned up next sweep.
+            tracing::warn!(%err, "retention sweep: cursor id scrub failed after the deletes");
+        }
     }
 
-    tx.commit().await.context("commit prune_old_entries tx")?;
     Ok(deleted)
+}
+
+/// Rows deleted per statement by [`delete_in_batches`].
+///
+/// Small enough that one batch — including its `entry_state` FK cascade — is a
+/// short lock hold, large enough that a big sweep is tens of statements rather
+/// than thousands.
+const PRUNE_BATCH: i64 = 1_000;
+
+/// Backstop against a delete loop that never drains. `rows_affected == 0` is the
+/// real terminator; this only bounds the damage if a future predicate change
+/// makes that untrue. At [`PRUNE_BATCH`] this is 10M rows, far past anything a
+/// 1 GB volume holds.
+const PRUNE_MAX_BATCHES: usize = 10_000;
+
+/// Delete every entry matched by `select_ids` (a `SELECT id FROM entries …`
+/// bound to one `?1` cutoff), in bounded batches, **one implicit transaction per
+/// batch**.
+///
+/// The retention sweep used to be a single `DELETE` inside one explicit
+/// transaction. On a populated instance that is one unbroken write-lock hold
+/// covering tens of thousands of row deletes plus their `entry_state` cascades —
+/// measured at ~10 minutes before `idx_entry_state_entry_id` existed, and still
+/// a single indivisible span after it. Everything else that writes (mark-read,
+/// login, cursor flush) has a 5 s `busy_timeout` and simply fails for the
+/// duration.
+///
+/// Batching does not make the total work smaller; it makes it INTERRUPTIBLE. A
+/// writer waiting on the lock gets in between batches instead of timing out, and
+/// the short sleep below guarantees that window actually exists rather than
+/// leaving it to chance against a tight loop.
+///
+/// A partial sweep is safe: each batch commits on its own, and the predicate is
+/// a fixed cutoff, so a crash mid-sweep leaves fewer rows deleted and the next
+/// run finishes the job.
+async fn delete_in_batches(
+    pool: &SqlitePool,
+    select_ids: &str,
+    cutoff: &str,
+    label: &str,
+) -> Result<u64> {
+    let sql = format!("DELETE FROM entries WHERE id IN ({select_ids} LIMIT {PRUNE_BATCH})");
+    let mut total: u64 = 0;
+    for batch in 0..PRUNE_MAX_BATCHES {
+        let n = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(cutoff)
+            .execute(pool)
+            .await
+            .with_context(|| format!("prune_old_entries {label} (cutoff {cutoff})"))?
+            .rows_affected();
+        total += n;
+        if n == 0 {
+            return Ok(total);
+        }
+        // Hand the write lock over. Without this the loop can re-acquire it
+        // immediately and a waiting writer still starves — batching would then
+        // be bookkeeping rather than a fix. At `PRUNE_BATCH` rows per batch this
+        // adds ~10 ms per 1,000 deleted rows to a sweep that runs once a day.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Only warn if the backstop actually cut the sweep short. A final batch
+        // that happened to drain the last rows would otherwise log "the rest
+        // waits for the next run" with nothing left — and an operator who reads
+        // that during an incident would go looking for a backlog that is not
+        // there. `n < PRUNE_BATCH` means this batch found fewer rows than it
+        // asked for, so there are none behind it.
+        // Still a 1-in-`PRUNE_BATCH` false positive when the final batch drains
+        // exactly a full batch with nothing behind it — distinguishing that
+        // needs another COUNT per sweep, which is not worth paying to make a
+        // backstop message that has never fired slightly more precise.
+        if batch + 1 == PRUNE_MAX_BATCHES && n == PRUNE_BATCH as u64 {
+            tracing::warn!(
+                label,
+                total,
+                "retention sweep hit its batch backstop; the rest waits for the next run"
+            );
+        }
+    }
+    Ok(total)
 }
 
 /// Scrub entry ids that no longer exist out of `read_cursor.read_ids` /
@@ -816,6 +1701,13 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64) -> Result<u64> {
 /// sets actually change is rewritten and marked `dirty` so the flusher resyncs
 /// it; unchanged cursors are left untouched (no spurious dirtying / PDS writes).
 /// Returns the number of cursor rows modified.
+///
+/// This is the TRANSACTIONAL variant, used by the per-feed trim inside
+/// `insert_entries`: it is scoped to one feed, examines that feed's cursors
+/// only, and genuinely wants to land atomically with the trim that created the
+/// orphans. The retention sweep uses [`prune_orphan_cursor_ids`] instead —
+/// global scope inside one transaction is what made the sweep a multi-minute
+/// write-lock hold.
 async fn prune_orphan_cursor_ids_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     feed_id: Option<i64>,
@@ -896,6 +1788,142 @@ async fn prune_orphan_cursor_ids_tx(
     Ok(changed)
 }
 
+/// [`prune_orphan_cursor_ids_tx`] over the pool — **no enclosing transaction**.
+///
+/// Same result, different locking. Each statement commits on its own, so the
+/// single write lock is taken for one cursor rewrite at a time and released
+/// between them, and the reads in between block nothing at all in WAL mode.
+/// That matters because this is the global pass: the retention sweep's version
+/// loads EVERY `read_cursor` row and then issues one live-ids query per cursor,
+/// and holding all of that inside a transaction is what made a daily sweep look
+/// like an outage to every writer on the instance.
+///
+/// **Each cursor's read-modify-write is one short transaction**, and that is not
+/// optional. The first version of this loaded every cursor into a snapshot, then
+/// walked them issuing an unguarded `UPDATE` per cursor from that snapshot. A
+/// `mark_read` landing during the walk — seconds, on a global pass — had its new
+/// id silently overwritten by the stale set, and the rewrite set `dirty = 1`, so
+/// the flusher then pushed the truncated set to the PDS as authoritative. Local
+/// `entry_state` still said read, so the loss was invisible here and visible
+/// only in every OTHER atproto client. The transactional predecessor did not
+/// have that bug: it held the write lock across the whole pass, so a concurrent
+/// `mark_read` blocked and applied on top.
+///
+/// So the lock is not eliminated, it is SCOPED: one cursor's live-ids query plus
+/// its update, rather than every cursor's. That keeps what T2.2 was for (a daily
+/// sweep must not look like an outage) without trading it for lost writes.
+///
+/// Re-running is still safe — surviving ids are recomputed from the current
+/// contents of `entries` — so dying partway just means the next sweep finishes.
+///
+/// `feed_id = Some(..)` scopes to one feed; `None` scans every cursor. Returns
+/// the number of cursor rows modified.
+async fn prune_orphan_cursor_ids(pool: &SqlitePool, feed_id: Option<i64>) -> Result<u64> {
+    let feed_url = match feed_id {
+        Some(fid) => match sqlx::query_scalar::<_, String>("SELECT url FROM feeds WHERE id = ?1")
+            .bind(fid)
+            .fetch_optional(pool)
+            .await
+            .context("prune_orphan_cursor_ids: feed url")?
+        {
+            Some(u) => Some(u),
+            None => return Ok(0),
+        },
+        None => None,
+    };
+
+    // Only the KEYS come from this snapshot. The id-sets are deliberately not
+    // read here — they are re-read inside each cursor's own transaction below,
+    // because anything read out here is stale by the time it is written back.
+    let keys: Vec<(String, String)> = match &feed_url {
+        Some(url) => sqlx::query_as("SELECT did, feed_url FROM read_cursor WHERE feed_url = ?1")
+            .bind(url)
+            .fetch_all(pool)
+            .await
+            .context("prune_orphan_cursor_ids: load feed cursors")?,
+        None => sqlx::query_as("SELECT did, feed_url FROM read_cursor")
+            .fetch_all(pool)
+            .await
+            .context("prune_orphan_cursor_ids: load all cursors")?,
+    };
+
+    let mut changed: u64 = 0;
+    for (did, curl) in keys {
+        // A cursor that vanished between the key snapshot and now is simply
+        // skipped; a cursor that APPEARED is missed until the next sweep. Both
+        // are fine — the scrub is housekeeping, not a correctness barrier.
+        match scrub_one_cursor(pool, &did, &curl).await {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            // One bad cursor must not abandon the rest of the pass.
+            Err(err) => tracing::warn!(%err, %did, feed = %curl, "cursor id scrub failed"),
+        }
+    }
+    Ok(changed)
+}
+
+/// Scrub one cursor's id-sets inside its own transaction. Returns whether the
+/// row changed.
+///
+/// The read of the id-sets, the live-ids query and the write all happen under
+/// one transaction, so a `mark_read` that lands mid-sweep either goes first (and
+/// is included) or waits (and applies on top). Reading the sets outside and
+/// writing them back later is the lost-update shape this function exists to
+/// avoid — see [`prune_orphan_cursor_ids`].
+async fn scrub_one_cursor(pool: &SqlitePool, did: &str, feed_url: &str) -> Result<bool> {
+    let mut tx = pool.begin().await.context("begin scrub_one_cursor tx")?;
+
+    let (_, read_ids, unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+    // An empty exception set has nothing to orphan, and skipping it avoids the
+    // live-ids query entirely — the dominant cost of this pass, and the common
+    // case for a cursor sitting at its high-water mark.
+    if is_empty_id_set(&read_ids) && is_empty_id_set(&unread_ids) {
+        return Ok(false);
+    }
+
+    let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id WHERE f.url = ?1",
+    )
+    .bind(feed_url)
+    .fetch_all(&mut *tx)
+    .await
+    .with_context(|| format!("prune_orphan_cursor_ids: live ids for {feed_url}"))?
+    .into_iter()
+    .collect();
+
+    let new_read = filter_id_set_to_live(&read_ids, &live);
+    let new_unread = filter_id_set_to_live(&unread_ids, &live);
+    if new_read == read_ids && new_unread == unread_ids {
+        return Ok(false); // nothing orphaned — leave the cursor (and its dirty flag) alone
+    }
+    sqlx::query(
+        "UPDATE read_cursor SET read_ids = ?3, unread_ids = ?4, dirty = 1, updated_at = ?5 \
+         WHERE did = ?1 AND feed_url = ?2",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(&new_read)
+    .bind(&new_unread)
+    .bind(now_rfc3339())
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("prune_orphan_cursor_ids: rewrite cursor {did}/{feed_url}"))?;
+    tx.commit().await.context("commit scrub_one_cursor tx")?;
+    Ok(true)
+}
+
+/// Whether a stored id-set is *textually* empty — `[]` or blank.
+///
+/// Deliberately NOT a parse: this is a fast pre-filter, and
+/// [`filter_id_set_to_live`] remains the authority on what a set contains. An
+/// unparseable value returns `false` here, so it goes through the full path and
+/// gets canonicalised to `[]` rather than being skipped — the pre-filter fails
+/// toward doing the work, which is the safe direction.
+fn is_empty_id_set(raw: &str) -> bool {
+    let t = raw.trim();
+    t.is_empty() || t == "[]"
+}
+
 /// Filter a JSON id-array string down to only ids present in `live`, returning
 /// the canonical JSON-array-of-strings form (matching [`json_id_set_toggle`]). A
 /// malformed input yields `[]`.
@@ -963,26 +1991,243 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
     Ok(found.is_some())
 }
 
-/// All entries for a feed, newest-published first — scoped to `did`'s
-/// subscriptions. Returns an empty vec if `did` does not subscribe to the feed.
-pub async fn entries_for_feed(pool: &SqlitePool, did: &str, feed_id: i64) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.* FROM entries e
-        WHERE e.feed_id = ?2
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .bind(feed_id)
-    .fetch_all(pool)
-    .await
-    .context("entries_for_feed failed")?;
-    Ok(entries)
+/// The shared body of every list query: the per-DID `entry_state` LEFT JOIN, the
+/// `sub_ref` authorization predicate, the view predicate and the optional
+/// feed-id restriction. `projection` is spliced in as the `SELECT` list.
+///
+/// Returns the SQL plus the number of feed-id placeholders emitted, so the
+/// caller knows where its own `LIMIT`/`OFFSET` placeholders start. `?1` is
+/// always the DID; feed ids are `?2..`.
+///
+/// **Why the callers may assert this is SQL-safe.** Only three things vary, and
+/// none is caller data: `projection` and [`ListView::predicate`] are `&'static
+/// str` written in this file, and the feed-id restriction contributes only a
+/// COUNT — the ids themselves are bound, never formatted in. Every runtime value
+/// (the DID, the ids, the limit, the offset) reaches SQLite as a bind parameter.
+fn list_query_sql(
+    projection: &'static str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+) -> (String, usize) {
+    let scoped = feed_ids.is_some();
+    let mut sql = format!(
+        "SELECT {projection} \
+         FROM entries e \
+         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1 \
+         WHERE {} \
+           AND EXISTS ( \
+               SELECT 1 FROM sub_ref sr \
+               WHERE sr.did = ?1 AND sr.feed_id = e.feed_id \
+           )",
+        view.predicate()
+    );
+    if scoped {
+        // **ONE bind parameter for any scope size.**
+        //
+        // This used to emit one placeholder per feed id, so the SQL string and
+        // the bind list both grew with the reader's subscription count — which
+        // is PDS-supplied and bounded only by the 20,000-record list ceiling.
+        //
+        // That was reachable-broken, not merely ugly: `SQLITE_LIMIT_VARIABLE_NUMBER`
+        // is 32766 on the bundled build, and the ids were bound TWICE per render
+        // (the count query and the page query), so the effective ceiling was
+        // ~16,383 feeds — below the list ceiling. Past it, `prepare` fails with
+        // "too many SQL variables" and the reader's page 500s. Measured: 20,000
+        // ids through `json_each` is a 108 KB bind that runs in 9.9 ms; 32,767
+        // placeholders does not prepare at all.
+        // The first attempt at bounding it truncated the subscription list
+        // instead, which traded a query-shape problem for an access problem:
+        // `sync_sub_refs` writes `sub_ref` from that list, so dropped feeds
+        // became unreadable AND unmutatable. `json_each` removes the need to
+        // choose — the whole set rides in as one JSON text bind.
+        sql.push_str(" AND e.feed_id IN (SELECT value FROM json_each(?2))");
+    }
+    (sql, usize::from(scoped))
+}
+
+/// Bind the DID and the optional feed-id restriction, in the order
+/// [`list_query_sql`] emits them — `?1` the DID, `?2` the scope JSON when there
+/// is one.
+fn bind_list_scope<'q, O>(
+    q: sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments>,
+    did: &'q str,
+    feed_ids: Option<&[i64]>,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments> {
+    let q = q.bind(did);
+    match feed_ids {
+        // Serialising i64s cannot fail; the fallback is an empty array, which
+        // matches nothing — the fail-closed direction for a scope filter.
+        Some(ids) => q.bind(serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())),
+        None => q,
+    }
+}
+
+/// One page of a list view, newest-published first, scoped to `did`'s
+/// subscriptions (`sub_ref`) and optionally narrowed to `feed_ids`.
+///
+/// **`limit` is a required parameter, not a convenience.** This function
+/// replaced three `SELECT e.*` queries that had no `LIMIT` at all and pulled the
+/// article body they never used; leaving an unbounded variant next to the
+/// bounded one would just be the same trap with a longer name. If a caller wants
+/// "everything", it has to say how much everything is allowed to be. See
+/// [`EntryListRow`] for what the projection deliberately omits and why.
+///
+/// `feed_ids = Some(&[])` means "no feeds in scope" and returns empty without
+/// touching the database — distinct from `None`, which means "every feed this
+/// DID subscribes to".
+pub async fn list_entries(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<EntryListRow>> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let (mut sql, n) = list_query_sql(
+        "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+         COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
+        view,
+        feed_ids,
+    );
+    sql.push_str(&format!(
+        " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
+        n + 2,
+        n + 3
+    ));
+    let q = sqlx::query_as::<_, EntryListRow>(sqlx::AssertSqlSafe(sql));
+    let rows = bind_list_scope(q, did, feed_ids)
+        .bind(limit)
+        .bind(offset.max(0))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("list_entries({view:?}) failed for {did}"))?;
+    Ok(rows)
+}
+
+/// How many entries the same scope + view would return, unpaged. Used for the
+/// "N entries" heading and to decide whether a next-page link is warranted —
+/// both of which used to read `entries.len()` off a fully materialized list.
+pub async fn count_entries_for_view(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+) -> Result<i64> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) {
+        return Ok(0);
+    }
+    let (sql, _) = list_query_sql("COUNT(*)", view, feed_ids);
+    // `query_as` over a 1-tuple keeps one binding helper for both shapes.
+    let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
+    let (n,) = bind_list_scope(q, did, feed_ids)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("count_entries_for_view({view:?}) failed for {did}"))?;
+    Ok(n)
+}
+
+/// The ordered entry ids for a scope + view — the same ordering [`list_entries`]
+/// renders, used for the reader's prev/next links.
+///
+/// Ids only: this one genuinely spans the whole list rather than a page (prev/next
+/// needs the reader's position in it), so it is the one query where row COUNT can
+/// still be large. An id is 8 bytes against the 11.9 KB row this used to fetch,
+/// and `limit` bounds it regardless. Past the limit, prev/next simply stops
+/// finding neighbours — the article still opens.
+pub async fn list_entry_ids(
+    pool: &SqlitePool,
+    did: &str,
+    view: ListView,
+    feed_ids: Option<&[i64]>,
+    limit: i64,
+) -> Result<Vec<i64>> {
+    if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let (mut sql, n) = list_query_sql("e.id", view, feed_ids);
+    sql.push_str(&format!(
+        " ORDER BY e.published DESC, e.id DESC LIMIT ?{}",
+        n + 2
+    ));
+    let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
+    let rows = bind_list_scope(q, did, feed_ids)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("list_entry_ids({view:?}) failed for {did}"))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Unread counts per `feed_id` for a DID — the sidebar's per-feed badges.
+///
+/// Counted in SQL. The sidebar used to fetch every unread entry (bodies and all)
+/// and count them in Rust, on every page with chrome, which is the single most
+/// frequent instance of the projection problem [`EntryListRow`] describes.
+pub async fn unread_counts_by_feed(
+    pool: &SqlitePool,
+    did: &str,
+) -> Result<std::collections::HashMap<i64, i64>> {
+    let (sql, _) = list_query_sql("e.feed_id, COUNT(*)", ListView::Unread, None);
+    let rows =
+        sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(format!("{sql} GROUP BY e.feed_id")))
+            .bind(did)
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("unread_counts_by_feed failed for {did}"))?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The `(url, guid)` identity pairs of every cached starred entry for a DID.
+///
+/// The starred view matches PDS saved records against these to decide which
+/// records the cache can render itself. It must span the whole starred set, not
+/// the visible page: a record that looks uncached gets an un-save button that
+/// deletes the PDS RECORD rather than un-starring the entry, so narrowing this
+/// set changes what a click destroys. Identity strings only — no bodies.
+///
+/// **Truncation is reported, not absorbed.** The `limit` is a memory backstop,
+/// but hitting it violates the invariant above — and the first version had no
+/// way to say so and no `ORDER BY`, so it silently returned an ARBITRARY subset
+/// and every starred article outside it rendered with a record-destroying
+/// button. `Truncated` lets the caller fail closed instead, and the ordering
+/// makes the subset at least deterministic across renders rather than
+/// whatever the query planner felt like returning.
+pub enum StarredIdentities {
+    /// The complete set for this DID.
+    All(Vec<(Option<String>, String)>),
+    /// `limit` was reached, so this is a partial set and MUST NOT be used to
+    /// decide that a record is uncached.
+    Truncated,
+}
+
+pub async fn starred_identities(
+    pool: &SqlitePool,
+    did: &str,
+    limit: i64,
+) -> Result<StarredIdentities> {
+    let (mut sql, n) = list_query_sql("e.url, e.guid", ListView::Starred, None);
+    // One past the limit, so reaching it is distinguishable from landing on it
+    // exactly. Ordered by id so the rows are stable; `url`/`guid` are not
+    // guaranteed unique or non-NULL, and the id is both.
+    //
+    // The placeholder index comes from `list_query_sql` rather than being
+    // hardcoded: it was `?2` only because this call passes `None` for the scope,
+    // which is the kind of coupling that breaks silently when the shared builder
+    // changes shape — as it just did.
+    sql.push_str(&format!(" ORDER BY e.id LIMIT ?{}", n + 2));
+    let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
+        .bind(did)
+        .bind(limit.saturating_add(1))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("starred_identities failed for {did}"))?;
+    if rows.len() as i64 > limit {
+        return Ok(StarredIdentities::Truncated);
+    }
+    Ok(StarredIdentities::All(rows))
 }
 
 /// Mark a single entry read/unread for a DID, upserting the per-DID state row
@@ -1070,6 +2315,221 @@ pub async fn mark_starred(
     .await
     .with_context(|| format!("mark_starred failed for {did}/{entry_id}"))?;
     Ok(res.rows_affected() > 0)
+}
+
+/// Fold ids already covered by a high-water-mark into `read_through`, so the
+/// exception set stops growing. Returns the new `read_through` when it advanced.
+///
+/// **What was wrong.** `read_through` was never COMPUTED — `project_entry_into_cursor`
+/// only carried an existing value through, and it starts NULL, so in practice it
+/// was always NULL. That left `read_ids` as the sole mechanism, growing one id
+/// per article read, bounded only by `max_entries_per_feed` (2000) — while the
+/// flusher caps the record at `ReadState::MAX_IDS` (1000) keeping the TAIL, with
+/// no log line. Past 1000 read articles in one feed, the oldest read-state
+/// silently stopped syncing, and those articles came back UNREAD in any other
+/// atproto reader. The `cap` helper's own comment assumed "the exception sets
+/// are expected to stay well under the cap in normal use"; against a 2000-entry
+/// per-feed ceiling that does not hold.
+///
+/// **The rule.** `read_through` means "every entry at or before this time is
+/// read". So it may advance only to a point with no unread entry at or before
+/// it. That point is computed here as the newest entry timestamp STRICTLY OLDER
+/// than the oldest unread entry — strictly, because entries can share a
+/// timestamp, and a watermark equal to an unread entry's time would assert that
+/// entry is read.
+///
+/// Once the watermark moves, every `read_ids` entry at or before it is
+/// redundant and is dropped — that is the compaction. `unread_ids` is filtered
+/// the same way; by construction nothing unread sits at or below the new
+/// watermark, so it empties, but the filter is written rather than assumed so it
+/// stays correct if that invariant ever shifts.
+///
+/// Timestamps compare lexicographically because every writer normalises to UTC
+/// `...Z` at seconds precision (`feed::fmt_time`, `now_rfc3339`) — the same
+/// assumption `poll_health` and the retention window already make.
+pub async fn compact_cursor(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+) -> Result<Option<String>> {
+    let mut tx = pool.begin().await.context("begin compact_cursor tx")?;
+    let (read_through, read_ids, unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+
+    // The oldest entry on this feed that `did` has NOT read. `NULL` = nothing
+    // unread, in which case the watermark can cover the whole feed.
+    let oldest_unread: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT MIN(COALESCE(e.published, e.fetched_at))
+        FROM entries e
+        JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        WHERE f.url = ?2 AND COALESCE(s.read, 0) = 0
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .fetch_one(&mut *tx)
+    .await
+    .with_context(|| format!("compact_cursor: oldest unread for {did}/{feed_url}"))?;
+
+    let watermark: Option<String> = match &oldest_unread {
+        Some(oldest) => sqlx::query_scalar(
+            r#"
+            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            FROM entries e JOIN feeds f ON f.id = e.feed_id
+            WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) < ?2
+            "#,
+        )
+        .bind(feed_url)
+        .bind(oldest)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("compact_cursor: watermark for {did}/{feed_url}"))?,
+        None => sqlx::query_scalar(
+            r#"
+            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            FROM entries e JOIN feeds f ON f.id = e.feed_id
+            WHERE f.url = ?1
+            "#,
+        )
+        .bind(feed_url)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("compact_cursor: watermark for {did}/{feed_url}"))?,
+    };
+
+    // Nothing to cover, or the watermark is already at least this far along.
+    // Never move it BACKWARDS: that would re-assert articles as unread.
+    let Some(watermark) = watermark else {
+        return Ok(None);
+    };
+    if read_through
+        .as_deref()
+        .is_some_and(|rt| rt >= &watermark[..])
+    {
+        return Ok(None);
+    }
+
+    let keep_above = ids_published_after(&mut tx, feed_url, &read_ids, &watermark).await?;
+    let keep_unread =
+        ids_published_at_or_before(&mut tx, feed_url, &unread_ids, &watermark).await?;
+
+    write_cursor_sets(
+        &mut tx,
+        did,
+        feed_url,
+        Some(&watermark),
+        &keep_above,
+        &keep_unread,
+        &now_rfc3339(),
+    )
+    .await?;
+    tx.commit().await.context("commit compact_cursor tx")?;
+    Ok(Some(watermark))
+}
+
+/// The subset of `ids` whose entries are published strictly AFTER `watermark`,
+/// as the canonical JSON array-of-strings the cursor stores.
+async fn ids_published_after(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    ids: &str,
+    watermark: &str,
+) -> Result<String> {
+    let live = ids_matching_watermark(tx, feed_url, watermark, true).await?;
+    Ok(filter_id_set_to_live(ids, &live))
+}
+
+/// The subset of `ids` whose entries are published at or BEFORE `watermark`.
+async fn ids_published_at_or_before(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    ids: &str,
+    watermark: &str,
+) -> Result<String> {
+    let live = ids_matching_watermark(tx, feed_url, watermark, false).await?;
+    Ok(filter_id_set_to_live(ids, &live))
+}
+
+/// Entry ids on `feed_url` on one side of `watermark`. `after = true` selects
+/// strictly newer; `false` selects at-or-older.
+async fn ids_matching_watermark(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    feed_url: &str,
+    watermark: &str,
+    after: bool,
+) -> Result<std::collections::HashSet<i64>> {
+    let sql = if after {
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
+         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) > ?2"
+    } else {
+        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
+         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) <= ?2"
+    };
+    Ok(sqlx::query_scalar::<_, i64>(sql)
+        .bind(feed_url)
+        .bind(watermark)
+        .fetch_all(&mut **tx)
+        .await
+        .context("compact_cursor: ids on one side of the watermark")?
+        .into_iter()
+        .collect())
+}
+
+/// Clear `did`'s star on any cached entry matching `url` or `guid`, **ignoring
+/// the subscription projection**. Returns the number of `entry_state` rows
+/// changed.
+///
+/// This closes a desync between the two places a star lives. The starred view
+/// matches PDS saved records against cached entries through `sub_ref`, so an
+/// entry that is cached AND starred in a feed the reader has since UNSUBSCRIBED
+/// from does not match: it renders as an uncached row whose button is
+/// `POST /saved/{rkey}/delete`. That deletes the PDS record and used to leave
+/// `entry_state.starred = 1` behind — invisible, because the starred list is
+/// `sub_ref`-scoped too, until the reader resubscribes and the star reappears
+/// with no record backing it.
+///
+/// **Why omitting `sub_ref` is safe here, when it is the per-DID isolation hook
+/// everywhere else.** Every row this can touch is keyed by `did` and this writes
+/// only `starred = 0`. The worst a caller can do with it is clear one of their
+/// OWN stars — which is what they just asked for. The predicate that matters for
+/// isolation is the `did` in the `WHERE`, and it is not optional.
+///
+/// Matching on `url` OR `guid` mirrors how the view decides a record is already
+/// cached, so the removal path and the render path agree on what "the same
+/// article" means.
+pub async fn clear_star_by_identity(
+    pool: &SqlitePool,
+    did: &str,
+    url: Option<&str>,
+    guid: Option<&str>,
+) -> Result<u64> {
+    // Neither identifier present: nothing to match on. Running the statement
+    // would compare NULL to NULL and match nothing, but returning early says so.
+    if url.is_none_or(str::is_empty) && guid.is_none_or(str::is_empty) {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        r#"
+        UPDATE entry_state
+        SET starred = 0, updated_at = ?4
+        WHERE did = ?1
+          AND starred = 1
+          AND entry_id IN (
+              SELECT id FROM entries
+              WHERE (?2 IS NOT NULL AND url = ?2)
+                 OR (?3 IS NOT NULL AND guid = ?3)
+          )
+        "#,
+    )
+    .bind(did)
+    .bind(url.filter(|u| !u.is_empty()))
+    .bind(guid.filter(|g| !g.is_empty()))
+    .bind(now_rfc3339())
+    .execute(pool)
+    .await
+    .with_context(|| format!("clear_star_by_identity failed for {did}"))?;
+    Ok(res.rows_affected())
 }
 
 /// Mark every entry of a feed read (or unread) for a DID in one statement —
@@ -1323,51 +2783,45 @@ async fn project_feed_into_cursor(
     .await
 }
 
-/// Unread entries for a DID: entries with no `entry_state` row for that DID, or
-/// one where `read = 0`. Newest-published first. This is the daily-driver list
-/// query, so it's a `LEFT JOIN` (an entry with no state row is unread).
-pub async fn get_unread_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.*
-        FROM entries e
-        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
-        WHERE COALESCE(s.read, 0) = 0
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("get_unread_for_did failed for {did}"))?;
-    Ok(entries)
+/// Test-only unbounded convenience wrappers over [`list_entries`].
+///
+/// Production code passes an explicit `limit`, because that is the whole point
+/// of the change these replaced. Fixtures hold a handful of rows and asserting
+/// on "the whole list" is what the tests actually mean, so they get a helper
+/// with a stated ceiling instead of each spelling one out — and the ceiling is
+/// high enough that a test hitting it is a broken fixture, not a truncation.
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    /// Far above any fixture; a test that reaches it has a bug of its own.
+    const FIXTURE_MAX: i64 = 10_000;
+
+    pub(crate) async fn entries_for_feed(
+        pool: &SqlitePool,
+        did: &str,
+        feed_id: i64,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::All, Some(&[feed_id]), FIXTURE_MAX, 0).await
+    }
+
+    pub(crate) async fn get_unread_for_did(
+        pool: &SqlitePool,
+        did: &str,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::Unread, None, FIXTURE_MAX, 0).await
+    }
+
+    pub(crate) async fn get_starred_for_did(
+        pool: &SqlitePool,
+        did: &str,
+    ) -> Result<Vec<EntryListRow>> {
+        list_entries(pool, did, ListView::Starred, None, FIXTURE_MAX, 0).await
+    }
 }
 
-/// Starred entries for a DID, newest-published first.
-pub async fn get_starred_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Entry>(
-        r#"
-        SELECT e.*
-        FROM entries e
-        JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
-        WHERE s.starred = 1
-          AND EXISTS (
-              SELECT 1 FROM sub_ref sr
-              WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
-          )
-        ORDER BY e.published DESC, e.id DESC
-        "#,
-    )
-    .bind(did)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("get_starred_for_did failed for {did}"))?;
-    Ok(entries)
-}
+#[cfg(test)]
+pub(crate) use test_helpers::{entries_for_feed, get_starred_for_did, get_unread_for_did};
 
 /// Insert or update a per-`(did, feed_url)` read cursor, stamping `updated_at`.
 /// The write path for local mark-read updates (and the seam a login-time PDS
@@ -1550,7 +3004,7 @@ pub async fn clear_cursor_dirty(
 // under the configured cap.
 
 /// Unix-epoch seconds for "now" — the integer time base for the beta tables.
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -2092,9 +3546,377 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
     })
 }
 
+/// Aggregate poll health, for the public stats page.
+///
+/// **Deliberately aggregate-only.** No user counts, no error rates, no per-feed
+/// detail: this is published to anyone, and a reader does not need to know how
+/// many people use an instance or which feeds are failing. What it does answer
+/// is the only question the page exists for — is the poller keeping up?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollHealth {
+    /// Distinct feeds the poller is responsible for.
+    pub feeds_tracked: i64,
+    /// How many were polled within the last hour.
+    pub polled_last_hour: i64,
+    /// Feeds whose `next_poll` has passed — the backlog. A healthy instance
+    /// clears this every tick; a growing number is the signal that the poller
+    /// cannot keep up with the feed count.
+    pub overdue: i64,
+    /// Seconds since the most recent poll of any feed. `None` before the first.
+    pub last_poll_secs_ago: Option<i64>,
+    /// Seconds since the LEAST recently polled feed was polled — the worst
+    /// staleness any reader is currently seeing.
+    ///
+    /// `None` when any feed has NEVER been polled, because that is a worse
+    /// staleness than any finite age and reporting the finite one would make
+    /// the page read healthiest exactly when it is least healthy.
+    pub oldest_poll_secs_ago: Option<i64>,
+    /// How many feeds have never been polled at all.
+    pub never_polled: i64,
+    /// Feeds currently in error backoff (`consecutive_errors > 0`).
+    ///
+    /// One of the two states that stop feeds updating, and previously visible
+    /// nowhere: `consecutive_errors` was written by `bump_feed_errors` and read
+    /// by nothing outside the backoff calculation — no page, no endpoint. Worse,
+    /// a feed in backoff is NOT counted in `overdue`, because backoff is applied
+    /// by pushing `next_poll` forward. So the one number a reader might have
+    /// checked moved the wrong way: a feed failing every fetch made `overdue`
+    /// look BETTER.
+    pub in_backoff: i64,
+    /// Of those, how many have failed enough times to be at or near the backoff
+    /// ceiling — the ones that will not recover on their own.
+    pub badly_broken: i64,
+}
+
+/// `consecutive_errors` at or above which a feed counts as `badly_broken`.
+///
+/// Chosen to mean "this is not a transient blip": `feed::backoff_for` climbs
+/// exponentially, so by this many consecutive failures a feed is being retried
+/// hours apart and is almost certainly gone rather than flaky.
+const BADLY_BROKEN_ERRORS: i64 = 6;
+
+/// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
+/// format the scheduler writes, so the comparisons are lexicographic).
+pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
+    #[allow(clippy::type_complexity)]
+    let row: (i64, i64, i64, Option<String>, Option<String>, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN last_polled IS NOT NULL AND last_polled >= ?2 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN next_poll IS NULL OR next_poll <= ?1 THEN 1 ELSE 0 END), 0),
+            MAX(last_polled),
+            -- NULL-AWARE. `MIN` skips NULLs, so an instance where most feeds
+            -- had NEVER been polled reported the freshest of the few that had —
+            -- the figure read healthiest in the most degraded state, which is
+            -- the opposite of what a health page is for. A never-polled feed IS
+            -- the worst staleness, so it wins outright.
+            CASE WHEN SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END) > 0
+                 THEN NULL ELSE MIN(last_polled) END,
+            SUM(CASE WHEN last_polled IS NULL THEN 1 ELSE 0 END),
+            COALESCE(SUM(CASE WHEN consecutive_errors > 0 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN consecutive_errors >= ?3 THEN 1 ELSE 0 END), 0)
+        FROM feeds
+        "#,
+    )
+    .bind(now)
+    .bind(hour_ago)
+    .bind(BADLY_BROKEN_ERRORS)
+    .fetch_one(pool)
+    .await
+    .context("computing poll health")?;
+
+    Ok(PollHealth {
+        feeds_tracked: row.0,
+        polled_last_hour: row.1,
+        overdue: row.2,
+        last_poll_secs_ago: secs_between(row.3.as_deref(), now),
+        oldest_poll_secs_ago: secs_between(row.4.as_deref(), now),
+        never_polled: row.5,
+        in_backoff: row.6,
+        badly_broken: row.7,
+    })
+}
+
+/// Whole seconds from `then` to `now`, or `None` if `then` is absent or
+/// unparseable. Never negative: a clock skew that puts a poll in the future
+/// reads as "just now" rather than as a negative age.
+fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(then?).ok()?;
+    let now = chrono::DateTime::parse_from_rfc3339(now).ok()?;
+    Some((now - then).num_seconds().max(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A partial upsert must not erase the conditional-GET validators.
+    ///
+    /// `set_next_poll` supplies only `url` + `next_poll` and runs after EVERY
+    /// poll of EVERY feed. While `upsert_feed` assigned etag/last_modified
+    /// unconditionally, that call wrote both back to NULL, so `If-None-Match`
+    /// was never sent, `304` was unreachable, and every feed was re-downloaded
+    /// and re-parsed in full on every cycle. Nothing failed; it was invisible.
+    #[tokio::test]
+    async fn validators_survive_a_partial_upsert() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://example.com/feed.xml";
+
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                etag: Some("\"abc123\"".to_string()),
+                last_modified: Some("Wed, 01 Jan 2026 00:00:00 GMT".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Exactly what `scheduler::set_next_poll` sends.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                next_poll: Some("2026-07-12T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let feed = get_feed_by_url(&pool, url).await?.expect("feed");
+        assert_eq!(
+            feed.etag.as_deref(),
+            Some("\"abc123\""),
+            "a partial upsert erased the ETag, disabling conditional GET"
+        );
+        assert_eq!(
+            feed.last_modified.as_deref(),
+            Some("Wed, 01 Jan 2026 00:00:00 GMT"),
+            "a partial upsert erased Last-Modified"
+        );
+        assert_eq!(feed.next_poll.as_deref(), Some("2026-07-12T00:00:00Z"));
+        Ok(())
+    }
+
+    /// A hard ceiling that is not strictly older than the window is IGNORED.
+    ///
+    /// `hard_days.max(days)` made `0` — the obvious "off" value, and the
+    /// documented disable value for `RETENTION_DAYS` — collapse the ceiling onto
+    /// the soft window, where the delete spares nothing. The starred and unread
+    /// rows the window exists to protect were purged at `retention_days`.
+    #[tokio::test]
+    async fn a_ceiling_inside_the_window_is_ignored_not_applied() -> Result<()> {
+        for hard in [0_i64, 1, 7, 14] {
+            let pool = init_url("sqlite::memory:").await?;
+            let feed_id = upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: "https://example.com/f.xml".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let old = (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            insert_entries(
+                &pool,
+                feed_id,
+                &[
+                    NewEntry {
+                        guid: "starred-30d".to_string(),
+                        published: Some(old.clone()),
+                        ..Default::default()
+                    },
+                    NewEntry {
+                        guid: "unread-30d".to_string(),
+                        published: Some(old.clone()),
+                        ..Default::default()
+                    },
+                ],
+                0,
+            )
+            .await?;
+            // Both need an explicit `entry_state` row: sparing keys off a
+            // DELIBERATE mark, and an entry with no row at all is unclaimed
+            // cache that the window is supposed to evict.
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+                 SELECT 'did:plc:x', id, 1, 1, '2026-01-01T00:00:00Z'
+                 FROM entries WHERE guid = 'starred-30d'",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+                 SELECT 'did:plc:x', id, 0, 0, '2026-01-01T00:00:00Z'
+                 FROM entries WHERE guid = 'unread-30d'",
+            )
+            .execute(&pool)
+            .await?;
+
+            prune_old_entries(&pool, 14, hard).await?;
+
+            let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(
+                left, 2,
+                "hard_days={hard} destroyed starred/unread rows at the soft window"
+            );
+        }
+        Ok(())
+    }
+
+    /// Turning the rolling window off must NOT also turn the ceiling off.
+    ///
+    /// `prune_old_entries` used to return on `days <= 0` before the ceiling was
+    /// even computed, so `RETENTION_DAYS=0` — advertised as "disables eviction" —
+    /// meant no window AND no ceiling. That is the one configuration with no
+    /// bound on the shared cache at all, and it stopped being survivable when the
+    /// per-feed trim started sparing starred entries: nothing was left to catch
+    /// them. The two knobs are independent now.
+    #[tokio::test]
+    async fn a_disabled_window_does_not_disable_the_ceiling() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let age = |d: i64| {
+            (chrono::Utc::now() - chrono::Duration::days(d))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "starred-400d".to_string(),
+                    published: Some(age(400)),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "starred-30d".to_string(),
+                    published: Some(age(30)),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        // Star both, so only the ceiling can remove either one — the soft
+        // window's exception would spare them both even if it did run.
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+             SELECT 'did:plc:x', id, 1, 1, '2026-01-01T00:00:00Z' FROM entries",
+        )
+        .execute(&pool)
+        .await?;
+
+        // No rolling window; a 180-day ceiling.
+        let deleted = prune_old_entries(&pool, 0, 180).await?;
+
+        assert_eq!(
+            deleted, 1,
+            "retention_days=0 skipped the hard ceiling, leaving the cache unbounded"
+        );
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            left,
+            vec!["starred-30d".to_string()],
+            "the ceiling removed the wrong rows with the window disabled"
+        );
+        Ok(())
+    }
+
+    /// With BOTH knobs off, nothing is deleted — that is the documented
+    /// "no eviction at all" configuration, and it must stay a true no-op rather
+    /// than falling through to one of the two deletes with a degenerate cutoff.
+    #[tokio::test]
+    async fn both_knobs_off_deletes_nothing() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "ancient".to_string(),
+                published: Some(
+                    (chrono::Utc::now() - chrono::Duration::days(9999))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        assert_eq!(prune_old_entries(&pool, 0, 0).await?, 0);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(left, 1);
+        Ok(())
+    }
+
+    /// Starred sparing must not remove the per-feed cap.
+    ///
+    /// The first version spared every starred row without limit: at cap=5 with
+    /// 50 starred entries, 55 survived — 11x the cap, i.e. no cap at all.
+    #[tokio::test]
+    async fn per_feed_trim_stays_bounded_when_everything_is_starred() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..100)
+            .map(|i| NewEntry {
+                guid: format!("g-{i}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+             SELECT 'did:plc:x', id, 0, 1, '2026-01-01T00:00:00Z'
+             FROM entries LIMIT 50",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Re-run the trim with cap = 5.
+        insert_entries(&pool, feed_id, &[], 5).await?;
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await?;
+        assert!(
+            left <= 10,
+            "per-feed trim kept {left} rows for a cap of 5; sparing removed the bound"
+        );
+        Ok(())
+    }
 
     /// Init an in-memory SQLite, insert a feed + entries, read them back.
     #[tokio::test]
@@ -2171,7 +3993,13 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].guid, "guid-2");
         assert_eq!(entries[1].guid, "guid-1");
-        assert_eq!(entries[1].content_html.as_deref(), Some("<p>hello</p>"));
+        // The body is stored, but it is NOT in the list projection — that is the
+        // point of `EntryListRow`. Read it the way the single-entry reader does.
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT content_html FROM entries WHERE guid = 'guid-1'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(body.as_deref(), Some("<p>hello</p>"));
 
         // Re-inserting the same GUID dedups (updates in place, no new row).
         let n2 = insert_entries(
@@ -2242,6 +4070,688 @@ mod tests {
         clear_cursor_dirty(&pool, did, "https://example.com/feed.xml", &flushed_at).await?;
         assert_eq!(dirty_cursors(&pool, did).await?.len(), 0);
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // The bounded, body-free list projection.
+    //
+    // The three queries these replaced were `SELECT e.*` with no `LIMIT`. Both
+    // halves of that are load-bearing on a 512 MB box: the projection dragged
+    // an ~11.9 KB article body per row that no list surface reads, and the
+    // missing bound let one reader's backlog decide how much a handler
+    // allocates.
+    // -----------------------------------------------------------------------
+
+    /// Seed `count` entries in one feed, each with a large body, subscribed by
+    /// `did`. Returns the feed id.
+    async fn seed_big_entries(pool: &SqlitePool, did: &str, count: usize) -> Result<i64> {
+        let feed_id = upsert_feed(
+            pool,
+            &NewFeed {
+                url: "https://example.com/big.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let body = "x".repeat(20_000);
+        let entries: Vec<NewEntry> = (0..count)
+            .map(|i| NewEntry {
+                guid: format!("guid-{i:04}"),
+                url: Some(format!("https://example.com/a/{i}")),
+                title: Some(format!("Article {i}")),
+                // Descending guid order matches descending published order, so
+                // assertions can name the rows they expect.
+                published: Some(format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1)),
+                content_html: Some(body.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(pool, did, &[feed_id]).await?;
+        Ok(feed_id)
+    }
+
+    /// `limit` is honoured, and `offset` walks the same ordering without gaps or
+    /// repeats. Against the unbounded originals the first assertion returned all
+    /// 250 rows.
+    #[tokio::test]
+    async fn list_entries_is_bounded_and_pages_without_overlap() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:pager";
+        seed_big_entries(&pool, did, 250).await?;
+
+        let page1 = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        assert_eq!(page1.len(), 100, "limit was not applied");
+        let page2 = list_entries(&pool, did, ListView::All, None, 100, 100).await?;
+        let page3 = list_entries(&pool, did, ListView::All, None, 100, 200).await?;
+        assert_eq!(page3.len(), 50, "the last page should be the remainder");
+
+        let walked: Vec<i64> = page1
+            .iter()
+            .chain(&page2)
+            .chain(&page3)
+            .map(|e| e.id)
+            .collect();
+        let unique: std::collections::HashSet<i64> = walked.iter().copied().collect();
+        assert_eq!(unique.len(), 250, "paging repeated or skipped rows");
+
+        // And the walk is the same order an unpaged read would produce.
+        let whole = list_entries(&pool, did, ListView::All, None, 1_000, 0).await?;
+        assert_eq!(
+            walked,
+            whole.iter().map(|e| e.id).collect::<Vec<_>>(),
+            "paging changed the ordering"
+        );
+
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, None).await?,
+            250,
+            "the unpaged count must survive paging"
+        );
+        Ok(())
+    }
+
+    /// The list projection must not read `content_html`.
+    ///
+    /// A type-level fact — `EntryListRow` has no body field — so the test proves
+    /// it the only way that survives a refactor: by asking SQLite what the query
+    /// it runs actually names. `SELECT e.*` would list every column.
+    #[tokio::test]
+    async fn the_list_projection_does_not_name_the_body_column() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:projection";
+        seed_big_entries(&pool, did, 3).await?;
+
+        // Ask the engine directly: EXPLAIN the query and read back its output
+        // column names.
+        let (sql, _) = list_query_sql(
+            "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+             COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
+            ListView::All,
+            None,
+        );
+        assert!(
+            !sql.contains("content_html") && !sql.contains("e.*"),
+            "the list query reads the article body: {sql}"
+        );
+
+        // And the rows really do come back without it, which is what bounds the
+        // per-request allocation.
+        let rows = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        assert_eq!(rows.len(), 3);
+        let widest = rows
+            .iter()
+            .map(|r| {
+                r.guid.len()
+                    + r.url.as_deref().map_or(0, str::len)
+                    + r.title.as_deref().map_or(0, str::len)
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest < 1_000,
+            "a list row carries {widest} bytes of text; the 20,000-byte body leaked in"
+        );
+        Ok(())
+    }
+
+    /// **A large scope must not become a large SQL statement.**
+    ///
+    /// The scope filter used to emit one placeholder per feed id, so the SQL
+    /// string and the bind list both grew with a reader's subscription count —
+    /// which comes from the PDS and is bounded only by a 20,000-record list
+    /// ceiling. The first attempt at fixing that truncated the subscription
+    /// list, which silently removed the reader's access to the dropped feeds
+    /// (`sub_ref` is written from the same list). `json_each` takes the whole
+    /// set as ONE bind, so neither trade-off is needed.
+    #[tokio::test]
+    async fn a_large_scope_is_one_bind_and_still_filters() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:widescope";
+
+        // 300 feeds, one entry each; the scope names 200 of them.
+        let mut all_ids = Vec::new();
+        for i in 0..300 {
+            let feed_id = upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: format!("https://wide{i}.example/f.xml"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            insert_entries(
+                &pool,
+                feed_id,
+                &[NewEntry {
+                    guid: format!("w-{i}"),
+                    ..Default::default()
+                }],
+                0,
+            )
+            .await?;
+            all_ids.push(feed_id);
+        }
+        replace_sub_refs(&pool, did, &all_ids).await?;
+
+        let scope: Vec<i64> = all_ids.iter().copied().take(200).collect();
+        let rows = list_entries(&pool, did, ListView::All, Some(&scope), 1_000, 0).await?;
+        assert_eq!(rows.len(), 200, "the scope filter did not narrow correctly");
+        let in_scope: std::collections::HashSet<i64> = scope.iter().copied().collect();
+        assert!(
+            rows.iter().all(|r| in_scope.contains(&r.feed_id)),
+            "a feed outside the scope came back"
+        );
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, Some(&scope)).await?,
+            200
+        );
+
+        // The statement itself carries no per-id placeholders — that is the
+        // property, and it is what stops the SQL growing with the reader.
+        let (sql, n) = list_query_sql("e.id", ListView::All, Some(&scope));
+        assert_eq!(n, 1, "the scope must contribute exactly one placeholder");
+        assert!(
+            sql.contains("json_each(?2)") && !sql.contains("?3"),
+            "the scope is still expanded into per-id placeholders: {sql}"
+        );
+        Ok(())
+    }
+
+    /// Scope is applied INSIDE the query, so a page is a page of rows the reader
+    /// will see. Filtering after the `LIMIT` (what the handler used to do) made
+    /// pages arbitrarily short for any narrowed scope.
+    #[tokio::test]
+    async fn a_feed_scope_narrows_the_query_not_the_page() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:scope";
+        let wanted = seed_big_entries(&pool, did, 10).await?;
+
+        let other = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://other.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let noise: Vec<NewEntry> = (0..40)
+            .map(|i| NewEntry {
+                guid: format!("noise-{i}"),
+                // Newer than everything in `wanted`, so an unscoped query would
+                // fill the whole page with these.
+                published: Some("2027-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, other, &noise, 0).await?;
+        replace_sub_refs(&pool, did, &[wanted, other]).await?;
+
+        let scoped = list_entries(&pool, did, ListView::All, Some(&[wanted]), 10, 0).await?;
+        assert_eq!(
+            scoped.len(),
+            10,
+            "the scoped page came back short — the filter ran after the LIMIT"
+        );
+        assert!(scoped.iter().all(|e| e.feed_id == wanted));
+
+        // An EMPTY scope means "no feeds in scope", not "every feed".
+        assert!(list_entries(&pool, did, ListView::All, Some(&[]), 10, 0)
+            .await?
+            .is_empty());
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, Some(&[])).await?,
+            0
+        );
+        Ok(())
+    }
+
+    /// The per-row `read` / `starred` bits come off the row's own join, matching
+    /// what the separate full-set queries used to compute — including the
+    /// "no `entry_state` row means unread" rule the views depend on.
+    #[tokio::test]
+    async fn list_rows_carry_their_own_read_and_star_bits() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:bits";
+        seed_big_entries(&pool, did, 3).await?;
+        let ids: Vec<i64> = list_entries(&pool, did, ListView::All, None, 10, 0)
+            .await?
+            .iter()
+            .map(|e| e.id)
+            .collect();
+
+        mark_read(&pool, did, ids[0], true).await?;
+        mark_starred(&pool, did, ids[1], true).await?;
+
+        let all = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        let by_id = |id: i64| all.iter().find(|e| e.id == id).expect("row present");
+        assert!(by_id(ids[0]).read && !by_id(ids[0]).starred);
+        assert!(!by_id(ids[1]).read && by_id(ids[1]).starred);
+        // Never touched: no state row at all, which must read as unread.
+        assert!(!by_id(ids[2]).read && !by_id(ids[2]).starred);
+
+        // And the view predicates agree with the bits.
+        let unread = list_entries(&pool, did, ListView::Unread, None, 10, 0).await?;
+        assert_eq!(unread.len(), 2);
+        assert!(unread.iter().all(|e| !e.read));
+        let starred = list_entries(&pool, did, ListView::Starred, None, 10, 0).await?;
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, ids[1]);
+        Ok(())
+    }
+
+    /// The sidebar's per-feed unread badges, counted in SQL rather than by
+    /// materializing every unread entry and filtering in Rust.
+    #[tokio::test]
+    async fn unread_counts_are_per_feed_and_exclude_read_rows() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:counts";
+        let a = seed_big_entries(&pool, did, 5).await?;
+        let b = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://b.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            b,
+            &[
+                NewEntry {
+                    guid: "b-1".to_string(),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "b-2".to_string(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[a, b]).await?;
+
+        let first_a = list_entries(&pool, did, ListView::All, Some(&[a]), 1, 0).await?[0].id;
+        mark_read(&pool, did, first_a, true).await?;
+
+        let counts = unread_counts_by_feed(&pool, did).await?;
+        assert_eq!(counts.get(&a).copied(), Some(4));
+        assert_eq!(counts.get(&b).copied(), Some(2));
+
+        // A feed the DID does not subscribe to contributes nothing.
+        replace_sub_refs(&pool, did, &[b]).await?;
+        let counts = unread_counts_by_feed(&pool, did).await?;
+        assert_eq!(counts.get(&a), None);
+        assert_eq!(counts.get(&b).copied(), Some(2));
+        Ok(())
+    }
+
+    /// **Read-state compaction: the water-mark must absorb the id set.**
+    ///
+    /// `read_through` was never computed, so `read_ids` was the only mechanism
+    /// and grew one id per article read against a 2000-entry per-feed ceiling —
+    /// while the flusher truncates the record at 1000, keeping the tail. Past
+    /// 1000 read articles in a feed, the oldest read-state stopped syncing and
+    /// those articles came back UNREAD in every other atproto reader.
+    #[tokio::test]
+    async fn compaction_folds_read_ids_into_the_water_mark() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:compact";
+        let feed_url = "https://compact.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // 40 entries, oldest first by published date.
+        let entries: Vec<NewEntry> = (0..40)
+            .map(|i| NewEntry {
+                guid: format!("c-{i:03}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let all = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        // Oldest first, so the read prefix is contiguous from the start.
+        let mut oldest_first = all.clone();
+        oldest_first.reverse();
+        for row in oldest_first.iter().take(30) {
+            mark_read(&pool, did, row.id, true).await?;
+        }
+
+        let before = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert!(before.read_through.is_none(), "read_through starts unset");
+        let before_ids: Vec<String> = serde_json::from_str(&before.read_ids)?;
+        assert_eq!(before_ids.len(), 30, "every read is its own exception");
+
+        let watermark = compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("the water-mark must advance");
+
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert_eq!(after.read_through.as_deref(), Some(watermark.as_str()));
+        let after_ids: Vec<String> = serde_json::from_str(&after.read_ids)?;
+        assert!(
+            after_ids.is_empty(),
+            "a contiguous read prefix must fold entirely into the water-mark, left {after_ids:?}"
+        );
+        // The 30th entry is read and the 31st is not, so the mark sits on the
+        // 30th — STRICTLY below the oldest unread, never equal to it.
+        assert_eq!(watermark, "2026-01-30T00:00:00Z");
+        assert!(after.dirty, "a rewritten cursor must be re-flushed");
+        Ok(())
+    }
+
+    /// The water-mark may never cover an unread entry, and may never move
+    /// backwards. Both would re-assert articles as read that are not.
+    #[tokio::test]
+    async fn compaction_stops_below_the_oldest_unread_entry() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:gap";
+        let feed_url = "https://gap.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..10)
+            .map(|i| NewEntry {
+                guid: format!("g-{i:02}"),
+                published: Some(format!("2026-02-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let mut oldest_first = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        oldest_first.reverse();
+        // Read everything EXCEPT the third-oldest: a hole at 2026-02-03.
+        for (i, row) in oldest_first.iter().enumerate() {
+            if i != 2 {
+                mark_read(&pool, did, row.id, true).await?;
+            }
+        }
+
+        let watermark = compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("advances");
+        assert_eq!(
+            watermark, "2026-02-02T00:00:00Z",
+            "the water-mark jumped the unread hole"
+        );
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let kept: Vec<String> = serde_json::from_str(&after.read_ids)?;
+        assert_eq!(
+            kept.len(),
+            7,
+            "the 7 reads ABOVE the hole must stay as explicit exceptions"
+        );
+        // The unread hole is above the water-mark, so it needs no unread
+        // exception — everything above the mark is unread by default.
+        let unread: Vec<String> = serde_json::from_str(&after.unread_ids)?;
+        assert!(
+            unread.is_empty(),
+            "redundant unread exceptions survived: {unread:?}"
+        );
+
+        // Idempotent, and never backwards: re-running changes nothing.
+        assert_eq!(
+            compact_cursor(&pool, did, feed_url).await?,
+            None,
+            "a second compaction moved a water-mark that was already correct"
+        );
+        Ok(())
+    }
+
+    /// Nothing read yet, or nothing in the feed: compaction must be a no-op
+    /// rather than inventing a water-mark that asserts the backlog is read.
+    #[tokio::test]
+    async fn compaction_never_invents_a_water_mark() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:none";
+        let feed_url = "https://none.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        // Empty feed: no entries at all.
+        assert_eq!(compact_cursor(&pool, did, feed_url).await?, None);
+
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "n-1".to_string(),
+                    published: Some("2026-03-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "n-2".to_string(),
+                    published: Some("2026-03-02T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+
+        // Nothing read: the OLDEST entry is unread, so there is no timestamp
+        // strictly below it and the mark cannot move at all.
+        assert_eq!(
+            compact_cursor(&pool, did, feed_url).await?,
+            None,
+            "a water-mark appeared with nothing read — that asserts the backlog is read"
+        );
+        Ok(())
+    }
+
+    /// **The unsave desync: clearing a star must work for an UNSUBSCRIBED feed.**
+    ///
+    /// That is the whole case. Every other starred path is `sub_ref`-scoped, so
+    /// an entry that is cached AND starred in a feed the reader has since
+    /// unsubscribed from is invisible to all of them — including the starred
+    /// list itself. Its PDS record therefore renders as "not cached", and the
+    /// button on that row deletes the record. If clearing the local star were
+    /// `sub_ref`-scoped too, it would silently do nothing, and the star would
+    /// reappear with no record behind it the moment the reader resubscribed.
+    #[tokio::test]
+    async fn a_star_can_be_cleared_after_unsubscribing_from_its_feed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:unsub";
+        let feed_id = seed_big_entries(&pool, did, 3).await?;
+        let rows = list_entries(&pool, did, ListView::All, None, 10, 0).await?;
+        let target = rows[0].clone();
+        mark_starred(&pool, did, target.id, true).await?;
+        assert_eq!(get_starred_for_did(&pool, did).await?.len(), 1);
+
+        // Unsubscribe. The entry stays cached and stays starred, but every
+        // sub_ref-scoped read now skips it.
+        replace_sub_refs(&pool, did, &[]).await?;
+        assert!(
+            get_starred_for_did(&pool, did).await?.is_empty(),
+            "fixture precondition: the star must be invisible to the scoped read"
+        );
+        assert!(
+            matches!(
+                starred_identities(&pool, did, 1_000).await?,
+                StarredIdentities::All(ref v) if v.is_empty()
+            ),
+            "fixture precondition: the identity lookup must miss it too"
+        );
+        let still_starred: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            still_starred, 1,
+            "the star is still there, just unreachable"
+        );
+
+        // The removal path must reach it anyway.
+        let cleared =
+            clear_star_by_identity(&pool, did, target.url.as_deref(), Some(&target.guid)).await?;
+        assert_eq!(cleared, 1, "the star survived the unsave");
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(after, 0);
+
+        // Resubscribing must NOT bring it back.
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        assert!(
+            get_starred_for_did(&pool, did).await?.is_empty(),
+            "the star came back after resubscribing — the desync is still there"
+        );
+        Ok(())
+    }
+
+    /// It clears only the CALLER's star, and only for the matching article.
+    ///
+    /// Omitting `sub_ref` is safe precisely because `did` is not optional; this
+    /// pins that, and that a non-matching identity is a no-op rather than a
+    /// wildcard.
+    #[tokio::test]
+    async fn clearing_a_star_touches_only_that_did_and_that_article() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let mine = "did:plc:mine";
+        let theirs = "did:plc:theirs";
+        let feed_id = seed_big_entries(&pool, mine, 3).await?;
+        replace_sub_refs(&pool, theirs, &[feed_id]).await?;
+        let rows = list_entries(&pool, mine, ListView::All, None, 10, 0).await?;
+
+        for r in &rows {
+            mark_starred(&pool, mine, r.id, true).await?;
+            mark_starred(&pool, theirs, r.id, true).await?;
+        }
+
+        let target = &rows[1];
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, target.url.as_deref(), Some(&target.guid)).await?,
+            1
+        );
+
+        let count = |did: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM entry_state WHERE did = ?1 AND starred = 1",
+                )
+                .bind(did)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(count(mine).await, 2, "it cleared more than the one article");
+        assert_eq!(count(theirs).await, 3, "it cleared another DID's stars");
+
+        // An identity that matches nothing is a no-op, not a wildcard.
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, Some("https://nope.example/x"), Some("nope"))
+                .await?,
+            0
+        );
+        assert_eq!(count(mine).await, 2);
+        // And neither identifier present does nothing at all.
+        assert_eq!(clear_star_by_identity(&pool, mine, None, None).await?, 0);
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, Some(""), Some("")).await?,
+            0
+        );
+        assert_eq!(count(mine).await, 2);
+        Ok(())
+    }
+
+    /// `starred_identities` must span the WHOLE starred set, not a page.
+    ///
+    /// The starred view matches PDS saved records against it; a cached article
+    /// missing from the set renders as "not cached", and that row's button
+    /// deletes the PDS RECORD instead of un-starring the entry. Narrowing this
+    /// set changes what a click destroys.
+    #[tokio::test]
+    async fn starred_identities_span_the_whole_set() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:ident";
+        seed_big_entries(&pool, did, 150).await?;
+        for row in list_entries(&pool, did, ListView::All, None, 1_000, 0).await? {
+            mark_starred(&pool, did, row.id, true).await?;
+        }
+
+        let identities = match starred_identities(&pool, did, 20_000).await? {
+            StarredIdentities::All(v) => v,
+            StarredIdentities::Truncated => panic!("150 rows must not read as truncated"),
+        };
+        assert_eq!(
+            identities.len(),
+            150,
+            "the identity set was truncated to a page"
+        );
+        assert!(identities
+            .iter()
+            .all(|(url, guid)| url.is_some() && !guid.is_empty()));
+
+        // **Hitting the cap must be REPORTED, not absorbed.** It used to return
+        // an arbitrary subset with no way to tell, and every starred article
+        // outside that subset then rendered an un-save button that deletes the
+        // PDS record rather than un-starring the entry.
+        assert!(
+            matches!(
+                starred_identities(&pool, did, 10).await?,
+                StarredIdentities::Truncated
+            ),
+            "a truncated identity set reported itself as complete"
+        );
+        // Landing EXACTLY on the cap is complete, not truncated — the query asks
+        // for one extra row precisely so the two are distinguishable.
+        assert!(
+            matches!(
+                starred_identities(&pool, did, 150).await?,
+                StarredIdentities::All(ref v) if v.len() == 150
+            ),
+            "a set exactly at the cap was misreported as truncated"
+        );
+        Ok(())
+    }
+
+    /// Prev/next ids are bounded too, and keep the list's ordering.
+    #[tokio::test]
+    async fn entry_ids_are_ordered_and_capped() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:ids";
+        seed_big_entries(&pool, did, 60).await?;
+
+        let capped = list_entry_ids(&pool, did, ListView::All, None, 25).await?;
+        assert_eq!(capped.len(), 25);
+
+        let rows = list_entries(&pool, did, ListView::All, None, 25, 0).await?;
+        assert_eq!(
+            capped,
+            rows.iter().map(|e| e.id).collect::<Vec<_>>(),
+            "the id list and the row list disagree on ordering"
+        );
         Ok(())
     }
 
@@ -3232,6 +5742,501 @@ mod tests {
 
     // -- F3: db_size_bytes ignores freed pages and drops after reclaim -------
 
+    /// A new on-disk database must be created in INCREMENTAL mode.
+    ///
+    /// This is the whole fix for new instances: `auto_vacuum` was read by
+    /// `reclaim` and set nowhere, so every database ran in NONE and `reclaim`
+    /// always took its full-`VACUUM` branch — the one that cannot complete on a
+    /// volume under the pressure that triggered the sweep. The pragma only binds
+    /// on a database with no tables yet, so "at creation" is the load-bearing
+    /// part, not "somewhere in init".
+    #[tokio::test]
+    async fn a_new_database_is_created_in_incremental_vacuum_mode() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-autovac-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let pool = init_url(&format!("sqlite://{}", path.display())).await?;
+
+        assert_eq!(
+            auto_vacuum_mode(&pool).await?,
+            AutoVacuum::Incremental,
+            "a fresh database is still in the mode where reclaim needs a full VACUUM"
+        );
+        // And the WAL is bounded rather than growing to its high-water mark
+        // forever.
+        let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            limit, WAL_SIZE_LIMIT_BYTES,
+            "journal_size_limit not applied"
+        );
+
+        // Being INCREMENTAL, the migration is a no-op — which is what makes the
+        // flag safe for an operator to run without checking first.
+        assert_eq!(
+            migrate_to_incremental_vacuum(&pool, None).await?,
+            VacuumMigration::NotNeeded(AutoVacuum::Incremental)
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// The migration refuses itself when the volume cannot hold the rebuild.
+    ///
+    /// A full `VACUUM` writes a complete second copy, so attempting one without
+    /// headroom burns I/O on a box that has none and finishes nothing. Refusing
+    /// is the entire reason this is an operator step rather than something
+    /// `reclaim` does on its own.
+    #[tokio::test]
+    async fn the_vacuum_migration_refuses_without_headroom() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-autovac-none-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        // Build a database the way one that predates this change looks: create
+        // the file in NONE mode explicitly, then populate it.
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+        assert_eq!(auto_vacuum_mode(&pool).await?, AutoVacuum::None);
+
+        // Zero free space: refused, and the mode is untouched.
+        let refused = migrate_to_incremental_vacuum(&pool, Some(0)).await?;
+        assert!(
+            matches!(refused, VacuumMigration::RefusedNoHeadroom { .. }),
+            "expected a refusal, got {refused:?}"
+        );
+        assert_eq!(
+            auto_vacuum_mode(&pool).await?,
+            AutoVacuum::None,
+            "a refused migration must not have changed the mode"
+        );
+
+        // With headroom it runs, and the database ends up INCREMENTAL — which is
+        // what makes `reclaim` cheap from then on.
+        let done = migrate_to_incremental_vacuum(&pool, Some(u64::MAX)).await?;
+        let VacuumMigration::Migrated {
+            bytes_after,
+            file_after,
+            ..
+        } = done
+        else {
+            panic!("expected a migration, got {done:?}");
+        };
+        assert_eq!(auto_vacuum_mode(&pool).await?, AutoVacuum::Incremental);
+        // The reported size must not include the WAL the VACUUM just filled. In
+        // WAL mode a VACUUM writes the whole rebuilt database through the WAL,
+        // so without the truncating checkpoint this reads as roughly double —
+        // "the migration doubled my database", from the one line the command
+        // prints.
+        let file_after = file_after.expect("an on-disk database has a file size") as i64;
+        assert!(
+            bytes_after <= file_after * 2,
+            "bytes_after ({bytes_after}) is inflated by an untruncated WAL against a \
+             {file_after}-byte file"
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// **R6 benchmark: what the retention sweep actually costs, and what fixes it.**
+    ///
+    /// `#[ignore]` — builds a ~1M-row database four times over, so it is a
+    /// measurement tool rather than a test. Run with:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored --nocapture r6_measure_retention_sweep
+    /// ```
+    ///
+    /// It exists because R6 was "every delete batch re-scans `entry_state`" and
+    /// the honest answer was "measure before changing an index". Kept so the next
+    /// candidate index can be tried against the same fixture rather than a new
+    /// one. Findings are recorded in `design/REVIEW-ROUND-2.md`.
+    #[tokio::test]
+    #[ignore]
+    async fn r6_measure_retention_sweep() -> Result<()> {
+        const FEEDS: i64 = 500;
+        const PER_FEED: i64 = 2_000; // matches `max_entries_per_feed`
+        const PINNED: i64 = 50_000; // entry_state rows a reader has touched
+
+        /// Build the fixture, apply `extra_indexes`, then plan and time a sweep.
+        async fn run(
+            label: &str,
+            extra_indexes: &[&str],
+            pinned: i64,
+            old_list_form: bool,
+        ) -> Result<()> {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("fr-r6-{}-{label}.db", std::process::id()));
+            let cleanup = |path: &std::path::Path| {
+                for p in [
+                    path.display().to_string(),
+                    format!("{}-wal", path.display()),
+                    format!("{}-shm", path.display()),
+                ] {
+                    std::fs::remove_file(&p).ok();
+                }
+            };
+            cleanup(&path);
+            let pool = init_url(&format!("sqlite://{}", path.display())).await?;
+
+            // Bulk-build with SQL: a million round trips would measure the
+            // fixture, not the sweep. Recursive CTE because `generate_series` is
+            // not compiled into the bundled SQLite.
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < ?1 \
+                 ) \
+                 INSERT INTO feeds (url) \
+                 SELECT 'https://f' || value || '.example/x.xml' FROM n",
+            )
+            .bind(FEEDS)
+            .execute(&pool)
+            .await
+            .context("seeding feeds")?;
+
+            // Half the entries older than the window, half inside it.
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < ?1 \
+                 ) \
+                 INSERT INTO entries (feed_id, guid, title, published, fetched_at) \
+                 SELECT f.id, \
+                        'g' || f.id || '-' || s.value, \
+                        'Entry ' || s.value, \
+                        CASE WHEN s.value % 2 = 0 THEN '2020-01-01T00:00:00Z' \
+                             ELSE '2099-01-01T00:00:00Z' END, \
+                        '2026-01-01T00:00:00Z' \
+                 FROM feeds f, n s",
+            )
+            .bind(PER_FEED)
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) \
+                 SELECT 'did:plc:reader', id, \
+                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
+                        CASE WHEN id % 2 = 0 THEN 0 ELSE 1 END, \
+                        '2026-01-01T00:00:00Z' \
+                 FROM entries LIMIT ?1",
+            )
+            .bind(pinned)
+            .execute(&pool)
+            .await?;
+
+            // Space is the other half of the trade: this is a 1 GB volume with a
+            // 768 MiB watermark, so an index that buys time and costs disk can be
+            // a net loss.
+            let pages_before: i64 = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&pool)
+                .await?;
+            let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                .fetch_one(&pool)
+                .await?;
+            for idx in extra_indexes {
+                sqlx::query(sqlx::AssertSqlSafe((*idx).to_string()))
+                    .execute(&pool)
+                    .await
+                    .with_context(|| format!("creating {idx}"))?;
+            }
+            let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&pool)
+                .await?;
+            let index_bytes = (pages_after - pages_before) * page_size;
+
+            // What the index costs on the WRITE path — the poller inserts
+            // constantly, the sweep runs once a day.
+            let t_ins = std::time::Instant::now();
+            sqlx::query(
+                "WITH RECURSIVE n(value) AS ( \
+                     SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 10000 \
+                 ) \
+                 INSERT INTO entries (feed_id, guid, published, fetched_at) \
+                 SELECT 1, 'ins-' || value, '2099-06-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+                 FROM n",
+            )
+            .execute(&pool)
+            .await?;
+            let insert_10k = t_ins.elapsed();
+
+            // Give the planner statistics, as a long-lived instance would have.
+            sqlx::query("ANALYZE").execute(&pool).await?;
+
+            let plan: Vec<String> = sqlx::query(
+                "EXPLAIN QUERY PLAN SELECT id FROM entries \
+                 WHERE COALESCE(published, fetched_at) < '2026-06-01T00:00:00Z' \
+                   AND id NOT IN (SELECT entry_id FROM entry_state \
+                                  WHERE starred = 1 OR read = 0) \
+                 LIMIT 1000",
+            )
+            .fetch_all(&pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect();
+
+            // ONE variant per fixture — running both against the same database
+            // measured the second against an already-emptied table, which
+            // reported a 0-row "win" the first time this was written.
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let t = std::time::Instant::now();
+            let deleted = if old_list_form {
+                // The shape `prune_old_entries` used to have: the pinned set as
+                // an `IN` list, re-materialised on every batch.
+                let mut n = 0u64;
+                loop {
+                    let got = sqlx::query(
+                        "DELETE FROM entries WHERE id IN ( \
+                             SELECT id FROM entries \
+                             WHERE COALESCE(published, fetched_at) < ?1 \
+                               AND id NOT IN ( \
+                                   SELECT entry_id FROM entry_state \
+                                   WHERE starred = 1 OR read = 0 \
+                               ) \
+                             LIMIT 1000)",
+                    )
+                    .bind(&cutoff)
+                    .execute(&pool)
+                    .await?
+                    .rows_affected();
+                    n += got;
+                    if got == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                n
+            } else {
+                prune_old_entries(&pool, 30, 3650).await?
+            };
+            let elapsed = t.elapsed();
+
+            println!("\n=== {label}  (entry_state = {pinned}) ===");
+            println!(
+                "  index cost: {:.1} MiB on disk, 10k inserts in {insert_10k:?}",
+                index_bytes as f64 / 1024.0 / 1024.0
+            );
+            for l in &plan {
+                println!("  plan: {l}");
+            }
+            println!(
+                "  deleted {deleted} in {elapsed:?}  ({:?}/batch)",
+                elapsed / (deleted as u32 / PRUNE_BATCH as u32).max(1)
+            );
+
+            pool.close().await;
+            cleanup(&path);
+            Ok(())
+        }
+
+        // R6's own hypothesis was that the per-batch `entry_state` scan is the
+        // cost. Both scales are measured because that scan grows with TOTAL
+        // users, not with the feed being swept — 50k is one active reader,
+        // 600k is the figure the schema comment cites as realistic.
+        const AGE_IDX: &str =
+            "CREATE INDEX idx_entries_age ON entries(COALESCE(published, fetched_at))";
+        for pinned in [PINNED, 600_000] {
+            // `false` = the shipped `prune_old_entries`, whatever shape it
+            // currently uses; `true` = the raw `NOT IN` list form it replaced,
+            // kept so the regression stays measurable rather than remembered.
+            run("as shipped", &[], pinned, false).await?;
+            run("old NOT IN list form", &[], pinned, true).await?;
+            run("as shipped + age index", &[AGE_IDX], pinned, false).await?;
+        }
+        Ok(())
+    }
+
+    /// **The migration must not ask the pool for anything while holding a
+    /// connection.** A single-connection pool is always saturated, so any such
+    /// call stalls for the full acquire timeout.
+    ///
+    /// This has now been introduced twice — once by acquiring a connection for
+    /// the pragma pair, and once by resolving the temp directory inside that
+    /// block. The second was worse than a stall: `main_db_path` swallows errors
+    /// into `None`, so it waited 30 s and then silently skipped the pragma it
+    /// existed to set. A wall-clock assertion is crude, but it is the only thing
+    /// that distinguishes "works" from "works after a 30-second timeout".
+    #[tokio::test]
+    async fn the_vacuum_migration_never_waits_on_its_own_pool() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-nodeadlock-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        // ONE connection: any pool call made while the migration holds it will
+        // block until the acquire timeout rather than deadlocking forever.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+
+        let t0 = std::time::Instant::now();
+        let outcome = migrate_to_incremental_vacuum(&pool, Some(u64::MAX)).await?;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            matches!(outcome, VacuumMigration::Migrated { .. }),
+            "expected a migration, got {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the migration took {elapsed:?} on an empty database — it is waiting on \
+             its own pool while holding a connection"
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
+    /// `reclaim` must NOT run a full VACUUM in NONE mode — the branch that used
+    /// to be the only one that ever executed, and the one that cannot finish on
+    /// a volume under the pressure that triggers a sweep.
+    ///
+    /// Observable without timing a VACUUM: a full VACUUM returns freed pages to
+    /// the OS, so `page_count` falls. Skipping it leaves the allocation in
+    /// place — while `db_size_bytes`, which subtracts the freelist, still drops.
+    /// That pairing is the actual claim: the watermark does not latch even
+    /// though the file does not shrink.
+    #[tokio::test]
+    async fn reclaim_does_not_full_vacuum_in_none_mode() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-noneclaim-{}.db", std::process::id()));
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::None);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        init_schema(&pool).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://none.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..1500)
+            .map(|i| NewEntry {
+                guid: format!("n-{i}"),
+                content_html: Some("x".repeat(800)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        // Fold the WAL in so the "full" baseline is file pages, not WAL churn.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await?;
+        let used_full = db_size_bytes(&pool).await?;
+
+        sqlx::query("DELETE FROM entries").execute(&pool).await?;
+        let pages_before: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await?;
+
+        reclaim(&pool).await?;
+
+        let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            pages_after, pages_before,
+            "reclaim shrank the file in NONE mode, so it ran the full VACUUM this \
+             branch exists to avoid"
+        );
+        // …and the watermark still falls, which is what makes skipping safe.
+        // `db_size_bytes` subtracts the freelist, so the delete alone lowers it
+        // even though the file kept every page it had allocated.
+        let used_after = db_size_bytes(&pool).await?;
+        assert!(
+            used_after < used_full,
+            "used size did not fall after the delete ({used_after} !< {used_full}); \
+             without a VACUUM the DB-size watermark would latch the poller off"
+        );
+
+        pool.close().await;
+        for p in [
+            path.display().to_string(),
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            std::fs::remove_file(&p).ok();
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn db_size_drops_after_prune_and_reclaim() -> Result<()> {
         // On-disk DB so VACUUM has a file to shrink (in-memory has no freelist to
@@ -3407,7 +6412,7 @@ mod tests {
         assert_eq!(state_before, 1);
 
         // Prune at a 90-day window: only the ancient entry is old.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 1, "only the year-old entry should be pruned");
         assert_eq!(
             count_entries(&pool).await?,
@@ -3429,8 +6434,10 @@ mod tests {
                 .await?;
         assert_eq!(state_after, 0, "entry_state must cascade on entry delete");
 
-        // days == 0 disables retention (no-op).
-        assert_eq!(prune_old_entries(&pool, 0).await?, 0);
+        // days == 0 disables the rolling WINDOW. The 3650-day ceiling still runs
+        // (see `a_disabled_window_does_not_disable_the_ceiling`); it deletes
+        // nothing here because both survivors are fresh.
+        assert_eq!(prune_old_entries(&pool, 0, 3650).await?, 0);
         assert_eq!(count_entries(&pool).await?, 2);
         Ok(())
     }
@@ -3490,7 +6497,7 @@ mod tests {
         assert!(ids_before.contains(&new_id.to_string()));
 
         // Prune the old entry — its id must be scrubbed from the cursor's id-set.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 1);
         let after = get_cursor(&pool, did, feed_url).await?.unwrap();
         let ids_after: Vec<String> = serde_json::from_str(&after.read_ids)?;
@@ -3575,6 +6582,302 @@ mod tests {
         Ok(())
     }
 
+    /// A sweep spanning several batches must still delete everything.
+    ///
+    /// The batching exists to make the write-lock hold interruptible, not to
+    /// make the sweep partial — so the obvious way to get it wrong is an
+    /// off-by-one that leaves a batch behind, or a loop that exits on the first
+    /// short batch instead of the first empty one.
+    #[tokio::test]
+    async fn a_sweep_larger_than_one_batch_still_drains() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://bulk.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Deliberately not a multiple of PRUNE_BATCH, so the final batch is
+        // short and the loop has to keep going to the empty one.
+        let count = (PRUNE_BATCH * 2 + 137) as usize;
+        let entries: Vec<NewEntry> = (0..count)
+            .map(|i| NewEntry {
+                guid: format!("bulk-{i}"),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        assert_eq!(count_entries(&pool).await? as usize, count);
+
+        let deleted = prune_old_entries(&pool, 30, 180).await?;
+        assert_eq!(deleted as usize, count, "the sweep left rows behind");
+        assert_eq!(count_entries(&pool).await?, 0);
+        Ok(())
+    }
+
+    /// **The sweep must not lock other writers out for its duration.**
+    ///
+    /// The whole sweep used to be one transaction — both deletes plus a global
+    /// cursor scrub that loads every `read_cursor` row and then issues a
+    /// per-cursor live-ids query. SQLite is single-writer with a 5 s
+    /// `busy_timeout`, so every mark-read, login write and cursor flush failed
+    /// for that whole span.
+    ///
+    /// On-disk (WAL, 5 connections) because the in-memory pool is deliberately
+    /// single-connection, which would make a concurrency test meaningless.
+    #[tokio::test]
+    async fn a_writer_gets_through_while_the_sweep_runs() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fr-sweeplock-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://lock.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let entries: Vec<NewEntry> = (0..(PRUNE_BATCH * 10) as usize)
+            .map(|i| NewEntry {
+                guid: format!("lock-{i}"),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+
+        // The discriminating measurement is LATENCY, not success. With only ten
+        // thousand rows the old single-transaction sweep would finish inside the
+        // 5 s `busy_timeout`, so the interleaved writes would still eventually
+        // land — they would just each have waited for the ENTIRE sweep. So the
+        // writer records the worst single-write wait, and the assertion is that
+        // no write waited for more than a fraction of the sweep.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_done = std::sync::Arc::clone(&done);
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let mut wrote = 0_u32;
+            let mut worst = std::time::Duration::ZERO;
+            while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
+                let t0 = std::time::Instant::now();
+                grant_access(
+                    &writer_pool,
+                    &format!("did:plc:writer{wrote}"),
+                    None,
+                    "sweep-test",
+                    None,
+                )
+                .await?;
+                worst = worst.max(t0.elapsed());
+                wrote += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            Ok::<(u32, std::time::Duration), anyhow::Error>((wrote, worst))
+        });
+
+        let t0 = std::time::Instant::now();
+        let deleted = prune_old_entries(&pool, 30, 180).await?;
+        let sweep = t0.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (wrote, worst) = writer.await??;
+
+        assert_eq!(deleted as usize, entries.len());
+        // Sanity: the sweep has to take long enough for "was a writer blocked
+        // for it" to be a meaningful question. Ten batches of inter-batch
+        // hand-off put this comfortably past the floor.
+        assert!(
+            sweep > std::time::Duration::from_millis(50),
+            "the sweep finished in {sweep:?}; too fast for this test to mean anything"
+        );
+        // The real property. Note this is asserted BEFORE the throughput check
+        // below: when the sweep does hold the lock, the writer is starved, so
+        // both assertions fail — and this one names the actual cause.
+        assert!(
+            worst * 3 < sweep,
+            "a single write waited {worst:?} of a {sweep:?} sweep ({wrote} writes \
+             landed) — the sweep is holding the write lock ACROSS batches rather \
+             than releasing it between them"
+        );
+        assert!(
+            wrote > 5,
+            "only {wrote} writes ran alongside a {sweep:?} sweep"
+        );
+
+        pool.close().await;
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+        Ok(())
+    }
+
+    /// **A mark-read landing during the scrub must not be overwritten.**
+    ///
+    /// Moving the scrub out of the sweep's transaction removed a multi-minute
+    /// write-lock hold and introduced a lost update in its place: the id-sets
+    /// were read into a snapshot up front and written back unguarded, so a
+    /// `mark_read` arriving mid-pass had its id silently dropped — and the
+    /// rewrite set `dirty = 1`, so the flusher pushed the truncated set to the
+    /// PDS as authoritative. Local `entry_state` still said read, so the loss was
+    /// invisible here and visible only in every other atproto client.
+    ///
+    /// The race is a few milliseconds wide, so this does not try to hit it.
+    /// Instead it pins the property that makes it impossible: the scrub reads the
+    /// id-sets itself, inside the same transaction that writes them, so a set
+    /// written after the pass began is the one that gets filtered.
+    #[tokio::test]
+    async fn the_cursor_scrub_reads_the_ids_it_writes() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:race";
+        let feed_url = "https://race.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "live".to_string(),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "doomed".to_string(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let live_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'live'")
+            .fetch_one(&pool)
+            .await?;
+        let doomed_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'doomed'")
+            .fetch_one(&pool)
+            .await?;
+
+        // A cursor holding only the id that is about to be deleted.
+        upsert_cursor(
+            &pool,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: feed_url.to_string(),
+                read_through: None,
+                read_ids: format!("[\"{doomed_id}\"]"),
+                unread_ids: "[]".to_string(),
+                dirty: false,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        sqlx::query("DELETE FROM entries WHERE guid = 'doomed'")
+            .execute(&pool)
+            .await?;
+
+        // Now a reader marks the surviving entry read — the write that the old
+        // snapshot-then-write shape would have clobbered. It lands BEFORE the
+        // scrub, which is the deterministic stand-in for landing during it: a
+        // scrub that reads its own input sees it, one that reuses a snapshot
+        // taken earlier does not.
+        mark_read(&pool, did, live_id, true).await?;
+
+        assert_eq!(prune_orphan_cursor_ids(&pool, None).await?, 1);
+
+        let cursor = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
+        assert_eq!(
+            ids,
+            vec![live_id.to_string()],
+            "the scrub dropped a mark-read that landed after the pass began"
+        );
+        assert!(
+            !ids.contains(&doomed_id.to_string()),
+            "the orphaned id survived the scrub"
+        );
+        Ok(())
+    }
+
+    /// The cursor scrub still happens — it just no longer rides inside the
+    /// delete transaction. Moving it out is only safe because it is idempotent;
+    /// this pins that it still runs at all, which is the thing a "move it out"
+    /// refactor can silently drop.
+    #[tokio::test]
+    async fn the_sweep_still_scrubs_orphaned_cursor_ids() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:scrub";
+        let feed_url = "https://scrub.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "doomed".to_string(),
+                published: Some(old),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let doomed = entries_for_feed(&pool, did, feed_id).await;
+        // `entries_for_feed` is sub_ref-scoped; read the id directly instead.
+        drop(doomed);
+        let doomed_id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = 'doomed'")
+            .fetch_one(&pool)
+            .await?;
+
+        upsert_cursor(
+            &pool,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: feed_url.to_string(),
+                read_through: None,
+                read_ids: format!("[\"{doomed_id}\"]"),
+                unread_ids: "[]".to_string(),
+                dirty: false,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+
+        assert_eq!(prune_old_entries(&pool, 30, 180).await?, 1);
+
+        let cursor = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
+        assert!(
+            ids.is_empty(),
+            "the deleted entry's id survived in the cursor: {ids:?}"
+        );
+        assert!(cursor.dirty, "a rewritten cursor must be re-flushed");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn prune_and_reclaim_drops_db_size() -> Result<()> {
         // On-disk DB so VACUUM has a file to shrink.
@@ -3607,7 +6910,7 @@ mod tests {
         assert!(full > 0);
 
         // A retention sweep prunes every (year-old) entry, then reclaim shrinks.
-        let deleted = prune_old_entries(&pool, 90).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650).await?;
         assert_eq!(deleted, 2000);
         reclaim(&pool).await?;
         let after = db_size_bytes(&pool).await?;
@@ -3708,6 +7011,23 @@ mod tests {
         init_schema(&pool)
             .await
             .expect("re-running init_schema must be idempotent");
+
+        // **The OAuth tables must exist too.** They live in this database, and
+        // creating them only when the Rust backend is selected would make the
+        // first request after a cutover flip fail with "no such table" -- at the
+        // one moment nobody wants to find out a migration was missed. They are
+        // empty and harmless while the sidecar is serving.
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for table in ["oauth_state", "oauth_session", "oauth_nonce"] {
+            assert!(
+                tables.iter().any(|t| t == table),
+                "{table} is missing, so the rust backend would fail on its first request: {tables:?}"
+            );
+        }
 
         // The legacy code still redeems (NULL intended_did → open, as before).
         let out = redeem_code(&pool, "FEATHER-LEGACY00", "did:plc:new", None, 100).await?;
@@ -3952,6 +7272,317 @@ mod tests {
         assert!(latest_network_stat(&pool, ADOPTION_STAT_KEY)
             .await?
             .is_none());
+        Ok(())
+    }
+
+    // ── poll health (the public stats page) ─────────────────────────────────
+
+    async fn feed_polled(
+        pool: &SqlitePool,
+        url: &str,
+        last_polled: Option<&str>,
+        next_poll: Option<&str>,
+    ) {
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind(url)
+            .bind(last_polled)
+            .bind(next_poll)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The numbers on the public page must describe the poller's actual state.
+    #[tokio::test]
+    async fn poll_health_counts_tracked_recent_and_overdue() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let now = "2026-01-01T12:00:00Z";
+        let hour_ago = "2026-01-01T11:00:00Z";
+
+        // Polled 10 minutes ago, due in 50 minutes: healthy.
+        feed_polled(
+            &pool,
+            "https://a.example/f",
+            Some("2026-01-01T11:50:00Z"),
+            Some("2026-01-01T12:50:00Z"),
+        )
+        .await;
+        // Polled 3 hours ago and overdue: the backlog case.
+        feed_polled(
+            &pool,
+            "https://b.example/f",
+            Some("2026-01-01T09:00:00Z"),
+            Some("2026-01-01T10:00:00Z"),
+        )
+        .await;
+        // Never polled: counts as overdue (next_poll IS NULL), and must not
+        // corrupt the "oldest poll" figure with a NULL.
+        feed_polled(&pool, "https://c.example/f", None, None).await;
+
+        let h = poll_health(&pool, now, hour_ago).await?;
+        assert_eq!(h.feeds_tracked, 3);
+        assert_eq!(
+            h.polled_last_hour, 1,
+            "only the 11:50 poll is within the hour"
+        );
+        assert_eq!(h.overdue, 2, "the stale feed and the never-polled one");
+        assert_eq!(
+            h.last_poll_secs_ago,
+            Some(600),
+            "most recent poll was 10 minutes ago"
+        );
+        // **A never-polled feed IS the worst staleness.**
+        //
+        // This originally asserted `Some(10_800)` — the oldest FINITE age — and
+        // in doing so pinned a defect: `MIN` skips NULLs, so the page reported
+        // "3h ago" while a quarter of the feeds had never been fetched at all.
+        // The figure read healthiest in the most degraded state, which is the
+        // opposite of what a health page is for.
+        assert_eq!(
+            h.oldest_poll_secs_ago, None,
+            "a never-polled feed must outrank any finite age"
+        );
+        assert_eq!(h.never_polled, 1);
+
+        // With every feed polled, the finite worst case is reported again.
+        sqlx::query("UPDATE feeds SET last_polled = ?1 WHERE last_polled IS NULL")
+            .bind("2026-01-01T09:00:00Z")
+            .execute(&pool)
+            .await?;
+        let h = poll_health(&pool, now, hour_ago).await?;
+        assert_eq!(h.never_polled, 0);
+        assert_eq!(h.oldest_poll_secs_ago, Some(10_800));
+        Ok(())
+    }
+
+    /// A fresh instance has no polls yet. The page must say so rather than
+    /// rendering a zero that reads as "polled just now".
+    #[tokio::test]
+    async fn poll_health_on_an_empty_instance_reports_no_polls() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        assert_eq!(h.feeds_tracked, 0);
+        assert_eq!(h.last_poll_secs_ago, None);
+        assert_eq!(h.oldest_poll_secs_ago, None);
+        Ok(())
+    }
+
+    /// A poll timestamped in the future — clock skew, or a restored backup —
+    /// reads as "just now", never as a negative age.
+    #[tokio::test]
+    async fn a_future_poll_timestamp_does_not_go_negative() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        feed_polled(
+            &pool,
+            "https://a.example/f",
+            Some("2026-01-01T13:00:00Z"),
+            None,
+        )
+        .await;
+        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        assert_eq!(h.last_poll_secs_ago, Some(0));
+        Ok(())
+    }
+
+    // ── retention is a CACHE policy, not a data-retention policy ────────────
+
+    async fn aged_entry(pool: &SqlitePool, url: &str, days_old: i64) -> i64 {
+        let when = (chrono::Utc::now() - chrono::Duration::days(days_old))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        sqlx::query("INSERT INTO feeds (url) VALUES (?1) ON CONFLICT(url) DO NOTHING")
+            .bind("https://f.example/feed")
+            .execute(pool)
+            .await
+            .unwrap();
+        let feed_id: i64 = sqlx::query_scalar("SELECT id FROM feeds WHERE url = ?1")
+            .bind("https://f.example/feed")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO entries (feed_id, guid, url, title, published, fetched_at) VALUES (?1,?2,?3,'t',?4,?4)")
+            .bind(feed_id).bind(url).bind(url).bind(&when)
+            .execute(pool).await.unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE guid = ?1")
+            .bind(url)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn mark(pool: &SqlitePool, entry_id: i64, read: i64, starred: i64) {
+        sqlx::query("INSERT INTO entry_state (did, entry_id, read, starred, updated_at) VALUES ('did:plc:x',?1,?2,?3,'2026-01-01T00:00:00Z')")
+            .bind(entry_id).bind(read).bind(starred)
+            .execute(pool).await.unwrap();
+    }
+
+    /// **A STARRED article is never evicted, however old.**
+    ///
+    /// The starred view joins `entries`, and `entry_state` cascades on delete,
+    /// so pruning a starred entry removed it from the starred list entirely —
+    /// and the content is not recoverable, because a feed serves only its last
+    /// few dozen items. The PDS keeps the saved RECORD; it has never held the
+    /// article.
+    #[tokio::test]
+    async fn retention_keeps_starred_and_unread_entries() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let old_read = aged_entry(&pool, "old-read", 30).await;
+        let old_starred = aged_entry(&pool, "old-starred", 30).await;
+        let old_unread = aged_entry(&pool, "old-unread", 30).await;
+        let recent_read = aged_entry(&pool, "recent-read", 1).await;
+        mark(&pool, old_read, 1, 0).await;
+        mark(&pool, old_starred, 1, 1).await; // read AND starred
+        mark(&pool, old_unread, 0, 0).await;
+        mark(&pool, recent_read, 1, 0).await;
+
+        let deleted = prune_old_entries(&pool, 14, 3650).await?;
+        assert_eq!(deleted, 1, "only the old, read, unstarred entry should go");
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(left, vec!["old-starred", "old-unread", "recent-read"]);
+        Ok(())
+    }
+
+    /// An entry nobody has interacted with at all — no `entry_state` row — is
+    /// still evicted once it ages out. Otherwise the cache never shrinks, since
+    /// most entries are never opened.
+    #[tokio::test]
+    async fn retention_evicts_entries_with_no_reader_state() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        aged_entry(&pool, "untouched-old", 30).await;
+        aged_entry(&pool, "untouched-new", 1).await;
+        assert_eq!(prune_old_entries(&pool, 14, 3650).await?, 1);
+        Ok(())
+    }
+
+    /// **A recently-polled feed is NOT made due again.**
+    ///
+    /// `due_feeds` treats NULL as due immediately, so an unbounded nudge from a
+    /// page handler turned every reload of the starred view into another poll of
+    /// those feeds — outbound amplification against third-party origins, and one
+    /// reader monopolising a poll budget that is shared and already the binding
+    /// constraint on user count.
+    #[tokio::test]
+    async fn a_recently_polled_feed_is_not_nudged_again() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let recent = "2026-01-01T11:59:00Z";
+        let stale_before = "2026-01-01T11:00:00Z"; // one hour before "now"
+
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind("https://fresh.example/f")
+            .bind(recent)
+            .bind("2026-01-01T12:59:00Z")
+            .execute(&pool)
+            .await?;
+        // Polled long ago: this one SHOULD be nudged.
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
+            .bind("https://stale.example/f")
+            .bind("2026-01-01T06:00:00Z")
+            .bind("2026-01-01T07:00:00Z")
+            .execute(&pool)
+            .await?;
+
+        mark_feed_due(&pool, "https://fresh.example/f", stale_before).await?;
+        mark_feed_due(&pool, "https://stale.example/f", stale_before).await?;
+
+        let fresh: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://fresh.example/f'")
+                .fetch_one(&pool)
+                .await?;
+        let stale: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://stale.example/f'")
+                .fetch_one(&pool)
+                .await?;
+
+        assert!(
+            fresh.is_some(),
+            "a feed polled a minute ago was made due again — a reload loop is an \
+             amplification vector"
+        );
+        assert!(stale.is_none(), "a long-unpolled feed should be nudged");
+        Ok(())
+    }
+
+    /// A feed that has never been polled is always nudgeable — there is no
+    /// recent fetch to argue it would be wasted.
+    #[tokio::test]
+    async fn a_never_polled_feed_is_nudged() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, NULL, ?2)")
+            .bind("https://new.example/f")
+            .bind("2026-01-01T12:59:00Z")
+            .execute(&pool)
+            .await?;
+        mark_feed_due(&pool, "https://new.example/f", "2026-01-01T11:00:00Z").await?;
+        let next: Option<String> =
+            sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = 'https://new.example/f'")
+                .fetch_one(&pool)
+                .await?;
+        assert!(next.is_none());
+        Ok(())
+    }
+
+    /// **The hard ceiling is the bound that sparing would otherwise remove.**
+    ///
+    /// "Mark unread" is a one-click control and `entries` is shared across every
+    /// reader, so an unbounded `read = 0` exception lets one person pin rows
+    /// permanently — and since the poller stops entirely above
+    /// `db_size_watermark_bytes` with this DELETE as its only release valve,
+    /// those pins could stop polling for everyone.
+    #[tokio::test]
+    async fn the_hard_ceiling_evicts_even_starred_and_unread() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let ancient_starred = aged_entry(&pool, "ancient-starred", 400).await;
+        let ancient_unread = aged_entry(&pool, "ancient-unread", 400).await;
+        let recent_starred = aged_entry(&pool, "recent-starred", 30).await;
+        mark(&pool, ancient_starred, 1, 1).await;
+        mark(&pool, ancient_unread, 0, 0).await;
+        mark(&pool, recent_starred, 1, 1).await;
+
+        // 14-day soft window, 180-day hard ceiling.
+        prune_old_entries(&pool, 14, 180).await?;
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            left,
+            vec!["recent-starred"],
+            "past the ceiling nothing is pinned — otherwise one reader can stall the poller \
+             for every reader"
+        );
+        Ok(())
+    }
+
+    /// The per-feed trim spares starred entries too. It was fixed in the
+    /// retention sweep and NOT here, which left the documented guarantee false —
+    /// and this path runs on every poll of every feed rather than daily.
+    #[tokio::test]
+    async fn the_per_feed_trim_spares_starred_entries() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let old_starred = aged_entry(&pool, "old-starred", 5).await;
+        mark(&pool, old_starred, 1, 1).await;
+        for i in 0..5 {
+            aged_entry(&pool, &format!("filler-{i}"), 1).await;
+        }
+        let feed_id: i64 = sqlx::query_scalar("SELECT id FROM feeds LIMIT 1")
+            .fetch_one(&pool)
+            .await?;
+
+        // Trim hard enough that the older starred entry would be cut. The trim
+        // runs inside `insert_entries`, so drive it the way production does.
+        insert_entries(&pool, feed_id, &[], 2).await?;
+
+        let left: Vec<String> =
+            sqlx::query_scalar("SELECT guid FROM entries WHERE guid = 'old-starred'")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            left,
+            vec!["old-starred"],
+            "the per-feed trim evicted a starred entry"
+        );
         Ok(())
     }
 }

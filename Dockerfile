@@ -142,6 +142,12 @@ COPY --from=node-build --chown=app:app /sidecar/package.json /app/oauth-sidecar/
 
 # Caddy config + the multi-process supervisor.
 COPY --chown=app:app deploy/Caddyfile /etc/caddy/Caddyfile
+# Both OAuth routing variants ship; the entrypoint installs the one matching
+# FEATHERREADER_REPO_BACKEND as /etc/caddy/oauth-routes.conf at start-up. Both
+# are present in every image so a rollback is an env change and a restart, with
+# no rebuild.
+COPY --chown=app:app deploy/caddy-oauth-sidecar.conf /etc/caddy/caddy-oauth-sidecar.conf
+COPY --chown=app:app deploy/caddy-oauth-rust.conf /etc/caddy/caddy-oauth-rust.conf
 COPY --chown=app:app deploy/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
 
@@ -155,8 +161,16 @@ RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
 # the edge value (https://feather-reader.com/oauth) delivered via
 # `fly secrets` and used only for the browser /login + OAuth client_id/redirect_uri.
 # Baking the loopback INTERNAL url here keeps server-to-server calls off the edge.
+#
+# FEATHERREADER_OAUTH_KEY_PATH MUST be on the volume. Its default is the
+# RELATIVE path `oauth-signing-key.json`, and the entrypoint runs the app from
+# /app — the image's ephemeral layer. Unset, the client's ES256 key is therefore
+# destroyed by every redeploy, and since a backend flip IS a redeploy, the rust
+# backend would mint a FRESH client key on each one: the published JWKS changes,
+# and every grant a PDS holds against the old key stops verifying.
 ENV FEATHERREADER_BIND=127.0.0.1:8082 \
     FEATHERREADER_DB=/data/featherreader.db \
+    FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json \
     FEATHERREADER_ENV=prod \
     FEATHERREADER_TRUSTED_IP_HEADER=cf-connecting-ip \
     SIDECAR_TRUSTED_IP_HEADER=cf-connecting-ip \
@@ -170,6 +184,9 @@ ENV FEATHERREADER_BIND=127.0.0.1:8082 \
 #
 # NOT set here (delivered at runtime via `fly secrets set`, never baked):
 #   FEATHERREADER_COOKIE_SECRET, SIDECAR_INTERNAL_SECRET, SIDECAR_ENC_KEY,
+#   FEATHERREADER_OAUTH_ENCRYPTION_KEY (required by FEATHERREADER_REPO_BACKEND=rust;
+#     without it the stored access tokens, refresh tokens and DPoP keys are
+#     plaintext, and validate_secrets() refuses to boot that combination),
 #   FEATHERREADER_PUBLIC_URL, SIDECAR_PUBLIC_URL (prod .../oauth — browser-facing),
 #   SIDECAR_APP_CALLBACK_URL, FEATHERREADER_ALLOWED_DIDS, etc.
 # config.rs::validate_secrets() and the sidecar's config.ts FAIL LOUD at boot if

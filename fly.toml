@@ -12,6 +12,26 @@
 # The container entrypoint chowns /data to the app uid on first boot (a fresh Fly
 # volume is root:root), so the non-root app can create these files.
 #
+# ONE-TIME MAINTENANCE — auto_vacuum (databases created before v0.3.0 only):
+#   fly ssh console -C "/app/featherreader --migrate-auto-vacuum"
+# Databases created from v0.3.0 on are already in INCREMENTAL mode. Older ones
+# are in SQLite's default NONE, where reclaiming freed pages requires a FULL
+# VACUUM — which writes a second complete copy of the database and so needs free
+# disk roughly equal to the live file. That is exactly what is missing under the
+# disk pressure that triggers a retention sweep, so the app now refuses to run
+# one on its own and logs a warning instead. Switching modes needs that same full
+# VACUUM, so it is this deliberate, operator-timed step: run it while the volume
+# has headroom (it refuses itself if not). Safe to run blindly — it exits 0 doing
+# nothing if already migrated.
+#
+# RUN IT WITH THE APP STOPPED. The VACUUM holds an exclusive lock for minutes on
+# a large database, and the app's busy_timeout is 5 s — so writes do not queue,
+# they FAIL: mark-read and star return errors, and OAuth session writes fail, so
+# LOGINS BREAK for the duration. /health keeps returning 200 throughout, because
+# its probe is a read. Also note this command runs as root and applies the
+# binary's schema migrations before the VACUUM, so use the SAME image version
+# that is currently deployed.
+#
 # DEPLOY BY DIGEST (not by tag). The release workflow publishes signed provenance
 # bound to the image DIGEST; deploying a mutable tag (or :latest) can silently
 # roll prod backward or bypass the attestation. The runbook resolves the tag to a
@@ -28,6 +48,17 @@
 #     SIDECAR_APP_CALLBACK_URL="https://feather-reader.com/oauth/callback" \
 #     FEATHERREADER_ALLOWED_DIDS="did:plc:..."
 #
+# REQUIRED ON THE RUST OAUTH BACKEND (see "BACKEND CUTOVER" below):
+#   fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+# Unset on FEATHERREADER_REPO_BACKEND=rust, config.rs::validate_secrets() REFUSES
+# TO BOOT — the app owns the OAuth flow there, so `oauth_session` holds every
+# user's access token, refresh token and DPoP private key, and without this key
+# the codec is a no-op and all three sit in plaintext in SQLite on the same
+# volume (and in every snapshot of it) as the feed cache. Not read at all on the
+# sidecar backend, which never writes those tables — so a rollback to `sidecar`
+# does not need it. Rotating it strands existing sessions: the old ciphertext
+# will not decrypt, and every reader must log in again.
+#
 # OPTIONAL SECRET — only if running the follow→invite bot (POST /bot/claims):
 #   fly secrets set FEATHERREADER_BOT_SECRET="$(openssl rand -base64 48)"
 # Unset ⇒ /bot/claims returns 503 (endpoint disabled). If set on this (public)
@@ -39,9 +70,32 @@
 # the image + set in [env] below, so /internal/* calls never egress the edge.
 # config.rs::validate_secrets() and the sidecar config FAIL LOUD at boot if the
 # cookie / internal / enc secrets are missing or weak on this (public) instance.
+#
+# BACKEND CUTOVER (sidecar -> rust). FEATHERREADER_REPO_BACKEND in [env] selects
+# which implementation performs the atproto calls and owns /oauth/*. Flipping it
+# is a TWO-part change and both parts must land in the same deploy:
+#   1. `fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY=...` (above) FIRST.
+#      Flipping the backend without it is an immediate, permanent boot loop.
+#   2. Change FEATHERREADER_REPO_BACKEND to "rust" in [env] and deploy.
+# The entrypoint reads the SAME variable to pick the Caddy OAuth routing and to
+# decide whether to start the Node sidecar at all, so it must be image/[env]
+# state, not a secret — the two cannot share /oauth/callback, and a mismatch
+# breaks every login. Rolling back is the same edit in reverse; the encryption
+# key can stay set, since the sidecar path never reads it.
 
 app = "featherreader"
 primary_region = "ord"
+
+# How long Fly waits after SIGTERM before SIGKILL. The default is 5 s, which is
+# shorter than a single poll round can take to even LAUNCH: a full batch is 50
+# feeds at a 250 ms stagger (12.5 s), and each feed is leased an hour forward
+# BEFORE its fetch so a crash cannot re-select it first. SIGKILL rolls no lease
+# back, so a deploy landing mid-round used to push up to 50 feeds an hour out —
+# invisible, because /stats cannot show a feed as overdue when next_poll was
+# moved forward. The poller now also stops launching new feeds the moment
+# shutdown is signalled; this is the other half, so the ones already in flight
+# can finish and the flusher can make its final read-state push.
+kill_timeout = "45s"
 
 [build]
   # Image is built + pushed by .github/workflows/release-image.yml to GHCR with
@@ -58,6 +112,12 @@ primary_region = "ord"
   FEATHERREADER_BIND = "127.0.0.1:8082"
   FEATHERREADER_DB = "/data/featherreader.db"
   FEATHERREADER_ENV = "prod"
+  # Which implementation serves com.atproto.repo.* and owns /oauth/* — "sidecar"
+  # (Node, two processes) or "rust" (in-process, one). Stated explicitly rather
+  # than left to the default so the live backend is visible in this file and the
+  # cutover is a one-line edit. See "BACKEND CUTOVER" in the header: "rust"
+  # additionally REQUIRES FEATHERREADER_OAUTH_ENCRYPTION_KEY as a secret.
+  FEATHERREADER_REPO_BACKEND = "sidecar"
   # Cloudflare fronts Fly, so the real client IP is CF-Connecting-IP. This is
   # authoritative ONLY if the origin is locked to Cloudflare (see Caddyfile note
   # + MANUAL STEP: CF-only origin allowlist).
@@ -77,6 +137,11 @@ primary_region = "ord"
   SIDECAR_INTERNAL_URL = "http://127.0.0.1:8081"
   SIDECAR_DB = "/data/oauth-sidecar.db"
   RUST_LOG = "info"
+  # Background loops wait 30/45/60/90 s (and the relay probe 5 min) before their
+  # FIRST tick, so a crash-looping machine does not re-run every sweep on every
+  # restart. FEATHERREADER_STARTUP_DELAY_SECS shortens them for a dev or
+  # integration run — it is a CEILING, so setting it HIGHER changes nothing and
+  # logs that it was ignored. Not set here: production wants the built-in values.
 
 [[mounts]]
   source = "featherreader_data"
@@ -86,8 +151,19 @@ primary_region = "ord"
   internal_port = 8080          # Caddy — the only off-loopback listener
   force_https = true
   auto_stop_machines = "off"    # the poller cannot scale to zero
-  auto_start_machines = false
-  min_machines_running = 1      # always exactly one machine
+  # TRUE, deliberately, even though auto_stop is off. These two are independent:
+  # auto_stop=off only means the proxy never STOPS a machine, and a machine can
+  # still end up stopped by the restart policy giving up. The default `on-fail`
+  # policy retries a non-zero exit at most 10 times in 5 minutes and then leaves
+  # the machine STOPPED — and with auto_start=false the proxy will not start it
+  # again, so an OOM crash loop (realistic on 512 MB) ends in a permanent outage
+  # needing a manual `fly machine start`. With auto_start=true a request brings it
+  # back. Costs nothing while the machine is already running.
+  auto_start_machines = true
+  # Inert with auto_stop_machines="off" — it only applies when that is "stop" or
+  # "suspend". Kept as documentation of intent, not as a safety net; it is not
+  # one.
+  min_machines_running = 1
   processes = ["app"]
 
   [http_service.concurrency]
@@ -95,8 +171,36 @@ primary_region = "ord"
     soft_limit = 200
     hard_limit = 250
 
-  # Liveness: the Rust app's /health returns `200 ok featherreader/<ver>`,
-  # reached through Caddy (so this also proves the edge + app path is up).
+  # Liveness. /health reads one row from a real table (`SELECT 1 FROM feeds
+  # LIMIT 1`) under a 2 s timeout — inside the 3 s below, so a wedged pool yields
+  # a 503 the app chose, with a reason, rather than a timeout Fly inferred. It
+  # reads a real page deliberately: a bare `SELECT 1` emits no OpenRead opcode at
+  # all, so it returns success against a corrupted database. CONCURRENT probes are
+  # deduplicated — at most one is ever in flight, others reuse its predecessor's
+  # verdict — so /health, which is origin-lock-exempt and unauthenticated, cannot
+  # be used to spend the 5-connection pool. (There is no TIME cache: every
+  # sequential request, including Fly's own, gets a fresh answer.) Only the
+  # database can fail this check:
+  # the body also reports uptime, the
+  # poll heartbeat, whether fetching is paused at the size watermark, and the
+  # live OAuth backend, but none of those affect the status code.
+  #
+  # WHAT A FAILED CHECK ACTUALLY DOES — this comment used to say "Fly restarts on
+  # a failed check", which is FALSE. Fly's docs state it three times: a failing
+  # service check does NOT restart or stop a Machine. Fly Proxy stops ROUTING to
+  # it, and re-registers automatically once the check passes. (That capability
+  # existed on Apps V1 as `restart_limit`; it has no successor on Machines.)
+  #
+  # With ONE machine there is no healthy peer to shift to, so a 503 here is not a
+  # failover — it is a total outage lasting exactly as long as the condition. It
+  # ALSO fails a `fly deploy`: the rolling strategy waits for the new machine to
+  # go healthy and there is no auto-rollback, so a database blip during a release
+  # leaves a stuck, empty app. Both are reasons to keep this check narrow.
+  #
+  # So the question the status code answers is "can this process serve a useful
+  # request at all", NOT "would a restart help". A stale poller can serve; a
+  # database it cannot read cannot. Alert on the BODY for everything else.
+  # Reached through Caddy, so this also proves the edge + app path is up.
   [[http_service.checks]]
     interval = "15s"
     timeout = "3s"

@@ -17,7 +17,10 @@ contributions — bug reports, fixes, docs, and design discussion — are welcom
 
 ## Building
 
-FeatherReader is two processes: the Rust server and a small Node OAuth sidecar.
+FeatherReader is the Rust server, plus a small Node OAuth sidecar when
+`FEATHERREADER_REPO_BACKEND=sidecar` (the default). On the `rust` backend the
+server owns the OAuth flow itself and no Node is involved. CI builds and checks
+both, so build both when working on either.
 
 ```sh
 # Rust server

@@ -13,7 +13,7 @@
         <path d="M4 7h16M4 12h16M4 17h16"/>
       </svg>
     </button>
-    <h1 class="topbar-title">{{ heading }} <span class="topbar-count">{{ entries.len() }}</span></h1>
+    <h1 class="topbar-title">{{ heading }} <span class="topbar-count">{{ total }}</span></h1>
     {% if !entries.is_empty() %}
       <button class="icon-btn js-mark-all" type="submit" form="mark-all-form" aria-label="Mark all read">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -37,7 +37,9 @@
 
     <div class="content-head">
       <h1 class="content-title">{{ heading }}</h1>
-      <span class="content-count">{{ entries.len() }} entries</span>
+      <span class="content-count">
+        {{ total }} entries{% if uncached_total > 0 %} ({{ uncached_total }} saved elsewhere){% endif %}
+      </span>
       <span class="content-spacer"></span>
       {% if !entries.is_empty() %}
         <form id="mark-all-form" method="post"
@@ -64,6 +66,22 @@
           {% include "entry_row.html" %}
         {% endfor %}
       </ul>
+
+      {% if page_count > 1 %}
+        <nav class="pager" aria-label="Pagination">
+          {% if let Some(href) = prev_href %}
+            <a class="btn-quiet" href="{{ href }}" rel="prev">← Newer</a>
+          {% else %}
+            <span class="btn-quiet is-disabled" aria-disabled="true">← Newer</span>
+          {% endif %}
+          <span class="pager-pos">Page {{ page }} of {{ page_count }}</span>
+          {% if let Some(href) = next_href %}
+            <a class="btn-quiet" href="{{ href }}" rel="next">Older →</a>
+          {% else %}
+            <span class="btn-quiet is-disabled" aria-disabled="true">Older →</span>
+          {% endif %}
+        </nav>
+      {% endif %}
     {% endif %}
 
     {% include "footer.html" %}
