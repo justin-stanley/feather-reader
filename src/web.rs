@@ -5720,7 +5720,15 @@ mod tests {
         assert!(set_cookie.contains("Max-Age=0"), "cookie must be cleared");
 
         // The sidecar revoke was called for exactly this DID.
-        let revoked_did = revoke_rx.await.unwrap();
+        //
+        // BOUNDED. A bare `await` here meant a broken `revoke_everywhere` — one
+        // that simply never called the sidecar — hung this test forever instead
+        // of failing it: a wedged CI job rather than a red one, which is the
+        // worse of the two signals because nobody reads it as a defect.
+        let revoked_did = tokio::time::timeout(std::time::Duration::from_secs(10), revoke_rx)
+            .await
+            .expect("the sidecar revoke never fired; revoke_everywhere did not call it")
+            .unwrap();
         assert_eq!(
             revoked_did, did,
             "sidecar revoke must fire for the caller DID"

@@ -50,17 +50,46 @@ pub async fn discover(
     pds_url: &str,
     auth_method: &str,
 ) -> Result<AuthorizationServer> {
+    discover_with(
+        |url| async move {
+            super::fetch::get_json(http, &url, super::fetch::JSON)
+                .await
+                .with_context(|| format!("fetching {url}"))
+        },
+        pds_url,
+        auth_method,
+    )
+    .await
+}
+
+/// [`discover`] with the fetch injected.
+///
+/// The orchestration — which URL each document is fetched from, and which value
+/// is carried forward as the expected issuer — is where the mix-up defence
+/// actually lives, and it was untested because testing it appeared to need a
+/// network: the SSRF guard rejects loopback, so there is no mock server to point
+/// at. Taking the fetch as an argument removes that obstacle without putting a
+/// test-only bypass inside the guard, which would weaken the very control these
+/// tests exist to protect.
+///
+/// `fetch` is called with the FULL url, so a test can assert on which locations
+/// were asked for — the thing a fixture handed two documents cannot see.
+pub async fn discover_with<F, Fut>(
+    fetch: F,
+    pds_url: &str,
+    auth_method: &str,
+) -> Result<AuthorizationServer>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
     let prm_url = protected_resource_url(pds_url)?;
-    let prm = super::fetch::get_json(http, &prm_url, super::fetch::JSON)
-        .await
-        .with_context(|| format!("fetching {prm_url}"))?;
+    let prm = fetch(prm_url).await?;
 
     // The issuer named by the PDS decides where the second document comes from.
     let issuer = validate_protected_resource(&prm, pds_url)?;
     let asm_url = authorization_server_url(&issuer);
-    let asm = super::fetch::get_json(http, &asm_url, super::fetch::JSON)
-        .await
-        .with_context(|| format!("fetching {asm_url}"))?;
+    let asm = fetch(asm_url.clone()).await?;
 
     resolve_documents(&prm, &asm, &asm_url, pds_url, auth_method)
 }
@@ -948,5 +977,114 @@ mod tests {
             authorization_server_url(ISS),
             format!("{ISS}/.well-known/oauth-authorization-server")
         );
+    }
+
+    // ── the full discovery orchestration, with the fetch injected ────────────
+
+    /// Serve documents by URL and record every URL asked for.
+    struct Fetcher {
+        docs: std::collections::HashMap<String, serde_json::Value>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Fetcher {
+        fn new(pairs: &[(&str, serde_json::Value)]) -> Self {
+            Self {
+                docs: pairs
+                    .iter()
+                    .map(|(u, d)| ((*u).to_string(), d.clone()))
+                    .collect(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn get(&self, url: String) -> Result<serde_json::Value> {
+            self.asked.lock().unwrap().push(url.clone());
+            self.docs
+                .get(&url)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("nothing served at {url}"))
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    /// **The metadata is fetched from the ISSUER, not from the PDS.**
+    ///
+    /// This is the mutation that survived even after `resolve_documents` gained
+    /// its origin check: the check made the mistake fail closed at runtime, but
+    /// nothing exercised the code that chooses the URL. Now the fetcher records
+    /// what was asked for, so a wrong derivation is visible directly.
+    #[tokio::test]
+    async fn the_metadata_is_fetched_from_the_issuers_own_location() {
+        let fetcher = Fetcher::new(&[
+            (
+                &protected_resource_url(PDS).unwrap(),
+                json!({ "resource": PDS, "authorization_servers": [ISS] }),
+            ),
+            (&authorization_server_url(ISS), as_metadata()),
+        ]);
+
+        let server = discover_with(|url| fetcher.get(url), PDS, "none")
+            .await
+            .expect("the honest pair must resolve");
+        assert_eq!(server.issuer, ISS);
+
+        assert_eq!(
+            fetcher.asked(),
+            vec![
+                protected_resource_url(PDS).unwrap(),
+                authorization_server_url(ISS),
+            ],
+            "discovery asked for the wrong locations, or in the wrong order"
+        );
+    }
+
+    /// A PDS that names someone else's authorization server gets that server's
+    /// document fetched — and the issuer carried forward is the one the PDS
+    /// named, not the one the document claims.
+    #[tokio::test]
+    async fn the_issuer_carried_forward_is_the_one_the_pds_named() {
+        let other = "https://other.example";
+        let mut impostor = as_metadata();
+        impostor["issuer"] = json!(other);
+
+        let fetcher = Fetcher::new(&[
+            (
+                &protected_resource_url(PDS).unwrap(),
+                json!({ "resource": PDS, "authorization_servers": [ISS] }),
+            ),
+            // Served at the URL derived from the issuer the PDS named, but
+            // claiming to be a different issuer.
+            (&authorization_server_url(ISS), impostor),
+        ]);
+
+        let err = match discover_with(|url| fetcher.get(url), PDS, "none").await {
+            Err(err) => err,
+            Ok(_) => panic!("a document claiming a different issuer was accepted"),
+        };
+        assert!(format!("{err:#}").contains("issuer"), "{err:#}");
+    }
+
+    /// A fetch failure on either document fails the discovery rather than
+    /// proceeding with half a picture.
+    #[tokio::test]
+    async fn a_missing_document_fails_the_discovery() {
+        // Only the protected-resource document exists.
+        let fetcher = Fetcher::new(&[(
+            &protected_resource_url(PDS).unwrap(),
+            json!({ "resource": PDS, "authorization_servers": [ISS] }),
+        )]);
+        assert!(discover_with(|url| fetcher.get(url), PDS, "none")
+            .await
+            .is_err());
+
+        // Neither exists.
+        let empty = Fetcher::new(&[]);
+        assert!(discover_with(|url| empty.get(url), PDS, "none")
+            .await
+            .is_err());
     }
 }
