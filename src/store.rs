@@ -752,9 +752,11 @@ pub async fn feeds_for_did(pool: &SqlitePool, did: &str) -> Result<Vec<Feed>> {
 /// callers leaned on that: the cap is enforced on the ADD and OPML paths only,
 /// never on read, and `sub_ref` is rebuilt from whatever the PDS returns — which
 /// any client can write to, bounded only by the list-pages ceiling at 20,000
-/// records. A claim in a comment is not a bound. The read path now imposes its
-/// own ([`crate::web`]'s resolved-subscription cap), and this says what is
-/// actually true rather than what would be convenient.
+/// records. A claim in a comment is not a bound.
+///
+/// Callers must therefore not assume a small result. The one that cared — the
+/// list views' scope filter — no longer does: it passes the whole set as a
+/// single `json_each` bind rather than one SQL placeholder per feed.
 pub async fn subscribed_feed_ids(pool: &SqlitePool, did: &str) -> Result<Vec<i64>> {
     let ids: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM sub_ref WHERE did = ?1")
         .bind(did)
@@ -1855,7 +1857,7 @@ fn list_query_sql(
     view: ListView,
     feed_ids: Option<&[i64]>,
 ) -> (String, usize) {
-    let n = feed_ids.map_or(0, <[i64]>::len);
+    let scoped = feed_ids.is_some();
     let mut sql = format!(
         "SELECT {projection} \
          FROM entries e \
@@ -1867,27 +1869,37 @@ fn list_query_sql(
            )",
         view.predicate()
     );
-    if n > 0 {
-        // Ids are i64 read out of this same database, so the risk here is
-        // shape, not injection — they still go through placeholders.
-        let placeholders = (2..2 + n).map(|i| format!("?{i}")).collect::<Vec<_>>();
-        sql.push_str(&format!(" AND e.feed_id IN ({})", placeholders.join(",")));
+    if scoped {
+        // **ONE bind parameter for any scope size.**
+        //
+        // This used to emit one placeholder per feed id, so the SQL string and
+        // the bind list both grew with the reader's subscription count — which
+        // is PDS-supplied and bounded only by the 20,000-record list ceiling.
+        // The first attempt at bounding it truncated the subscription list
+        // instead, which traded a query-shape problem for an access problem:
+        // `sync_sub_refs` writes `sub_ref` from that list, so dropped feeds
+        // became unreadable AND unmutatable. `json_each` removes the need to
+        // choose — the whole set rides in as one JSON text bind.
+        sql.push_str(" AND e.feed_id IN (SELECT value FROM json_each(?2))");
     }
-    (sql, n)
+    (sql, usize::from(scoped))
 }
 
 /// Bind the DID and the optional feed-id restriction, in the order
-/// [`list_query_sql`] emits them.
+/// [`list_query_sql`] emits them — `?1` the DID, `?2` the scope JSON when there
+/// is one.
 fn bind_list_scope<'q, O>(
     q: sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments>,
     did: &'q str,
     feed_ids: Option<&[i64]>,
 ) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments> {
-    let mut q = q.bind(did);
-    for id in feed_ids.unwrap_or(&[]) {
-        q = q.bind(*id);
+    let q = q.bind(did);
+    match feed_ids {
+        // Serialising i64s cannot fail; the fallback is an empty array, which
+        // matches nothing — the fail-closed direction for a scope filter.
+        Some(ids) => q.bind(serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())),
+        None => q,
     }
-    q
 }
 
 /// One page of a list view, newest-published first, scoped to `did`'s
@@ -2036,11 +2048,16 @@ pub async fn starred_identities(
     did: &str,
     limit: i64,
 ) -> Result<StarredIdentities> {
-    let (mut sql, _) = list_query_sql("e.url, e.guid", ListView::Starred, None);
+    let (mut sql, n) = list_query_sql("e.url, e.guid", ListView::Starred, None);
     // One past the limit, so reaching it is distinguishable from landing on it
     // exactly. Ordered by id so the rows are stable; `url`/`guid` are not
     // guaranteed unique or non-NULL, and the id is both.
-    sql.push_str(" ORDER BY e.id LIMIT ?2");
+    //
+    // The placeholder index comes from `list_query_sql` rather than being
+    // hardcoded: it was `?2` only because this call passes `None` for the scope,
+    // which is the kind of coupling that breaks silently when the shared builder
+    // changes shape — as it just did.
+    sql.push_str(&format!(" ORDER BY e.id LIMIT ?{}", n + 2));
     let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
         .bind(did)
         .bind(limit.saturating_add(1))
@@ -4004,6 +4021,69 @@ mod tests {
         assert!(
             widest < 1_000,
             "a list row carries {widest} bytes of text; the 20,000-byte body leaked in"
+        );
+        Ok(())
+    }
+
+    /// **A large scope must not become a large SQL statement.**
+    ///
+    /// The scope filter used to emit one placeholder per feed id, so the SQL
+    /// string and the bind list both grew with a reader's subscription count —
+    /// which comes from the PDS and is bounded only by a 20,000-record list
+    /// ceiling. The first attempt at fixing that truncated the subscription
+    /// list, which silently removed the reader's access to the dropped feeds
+    /// (`sub_ref` is written from the same list). `json_each` takes the whole
+    /// set as ONE bind, so neither trade-off is needed.
+    #[tokio::test]
+    async fn a_large_scope_is_one_bind_and_still_filters() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:widescope";
+
+        // 300 feeds, one entry each; the scope names 200 of them.
+        let mut all_ids = Vec::new();
+        for i in 0..300 {
+            let feed_id = upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: format!("https://wide{i}.example/f.xml"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            insert_entries(
+                &pool,
+                feed_id,
+                &[NewEntry {
+                    guid: format!("w-{i}"),
+                    ..Default::default()
+                }],
+                0,
+            )
+            .await?;
+            all_ids.push(feed_id);
+        }
+        replace_sub_refs(&pool, did, &all_ids).await?;
+
+        let scope: Vec<i64> = all_ids.iter().copied().take(200).collect();
+        let rows = list_entries(&pool, did, ListView::All, Some(&scope), 1_000, 0).await?;
+        assert_eq!(rows.len(), 200, "the scope filter did not narrow correctly");
+        let in_scope: std::collections::HashSet<i64> = scope.iter().copied().collect();
+        assert!(
+            rows.iter().all(|r| in_scope.contains(&r.feed_id)),
+            "a feed outside the scope came back"
+        );
+        assert_eq!(
+            count_entries_for_view(&pool, did, ListView::All, Some(&scope)).await?,
+            200
+        );
+
+        // The statement itself carries no per-id placeholders — that is the
+        // property, and it is what stops the SQL growing with the reader.
+        let (sql, n) = list_query_sql("e.id", ListView::All, Some(&scope));
+        assert_eq!(n, 1, "the scope must contribute exactly one placeholder");
+        assert!(
+            sql.contains("json_each(?2)") && !sql.contains("?3"),
+            "the scope is still expanded into per-id placeholders: {sql}"
         );
         Ok(())
     }

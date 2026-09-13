@@ -1602,31 +1602,21 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
         }
     };
 
-    // **Bound the set on the READ path, not just on the write paths.**
+    // **Deliberately NOT truncated to `max_subs_per_did`.**
     //
-    // `max_subs_per_did` is enforced when adding a feed and when importing OPML,
-    // and nowhere else — but this list comes from the PDS, which any client can
-    // write to, bounded only by the 20,000-record list-pages ceiling. Every
-    // render then turns it into one SQL placeholder per feed for the scope
-    // filter, twice, on a 512 MB box. `subscribed_feed_ids` claimed to be
-    // bounded by the cap and was not; this is where that becomes true.
+    // The PDS list is unbounded in practice — any client can write subscription
+    // records, and only the 20,000-record list ceiling stops it — and the first
+    // attempt at bounding it truncated the list right here. That was the wrong
+    // place: `sync_sub_refs` below writes `sub_ref` from exactly this set, and
+    // `sub_ref` is THE per-DID authorization hook, so dropping entries silently
+    // removed the reader's ability to read OR mutate those feeds. A query-shape
+    // problem would have become an access problem.
     //
-    // Truncation is loud and deterministic (the PDS list is already sorted), so
-    // a reader over the cap sees a stable prefix rather than a random one, and
-    // the operator gets told which DID to look at.
-    let cap = state.config.max_subs_per_did as usize;
-    let subs: Vec<_> = if cap > 0 && subs.len() > cap {
-        warn!(
-            %did,
-            found = subs.len(),
-            cap,
-            "this DID's PDS holds more subscriptions than the per-DID cap; rendering              the first {cap} and ignoring the rest"
-        );
-        subs.into_iter().take(cap).collect()
-    } else {
-        subs
-    };
-
+    // The shape problem was the scope filter emitting one SQL placeholder per
+    // feed; `store::list_query_sql` now passes the whole set as a single
+    // `json_each` bind, so there is no size to defend against here and nothing
+    // to truncate. `max_subs_per_did` stays what it is — a policy cap on ADDING
+    // feeds — rather than becoming a silent read-time filter.
     let mut out = Vec::with_capacity(subs.len());
     for (rkey, sub) in subs {
         let feed = match store::get_feed_by_url(pool, &sub.url).await {
