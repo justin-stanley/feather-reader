@@ -49,17 +49,30 @@ recorded digest exactly.
 
 ## Blockers
 
-1. **`flyctl` is not authenticated** (`fly auth whoami` → no access token). Every
-   deploy step needs it, and logging in is Justin's to do:
-   `! fly auth login`
-2. **The CF origin lock is still open** — wiki step 10, the one remaining
-   pre-launch gate. Not new to 0.3.0 and not a blocker for it, but it is the
-   assumption `FEATHERREADER_TRUSTED_IP_HEADER = "cf-connecting-ip"` rests on, and
-   0.3.0 adds a rate limiter that trusts that header harder than 0.2.8 did.
+1. **`login::complete` has no tests** — see Stage 3. Blocks the cutover only;
+   Stages 1 and 2 are unaffected.
 
-`gh attestation verify` is working and authenticated — dry-run against the live
-0.2.8 digest returns exit 0, so the fail-closed gate is functional before we need
-it.
+**Cleared 2026-09-13:**
+
+- `flyctl` is authenticated, and the machine is `started` with its check passing.
+- `gh attestation verify` works — a dry run against the live 0.2.8 digest returns
+  exit 0, so the fail-closed gate is functional before we need it.
+- **The Cloudflare origin lock is LIVE.** The wiki lists this as the one remaining
+  pre-launch gate, unchecked, and an earlier version of this document repeated
+  that. Measured instead:
+
+  | path | direct `featherreader.fly.dev` | via `feather-reader.com` |
+  |---|---|---|
+  | `/about` | **403** | 200 |
+  | `/stats` | **403** | — |
+  | `/health` | 200 | 200 |
+
+  `/health` answering directly is correct, not a leak — it is the single
+  documented exemption, because Fly's own check must reach it without transiting
+  Cloudflare. So `FEATHERREADER_TRUSTED_IP_HEADER = "cf-connecting-ip"` rests on
+  something real, and 0.3.0's rate limiter can trust it. `FEATHERREADER_ORIGIN_SECRET`
+  is set as a Fly secret, which is the mechanism. **The wiki's step-10 checkbox
+  should be ticked.**
 
 ---
 
@@ -117,6 +130,28 @@ additive and 0.2.8 ignores them, so rollback is clean.
 The prod database predates 0.3.0, so it is in SQLite's default `auto_vacuum=NONE`,
 where freed pages are never returned and the file only grows. Databases created
 from 0.3.0 on are already `INCREMENTAL`.
+
+**Confirmed by measurement, not inferred from the version.** SQLite header offset
+52 (largest root b-tree page, big-endian) reads `0 0 0 0` on the live file, and
+that field is non-zero if and only if auto-vacuum or incremental-vacuum is on:
+
+```
+$ fly ssh console -a featherreader -C "od -An -tu1 -j52 -N4 /data/featherreader.db"
+   0   0   0   0
+```
+
+(Read offset 52 **big-endian**; an earlier attempt at this in a different context
+read it little-endian and drew the opposite conclusion.)
+
+**The migration is low-risk here.** The live database is 21 MB with 879 MB free on
+the 1 GB volume, so the full VACUUM's "needs free space roughly equal to the live
+file" requirement is met roughly forty times over:
+
+```
+/dev/vdc  974M  29M  879M  4% /data
+-rw-r--r-- 1 app app 21815296 featherreader.db
+-rw-r--r-- 1 app app  4177712 featherreader.db-wal
+```
 
 **Run this only after Stage 1 has soaked**, with the 0.3.0 image deployed — the
 runbook requires the migration run from the same image version that is live, and
