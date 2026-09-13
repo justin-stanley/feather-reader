@@ -96,13 +96,7 @@ pub async fn start(
         request::Retry::Allowed,
     )
     .await?;
-    if !outcome.is_success() {
-        bail!(
-            "the pushed authorization request failed with status {}",
-            outcome.status
-        );
-    }
-    let par = flow::parse_par_response(&outcome.json()?)?;
+    let par = accept_par_response(&outcome)?;
 
     store::put_pending(
         pool,
@@ -121,7 +115,7 @@ pub async fn start(
             requested_scope: runtime.client.scope_str().to_string(),
             request_uri: par.request_uri.clone(),
             app_return_to: None,
-            expires_at: now + par.expires_in.min(MAX_PENDING_SECS),
+            expires_at: pending_expiry(now, par.expires_in),
         },
     )
     .await?;
@@ -260,6 +254,34 @@ pub async fn complete(
     };
 
     Ok(CompletedLogin { did, handle })
+}
+
+/// When a pending login must be swept, capped at [`MAX_PENDING_SECS`].
+///
+/// **The cap is ours, not the server's.** Without `.min(...)` the authorization
+/// server chooses how long a row holding a sealed DPoP key and a PKCE verifier
+/// survives, and a server answering with a large `expires_in` widens the window
+/// in which a stolen `state` is worth replaying. Dropping the `.min` passed the
+/// entire suite.
+fn pending_expiry(now: i64, par_expires_in: i64) -> i64 {
+    now + par_expires_in.min(MAX_PENDING_SECS)
+}
+
+/// Read a PAR response, refusing a non-2xx before parsing it.
+///
+/// **Split out so the status check is reachable.** Deleting it let a FAILED push
+/// fall through to `parse_par_response`, and a failure body that happened to
+/// carry a `request_uri` would then be used to build an authorize URL — sending
+/// the user to a grant the server never issued. Nothing tested it, because a
+/// test cannot reach the live endpoint that produces the response.
+fn accept_par_response(outcome: &request::PostOutcome) -> Result<flow::ParResponse> {
+    if !outcome.is_success() {
+        bail!(
+            "the pushed authorization request failed with status {}",
+            outcome.status
+        );
+    }
+    flow::parse_par_response(&outcome.json()?)
 }
 
 /// Assemble the token-endpoint form for this pending login.
@@ -577,6 +599,64 @@ mod tests {
             "the redirect must be the one PAR was pushed under",
         );
         assert_eq!(get("grant_type"), Some("authorization_code"));
+    }
+
+    /// **A failed PAR push must not be parsed as a successful one.**
+    ///
+    /// Without the status check a failure body falls through to
+    /// `parse_par_response`, so an error response that happens to carry a
+    /// `request_uri` would be used to build an authorize URL and the user would
+    /// be sent to a grant the server never issued. Deleting it passed everything.
+    #[test]
+    fn a_failed_par_push_is_not_parsed_as_a_grant() {
+        // A body that WOULD parse as a valid PAR response, behind a failure
+        // status — so only the status check stands between it and an authorize
+        // URL.
+        let body = serde_json::json!({ "request_uri": "urn:ietf:params:oauth:request_uri:x", "expires_in": 60 });
+
+        assert!(
+            accept_par_response(&outcome(200, &body)).is_ok(),
+            "the same body at 200 must parse — otherwise this test proves nothing",
+        );
+
+        // `match` rather than `expect_err`: that would require `Debug` on
+        // `ParResponse`, and a `request_uri` is a one-time grant reference bound
+        // to our DPoP key — not something to make printable for a test's sake.
+        let err = match accept_par_response(&outcome(400, &body)) {
+            Ok(_) => panic!("a 400 must not yield a request_uri"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("failed with status 400"),
+            "refused, but not by the status check: {err:#}",
+        );
+    }
+
+    /// **The pending row's lifetime is capped by us, not chosen by the server.**
+    ///
+    /// The row holds a sealed DPoP key and a PKCE verifier. Dropping the
+    /// `.min(MAX_PENDING_SECS)` lets an authorization server answering with a
+    /// large `expires_in` decide how long that sits in our database, widening the
+    /// window in which a stolen `state` is worth replaying. The mutation passed
+    /// the whole suite.
+    #[test]
+    fn the_pending_row_lifetime_is_capped_regardless_of_the_server() {
+        let now = 1_700_000_000;
+
+        // A server asking for a day gets ten minutes.
+        assert_eq!(
+            pending_expiry(now, 86_400),
+            now + MAX_PENDING_SECS,
+            "a server must not be able to extend the pending row past our cap",
+        );
+        // A shorter server lifetime still wins — the cap is a ceiling, not a
+        // floor, and pinning the row open past the request_uri's own life would
+        // protect nothing.
+        assert_eq!(pending_expiry(now, 60), now + 60);
+        assert_eq!(
+            pending_expiry(now, MAX_PENDING_SECS),
+            now + MAX_PENDING_SECS
+        );
     }
 
     /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
