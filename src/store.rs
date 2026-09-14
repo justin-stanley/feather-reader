@@ -6997,8 +6997,9 @@ mod tests {
         // defect landed exactly ON the threshold and would have reported itself
         // as an invalid measurement. That is why the timeout is 2 ms.
         //
-        // Both hold at scale: a 5x fixture (fifty batches, a 1.4 s loop — CI's
-        // observed duration) gives 289 blocked attempts against the same floor.
+        // Both hold at scale and under forced fsync: a 5x fixture (fifty
+        // batches, CI's observed loop duration) gives 289 blocked attempts, and
+        // `synchronous = FULL` gives 45, against the same floor.
         //
         // If it somehow does not hold, THIS assertion fires and says the
         // measurement was too thin. It does not blame the sweep.
@@ -7009,16 +7010,33 @@ mod tests {
              write lock. This is an invalid measurement, not a sweep that held \
              the lock{why}"
         );
-        // Threshold of 2 rather than 1 so a single boundary-straddling write
-        // cannot satisfy it. Verified against the reintroduced single-transaction
-        // sweep: see the mutation note in the PR.
+        // **A FRACTION of attempts, not a count of them.**
+        //
+        // This was `during >= 2`, on the reasoning that a held lock admits zero
+        // and two rules out a single boundary-straddling write. Measured, a held
+        // lock does not always admit zero: forcing `synchronous = FULL` over a
+        // fifty-batch fixture let **3** writes through a 2.1 s hold, which
+        // cleared that threshold by one write and let the defect survive.
+        //
+        // The success FRACTION separates cleanly where the count does not, and
+        // unlike writes-per-second it is scale-free — it cannot be moved by a
+        // faster disk or a bigger fixture, only by whether the lock is available:
+        //
+        //   correct, plain          752/764   98.4%
+        //   correct, synchronous=FULL   424/442   95.9%
+        //   one tx across batches     0/70    0.0%
+        //   one tx, synchronous=FULL    0/45    0.0%
+        //
+        // 50% sits two orders of magnitude from the defect and ~2x below the
+        // quietest correct run. It is also strictly stronger than `during >= 2`
+        // for any run with at least four attempts, which `attempts >= 20` above
+        // already guarantees — so nothing the old threshold caught is lost.
         assert!(
-            during >= 2,
-            "{during} of {attempts} attempted writes completed DURING the \
-             {sweep:?} sweep — a sweep that releases the write lock between \
-             batches lets writes land throughout it; one that holds the lock \
-             across them blocks every writer until it finishes, so none complete \
-             inside the window{why}"
+            during * 2 >= attempts,
+            "only {during} of {attempts} attempted writes completed DURING the \
+             {sweep:?} delete loop — a loop that releases the write lock between \
+             batches lets most attempts through; one that holds the lock across \
+             them refuses nearly all of them{why}"
         );
 
         pool.close().await;
