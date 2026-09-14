@@ -158,6 +158,16 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Test
+        # The sidecar's 71 tests gated NOTHING until this step existed. Every
+        # other job here runs its suite (`rust`, `bot`); this one went install →
+        # build → typecheck → lint → format → audit, so a `npm test` failure
+        # could not fail a PR. The tests cover the parts of the sidecar with no
+        # other safety net: session-store encryption and the plaintext migrate-
+        # on-read path, the reaper's absolute/idle TTLs, `StoreError` tagging,
+        # and `purgeDid`.
+        run: npm test
+
       - name: Lint (oxlint, --max-warnings 0)
         run: npm run lint
 
@@ -173,6 +183,25 @@ jobs:
       - name: npm audit (prod deps, high+)
         # Sidecar runtime deps only (--omit=dev); dev tooling churn shouldn't
         # break CI. Fails on high/critical advisories.
+        #
+        # **A green result here is not an all-clear, and that is not a
+        # hypothetical.** `npm audit` queries the npm registry's advisory feed
+        # only. On 2026-09-14 this step passed — at EVERY severity, not just
+        # high — while fastify 5.12.1 was in the lockfile and four PUBLISHED
+        # high-severity advisories applied to it, one an authentication bypass
+        # (GHSA-p68q-wchp-6fh7, `>= 4.0.0, < 5.12.2`).
+        #
+        # They were visible on GitHub's REPO-level advisory database
+        # (`gh api repos/fastify/fastify/security-advisories`) and nowhere a
+        # scanner looks: `gh api advisories/<id>` 404s for all four, and OSV
+        # holds them only under CVE aliases with a GIT range and no npm package
+        # mapping — so an OSV query for `fastify@5.12.1` also returns nothing.
+        # npm audit, OSV-Scanner and Dependabot would all have said the same.
+        #
+        # There is no CI step that closes this today. What closes it is reading
+        # the upstream release notes when a dependabot PR bumps a
+        # network-facing dependency, and checking
+        # `repos/<owner>/<repo>/security-advisories` directly.
         run: npm audit --omit=dev --audit-level=high
 
   bot:
