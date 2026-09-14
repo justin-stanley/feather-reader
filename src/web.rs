@@ -633,6 +633,14 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 /// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
 /// handler chose rather than a timeout Fly inferred — the difference between a
 /// log line that says why and one that says nothing.
+/// The statement `/health` uses to prove the database is readable.
+///
+/// **A named constant so the test can assert on the query that actually runs.**
+/// `the_health_probe_opens_a_real_table` used to `EXPLAIN` a hand-typed copy of
+/// this string, so degrading the real probe to `SELECT 1` — which opens no page
+/// and therefore cannot detect a broken database — left the suite green.
+const HEALTH_DB_PROBE_SQL: &str = "SELECT 1 FROM feeds LIMIT 1";
+
 const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Floor for the poll-heartbeat staleness threshold. **Reported, never fatal** —
@@ -757,8 +765,7 @@ async fn health(State(state): State<AppState>) -> Response {
                 // matters.
                 let verdict = match tokio::time::timeout(
                     HEALTH_DB_TIMEOUT,
-                    sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
-                        .fetch_optional(&pool),
+                    sqlx::query_scalar::<_, i64>(HEALTH_DB_PROBE_SQL).fetch_optional(&pool),
                 )
                 .await
                 {
@@ -6574,8 +6581,21 @@ mod tests {
 
     #[tokio::test]
     async fn about_renders_adoption_line_when_enabled() {
-        let body = about_body(adoption_state(4, false).await).await;
-        assert!(body.contains("4"), "the count must render");
+        // **A distinctive count, and asserted IN ITS SENTENCE.**
+        //
+        // This used to seed 4 and assert `body.contains("4")`, which the
+        // colophon's `width="44"` satisfies whatever the count is — so
+        // hardcoding the rendered number passed. Both halves are needed: a
+        // digit that does not occur incidentally, and the assertion tied to the
+        // phrase it belongs to.
+        let body = about_body(adoption_state(7_318, false).await).await;
+        // The count and its phrase are on separate template lines, so compare
+        // against a whitespace-collapsed copy rather than the raw HTML.
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("7318 accounts on the atproto network hold"),
+            "the count did not render in its own sentence: {flat}",
+        );
         assert!(
             body.contains("accounts on the atproto network hold"),
             "{body}"
@@ -6844,7 +6864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opml_import_under_limit_upload_is_not_413() {
+    async fn opml_import_under_limit_upload_is_accepted() {
         let state = test_state(&["did:plc:admin"]).await;
         let cookie = session_cookie(&state, "did:plc:admin", None);
         let app = router(state);
@@ -6869,10 +6889,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(
+        // **Assert it was ACCEPTED, not merely that it was not a 413.**
+        //
+        // The old assertion was `assert_ne!(status, PAYLOAD_TOO_LARGE)`, which a
+        // 500 satisfies — so making `import_opml` fail unconditionally left this
+        // green. Three other OPML tests caught that mutation; the one whose name
+        // promises to cover the under-cap case did not.
+        assert_eq!(
             resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "an under-cap OPML upload must not be rejected as too large"
+            StatusCode::SEE_OTHER,
+            "an under-cap OPML upload was not accepted (status {})",
+            resp.status(),
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !location.starts_with("/login"),
+            "the import bounced to login instead of being accepted: {location}",
         );
     }
 
@@ -8768,7 +8805,10 @@ mod tests {
             }
         };
 
-        let probe = opcodes("EXPLAIN SELECT 1 FROM feeds LIMIT 1").await;
+        // The statement /health really runs, not a copy re-typed here.
+        let explain: &'static str =
+            Box::leak(format!("EXPLAIN {HEALTH_DB_PROBE_SQL}").into_boxed_str());
+        let probe = opcodes(explain).await;
         assert!(
             probe.iter().any(|op| op == "OpenRead"),
             "the health probe reads no page; it cannot detect a broken database: {probe:?}"
