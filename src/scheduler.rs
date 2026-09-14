@@ -128,6 +128,36 @@ const PENDING_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(45);
 const CODE_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
 
+/// Every background loop's startup offset, in ONE place.
+///
+/// **`spawn` reads this and passes each loop its delay; no loop chooses its
+/// own.** They used to, and the test guarding it compared the CONSTANTS — so
+/// pointing all five call sites at `POLLER_STARTUP_DELAY`, which is exactly the
+/// "everything fires at once at boot" failure the offsets exist to prevent, left
+/// the whole suite green. With the decision here there are no call sites left to
+/// diverge, and `the_startup_delays_are_distinct` asserts on the table the code
+/// actually uses.
+fn startup_offsets() -> [(&'static str, Duration); 5] {
+    [
+        ("poller", POLLER_STARTUP_DELAY),
+        ("pending-sweep", PENDING_SWEEP_STARTUP_DELAY),
+        ("code-sweep", CODE_SWEEP_STARTUP_DELAY),
+        ("retention", RETENTION_STARTUP_DELAY),
+        ("adoption", ADOPTION_STARTUP_DELAY),
+    ]
+}
+
+/// Look up one loop's offset from [`startup_offsets`], with the env ceiling
+/// applied.
+fn offset_for(name: &str) -> Duration {
+    let d = startup_offsets()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| d)
+        .unwrap_or(POLLER_STARTUP_DELAY);
+    startup_delay(d)
+}
+
 /// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a loop's startup
 /// delay. The variable is a CEILING, not a replacement: it can only shorten the
 /// wait, so setting it cannot accidentally push a production loop out further
@@ -257,24 +287,30 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     let poller = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_poller(state, shutdown).await })
+        tokio::spawn(async move { run_poller(state, shutdown, offset_for("poller")).await })
     };
     let sweeper = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_code_sweeper(state, shutdown).await })
+        tokio::spawn(
+            async move { run_code_sweeper(state, shutdown, offset_for("code-sweep")).await },
+        )
     };
     let retention = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_retention_sweeper(state, shutdown).await })
+        tokio::spawn(async move {
+            run_retention_sweeper(state, shutdown, offset_for("retention")).await
+        })
     };
     // NOTE: must be constructed BEFORE the flusher, which consumes the
     // un-cloned `state` / `shutdown` by move.
     let probe = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_adoption_probe(state, shutdown).await })
+        tokio::spawn(
+            async move { run_adoption_probe(state, shutdown, offset_for("adoption")).await },
+        )
     };
     let metrics = {
         let state = state.clone();
@@ -284,7 +320,9 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     let pending = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_pending_sweeper(state, shutdown).await })
+        tokio::spawn(async move {
+            run_pending_sweeper(state, shutdown, offset_for("pending-sweep")).await
+        })
     };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
@@ -304,7 +342,7 @@ async fn shutdown_fired(rx: &mut watch::Receiver<()>) {
 /// The poll-scheduler loop. Wakes on an interval, selects due feeds, and polls
 /// each (conditional-GET + backoff via [`feed::poll_feed`]), staggered and
 /// concurrency-bounded. Returns when `shutdown` resolves.
-pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, startup: Duration) {
     let tick = env_duration_secs("FEATHERREADER_POLL_TICK_SECS", DEFAULT_POLL_TICK);
     let batch = env_scalar::<i64>("FEATHERREADER_POLL_BATCH", DEFAULT_POLL_BATCH).max(1);
     let concurrency =
@@ -336,7 +374,7 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
 
     // Not an immediate first tick: see `POLLER_STARTUP_DELAY`. Missed ticks are
     // skipped rather than burst through, so a slow poll round does not queue up.
-    let mut ticker = delayed_interval(startup_delay(POLLER_STARTUP_DELAY), tick);
+    let mut ticker = delayed_interval(startup, tick);
 
     loop {
         tokio::select! {
@@ -660,7 +698,11 @@ fn cadence_from_hint(hint: &str, default_interval: Duration) -> Duration {
 /// ([`store::expire_old_codes`]), keeping the closed-beta table tidy. Returns
 /// when `shutdown` resolves. Failures are logged and never kill the loop — a
 /// missed sweep is harmless because `redeem_code` re-checks expiry itself.
-pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_code_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = env_duration_secs("FEATHERREADER_CODE_SWEEP_SECS", DEFAULT_CODE_SWEEP);
     info!(?period, "invite-code TTL sweeper started");
 
@@ -668,7 +710,7 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
     // immediate one this used to have — a long-stale set of codes is still swept
     // a minute into the boot, and `redeem_code` re-checks expiry itself, so the
     // sweep was never on the correctness path to begin with.
-    let mut ticker = delayed_interval(startup_delay(CODE_SWEEP_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -707,7 +749,11 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
 /// return, spawning no ticker; that configuration has no bound at all and says
 /// so. Failures are logged and never kill the loop — a missed sweep just means
 /// the window is enforced on the next tick.
-pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_retention_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let days = state.config.retention_days as i64;
     let hard_days = state.config.retention_hard_days as i64;
     if days <= 0 && hard_days <= 0 {
@@ -733,7 +779,7 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
     // of the local loops — it takes the single write lock for the whole delete —
     // so firing it into a boot that is still opening the database and warming
     // caches was the worst timing available.
-    let mut ticker = delayed_interval(startup_delay(RETENTION_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -783,7 +829,11 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
 /// per boot" into "once per crash-loop restart". Nothing it does can fail the
 /// process: every error path is a `warn!` that leaves the previous observation
 /// in place.
-pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_adoption_probe(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = state.config.adoption_interval;
     if period.is_zero() {
         info!("adoption probe: disabled (FEATHERREADER_ADOPTION_INTERVAL_SECS=0)");
@@ -821,10 +871,7 @@ pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<(
         "adoption probe started"
     );
 
-    let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + startup_delay(ADOPTION_STARTUP_DELAY),
-        period,
-    );
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + startup, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -926,12 +973,16 @@ const NONCE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 ///
 /// Runs on both backends: the rows are written by the Rust login path, and a
 /// deployment that flips back to the sidecar still has whatever it left behind.
-pub async fn run_pending_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_pending_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = Duration::from_secs(PENDING_SWEEP_SECS);
     info!(?period, "pending-login sweeper started");
 
     // Delayed first tick, like its siblings (see `PENDING_SWEEP_STARTUP_DELAY`).
-    let mut ticker = delayed_interval(startup_delay(PENDING_SWEEP_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -1250,22 +1301,47 @@ mod tests {
         assert_eq!(startup_delay_from(d, None), d);
     }
 
-    /// The four local loops must not land on the same instant at boot — that is
-    /// the whole reason the offsets are distinct rather than one shared value.
+    /// **The loops must not land on the same instant at boot — asserted on the
+    /// table the code actually reads.**
+    ///
+    /// The earlier version compared the CONSTANTS. No call site was involved, so
+    /// pointing all five loops at `POLLER_STARTUP_DELAY` — precisely the
+    /// everything-at-once failure the offsets exist to prevent — left the suite
+    /// green. `spawn` now takes every delay from `startup_offsets`, so there are
+    /// no per-loop call sites left to diverge and this reads the real source.
     #[test]
     fn the_startup_delays_are_distinct() {
-        let all = [
-            POLLER_STARTUP_DELAY,
-            PENDING_SWEEP_STARTUP_DELAY,
-            CODE_SWEEP_STARTUP_DELAY,
-            RETENTION_STARTUP_DELAY,
-            ADOPTION_STARTUP_DELAY,
-        ];
-        let unique: std::collections::HashSet<Duration> = all.iter().copied().collect();
-        assert_eq!(unique.len(), all.len(), "two loops share a startup delay");
+        let table = startup_offsets();
+        let unique: std::collections::HashSet<Duration> = table.iter().map(|(_, d)| *d).collect();
+        assert_eq!(
+            unique.len(),
+            table.len(),
+            "two loops share a startup delay: {table:?}",
+        );
         assert!(
-            all.iter().all(|d| *d > Duration::ZERO),
-            "a loop still fires immediately at boot"
+            table.iter().all(|(_, d)| *d > Duration::ZERO),
+            "a loop still fires immediately at boot: {table:?}",
+        );
+    }
+
+    /// Every loop `spawn` starts has an entry, and `offset_for` finds it.
+    ///
+    /// Without this, a loop could be added to `spawn` with a name that is not in
+    /// the table; `offset_for` falls back to the poller's offset, which silently
+    /// re-creates the collision the table exists to prevent.
+    #[test]
+    fn every_named_loop_resolves_to_its_own_offset() {
+        for (name, expected) in startup_offsets() {
+            assert_eq!(
+                offset_for(name),
+                expected,
+                "{name} did not resolve to its own offset",
+            );
+        }
+        assert_eq!(
+            offset_for("not-a-real-loop"),
+            POLLER_STARTUP_DELAY,
+            "the fallback moved; the collision risk it documents has changed",
         );
     }
 

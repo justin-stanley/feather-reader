@@ -2025,6 +2025,17 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
 /// str` written in this file, and the feed-id restriction contributes only a
 /// COUNT — the ids themselves are bound, never formatted in. Every runtime value
 /// (the DID, the ids, the limit, the offset) reaches SQLite as a bind parameter.
+/// The columns the list view reads — deliberately NOT `content_html`.
+///
+/// **A named constant so a test can assert on the projection the query actually
+/// runs.** It used to be an inline literal, and the test that claimed to guard
+/// it re-typed a copy and asserted on its own argument: adding `e.content_html`
+/// to the real query left the suite green. The article body is up to 20 KB per
+/// row and the list renders 50 at a time, so reading it here is the difference
+/// between a bounded response and a megabyte of allocation per page.
+const LIST_PROJECTION: &str = "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+     COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred";
+
 fn list_query_sql(
     projection: &'static str,
     view: ListView,
@@ -2107,12 +2118,7 @@ pub async fn list_entries(
     if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
         return Ok(Vec::new());
     }
-    let (mut sql, n) = list_query_sql(
-        "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
-         COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
-        view,
-        feed_ids,
-    );
+    let (mut sql, n) = list_query_sql(LIST_PROJECTION, view, feed_ids);
     sql.push_str(&format!(
         " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
         n + 2,
@@ -4213,14 +4219,11 @@ mod tests {
         let did = "did:plc:projection";
         seed_big_entries(&pool, did, 3).await?;
 
-        // Ask the engine directly: EXPLAIN the query and read back its output
-        // column names.
-        let (sql, _) = list_query_sql(
-            "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
-             COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
-            ListView::All,
-            None,
-        );
+        // **The projection the query actually runs**, not a copy re-typed here.
+        // The earlier version passed its own literal to `list_query_sql` and
+        // asserted on that, so adding `e.content_html` to `list_entries` left
+        // this green.
+        let (sql, _) = list_query_sql(LIST_PROJECTION, ListView::All, None);
         assert!(
             !sql.contains("content_html") && !sql.contains("e.*"),
             "the list query reads the article body: {sql}"
@@ -5519,11 +5522,29 @@ mod tests {
         Ok(())
     }
 
+    /// **It must actually GROW — the name used to be a lie.**
+    ///
+    /// The earlier body was three lines asserting only `before > 0`. There was
+    /// no second measurement, so `db_size_bytes` returning a constant `1` passed.
+    /// That matters because this number is the poller's disk watermark: a size
+    /// that never moves means the pause never trips and the volume fills
+    /// instead.
     #[tokio::test]
     async fn db_size_is_positive_and_grows() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let before = db_size_bytes(&pool).await?;
         assert!(before > 0, "a schema-initialised DB has a non-zero size");
+
+        // Enough rows that the file must gain pages, not just fill slack.
+        seed_big_entries(&pool, "did:plc:growth", 400).await?;
+
+        let after = db_size_bytes(&pool).await?;
+        assert!(
+            after > before,
+            "the database grew by {} bytes after 400 seeded entries; the size is \
+             not tracking the data, so the disk watermark can never trip",
+            after.saturating_sub(before),
+        );
         Ok(())
     }
 
