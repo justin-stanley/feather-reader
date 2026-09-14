@@ -9323,4 +9323,59 @@ mod tests {
             "a failed flush must not block the revoke",
         );
     }
+
+    /// **The probe detects a broken database — asserted through `/health`
+    /// itself, not through a string.**
+    ///
+    /// A named constant did not bind the handler: it stayed free to call
+    /// `query_scalar` with a different literal, so degrading the real probe to
+    /// `SELECT 1` shipped green twice over. This drops the table the probe reads
+    /// and asserts the endpoint stops saying `ok` — behaviour no substituted SQL
+    /// can fake, because `SELECT 1` still succeeds against a wrecked schema.
+    #[tokio::test]
+    async fn health_reports_a_broken_database() {
+        let state = test_state(&[]).await;
+        // Sanity: healthy first, so the assertion below is about the damage.
+        assert!(
+            health_db_probe(&state.db).await.is_ok(),
+            "the fixture was not healthy to begin with",
+        );
+
+        sqlx::query("DROP TABLE feeds")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert!(
+            health_db_probe(&state.db).await.is_err(),
+            "the probe reported success against a database missing the table it \
+             claims to read; `SELECT 1` would do exactly this",
+        );
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // The documented contract: the FIRST token is the state.
+        assert!(
+            body.starts_with("FAIL"),
+            "/health did not report FAIL for a broken database: {body}",
+        );
+        assert!(
+            !body.contains("db: ok"),
+            "/health still called the database ok: {body}",
+        );
+    }
 }
