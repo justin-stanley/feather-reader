@@ -7987,6 +7987,18 @@ mod tests {
             !html.contains("hx-swap-oob"),
             "list-view response must NOT be an OOB swap: {html}"
         );
+        // **And it must actually BE the row.** The assertion above is satisfied
+        // by an empty body, or by any response that simply omits the attribute —
+        // so on its own it pins half a property and the name promises the other
+        // half.
+        assert!(
+            html.contains(&format!("/entries/{entry_id}")),
+            "the response is not the row for this entry: {html}",
+        );
+        assert!(
+            html.contains("Article"),
+            "the row rendered without its title: {html}",
+        );
     }
 
     // -----------------------------------------------------------------------
