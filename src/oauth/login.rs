@@ -756,7 +756,6 @@ mod tests {
         );
     }
 
-    /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
     /// One DPoP key for the whole test run.
     ///
     /// Deterministic on purpose: a freshly generated key per fixture made it
@@ -781,6 +780,7 @@ mod tests {
             .unwrap()
     }
 
+    /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
     fn pending_auth(cookie_hash: &str) -> crate::oauth::store::PendingAuth {
         crate::oauth::store::PendingAuth {
             state: "state-value".into(),
@@ -1017,12 +1017,22 @@ mod tests {
         retry: request::Retry,
     }
 
+    /// The token endpoint a real authorization server would publish: on a
+    /// DIFFERENT host and path from the issuer.
+    ///
+    /// **Deliberately not `{issuer}/token`.** With the endpoints derived from the
+    /// issuer string, ignoring the discovery result entirely — posting to
+    /// `format!("{}/token", pending.issuer)` — passed all 16 tests. Real servers
+    /// do not follow that pattern; this repo's own discovery fixture publishes
+    /// `https://pds.justin-stanley.com/oauth/token` against a different issuer.
+    const DISCOVERED_TOKEN_ENDPOINT: &str = "https://token.example.net/oauth/v2/token";
+
     fn server_at(issuer: &str) -> crate::oauth::discovery::AuthorizationServer {
         crate::oauth::discovery::AuthorizationServer {
             issuer: issuer.into(),
             par_endpoint: format!("{issuer}/par"),
             authorization_endpoint: format!("{issuer}/authorize"),
-            token_endpoint: format!("{issuer}/token"),
+            token_endpoint: DISCOVERED_TOKEN_ENDPOINT.to_string(),
             revocation_endpoint: None,
         }
     }
@@ -1129,11 +1139,21 @@ mod tests {
 
         // Copied out in a block so the guard is gone before the `await` below;
         // a MutexGuard held across an await is a clippy deny in CI.
-        let (discoveries, expected_issuer, posts, token_url, thumbprint, retry, token_params) = {
+        let (
+            discoveries,
+            expected_issuer,
+            auth_method,
+            posts,
+            token_url,
+            thumbprint,
+            retry,
+            token_params,
+        ) = {
             let calls = log.lock().unwrap();
             (
                 calls.discovered.len(),
                 calls.discovered[0].1.clone(),
+                calls.discovered[0].2.clone(),
                 calls.posted.len(),
                 calls.posted[0].url.clone(),
                 calls.posted[0].dpop_thumbprint.clone(),
@@ -1143,12 +1163,22 @@ mod tests {
         };
         assert_eq!(discoveries, 1, "discovery ran once");
         assert_eq!(
+            auth_method, "private_key_jwt",
+            "discovery was told the wrong auth method; `none` would disable the \
+             token_endpoint_auth_methods_supported check and the server would \
+             then receive a private_key_jwt assertion it never advertised",
+        );
+        assert_eq!(
             expected_issuer.as_deref(),
             Some(PENDING_ISSUER),
             "the mix-up re-check was not armed: discovery got {expected_issuer:?}",
         );
         assert_eq!(posts, 1, "the token exchange ran once");
-        assert_eq!(token_url, format!("{PENDING_ISSUER}/token"));
+        assert_eq!(
+            token_url, DISCOVERED_TOKEN_ENDPOINT,
+            "the grant went to an endpoint guessed from the issuer rather than \
+             the one discovery returned",
+        );
         assert_eq!(
             retry,
             request::Retry::Allowed,
@@ -1170,6 +1200,14 @@ mod tests {
             fixture_thumbprint(),
             "the token request was signed under a different key than the one the \
              authorization request was bound to",
+        );
+
+        // The handle is looked up for the DID the GRANT returned, never for
+        // anything remembered from the login form.
+        assert_eq!(
+            log.lock().unwrap().resolved,
+            vec![PENDING_DID.to_string()],
+            "the handle was resolved for the wrong subject",
         );
 
         let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
@@ -1241,7 +1279,12 @@ mod tests {
         .await;
 
         assert!(out.is_err(), "a foreign browser completed the login");
-        assert!(log.lock().unwrap().posted.is_empty());
+        let calls = log.lock().unwrap();
+        assert!(calls.posted.is_empty());
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the browser binding was checked",
+        );
     }
 
     /// **Discovery is told which issuer PAR was pushed under.**
@@ -1727,6 +1770,65 @@ mod tests {
             Some("nonce-from-the-server"),
             "the retry did not carry the server's nonce; it would be challenged \
              again forever",
+        );
+    }
+
+    /// **The token request uses the auth method the login was STARTED under.**
+    ///
+    /// A nine-line comment in `complete` explains why this must come from the
+    /// pending row rather than the live runtime: a deploy that flipped
+    /// dev/production between the push and the callback would otherwise present
+    /// credentials that do not match the ones PAR was authenticated with, and the
+    /// exchange fails for a reason nothing in the logs explains.
+    ///
+    /// Nothing tested it. Swapping `auth_method` for `runtime.auth_method` in
+    /// `token_exchange_params` passed the whole suite, because every fixture had
+    /// the two agreeing. Here they disagree: the login was started under `none`
+    /// while the runtime is configured for `private_key_jwt`, so a client
+    /// assertion appearing in the token params can only have come from the
+    /// runtime.
+    #[tokio::test]
+    async fn the_exchange_uses_the_auth_method_the_login_started_under() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.auth_method = "none".into();
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        // The runtime, by contrast, is a private_key_jwt client.
+        let runtime = runtime_at("https://feather-reader.com");
+        assert_eq!(
+            runtime.auth_method.as_str(),
+            "private_key_jwt",
+            "fixture: the runtime must DISAGREE with the pending row",
+        );
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok(), "the exchange should complete: {out:?}");
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.discovered[0].2, "none",
+            "discovery was told the runtime's method, not the one PAR was pushed \
+             under",
+        );
+        let params = &calls.posted[0].params;
+        assert!(
+            !params.iter().any(|(k, _)| *k == "client_assertion"),
+            "a private_key_jwt assertion was sent for a login started under \
+             `none`: {params:?}",
         );
     }
 }
