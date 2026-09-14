@@ -1645,6 +1645,17 @@ const PRUNE_BATCH: i64 = 1_000;
 /// 1 GB volume holds.
 const PRUNE_MAX_BATCHES: usize = 10_000;
 
+/// How long [`delete_in_batches`] stands down between batches, so a writer
+/// waiting on the SQLite write lock actually gets it rather than losing the race
+/// to the loop's next statement.
+///
+/// Named because it is the one thing that makes batching a fix rather than
+/// bookkeeping, and because `a_writer_gets_through_while_the_sweep_runs` derives
+/// its "was this sweep long enough to measure" floor from it. A sweep that is
+/// genuinely batched cannot finish faster than one hand-off per batch; that is a
+/// structural lower bound, not a number calibrated against a particular machine.
+const PRUNE_BATCH_HANDOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Delete every entry matched by `select_ids` (a `SELECT id FROM entries …`
 /// bound to one `?1` cutoff), in bounded batches, **one implicit transaction per
 /// batch**.
@@ -1687,8 +1698,9 @@ async fn delete_in_batches(
         // Hand the write lock over. Without this the loop can re-acquire it
         // immediately and a waiting writer still starves — batching would then
         // be bookkeeping rather than a fix. At `PRUNE_BATCH` rows per batch this
-        // adds ~10 ms per 1,000 deleted rows to a sweep that runs once a day.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // adds one `PRUNE_BATCH_HANDOFF` per 1,000 deleted rows to a sweep that
+        // runs once a day.
+        tokio::time::sleep(PRUNE_BATCH_HANDOFF).await;
         // Only warn if the backstop actually cut the sweep short. A final batch
         // that happened to drain the last rows would otherwise log "the rest
         // waits for the next run" with nothing left — and an operator who reads
@@ -6736,9 +6748,14 @@ mod tests {
     /// `busy_timeout`, so every mark-read, login write and cursor flush failed
     /// for that whole span.
     ///
-    /// On-disk (WAL, 5 connections) because the in-memory pool is deliberately
+    /// On-disk (WAL) because the in-memory pool is deliberately
     /// single-connection, which would make a concurrency test meaningless.
-    #[tokio::test]
+    ///
+    /// **The writer runs on its own pool with a short `busy_timeout`, and the
+    /// runtime is multi-thread.** Both are load-bearing — a 5 s `busy_timeout`
+    /// on a shared runtime is what made this test flake on CI. See the comment
+    /// on the writer pool and the `attempts` assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_writer_gets_through_while_the_sweep_runs() -> Result<()> {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("fr-sweeplock-{}.db", std::process::id()));
@@ -6765,45 +6782,81 @@ mod tests {
             .collect();
         insert_entries(&pool, feed_id, &entries, 0).await?;
 
-        // The discriminating measurement is LATENCY, not success. With only ten
-        // thousand rows the old single-transaction sweep would finish inside the
-        // 5 s `busy_timeout`, so the interleaved writes would still eventually
-        // land — they would just each have waited for the ENTIRE sweep. So the
-        // writer records the worst single-write wait, and the assertion is that
-        // no write waited for more than a fraction of the sweep.
+        // **The writer gets its OWN pool, with a SHORT `busy_timeout`.**
+        //
+        // This is the fix for the CI flake described on the `attempts` assertion
+        // below, and it is two separate changes.
+        //
+        // *Its own pool*, so the only thing that can block a write is SQLite's
+        // write lock — the thing under test. Sharing the 5-connection pool with
+        // the sweep meant a write could also stall waiting to ACQUIRE a pooled
+        // connection the sweep was holding, which is a confounder that looks
+        // identical from the outside.
+        //
+        // *A short `busy_timeout`*, so a contended write FAILS FAST and the loop
+        // takes another shot. At the production 5 s, SQLite's busy handler backs
+        // off internally — 1, 2, 5, 10, 25, 50, 100 ms and up — all inside a
+        // single `execute()`. The writer therefore gets ONE attempt per blocked
+        // write, and once the ladder reaches 100 ms it sleeps straight past the
+        // `PRUNE_BATCH_HANDOFF` windows `delete_in_batches` opens. Failing fast
+        // turns one low-probability attempt into hundreds of independent ones:
+        // measured 54 attempts at 5 ms, 517 at 2 ms, over the same sweep.
+        const WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
+        let writer_pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&url)?
+                    .foreign_keys(true)
+                    .busy_timeout(WRITER_BUSY_TIMEOUT)
+                    .log_statements(tracing::log::LevelFilter::Debug),
+            )
+            .await?;
+
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_done = std::sync::Arc::clone(&done);
-        let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
             // Record WHEN each write completed, not just how many did. See the
             // assertion below for why the timestamps are the load-bearing part.
             let mut completions: Vec<std::time::Instant> = Vec::new();
-            let mut worst = std::time::Duration::ZERO;
+            let mut attempts: usize = 0;
+            // Kept for the failure message: if the writes are failing for a
+            // reason that is NOT lock contention, `during` is 0 and the test
+            // fails — this is what says why.
+            let mut first_err: Option<String> = None;
             while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
-                let t0 = std::time::Instant::now();
-                grant_access(
+                attempts += 1;
+                match grant_access(
                     &writer_pool,
-                    &format!("did:plc:writer{}", completions.len()),
+                    &format!("did:plc:writer{attempts}"),
                     None,
                     "sweep-test",
                     None,
                 )
-                .await?;
-                worst = worst.max(t0.elapsed());
-                completions.push(std::time::Instant::now());
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                .await
+                {
+                    Ok(()) => completions.push(std::time::Instant::now()),
+                    // Expected: the sweep holds the write lock right now.
+                    // Retrying is the entire point, so this is counted, not
+                    // fatal. A `?` here would abort the writer on the first
+                    // contended write and destroy the measurement.
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(format!("{err:#}"));
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
             }
-            Ok::<(Vec<std::time::Instant>, std::time::Duration), anyhow::Error>((
-                completions,
-                worst,
-            ))
+            writer_pool.close().await;
+            (completions, attempts, first_err)
         });
 
         let t0 = std::time::Instant::now();
         let deleted = prune_old_entries(&pool, 30, 180).await?;
         let sweep = t0.elapsed();
         done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (completions, worst) = writer.await??;
+        let (completions, attempts, first_err) = writer.await?;
         let sweep_end = t0 + sweep;
         // Writes that COMPLETED while the sweep was in flight.
         let during = completions
@@ -6811,14 +6864,45 @@ mod tests {
             .filter(|t| **t > t0 && **t < sweep_end)
             .count();
         let wrote = completions.len();
+        let why = first_err
+            .as_deref()
+            .map(|e| format!(" (first write error: {e})"))
+            .unwrap_or_default();
 
         assert_eq!(deleted as usize, entries.len());
-        // Sanity: the sweep has to take long enough for "was a writer blocked
-        // for it" to be a meaningful question. Ten batches of inter-batch
-        // hand-off put this comfortably past the floor.
+        // **The sweep has to BE batched before anything downstream means
+        // anything, and this floor is derived, not calibrated.**
+        //
+        // The fixture is `PRUNE_BATCH * 10` rows, all older than the hard
+        // ceiling, so the hard-ceiling delete drains them in ten full batches
+        // and stands down `PRUNE_BATCH_HANDOFF` after each. A genuinely batched
+        // sweep therefore cannot finish in under `10 * PRUNE_BATCH_HANDOFF` on
+        // any machine, however fast its disk — the sleeps are a floor the
+        // hardware cannot undercut, and the deletes themselves only add to it.
+        //
+        // A sweep that has LOST its batching is faster, not slower: measured at
+        // 66 ms with the `LIMIT` dropped, against 273 ms batched. That is why
+        // this fires before the two assertions below — without it, removing the
+        // batching starves the writer of attempts and gets reported as "invalid
+        // measurement", blaming the test for the defect it just detected.
+        //
+        // **Known limit, stated rather than implied.** Deleting only the
+        // `PRUNE_BATCH_HANDOFF` sleep — keeping the batching — is caught here at
+        // 97 ms against the 100 ms floor, which is a 3 ms margin and therefore
+        // luck, not coverage. It holds because this machine's ten deletes take
+        // under 100 ms; on a runner where they take longer (CI's sweep is 1.1 s)
+        // that mutation clears the floor and this test would not catch it. The
+        // defect this test is named for — one transaction spanning every batch —
+        // IS caught robustly, by `during` below. Closing the sleep-only gap
+        // needs a measurement of the hand-off itself rather than of the total,
+        // and is not attempted here.
+        const BATCHES: u32 = 10;
         assert!(
-            sweep > std::time::Duration::from_millis(50),
-            "the sweep finished in {sweep:?}; too fast for this test to mean anything"
+            sweep > PRUNE_BATCH_HANDOFF * BATCHES,
+            "the sweep finished in {sweep:?}, under the {:?} that {BATCHES} batches \
+             of `PRUNE_BATCH_HANDOFF` alone would take — it is not handing the \
+             write lock over between batches at all",
+            PRUNE_BATCH_HANDOFF * BATCHES
         );
         // **Assert the SHAPE, not a ratio of durations.**
         //
@@ -6841,29 +6925,62 @@ mod tests {
         //
         // What IS anchored: a sweep holding one transaction across every batch
         // blocks the writer for its whole duration, so **zero** writes complete
-        // inside the window — they queue on `busy_timeout` and land afterwards.
-        // Releasing the lock between batches lets writes complete THROUGHOUT it.
-        // That is a shape difference, not a rate, and it survives a slow runner:
-        // a machine ten times slower still interleaves, just less often.
+        // inside the window — every attempt gets SQLITE_BUSY and nothing lands
+        // until it finishes. Releasing the lock between batches lets writes
+        // complete THROUGHOUT it. That is a shape difference, not a rate.
+        //
+        // **The measurement has to be valid before its result means anything,
+        // and this assertion has to come FIRST.**
+        //
+        // This test flaked on CI as `0 of 1 writes completed DURING the 1.144s
+        // sweep` — a message that reads as "the sweep held the lock" but was
+        // nothing of the sort. `wrote == 1` is the tell: the writer got a single
+        // attempt in 1.1 s. It blocked on the production 5 s `busy_timeout`,
+        // whose internal back-off ladder slept past every 10 ms hand-off window,
+        // and the loop never came round again. Zero successes out of one attempt
+        // and zero successes out of four hundred are the same number and mean
+        // completely different things — so the old test could not tell the
+        // defect it exists to catch from a slow disk, and reported the slow disk
+        // as the defect.
+        //
+        // The writer's short `busy_timeout` is what makes this hold, and the
+        // attempt count is close to machine-INDEPENDENT: both the sweep and a
+        // single attempt slow down together, so their ratio barely moves.
+        //
+        // 20 is the structurally right floor: the test inserts `PRUNE_BATCH *
+        // 10` rows, so the hard-ceiling delete runs ten batches and opens ten
+        // `PRUNE_BATCH_HANDOFF` windows. Twenty attempts is two per window —
+        // enough that missing EVERY window means the lock was held, not that
+        // the writer was unlucky.
+        //
+        // Measured margin on both sides, which is the point: **517** attempts
+        // when the sweep is correct, and **52** when it holds one transaction
+        // across every batch. The blocked case is the tighter one — every
+        // attempt there pays the full `WRITER_BUSY_TIMEOUT` instead of
+        // succeeding immediately — and it still clears this floor by 2.6x. At
+        // the 5 ms timeout tried first those numbers were 54 and 20, i.e. the
+        // defect landed exactly ON the threshold and would have reported itself
+        // as an invalid measurement. That is why the timeout is 2 ms.
+        //
+        // If it somehow does not hold, THIS assertion fires and says the
+        // measurement was too thin. It does not blame the sweep.
+        assert!(
+            attempts >= 20,
+            "the writer only got {attempts} attempts during a {sweep:?} sweep \
+             ({wrote} landed) — too few for `during` to mean anything about the \
+             write lock. This is an invalid measurement, not a sweep that held \
+             the lock{why}"
+        );
         // Threshold of 2 rather than 1 so a single boundary-straddling write
         // cannot satisfy it. Verified against the reintroduced single-transaction
-        // sweep: `0 of 1 writes completed DURING the 155ms sweep`.
+        // sweep: see the mutation note in the PR.
         assert!(
             during >= 2,
-            "{during} of {wrote} writes completed DURING the {sweep:?} sweep — a \
-             sweep that releases the write lock between batches lets writes land \
-             throughout it; one that holds the lock across them blocks every \
-             writer until it finishes, so none complete inside the window"
-        );
-        // And no single write may span the WHOLE sweep, which is what a held
-        // lock looks like from the writer's side. Deliberately loose: on a noisy
-        // shared runner one write can wait several batches without anything
-        // being wrong.
-        assert!(
-            worst < sweep,
-            "a single write waited {worst:?} of a {sweep:?} sweep ({wrote} writes \
-             landed) — the sweep is holding the write lock ACROSS batches rather \
-             than releasing it between them"
+            "{during} of {attempts} attempted writes completed DURING the \
+             {sweep:?} sweep — a sweep that releases the write lock between \
+             batches lets writes land throughout it; one that holds the lock \
+             across them blocks every writer until it finishes, so none complete \
+             inside the window{why}"
         );
 
         pool.close().await;
