@@ -8015,12 +8015,22 @@ mod tests {
             html.contains("Article"),
             "the row rendered without its title: {html}",
         );
-        // **The row carries the read state this request asked for.**
+        // **The row comes back carrying read state. That is all this proves.**
         //
-        // NOT that the state was PERSISTED — a review showed this does not prove
-        // that: the handler renders `Some(read)` from the form value, so making
-        // `mark_read` roll back instead of commit fails 11 store tests and leaves
-        // this one green. What is pinned here is the override plumbing.
+        // It does NOT prove the state was persisted: the handler renders
+        // `Some(read)` from the form value, so making `mark_read` roll back
+        // instead of commit fails 11 store tests and leaves this one green.
+        //
+        // It does not prove the OVERRIDE either, which an earlier version of
+        // this comment claimed. Verified: changing the call site to
+        // `build_entry_row(pool, &did, id, None)` — deleting the override
+        // wholesale — keeps the whole suite green, because `mark_read` has
+        // already persisted the same value two lines earlier, so reading it back
+        // from the database produces an identical row.
+        //
+        // Distinguishing the two needs a case where the override and the stored
+        // state DISAGREE, which this handler never produces: it writes the value
+        // it then renders. Left as a known gap rather than described as covered.
         assert!(
             html.contains("is-read"),
             "the row came back without the read state it was just given: {html}",

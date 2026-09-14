@@ -1425,32 +1425,71 @@ mod tests {
         assert_eq!(STARTUP_DELAY_ENV, "FEATHERREADER_STARTUP_DELAY_SECS");
     }
 
-    /// **Every registered loop is actually started, and nothing else is.**
+    /// The registry holds each loop exactly once.
     ///
-    /// `spawn` iterates `Loop::ALL`, so a variant missing from the registry is
-    /// never started. That is a visible absence rather than the silent
-    /// wrong-offset collision this file has now had three forms of — but only if
-    /// something notices the count.
-    ///
-    /// The `+ 2` is the two loops with no startup offset: the metrics flusher
-    /// (which fires immediately at boot, deliberately) and the read-state
-    /// flusher. Neither is in `Loop`, so neither is covered by
-    /// `the_startup_delays_are_distinct`.
+    /// A pure statement about `Loop::ALL`. It says nothing about `spawn` — see
+    /// `spawn_starts_every_registered_loop` for that, and read the note there
+    /// before trusting a test in this file that has "spawn" in its name.
     #[test]
-    fn spawn_starts_every_registered_loop() {
-        assert_eq!(
-            Loop::ALL.len(),
-            5,
-            "a loop was added to or removed from the registry; `spawn` follows it, \
-             so confirm the new one belongs and update this count",
-        );
-        // Each variant appears exactly once.
+    fn the_registry_lists_each_loop_exactly_once() {
         let unique: std::collections::HashSet<Loop> = Loop::ALL.iter().copied().collect();
         assert_eq!(
             unique.len(),
             Loop::ALL.len(),
             "a loop is listed twice in the registry and would be started twice",
         );
+    }
+
+    /// **`spawn` starts one task per registered loop — by calling `spawn`.**
+    ///
+    /// This test previously carried this name while asserting only
+    /// `Loop::ALL.len() == 5` plus uniqueness. It never called `spawn`, so the
+    /// callback `spawn` passes to `for_each_loop` was an untested decision
+    /// point, and dropping a loop there was silent:
+    ///
+    /// ```ignore
+    /// for_each_loop(|l| {
+    ///     if l != Loop::PendingSweep {           // 697 lib + 13 bin green,
+    ///         handles.push(l.spawn_with(..));    // clippy -D warnings clean
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// The pending-login sweeper never starts and nonce rows grow without
+    /// bound. That is the FOURTH form of this file's recurring defect — after a
+    /// wrong constant, a mistyped string key, and a wrong positional argument —
+    /// and the round that introduced `for_each_loop` to close the third form
+    /// also introduced the mis-named test that hid this one.
+    ///
+    /// The `+ 2` is the two loops with no startup offset: the metrics flusher
+    /// (which fires immediately at boot, deliberately) and the read-state
+    /// flusher. Neither is in `Loop`.
+    #[tokio::test]
+    async fn spawn_starts_every_registered_loop() {
+        // `spawn` returns early with an empty Vec when the kill switch is set,
+        // which would make the assertion below vacuously wrong rather than
+        // failing for a real reason. Say so instead of measuring nothing.
+        assert!(
+            schedulers_enabled(),
+            "FEATHERREADER_DISABLE_SCHEDULER is set in this test process, so \
+             `spawn` returns no handles and this test cannot measure anything",
+        );
+        let state = rust_state().await;
+        let (tx, rx) = watch::channel(());
+        let handles = spawn(state, rx);
+        assert_eq!(
+            handles.len(),
+            Loop::ALL.len() + 2,
+            "`spawn` started {} tasks for {} registered loops + 2 unoffset ones \
+             — it is not starting one task per registry entry",
+            handles.len(),
+            Loop::ALL.len(),
+        );
+        // Shut them down rather than leaking tasks into the rest of the suite.
+        drop(tx);
+        for h in handles {
+            let _ = h.await;
+        }
     }
 
     /// The ceiling still applies on the way to a loop — the one thing
@@ -1468,10 +1507,42 @@ mod tests {
                 Duration::ZERO,
                 "{l:?} ignored the startup-delay ceiling",
             );
+        }
+    }
+
+    /// **Each variant gets ITS OWN offset — spelled out, not derived.**
+    ///
+    /// This replaces `assert_eq!(offset_from(l, None), l.startup_offset())`,
+    /// which was a tautology: `offset_from` is
+    /// `startup_delay_from(which.startup_offset(), raw)` and
+    /// `startup_delay_from(d, None)` is `d`, so both sides reduced to the same
+    /// expression and the assertion could not fail for ANY mapping. Swapping
+    /// two variants' arms in `startup_offset` passed the whole suite.
+    ///
+    /// The table below is written independently of the `match`, so the two have
+    /// to agree — the same reason `the_startup_override_env_key_is_the_documented_one`
+    /// spells the env key out by hand. Spelling the seconds here rather than
+    /// naming the constants is the point: naming them would reintroduce the
+    /// tautology one level up.
+    #[test]
+    fn every_loop_is_on_its_documented_offset() {
+        let documented = [
+            (Loop::Poller, 30),
+            (Loop::PendingSweep, 45),
+            (Loop::CodeSweep, 60),
+            (Loop::Retention, 90),
+            (Loop::Adoption, 300),
+        ];
+        assert_eq!(
+            documented.len(),
+            Loop::ALL.len(),
+            "a loop was added to the registry without an entry in this table",
+        );
+        for (l, secs) in documented {
             assert_eq!(
-                offset_from(l, None),
                 l.startup_offset(),
-                "{l:?} did not get its own offset with no override set",
+                Duration::from_secs(secs),
+                "{l:?} is not on its documented {secs}s offset",
             );
         }
     }
