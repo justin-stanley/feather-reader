@@ -94,8 +94,10 @@ pub enum Retry {
 
 /// The nonce to retry with, or `None` to stop.
 ///
-/// Pure so the policy is testable: the SSRF guard forbids pointing any of this
-/// at a loopback test server, so the round trip itself cannot be exercised.
+/// Pure so the policy is testable in isolation. The round trip itself is now
+/// exercised too - `login::tests::a_nonce_challenge_on_the_token_endpoint_is_retried`
+/// drives a real challenge-then-retry against a TLS test server, which the SSRF
+/// guard's loopback refusal used to make impossible.
 fn next_nonce(
     attempt: usize,
     retry: Retry,

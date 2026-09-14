@@ -302,7 +302,7 @@ pub(crate) async fn spawn_tls<F>(
     build_routes: F,
 ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
 where
-    F: FnOnce(SocketAddr) -> std::collections::HashMap<String, (u16, String)>,
+    F: FnOnce(SocketAddr) -> std::collections::HashMap<String, Vec<TestResponse>>,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -334,6 +334,8 @@ where
     let routes = build_routes(addr);
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::clone(&log);
+    let hits: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        Default::default();
 
     tokio::spawn(async move {
         loop {
@@ -343,6 +345,7 @@ where
             let acceptor = acceptor.clone();
             let routes = routes.clone();
             let sink = std::sync::Arc::clone(&sink);
+            let hits = std::sync::Arc::clone(&hits);
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(sock).await else {
                     return;
@@ -359,12 +362,30 @@ where
                     .unwrap_or("/")
                     .to_string();
                 sink.lock().unwrap().push(req);
-                let (status, body) = routes
+                // Nth hit on this path picks the Nth canned reply; the last one
+                // repeats. That is what lets a route answer a nonce challenge
+                // once and something else afterwards — the only way to observe
+                // whether a request was RETRIED.
+                let n = {
+                    let mut c = hits.lock().unwrap();
+                    let e = c.entry(path.clone()).or_insert(0usize);
+                    let n = *e;
+                    *e += 1;
+                    n
+                };
+                let reply = routes
                     .get(&path)
+                    .and_then(|v| v.get(n.min(v.len().saturating_sub(1))))
                     .cloned()
-                    .unwrap_or_else(|| (404, "not found".into()));
+                    .unwrap_or_else(|| TestResponse::json(404, "not found"));
+                let extra: String = reply
+                    .headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .collect();
+                let (status, body) = (reply.status, reply.body);
                 let resp = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
@@ -416,6 +437,31 @@ fn decode_pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
         rest = &after[j + end.len()..];
     }
     out
+}
+
+/// One canned reply from the TLS test server.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestResponse {
+    pub status: u16,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+impl TestResponse {
+    pub fn json(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_header(mut self, k: &str, v: &str) -> Self {
+        self.headers.push((k.to_string(), v.to_string()));
+        self
+    }
 }
 
 /// Hostnames the test leaf is valid for. Adding a new `.test` host to a test
@@ -1988,7 +2034,7 @@ pub(crate) mod tests {
     async fn the_test_ca_is_trusted_and_still_validates_hostnames() {
         let (addr, _log) = spawn_tls(|_| {
             let mut r = std::collections::HashMap::new();
-            r.insert("/ok".to_string(), (200, "{}".to_string()));
+            r.insert("/ok".to_string(), vec![TestResponse::json(200, "{}")]);
             r
         })
         .await;

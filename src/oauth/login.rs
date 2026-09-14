@@ -1378,22 +1378,22 @@ mod tests {
     fn discovery_routes(
         pds: &str,
         issuer: &str,
-    ) -> std::collections::HashMap<String, (u16, String)> {
+    ) -> std::collections::HashMap<String, Vec<crate::net::TestResponse>> {
         let mut r = std::collections::HashMap::new();
         r.insert(
             "/.well-known/oauth-protected-resource".to_string(),
-            (
+            vec![crate::net::TestResponse::json(
                 200,
                 serde_json::json!({
                     "resource": pds,
                     "authorization_servers": [issuer],
                 })
                 .to_string(),
-            ),
+            )],
         );
         r.insert(
             "/.well-known/oauth-authorization-server".to_string(),
-            (
+            vec![crate::net::TestResponse::json(
                 200,
                 serde_json::json!({
                     "issuer": issuer,
@@ -1413,7 +1413,7 @@ mod tests {
                     "code_challenge_methods_supported": ["S256"],
                 })
                 .to_string(),
-            ),
+            )],
         );
         r
     }
@@ -1512,7 +1512,10 @@ mod tests {
             // The exchange itself fails; what is asserted is that it was REACHED.
             r.insert(
                 "/token".to_string(),
-                (400, "{\"error\":\"invalid_grant\"}".to_string()),
+                vec![crate::net::TestResponse::json(
+                    400,
+                    "{\"error\":\"invalid_grant\"}",
+                )],
             );
             r
         })
@@ -1548,6 +1551,182 @@ mod tests {
             seen.contains("POST /token"),
             "a well-formed discovery never reached the token endpoint — the \
              refusal test above would pass for the wrong reason:\n{seen}",
+        );
+    }
+
+    /// The DPoP proof JWT from a recorded request.
+    fn dpop_proof(raw: &str) -> String {
+        raw.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("dpop:"))
+            .expect("no DPoP header on the request")[5..]
+            .trim()
+            .to_string()
+    }
+
+    /// Decode one base64url segment of a JWT as JSON.
+    fn jwt_part(jwt: &str, idx: usize) -> serde_json::Value {
+        use base64::Engine as _;
+        let seg = jwt.split('.').nth(idx).expect("malformed JWT");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(seg)
+            .expect("JWT segment is not base64url");
+        serde_json::from_slice(&raw).expect("JWT segment is not JSON")
+    }
+
+    /// Pull the `jwk` out of a recorded request's DPoP proof header.
+    fn dpop_jwk_from(raw: &str) -> String {
+        use base64::Engine as _;
+        let line = raw
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("dpop:"))
+            .expect("no DPoP header on the token request");
+        let jwt = line[5..].trim();
+        let header_b64 = jwt.split('.').next().expect("malformed DPoP proof");
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .expect("DPoP header is not base64url");
+        let v: serde_json::Value = serde_json::from_slice(&json).expect("DPoP header is not JSON");
+        v.get("jwk")
+            .expect("DPoP header carries no jwk")
+            .to_string()
+    }
+
+    /// **The grant is signed under the PENDING ROW's key — checked on the wire.**
+    ///
+    /// The adapter could substitute a freshly generated key and every stub-driven
+    /// test stayed green, because the stub is handed the key rather than the
+    /// proof. Here the real proof reaches a real server, and its embedded public
+    /// key is compared against the key the authorization request was bound to.
+    ///
+    /// A substituted key also produces a valid-looking proof, so only comparing
+    /// thumbprints catches it.
+    #[tokio::test]
+    async fn the_token_request_is_signed_under_the_pending_rows_key() {
+        let cookie = flow::new_binding_token();
+        let (addr, log) = crate::net::spawn_tls(|addr| {
+            let port = addr.port();
+            let mut r = discovery_routes(
+                &format!("https://pds-e2e.test:{port}"),
+                &format!("https://as-e2e.test:{port}"),
+            );
+            r.insert(
+                "/token".to_string(),
+                vec![crate::net::TestResponse::json(
+                    400,
+                    "{\"error\":\"invalid_grant\"}",
+                )],
+            );
+            r
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+        let port = addr.port();
+        let issuer = format!("https://as-e2e.test:{port}");
+        let pool = pending_against(&format!("https://pds-e2e.test:{port}"), &issuer, &cookie).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some(issuer);
+
+        let _ = complete(
+            &runtime,
+            &reqwest::Client::builder().build().unwrap(),
+            &pool,
+            &params,
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await;
+
+        let token_req = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.starts_with("POST /token"))
+            .cloned()
+            .expect("the token endpoint was never reached");
+        let on_the_wire =
+            keys::SigningKey::public_thumbprint_of(&dpop_jwk_from(&token_req)).unwrap();
+        assert_eq!(
+            on_the_wire,
+            fixture_thumbprint(),
+            "the token request was signed under a key the authorization request \
+             was never bound to",
+        );
+    }
+
+    /// **A `use_dpop_nonce` challenge is retried — observed as a second request.**
+    ///
+    /// `Retry::Allowed` is chosen in `complete` and forwarded by the adapter;
+    /// neither was pinned, and getting it wrong is not hypothetical — the
+    /// comment on `Retry::Forbidden` records that this exact mistake once cost a
+    /// real login against a live PDS, because servers rotate their nonce between
+    /// PAR and the callback.
+    ///
+    /// The server challenges once, then answers. Two hits on `/token` means the
+    /// retry happened; one means it did not.
+    #[tokio::test]
+    async fn a_nonce_challenge_on_the_token_endpoint_is_retried() {
+        let cookie = flow::new_binding_token();
+        let (addr, log) = crate::net::spawn_tls(|addr| {
+            let port = addr.port();
+            let mut r = discovery_routes(
+                &format!("https://pds-e2e.test:{port}"),
+                &format!("https://as-e2e.test:{port}"),
+            );
+            r.insert(
+                "/token".to_string(),
+                vec![
+                    crate::net::TestResponse::json(400, "{\"error\":\"use_dpop_nonce\"}")
+                        .with_header("DPoP-Nonce", "nonce-from-the-server"),
+                    crate::net::TestResponse::json(400, "{\"error\":\"invalid_grant\"}"),
+                ],
+            );
+            r
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+        let port = addr.port();
+        let issuer = format!("https://as-e2e.test:{port}");
+        let pool = pending_against(&format!("https://pds-e2e.test:{port}"), &issuer, &cookie).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some(issuer);
+
+        let _ = complete(
+            &runtime,
+            &reqwest::Client::builder().build().unwrap(),
+            &pool,
+            &params,
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await;
+
+        let reqs = log.lock().unwrap().clone();
+        let token_hits = reqs.iter().filter(|r| r.starts_with("POST /token")).count();
+        assert_eq!(
+            token_hits, 2,
+            "a use_dpop_nonce challenge was not retried; the exchange is marked \
+             non-retryable somewhere between complete and the wire",
+        );
+        let second = reqs
+            .iter()
+            .filter(|r| r.starts_with("POST /token"))
+            .nth(1)
+            .unwrap();
+        // The nonce rides INSIDE the DPoP proof's claims, not as plaintext in
+        // the request — asserting on the raw bytes would have passed for a retry
+        // that ignored the challenge entirely.
+        let claims = jwt_part(&dpop_proof(second), 1);
+        assert_eq!(
+            claims.get("nonce").and_then(|v| v.as_str()),
+            Some("nonce-from-the-server"),
+            "the retry did not carry the server's nonce; it would be challenged \
+             again forever",
         );
     }
 }
