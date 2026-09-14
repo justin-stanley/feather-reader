@@ -171,6 +171,14 @@ impl Loop {
     /// site compiled, passed 707 tests and clippy, and silently collided the two
     /// loops at boot. That is the third form of this same bug; the first two were
     /// a wrong constant and a mistyped string key.
+    ///
+    /// **What is still NOT prevented:** pairing a variant with the wrong `run_*`
+    /// in an arm below — `Loop::PendingSweep => run_poller(..)` compiles and the
+    /// suite passes. That is a different failure (one loop never starts, another
+    /// runs twice) and it is narrower: one exhaustive match in one place, rather
+    /// than five spawn sites scattered through the file. Catching it would need
+    /// each loop to report that it started, i.e. production instrumentation for a
+    /// test — not obviously worth it, but it is a hole, not an absence of one.
     fn spawn_with(
         self,
         state: AppState,
