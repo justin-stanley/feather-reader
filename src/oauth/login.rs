@@ -528,6 +528,10 @@ mod tests {
         serde_json::json!({
             "access_token": "at-abc",
             "token_type": "DPoP",
+            // NARROWED on purpose: the pending row REQUESTS
+            // "atproto transition:generic"; the server grants less. Identical
+            // values made an assertion here pass whichever field was stored —
+            // the same trap as deriving the token endpoint from the issuer.
             "scope": "atproto",
             "sub": sub,
             "expires_in": 3600,
@@ -797,7 +801,7 @@ mod tests {
             auth_method: "private_key_jwt".into(),
             auth_kid: None,
             redirect_uri: PUSHED_REDIRECT.into(),
-            requested_scope: "atproto".into(),
+            requested_scope: "atproto transition:generic".into(),
             request_uri: "urn:x".into(),
             app_return_to: None,
             expires_at: 2_000_000_000,
@@ -822,6 +826,17 @@ mod tests {
             public_url: public_url.into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(TEST_KEY.to_string()),
+                // **Off the repo root.** `key_path` defaults to a RELATIVE
+                // `oauth-signing-key.json`, so a rust-backend runtime here
+                // creates real ES256 key material in whatever the working
+                // directory is — the repo root during `cargo test`. Confirmed by
+                // a review; `runtime.rs` documents this side effect as the very
+                // thing that motivated gating key creation.
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-login-test-key-{}-{:p}.json",
+                    std::process::id(),
+                    &TEST_KEY as *const _
+                )),
                 // **Offline.** The default is the real PLC directory, and
                 // PENDING_DID is a real Bluesky DID — so handle resolution in
                 // these tests was making a live internet call, which is slow,
@@ -1238,6 +1253,33 @@ mod tests {
             fixture_thumbprint(),
             "the session persisted a different DPoP key than the grant is bound to",
         );
+
+        // **Every remaining field `accept_token_response` writes.**
+        //
+        // A review found four of the nine unpinned — and the same mapping on the
+        // REFRESH path has dedicated tests for each of them. The login half of a
+        // mapping tested twice over on the refresh half.
+        assert_eq!(stored.access_token, "at-abc");
+        assert_eq!(
+            stored.refresh_token, "rt-abc",
+            "an empty refresh token stores an un-refreshable session: the first \
+             refresh presents \"\" and the server's invalid_grant deletes it, \
+             which is the spurious logout the token module exists to avoid",
+        );
+        assert_eq!(stored.token_type, "DPoP");
+        assert_eq!(
+            stored.granted_scope, "atproto",
+            "the session stored the REQUESTED scope, not the granted one — a \
+             narrowed grant must be visible now rather than as a mystery write \
+             failure later",
+        );
+        assert_eq!(
+            stored.expires_at,
+            Some(1_700_000_000 + 3600),
+            "the session's expiry is not the token's; `None` means `is_stale` is \
+             never true, so it is never proactively refreshed and simply dies",
+        );
+        assert_eq!(stored.issuer, PENDING_ISSUER);
     }
 
     /// **A wrong `iss` stops the flow BEFORE anything is posted.**
@@ -1550,6 +1592,47 @@ mod tests {
             stored.aud, "https://pds.example.com",
             "the session's audience is not the PDS; every later DPoP-bound call \
              would carry the wrong `htu`/`aud`",
+        );
+    }
+
+    /// **An expired pending row is refused — `now` really reaches the sweep.**
+    ///
+    /// `complete` passes `now` into `flow::complete_callback`, which is what lets
+    /// `take_pending` prune expired rows. Passing `0` instead honoured a pending
+    /// row long past its expiry — a sealed DPoP key and PKCE verifier that should
+    /// have been swept — and the whole suite stayed green, because every fixture
+    /// used an `expires_at` far in the future.
+    ///
+    /// `MAX_PENDING_SECS`'s COMPUTATION is pinned elsewhere; this pins that the
+    /// bound is honoured.
+    #[tokio::test]
+    async fn an_expired_pending_row_is_refused() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        // Expired an hour before the callback arrives.
+        pending.expires_at = 1_700_000_000 - 3600;
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "an expired pending row completed a login");
+        assert!(
+            log.lock().unwrap().posted.is_empty(),
+            "the authorization code was posted for an expired pending row",
         );
     }
 }
