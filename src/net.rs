@@ -212,6 +212,93 @@ fn first_vetted(name: &str, addrs: impl Iterator<Item = SocketAddr>) -> Result<S
 static TEST_HOSTS: std::sync::Mutex<Option<std::collections::HashMap<String, SocketAddr>>> =
     std::sync::Mutex::new(None);
 
+/// The TEST certificate authority, and the leaf it issues for test hostnames.
+///
+/// **Why this exists at all.** An OAuth issuer is required to be `https`
+/// (`discovery::validate_issuer_form`), so a plain-HTTP loopback server cannot
+/// stand in for an authorization server — which meant the real `login::complete`
+/// could never be driven end to end, and the wiring between its tested core and
+/// the network had no coverage. A review proved that gap was live: the
+/// authorization-server mix-up defence could be disabled in that wiring with the
+/// whole suite green.
+///
+/// **Why a CA rather than relaxing the rule.** The alternative was a test-only
+/// escape from the https requirement. That would *suspend* a security rule; this
+/// *satisfies* it — the server really presents a certificate and the client
+/// really validates the chain. It also keeps the existing tests that assert
+/// `http` issuers are REJECTED meaningful, which a blanket relaxation would not.
+///
+/// Generated once per process. `#[cfg(test)]`, so none of it — not the trust
+/// decision, not the key material — exists in a release build.
+#[cfg(test)]
+pub(crate) struct TestPki {
+    /// PEM of the CA certificate, for `reqwest`'s root store.
+    pub ca_pem: String,
+    /// PEM of the leaf certificate chain, for the server.
+    pub leaf_pem: String,
+    /// PEM of the leaf private key, for the server.
+    pub leaf_key_pem: String,
+}
+
+#[cfg(test)]
+pub(crate) fn test_pki() -> &'static TestPki {
+    static PKI: std::sync::OnceLock<TestPki> = std::sync::OnceLock::new();
+    PKI.get_or_init(|| {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
+        };
+
+        let mut ca_params = CertificateParams::default();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "featherreader test CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate().expect("test CA key");
+        let ca_cert = ca_params
+            .clone()
+            .self_signed(&ca_key)
+            .expect("test CA cert");
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        // SANs for the hostnames the tests register with `test_host_override`.
+        // A wildcard would not cover the multi-label names, so they are listed.
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "featherreader test leaf");
+        leaf_params.subject_alt_names = TEST_TLS_HOSTS
+            .iter()
+            .map(|h| SanType::DnsName((*h).try_into().expect("test SAN")))
+            .collect();
+        let leaf_key = KeyPair::generate().expect("test leaf key");
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("test leaf cert");
+
+        TestPki {
+            ca_pem: ca_cert.pem(),
+            leaf_pem: leaf_cert.pem(),
+            leaf_key_pem: leaf_key.serialize_pem(),
+        }
+    })
+}
+
+/// Hostnames the test leaf is valid for. Adding a new `.test` host to a test
+/// means adding it here, which is deliberate friction: the certificate is
+/// supposed to be narrow.
+#[cfg(test)]
+pub(crate) const TEST_TLS_HOSTS: &[&str] = &[
+    "pds-e2e.test",
+    "as-e2e.test",
+    "feed-tls.test",
+    "hop-tls.test",
+];
+
 /// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the
 /// forbidden-IP check for that host only.
 ///
@@ -344,7 +431,7 @@ static PINNED_CLIENTS: LazyLock<PinnedClients> = LazyLock::new(PinnedClients::ne
 /// client), and auto-redirect off — [`guarded_get`] follows + re-validates each
 /// hop itself.
 fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
-    Client::builder()
+    let builder = Client::builder()
         .user_agent(crate::USER_AGENT)
         // Bound each hop the same way the feed client is bounded: a total
         // request timeout plus a per-read idle timeout. Without these the
@@ -377,7 +464,29 @@ fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
         // No auto-redirect: guarded_get follows + re-validates each hop.
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+
+    // **The TEST certificate authority — `#[cfg(test)]`, so a release build has
+    // neither this call nor the certificate.**
+    //
+    // This is the one test seam in this file that touches TLS TRUST, so it is
+    // worth being exact about what it does and does not do. It ADDS one root:
+    // the built-in roots stay, nothing is disabled, and `danger_accept_invalid_
+    // certs` is NOT used — a server still has to present a chain that validates,
+    // and a hostname still has to match a SAN. What it buys is that a loopback
+    // test server can hold a certificate the client will accept, which is what
+    // makes it possible to drive the real `login::complete` (and the real
+    // redirect path) against a server at all: the OAuth issuer must be `https`.
+    //
+    // `test_pki()` is itself `#[cfg(test)]`, so removing the attribute here
+    // fails to compile rather than silently trusting an extra root in prod.
+    #[cfg(test)]
+    let builder = builder.add_root_certificate(
+        reqwest::Certificate::from_pem(test_pki().ca_pem.as_bytes())
+            .context("parsing the test CA")?,
+    );
+
+    builder
         .build()
         .context("failed to build IP-pinned fetch client")
 }
@@ -1734,5 +1843,166 @@ pub(crate) mod tests {
         }
         // No answers at all is an error, not a silent pass.
         assert!(first_vetted("empty.example", std::iter::empty()).is_err());
+    }
+
+    // ── TLS test server ──────────────────────────────────────────────────────
+
+    /// A loopback HTTPS server presenting the test CA's leaf, routing by path.
+    ///
+    /// The point of the TLS is not TLS: it is that an OAuth issuer must be
+    /// `https`, so nothing could drive the real `login::complete` against a
+    /// local server. The client validates this chain for real — no invalid-cert
+    /// acceptance anywhere.
+    ///
+    /// `routes` maps a path to a canned `(status, body)`. Unknown paths 404.
+    /// Every request line is recorded.
+    pub(crate) async fn spawn_tls(
+        routes: std::collections::HashMap<String, (u16, String)>,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        // Both `ring` and `aws-lc-rs` are reachable in this tree (reqwest and
+        // rustls-platform-verifier pull their own), so rustls refuses to guess a
+        // process-level provider. Pick `ring`, once, to match the backend the
+        // production client already uses. `install_default` errors if something
+        // else got there first, which is fine — any provider will serve.
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let pki = test_pki();
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile_certs(pki.leaf_pem.as_bytes());
+        let key: PrivateKeyDer<'static> = rustls_pemfile_key(pki.leaf_key_pem.as_bytes());
+
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("test server TLS config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&log);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let routes = routes.clone();
+                let sink = std::sync::Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 16384];
+                    let Ok(n) = tls.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    sink.lock().unwrap().push(req);
+                    let (status, body) = routes
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| (404, "not found".into()));
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        (addr, log)
+    }
+
+    fn rustls_pemfile_certs(
+        pem: &[u8],
+    ) -> Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> {
+        // Minimal PEM splitter — avoids another dependency for two blocks.
+        decode_pem_blocks(pem, "CERTIFICATE")
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn rustls_pemfile_key(pem: &[u8]) -> tokio_rustls::rustls::pki_types::PrivateKeyDer<'static> {
+        let der = decode_pem_blocks(pem, "PRIVATE KEY")
+            .into_iter()
+            .next()
+            .expect("a private key block");
+        tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(der).into()
+    }
+
+    fn decode_pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
+        use base64::Engine as _;
+        let text = String::from_utf8_lossy(pem);
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let mut out = Vec::new();
+        let mut rest = text.as_ref();
+        while let Some(i) = rest.find(&begin) {
+            let after = &rest[i + begin.len()..];
+            let Some(j) = after.find(&end) else { break };
+            let b64: String = after[..j].chars().filter(|c| !c.is_whitespace()).collect();
+            out.push(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .expect("valid base64 in test PEM"),
+            );
+            rest = &after[j + end.len()..];
+        }
+        out
+    }
+
+    /// **The chain really validates — no invalid-cert acceptance anywhere.**
+    ///
+    /// The foundation every test below rests on. If this passed because
+    /// validation were disabled rather than because the CA is trusted, none of
+    /// the others would mean anything, so it is asserted directly: a host the
+    /// leaf has NO SAN for must still fail.
+    #[tokio::test]
+    async fn the_test_ca_is_trusted_and_still_validates_hostnames() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("/ok".to_string(), (200, "{}".to_string()));
+        let (addr, _log) = spawn_tls(routes).await;
+        test_host_override("feed-tls.test", addr);
+        // Registered, resolvable — but NOT in the leaf's SAN list.
+        test_host_override("not-in-san.test", addr);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let ok = guarded_get(
+            &client,
+            &format!("https://feed-tls.test:{}/ok", addr.port()),
+            &[],
+        )
+        .await
+        .expect("a SAN-matching https host should be accepted");
+        assert!(ok.status().is_success());
+
+        let err = guarded_get(
+            &client,
+            &format!("https://not-in-san.test:{}/ok", addr.port()),
+            &[],
+        )
+        .await
+        .expect_err("a host with no SAN must still fail: validation is NOT disabled");
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            msg.contains("certificate") || msg.contains("tls") || msg.contains("name"),
+            "failed, but not for a certificate reason: {msg}",
+        );
     }
 }
