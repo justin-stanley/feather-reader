@@ -1603,10 +1603,16 @@ pub(crate) mod tests {
     ///
     /// reqwest defaults `auto_sys_proxy: true`. With `HTTP_PROXY` set in the
     /// process environment, a request is sent to the proxy in ABSOLUTE form —
-    /// `GET http://host/path` — for the proxy to resolve the hostname. The
-    /// `.resolve()` pin never sees the connection and `is_forbidden_ip` never
-    /// sees the address, because this process no longer does the resolving.
-    /// Both defences are off at once, and the call returns 200: it fails OPEN.
+    /// `GET http://host/path` — and over https as `CONNECT host:443`, for the
+    /// PROXY to resolve the hostname.
+    ///
+    /// Precisely what breaks: `resolve_and_check` still runs its own lookup and
+    /// still rejects forbidden IPs, so it is not that the check is skipped. It
+    /// is that the checked address is no longer the address connected to — the
+    /// proxy re-resolves the name on its own network, so the vetted result is
+    /// decorative. DNS rebinding, split-horizon DNS and anything reachable from
+    /// the proxy but not from here all come back. And the call returns 200, so
+    /// it fails OPEN.
     ///
     /// Measured before `.no_proxy()` existed: vetted server 0 requests, proxy
     /// received `GET http://pin-vs-proxy.invalid/feed HTTP/1.1`, result
@@ -1620,7 +1626,6 @@ pub(crate) mod tests {
     /// `HTTP_PROXY` from birth — no mutation of a live environment anywhere.
     #[tokio::test]
     async fn the_pinned_client_ignores_ambient_proxy_configuration() {
-        const CHILD: &str = "FR_AMBIENT_PROXY_CHILD";
         const VETTED: &str = "FR_AMBIENT_PROXY_VETTED";
         const HOST: &str = "ambient-proxy-probe.invalid";
 
@@ -1636,11 +1641,11 @@ pub(crate) mod tests {
         let (vetted_addr, vetted_log) = spawn_http(vec![ok_200()]).await;
         let (proxy_addr, proxy_log) = spawn_http(vec![ok_200()]).await;
 
-        // , not : a blocking `output()` here would
-        // hold this single-threaded runtime and the servers above could never
-        // accept the child's connection — the test would fail with "did not
-        // reach the vetted address" for a reason that has nothing to do with
-        // proxies.
+        // `tokio::process`, NOT `std::process`: a blocking `output()` here
+        // would hold this single-threaded runtime, so the servers above could
+        // never accept the child's connection — and the test would fail with
+        // "did not reach the vetted address" for a reason that has nothing to
+        // do with proxies. That exact false failure happened while writing it.
         let out = tokio::process::Command::new(std::env::current_exe().unwrap())
             // FULL path: `--exact` matches the whole test name including the
             // module. With the bare function name the child matched nothing,
@@ -1653,7 +1658,20 @@ pub(crate) mod tests {
                 "--exact",
                 "--test-threads=1",
             ])
-            .env(CHILD, "1")
+            // **Clear the inherited proxy KILL-SWITCHES.**
+            //
+            // The child inherits this process's environment, and two inherited
+            // values make the whole test vacuous — it passes with `.no_proxy()`
+            // DELETED. Verified: `NO_PROXY='*'` and `REQUEST_METHOD=GET`
+            // (hyper-util treats the latter as a CGI context and disables proxy
+            // env entirely) each turn a genuine failure into `1 passed`.
+            //
+            // GitHub-hosted runners set none of these, so the gap was invisible
+            // here — a self-hosted or corporate runner would have silently
+            // neutered the regression test while it kept reporting success.
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("REQUEST_METHOD")
             .env(VETTED, vetted_addr.to_string())
             .env("HTTP_PROXY", format!("http://{proxy_addr}"))
             .env("HTTPS_PROXY", format!("http://{proxy_addr}"))
