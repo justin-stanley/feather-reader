@@ -23,15 +23,15 @@
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
   },
   "dependencies": {
-    "@atproto/api": "^0.20.42",
+    "@atproto/api": "^0.20.44",
     "@atproto/jwk-jose": "^0.2.4",
-    "@atproto/oauth-client-node": "^0.5.4",
+    "@atproto/oauth-client-node": "^0.5.6",
     "@fastify/rate-limit": "^11.2.0",
-    "fastify": "^5.12.1"
+    "fastify": "^5.12.3"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1",
-    "oxlint": "^1.81.0",
+    "@types/node": "^26.5.1",
+    "oxlint": "^1.82.0",
     "prettier": "3.9.6",
     "tsx": "^4.23.13",
     "typescript": "^7.0.0"
