@@ -6813,6 +6813,19 @@ mod tests {
         // accused of not handing the lock over at all (1 run in 6). Now the
         // compiler carries the coupling.
         const BATCHES: i64 = 10;
+        // **The 50% ceiling below is only safe because BATCHES is large.**
+        //
+        // `max_refused_run / attempts` is bounded by roughly `1 / BATCHES` only
+        // because the fixture opens that many hand-off windows. Shrink it and
+        // correct code walks into the ceiling: measured with production code
+        // untouched and the per-batch hold grown 10x, `BATCHES = 4` gives ratios
+        // of 0.21–0.35 and `BATCHES = 2` gives 0.45–0.56, **failing 3 runs in
+        // 5**. The comment above invites editing this fixture; this stops that
+        // edit from silently turning the assertion against the code it guards.
+        const _: () = assert!(
+            BATCHES >= 5,
+            "the 50% ceiling assumes ~1/BATCHES; below 5 batches correct code              false-fails",
+        );
         let old = (chrono::Utc::now() - chrono::Duration::days(400))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let entries: Vec<NewEntry> = (0..(PRUNE_BATCH * BATCHES) as usize)
@@ -6858,20 +6871,25 @@ mod tests {
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_done = std::sync::Arc::clone(&done);
         let writer = tokio::spawn(async move {
-            // Record WHEN each write completed, not just how many did. See the
-            // assertion below for why the timestamps are the load-bearing part.
-            // (when the attempt STARTED, whether it landed).
+            // `(when the attempt STARTED, whether it landed)`.
             //
-            // The outcome travels with the timestamp because the assertions
-            // below count consecutive FAILURES, not elapsed time — see the note
-            // there. Start times rather than completion times so only attempts
-            // actually made inside the measured window are counted; the writer
-            // is spawned before `t0`.
+            // The ORDER is what the assertions read, not the timestamps: they
+            // count consecutive failures. The instants serve only to select the
+            // attempts made inside the measured window — the writer is spawned
+            // before `t0`, so a plain counter would fold in attempts that can
+            // never appear in `during`.
+            //
+            // (An earlier version of this comment, left behind by the switch away
+            // from elapsed time, said completions were recorded and that "the
+            // timestamps are the load-bearing part". Neither is true now.)
             let mut outcomes: Vec<(std::time::Instant, bool)> = Vec::new();
             // Kept for the failure message: if the writes are failing for a
             // reason that is NOT lock contention, nothing lands and the test
-            // fails — this is what says why.
-            let mut first_err: Option<String> = None;
+            // fails — this is what says why. Timestamped so the test can drop it
+            // when it describes an attempt OUTSIDE the measured window; the
+            // writer starts before `t0`, so the very first error is usually from
+            // an attempt the assertions never look at.
+            let mut first_err: Option<(std::time::Instant, String)> = None;
             while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
                 let started = std::time::Instant::now();
                 match grant_access(
@@ -6891,7 +6909,7 @@ mod tests {
                     Err(err) => {
                         outcomes.push((started, false));
                         if first_err.is_none() {
-                            first_err = Some(format!("{err:#}"));
+                            first_err = Some((started, format!("{err:#}")));
                         }
                     }
                 }
@@ -6960,8 +6978,8 @@ mod tests {
             worst
         };
         let why = first_err
-            .as_deref()
-            .map(|e| format!(" (first write error: {e})"))
+            .filter(|(t, _)| *t >= t0 && *t < sweep_end)
+            .map(|(_, e)| format!(" (first in-window write error: {e})"))
             .unwrap_or_default();
 
         assert_eq!(deleted as usize, entries.len());
@@ -6982,11 +7000,16 @@ mod tests {
         // measurement", blaming the test for the defect it just detected.
         //
         // **Partial coverage, measured rather than asserted.** Two mutations
-        // that keep the loop looking roughly batched are caught only sometimes,
-        // both by this floor rather than by the assertion below:
+        // that keep the loop looking roughly batched are caught only sometimes:
         //
-        //   `LIMIT` dropped (no batching at all)   3 runs in 5
-        //   `PRUNE_BATCH_HANDOFF` sleep removed    1 run  in 5
+        //   `LIMIT` dropped (no batching at all)   3-4 runs in 5-6, MOSTLY by
+        //                                          the refusal assertion below,
+        //                                          not by this floor
+        //   `PRUNE_BATCH_HANDOFF` sleep removed    1 run in 5-6, by this floor
+        //
+        // (An earlier version attributed both to this floor. Re-measured: of
+        // four catches of the `LIMIT` mutation in six runs, three panicked at
+        // the refusal assertion and one here.)
         //
         // Both were caught more often — 5/5 and 3/5 — by the wall-clock form
         // this replaced. That is a real coverage loss and it was taken on
@@ -7047,9 +7070,19 @@ mod tests {
         // against the number of attempts made:
         //
         //   handed over : the lock is free for `PRUNE_BATCH_HANDOFF` after every
-        //                 batch, so the longest refused run is about one batch's
-        //                 worth of attempts — ~`attempts / BATCHES`, ~10%.
+        //                 batch, so the longest refused run is bounded by about
+        //                 one batch's worth of attempts.
         //   held across : every attempt in the window is refused — 100%.
+        //
+        // **The ~10% this comment used to quote for the handed-over case is not
+        // what the shipped configuration produces.** Measured here: 0.001–0.05,
+        // and in roughly a quarter of runs the writer is refused ZERO times
+        // (`max_refused_run == 0`, every attempt landing), so the assertion is
+        // vacuously true and certifies the hand-off by never observing one. That
+        // is a weak test, not a wrong one — but it is worth knowing that the
+        // enormous margin comes from the writer rarely colliding at all, not
+        // from a measured 10%. 10% is what appears only once the per-batch hold
+        // dominates the hand-off (`PRUNE_BATCH` x10 gives 0.115–0.143).
         //
         // This is immune to descheduling in a way no wall-clock measure can be:
         // a starved writer makes no attempts, so it contributes to neither side
@@ -7058,7 +7091,32 @@ mod tests {
         // 622 of 626 landing means a refused run of at most 4, nowhere near the
         // 313 it would take to trip.
         //
-        // A 50% ceiling sits 5x above the expected 10% and 2x below the defect.
+        // **Detection is near all-or-nothing, and that is a known limit rather
+        // than an oversight.** Holding one transaction across only the FIRST
+        // HALF of the batches — production code otherwise correct — is not
+        // caught at all:
+        //
+        //   batches held in one tx (of 10)   runs failing
+        //   5                                0 of 6   (ratios 0.05-0.27)
+        //   7                                2 of 6
+        //   9                                5 of 5
+        //   10                               22 of 22
+        //
+        // The ratio systematically UNDERSTATES the wall-clock fraction the lock
+        // was held, because a refused attempt costs ~2 ms and leaves the sweeper
+        // running uncontended, while a successful write actively blocks it and
+        // stretches the loop. So attempts pile up during free time. The
+        // "10% vs 100%" framing above describes the endpoints, not the curve.
+        //
+        // Closing that would mean measuring the wall-clock SPAN of a refusal run
+        // rather than its length — which is most of the way back to `max_gap`,
+        // the form that false-failed correct code on a descheduled writer. Given
+        // this assertion has now been wrong four times in a row, and the current
+        // one has zero false failures across 134 runs in six environments while
+        // catching the real defect 22/22, a fifth redesign to catch a
+        // half-transaction — a mutation no plausible edit produces — is not a
+        // trade worth making. Stated here so the next reader knows the gap is
+        // chosen, not missed.
         //
         // Measured, with the apparatus verified before each run:
         //
@@ -7076,8 +7134,11 @@ mod tests {
         assert!(
             attempts >= 20,
             "the writer only got {attempts} attempts inside a {sweep:?} delete loop \
-             — too few for anything below to mean something about the write lock. \
-             This is an invalid measurement, not a loop that held the lock{why}"
+             — too few for the ratio below to mean anything. That is USUALLY an \
+             invalid measurement rather than a held lock, but note that a loop \
+             holding the lock throughout is itself one cause of a starved writer, \
+             so check {during} (landed) before concluding the test is at \
+             fault{why}"
         );
         assert!(
             max_refused_run * 2 < attempts,
