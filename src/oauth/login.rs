@@ -1362,4 +1362,192 @@ mod tests {
             "discovery ran before the DPoP key was checked",
         );
     }
+
+    // ── THE ADAPTER, over real TLS ───────────────────────────────────────────
+    //
+    // Everything above drives `complete_with`, whose transports are stubs — so
+    // the wiring in `complete` that hands those transports their arguments has
+    // no coverage. A review proved that gap was live: the mix-up defence could
+    // be disarmed there with the whole suite green.
+    //
+    // These drive the REAL `complete`. That needs a server the client will talk
+    // to, which needs https (an issuer must be https) on loopback (which the
+    // SSRF guard refuses) — hence the test CA in `net`.
+
+    /// Documents for a well-formed PDS + authorization server on one TLS server.
+    fn discovery_routes(
+        pds: &str,
+        issuer: &str,
+    ) -> std::collections::HashMap<String, (u16, String)> {
+        let mut r = std::collections::HashMap::new();
+        r.insert(
+            "/.well-known/oauth-protected-resource".to_string(),
+            (
+                200,
+                serde_json::json!({
+                    "resource": pds,
+                    "authorization_servers": [issuer],
+                })
+                .to_string(),
+            ),
+        );
+        r.insert(
+            "/.well-known/oauth-authorization-server".to_string(),
+            (
+                200,
+                serde_json::json!({
+                    "issuer": issuer,
+                    "pushed_authorization_request_endpoint": format!("{issuer}/par"),
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "protected_resources": [pds],
+                    "client_id_metadata_document_supported": true,
+                    "require_pushed_authorization_requests": true,
+                    "authorization_response_iss_parameter_supported": true,
+                    "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+                    "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+                    "dpop_signing_alg_values_supported": ["ES256"],
+                    "scopes_supported": ["atproto"],
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                })
+                .to_string(),
+            ),
+        );
+        r
+    }
+
+    /// Seed a pending login pointing at the live TLS server.
+    async fn pending_against(pds: &str, issuer: &str, cookie: &str) -> sqlx::SqlitePool {
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(cookie));
+        pending.pds_url = pds.to_string();
+        pending.issuer = issuer.to_string();
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+        pool
+    }
+
+    /// **The adapter really forwards the expected issuer — over real TLS.**
+    ///
+    /// THE test this whole harness exists for. The PDS names an authorization
+    /// server that is NOT the one PAR was pushed under; `complete` must refuse
+    /// before the authorization code is posted anywhere.
+    ///
+    /// This is the authorization-server mix-up. It is the one defence whose
+    /// value is entirely in WHERE it happens, and the wiring that arms it —
+    /// `Some(expected_issuer)` handed to `discover` — sits in `complete`'s
+    /// adapter, outside every stub-driven test. Changing it to `None` left 702
+    /// tests green. It does not leave this one green.
+    #[tokio::test]
+    async fn a_repointed_authorization_server_is_refused_before_the_code_is_posted() {
+        let cookie = flow::new_binding_token();
+        let (addr, log) = crate::net::spawn_tls(|addr| {
+            let port = addr.port();
+            // The PDS points at as-EVIL; the pending row was pushed under as-e2e.
+            discovery_routes(
+                &format!("https://pds-e2e.test:{port}"),
+                &format!("https://as-evil.test:{port}"),
+            )
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test", "as-evil.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+
+        let port = addr.port();
+        let pds = format!("https://pds-e2e.test:{port}");
+        let honest = format!("https://as-e2e.test:{port}");
+
+        let pool = pending_against(&pds, &honest, &cookie).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some(honest.clone());
+
+        let err = complete(
+            &runtime,
+            &reqwest::Client::builder().build().unwrap(),
+            &pool,
+            &params,
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await
+        .expect_err("a repointed authorization server completed the login");
+
+        let rendered = format!("{err:#}");
+        // The real message names both servers and says why, which is more than
+        // the word "issuer" — assert on the substance, and on BOTH names, so a
+        // generic failure (TLS, 404, parse) cannot satisfy this.
+        let lower = rendered.to_ascii_lowercase();
+        assert!(
+            lower.contains("different authorization server")
+                && rendered.contains("as-evil.test")
+                && rendered.contains("as-e2e.test"),
+            "refused, but not by the mix-up check: {rendered}",
+        );
+        let seen = log.lock().unwrap().join("\n");
+        assert!(
+            !seen.contains("POST /token"),
+            "the authorization code was posted to a server the user never \
+             approved:\n{seen}",
+        );
+    }
+
+    /// **The honest path over the same real TLS server completes.**
+    ///
+    /// Without this, the test above is satisfied by a `complete` that refuses
+    /// everything — including every real login.
+    #[tokio::test]
+    async fn a_well_formed_discovery_over_tls_reaches_the_token_endpoint() {
+        let cookie = flow::new_binding_token();
+        let (addr, log) = crate::net::spawn_tls(|addr| {
+            let port = addr.port();
+            let pds = format!("https://pds-e2e.test:{port}");
+            let issuer = format!("https://as-e2e.test:{port}");
+            let mut r = discovery_routes(&pds, &issuer);
+            // The exchange itself fails; what is asserted is that it was REACHED.
+            r.insert(
+                "/token".to_string(),
+                (400, "{\"error\":\"invalid_grant\"}".to_string()),
+            );
+            r
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+
+        let port = addr.port();
+        let pds = format!("https://pds-e2e.test:{port}");
+        let issuer = format!("https://as-e2e.test:{port}");
+        let pool = pending_against(&pds, &issuer, &cookie).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some(issuer.clone());
+
+        let _ = complete(
+            &runtime,
+            &reqwest::Client::builder().build().unwrap(),
+            &pool,
+            &params,
+            Some(&cookie),
+            1_700_000_000,
+        )
+        .await;
+
+        let seen = log.lock().unwrap().join("\n");
+        assert!(
+            seen.contains("/.well-known/oauth-protected-resource"),
+            "discovery never fetched the protected-resource document:\n{seen}",
+        );
+        assert!(
+            seen.contains("POST /token"),
+            "a well-formed discovery never reached the token endpoint — the \
+             refusal test above would pass for the wrong reason:\n{seen}",
+        );
+    }
 }

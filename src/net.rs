@@ -288,6 +288,136 @@ pub(crate) fn test_pki() -> &'static TestPki {
     })
 }
 
+#[cfg(test)]
+/// A loopback HTTPS server presenting the test CA's leaf, routing by path.
+///
+/// The point of the TLS is not TLS: it is that an OAuth issuer must be
+/// `https`, so nothing could drive the real `login::complete` against a
+/// local server. The client validates this chain for real — no invalid-cert
+/// acceptance anywhere.
+///
+/// `routes` maps a path to a canned `(status, body)`. Unknown paths 404.
+/// Every request line is recorded.
+pub(crate) async fn spawn_tls<F>(
+    build_routes: F,
+) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+where
+    F: FnOnce(SocketAddr) -> std::collections::HashMap<String, (u16, String)>,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    // Both `ring` and `aws-lc-rs` are reachable in this tree (reqwest and
+    // rustls-platform-verifier pull their own), so rustls refuses to guess a
+    // process-level provider. Pick `ring`, once, to match the backend the
+    // production client already uses. `install_default` errors if something
+    // else got there first, which is fine — any provider will serve.
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
+
+    let pki = test_pki();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile_certs(pki.leaf_pem.as_bytes());
+    let key: PrivateKeyDer<'static> = rustls_pemfile_key(pki.leaf_key_pem.as_bytes());
+
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("test server TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Routes are built from the bound address: the documents have to name their
+    // own port, and the port is not known until the listener exists.
+    let routes = build_routes(addr);
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&log);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let routes = routes.clone();
+            let sink = std::sync::Arc::clone(&sink);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(sock).await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 16384];
+                let Ok(n) = tls.read(&mut buf).await else {
+                    return;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                sink.lock().unwrap().push(req);
+                let (status, body) = routes
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_else(|| (404, "not found".into()));
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(resp.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    (addr, log)
+}
+
+#[cfg(test)]
+fn rustls_pemfile_certs(
+    pem: &[u8],
+) -> Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> {
+    // Minimal PEM splitter — avoids another dependency for two blocks.
+    decode_pem_blocks(pem, "CERTIFICATE")
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+#[cfg(test)]
+fn rustls_pemfile_key(pem: &[u8]) -> tokio_rustls::rustls::pki_types::PrivateKeyDer<'static> {
+    let der = decode_pem_blocks(pem, "PRIVATE KEY")
+        .into_iter()
+        .next()
+        .expect("a private key block");
+    tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(der).into()
+}
+
+#[cfg(test)]
+fn decode_pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
+    use base64::Engine as _;
+    let text = String::from_utf8_lossy(pem);
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let mut out = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(i) = rest.find(&begin) {
+        let after = &rest[i + begin.len()..];
+        let Some(j) = after.find(&end) else { break };
+        let b64: String = after[..j].chars().filter(|c| !c.is_whitespace()).collect();
+        out.push(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("valid base64 in test PEM"),
+        );
+        rest = &after[j + end.len()..];
+    }
+    out
+}
+
 /// Hostnames the test leaf is valid for. Adding a new `.test` host to a test
 /// means adding it here, which is deliberate friction: the certificate is
 /// supposed to be narrow.
@@ -297,6 +427,7 @@ pub(crate) const TEST_TLS_HOSTS: &[&str] = &[
     "as-e2e.test",
     "feed-tls.test",
     "hop-tls.test",
+    "as-evil.test",
 ];
 
 /// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the
@@ -1847,126 +1978,6 @@ pub(crate) mod tests {
 
     // ── TLS test server ──────────────────────────────────────────────────────
 
-    /// A loopback HTTPS server presenting the test CA's leaf, routing by path.
-    ///
-    /// The point of the TLS is not TLS: it is that an OAuth issuer must be
-    /// `https`, so nothing could drive the real `login::complete` against a
-    /// local server. The client validates this chain for real — no invalid-cert
-    /// acceptance anywhere.
-    ///
-    /// `routes` maps a path to a canned `(status, body)`. Unknown paths 404.
-    /// Every request line is recorded.
-    pub(crate) async fn spawn_tls(
-        routes: std::collections::HashMap<String, (u16, String)>,
-    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-        // Both `ring` and `aws-lc-rs` are reachable in this tree (reqwest and
-        // rustls-platform-verifier pull their own), so rustls refuses to guess a
-        // process-level provider. Pick `ring`, once, to match the backend the
-        // production client already uses. `install_default` errors if something
-        // else got there first, which is fine — any provider will serve.
-        static PROVIDER: std::sync::Once = std::sync::Once::new();
-        PROVIDER.call_once(|| {
-            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-        });
-
-        let pki = test_pki();
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile_certs(pki.leaf_pem.as_bytes());
-        let key: PrivateKeyDer<'static> = rustls_pemfile_key(pki.leaf_key_pem.as_bytes());
-
-        let config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .expect("test server TLS config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = std::sync::Arc::clone(&log);
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let acceptor = acceptor.clone();
-                let routes = routes.clone();
-                let sink = std::sync::Arc::clone(&sink);
-                tokio::spawn(async move {
-                    let Ok(mut tls) = acceptor.accept(sock).await else {
-                        return;
-                    };
-                    let mut buf = vec![0u8; 16384];
-                    let Ok(n) = tls.read(&mut buf).await else {
-                        return;
-                    };
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let path = req
-                        .lines()
-                        .next()
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .unwrap_or("/")
-                        .to_string();
-                    sink.lock().unwrap().push(req);
-                    let (status, body) = routes
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_else(|| (404, "not found".into()));
-                    let resp = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = tls.write_all(resp.as_bytes()).await;
-                    let _ = tls.shutdown().await;
-                });
-            }
-        });
-        (addr, log)
-    }
-
-    fn rustls_pemfile_certs(
-        pem: &[u8],
-    ) -> Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> {
-        // Minimal PEM splitter — avoids another dependency for two blocks.
-        decode_pem_blocks(pem, "CERTIFICATE")
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn rustls_pemfile_key(pem: &[u8]) -> tokio_rustls::rustls::pki_types::PrivateKeyDer<'static> {
-        let der = decode_pem_blocks(pem, "PRIVATE KEY")
-            .into_iter()
-            .next()
-            .expect("a private key block");
-        tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(der).into()
-    }
-
-    fn decode_pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
-        use base64::Engine as _;
-        let text = String::from_utf8_lossy(pem);
-        let begin = format!("-----BEGIN {label}-----");
-        let end = format!("-----END {label}-----");
-        let mut out = Vec::new();
-        let mut rest = text.as_ref();
-        while let Some(i) = rest.find(&begin) {
-            let after = &rest[i + begin.len()..];
-            let Some(j) = after.find(&end) else { break };
-            let b64: String = after[..j].chars().filter(|c| !c.is_whitespace()).collect();
-            out.push(
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .expect("valid base64 in test PEM"),
-            );
-            rest = &after[j + end.len()..];
-        }
-        out
-    }
-
     /// **The chain really validates — no invalid-cert acceptance anywhere.**
     ///
     /// The foundation every test below rests on. If this passed because
@@ -1975,9 +1986,12 @@ pub(crate) mod tests {
     /// leaf has NO SAN for must still fail.
     #[tokio::test]
     async fn the_test_ca_is_trusted_and_still_validates_hostnames() {
-        let mut routes = std::collections::HashMap::new();
-        routes.insert("/ok".to_string(), (200, "{}".to_string()));
-        let (addr, _log) = spawn_tls(routes).await;
+        let (addr, _log) = spawn_tls(|_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert("/ok".to_string(), (200, "{}".to_string()));
+            r
+        })
+        .await;
         test_host_override("feed-tls.test", addr);
         // Registered, resolvable — but NOT in the leaf's SAN list.
         test_host_override("not-in-san.test", addr);
