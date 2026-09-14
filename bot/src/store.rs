@@ -278,13 +278,41 @@ impl Store {
     /// Count fresh mints in the rolling window `[now - window_secs, now]` — the
     /// figure the poll loop checks against `max_daily_mints` before minting more.
     pub fn count_mints_since(&self, window_secs: i64) -> Result<usize> {
-        let cutoff = now() - window_secs;
+        self.count_mints_at(now() - window_secs)
+    }
+
+    /// [`count_mints_since`] with the cutoff passed in rather than derived from
+    /// the clock.
+    ///
+    /// Split out because `now()` is whole seconds. `record_mint` stamps
+    /// `minted_at = now()` at one instant and `count_mints_since` computed its
+    /// cutoff at a LATER one, so a second boundary crossing between them made
+    /// `minted_at >= cutoff` false for rows written moments earlier. At
+    /// `window_secs = 0` that is a zero-width window and the count drops to 0.
+    ///
+    /// That is a test-only input — the sole production caller passes
+    /// `DAY_SECS` (`bot/src/main.rs`) — but it reddened CI on unrelated PRs,
+    /// because the assertion it broke sits in the invite bot's suite and the
+    /// bot runs on every PR. Taking the cutoff as a parameter lets the test
+    /// pin a fixed instant and never read the clock twice.
+    fn count_mints_at(&self, cutoff: i64) -> Result<usize> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM mint_log WHERE minted_at >= ?1",
             [cutoff],
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Record a mint at an explicit instant. Test-only: production always
+    /// stamps `now()` via [`record_mint`].
+    #[cfg(test)]
+    fn record_mint_at(&self, did: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO mint_log (did, minted_at) VALUES (?1, ?2)",
+            rusqlite::params![did, at],
+        )?;
+        Ok(())
     }
 
     /// Whether the store has NO handled rows yet — i.e. this is a FIRST RUN (fresh
@@ -493,14 +521,35 @@ mod tests {
         );
     }
 
+    /// **Pinned to a fixed instant, because the clock moved under this test.**
+    ///
+    /// It used to stamp rows with `record_mint` (whole-second `now()`) and then
+    /// ask `count_mints_since(0)`, which re-read the clock for its cutoff. One
+    /// second boundary between the two made `minted_at >= cutoff` false and the
+    /// count 0 — a genuine failure, and one that reddened CI on PRs that had
+    /// nothing to do with the bot. Reproduced deterministically by sleeping past
+    /// a boundary before the assertion: `left: 0, right: 2`, the exact CI
+    /// signature.
+    ///
+    /// Everything below now works from `t0`, so no assertion depends on when it
+    /// runs. One `count_mints_since` call is kept so the `now() - window_secs`
+    /// wiring stays covered.
     #[test]
     fn mint_log_counts_within_window() {
         let s = mem();
-        assert_eq!(s.count_mints_since(86_400).unwrap(), 0);
-        s.record_mint("did:plc:a").unwrap();
-        s.record_mint("did:plc:b").unwrap();
-        assert_eq!(s.count_mints_since(86_400).unwrap(), 2);
-        // A zero-width window (cutoff == now) still counts mints stamped this second.
-        assert_eq!(s.count_mints_since(0).unwrap(), 2);
+        let t0 = now();
+        assert_eq!(s.count_mints_at(t0).unwrap(), 0);
+        s.record_mint_at("did:plc:a", t0).unwrap();
+        s.record_mint_at("did:plc:b", t0).unwrap();
+        // A zero-width window (cutoff == the stamp) still counts them.
+        assert_eq!(s.count_mints_at(t0).unwrap(), 2);
+        // A cutoff one second later excludes them — the boundary is `>=`.
+        assert_eq!(s.count_mints_at(t0 + 1).unwrap(), 0);
+        // An older row falls outside a cutoff that a newer one clears.
+        s.record_mint_at("did:plc:old", t0 - 100).unwrap();
+        assert_eq!(s.count_mints_at(t0 - 50).unwrap(), 2);
+        assert_eq!(s.count_mints_at(t0 - 200).unwrap(), 3);
+        // The production wrapper still derives its cutoff from the clock.
+        assert_eq!(s.count_mints_since(86_400).unwrap(), 3);
     }
 }
