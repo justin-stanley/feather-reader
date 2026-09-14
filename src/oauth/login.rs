@@ -1202,21 +1202,41 @@ mod tests {
              authorization request was bound to",
         );
 
-        // The handle is looked up for the DID the GRANT returned, never for
-        // anything remembered from the login form.
+        // Resolution happens exactly once, and after the exchange.
+        //
+        // NOT "for the DID the grant returned rather than the pending row" — a
+        // review pointed out that claim is unfalsifiable, because
+        // `accept_token_response` bails unless `tokens.sub == pending.did`, so
+        // the two are provably equal on every path that reaches here. What is
+        // left worth asserting is the count and the subject.
         assert_eq!(
             log.lock().unwrap().resolved,
             vec![PENDING_DID.to_string()],
-            "the handle was resolved for the wrong subject",
+            "the handle lookup did not run exactly once for this subject",
         );
 
         let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
-        assert!(
-            crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
-                .await
-                .unwrap()
-                .is_some(),
-            "no session was stored for a successful login",
+        let stored = crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+            .await
+            .unwrap()
+            .expect("no session was stored for a successful login");
+
+        // **The session must PERSIST the DPoP key the grant was bound to.**
+        //
+        // A review found this unpinned even after the EXCHANGE's key was fixed:
+        // storing a freshly generated key left 708 tests green. The access token
+        // is DPoP-bound to the pending key's thumbprint, so a session holding any
+        // other key fails proof validation on every later PDS call — a login that
+        // succeeds and then does nothing. That is the worst shape this bug could
+        // take, because the failure surfaces far from its cause.
+        let stored_thumbprint = keys::SigningKey::from_jwk_json(&stored.dpop_key_jwk, "session")
+            .expect("the stored session's DPoP key does not parse")
+            .thumbprint()
+            .unwrap();
+        assert_eq!(
+            stored_thumbprint,
+            fixture_thumbprint(),
+            "the session persisted a different DPoP key than the grant is bound to",
         );
     }
 
@@ -1829,6 +1849,74 @@ mod tests {
             !params.iter().any(|(k, _)| *k == "client_assertion"),
             "a private_key_jwt assertion was sent for a login started under \
              `none`: {params:?}",
+        );
+    }
+
+    /// **The client assertion's `aud`, and the session's, are the right hosts.**
+    ///
+    /// Two more values `complete` decides that nothing checked: swapping the
+    /// assertion's audience from `pending.issuer` to `pending.pds_url`, and the
+    /// stored session's `aud` the other way, each left the whole suite green
+    /// despite being genuinely different hosts in the fixture.
+    ///
+    /// `aud` is the assertion's anti-replay binding — an assertion minted for one
+    /// audience must not be accepted by another — and the session's `aud` is the
+    /// audience every later DPoP-bound PDS call uses. The earlier tests inspected
+    /// only whether `client_assertion` was PRESENT, never what was in it.
+    #[tokio::test]
+    async fn the_assertion_and_session_audiences_are_distinct_and_correct() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok());
+
+        // The fixture's issuer and PDS are deliberately different hosts, so
+        // these two assertions cannot both be satisfied by one value.
+        let assertion = {
+            let calls = log.lock().unwrap();
+            calls.posted[0]
+                .params
+                .iter()
+                .find(|(k, _)| *k == "client_assertion")
+                .map(|(_, v)| v.clone())
+                .expect("no client_assertion for a private_key_jwt login")
+        };
+        // Decoded inline rather than via a shared helper: this file is merged
+        // into another branch that defines one, and two definitions would clash.
+        let claims: serde_json::Value = {
+            use base64::Engine as _;
+            let seg = assertion.split('.').nth(1).expect("malformed assertion");
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(seg)
+                .expect("assertion payload is not base64url");
+            serde_json::from_slice(&raw).expect("assertion payload is not JSON")
+        };
+        assert_eq!(
+            claims.get("aud").and_then(|v| v.as_str()),
+            Some(PENDING_ISSUER),
+            "the assertion was minted for the wrong audience; its anti-replay \
+             binding names a server it was not sent to",
+        );
+
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let stored = crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+            .await
+            .unwrap()
+            .expect("session");
+        assert_eq!(
+            stored.aud, "https://pds.example.com",
+            "the session's audience is not the PDS; every later DPoP-bound call \
+             would carry the wrong `htu`/`aud`",
         );
     }
 }
