@@ -307,11 +307,17 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    // Both `ring` and `aws-lc-rs` are reachable in this tree (reqwest and
-    // rustls-platform-verifier pull their own), so rustls refuses to guess a
-    // process-level provider. Pick `ring`, once, to match the backend the
-    // production client already uses. `install_default` errors if something
-    // else got there first, which is fine — any provider will serve.
+    // Both `ring` and `aws-lc-rs` are reachable in this tree, so rustls refuses
+    // to guess a process-level provider for the SERVER side here.
+    //
+    // **This does NOT match the client, contrary to what this comment used to
+    // say.** reqwest's `rustls` feature resolves to aws-lc-rs and its builder
+    // selects that provider unconditionally — it never reads the process default
+    // — so the client under test uses aws-lc-rs while this server uses ring.
+    // Harmless (they interoperate, and `install_default` cannot influence
+    // reqwest), but worth stating correctly rather than reassuringly.
+    //
+    // `install_default` errors if something else got there first, which is fine.
     static PROVIDER: std::sync::Once = std::sync::Once::new();
     PROVIDER.call_once(|| {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -478,6 +484,14 @@ pub(crate) const TEST_TLS_HOSTS: &[&str] = &[
 
 /// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the
 /// forbidden-IP check for that host only.
+///
+/// **Registrations are process-global and last-write-wins.** Several tests
+/// register the SAME hostnames to different servers concurrently. What keeps
+/// them apart is not the host key — an earlier comment claimed it was — but that
+/// reqwest's `.resolve()` ignores the port, so every registration collapses to
+/// `127.0.0.1` and each test's URL port routes it back to its own listener. That
+/// is incidental, and would break the moment a test server bound anything other
+/// than loopback.
 ///
 /// Bypassing the IP check is the entire point: the test server is on loopback,
 /// which the guard is right to refuse. Only the registered host is exempt —
@@ -2059,10 +2073,17 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("a host with no SAN must still fail: validation is NOT disabled");
+        // **Assert the CERTIFICATE reason, not merely that it failed.**
+        //
+        // An earlier version accepted `msg.contains("name")`, which the DNS error
+        // `nodename nor servname provided` also satisfies — so deleting the
+        // `test_host_override` line above made this pass while proving nothing
+        // about SAN validation. Verified: it did.
         let msg = format!("{err:#}").to_ascii_lowercase();
         assert!(
-            msg.contains("certificate") || msg.contains("tls") || msg.contains("name"),
-            "failed, but not for a certificate reason: {msg}",
+            msg.contains("notvalidforname") || msg.contains("invalid peer certificate"),
+            "failed, but not because the certificate is invalid for this name — a \
+             DNS or connect failure would prove nothing here: {msg}",
         );
     }
 }
