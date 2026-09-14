@@ -163,3 +163,22 @@ tower = { version = "0.5", features = ["util"] }
 # exact rather than timing-dependent. Same tokio crate as the runtime dependency
 # above — this enables a feature, it does not add a package to the lock.
 tokio = { version = "1.45", features = ["test-util"] }
+# A TEST certificate authority, so the test HTTP server can speak real TLS.
+#
+# The OAuth issuer is required to be `https` (discovery.rs), and the SSRF guard
+# refuses loopback — so there was no way to drive the real `complete` against a
+# local server, and the adapter wiring between the tested seam and the network
+# had no coverage at all. The alternative was a test-only escape from the https
+# rule; a real CA SATISFIES the rule instead of suspending it, which is why this
+# dependency is here rather than a `#[cfg(test)]` `if scheme != "https"` bypass.
+#
+# `ring` for the TEST SERVER. reqwest reads the process-installed default and
+# falls back to aws-lc-rs, so installing ring in a test DOES affect clients built
+# after it in the same binary; release builds install nothing and use aws-lc-rs. Both are already in the lock; this adds neither.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
+
+# The server half of that. rustls 0.23 and tokio-rustls are ALREADY in the lock
+# transitively via reqwest, so this promotes an existing crate to a direct dev
+# dependency rather than adding a second TLS stack — verified: exactly one
+# `rustls` package in Cargo.lock.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
