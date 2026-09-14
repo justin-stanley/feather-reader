@@ -6860,34 +6860,36 @@ mod tests {
         let writer = tokio::spawn(async move {
             // Record WHEN each write completed, not just how many did. See the
             // assertion below for why the timestamps are the load-bearing part.
-            let mut completions: Vec<std::time::Instant> = Vec::new();
-            // Attempt START times, so the assertions can count only the attempts
-            // actually made inside the measured window. The writer is spawned
-            // before `t0`, so a plain counter folds in pre-`t0` attempts that
-            // can never appear in `during` — a systematic bias against the very
-            // thing being asserted.
-            let mut starts: Vec<std::time::Instant> = Vec::new();
+            // (when the attempt STARTED, whether it landed).
+            //
+            // The outcome travels with the timestamp because the assertions
+            // below count consecutive FAILURES, not elapsed time — see the note
+            // there. Start times rather than completion times so only attempts
+            // actually made inside the measured window are counted; the writer
+            // is spawned before `t0`.
+            let mut outcomes: Vec<(std::time::Instant, bool)> = Vec::new();
             // Kept for the failure message: if the writes are failing for a
             // reason that is NOT lock contention, nothing lands and the test
             // fails — this is what says why.
             let mut first_err: Option<String> = None;
             while !writer_done.load(std::sync::atomic::Ordering::Relaxed) {
-                starts.push(std::time::Instant::now());
+                let started = std::time::Instant::now();
                 match grant_access(
                     &writer_pool,
-                    &format!("did:plc:writer{}", starts.len()),
+                    &format!("did:plc:writer{}", outcomes.len()),
                     None,
                     "sweep-test",
                     None,
                 )
                 .await
                 {
-                    Ok(()) => completions.push(std::time::Instant::now()),
+                    Ok(()) => outcomes.push((started, true)),
                     // Expected: the sweep holds the write lock right now.
                     // Retrying is the entire point, so this is counted, not
                     // fatal. A `?` here would abort the writer on the first
                     // contended write and destroy the measurement.
                     Err(err) => {
+                        outcomes.push((started, false));
                         if first_err.is_none() {
                             first_err = Some(format!("{err:#}"));
                         }
@@ -6896,7 +6898,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             writer_pool.close().await;
-            (completions, starts, first_err)
+            (outcomes, first_err)
         });
 
         // **Drive `delete_in_batches` directly, not `prune_old_entries`.**
@@ -6935,31 +6937,25 @@ mod tests {
         .await?;
         let sweep = t0.elapsed();
         done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (completions, starts, first_err) = writer.await?;
+        let (outcomes, first_err) = writer.await?;
         let sweep_end = t0 + sweep;
-        // Writes that COMPLETED while the delete loop was in flight, and the
-        // attempts actually STARTED inside it.
-        let landed: Vec<std::time::Instant> = completions
+        // Attempts actually made inside the measured window, in order.
+        let inside: Vec<bool> = outcomes
             .iter()
-            .copied()
-            .filter(|t| *t > t0 && *t < sweep_end)
+            .filter(|(t, _)| *t >= t0 && *t < sweep_end)
+            .map(|(_, ok)| *ok)
             .collect();
-        let during = landed.len();
-        let attempts = starts
-            .iter()
-            .filter(|t| **t >= t0 && **t < sweep_end)
-            .count();
-        // **The longest stretch of the loop with no write getting through.**
+        let attempts = inside.len();
+        let during = inside.iter().filter(|ok| **ok).count();
+        // **The longest unbroken run of REFUSED attempts.**
         //
-        // Anchored at both ends, so "nothing landed at all" is not a special
-        // case: with no completions this is the whole sweep, which is exactly
-        // what a lock held from the first batch to the last looks like.
-        let max_gap = {
-            let mut worst = std::time::Duration::ZERO;
-            let mut prev = t0;
-            for t in landed.iter().copied().chain(std::iter::once(sweep_end)) {
-                worst = worst.max(t.saturating_duration_since(prev));
-                prev = t;
+        // Counted in attempts, not elapsed time — see the note on the assertion
+        // for why that distinction is the whole point.
+        let max_refused_run = {
+            let (mut worst, mut run) = (0usize, 0usize);
+            for ok in &inside {
+                run = if *ok { 0 } else { run + 1 };
+                worst = worst.max(run);
             }
             worst
         };
@@ -6985,15 +6981,22 @@ mod tests {
         // batching starves the writer of attempts and gets reported as "invalid
         // measurement", blaming the test for the defect it just detected.
         //
-        // **Partial coverage, measured rather than asserted.** Deleting only the
-        // `PRUNE_BATCH_HANDOFF` sleep and keeping the batching is caught **3
-        // runs in 5** — sometimes here, when the loop dips under the floor, more
-        // often by the gap assertion below. A previous version of this comment
-        // claimed it was NOT caught at all; that was wrong, and so was the "~3x
-        // throughput" figure offered as the reason not to chase it. The honest
-        // statement is that the removal is detected unreliably, and that nothing
-        // here is tuned to make it reliable, because doing so means thresholding
-        // a rate.
+        // **Partial coverage, measured rather than asserted.** Two mutations
+        // that keep the loop looking roughly batched are caught only sometimes,
+        // both by this floor rather than by the assertion below:
+        //
+        //   `LIMIT` dropped (no batching at all)   3 runs in 5
+        //   `PRUNE_BATCH_HANDOFF` sleep removed    1 run  in 5
+        //
+        // Both were caught more often — 5/5 and 3/5 — by the wall-clock form
+        // this replaced. That is a real coverage loss and it was taken on
+        // purpose: the wall-clock form FALSE-FAILED correct code, which is a
+        // worse defect than missing a deliberate deletion of a commented line.
+        // See the note on the assertion below for the measurement.
+        //
+        // Nothing here is tuned to make those two reliable. Doing so means
+        // thresholding a rate, which is what this test has now been wrong about
+        // three separate times.
         let handoff_floor = PRUNE_BATCH_HANDOFF * BATCHES as u32;
         assert!(
             sweep > handoff_floor,
@@ -7029,22 +7032,47 @@ mod tests {
         //                          cannot find this — it slows writer and
         //                          sweeper together, which is the wrong axis.
         //
-        // What genuinely does not move with disk speed is the SHAPE: how long
-        // the loop goes without letting anybody in. Both sides of `max_gap` vs
-        // `sweep` scale with the machine, so the ratio is stable.
+        //   `max_gap * 2 <`     — the longest WALL-CLOCK stretch with no write
+        //   `sweep`               landing, against the loop's duration. Both
+        //                         sides scale with the machine, which fixed the
+        //                         fraction's problem and introduced a new one:
+        //                         a gap opens when the writer is DESCHEDULED
+        //                         just as surely as when the lock is held.
+        //                         Observed under 4x CPU saturation, full suite:
+        //                         `went 319.95ms of 609.83ms` — while **622 of
+        //                         626 attempts landed**. The lock was fine; the
+        //                         writer task simply did not run for 320 ms.
+        //
+        // So count REFUSALS, not time. The longest unbroken run of `SQLITE_BUSY`
+        // against the number of attempts made:
         //
         //   handed over : the lock is free for `PRUNE_BATCH_HANDOFF` after every
-        //                 batch, so the longest dry stretch is about one batch,
-        //                 i.e. ~`sweep / BATCHES` — ~10%.
-        //   held across : nothing lands from the first batch to the last, so the
-        //                 longest dry stretch is the whole loop — 100%.
+        //                 batch, so the longest refused run is about one batch's
+        //                 worth of attempts — ~`attempts / BATCHES`, ~10%.
+        //   held across : every attempt in the window is refused — 100%.
+        //
+        // This is immune to descheduling in a way no wall-clock measure can be:
+        // a starved writer makes no attempts, so it contributes to neither side
+        // of the ratio. Machine speed still cancels, because both sides are
+        // counts of the same attempts. Re-checked against the failure above:
+        // 622 of 626 landing means a refused run of at most 4, nowhere near the
+        // 313 it would take to trip.
         //
         // A 50% ceiling sits 5x above the expected 10% and 2x below the defect.
-        // It tolerates the writer missing four consecutive hand-offs before it
-        // would false-fail, and it does not care how long a batch takes.
         //
-        // `max_gap` is anchored at `t0` and `sweep_end`, so zero completions
-        // yields the whole sweep rather than an empty-iterator special case.
+        // Measured, with the apparatus verified before each run:
+        //
+        //   correct, 1x / 10x per-batch hold   passes
+        //   one tx across batches, 1x          CAUGHT — refused 128 of 129
+        //   one tx across batches, 10x         CAUGHT — refused 1841 of 1843
+        //   `LIMIT` dropped                    caught 3 runs in 5 (by the floor)
+        //   hand-off sleep removed             caught 1 run  in 5 (by the floor)
+        //
+        // The last two were 5/5 and 3/5 under the wall-clock form. Losing that
+        // is the price of not false-failing correct code, and it is the right
+        // way round: the named defect is now caught by two orders of magnitude,
+        // and the mutations that got weaker are deliberate deletions of lines
+        // that carry their own explanation.
         assert!(
             attempts >= 20,
             "the writer only got {attempts} attempts inside a {sweep:?} delete loop \
@@ -7052,12 +7080,11 @@ mod tests {
              This is an invalid measurement, not a loop that held the lock{why}"
         );
         assert!(
-            max_gap * 2 < sweep,
-            "the delete loop went {max_gap:?} of {sweep:?} without a single write \
-             getting through ({during} of {attempts} attempts landed) — a loop that \
-             hands the write lock over between batches leaves no dry stretch longer \
-             than about one batch; one that holds the lock across them is dry from \
-             the first batch to the last{why}"
+            max_refused_run * 2 < attempts,
+            "the delete loop refused {max_refused_run} consecutive write attempts out \
+             of {attempts} ({during} landed) — a loop that hands the write lock over \
+             between batches refuses at most about one batch's worth in a row; one \
+             that holds the lock across them refuses nearly every attempt it sees{why}"
         );
 
         pool.close().await;
