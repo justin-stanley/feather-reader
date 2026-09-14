@@ -66,7 +66,7 @@ publication being polled.
 `content` is **not a standard**. Each publishing platform writes its own format
 into that field. Measured across the same 449 documents:
 
-**7 distinct content wrappers**
+**6 distinct content wrappers** (the table has seven rows; one is the *absence* of a wrapper)
 
 | count | `$type` |
 |---|---|
@@ -83,7 +83,7 @@ into that field. Measured across the same 449 documents:
 `app.offprint.block.image`, `blog.pckt.block.table`, and so on, from five
 different vendor namespaces.
 
-Rendering `content` means implementing seven formats and twenty-two block types,
+Rendering `content` means implementing six formats and twenty-two block types,
 and that set **grows with every new platform that adopts the lexicon** — the work
 is unbounded and the cost lands on us, not on the publishers. It also drags in an
 HTML-sanitisation surface (`iframe`, `website`, `blueskyEmbed` blocks) on
@@ -137,7 +137,9 @@ check when implementation starts.
 | full payload, everything | **~3.7 MB** |
 | requests for a full sweep | ~35 (1–3 pages each at `limit=100`) |
 
-The existing poller already handles 111 HTTP feeds. This is smaller. **No
+The existing poller already handles 92 HTTP feeds — 111 total minus the 19
+`at://` rows it cannot poll, which are the subject of this document. This is
+smaller. **No
 server-side filtering is needed and none is available** — `listRecords` cannot
 filter by field, so `site` is matched client-side.
 
