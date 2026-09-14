@@ -37,7 +37,9 @@ trivial to self-host.
   algorithm, no "discover" tab. Every feature has to earn its place against
   "does this make the calm reading experience better, or just bigger?"
 - **Single binary, self-hostable.** Rust + an embedded SQLite cache (no Postgres
-  to run), plus a small Node OAuth sidecar. Easy to run yourself.
+  to run). Since 0.3.0 the atproto OAuth client is built in, so a self-host can
+  be **one process** — or keep the Node sidecar if you prefer. Easy to run
+  yourself either way.
 
 ## The `community.lexicon.rss.*` standard
 
@@ -78,15 +80,20 @@ lexicon.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="design/architecture/runtime-dark.png">
-    <img alt="Runtime: the browser reaches Cloudflare (proxy, cache, origin lock), which forwards to a single Fly.io container running Caddy on :8080 as the edge — routing /oauth/* to a Node OAuth sidecar on :8081 and everything else to the Rust axum app on :8082, which holds a disposable SQLite cache on /data. The app makes SSRF-guarded conditional-GET fetches to feed origins and com.atproto.repo.* calls to your atproto PDS; the sidecar handles the OAuth handshake and tokens with the PDS." src="design/architecture/runtime-light.png" width="620">
+    <img alt="Runtime: the browser reaches Cloudflare (proxy, cache, origin lock), which forwards to a single Fly.io container running Caddy on :8080 as the edge. Caddy sends everything to the Rust axum app on :8082, which holds a disposable SQLite cache on /data, makes SSRF-guarded conditional-GET fetches to feed origins, and makes com.atproto.repo.* calls to your atproto PDS. The OAuth handshake is handled either by the app itself (FEATHERREADER_REPO_BACKEND=rust, one process) or by a Node OAuth sidecar on :8081 that Caddy routes /oauth/* to (the sidecar backend, the default, two processes); exactly one of the two is live." src="design/architecture/runtime-light.png" width="620">
   </picture>
 </p>
 
-Caddy fronts everything on a single port — routing `/oauth/*` to the Node
-confidential-client sidecar and the rest to the Rust server. The SQLite cache on
+Caddy fronts everything on a single port — routing `/oauth/*` to whichever
+process owns the OAuth flow and the rest to the Rust server. The SQLite cache on
 the mounted volume is disposable; all durable state lives in your PDS. An
 [optional follow→invite bot](#invite-bot-optional) runs *outside* this container
 and reaches the app over `POST /bot/claims`; it isn't part of the core app.
+
+The dashed links are the Node sidecar, used only on the default `sidecar`
+backend. On `FEATHERREADER_REPO_BACKEND=rust` the app owns the OAuth flow itself,
+those links do not exist, and the `:8081` process is not started — see
+[Choosing an OAuth backend](#choosing-an-oauth-backend).
 
 <sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
 
@@ -118,18 +125,24 @@ permissioned ("private") records ship.
 
 ## Build & run
 
-FeatherReader is two processes: the **Rust server** and a small **Node OAuth
-sidecar** that owns the atproto OAuth flow (DPoP, token refresh) so the Rust side
-never holds PDS tokens.
+FeatherReader runs as **one or two processes**, depending on which OAuth backend
+you choose (see [Choosing an OAuth backend](#choosing-an-oauth-backend)):
+
+- **`sidecar`** (the default) — the Rust server plus a small **Node OAuth
+  sidecar** that owns the atproto OAuth flow, so the Rust side never holds PDS
+  tokens.
+- **`rust`** — the Rust server alone, using its own built-in atproto OAuth
+  client. No Node.
 
 **Prerequisites:** a recent stable Rust toolchain (see `rust-version` in
-`Cargo.toml`) and Node.js for the sidecar.
+`Cargo.toml`), plus Node.js **24 or newer only if** you run the sidecar backend
+(it uses the built-in `node:sqlite`, which is stable and flagless from 24).
 
 ```sh
-# 1. Build the server
+# 1. Build the server (always)
 cargo build --release          # -> target/release/featherreader
 
-# 2. Build the OAuth sidecar
+# 2. Build the OAuth sidecar (only for FEATHERREADER_REPO_BACKEND=sidecar)
 cd oauth-sidecar
 npm ci
 npm run build
@@ -139,22 +152,124 @@ Both processes are configured entirely through environment variables — there i
 no config file. Every knob has a sensible default, so a bare run boots and works.
 
 - The **server** reads `FEATHERREADER_*` variables (bind address, database path,
-  poll interval, the sidecar URL and shared internal secret, …). See the table at
-  the top of [`src/config.rs`](src/config.rs).
+  poll interval, …), plus the `SIDECAR_*` URL and shared-secret pair it needs to
+  reach the sidecar. See the table at the top of
+  [`src/config.rs`](src/config.rs).
 - The **sidecar** reads `SIDECAR_*` variables (its public URL, storage path, the
   at-rest token-encryption key, the shared internal secret, …). See
-  [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example).
+  [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). Not used on the
+  `rust` backend.
 
 In production the sidecar requires a real at-rest encryption key and a strong
 shared internal secret, and refuses to boot without them. **Never commit secret
 values** — the example files ship placeholders only.
 
+## Choosing an OAuth backend
+
+`FEATHERREADER_REPO_BACKEND` selects which implementation performs the atproto
+OAuth handshake and every `com.atproto.repo.*` call:
+
+| | `sidecar` (default) | `rust` |
+|---|---|---|
+| Processes | Rust server + Node sidecar | Rust server only |
+| OAuth client | `@atproto/oauth-client-node` | built in |
+| Runtime deps | Node.js | none |
+| Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` |
+
+**Upgrading to 0.3.0 changes nothing.** The default is `sidecar`, so an existing
+deployment keeps the topology it already has until you choose otherwise.
+
+### Switching
+
+```sh
+FEATHERREADER_REPO_BACKEND=rust
+FEATHERREADER_OAUTH_ENCRYPTION_KEY=<random, >=32 bytes>   # required in production
+```
+
+The server **refuses to start** if you select `rust` on a production-like
+instance without an encryption key. That table holds every user's access token,
+refresh token and DPoP private key; without a key they would sit in plaintext in
+SQLite, on the same volume as the feed cache and in every backup of it. An
+unrecognised backend name is also a startup failure rather than a silent
+fallback.
+
+**Put the signing key somewhere persistent.** `FEATHERREADER_OAUTH_KEY_PATH`
+defaults to the *relative* `oauth-signing-key.json`, which is fine for a local
+run and a trap in a container: the key lands in the working directory, is lost on
+every redeploy, and a new one is generated in its place. Your published JWKS then
+changes on each deploy, which breaks `private_key_jwt` against any authorization
+server still holding the old one. The supplied image already points it at the
+persistent volume; a custom image or bare-binary deployment must do the same:
+
+```sh
+FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json
+```
+
+### What switching costs
+
+- **Everyone signs in again — in both directions.** The two backends keep
+  separate session stores, and separate is literal: nothing under `src/` reads
+  `SIDECAR_DB`, because the Rust backend keeps its own `oauth_session` table
+  inside `FEATHERREADER_DB`, apart from the sidecar's own database. No access
+  token, refresh token or DPoP key crosses the flip, so every signed-in reader is
+  logged out by it — and **rolling back logs them out a second time**, off a
+  sidecar store that has gone stale in the meantime. Browser sessions are
+  in-memory and already end on restart, so nothing is lost; it is one login per
+  flip, which is worth timing for low traffic and telling people about.
+- **Unverified, but worth knowing:** the two backends publish JWKS from different
+  signing keys, so if a PDS caches our JWKS across the flip, the first login
+  after it may fail for that reason rather than because of a bug in the new path.
+  This has not been observed or reproduced — it is a thing to rule out before
+  concluding the backend is broken.
+- **`/oauth/*` routing must match the backend.** The two cannot share
+  `/oauth/callback`: your PDS redirects there with identical
+  `?code=&state=&iss=` in both cases, so nothing in the request distinguishes
+  them and one process has to own the path. The supplied container handles this
+  — the entrypoint installs the matching Caddy routing from the same environment
+  variable. **A bare-binary deployment must route `/oauth/*` itself:** to the app
+  on `rust`, to the sidecar on `sidecar`.
+- **Rolling back is unsetting the variable and restarting.** Nothing is migrated
+  or destroyed by the switch, and both Caddy routings ship in every image, so a
+  rollback needs no rebuild. Cheap operationally — but not free for your readers,
+  who log in again (see above).
+
+### Which should you run?
+
+`sidecar` is the default and the option with production time behind it — it is
+what the hosted instance runs today. `rust` shipped in 0.3.0, but it has **no
+production time at all** yet: its login path is now covered by tests (the code
+exchange itself, and each of the security guards around it, are pinned by them),
+and that is a different claim from having been exercised against real PDSes under
+real traffic. `private_key_jwt` client authentication and RFC 7009 revocation in
+particular are implemented and unit-tested on the Rust path but have not run
+against a production PDS.
+
+So: if you want the smaller deployment — one process, no Node — and are content
+to be early, start fresh on `rust` and watch your logs through the first logins.
+Otherwise run the default. If you already have a working `sidecar` deployment,
+there is no urgency to move.
+
+The choice is **transitional**. Maintaining two implementations of the same
+surface has a real cost, and the intent is to remove the sidecar in a later
+release once the Rust path has enough production time. `sidecar` will be
+announced as deprecated before it is removed.
+
 ## Self-hosting
 
-FeatherReader is designed to be run by anyone: a single static Rust binary plus
-the sidecar, an embedded SQLite cache, and no external database. Front it with
-your own reverse proxy / TLS. Teardown and data-ownership notes live in
-[`deploy/`](deploy/).
+FeatherReader is designed to be run by anyone: a single static Rust binary
+(optionally plus the Node sidecar), an embedded SQLite cache, and no external
+database. Front it with your own reverse proxy / TLS. Teardown and
+data-ownership notes live in [`deploy/`](deploy/).
+
+`GET /health` is the unauthenticated liveness endpoint, and it reports machine
+facts only — no user counts, no DIDs, no feed URLs. The first token of the body
+is the state: `ok`, `unknown` or `FAIL`. Only a *measured* database failure is a
+failure (`FAIL`, HTTP 503); `unknown` means no probe has completed yet, which
+happens briefly at boot and is not an outage — so match the state token, not just
+the status code. The remaining lines (`db:`, `uptime:`, `poller:`,
+`polling-paused:`, `backend:`, `oauth-runtime:`) never change the status code, on
+the grounds that a stale poller can still serve pages while an unreadable
+database cannot. Alert on the body if you want to hear about those.
 
 ## Invite bot (optional)
 

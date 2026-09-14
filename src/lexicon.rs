@@ -497,3 +497,158 @@ mod tests {
         assert_eq!(parsed.read_through, None);
     }
 }
+
+/// Deterministic orderings for the reader's record lists.
+///
+/// These live here, beside the types, and are used by **both** the sidecar
+/// client and the Rust-native one. That is deliberate: the two clients coexist
+/// until cutover, and a divergence in ordering would not be a subtle bug — it
+/// would reorder the user's feed list the moment the implementation swapped, in
+/// a way no test comparing the clients' *data* would catch.
+pub mod sort {
+    use super::{Folder, Saved, Subscription};
+    use std::cmp::Ordering;
+
+    /// Subscriptions: display title (case-insensitive), then URL, then rkey.
+    ///
+    /// An untitled feed sorts by its URL, so it lands where a reader would look
+    /// for it rather than at one end of the list.
+    pub fn subscriptions(
+        (a_key, a): &(String, Subscription),
+        (b_key, b): &(String, Subscription),
+    ) -> Ordering {
+        let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
+        let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
+        a_title
+            .cmp(&b_title)
+            .then_with(|| a.url.cmp(&b.url))
+            .then_with(|| a_key.cmp(b_key))
+    }
+
+    /// Folders: `position` (the lexicon's sort hint; unset sorts LAST), then
+    /// name (case-insensitive), then rkey.
+    pub fn folders((a_key, a): &(String, Folder), (b_key, b): &(String, Folder)) -> Ordering {
+        a.position
+            .unwrap_or(u64::MAX)
+            .cmp(&b.position.unwrap_or(u64::MAX))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a_key.cmp(b_key))
+    }
+
+    /// Saved entries: newest first by `createdAt` (RFC 3339 sorts
+    /// lexicographically), then rkey ascending.
+    pub fn saved((a_key, a): &(String, Saved), (b_key, b): &(String, Saved)) -> Ordering {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a_key.cmp(b_key))
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::sort;
+    use super::{Folder, Saved, Subscription};
+
+    fn sub(rkey: &str, url: &str, title: Option<&str>) -> (String, Subscription) {
+        let mut s = Subscription::new(url, "2026-01-01T00:00:00Z");
+        s.title = title.map(str::to_string);
+        (rkey.to_string(), s)
+    }
+
+    fn folder(rkey: &str, name: &str, position: Option<u64>) -> (String, Folder) {
+        let mut f = Folder::new(name, "2026-01-01T00:00:00Z");
+        f.position = position;
+        (rkey.to_string(), f)
+    }
+
+    fn saved(rkey: &str, url: &str, created_at: &str) -> (String, Saved) {
+        (rkey.to_string(), Saved::new(url, created_at))
+    }
+
+    fn order<T>(
+        mut items: Vec<(String, T)>,
+        cmp: fn(&(String, T), &(String, T)) -> std::cmp::Ordering,
+    ) -> Vec<String> {
+        items.sort_by(cmp);
+        items.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Title first, and case must NOT split the alphabet.
+    #[test]
+    fn subscriptions_sort_by_title_case_insensitively() {
+        let items = vec![
+            sub("r1", "https://z.example/f", Some("banana")),
+            sub("r2", "https://a.example/f", Some("Apple")),
+            sub("r3", "https://m.example/f", Some("cherry")),
+        ];
+        assert_eq!(order(items, sort::subscriptions), ["r2", "r1", "r3"]);
+    }
+
+    /// An UNTITLED feed sorts by its URL, so it lands where a reader would look
+    /// rather than being bunched at one end.
+    #[test]
+    fn an_untitled_subscription_sorts_by_its_url() {
+        let items = vec![
+            sub("r1", "https://zebra.example/f", Some("aardvark")),
+            sub("r2", "https://bison.example/f", None),
+        ];
+        assert_eq!(order(items, sort::subscriptions), ["r1", "r2"]);
+    }
+
+    /// Equal titles fall to URL, then to rkey — so the order is TOTAL and a
+    /// re-read cannot shuffle the list.
+    #[test]
+    fn subscriptions_break_ties_by_url_then_rkey() {
+        let items = vec![
+            sub("r2", "https://b.example/f", Some("same")),
+            sub("r1", "https://b.example/f", Some("same")),
+            sub("r3", "https://a.example/f", Some("same")),
+        ];
+        assert_eq!(order(items, sort::subscriptions), ["r3", "r1", "r2"]);
+    }
+
+    /// `position` is the lexicon's sort hint; an UNSET one sorts last rather
+    /// than first, which `unwrap_or(0)` would have got backwards.
+    #[test]
+    fn folders_sort_by_position_with_unset_last() {
+        let items = vec![
+            folder("r1", "zulu", None),
+            folder("r2", "alpha", Some(10)),
+            folder("r3", "bravo", Some(2)),
+        ];
+        assert_eq!(order(items, sort::folders), ["r3", "r2", "r1"]);
+    }
+
+    #[test]
+    fn folders_break_ties_by_name_then_rkey() {
+        let items = vec![
+            folder("r2", "Beta", Some(1)),
+            folder("r1", "alpha", Some(1)),
+            folder("r3", "alpha", Some(1)),
+        ];
+        assert_eq!(order(items, sort::folders), ["r1", "r3", "r2"]);
+    }
+
+    /// Saved entries read NEWEST FIRST -- the one ordering here that is
+    /// descending, and the easiest to get backwards.
+    #[test]
+    fn saved_entries_are_newest_first() {
+        let items = vec![
+            saved("r1", "https://a.example/x", "2026-01-01T00:00:00Z"),
+            saved("r2", "https://b.example/x", "2026-06-01T00:00:00Z"),
+            saved("r3", "https://c.example/x", "2026-03-01T00:00:00Z"),
+        ];
+        assert_eq!(order(items, sort::saved), ["r2", "r3", "r1"]);
+    }
+
+    /// Same instant: rkey ASCENDING, even though the timestamp is descending.
+    #[test]
+    fn saved_entries_break_ties_by_ascending_rkey() {
+        let items = vec![
+            saved("r3", "https://c.example/x", "2026-01-01T00:00:00Z"),
+            saved("r1", "https://a.example/x", "2026-01-01T00:00:00Z"),
+            saved("r2", "https://b.example/x", "2026-01-01T00:00:00Z"),
+        ];
+        assert_eq!(order(items, sort::saved), ["r1", "r2", "r3"]);
+    }
+}

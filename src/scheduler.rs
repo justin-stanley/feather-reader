@@ -41,7 +41,6 @@
 //! reader: every failure is a `warn!` that leaves the previous observation in
 //! place. `FEATHERREADER_ADOPTION_INTERVAL_SECS=0` disables it on its own.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +51,12 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use feather_reader::feed::{self, PollOutcome};
-use feather_reader::lexicon::{nsid, ReadState};
+use std::collections::HashSet;
+
+use feather_reader::lexicon::nsid;
 use feather_reader::network::RelayClient;
-use feather_reader::store::{self, Feed, Pool, ReadCursor};
+use feather_reader::readstate::{flush_did, fnv1a_64};
+use feather_reader::store::{self, Feed, Pool};
 use feather_reader::AppState;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +104,86 @@ const DEFAULT_RETENTION_SWEEP: Duration = Duration::from_secs(24 * 60 * 60);
 /// the moment any child exits — so an immediate first tick would probe the relay
 /// once per crash-loop restart rather than once per day.
 const ADOPTION_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// Delay before each local loop's FIRST tick after boot.
+///
+/// All four used to fire immediately. Combined with the container supervisor —
+/// which tears the machine down the moment any child exits, and Fly restarts it
+/// — "once per boot" becomes "once per crash-loop restart", and the loops all
+/// pile onto the same instant while the machine is still opening its database
+/// and warming its caches. The adoption probe already reasoned about exactly
+/// this ([`ADOPTION_STARTUP_DELAY`]); its three siblings did not.
+///
+/// The values are deliberately DISTINCT rather than jittered. There is exactly
+/// one machine, so there is no fleet to de-synchronise; what matters is that the
+/// four loops do not land together, and fixed offsets give that property while
+/// staying reproducible in a test. They are also short enough to be irrelevant
+/// to an hourly poller and a daily sweep.
+///
+/// `FEATHERREADER_STARTUP_DELAY_SECS` scales all of them (0 restores the old
+/// immediate-first-tick behaviour), for dev loops and integration tests that
+/// cannot wait.
+const POLLER_STARTUP_DELAY: Duration = Duration::from_secs(30);
+const PENDING_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(45);
+const CODE_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
+const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
+
+/// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a loop's startup
+/// delay. The variable is a CEILING, not a replacement: it can only shorten the
+/// wait, so setting it cannot accidentally push a production loop out further
+/// than the constant above intends.
+fn startup_delay(default: Duration) -> Duration {
+    startup_delay_from(
+        default,
+        std::env::var("FEATHERREADER_STARTUP_DELAY_SECS").ok(),
+    )
+}
+
+/// [`startup_delay`] with the environment value passed in.
+///
+/// Split out so the ceiling behaviour is testable without `std::env::set_var`,
+/// which is a documented data race against the ~39 `std::env::var` reads
+/// elsewhere in this binary — and this was the only `set_var` in `src/`, in a
+/// 650-test multithreaded runner. Latent today because nothing else reads that
+/// key; a flaky crash the moment something does.
+fn startup_delay_from(default: Duration, raw: Option<String>) -> Duration {
+    match raw.as_deref().map(str::trim) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) => {
+                let requested = Duration::from_secs(secs);
+                if requested > default {
+                    // The variable is a CEILING, which is a good property and a
+                    // surprising one: setting it to 300 changes nothing. Saying
+                    // so beats leaving an operator to wonder why.
+                    info!(
+                        requested_secs = secs,
+                        effective_secs = default.as_secs(),
+                        "FEATHERREADER_STARTUP_DELAY_SECS is a ceiling and can only \
+                         SHORTEN a startup delay; using the built-in value"
+                    );
+                    return default;
+                }
+                requested
+            }
+            Err(_) => {
+                warn!(
+                    value = v,
+                    "FEATHERREADER_STARTUP_DELAY_SECS is not a number; ignoring it"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// An `Interval` whose first tick is `delay` from now, then every `period`,
+/// skipping missed ticks rather than bursting to catch up.
+fn delayed_interval(delay: Duration, period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker
+}
 
 /// Read a `Duration` (in seconds) from the environment, or fall back.
 fn env_duration_secs(key: &str, default: Duration) -> Duration {
@@ -161,8 +243,12 @@ pub fn schedulers_enabled() -> bool {
 pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task::JoinHandle<()>> {
     if !schedulers_enabled() {
         info!("background schedulers disabled (FEATHERREADER_DISABLE_SCHEDULER)");
+        // Recorded so a handler can tell "never started" from "started and
+        // stopped ticking" — identical from the outside, opposite responses.
+        state.runtime_health.set_schedulers_enabled(false);
         return Vec::new();
     }
+    state.runtime_health.set_schedulers_enabled(true);
 
     info!(
         "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
@@ -190,9 +276,19 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_adoption_probe(state, shutdown).await })
     };
+    let metrics = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
+    };
+    let pending = {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_pending_sweeper(state, shutdown).await })
+    };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
 
-    vec![poller, sweeper, retention, probe, flusher]
+    vec![poller, sweeper, retention, probe, metrics, pending, flusher]
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -238,10 +334,9 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
     };
     let limiter = Arc::new(Semaphore::new(concurrency));
 
-    let mut ticker = interval(tick);
-    // If the loop falls behind (a slow poll round), skip missed ticks rather than
-    // firing a burst to catch up.
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Not an immediate first tick: see `POLLER_STARTUP_DELAY`. Missed ticks are
+    // skipped rather than burst through, so a slow poll round does not queue up.
+    let mut ticker = delayed_interval(startup_delay(POLLER_STARTUP_DELAY), tick);
 
     loop {
         tokio::select! {
@@ -250,11 +345,19 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
                 break;
             }
             _ = ticker.tick() => {
-                if let Err(err) = poll_due_once(&state, &client, &limiter, batch, stagger).await {
+                if let Err(err) =
+                    poll_due_once(&state, &client, &limiter, batch, stagger, &shutdown).await
+                {
                     // A store-level error is worth logging, but must not kill the
                     // loop — the next tick retries.
                     error!(%err, "poll scheduler: tick failed");
                 }
+                // Heartbeat, stamped on COMPLETION — including after a failed
+                // tick, which is the honest reading: the loop is alive and
+                // erroring, which is a different condition from the loop being
+                // wedged, and `/health` reports them differently. A tick that
+                // hangs forever never reaches here, which is the point.
+                state.runtime_health.poll_tick_completed(Utc::now().timestamp());
             }
         }
     }
@@ -269,6 +372,7 @@ async fn poll_due_once(
     limiter: &Arc<Semaphore>,
     batch: i64,
     stagger: Duration,
+    shutdown: &watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     // DB-size watermark: above it, stop pulling NEW content so a small box can't
     // be filled to a crash by the poller. Reads/serving continue; only fetching
@@ -292,9 +396,16 @@ async fn poll_due_once(
                 // free disk ~= the live DB size to write the new file, which is
                 // exactly what's scarce under the disk pressure that tripped the
                 // watermark.
+                //
+                // Recorded, not just logged. This is one of the two states that
+                // stop feeds updating, and until now the per-tick `warn!` was its
+                // ONLY trace — so `/stats` showed `overdue` climbing and
+                // `polled_last_hour` falling with nothing to say which of the two
+                // causes was responsible. See `runtime_health`.
+                state.runtime_health.set_watermark(true);
                 return Ok(());
             }
-            Ok(_) => {}
+            Ok(_) => state.runtime_health.set_watermark(false),
             Err(err) => warn!(%err, "could not read DB size for watermark check; polling anyway"),
         }
     }
@@ -308,7 +419,26 @@ async fn poll_due_once(
     info!(count = due.len(), "poll scheduler: polling due feeds");
 
     let mut handles = Vec::with_capacity(due.len());
+    let mut abandoned = 0usize;
     for feed in due {
+        // **Stop LAUNCHING once shutdown is asked for.**
+        //
+        // The loop above only checked shutdown between ticks, so once inside a
+        // tick this ran to completion: a full batch is 50 feeds at a 250 ms
+        // stagger — 12.5 s just to launch — against Fly's default 5 s
+        // `kill_timeout`. Every feed in the batch has already been leased an hour
+        // forward by `poll_and_reschedule`, and SIGKILL rolls nothing back, so a
+        // routine deploy landing mid-tick silently pushed up to 50 feeds out by
+        // an hour. Nobody would attribute that: it presents as "some feeds are
+        // behind after a deploy", and `/stats` cannot show it as overdue because
+        // `next_poll` was moved FORWARD.
+        //
+        // Feeds not launched keep whatever `next_poll` they had, so they stay due
+        // and the next boot picks them up immediately.
+        if shutdown.has_changed().unwrap_or(true) {
+            abandoned += 1;
+            continue;
+        }
         // Acquire a permit *before* launching so at most `concurrency` fetches
         // are ever in flight; the permit is released when the task ends.
         let permit = match Arc::clone(limiter).acquire_owned().await {
@@ -336,6 +466,14 @@ async fn poll_due_once(
         }
     }
 
+    if abandoned > 0 {
+        info!(
+            abandoned,
+            "poll scheduler: shutdown requested mid-round; these feeds were not \
+             launched and stay due"
+        );
+    }
+
     // Drain the batch so the next tick starts from a clean slate.
     for h in handles {
         if let Err(err) = h.await {
@@ -359,7 +497,56 @@ async fn poll_and_reschedule(
     default_interval: Duration,
     max_entries_per_feed: i64,
 ) {
-    let next_delay = match feed::poll_feed(pool, client, feed, max_entries_per_feed).await {
+    poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| {
+        feed::poll_feed(pool, client, feed, max_entries_per_feed)
+    })
+    .await;
+}
+
+/// [`poll_and_reschedule`] with the fetch injected, so the ordering guarantee
+/// below can be tested without a network — the same shape the OAuth
+/// orchestrators use.
+async fn poll_and_reschedule_with<'a, F, Fut>(
+    pool: &'a Pool,
+    feed: &'a Feed,
+    default_interval: Duration,
+    poll: F,
+) where
+    F: FnOnce(&'a Pool, &'a Feed) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<PollOutcome>>,
+{
+    // **Lease the feed forward BEFORE fetching it.**
+    //
+    // Nothing used to be written to the feed row until after `poll_feed`
+    // returned. `due_feeds` orders by `next_poll ASC` and the poller's first
+    // tick fires immediately, so a feed whose fetch or parse takes the PROCESS
+    // down was re-selected first on every restart — forever, with no escape
+    // short of editing the database by hand.
+    //
+    // The trigger is plausible on a 512 MB box: `MAX_BODY_BYTES` is 8 MiB and
+    // concurrency is 4, so 32 MiB of raw bodies can be in flight, and `feed_rs`
+    // builds an in-memory model several times the wire size alongside the
+    // sanitized `Vec<NewEntry>`. `deploy/container-entrypoint.sh` tears the
+    // machine down the moment any child exits, and Fly restarts it — which is
+    // what turns "one bad poll" into a loop.
+    //
+    // Writing the optimistic next time FIRST converts that permanent loop into
+    // a single restart: the killer feed goes to the BACK of the due queue
+    // instead of the front, every other feed gets polled, and the instance
+    // heals itself. The value is the cadence the feed would have got had the
+    // poll succeeded, so the common case — the poll returns and overwrites this
+    // — is unchanged.
+    //
+    // The cost is one extra tiny UPDATE per feed per poll on a single-writer
+    // database. Against an unrecoverable instance, that is not a close call.
+    if let Err(err) = set_next_poll(pool, &feed.url, cadence_for(feed, default_interval)).await {
+        // Non-fatal: the poll is still worth attempting. It just means a crash
+        // during THIS fetch is not protected.
+        warn!(feed = %feed.url, %err, "failed to lease next_poll before fetching; \
+                                       a crash during this poll would re-select this feed first");
+    }
+
+    let next_delay = match poll(pool, feed).await {
         Ok(PollOutcome::Updated { new_entries }) => {
             debug!(feed = %feed.url, new_entries, "polled: updated");
             // A successful poll clears the consecutive-error streak so a
@@ -411,7 +598,11 @@ async fn set_next_poll(pool: &Pool, url: &str, delay: Duration) -> anyhow::Resul
         + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
     let next_poll = next.to_rfc3339_opts(SecondsFormat::Secs, true);
     // upsert_feed COALESCEs unset fields, so supplying only url + next_poll bumps
-    // the schedule without clobbering title/validators/last_polled.
+    // the schedule without clobbering title/validators/last_polled. That claim
+    // was false when it was written — etag and last_modified were assigned
+    // unconditionally, so this call, which runs after EVERY poll of EVERY feed,
+    // erased both and made conditional GET dead code instance-wide. The store
+    // now COALESCEs them; `validators_survive_a_partial_upsert` pins it.
     let nf = store::NewFeed {
         url: url.to_string(),
         next_poll: Some(next_poll),
@@ -473,11 +664,11 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
     let period = env_duration_secs("FEATHERREADER_CODE_SWEEP_SECS", DEFAULT_CODE_SWEEP);
     info!(?period, "invite-code TTL sweeper started");
 
-    let mut ticker = interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // The first `tick()` fires immediately — do an initial sweep on startup so a
-    // long-stale set of codes gets cleaned up promptly rather than after a full
-    // period.
+    // Delayed first tick (see `CODE_SWEEP_STARTUP_DELAY`) rather than the
+    // immediate one this used to have — a long-stale set of codes is still swept
+    // a minute into the boot, and `redeem_code` re-checks expiry itself, so the
+    // sweep was never on the correctness path to begin with.
+    let mut ticker = delayed_interval(startup_delay(CODE_SWEEP_STARTUP_DELAY), period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -508,25 +699,41 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
 /// entry ids are scrubbed from the affected `read_cursor` id-sets inside the
 /// prune itself.
 ///
-/// `retention_days == 0` disables retention entirely: the loop logs once and
-/// returns, spawning no ticker. Failures are logged and never kill the loop — a
-/// missed sweep just means the window is enforced on the next tick.
+/// The loop runs if EITHER knob is on. `retention_days == 0` disables only the
+/// rolling window; `retention_hard_days` still evicts everything past the
+/// ceiling, and that is deliberate — the ceiling is what bounds the shared cache
+/// for entries a reader pinned by starring or marking unread, and the per-feed
+/// trim now spares those. Only when both are zero does the loop log once and
+/// return, spawning no ticker; that configuration has no bound at all and says
+/// so. Failures are logged and never kill the loop — a missed sweep just means
+/// the window is enforced on the next tick.
 pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
     let days = state.config.retention_days as i64;
-    if days <= 0 {
-        info!("retention sweeper: retention_days=0, retention disabled (no rolling window)");
+    let hard_days = state.config.retention_hard_days as i64;
+    if days <= 0 && hard_days <= 0 {
+        info!(
+            "retention sweeper: retention_days=0 and retention_hard_days=0, \
+             retention disabled entirely (no rolling window, NO ceiling — the \
+             shared cache is unbounded in this configuration)"
+        );
         return;
     }
     let period = env_duration_secs(
         "FEATHERREADER_RETENTION_SWEEP_SECS",
         DEFAULT_RETENTION_SWEEP,
     );
-    info!(retention_days = days, ?period, "retention sweeper started");
+    info!(
+        retention_days = days,
+        retention_hard_days = hard_days,
+        ?period,
+        "retention sweeper started"
+    );
 
-    let mut ticker = interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // The first `tick()` fires immediately — sweep on startup so a long-stale
-    // cache is trimmed promptly rather than after a full period.
+    // Delayed first tick (see `RETENTION_STARTUP_DELAY`). This is the heaviest
+    // of the local loops — it takes the single write lock for the whole delete —
+    // so firing it into a boot that is still opening the database and warming
+    // caches was the worst timing available.
+    let mut ticker = delayed_interval(startup_delay(RETENTION_STARTUP_DELAY), period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -534,10 +741,15 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
                 break;
             }
             _ = ticker.tick() => {
-                match store::prune_old_entries(&state.db, days).await {
+                match store::prune_old_entries(&state.db, days, hard_days).await {
                     Ok(0) => debug!("retention sweeper: nothing past the retention window"),
                     Ok(n) => {
-                        info!(pruned = n, retention_days = days, "retention sweeper: pruned old entries");
+                        info!(
+                            pruned = n,
+                            retention_days = days,
+                            retention_hard_days = hard_days,
+                            "retention sweeper: pruned old entries"
+                        );
                         // Return the freed pages to the OS so the file actually
                         // shrinks and the DB-size watermark can fall back.
                         if let Err(err) = store::reclaim(&state.db).await {
@@ -609,8 +821,10 @@ pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<(
         "adoption probe started"
     );
 
-    let mut ticker =
-        tokio::time::interval_at(tokio::time::Instant::now() + ADOPTION_STARTUP_DELAY, period);
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + startup_delay(ADOPTION_STARTUP_DELAY),
+        period,
+    );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -691,6 +905,109 @@ fn jittered(period: Duration, seed: &str) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
+// Pending-login sweeper
+// ---------------------------------------------------------------------------
+
+/// How often abandoned logins and stale nonces are swept.
+const PENDING_SWEEP_SECS: u64 = 900;
+
+/// How long an untouched DPoP nonce is kept. A server nonce lasts minutes; a day
+/// is generous and keeps the table to the origins actually in use.
+const NONCE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+
+/// Delete expired pending logins.
+///
+/// An abandoned login — the user is redirected to their PDS and closes the tab —
+/// leaves an `oauth_state` row behind. `take_pending` only ever consumes rows
+/// that come BACK, so nothing else removes these, and each one holds a sealed
+/// DPoP private key and a PKCE verifier. Without this the table grows without
+/// bound and accumulates secret material that can no longer be used for
+/// anything.
+///
+/// Runs on both backends: the rows are written by the Rust login path, and a
+/// deployment that flips back to the sidecar still has whatever it left behind.
+pub async fn run_pending_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = Duration::from_secs(PENDING_SWEEP_SECS);
+    info!(?period, "pending-login sweeper started");
+
+    // Delayed first tick, like its siblings (see `PENDING_SWEEP_STARTUP_DELAY`).
+    let mut ticker = delayed_interval(startup_delay(PENDING_SWEEP_STARTUP_DELAY), period);
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("pending-login sweeper: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => {
+                let now = Utc::now().timestamp();
+                match feather_reader::oauth::store::sweep_expired_pending(&state.db, now).await {
+                    Ok(0) => debug!("pending-login sweeper: nothing to expire"),
+                    Ok(n) => info!(swept = n, "pending-login sweeper: removed abandoned logins"),
+                    Err(err) => error!(%err, "pending-login sweeper: sweep failed"),
+                }
+                // Same volume, same pre-auth write primitive, and a stale nonce
+                // is worthless — the server issues a new one with the next
+                // challenge.
+                match feather_reader::oauth::store::sweep_stale_nonces(
+                    &state.db,
+                    now - NONCE_MAX_AGE_SECS,
+                )
+                .await
+                {
+                    Ok(0) => debug!("nonce sweeper: nothing stale"),
+                    Ok(n) => info!(swept = n, "nonce sweeper: removed stale DPoP nonces"),
+                    Err(err) => error!(%err, "nonce sweeper: sweep failed"),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repo-timing flusher
+// ---------------------------------------------------------------------------
+
+/// How often buffered repo timings are written to SQLite.
+///
+/// Frequent enough that a crash loses little, rare enough that the write is
+/// nowhere near the request path. Recording itself only touches memory.
+const METRICS_FLUSH_SECS: u64 = 30;
+
+/// Periodically persist buffered repo timings, and once more on shutdown.
+///
+/// The shutdown flush is the one that matters for a CUTOVER: throwing the
+/// switch means a restart, and unflushed samples from the outgoing backend
+/// would be lost at precisely the moment they became the thing worth comparing
+/// against.
+pub async fn run_metrics_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
+    let period = Duration::from_secs(METRICS_FLUSH_SECS);
+    info!(?period, "repo-timing flusher started");
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => flush_metrics_once(&state).await,
+            _ = shutdown.changed() => {
+                flush_metrics_once(&state).await;
+                info!("repo-timing flusher stopped (final flush done)");
+                return;
+            }
+        }
+    }
+}
+
+/// One flush. A metrics write must never be able to take anything else down, so
+/// a failure is logged and the loop continues.
+async fn flush_metrics_once(state: &AppState) {
+    if let Err(err) =
+        feather_reader::metrics::flush(&state.metrics, &state.db, Utc::now().timestamp()).await
+    {
+        warn!(%err, "could not persist repo timings");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Read-state flusher
 // ---------------------------------------------------------------------------
 
@@ -700,6 +1017,10 @@ fn jittered(period: Duration, seed: &str) -> Duration {
 pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
     let debounce = env_duration_secs("FEATHERREADER_FLUSH_DEBOUNCE_SECS", DEFAULT_FLUSH_DEBOUNCE);
     info!(?debounce, "read-state flusher started");
+
+    // Which DIDs we have already reported as parked, so the log line is once
+    // per DID per process rather than once per minute forever.
+    let mut parked: HashSet<String> = HashSet::new();
 
     let mut ticker = interval(debounce);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -712,13 +1033,13 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
             _ = shutdown_fired(&mut shutdown) => {
                 info!("read-state flusher: shutdown signal received, final flush");
                 // Final drain so Ctrl-C never strands unsynced read-state.
-                if let Err(err) = flush_all_dirty(&state).await {
+                if let Err(err) = flush_all_dirty(&state, &mut parked).await {
                     error!(%err, "read-state flusher: final flush failed");
                 }
                 break;
             }
             _ = ticker.tick() => {
-                if let Err(err) = flush_all_dirty(&state).await {
+                if let Err(err) = flush_all_dirty(&state, &mut parked).await {
                     error!(%err, "read-state flusher: flush round failed");
                 }
             }
@@ -729,7 +1050,7 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
 /// Flush every DID that has dirty cursors. Coalesces each DID's dirty cursors
 /// into a single `applyWrites` batch, then clears the `dirty` flag on the ones
 /// that flushed successfully.
-async fn flush_all_dirty(state: &AppState) -> anyhow::Result<()> {
+async fn flush_all_dirty(state: &AppState, parked: &mut HashSet<String>) -> anyhow::Result<()> {
     let dids = dids_with_dirty_cursors(&state.db).await?;
     if dids.is_empty() {
         debug!("read-state flusher: nothing dirty");
@@ -741,165 +1062,52 @@ async fn flush_all_dirty(state: &AppState) -> anyhow::Result<()> {
     );
 
     for did in dids {
+        // **A DID with no session is PARKED, not failed (#117).**
+        //
+        // Attempting the flush anyway is what produced the production incident:
+        // `Repo::session` fails before any network call, the enclosing
+        // `flush_read_states` records an error, and the whole thing repeats
+        // every 60s forever. 20 failures in the first 20 minutes, and nothing
+        // about it could ever have succeeded — the user is signed out.
+        //
+        // The cursors stay DIRTY on purpose. The reads are not discarded; they
+        // wait, and flush on the user's next sign-in. Clearing the flag here
+        // would turn a stalled sync into silent data loss, which is strictly
+        // worse than the bug being fixed.
+        match state.repo().has_session(&did).await {
+            Ok(false) => {
+                // Once per DID per process: enough to diagnose, not enough to
+                // drown the log or mask a real failure during the soak.
+                if parked.insert(did.clone()) {
+                    info!(
+                        %did,
+                        "read-state flusher: no OAuth session; parking this DID's \
+                         read-state until it signs in again"
+                    );
+                }
+                continue;
+            }
+            Ok(true) => {
+                // It had a session and may have just got one back — stop
+                // suppressing its log line, so a LATER park is reported.
+                parked.remove(&did);
+            }
+            Err(err) => {
+                // The precondition check itself failed (a DB problem, not an
+                // absent session). Fall through and let the flush attempt
+                // produce the real error rather than silently skipping.
+                warn!(%did, %err, "read-state flusher: session check failed; attempting anyway");
+            }
+        }
+
         if let Err(err) = flush_did(state, &did).await {
             // One DID's PDS hiccup must not block the others — its cursors stay
-            // dirty and retry next round.
+            // dirty and retry next round. This arm is now genuinely transient
+            // failures only; the permanent case is parked above.
             warn!(%did, %err, "read-state flusher: DID flush failed; will retry");
         }
     }
     Ok(())
-}
-
-/// Flush a single DID's dirty cursors in one batched `applyWrites`, then clear
-/// the `dirty` flag for the cursors that were included.
-async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
-    let cursors = store::dirty_cursors(&state.db, did).await?;
-    if cursors.is_empty() {
-        return Ok(());
-    }
-
-    // Build (rkey, ReadState) pairs, deduping on rkey so two rows that hash to
-    // the same feed-key don't produce two ops in one batch (applyWrites rejects
-    // duplicate writes to the same key). Deterministic order for stable batches.
-    let mut batch: BTreeMap<String, (ReadState, ReadCursor)> = BTreeMap::new();
-    for cursor in cursors {
-        let rkey = read_state_rkey(&cursor.feed_url);
-        let record = read_state_record(&cursor);
-        batch.insert(rkey, (record, cursor));
-    }
-
-    // Each op carries whether its PDS record already exists: a not-yet-created
-    // cursor becomes an applyWrites#create (not an #update, which would error and,
-    // since applyWrites is atomic-per-repo, drop the whole DID batch on a feed's
-    // first flush). All create + update ops ride ONE batch.
-    let ops: Vec<(String, ReadState, bool)> = batch
-        .iter()
-        .map(|(rkey, (record, cursor))| (rkey.clone(), record.clone(), cursor.pds_created))
-        .collect();
-
-    // ONE applyWrites round-trip for all of this DID's dirty feeds.
-    state.sidecar.flush_read_states(did, &ops).await?;
-
-    // Success — for each flushed cursor: mark its PDS record as created (so future
-    // flushes emit an update), then clear `dirty` but ONLY if its `updated_at`
-    // still matches the snapshot we just flushed. A mark-read that landed DURING
-    // the in-flight PDS write bumped `updated_at` and re-dirtied the row; the
-    // conditional clear leaves that row dirty so its new reads re-flush next
-    // round instead of being silently dropped.
-    let flushed = ops.len();
-    for (_rkey, (_record, cursor)) in batch {
-        // Flip the created flag first: the record now exists in the PDS regardless
-        // of whether the dirty-clear below is a no-op due to a concurrent bump.
-        if !cursor.pds_created {
-            if let Err(err) = store::mark_cursor_pds_created(&state.db, did, &cursor.feed_url).await
-            {
-                warn!(%did, feed = %cursor.feed_url, %err, "failed to mark cursor pds_created");
-            }
-        }
-        if let Err(err) =
-            store::clear_cursor_dirty(&state.db, did, &cursor.feed_url, &cursor.updated_at).await
-        {
-            // The PDS write already landed; a failure to clear the local flag
-            // just means we harmlessly re-flush this cursor next round.
-            warn!(%did, feed = %cursor.feed_url, %err, "failed to clear cursor dirty flag");
-        }
-    }
-
-    info!(%did, feeds = flushed, "read-state flusher: flushed dirty cursors");
-    Ok(())
-}
-
-/// Turn a local [`ReadCursor`] row into the PDS [`ReadState`] lexicon record.
-///
-/// The store keeps `read_ids` / `unread_ids` as JSON arrays of ids; the lexicon
-/// wants string arrays. `read_through` is optional both locally AND in the
-/// record: when the cursor has no local high-water-mark we pass `None` so the
-/// record OMITS `readThrough` entirely. This is the conservative behaviour —
-/// `readThrough` is a "everything seen/published `<=` this is read" water-mark,
-/// so synthesizing a flush-time (`≈ now`) value for a cursor that has none would
-/// assert the whole unread backlog is read. With `None` only the explicit
-/// `read_ids` mark entries read. Both id-sets are capped at [`ReadState::MAX_IDS`]
-/// to respect the lexicon bound.
-fn read_state_record(cursor: &ReadCursor) -> ReadState {
-    let read_ids = parse_id_array(&cursor.read_ids);
-    let unread_ids = parse_id_array(&cursor.unread_ids);
-
-    // Do NOT synthesize a water-mark from `updated_at`: an unset local
-    // `read_through` means "no high-water-mark", which the record represents by
-    // omitting `readThrough` (None), not by back-dating it to flush time.
-    let mut record = ReadState::new(
-        &cursor.feed_url,
-        cursor.read_through.clone(),
-        &cursor.updated_at,
-    );
-    record.read_ids = cap(read_ids, ReadState::MAX_IDS);
-    record.unread_ids = cap(unread_ids, ReadState::MAX_IDS);
-    record
-}
-
-/// Parse a stored JSON id-array into `Vec<String>`, tolerating both string and
-/// numeric ids (the store keeps entry ids). A malformed/empty value yields an
-/// empty set rather than an error — read-state must never fail to flush over a
-/// cosmetic parse issue.
-fn parse_id_array(raw: &str) -> Vec<String> {
-    if raw.trim().is_empty() {
-        return Vec::new();
-    }
-    match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-        Ok(vals) => vals
-            .into_iter()
-            .map(|v| match v {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            })
-            .collect(),
-        Err(err) => {
-            warn!(%err, raw, "read-state flusher: unparseable id array; treating as empty");
-            Vec::new()
-        }
-    }
-}
-
-/// Truncate a set to `max`, keeping the most recent (tail) ids. This only
-/// enforces the lexicon's hard cap; it does not fold covered ids into the
-/// `read_through` water-mark (there is no compaction step yet — the exception
-/// sets are expected to stay well under the cap in normal use).
-fn cap(mut ids: Vec<String>, max: usize) -> Vec<String> {
-    if ids.len() > max {
-        let drop = ids.len() - max;
-        ids.drain(0..drop);
-    }
-    ids
-}
-
-/// Derive the deterministic, stable rkey for a feed's read-state record from its
-/// URL, so there is exactly **one record per feed** (a fixed key, not a fresh tid
-/// per flush).
-///
-/// atproto record keys must match `[A-Za-z0-9._~:-]{1,512}` (and not be `.`/`..`).
-/// A lowercase-hex FNV-1a-64 digest of the feed URL satisfies that, is stable
-/// across restarts and instances, and collides only on genuine hash collision
-/// (astronomically unlikely at feed scale; the flusher additionally dedups by
-/// rkey within a batch as a belt-and-braces guard).
-///
-/// The stable rkey is what makes create-then-update work: a feed's FIRST flush
-/// emits an `applyWrites#create` at this key (tracked by `read_cursor.pds_created`)
-/// and every subsequent flush an `#update` at the same key, so there is exactly
-/// one record per feed and the first flush never fails on a missing record.
-pub fn read_state_rkey(feed_url: &str) -> String {
-    format!("rs-{:016x}", fnv1a_64(feed_url.as_bytes()))
-}
-
-/// FNV-1a 64-bit — a tiny, dependency-free stable hash for the feed-key.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 /// Every DID that currently has at least one dirty read cursor.
@@ -927,122 +1135,138 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feather_reader::store::ReadCursor;
 
-    #[test]
-    fn rkey_is_stable_and_valid() {
-        let a = read_state_rkey("https://example.com/feed.xml");
-        let b = read_state_rkey("https://example.com/feed.xml");
-        assert_eq!(a, b, "rkey must be deterministic");
-        assert_ne!(a, read_state_rkey("https://other.example/feed.xml"));
-        // Valid atproto rkey charset and length.
-        assert!(a.len() <= 512 && !a.is_empty());
-        assert!(a
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b':')));
-        assert!(a != "." && a != "..");
-    }
-
-    #[test]
-    fn parse_id_array_tolerates_shapes() {
-        assert_eq!(parse_id_array(""), Vec::<String>::new());
-        assert_eq!(parse_id_array("[]"), Vec::<String>::new());
-        assert_eq!(parse_id_array(r#"["a","b"]"#), vec!["a", "b"]);
-        assert_eq!(parse_id_array("[1,2,3]"), vec!["1", "2", "3"]);
-        assert_eq!(parse_id_array("not json"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn cap_keeps_tail_within_bound() {
-        let ids: Vec<String> = (0..10).map(|i| i.to_string()).collect();
-        let capped = cap(ids, 3);
-        assert_eq!(capped, vec!["7", "8", "9"]);
-    }
-
-    #[test]
-    fn record_maps_cursor_fields() {
-        let cursor = ReadCursor {
-            did: "did:plc:abc".into(),
-            feed_url: "https://example.com/feed.xml".into(),
-            read_through: Some("2026-07-12T00:00:00Z".into()),
-            read_ids: r#"["10","11"]"#.into(),
-            unread_ids: "[]".into(),
-            dirty: true,
-            pds_created: false,
-            updated_at: "2026-07-12T01:00:00Z".into(),
-        };
-        let rec = read_state_record(&cursor);
-        assert_eq!(rec.feed_url, "https://example.com/feed.xml");
-        assert_eq!(rec.read_through.as_deref(), Some("2026-07-12T00:00:00Z"));
-        assert_eq!(rec.read_ids, vec!["10", "11"]);
-        assert!(rec.unread_ids.is_empty());
-        assert_eq!(rec.updated_at, "2026-07-12T01:00:00Z");
-    }
-
-    #[test]
-    fn read_through_omitted_when_local_unset() {
-        // A cursor with no local high-water-mark must NOT synthesize one from
-        // `updated_at` (≈ now) — doing so would mark the whole backlog read. The
-        // record omits `readThrough` (None) so only explicit read_ids apply.
-        let cursor = ReadCursor {
-            did: "did:plc:abc".into(),
-            feed_url: "https://example.com/feed.xml".into(),
-            read_through: None,
-            read_ids: r#"["42"]"#.into(),
-            unread_ids: "[]".into(),
-            dirty: true,
-            pds_created: false,
-            updated_at: "2026-07-12T01:00:00Z".into(),
-        };
-        let rec = read_state_record(&cursor);
-        assert_eq!(
-            rec.read_through, None,
-            "no local water-mark => readThrough absent (backlog not implicitly read)"
+    /// A feed row that is due right now (`next_poll` NULL), plus its store.
+    async fn due_feed(url: &str) -> (Pool, Feed) {
+        let pool = store::init_url("sqlite::memory:").await.unwrap();
+        store::upsert_feed(
+            &pool,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = store::get_feed_by_url(&pool, url).await.unwrap().unwrap();
+        assert!(
+            feed.next_poll.is_none(),
+            "fixture must start due (NULL next_poll sorts FIRST in due_feeds)"
         );
-        // The explicit read_ids still carry through.
-        assert_eq!(rec.read_ids, vec!["42"]);
-        // Serialized form must not carry a readThrough field at all.
-        let json = serde_json::to_value(&rec).expect("serialize");
-        assert!(json.get("readThrough").is_none());
+        (pool, feed)
     }
 
-    #[test]
-    fn read_through_present_when_local_high_water_mark_exists() {
-        // A real high-water-mark IS written through unchanged.
-        let cursor = ReadCursor {
-            did: "did:plc:abc".into(),
-            feed_url: "https://example.com/feed.xml".into(),
-            read_through: Some("2026-07-11T00:00:00Z".into()),
-            read_ids: "[]".into(),
-            unread_ids: "[]".into(),
-            dirty: true,
-            pds_created: false,
-            updated_at: "2026-07-12T01:00:00Z".into(),
-        };
-        let rec = read_state_record(&cursor);
-        assert_eq!(rec.read_through.as_deref(), Some("2026-07-11T00:00:00Z"));
+    /// **`next_poll` must already be in the future when the fetch is invoked.**
+    ///
+    /// This is the ordering that converts a process-killing feed from a permanent
+    /// crash loop into a single restart. A test cannot kill the process, so it
+    /// asserts the observable form of the same fact: at the moment the fetch
+    /// begins, the durable state a restart would read has already moved on.
+    #[tokio::test]
+    async fn next_poll_moves_before_the_fetch_is_invoked() {
+        let url = "https://killer.example/feed.xml";
+        let (pool, feed) = due_feed(url).await;
+
+        let seen_at_fetch = std::sync::Arc::new(std::sync::Mutex::new(None::<Option<String>>));
+        let probe = std::sync::Arc::clone(&seen_at_fetch);
+
+        poll_and_reschedule_with(&pool, &feed, Duration::from_secs(3600), |pool, feed| {
+            let probe = std::sync::Arc::clone(&probe);
+            let url = feed.url.clone();
+            async move {
+                // What a restart happening RIGHT NOW would find.
+                let row = store::get_feed_by_url(pool, &url).await.unwrap().unwrap();
+                *probe.lock().unwrap() = Some(row.next_poll);
+                // Then take the process down, as far as this test can simulate it:
+                // never produce an outcome the caller could reschedule from.
+                Err(anyhow::anyhow!("the fetch killed the process"))
+            }
+        })
+        .await;
+
+        let at_fetch = seen_at_fetch.lock().unwrap().clone().expect("fetch ran");
+        let at_fetch = at_fetch.expect(
+            "next_poll was still NULL when the fetch began: a crash here re-selects \
+             this feed FIRST on every restart, forever",
+        );
+        assert!(
+            at_fetch > now_rfc3339(),
+            "next_poll was leased to {at_fetch}, which is not in the future"
+        );
     }
 
+    /// The lease is optimistic, not final: a poll that returns overwrites it.
+    /// A failure must land on its backoff, not sit at the full cadence.
+    #[tokio::test]
+    async fn a_returning_poll_overwrites_the_lease() {
+        let url = "https://slow.example/feed.xml";
+        let (pool, feed) = due_feed(url).await;
+
+        // A cadence far in the future, so "the lease survived" is unmistakable.
+        poll_and_reschedule_with(&pool, &feed, Duration::from_secs(86_400), |_, _| async {
+            Ok(PollOutcome::Failed {
+                backoff: Duration::from_secs(300),
+            })
+        })
+        .await;
+
+        let after = store::get_feed_by_url(&pool, url)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_poll
+            .expect("next_poll must be set after a poll");
+        let horizon =
+            (Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert!(
+            after < horizon,
+            "the failure backoff did not overwrite the 24h lease: next_poll={after}"
+        );
+        assert!(
+            after > now_rfc3339(),
+            "next_poll must still be in the future"
+        );
+    }
+
+    /// The startup-delay override can only SHORTEN the wait. A deployment that
+    /// sets an enormous value must not push a production loop further out than
+    /// the constant intends.
+    ///
+    /// Tested through `startup_delay_from` rather than the environment: a
+    /// `set_var` here would be the only one in `src/`, racing ~39 `var` reads on
+    /// other test threads.
     #[test]
-    fn flush_with_only_read_ids_sets_no_read_through() {
-        // The core F1 guarantee: a flush whose cursor carries only explicit
-        // read_ids (and no water-mark) emits a record WITHOUT readThrough, so the
-        // user's PDS never asserts the backlog is read.
-        let cursor = ReadCursor {
-            did: "did:plc:abc".into(),
-            feed_url: "https://example.com/feed.xml".into(),
-            read_through: None,
-            read_ids: r#"["100","101","102"]"#.into(),
-            unread_ids: "[]".into(),
-            dirty: true,
-            pds_created: false,
-            updated_at: "2026-07-12T02:00:00Z".into(),
-        };
-        let rec = read_state_record(&cursor);
-        assert_eq!(rec.read_through, None);
-        assert_eq!(rec.read_ids, vec!["100", "101", "102"]);
-        let json = serde_json::to_value(&rec).expect("serialize");
-        assert!(json.get("readThrough").is_none());
-        assert_eq!(json["readIds"], serde_json::json!(["100", "101", "102"]));
+    fn the_startup_delay_override_is_a_ceiling() {
+        let d = POLLER_STARTUP_DELAY;
+        let at = |v: &str| startup_delay_from(d, Some(v.to_string()));
+
+        assert_eq!(at("0"), Duration::ZERO);
+        assert_eq!(at("5"), Duration::from_secs(5));
+        assert_eq!(at(" 5 "), Duration::from_secs(5), "surrounding space");
+        assert_eq!(at("99999"), d, "the override lengthened the wait");
+        assert_eq!(at("not-a-number"), d);
+        assert_eq!(at(""), d);
+        assert_eq!(startup_delay_from(d, None), d);
+    }
+
+    /// The four local loops must not land on the same instant at boot — that is
+    /// the whole reason the offsets are distinct rather than one shared value.
+    #[test]
+    fn the_startup_delays_are_distinct() {
+        let all = [
+            POLLER_STARTUP_DELAY,
+            PENDING_SWEEP_STARTUP_DELAY,
+            CODE_SWEEP_STARTUP_DELAY,
+            RETENTION_STARTUP_DELAY,
+            ADOPTION_STARTUP_DELAY,
+        ];
+        let unique: std::collections::HashSet<Duration> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "two loops share a startup delay");
+        assert!(
+            all.iter().all(|d| *d > Duration::ZERO),
+            "a loop still fires immediately at boot"
+        );
     }
 
     #[test]
@@ -1081,5 +1305,176 @@ mod tests {
     fn jitter_never_returns_a_sub_second_period() {
         assert!(jittered(Duration::from_secs(1), "x") >= Duration::from_secs(1));
         assert!(jittered(Duration::from_millis(1), "x") >= Duration::from_secs(1));
+    }
+
+    // ── #117: orphaned dirty read-state ──────────────────────────────────────
+
+    /// An `AppState` on the rust backend with an empty in-memory store.
+    ///
+    /// `key_path` is per-test: the default is the RELATIVE
+    /// `oauth-signing-key.json`, so a rust-backend test would write real
+    /// encrypted key material into the working directory and later runs would
+    /// fail to decrypt it under a fresh key.
+    async fn rust_state() -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        AppState::new(
+            feather_reader::config::Config {
+                repo_backend: feather_reader::metrics::Backend::Rust,
+                oauth: feather_reader::config::OauthConfig {
+                    key_path: std::env::temp_dir().join(format!(
+                        "fr-sched-oauth-key-{}-{:p}.json",
+                        std::process::id(),
+                        &db as *const _
+                    )),
+                    encryption_key: Some("a".repeat(43)),
+                    ..feather_reader::config::OauthConfig::default()
+                },
+                ..feather_reader::config::Config::default()
+            },
+            db,
+        )
+        .unwrap()
+    }
+
+    /// A dirty cursor for `did`, as a mark-read would leave it.
+    async fn dirty_cursor_for(state: &AppState, did: &str) {
+        store::upsert_cursor(
+            &state.db,
+            &ReadCursor {
+                did: did.to_string(),
+                feed_url: "https://example.com/feed.xml".into(),
+                read_through: None,
+                read_ids: "[\"1\"]".into(),
+                unread_ids: "[]".into(),
+                dirty: true,
+                pds_created: false,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// **#117 — a DID with no OAuth session is PARKED, not retried.**
+    ///
+    /// The inverse of the characterization test this replaces. Before the fix,
+    /// five rounds produced five recorded failures and a `warn!` each; nothing
+    /// about them could ever have succeeded, because the user is signed out.
+    ///
+    /// Asserts the two properties the fix has to hold together:
+    ///   1. no error is recorded, however many rounds run — the soak is not
+    ///      polluted by a condition that is not a failure; and
+    ///   2. the cursor stays DIRTY — the reads are parked, not discarded.
+    ///
+    /// (2) is the one worth guarding. The cheapest way to silence the loop is to
+    /// clear the flag, and that would turn a stalled sync into silent data loss.
+    #[tokio::test]
+    async fn a_did_with_no_session_is_parked_not_retried() {
+        let state = rust_state().await;
+        let did = "did:plc:orphanedreadstate00000000";
+        dirty_cursor_for(&state, did).await;
+
+        let mut parked = HashSet::new();
+        const ROUNDS: usize = 5;
+        for round in 1..=ROUNDS {
+            flush_all_dirty(&state, &mut parked)
+                .await
+                .expect("a parked DID must not abort the sweep");
+            assert_eq!(
+                store::dirty_cursors(&state.db, did).await.unwrap().len(),
+                1,
+                "round {round}: the parked cursor was cleared — the reads are now lost",
+            );
+        }
+
+        let err = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "flush_read_states")
+            .map(|r| r.stats.err_count)
+            .unwrap_or(0);
+        assert_eq!(err, 0, "a parked DID was counted as {err} flush failures");
+        assert_eq!(parked.len(), 1, "the DID should be recorded as parked once");
+    }
+
+    /// **The reads survive the gap: parking holds them until the user returns.**
+    ///
+    /// This is the test that makes parking defensible rather than merely quiet.
+    /// A cursor parked while signed out must still be there — and still flush —
+    /// once a session exists again.
+    ///
+    /// The flush itself fails here (the fixture PDS is unreachable), which is
+    /// the point: what is asserted is that the DID is no longer SKIPPED, so the
+    /// attempt is made at all. A fix that parked permanently would pass the test
+    /// above and fail this one.
+    #[tokio::test]
+    async fn a_parked_cursor_is_retried_once_the_user_signs_in_again() {
+        let state = rust_state().await;
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        dirty_cursor_for(&state, did).await;
+        let mut parked = HashSet::new();
+
+        flush_all_dirty(&state, &mut parked).await.unwrap();
+        assert!(
+            parked.contains(did),
+            "precondition: parked while signed out"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .snapshot()
+                .into_iter()
+                .find(|r| r.op == "flush_read_states")
+                .map(|r| r.stats.ok_count + r.stats.err_count)
+                .unwrap_or(0),
+            0,
+            "precondition: no flush was attempted while parked",
+        );
+
+        // The user signs back in.
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        feather_reader::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &feather_reader::oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: "https://pds.invalid".into(),
+                dpop_key_jwk: feather_reader::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(Utc::now().timestamp() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+
+        flush_all_dirty(&state, &mut parked).await.unwrap();
+
+        assert!(
+            !parked.contains(did),
+            "the DID is still marked parked after regaining a session",
+        );
+        let attempts = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.op == "flush_read_states")
+            .map(|r| r.stats.ok_count + r.stats.err_count)
+            .unwrap_or(0);
+        assert_eq!(
+            attempts, 1,
+            "the parked read-state was never re-attempted after sign-in",
+        );
+        assert_eq!(
+            store::dirty_cursors(&state.db, did).await.unwrap().len(),
+            1,
+            "the unflushed cursor must remain dirty after a failed attempt",
+        );
     }
 }

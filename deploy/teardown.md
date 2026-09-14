@@ -10,6 +10,7 @@ There are two related but distinct wipes:
 | Layer | What it holds | Wiped by |
 |---|---|---|
 | **Rust app** (`featherreader`) | The SQLite cache: `entry_state`, `read_cursor`, `sub_ref`, `beta_access`, `invite_codes`, plus the shared `feeds`/`entries` cache. Signed session cookies are keyed by DID but hold no server secret beyond the cookie HMAC. | Deleting `FEATHERREADER_DB` (+ `-wal`/`-shm`). |
+| **Rust OAuth client** (`FEATHERREADER_REPO_BACKEND=rust`) | Per-DID OAuth tokens (refresh + access) and the session DPoP key, in the app's own SQLite (`FEATHERREADER_DB`, tables `oauth_session` / `oauth_state` / `oauth_nonce`), AEAD-encrypted at rest under `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. | `POST /logout` or `POST /account/delete` per DID (revokes at the PDS via RFC 7009 **and** drops the row), then deleting the DB. Revocation is attempted first, because it needs the tokens the delete destroys. |
 | **OAuth sidecar** (`oauth-sidecar`) | Per-DID OAuth tokens (refresh + access, DPoP keys) and the `session_id` handoff rows, in its own SQLite (`SIDECAR_DB`), AEAD-encrypted at rest. Plus the confidential-client signing JWK at `${SIDECAR_DB}.jwk.json`. | `POST /internal/revoke` per DID (revokes at the PDS **and** drops the row), then deleting `SIDECAR_DB`. |
 
 A user-initiated `POST /account/delete` already does the per-user version of both

@@ -29,8 +29,11 @@
 //! attacker-controlled resolver cannot answer "public IP" for the check and
 //! "127.0.0.1" for the connect, because there is no second resolution.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{
@@ -154,26 +157,182 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
             Ok(SocketAddr::new(IpAddr::V6(ip), port))
         }
         Host::Domain(name) => {
-            let mut vetted: Option<SocketAddr> = None;
+            // **Test seam — `#[cfg(test)]`, so it does not exist in a release
+            // build at all.** Not a parameter, not an env var, not a feature
+            // flag: the compiler removes it, so there is no runtime bypass to
+            // reason about. It exists because the guard is otherwise untestable
+            // end-to-end — a local test server lives on loopback, which
+            // `is_forbidden_ip` correctly refuses, so nothing could ever drive a
+            // real redirect through this function. See `test_host_override`.
+            #[cfg(test)]
+            if let Some(addr) = test_override_for(name, port) {
+                return Ok(addr);
+            }
             let addrs = tokio::net::lookup_host((name, port))
                 .await
                 .with_context(|| format!("resolving host {name:?}"))?;
-            for sa in addrs {
-                let ip = sa.ip();
-                if is_forbidden_ip(&ip) {
-                    bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
-                }
-                // Keep the FIRST vetted answer as the address to pin the connect
-                // to. Every answer is still checked (loop continues), so a mixed
-                // A/AAAA record set with any forbidden entry is rejected wholesale.
-                if vetted.is_none() {
-                    vetted = Some(sa);
-                }
-            }
-            vetted.ok_or_else(|| anyhow::anyhow!("host {name:?} did not resolve to any address"))
+            first_vetted(name, addrs)
         }
     }
 }
+
+/// Pick the address to pin to from a host's DNS answers, rejecting the whole
+/// set if ANY answer is forbidden.
+///
+/// **Extracted so it can be tested.** Inline in the resolver it was unreachable
+/// without real DNS returning a mixed answer set, and a mutation that checked
+/// only the FIRST answer left the entire suite green — a DNS-rebinding style
+/// attack that publishes `1.2.3.4, 127.0.0.1` would have been accepted on the
+/// strength of the first record.
+///
+/// Rejecting wholesale rather than filtering is deliberate: a host that resolves
+/// to any internal address is not a host we want to talk to, even on the answers
+/// that look fine.
+fn first_vetted(name: &str, addrs: impl Iterator<Item = SocketAddr>) -> Result<SocketAddr> {
+    let mut vetted: Option<SocketAddr> = None;
+    for sa in addrs {
+        let ip = sa.ip();
+        if is_forbidden_ip(&ip) {
+            bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
+        }
+        // Keep the FIRST vetted answer as the address to pin the connect to.
+        // Every answer is still checked (the loop continues), so a mixed A/AAAA
+        // set with any forbidden entry is rejected wholesale.
+        if vetted.is_none() {
+            vetted = Some(sa);
+        }
+    }
+    vetted.ok_or_else(|| anyhow::anyhow!("host {name:?} did not resolve to any address"))
+}
+
+/// Test-only host→address overrides, consulted by [`resolve_and_check`] before
+/// real DNS. Keyed by host so tests using distinct hostnames never collide, and
+/// gone entirely from a release build.
+#[cfg(test)]
+static TEST_HOSTS: std::sync::Mutex<Option<std::collections::HashMap<String, SocketAddr>>> =
+    std::sync::Mutex::new(None);
+
+/// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the
+/// forbidden-IP check for that host only.
+///
+/// Bypassing the IP check is the entire point: the test server is on loopback,
+/// which the guard is right to refuse. Only the registered host is exempt —
+/// anything else in the same test, including every redirect target, still goes
+/// through the real check. That is what makes a redirect test meaningful.
+#[cfg(test)]
+pub(crate) fn test_host_override(host: &str, addr: SocketAddr) {
+    TEST_HOSTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(host.to_string(), addr);
+}
+
+#[cfg(test)]
+fn test_override_for(name: &str, port: u16) -> Option<SocketAddr> {
+    let guard = TEST_HOSTS.lock().unwrap();
+    let map = guard.as_ref()?;
+    map.get(name)
+        .copied()
+        .or_else(|| map.get(&format!("{name}:{port}")).copied())
+}
+
+/// How long an idle pinned client may be kept before it is rebuilt.
+///
+/// Not a security boundary — the address is re-resolved and re-checked on every
+/// single request, and a changed address misses the cache by construction. This
+/// only bounds how long a pooled connection to a once-vetted address may live,
+/// and keeps the map from holding entries for hosts nobody fetches any more.
+const PINNED_CLIENT_TTL: Duration = Duration::from_secs(300);
+
+/// Most distinct (host, address) pairs kept. A bound, not a target: the reader
+/// talks to one PDS, while the poller talks to as many hosts as there are feeds.
+const MAX_PINNED_CLIENTS: usize = 256;
+
+/// How long a pinned client may hold an IDLE socket open.
+///
+/// Deliberately shorter than [`PINNED_CLIENT_TTL`] so a client releases its
+/// sockets before the cache releases the client — otherwise the last minute of
+/// an entry's life is pure socket rent. See [`build_pinned_client`] for why the
+/// pool needs bounding at all.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pinned clients, keyed by the **vetted address** they are pinned to.
+///
+/// ## Why this is safe to reuse
+///
+/// Building a fresh client per request meant a fresh connection pool, so every
+/// PDS call paid a full TCP + TLS handshake: measured at 91 ms against this
+/// project's PDS versus 30 ms on a warm connection. That is most of why the
+/// Rust repo backend measured ~3x slower than the Node sidecar, which pools.
+///
+/// Reuse does NOT weaken the DNS-rebinding defence, because the defence does not
+/// live in the client's lifetime:
+///
+/// * every request still resolves the host and runs [`is_forbidden_ip`] over
+///   EVERY answer before this cache is consulted — a host that now resolves to
+///   an internal address is refused before a pooled client could be returned;
+/// * the key includes the vetted [`SocketAddr`], so a host that legitimately
+///   moves to a different address MISSES the cache and gets a client pinned to
+///   the new one. A pooled connection can only ever be reused for an address
+///   that was just re-vetted this request.
+struct PinnedClients {
+    entries: Mutex<HashMap<(String, SocketAddr), (Client, Instant)>>,
+    /// How many clients have actually been constructed. Test-only bookkeeping:
+    /// it is the only way to observe that a hit avoided a rebuild, since
+    /// `reqwest::Client` exposes no identity.
+    builds: AtomicUsize,
+}
+
+impl PinnedClients {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            builds: AtomicUsize::new(0),
+        }
+    }
+
+    /// A client pinned to `addr` for `host`, reusing a pooled one when the
+    /// address is unchanged and the entry is fresh.
+    fn get(&self, host: &str, addr: SocketAddr, now: Instant) -> Result<Client> {
+        let key = (host.to_string(), addr);
+        // A poisoned lock here is NOT fatal and must not be treated as fatal: the
+        // guard is held across a fallible builder, so one panic inside it would
+        // otherwise make EVERY subsequent outbound request panic, forever, with a
+        // live-looking process and a green /health. Recover the data like the rate
+        // limiter already does — a torn entry is a cache entry, worst case a rebuild.
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some((client, last_used)) = entries.get_mut(&key) {
+            if now.duration_since(*last_used) < PINNED_CLIENT_TTL {
+                *last_used = now;
+                // Cloning a `reqwest::Client` shares its connection pool, which
+                // is the entire point — a clone is a handle, not a new pool.
+                return Ok(client.clone());
+            }
+        }
+
+        let client = build_pinned_client(host, addr)?;
+        self.builds.fetch_add(1, Ordering::Relaxed);
+
+        // Drop anything idle past the TTL before considering the bound, so a
+        // burst of one-off hosts does not evict the PDS client we use constantly.
+        entries.retain(|_, (_, last_used)| now.duration_since(*last_used) < PINNED_CLIENT_TTL);
+        if entries.len() >= MAX_PINNED_CLIENTS {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (client.clone(), now));
+        Ok(client)
+    }
+}
+
+static PINNED_CLIENTS: LazyLock<PinnedClients> = LazyLock::new(PinnedClients::new);
 
 /// Build a per-hop client that **pins** DNS for `host` to the already-vetted
 /// `addr`, so reqwest's `connect` reuses the exact IP that passed the SSRF check
@@ -184,7 +343,7 @@ async fn resolve_and_check(url: &Url) -> Result<SocketAddr> {
 /// its slowloris / slow-upstream defence even though each hop is a freshly built
 /// client), and auto-redirect off — [`guarded_get`] follows + re-validates each
 /// hop itself.
-fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
     Client::builder()
         .user_agent(crate::USER_AGENT)
         // Bound each hop the same way the feed client is bounded: a total
@@ -194,6 +353,26 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         // never-finishing upstream.
         .timeout(FETCH_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        // Bound the idle connection pool too.
+        //
+        // These clients are CACHED — up to `MAX_PINNED_CLIENTS` of them, each
+        // holding its own pool — and every entry keeps live keep-alive TLS
+        // connections open until it is evicted. With reqwest's defaults
+        // (unlimited idle per host, no idle timeout) a poller touching many
+        // distinct feed hosts drives the cache toward its bound and each entry
+        // toward an unbounded number of sockets, on a 512 MB box with one shared
+        // core. The cache was given a size bound for the same reason; its pools
+        // were not.
+        //
+        // One idle connection per host is the right number here: reuse across
+        // the ~300 s TTL is what the cache exists for (measured 91 ms cold
+        // versus 30 ms warm), and nothing in this codebase issues concurrent
+        // requests to the SAME host through one client — `guarded_get` walks
+        // redirect hops sequentially, and the poller's concurrency is across
+        // DIFFERENT feeds. The idle timeout is well under the cache TTL so
+        // sockets are released before the client itself is.
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         // Override reqwest's resolver for this host only: connect goes straight
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
@@ -201,6 +380,15 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build IP-pinned fetch client")
+}
+
+/// The per-hop client for an already-vetted `(host, addr)`, pooled.
+///
+/// Callers must have run [`resolve_and_check`] for THIS request before calling
+/// this — the cache trusts its key, and the key is only as good as the check
+/// that produced it.
+fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
+    PINNED_CLIENTS.get(host, addr, Instant::now())
 }
 
 /// Fetch a user-supplied URL through the full SSRF guard: scheme + IP checks on
@@ -225,7 +413,7 @@ pub async fn guarded_get(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, true).await
+    guarded_get_inner(client, url, extra_headers, true, MAX_REDIRECTS).await
 }
 
 /// The SSRF core of [`guarded_get`] **without** the feed-privacy layer: scheme +
@@ -244,7 +432,30 @@ pub async fn guarded_get_no_privacy(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<Response> {
-    guarded_get_inner(client, url, extra_headers, false).await
+    guarded_get_inner(client, url, extra_headers, false, MAX_REDIRECTS).await
+}
+
+/// Like [`guarded_get_no_privacy`] but **refuses redirects outright**.
+///
+/// For the OAuth discovery and DID documents, following a redirect is not a
+/// convenience — it is a hole. The mix-up defence rests on comparing a
+/// document's `issuer` against *the URL it was fetched from*; if a `302` can move
+/// the fetch to another origin, that comparison is against the original URL while
+/// the bytes came from somewhere else, and the check silently stops meaning
+/// anything. The reference client sets `redirect: 'manual'`/`'error'` on every
+/// one of these fetches for the same reason.
+///
+/// Applies to: `/.well-known/oauth-protected-resource`,
+/// `/.well-known/oauth-authorization-server`, `plc.directory/<did>`, `did:web`
+/// `did.json`, and the client-metadata self-fetch. It deliberately does NOT
+/// apply to `/.well-known/atproto-did`, where the handle spec explicitly permits
+/// redirects.
+pub async fn guarded_get_no_redirect(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+) -> Result<Response> {
+    guarded_get_inner(client, url, extra_headers, false, 0).await
 }
 
 /// Whether a header carries credentials that must never follow a redirect onto a
@@ -292,6 +503,7 @@ async fn guarded_get_inner(
     url: &str,
     extra_headers: &[(HeaderName, HeaderValue)],
     check_privacy: bool,
+    max_redirects: usize,
 ) -> Result<Response> {
     // `client` is retained in the signature for API stability + as the policy
     // template; the actual send goes through a per-hop IP-pinned client.
@@ -300,7 +512,7 @@ async fn guarded_get_inner(
     // The origin the caller's credentials belong to; a hop off it drops them.
     let original = current.clone();
 
-    for _ in 0..=MAX_REDIRECTS {
+    for _ in 0..=max_redirects {
         check_scheme(&current)?;
         // Re-validate PRIVACY on EVERY hop: a public URL can `30x` to a
         // secret-bearing private feed (Substack/Patreon/tokened podcast). Without
@@ -338,6 +550,13 @@ async fn guarded_get_inner(
             .with_context(|| format!("fetching {current}"))?;
 
         if resp.status().is_redirection() {
+            if max_redirects == 0 {
+                bail!(
+                    "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
+                     this document's origin is load-bearing and must not be moved",
+                    resp.status()
+                );
+            }
             let location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -354,7 +573,7 @@ async fn guarded_get_inner(
         return Ok(resp);
     }
 
-    bail!("too many redirects (> {MAX_REDIRECTS}) while fetching {url:?}")
+    bail!("too many redirects (> {max_redirects}) while fetching {url:?}")
 }
 
 /// POST a JSON body to a **user-influenced** URL through the SSRF guard.
@@ -384,6 +603,78 @@ pub async fn guarded_post_json(
     extra_headers: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response> {
+    guarded_post(client, url, extra_headers, PostBody::Json(body)).await
+}
+
+/// A request body together with the content type that describes it.
+///
+/// The two travel as ONE value deliberately. Passing the content type alongside
+/// the bytes made it possible to send a JSON body labelled as a form, or the
+/// reverse — a swap no test could see without a live server, and the SSRF guard
+/// forbids pointing one of these at loopback. Deriving the header from the same
+/// value that produces the bytes removes the failure mode instead of watching
+/// for it.
+pub(crate) enum PostBody<'a> {
+    Json(Vec<u8>),
+    Form(&'a [(&'a str, &'a str)]),
+}
+
+impl PostBody<'_> {
+    fn content_type(&self) -> HeaderValue {
+        match self {
+            PostBody::Json(_) => HeaderValue::from_static("application/json"),
+            PostBody::Form(_) => HeaderValue::from_static("application/x-www-form-urlencoded"),
+        }
+    }
+
+    /// Every form value goes through the serializer rather than string
+    /// interpolation: an OAuth form carries the authorization code, the PKCE
+    /// verifier and the client assertion, and a raw `&` or `=` in any of them
+    /// would otherwise splice an extra parameter into the request.
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            PostBody::Json(bytes) => bytes,
+            PostBody::Form(params) => {
+                let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                for (k, v) in params {
+                    ser.append_pair(k, v);
+                }
+                ser.finish().into_bytes()
+            }
+        }
+    }
+}
+
+/// POST a form-encoded body to a **user-influenced** URL through the SSRF guard.
+///
+/// The OAuth counterpart to [`guarded_post_json`]: PAR, token exchange and
+/// refresh are all `application/x-www-form-urlencoded`. It matters more here
+/// than anywhere else that the guard applies — these are the requests that
+/// carry the client assertion and the authorization code, so an issuer URL
+/// that resolves to loopback or RFC1918 has to fail closed *before* the
+/// credential leaves the process.
+///
+/// Redirects are refused for the same reason as [`guarded_post_json`], and more
+/// acutely: a `307` would re-send the assertion and code to the new host.
+pub async fn guarded_post_form(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    params: &[(&str, &str)],
+) -> Result<Response> {
+    guarded_post(client, url, extra_headers, PostBody::Form(params)).await
+}
+
+/// The shared body of [`guarded_post_json`] and [`guarded_post_form`]. Kept as
+/// one function so the guard cannot drift between the two content types.
+async fn guarded_post(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    body: PostBody<'_>,
+) -> Result<Response> {
+    let content_type = body.content_type();
+    let body = body.into_bytes();
     // As in `guarded_get_inner`: `client` is the policy template; the send goes
     // through a freshly built, IP-pinned client.
     let _ = client;
@@ -395,7 +686,7 @@ pub async fn guarded_post_json(
 
     let mut req = hop_client
         .post(target.clone())
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(CONTENT_TYPE, content_type)
         .body(body);
     for (name, value) in extra_headers {
         req = req.header(name.clone(), value.clone());
@@ -556,6 +847,145 @@ pub(crate) mod tests {
         );
     }
 
+    // ── the pinned-client cache ──────────────────────────────────────────────
+
+    const V4: &str = "93.184.216.34:443";
+    const V4_OTHER: &str = "93.184.216.35:443";
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    /// A repeat request to the same vetted address REUSES the client, so the
+    /// connection pool survives and the TLS handshake is paid once.
+    ///
+    /// Measured motivation: a fresh connection to this project's PDS costs 91 ms
+    /// against 30 ms warm, which was most of the ~3x gap between the Rust repo
+    /// backend and the Node sidecar.
+    #[test]
+    fn the_same_vetted_address_reuses_one_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for i in 0..5 {
+            cache.get("example.com", addr, at(now, i)).unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "each request rebuilt the client, so every call pays a TLS handshake"
+        );
+    }
+
+    /// **A CHANGED ADDRESS MUST NOT REUSE THE POOL.**
+    ///
+    /// This is the property that makes the cache safe. The DNS-rebinding defence
+    /// is that we connect only to an address vetted for THIS request; a cache
+    /// keyed on the host alone would hand back a connection pinned to an address
+    /// vetted minutes ago, quietly undoing it. The key includes the address, so
+    /// a move is a miss.
+    #[test]
+    fn a_changed_address_does_not_reuse_the_pooled_client() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+
+        cache.get("example.com", V4.parse().unwrap(), now).unwrap();
+        cache
+            .get("example.com", V4_OTHER.parse().unwrap(), at(now, 1))
+            .unwrap();
+
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            2,
+            "the same host at a DIFFERENT address reused a connection pinned to the old one"
+        );
+        assert_eq!(cache.entries.lock().unwrap().len(), 2);
+    }
+
+    /// Two hosts that happen to resolve to the same address still get their own
+    /// clients — the pin is per host, and SNI/Host differ.
+    #[test]
+    fn different_hosts_at_one_address_are_separate_clients() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("a.example.com", addr, now).unwrap();
+        cache.get("b.example.com", addr, now).unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// An entry idle past the TTL is rebuilt, bounding how long a pooled
+    /// connection to a once-vetted address can live.
+    #[test]
+    fn an_idle_entry_is_rebuilt_after_the_ttl() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        cache.get("example.com", addr, now).unwrap();
+        cache
+            .get(
+                "example.com",
+                addr,
+                now + PINNED_CLIENT_TTL + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(cache.builds.load(Ordering::Relaxed), 2);
+    }
+
+    /// Use keeps an entry alive: a client fetched every minute must not be
+    /// rebuilt just because it was first created more than a TTL ago. The TTL is
+    /// idle time, not total age — otherwise the busiest client in the process
+    /// would be the one thrown away on a schedule.
+    #[test]
+    fn continued_use_keeps_an_entry_alive() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        let addr: SocketAddr = V4.parse().unwrap();
+
+        for minute in 0..20 {
+            cache
+                .get("example.com", addr, at(now, minute * 60))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.builds.load(Ordering::Relaxed),
+            1,
+            "a continuously-used client was expired by age rather than idleness"
+        );
+    }
+
+    /// A client must release its idle sockets BEFORE the cache releases the
+    /// client. The other way round, every entry spends the tail of its life
+    /// holding connections nothing will reuse — which is the whole cost the pool
+    /// bound exists to avoid.
+    #[test]
+    fn idle_sockets_are_released_before_their_client_is() {
+        assert!(
+            POOL_IDLE_TIMEOUT < PINNED_CLIENT_TTL,
+            "pool idle timeout {POOL_IDLE_TIMEOUT:?} is not shorter than the \
+             client TTL {PINNED_CLIENT_TTL:?}"
+        );
+    }
+
+    /// The map is bounded. The poller talks to as many hosts as there are feeds,
+    /// so an unbounded map would be a slow leak of connection pools.
+    #[test]
+    fn the_cache_is_bounded() {
+        let cache = PinnedClients::new();
+        let now = Instant::now();
+        for i in 0..(MAX_PINNED_CLIENTS + 50) {
+            let addr: SocketAddr = format!("93.184.216.34:{}", 1024 + i).parse().unwrap();
+            cache.get(&format!("h{i}.example.com"), addr, now).unwrap();
+        }
+        assert!(
+            cache.entries.lock().unwrap().len() <= MAX_PINNED_CLIENTS,
+            "the cache grew past its bound"
+        );
+    }
+
     #[test]
     fn pinned_client_builds_for_both_families() {
         // Both address families must produce a usable pinned client.
@@ -625,6 +1055,220 @@ pub(crate) mod tests {
         let resp = client.get(&base).send().await.unwrap();
         let body = read_capped(resp).await.unwrap();
         assert_eq!(body, b"hello world");
+    }
+
+    /// A raw HTTP server on loopback that answers `/final` with `200 arrived`
+    /// and **everything else** with `302 Location: /final`. Returns its bound
+    /// address, so a caller can pin a client to it by address rather than name.
+    ///
+    /// This is the fixture the two tests below need and that the module did not
+    /// previously have. Note it returns the `SocketAddr`, not a URL: the whole
+    /// point is to reach it under a hostname that does not resolve.
+    pub(crate) async fn serve_redirect_to_final() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET /final") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\narrived"
+                    } else {
+                        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// **The connect goes to the address the guard vetted — enforcement, not
+    /// decision.**
+    ///
+    /// `resolve_and_check` vets an address and `build_pinned_client` then
+    /// `.resolve()`s the host to exactly that address, so the TCP connect cannot
+    /// be rebound onto an internal one in the window between the two. That is
+    /// the DNS-rebinding defence the module doc spends 25 lines on.
+    ///
+    /// **Nothing observed it.** Deleting `.resolve(host, addr)` left all 659
+    /// tests green, because every other test either passes an IP literal — where
+    /// a second resolution is a no-op — or asserts on `is_forbidden_ip`
+    /// directly. `is_forbidden_ip` is thoroughly tested; what carries its verdict
+    /// to the socket was not tested at all.
+    ///
+    /// This pins it in the one way that cannot silently stop discriminating: the
+    /// host **resolves nowhere**. `.invalid` is reserved by RFC 2606 and is
+    /// guaranteed never to exist, so the only route to the stub is the pin. Drop
+    /// `.resolve()` and the client falls back to real DNS and cannot connect —
+    /// which is also why this test needs no network.
+    #[tokio::test]
+    async fn the_connect_is_pinned_to_the_vetted_address() {
+        let addr = serve_redirect_to_final().await;
+        let host = "pinned-target.invalid";
+        let client = pinned_client(host, addr).expect("building a pinned client");
+
+        let resp = client
+            .get(format!("http://{host}:{}/final", addr.port()))
+            .send()
+            .await
+            .expect(
+                "a pinned host must reach the vetted address without consulting DNS — \
+                 if this failed to connect, the `.resolve()` pin is gone",
+            );
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "arrived");
+    }
+
+    /// **The per-hop client must not follow redirects on its own.**
+    ///
+    /// `guarded_get_inner` follows redirects *manually* so it can re-run the
+    /// scheme check, the privacy check and `resolve_and_check` on every hop, and
+    /// so it can strip credential headers when a hop leaves the original origin.
+    /// All of that is bypassed if reqwest follows the redirect internally: the
+    /// connect to hop 2 happens inside reqwest, against an address nothing
+    /// vetted. For `guarded_post` it is worse still — reqwest would re-send a
+    /// `307`'s BODY (a client assertion, an auth code) to the new origin before
+    /// `guarded_post`'s own 3xx refusal ever ran.
+    ///
+    /// Flipping `Policy::none()` to `Policy::limited(10)` left all 659 tests
+    /// green. The existing redirect test could not catch it: it builds a 302 stub
+    /// and then discards the address with `let _ = addr`, because the guard
+    /// forbids loopback and the stub was therefore unreachable *through* the
+    /// guard. It asserts on a private URL passed directly in, so no redirect ever
+    /// occurs in it.
+    ///
+    /// Pinning by address sidesteps that — `pinned_client` does not consult the
+    /// guard, so the stub is reachable — and the assertion is on the status the
+    /// caller receives: `302`, handed back for the loop to re-validate, not the
+    /// `200` that reqwest would return after quietly following it.
+    #[tokio::test]
+    async fn the_pinned_client_does_not_follow_redirects_itself() {
+        let addr = serve_redirect_to_final().await;
+        let host = "redirector.invalid";
+        let client = pinned_client(host, addr).expect("building a pinned client");
+
+        let resp = client
+            .get(format!("http://{host}:{}/start", addr.port()))
+            .send()
+            .await
+            .expect("the stub must answer the first hop");
+
+        assert_eq!(
+            resp.status(),
+            302,
+            "the per-hop client must hand the 30x BACK to guarded_get_inner for \
+             re-validation; a 200 here means reqwest followed it internally and the \
+             second hop was connected to without passing resolve_and_check",
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/final"),
+            "the Location must reach the caller — it is what the next hop re-validates",
+        );
+    }
+
+    /// **Every branch of the v4/v6 blocklist is load-bearing.**
+    ///
+    /// Four branches were unreachable from the existing tests: `is_multicast()`
+    /// on both families, `192.0.0.0/24` ("this host on this network", IETF
+    /// protocol assignments) and `198.18.0.0/15` (benchmarking). Deleting all
+    /// four at once left the suite green, so a quarter of the blocklist could
+    /// have been dropped in a refactor without a single failure.
+    ///
+    /// These are not decorative: multicast to an internal group and the
+    /// benchmarking range are both reachable on a real network and neither can
+    /// host a legitimate public feed.
+    #[test]
+    fn every_blocklist_branch_is_load_bearing() {
+        for ip in [
+            "224.0.0.1",       // v4 multicast, all-systems group
+            "239.255.255.250", // v4 multicast, SSDP — a real LAN discovery target
+            "192.0.0.1",       // 192.0.0.0/24, IETF protocol assignments
+            "192.0.0.171",     // same /24
+            "198.18.0.1",      // 198.18/15 benchmarking
+            "198.19.255.255",  // top of the benchmarking range
+            "0.0.0.0",         // unspecified
+            "0.1.2.3",         // rest of 0/8
+            "255.255.255.255", // broadcast
+            "100.64.0.1",      // CGNAT floor
+            "100.127.255.255", // CGNAT ceiling
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} must be forbidden");
+        }
+        for ip in [
+            "ff02::1",                // v6 multicast, all-nodes
+            "::1",                    // v6 loopback
+            "::",                     // v6 unspecified
+            "fe80::1",                // v6 link-local
+            "fc00::1",                // v6 ULA
+            "fd00::1",                // v6 ULA
+            "::ffff:127.0.0.1",       // v4-mapped loopback
+            "::ffff:169.254.169.254", // v4-mapped cloud metadata
+            "::ffff:10.0.0.1",        // v4-mapped RFC1918
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} must be forbidden");
+        }
+    }
+
+    /// **The blocklist must not over-block, and only boundaries can show that.**
+    ///
+    /// A guard that refuses everything passes every all-negative test, and the
+    /// existing positive cases (`1.1.1.1`, `8.8.8.8`, `93.184.216.34`) sit
+    /// nowhere near a blocked range, so none of them would notice. Widening
+    /// `172.16/12` to all of `172/8` and `100.64/10` to all of `100/8` — which
+    /// would silently refuse Google and AWS address space — left the suite green.
+    ///
+    /// Each address here is the one immediately OUTSIDE a blocked range, so an
+    /// off-by-one in any CIDR boundary fails this test and nothing else.
+    #[test]
+    fn the_blocklist_does_not_over_block_adjacent_public_space() {
+        for ip in [
+            "9.255.255.255",   // just below 10/8
+            "11.0.0.0",        // just above 10/8
+            "172.15.255.255",  // just below 172.16/12
+            "172.32.0.0",      // just above 172.16/12 (172.217.x is Google)
+            "192.167.255.255", // just below 192.168/16
+            "192.169.0.0",     // just above 192.168/16
+            "169.253.255.255", // just below 169.254/16
+            "169.255.0.0",     // just above 169.254/16
+            "126.255.255.255", // just below 127/8
+            "128.0.0.0",       // just above 127/8
+            "100.63.255.255",  // just below 100.64/10 CGNAT
+            "100.128.0.0",     // just above 100.64/10 (100.20.x is AWS)
+            "192.0.1.0",       // just above 192.0.0.0/24
+            "198.17.255.255",  // just below 198.18/15
+            "198.20.0.0",      // just above 198.18/15
+            "223.255.255.255", // just below 224/4 multicast
+            "1.0.0.0",         // just above 0/8
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(&parsed),
+                "{ip} is public and adjacent to a blocked range — refusing it means a \
+                 CIDR boundary is wrong and real feeds are unreachable",
+            );
+        }
+        for ip in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(&parsed),
+                "{ip} is public and must be allowed"
+            );
+        }
     }
 
     /// **Regression (v0.2.8):** the write-side guard must refuse the same targets
@@ -784,5 +1428,311 @@ pub(crate) mod tests {
         assert_eq!(safe_link("   "), None);
         // A relative/naked path isn't an absolute http(s) URL → dropped.
         assert_eq!(safe_link("/relative/path"), None);
+    }
+
+    /// The OAuth token/PAR calls are form POSTs carrying a client assertion and,
+    /// on the token call, the authorization code. They must go through the SAME
+    /// SSRF guard as everything else: a PDS or issuer URL that resolves to
+    /// loopback/RFC1918 has to fail closed BEFORE the credential is sent.
+    #[tokio::test]
+    async fn guarded_post_form_fails_closed_on_a_forbidden_target() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1:2583/oauth/token",
+            "http://[::1]:2583/oauth/token",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/oauth/token",
+        ] {
+            let err = guarded_post_form(&client, url, &[], &[("grant_type", "authorization_code")])
+                .await
+                .expect_err("must refuse {url}");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("forbidden") || msg.contains("refus") || msg.contains("resolve"),
+                "unexpected error for {url}: {err:#}"
+            );
+        }
+    }
+
+    /// A non-http(s) scheme must be rejected before any DNS work.
+    #[tokio::test]
+    async fn guarded_post_form_rejects_non_http_schemes() {
+        let client = Client::new();
+        assert!(
+            guarded_post_form(&client, "file:///etc/passwd", &[], &[("a", "b")])
+                .await
+                .is_err()
+        );
+    }
+
+    /// OAuth metadata and DID documents must be fetched WITHOUT following
+    /// redirects, and still through the SSRF guard.
+    /// Asserts on the GUARD's error, not merely `is_err()`. Connecting to
+    /// `127.0.0.1` fails anyway (refused, or a slow timeout for an unrouted
+    /// RFC1918 address), so an `is_err()`-only assertion passes with
+    /// `resolve_and_check` deleted and proves nothing.
+    #[tokio::test]
+    async fn guarded_get_no_redirect_still_fails_closed_on_forbidden_targets() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1/.well-known/oauth-authorization-server",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/.well-known/did.json",
+            "http://[::1]/.well-known/did.json",
+        ] {
+            let err = guarded_get_no_redirect(&client, url, &[])
+                .await
+                .expect_err("must refuse");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("forbidden (internal) address"),
+                "{url} failed for the wrong reason: {rendered}"
+            );
+        }
+        // And the scheme check, which is a different branch entirely.
+        let err = guarded_get_no_redirect(&client, "file:///etc/passwd", &[])
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("non-http(s) URL scheme"));
+    }
+
+    /// The content type must follow the body it describes. Because both come
+    /// from the same value, a JSON body can never be labelled as a form.
+    #[test]
+    fn the_content_type_follows_the_body_kind() {
+        assert_eq!(
+            PostBody::Json(b"{}".to_vec()).content_type(),
+            "application/json"
+        );
+        assert_eq!(
+            PostBody::Form(&[("a", "b")]).content_type(),
+            "application/x-www-form-urlencoded"
+        );
+        // And the bytes are encoded to match.
+        assert_eq!(
+            PostBody::Json(b"{\"a\":1}".to_vec()).into_bytes(),
+            b"{\"a\":1}"
+        );
+        assert_eq!(PostBody::Form(&[("a", "b c")]).into_bytes(), b"a=b+c");
+    }
+
+    /// Form encoding must percent-encode values; a value containing `&` or `=`
+    /// must not be able to inject an extra parameter into the body.
+    #[test]
+    fn form_body_percent_encodes_and_cannot_inject_parameters() {
+        let body = PostBody::Form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "abc&scope=evil"),
+            ("redirect_uri", "https://x.example/oauth/callback"),
+        ])
+        .into_bytes();
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains("grant_type=authorization_code"));
+        assert!(
+            s.matches("scope=").count() == 0,
+            "a `&` in a value injected a parameter: {s}"
+        );
+        assert!(s.contains("%26"), "the `&` was not encoded: {s}");
+        assert!(s.contains("%3A%2F%2F"), "the `://` was not encoded: {s}");
+    }
+
+    // ── SSRF ENFORCEMENT (not just the decision) ─────────────────────────────
+    //
+    // Everything below drives a REAL redirect through `guarded_get_inner`
+    // against a real HTTP server. None of it was possible before the
+    // `test_host_override` seam: the guard correctly refuses loopback, so a
+    // local test server was unreachable through it, and three enforcement
+    // properties had no coverage at all. Each had a mutation that left the
+    // whole suite green.
+
+    /// A tiny HTTP server that replays canned responses and records every raw
+    /// request it received. Returns its address and the request log.
+    async fn spawn_http(
+        responses: Vec<String>,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = responses
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| responses.last().cloned().unwrap_or_default());
+                i += 1;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, log)
+    }
+
+    fn ok_200() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_string()
+    }
+    fn redirect_to(loc: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    /// **A redirect to a forbidden address is refused — the marquee SSRF
+    /// property, and until now it had no end-to-end test.**
+    ///
+    /// `guarded_get_refuses_private_redirect_target` builds a 302 stub and then
+    /// throws it away (`let _ = addr;`), asserting on a private URL passed in
+    /// directly. Nothing drove a redirect through the guard, and a mutation that
+    /// validated only the first hop — resolving redirect targets with a bare
+    /// `lookup_host` and no `is_forbidden_ip` — left all 679 tests passing.
+    ///
+    /// Here a real server really 302s to the cloud metadata endpoint. Only the
+    /// test server's own host is exempted from the IP check; the redirect target
+    /// is an IP literal and goes through the real one.
+    #[tokio::test]
+    async fn a_redirect_to_a_forbidden_address_is_refused() {
+        let (addr, log) = spawn_http(vec![redirect_to(
+            "http://169.254.169.254/latest/meta-data/",
+        )])
+        .await;
+        test_host_override("hop-forbidden.test", addr);
+
+        let err = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://hop-forbidden.test:{}/feed.xml", addr.port()),
+            &[],
+        )
+        .await
+        .expect_err("a 302 to the metadata endpoint was followed");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("169.254.169.254") && msg.contains("forbidden"),
+            "refused, but not by the address check: {msg}",
+        );
+        // The hop happened; the SECOND hop is what was stopped.
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    /// **Credentials do not follow a redirect off the original origin.**
+    ///
+    /// `hop_headers` is tested as a pure function; nothing tested that
+    /// `guarded_get_inner` actually calls it. Swapping the call for a plain
+    /// `extra_headers` — so a bearer token rides to whatever host an upstream
+    /// names — left the whole suite green.
+    ///
+    /// Two real servers on two hosts. The first 302s to the second; the second
+    /// records what it was sent.
+    #[tokio::test]
+    async fn credentials_are_dropped_when_a_redirect_leaves_the_origin() {
+        let (b_addr, b_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("cred-b.test", b_addr);
+        let (a_addr, _a_log) = spawn_http(vec![redirect_to(&format!(
+            "http://cred-b.test:{}/next",
+            b_addr.port()
+        ))])
+        .await;
+        test_host_override("cred-a.test", a_addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://cred-a.test:{}/feed.xml", a_addr.port()),
+            &[(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer super-secret"),
+            )],
+        )
+        .await
+        .expect("the cross-origin hop should still succeed, just without the token");
+        assert!(resp.status().is_success());
+
+        let seen = b_log.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(
+            !seen.contains("super-secret"),
+            "the bearer token was forwarded across origins:\n{seen}",
+        );
+        assert!(
+            !seen.contains("authorization:"),
+            "the Authorization header survived a cross-origin redirect:\n{seen}",
+        );
+    }
+
+    /// **...but they DO survive a same-origin redirect.**
+    ///
+    /// The other direction, without which the test above is satisfied by a guard
+    /// that strips every header always — which would quietly break every
+    /// authenticated fetch in the app.
+    ///
+    /// A RELATIVE `Location` keeps the hop on the same origin without the
+    /// response needing to know its own port.
+    #[tokio::test]
+    async fn credentials_survive_a_same_origin_redirect() {
+        let (addr, log) = spawn_http(vec![redirect_to("/second"), ok_200()]).await;
+        test_host_override("cred-same.test", addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://cred-same.test:{}/feed.xml", addr.port()),
+            &[(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_static("Bearer keep-me"),
+            )],
+        )
+        .await
+        .expect("a same-origin redirect should be followed");
+        assert!(resp.status().is_success());
+
+        let reqs = log.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "the redirect was not followed");
+        assert!(
+            reqs[1].to_ascii_lowercase().contains("keep-me"),
+            "the token was stripped on a SAME-origin redirect — over-stripping \
+             would break every authenticated fetch:\n{}",
+            reqs[1],
+        );
+    }
+
+    /// **Every DNS answer is checked, not just the first.**
+    ///
+    /// A host that publishes `1.2.3.4, 127.0.0.1` must be rejected wholesale.
+    /// Checking only the first answer left the suite green, because nothing
+    /// exercised a multi-answer set — real DNS in a test cannot be made to
+    /// return one.
+    #[test]
+    fn a_mixed_dns_answer_set_is_rejected_wholesale() {
+        let public: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let private: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let link_local: SocketAddr = "169.254.169.254:80".parse().unwrap();
+
+        // All public: the first is pinned.
+        assert_eq!(
+            first_vetted(
+                "ok.example",
+                [public, "5.6.7.8:80".parse().unwrap()].into_iter()
+            )
+            .unwrap(),
+            public,
+        );
+        // A forbidden answer ANYWHERE rejects the set — including last, which is
+        // exactly what a first-answer-only check would miss.
+        for bad in [private, link_local] {
+            assert!(
+                first_vetted("evil.example", [public, bad].into_iter()).is_err(),
+                "{bad} in the answer set was accepted because a good answer came first",
+            );
+            assert!(first_vetted("evil.example", [bad, public].into_iter()).is_err());
+        }
+        // No answers at all is an error, not a silent pass.
+        assert!(first_vetted("empty.example", std::iter::empty()).is_err());
     }
 }

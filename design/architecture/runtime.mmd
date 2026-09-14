@@ -2,15 +2,19 @@ flowchart TB
     B["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>proxy · cache · origin lock"]
     subgraph Fly["Fly.io container — tini + gosu"]
         Caddy["Caddy edge · :8080"]
-        App["Rust app · axum · :8082"]
+        App["Rust app · axum · :8082<br/>built-in atproto OAuth"]
         Side["Node OAuth sidecar · :8081"]
         DB[("SQLite cache · /data")]
-        Caddy -->|"/oauth/*"| Side
         Caddy -->|"everything else"| App
+        Caddy -->|"/oauth/*"| App
+        Caddy -.->|"/oauth/*"| Side
         App --- DB
-        App <-->|"internal API"| Side
+        App <-.->|"internal API"| Side
     end
     CF -->|"X-Origin-Auth"| Caddy
     App -->|"conditional GET · SSRF-guarded"| Feeds[("Feed origins")]
     App <-->|"com.atproto.repo.*"| PDS[("Your atproto PDS")]
-    Side <-->|"OAuth handshake · tokens"| PDS
+    App <-->|"OAuth handshake · tokens"| PDS
+    Side <-.->|"OAuth handshake · tokens"| PDS
+    Note["Dashed = the Node sidecar, used only when<br/>FEATHERREADER_REPO_BACKEND=sidecar (the default).<br/>On the rust backend those three links do not exist<br/>and the sidecar process is not started.<br/>Everything solid runs either way."]
+    Fly -.- Note

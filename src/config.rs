@@ -12,7 +12,9 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_RETENTION_DAYS`| `90`                    | Prune read, unstarred entries older than this. |
+//! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
+//! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
+//! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
 //! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |
@@ -25,6 +27,16 @@
 //! | `FEATHERREADER_RELAY_HOSTS`  | `relay1.us-west.bsky.network,relay1.us-east.bsky.network` | Relays queried for the network adoption count. Bare hosts or full URLs. Setting it to the **empty string** names no relays and so disables the probe (unset ⇒ the defaults above; the two are deliberately distinguished). |
 //! | `FEATHERREADER_ADOPTION_INTERVAL_SECS` | `86400` (24h)  | Adoption-probe cadence (±10% jitter). `0` disables the probe. |
 //! | `FEATHERREADER_SHOW_ADOPTION` | `false`                 | Render the one-line adoption fact on `/about`. |
+//!
+//! The **cutover switch** and the Rust-native OAuth client it selects:
+//!
+//! | Variable                          | Default             | Meaning |
+//! |-----------------------------------|---------------------|---------|
+//! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
+//! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
+//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
+//! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
+//! | `FEATHERREADER_OAUTH_SCOPE`       | `atproto transition:generic` | Scope requested at login. Part of the dev `client_id`, so changing it changes the client's identity in dev. |
 //!
 //! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
 //! second small block — the base URL the Rust server reaches it on and the shared
@@ -63,8 +75,29 @@ pub struct Config {
     pub allowed_dids: Vec<String>,
     /// The default per-feed poll interval.
     pub poll_interval: Duration,
-    /// Retention window: read, unstarred entries older than this are pruned.
+    /// Cache eviction window, in days: a READ, UNSTARRED entry older than this
+    /// is dropped from the local cache. Starred and still-unread entries are
+    /// kept past this window — but NOT indefinitely: see `retention_hard_days`,
+    /// which is the bound. The PDS holds the reader's choices, and the entry
+    /// CONTENT lives only here and at the origin feed, which usually serves just
+    /// its last few dozen items.
+    ///
+    /// Two weeks by default. The cache exists to render a feed list quickly,
+    /// not to archive the web.
     pub retention_days: u32,
+    /// Absolute cache ceiling, in days. Entries older than this are dropped
+    /// REGARDLESS of starred or unread state.
+    ///
+    /// This is the bound, and sparing would remove it without one. "Mark
+    /// unread" is a one-click control and `entries` is shared across every
+    /// reader, so an unbounded exception lets one person pin rows permanently —
+    /// and because the poller stops entirely once the database crosses
+    /// `db_size_watermark_bytes`, with the retention DELETE as its only release
+    /// valve, those pins could stop polling for everyone.
+    ///
+    /// Losing a starred entry here is survivable: the saved record stays in the
+    /// reader's PDS and renders as a link.
+    pub retention_hard_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
     /// Closed-beta seat cap: the maximum number of DIDs that may hold beta
@@ -100,6 +133,10 @@ pub struct Config {
     pub db_size_watermark_bytes: i64,
     /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
     pub sidecar: SidecarConfig,
+    /// The Rust-native OAuth client's own wiring. Read whatever the backend, so
+    /// a misconfiguration is caught at startup rather than at the moment the
+    /// switch is thrown.
+    pub oauth: OauthConfig,
     /// HMAC key used to sign the session cookie. In production this MUST be set
     /// (`FEATHERREADER_COOKIE_SECRET`); a stable dev fallback is used otherwise
     /// so local runs work without configuration.
@@ -108,6 +145,10 @@ pub struct Config {
     /// is served as this DID (local runs without the OAuth sidecar). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
+    /// Which repo implementation serves `com.atproto.repo.*` — the cutover
+    /// switch. Defaults to the sidecar, so deploying the Rust client changes
+    /// nothing until this is set deliberately.
+    pub repo_backend: crate::metrics::Backend,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
     /// handle into a DID so an existing seat can be honored on a cookie-less first
@@ -173,6 +214,43 @@ pub struct SidecarConfig {
     pub internal_secret: String,
 }
 
+/// Wiring for the Rust-native OAuth client.
+#[derive(Debug, Clone)]
+pub struct OauthConfig {
+    /// Path to the client's ES256 signing key. Encrypted at rest with
+    /// `encryption_key`, in the SAME `enc.v1` format the sidecar writes, so the
+    /// two can share one file and a rollback finds the key it expects.
+    pub key_path: PathBuf,
+    /// Passphrase for the at-rest encryption of the signing key and the stored
+    /// sessions. `None` leaves them in PLAINTEXT, which `validate_secrets`
+    /// refuses on a production-like instance when the Rust backend is selected
+    /// — that is the only configuration in which these tables are written.
+    pub encryption_key: Option<String>,
+    /// The PLC directory used to resolve `did:plc` documents.
+    pub plc_directory: String,
+    /// The OAuth scope requested at login. Part of the dev `client_id`, so
+    /// changing it changes the client's identity in dev.
+    pub scope: String,
+}
+
+/// The default PLC directory — the canonical one operated by Bluesky.
+const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
+
+/// The scope the reader needs: `atproto` for identity, `transition:generic` for
+/// the `com.atproto.repo.*` writes. Matches the sidecar's.
+const DEFAULT_OAUTH_SCOPE: &str = "atproto transition:generic";
+
+impl Default for OauthConfig {
+    fn default() -> Self {
+        Self {
+            key_path: PathBuf::from("oauth-signing-key.json"),
+            encryption_key: None,
+            plc_directory: DEFAULT_PLC_DIRECTORY.to_string(),
+            scope: DEFAULT_OAUTH_SCOPE.to_string(),
+        }
+    }
+}
+
 /// The sidecar's own dev fallback for the shared secret (matches the sidecar's
 /// `dev-internal-secret-change-me`) so a fully-local dev stack works untouched.
 const DEV_INTERNAL_SECRET: &str = "dev-internal-secret-change-me";
@@ -220,6 +298,20 @@ impl SidecarConfig {
     }
 }
 
+/// Parse the cutover switch. Unknown values are an ERROR rather than a silent
+/// fall back to the default: a typo in `FEATHERREADER_REPO_BACKEND=rsut` that
+/// quietly kept the sidecar live would make the whole comparison a measurement
+/// of the sidecar against itself.
+fn parse_repo_backend(raw: &str) -> Result<crate::metrics::Backend> {
+    match raw.trim() {
+        "sidecar" => Ok(crate::metrics::Backend::Sidecar),
+        "rust" => Ok(crate::metrics::Backend::Rust),
+        other => anyhow::bail!(
+            "FEATHERREADER_REPO_BACKEND: expected \"sidecar\" or \"rust\", got {other:?}"
+        ),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -230,7 +322,8 @@ impl Default for Config {
             public_url: "http://localhost:8080".to_string(),
             allowed_dids: Vec::new(),
             poll_interval: Duration::from_secs(3600),
-            retention_days: 90,
+            retention_days: 14,
+            retention_hard_days: 180,
             proxy_images: false,
             beta_cap: 100,
             trusted_ip_header: None,
@@ -239,7 +332,10 @@ impl Default for Config {
             max_entries_per_feed: 2_000,
             db_size_watermark_bytes: 2 * 1024 * 1024 * 1024,
             sidecar: SidecarConfig::default(),
+            oauth: OauthConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
+            // The sidecar stays the live path until the switch is thrown.
+            repo_backend: crate::metrics::Backend::Sidecar,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
@@ -297,6 +393,13 @@ impl Config {
                 Duration::from_secs(secs)
             }
             None => defaults.poll_interval,
+        };
+
+        let retention_hard_days = match env_opt("FEATHERREADER_RETENTION_HARD_DAYS") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!("FEATHERREADER_RETENTION_HARD_DAYS: expected an integer, got {raw:?}")
+            })?,
+            None => defaults.retention_hard_days,
         };
 
         let retention_days = match env_opt("FEATHERREADER_RETENTION_DAYS") {
@@ -418,6 +521,22 @@ impl Config {
             None => defaults.adoption_interval,
         };
 
+        let oauth = OauthConfig {
+            key_path: env_opt("FEATHERREADER_OAUTH_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or(defaults.oauth.key_path),
+            encryption_key: env_opt("FEATHERREADER_OAUTH_ENCRYPTION_KEY"),
+            plc_directory: env_opt("FEATHERREADER_PLC_DIRECTORY")
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or(defaults.oauth.plc_directory),
+            scope: env_opt("FEATHERREADER_OAUTH_SCOPE").unwrap_or(defaults.oauth.scope),
+        };
+
+        let repo_backend = match env_opt("FEATHERREADER_REPO_BACKEND") {
+            Some(raw) => parse_repo_backend(&raw)?,
+            None => defaults.repo_backend,
+        };
+
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
                 format!("FEATHERREADER_SHOW_ADOPTION: expected a boolean, got {raw:?}")
@@ -426,12 +545,15 @@ impl Config {
         };
 
         let config = Self {
+            oauth,
+            repo_backend,
             bind,
             db_path,
             public_url,
             allowed_dids,
             poll_interval,
             retention_days,
+            retention_hard_days,
             proxy_images,
             beta_cap,
             trusted_ip_header,
@@ -455,8 +577,47 @@ impl Config {
         // repo-published dev secrets — those are known to any attacker, who could
         // then forge a session cookie offline. Refuse to boot instead.
         config.validate_secrets()?;
+        config.validate_retention()?;
 
         Ok(config)
+    }
+
+    /// Refuse a retention pair where the ceiling is inside the window.
+    ///
+    /// `prune_old_entries` ignores a hard ceiling that is not strictly older than
+    /// the rolling window, because applying it would delete exactly the starred
+    /// and unread rows the window exists to spare. That refusal is right, but the
+    /// fallback it lands on — no ceiling at all — is the UNBOUNDED one, and the
+    /// only signal was a `warn!` emitted once per daily sweep.
+    ///
+    /// The configuration that reaches it is not exotic. An operator who wants a
+    /// bigger cache sets `FEATHERREADER_RETENTION_DAYS=365` and leaves
+    /// `RETENTION_HARD_DAYS` at its 180-day default; `180 <= 365`, so the ceiling
+    /// silently disappears. The shared `entries` table then has no bound on rows
+    /// a reader has pinned by starring or marking unread — and `poll_due_once`
+    /// stops polling for EVERY reader once the database crosses the size
+    /// watermark, with the retention DELETE as the only release valve. One
+    /// reader can hold that valve shut permanently.
+    ///
+    /// So this is a boot refusal, matching how `FEATHERREADER_REPO_BACKEND`
+    /// treats an unrecognised value: a contradictory setting fails startup rather
+    /// than being reinterpreted into the most destructive reading available.
+    /// Both knobs off (`0`/`0`) is still allowed — that is an explicit choice to
+    /// run unbounded, not an accident of changing one variable.
+    fn validate_retention(&self) -> anyhow::Result<()> {
+        let (days, hard) = (self.retention_days, self.retention_hard_days);
+        if hard > 0 && days > 0 && hard <= days {
+            anyhow::bail!(
+                "FEATHERREADER_RETENTION_HARD_DAYS ({hard}) must be strictly greater than \
+                 FEATHERREADER_RETENTION_DAYS ({days}), or 0 to disable the ceiling. A ceiling \
+                 inside the window cannot be applied — it would delete exactly the starred and \
+                 unread entries the window exists to spare — so it would be ignored, leaving \
+                 the shared cache with NO bound on entries readers have pinned. Raise the \
+                 ceiling above the window (the default pair is 14/180), or set it to 0 if you \
+                 genuinely want no ceiling."
+            );
+        }
+        Ok(())
     }
 
     /// Whether this instance is "production-like" and therefore MUST have strong,
@@ -499,6 +660,25 @@ impl Config {
         if let Some(bot_secret) = &self.bot_secret {
             check_secret("FEATHERREADER_BOT_SECRET", bot_secret, "")?;
         }
+        // With the Rust backend live, `oauth_session` holds every user's access
+        // token, refresh token and DPoP PRIVATE KEY. An unset encryption key
+        // makes the codec a no-op and leaves all three in the clear in SQLite —
+        // on the same mounted volume as the feed cache, and in every snapshot
+        // and backup of it. Gated on the backend because the sidecar path never
+        // writes these tables, and blocking a rollback over a key that path does
+        // not read would be the wrong failure.
+        if self.repo_backend == crate::metrics::Backend::Rust {
+            match self.oauth.encryption_key.as_deref() {
+                Some(key) => check_secret("FEATHERREADER_OAUTH_ENCRYPTION_KEY", key, "")?,
+                None => anyhow::bail!(
+                    "FEATHERREADER_REPO_BACKEND=rust on a production-like instance requires \
+                     FEATHERREADER_OAUTH_ENCRYPTION_KEY: without it every stored access token, \
+                     refresh token and DPoP private key is written to SQLite in plaintext. \
+                     Set it to a random secret of at least {MIN_SECRET_BYTES} bytes."
+                ),
+            }
+        }
+
         // Split-deploy footgun: on a production-like instance, if the sidecar's
         // INTERNAL base equals its PUBLIC base and that base is non-loopback, the
         // Rust server would send the `X-Internal-Secret` + all session/repo
@@ -653,12 +833,62 @@ fn parse_bool(raw: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// A ceiling inside the window is refused at BOOT, not ignored at sweep time.
+    ///
+    /// `prune_old_entries` correctly refuses to apply such a ceiling — it would
+    /// delete exactly the starred and unread rows the window spares — but the
+    /// fallback is "no ceiling", which is the unbounded reading. The pair is
+    /// reachable by changing ONE variable: raise `RETENTION_DAYS` to 365 and the
+    /// default 180-day ceiling silently disappears.
+    #[test]
+    fn a_retention_ceiling_inside_the_window_is_refused_at_startup() {
+        let base = Config::default();
+        let with = |days: u32, hard: u32| Config {
+            retention_days: days,
+            retention_hard_days: hard,
+            ..base.clone()
+        };
+
+        // The one-variable footgun this exists for.
+        let err = with(365, 180)
+            .validate_retention()
+            .expect_err("365/180 must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RETENTION_HARD_DAYS"),
+            "unhelpful message: {msg}"
+        );
+        assert!(msg.contains("strictly greater"), "unhelpful message: {msg}");
+
+        // Equal is refused too — the two cutoffs coincide, so the ceiling would
+        // delete precisely what the window spares.
+        assert!(with(14, 14).validate_retention().is_err());
+        assert!(with(30, 7).validate_retention().is_err());
+
+        // Valid pairs.
+        assert!(
+            with(14, 180).validate_retention().is_ok(),
+            "the default pair"
+        );
+        assert!(
+            with(365, 400).validate_retention().is_ok(),
+            "a bigger cache with the ceiling raised to match"
+        );
+        // Ceiling deliberately off: allowed, because it is an explicit choice
+        // rather than a side effect of moving the window.
+        assert!(with(14, 0).validate_retention().is_ok());
+        // Window off, ceiling on: the T1.3 configuration.
+        assert!(with(0, 180).validate_retention().is_ok());
+        // Both off: unbounded, but explicitly so.
+        assert!(with(0, 0).validate_retention().is_ok());
+    }
+
     #[test]
     fn defaults_are_sane() {
         let c = Config::default();
         assert_eq!(c.bind.port(), 8080);
         assert_eq!(c.poll_interval, Duration::from_secs(3600));
-        assert_eq!(c.retention_days, 90);
+        assert_eq!(c.retention_days, 14);
         assert!(!c.proxy_images);
         assert!(c.allowed_dids.is_empty());
         assert_eq!(c.beta_cap, 100);
@@ -757,6 +987,135 @@ mod tests {
             parse_relay_hosts(Some("wss://a.example, ftp://b.example"), relay_defaults());
         assert!(hosts.is_empty());
         assert_eq!(rejected.len(), 2);
+    }
+
+    /// **Plaintext tokens must not be deployable.**
+    ///
+    /// With the Rust backend live, `oauth_session` holds every user's access
+    /// token, refresh token and DPoP PRIVATE KEY. Without an encryption key the
+    /// codec is a no-op and all three sit in the clear in SQLite — on the same
+    /// mounted volume as the feed cache, in every snapshot and backup of it.
+    ///
+    /// This was found by reading a real session row during the live test: the
+    /// stored access token began `eyJ0eXAiOiJh`, i.e. a bare JWT. The doc
+    /// comment on `OauthConfig::encryption_key` already CLAIMED this was
+    /// refused; it was not.
+    #[test]
+    fn a_production_rust_backend_refuses_to_boot_without_an_encryption_key() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: None,
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate_secrets()
+            .expect_err("plaintext tokens must not boot in production");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("FEATHERREADER_OAUTH_ENCRYPTION_KEY"),
+            "the error must name the variable to set: {rendered}"
+        );
+    }
+
+    /// The SIDECAR backend is unaffected: it stores nothing in these tables, and
+    /// blocking a rollback over a key that path never reads would be the wrong
+    /// failure.
+    #[test]
+    fn the_sidecar_backend_boots_without_an_oauth_encryption_key() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Sidecar,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: None,
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_secrets().is_ok());
+    }
+
+    /// A weak key is refused on the same terms as every other secret — a short
+    /// passphrase is stretched into an AES key, so its entropy is the ceiling.
+    #[test]
+    fn a_weak_oauth_encryption_key_is_refused_in_production() {
+        let cfg = Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
+            sidecar: SidecarConfig {
+                internal_secret: "a-long-enough-production-internal-secret".into(),
+                internal_url: "http://127.0.0.1:8081".into(),
+                ..SidecarConfig::default()
+            },
+            oauth: OauthConfig {
+                encryption_key: Some("short".into()),
+                ..OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate_secrets().is_err());
+    }
+
+    /// **A typo must fail loudly.**
+    ///
+    /// `FEATHERREADER_REPO_BACKEND=rsut` falling back to the default would leave
+    /// the sidecar serving every request while the operator believed the Rust
+    /// path was live. Every number in the comparison would then be the sidecar
+    /// measured against itself, and the cutover would look flawless right up
+    /// until the flag was removed.
+    #[test]
+    fn an_unknown_repo_backend_is_an_error_rather_than_a_silent_default() {
+        let err = parse_repo_backend("rsut").expect_err("a typo must not be ignored");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rsut"),
+            "the message must name the bad value: {rendered}"
+        );
+        assert!(rendered.contains("sidecar") && rendered.contains("rust"));
+    }
+
+    /// Both spellings parse, and surrounding whitespace (a stray newline in a
+    /// compose file or secret) does not change the backend.
+    #[test]
+    fn the_two_backends_parse_including_stray_whitespace() {
+        assert_eq!(
+            parse_repo_backend("sidecar").unwrap(),
+            crate::metrics::Backend::Sidecar
+        );
+        assert_eq!(
+            parse_repo_backend("rust").unwrap(),
+            crate::metrics::Backend::Rust
+        );
+        assert_eq!(
+            parse_repo_backend(" rust\n").unwrap(),
+            crate::metrics::Backend::Rust
+        );
+    }
+
+    /// The default is the SIDECAR. Deploying this branch must not move anyone
+    /// onto the new path by merely shipping; the switch has to be thrown.
+    #[test]
+    fn the_default_backend_is_the_sidecar() {
+        assert_eq!(
+            Config::default().repo_backend,
+            crate::metrics::Backend::Sidecar
+        );
     }
 
     #[test]
