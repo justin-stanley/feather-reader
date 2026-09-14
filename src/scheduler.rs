@@ -150,8 +150,10 @@ enum Loop {
 }
 
 impl Loop {
-    /// Every loop, so a test can assert the mapping is total and injective.
-    #[cfg(test)]
+    /// The registry: every offset-bearing loop, in the order `spawn` starts them.
+    ///
+    /// A variant missing from here is never STARTED — a visible absence — rather
+    /// than started with the wrong offset, which was silent.
     const ALL: [Loop; 5] = [
         Loop::Poller,
         Loop::PendingSweep,
@@ -159,6 +161,30 @@ impl Loop {
         Loop::Retention,
         Loop::Adoption,
     ];
+
+    /// Start this loop, with its own offset.
+    ///
+    /// **The variant names the loop AND the offset, in one place.** The previous
+    /// shape passed `offset_for(Loop::X)` as a positional argument at five
+    /// near-identical `tokio::spawn` lines, ~600 lines from the loop it
+    /// configured — so writing `offset_for(Loop::Poller)` at the pending-sweeper
+    /// site compiled, passed 707 tests and clippy, and silently collided the two
+    /// loops at boot. That is the third form of this same bug; the first two were
+    /// a wrong constant and a mistyped string key.
+    fn spawn_with(
+        self,
+        state: AppState,
+        shutdown: watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let startup = offset_for(self);
+        match self {
+            Loop::Poller => tokio::spawn(run_poller(state, shutdown, startup)),
+            Loop::PendingSweep => tokio::spawn(run_pending_sweeper(state, shutdown, startup)),
+            Loop::CodeSweep => tokio::spawn(run_code_sweeper(state, shutdown, startup)),
+            Loop::Retention => tokio::spawn(run_retention_sweeper(state, shutdown, startup)),
+            Loop::Adoption => tokio::spawn(run_adoption_probe(state, shutdown, startup)),
+        }
+    }
 
     /// This loop's startup offset. Exhaustive: adding a variant without an
     /// offset does not compile.
@@ -318,49 +344,29 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
     );
 
-    let poller = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_poller(state, shutdown, offset_for(Loop::Poller)).await })
-    };
-    let sweeper = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(
-            async move { run_code_sweeper(state, shutdown, offset_for(Loop::CodeSweep)).await },
-        )
-    };
-    let retention = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            run_retention_sweeper(state, shutdown, offset_for(Loop::Retention)).await
-        })
-    };
-    // NOTE: must be constructed BEFORE the flusher, which consumes the
-    // un-cloned `state` / `shutdown` by move.
-    let probe = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            run_adoption_probe(state, shutdown, offset_for(Loop::Adoption)).await
-        })
-    };
-    let metrics = {
+    // **Driven off the registry, not five hand-written lines.** Every offset-
+    // bearing loop is started here by iterating `Loop::ALL`, so a loop cannot be
+    // given another's offset — the variant chooses both.
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Loop::ALL
+        .iter()
+        .map(|l| l.spawn_with(state.clone(), shutdown.clone()))
+        .collect();
+
+    // The two loops with NO startup offset. `run_metrics_flusher` deliberately
+    // fires immediately at boot; `run_flusher` swallows its first tick. Neither
+    // is in `Loop`, so neither is covered by the distinctness invariant — stated
+    // here because the test's message would otherwise read as covering all loops.
+    handles.push({
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
-    };
-    let pending = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            run_pending_sweeper(state, shutdown, offset_for(Loop::PendingSweep)).await
-        })
-    };
-    let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
+    });
+    // Last: consumes the un-cloned `state` / `shutdown` by move.
+    handles.push(tokio::spawn(
+        async move { run_flusher(state, shutdown).await },
+    ));
 
-    vec![poller, sweeper, retention, probe, metrics, pending, flusher]
+    handles
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -1360,6 +1366,34 @@ mod tests {
         assert!(
             offsets.iter().all(|d| *d > Duration::ZERO),
             "a loop still fires immediately at boot: {offsets:?}",
+        );
+    }
+
+    /// **Every registered loop is actually started, and nothing else is.**
+    ///
+    /// `spawn` iterates `Loop::ALL`, so a variant missing from the registry is
+    /// never started. That is a visible absence rather than the silent
+    /// wrong-offset collision this file has now had three forms of — but only if
+    /// something notices the count.
+    ///
+    /// The `+ 2` is the two loops with no startup offset: the metrics flusher
+    /// (which fires immediately at boot, deliberately) and the read-state
+    /// flusher. Neither is in `Loop`, so neither is covered by
+    /// `the_startup_delays_are_distinct`.
+    #[test]
+    fn spawn_starts_every_registered_loop() {
+        assert_eq!(
+            Loop::ALL.len(),
+            5,
+            "a loop was added to or removed from the registry; `spawn` follows it, \
+             so confirm the new one belongs and update this count",
+        );
+        // Each variant appears exactly once.
+        let unique: std::collections::HashSet<Loop> = Loop::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Loop::ALL.len(),
+            "a loop is listed twice in the registry and would be started twice",
         );
     }
 
