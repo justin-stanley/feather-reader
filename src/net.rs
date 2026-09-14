@@ -373,6 +373,25 @@ fn build_pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
         // sockets are released before the client itself is.
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // **Ignore ambient proxy configuration.** reqwest defaults
+        // `auto_sys_proxy: true`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+        // in the process environment silently route every request through a
+        // proxy — and a proxied request is sent in absolute form for the PROXY
+        // to resolve the hostname. That defeats the two mechanisms this whole
+        // module rests on at once: the `.resolve()` pin below never sees the
+        // connection, and `is_forbidden_ip` never sees the address, because we
+        // no longer do the resolving.
+        //
+        // Measured before this line existed, with `HTTP_PROXY` set: the vetted
+        // address received ZERO requests, the proxy received
+        // `GET http://pinned.invalid/feed HTTP/1.1`, and the call returned
+        // `Ok(200)`. It failed OPEN and silently.
+        //
+        // Not remotely triggerable — it needs a proxy variable in the server's
+        // own environment — but that is one `fly secrets set`, one debugging
+        // session, or one base image away, and nothing would have reported the
+        // guard had stopped working.
+        .no_proxy()
         // Override reqwest's resolver for this host only: connect goes straight
         // to the vetted socket address — no independent re-resolution.
         .resolve(host, addr)
@@ -1578,6 +1597,94 @@ pub(crate) mod tests {
             }
         });
         (addr, log)
+    }
+
+    /// **The SSRF guard must ignore ambient proxy configuration.**
+    ///
+    /// reqwest defaults `auto_sys_proxy: true`. With `HTTP_PROXY` set in the
+    /// process environment, a request is sent to the proxy in ABSOLUTE form —
+    /// `GET http://host/path` — for the proxy to resolve the hostname. The
+    /// `.resolve()` pin never sees the connection and `is_forbidden_ip` never
+    /// sees the address, because this process no longer does the resolving.
+    /// Both defences are off at once, and the call returns 200: it fails OPEN.
+    ///
+    /// Measured before `.no_proxy()` existed: vetted server 0 requests, proxy
+    /// received `GET http://pin-vs-proxy.invalid/feed HTTP/1.1`, result
+    /// `Ok(200)`.
+    ///
+    /// **Why this re-execs itself.** reqwest reads the proxy environment when
+    /// the client is BUILT, so the variable has to be present before the
+    /// builder runs. `set_var` is a data race against the ~39 `env::var` reads
+    /// in this binary and is the one thing this codebase refuses to do in
+    /// tests. So the parent owns both servers, and the child inherits
+    /// `HTTP_PROXY` from birth — no mutation of a live environment anywhere.
+    #[tokio::test]
+    async fn the_pinned_client_ignores_ambient_proxy_configuration() {
+        const CHILD: &str = "FR_AMBIENT_PROXY_CHILD";
+        const VETTED: &str = "FR_AMBIENT_PROXY_VETTED";
+        const HOST: &str = "ambient-proxy-probe.invalid";
+
+        if let Ok(vetted) = std::env::var(VETTED) {
+            // ── child: HTTP_PROXY is already in our environment ──
+            let addr: SocketAddr = vetted.parse().unwrap();
+            let client = build_pinned_client(HOST, addr).expect("client");
+            let _ = client.get(format!("http://{HOST}/probe")).send().await;
+            return;
+        }
+
+        // ── parent: owns both servers, so it can see who was contacted ──
+        let (vetted_addr, vetted_log) = spawn_http(vec![ok_200()]).await;
+        let (proxy_addr, proxy_log) = spawn_http(vec![ok_200()]).await;
+
+        // , not : a blocking `output()` here would
+        // hold this single-threaded runtime and the servers above could never
+        // accept the child's connection — the test would fail with "did not
+        // reach the vetted address" for a reason that has nothing to do with
+        // proxies.
+        let out = tokio::process::Command::new(std::env::current_exe().unwrap())
+            // FULL path: `--exact` matches the whole test name including the
+            // module. With the bare function name the child matched nothing,
+            // ran zero tests, and exited 0 — so the parent saw a "successful"
+            // child that had done nothing, and blamed the pin. The
+            // `1 test` assertion below is there so that can never pass silently
+            // again.
+            .args([
+                "net::tests::the_pinned_client_ignores_ambient_proxy_configuration",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(VETTED, vetted_addr.to_string())
+            .env("HTTP_PROXY", format!("http://{proxy_addr}"))
+            .env("HTTPS_PROXY", format!("http://{proxy_addr}"))
+            .env("ALL_PROXY", format!("http://{proxy_addr}"))
+            .output()
+            .await
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test, so this proves nothing about proxies — \
+             check the --exact filter. Child stdout:\n{stdout}"
+        );
+
+        let proxied = proxy_log.lock().unwrap().clone();
+        let direct = vetted_log.lock().unwrap().len();
+        assert!(
+            proxied.is_empty(),
+            "the pinned client used an ambient proxy, so the connect pin and \
+             `is_forbidden_ip` were both bypassed — the proxy resolves the \
+             hostname itself. Proxy saw: {proxied:?}"
+        );
+        assert_eq!(
+            direct, 1,
+            "the pinned client did not reach the vetted address it was pinned to",
+        );
     }
 
     fn ok_200() -> String {
