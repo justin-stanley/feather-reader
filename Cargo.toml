@@ -106,10 +106,15 @@ getrandom = "0.4"
 # cargo-minor-patch group PR) — and it arrives through reqwest, without anyone
 # editing this line.
 #
-# So when that lands: track reqwest (pin 0.23), because matching the crate this
-# codebase shares base64 VALUES with is what the original reasoning was for.
-# Expect the duplicate, and delete this paragraph only once sqlx-core and
-# hyper-util have caught up and one copy is achievable again.
+# When that lands, expect the duplicate and do not chase it. The copy count is
+# two either way — pinned at 0.22 we group with sqlx-core and hyper-util, at
+# 0.23 with reqwest — so moving the pin buys nothing. There is no correctness
+# dimension: this crate only encodes its own bytes to `String` via
+# `general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD}`, no base64
+# type crosses into reqwest's API, and the output is byte-identical across
+# versions. Leave it at 0.22 unless a concrete reason appears, and delete this
+# paragraph once sqlx-core and hyper-util catch up and one copy is achievable
+# again.
 ring = "0.17"
 base64 = "0.22"
 # Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
