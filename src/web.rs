@@ -628,6 +628,24 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 // Health
 // ---------------------------------------------------------------------------
 
+/// Run `/health`'s database probe. **The single path, so a test cannot assert
+/// on a string the handler is free to ignore** — a named constant alone was not
+/// enough: the test read the constant while the handler passed `query_scalar`
+/// whatever it liked, so degrading the real call to `SELECT 1` shipped green.
+async fn health_db_probe(pool: &store::Pool) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(HEALTH_DB_PROBE_SQL)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The statement `/health` uses to prove the database is readable.
+///
+/// **A named constant so the test can assert on the query that actually runs.**
+/// `the_health_probe_opens_a_real_table` used to `EXPLAIN` a hand-typed copy of
+/// this string, so degrading the real probe to `SELECT 1` — which opens no page
+/// and therefore cannot detect a broken database — left the suite green.
+const HEALTH_DB_PROBE_SQL: &str = "SELECT 1 FROM feeds LIMIT 1";
+
 /// How long `/health` will wait for its database ping before calling it broken.
 ///
 /// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
@@ -755,30 +773,25 @@ async fn health(State(state): State<AppState>) -> Response {
                 // check claims. `LIMIT 1` keeps it to a single page; an empty
                 // table still opens the b-tree root, which is the part that
                 // matters.
-                let verdict = match tokio::time::timeout(
-                    HEALTH_DB_TIMEOUT,
-                    sqlx::query_scalar::<_, i64>("SELECT 1 FROM feeds LIMIT 1")
-                        .fetch_optional(&pool),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => DbProbe::Ok,
-                    // Coarse, not the raw error. An unauthenticated caller
-                    // learning exactly which failure it hit is an
-                    // attack-progress oracle; the detail belongs in the log,
-                    // which gets it here.
-                    Ok(Err(err)) => {
-                        warn!(%err, "health: database probe failed");
-                        DbProbe::Failed("unavailable".to_string())
-                    }
-                    Err(_) => {
-                        warn!(
-                            timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
-                            "health: database probe timed out (pool exhausted?)"
-                        );
-                        DbProbe::Failed("timeout".to_string())
-                    }
-                };
+                let verdict =
+                    match tokio::time::timeout(HEALTH_DB_TIMEOUT, health_db_probe(&pool)).await {
+                        Ok(Ok(_)) => DbProbe::Ok,
+                        // Coarse, not the raw error. An unauthenticated caller
+                        // learning exactly which failure it hit is an
+                        // attack-progress oracle; the detail belongs in the log,
+                        // which gets it here.
+                        Ok(Err(err)) => {
+                            warn!(%err, "health: database probe failed");
+                            DbProbe::Failed("unavailable".to_string())
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
+                                "health: database probe timed out (pool exhausted?)"
+                            );
+                            DbProbe::Failed("timeout".to_string())
+                        }
+                    };
                 probe.record(verdict.clone());
                 verdict
             });
@@ -6574,8 +6587,21 @@ mod tests {
 
     #[tokio::test]
     async fn about_renders_adoption_line_when_enabled() {
-        let body = about_body(adoption_state(4, false).await).await;
-        assert!(body.contains("4"), "the count must render");
+        // **A distinctive count, and asserted IN ITS SENTENCE.**
+        //
+        // This used to seed 4 and assert `body.contains("4")`, which the
+        // colophon's `width="44"` satisfies whatever the count is — so
+        // hardcoding the rendered number passed. Both halves are needed: a
+        // digit that does not occur incidentally, and the assertion tied to the
+        // phrase it belongs to.
+        let body = about_body(adoption_state(7_318, false).await).await;
+        // The count and its phrase are on separate template lines, so compare
+        // against a whitespace-collapsed copy rather than the raw HTML.
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("7318 accounts on the atproto network hold"),
+            "the count did not render in its own sentence: {flat}",
+        );
         assert!(
             body.contains("accounts on the atproto network hold"),
             "{body}"
@@ -6844,9 +6870,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opml_import_under_limit_upload_is_not_413() {
+    async fn opml_import_under_limit_upload_is_accepted() {
         let state = test_state(&["did:plc:admin"]).await;
         let cookie = session_cookie(&state, "did:plc:admin", None);
+        let db = state.db.clone();
         let app = router(state);
 
         // A small, valid OPML well under the cap: must be accepted (the handler
@@ -6869,10 +6896,36 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(
+        // **Assert it was ACCEPTED, not merely that it was not a 413.**
+        //
+        // The old assertion was `assert_ne!(status, PAYLOAD_TOO_LARGE)`, which a
+        // 500 satisfies — so making `import_opml` fail unconditionally left this
+        // green. Three other OPML tests caught that mutation; the one whose name
+        // promises to cover the under-cap case did not.
+        assert_eq!(
             resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "an under-cap OPML upload must not be rejected as too large"
+            StatusCode::SEE_OTHER,
+            "an under-cap OPML upload was not accepted (status {})",
+            resp.status(),
+        );
+        // **303 alone is not acceptance.** `import_opml` redirects on several
+        // FAILURES too — unparseable OPML, zero feeds found, every feed trimmed
+        // by a cap — so an import that stored nothing satisfied the status check.
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feeds WHERE url = ?1")
+            .bind("https://example.com/feed.xml")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the upload was redirected but imported nothing");
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !location.starts_with("/login"),
+            "the import bounced to login instead of being accepted: {location}",
         );
     }
 
@@ -7950,6 +8003,38 @@ mod tests {
             !html.contains("hx-swap-oob"),
             "list-view response must NOT be an OOB swap: {html}"
         );
+        // **And it must actually BE the row.** The assertion above is satisfied
+        // by an empty body, or by any response that simply omits the attribute —
+        // so on its own it pins half a property and the name promises the other
+        // half.
+        assert!(
+            html.contains(&format!("/entries/{entry_id}")),
+            "the response is not the row for this entry: {html}",
+        );
+        assert!(
+            html.contains("Article"),
+            "the row rendered without its title: {html}",
+        );
+        // **The row comes back carrying read state. That is all this proves.**
+        //
+        // It does NOT prove the state was persisted: the handler renders
+        // `Some(read)` from the form value, so making `mark_read` roll back
+        // instead of commit fails 11 store tests and leaves this one green.
+        //
+        // It does not prove the OVERRIDE either, which an earlier version of
+        // this comment claimed. Verified: changing the call site to
+        // `build_entry_row(pool, &did, id, None)` — deleting the override
+        // wholesale — keeps the whole suite green, because `mark_read` has
+        // already persisted the same value two lines earlier, so reading it back
+        // from the database produces an identical row.
+        //
+        // Distinguishing the two needs a case where the override and the stored
+        // state DISAGREE, which this handler never produces: it writes the value
+        // it then renders. Left as a known gap rather than described as covered.
+        assert!(
+            html.contains("is-read"),
+            "the row came back without the read state it was just given: {html}",
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8768,7 +8853,16 @@ mod tests {
             }
         };
 
-        let probe = opcodes("EXPLAIN SELECT 1 FROM feeds LIMIT 1").await;
+        // The statement `health_db_probe` really runs — it is the sole path, so
+        // there is no second string for the handler to use instead.
+        let explain: &'static str =
+            Box::leak(format!("EXPLAIN {HEALTH_DB_PROBE_SQL}").into_boxed_str());
+        let probe = opcodes(explain).await;
+        // And the probe itself works against a real schema.
+        assert!(
+            health_db_probe(&state.db).await.is_ok(),
+            "the probe does not run against the real schema",
+        );
         assert!(
             probe.iter().any(|op| op == "OpenRead"),
             "the health probe reads no page; it cannot detect a broken database: {probe:?}"
@@ -9240,6 +9334,61 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a failed flush must not block the revoke",
+        );
+    }
+
+    /// **The probe detects a broken database — asserted through `/health`
+    /// itself, not through a string.**
+    ///
+    /// A named constant did not bind the handler: it stayed free to call
+    /// `query_scalar` with a different literal, so degrading the real probe to
+    /// `SELECT 1` shipped green twice over. This drops the table the probe reads
+    /// and asserts the endpoint stops saying `ok` — behaviour no substituted SQL
+    /// can fake, because `SELECT 1` still succeeds against a wrecked schema.
+    #[tokio::test]
+    async fn health_reports_a_broken_database() {
+        let state = test_state(&[]).await;
+        // Sanity: healthy first, so the assertion below is about the damage.
+        assert!(
+            health_db_probe(&state.db).await.is_ok(),
+            "the fixture was not healthy to begin with",
+        );
+
+        sqlx::query("DROP TABLE feeds")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert!(
+            health_db_probe(&state.db).await.is_err(),
+            "the probe reported success against a database missing the table it \
+             claims to read; `SELECT 1` would do exactly this",
+        );
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // The documented contract: the FIRST token is the state.
+        assert!(
+            body.starts_with("FAIL"),
+            "/health did not report FAIL for a broken database: {body}",
+        );
+        assert!(
+            !body.contains("db: ok"),
+            "/health still called the database ok: {body}",
         );
     }
 }

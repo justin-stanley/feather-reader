@@ -2039,6 +2039,50 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
     Ok(found.is_some())
 }
 
+/// The exact `(sql, bind_count)` `list_entries` runs, for a view and scope.
+///
+/// **One path, so a test cannot assert on something the query is free to
+/// ignore.** A named `LIST_PROJECTION` constant was not enough: the test read
+/// the constant while `list_entries` passed `list_query_sql` whatever it liked,
+/// so swapping in an inline literal containing `e.content_html` still shipped
+/// green. The test now calls this.
+fn list_entries_sql(view: ListView, feed_ids: Option<&[i64]>) -> (String, usize) {
+    list_query_sql(Projection::EntryList, view, feed_ids)
+}
+
+/// Which columns a list query may select.
+///
+/// **A closed type, not a `&str`.** A named constant was not enough and neither
+/// was a helper function: both left `list_query_sql` taking an arbitrary string,
+/// so a call site could pass an inline literal containing `e.content_html` and
+/// ship green — twice over, which is how this ended up as an enum. The article
+/// body is up to 20 KB per row and the list renders 50 at a time, so reading it
+/// is the difference between a bounded response and a megabyte per page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// The list view. Deliberately omits `content_html`.
+    EntryList,
+    Count,
+    Ids,
+    FeedCounts,
+    StarredUrls,
+}
+
+impl Projection {
+    const fn columns(self) -> &'static str {
+        match self {
+            Projection::EntryList => {
+                "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+                 COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred"
+            }
+            Projection::Count => "COUNT(*)",
+            Projection::Ids => "e.id",
+            Projection::FeedCounts => "e.feed_id, COUNT(*)",
+            Projection::StarredUrls => "e.url, e.guid",
+        }
+    }
+}
+
 /// The shared body of every list query: the per-DID `entry_state` LEFT JOIN, the
 /// `sub_ref` authorization predicate, the view predicate and the optional
 /// feed-id restriction. `projection` is spliced in as the `SELECT` list.
@@ -2053,13 +2097,14 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
 /// COUNT — the ids themselves are bound, never formatted in. Every runtime value
 /// (the DID, the ids, the limit, the offset) reaches SQLite as a bind parameter.
 fn list_query_sql(
-    projection: &'static str,
+    projection: Projection,
     view: ListView,
     feed_ids: Option<&[i64]>,
 ) -> (String, usize) {
+    let cols = projection.columns();
     let scoped = feed_ids.is_some();
     let mut sql = format!(
-        "SELECT {projection} \
+        "SELECT {cols} \
          FROM entries e \
          LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1 \
          WHERE {} \
@@ -2134,12 +2179,7 @@ pub async fn list_entries(
     if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
         return Ok(Vec::new());
     }
-    let (mut sql, n) = list_query_sql(
-        "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
-         COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
-        view,
-        feed_ids,
-    );
+    let (mut sql, n) = list_entries_sql(view, feed_ids);
     sql.push_str(&format!(
         " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
         n + 2,
@@ -2167,7 +2207,7 @@ pub async fn count_entries_for_view(
     if feed_ids.is_some_and(<[i64]>::is_empty) {
         return Ok(0);
     }
-    let (sql, _) = list_query_sql("COUNT(*)", view, feed_ids);
+    let (sql, _) = list_query_sql(Projection::Count, view, feed_ids);
     // `query_as` over a 1-tuple keeps one binding helper for both shapes.
     let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
     let (n,) = bind_list_scope(q, did, feed_ids)
@@ -2195,7 +2235,7 @@ pub async fn list_entry_ids(
     if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
         return Ok(Vec::new());
     }
-    let (mut sql, n) = list_query_sql("e.id", view, feed_ids);
+    let (mut sql, n) = list_query_sql(Projection::Ids, view, feed_ids);
     sql.push_str(&format!(
         " ORDER BY e.published DESC, e.id DESC LIMIT ?{}",
         n + 2
@@ -2218,7 +2258,7 @@ pub async fn unread_counts_by_feed(
     pool: &SqlitePool,
     did: &str,
 ) -> Result<std::collections::HashMap<i64, i64>> {
-    let (sql, _) = list_query_sql("e.feed_id, COUNT(*)", ListView::Unread, None);
+    let (sql, _) = list_query_sql(Projection::FeedCounts, ListView::Unread, None);
     let rows =
         sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(format!("{sql} GROUP BY e.feed_id")))
             .bind(did)
@@ -2256,7 +2296,7 @@ pub async fn starred_identities(
     did: &str,
     limit: i64,
 ) -> Result<StarredIdentities> {
-    let (mut sql, n) = list_query_sql("e.url, e.guid", ListView::Starred, None);
+    let (mut sql, n) = list_query_sql(Projection::StarredUrls, ListView::Starred, None);
     // One past the limit, so reaching it is distinguishable from landing on it
     // exactly. Ordered by id so the rows are stable; `url`/`guid` are not
     // guaranteed unique or non-NULL, and the id is both.
@@ -4240,14 +4280,11 @@ mod tests {
         let did = "did:plc:projection";
         seed_big_entries(&pool, did, 3).await?;
 
-        // Ask the engine directly: EXPLAIN the query and read back its output
-        // column names.
-        let (sql, _) = list_query_sql(
-            "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
-             COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred",
-            ListView::All,
-            None,
-        );
+        // **The projection the query actually runs**, not a copy re-typed here.
+        // The earlier version passed its own literal to `list_query_sql` and
+        // asserted on that, so adding `e.content_html` to `list_entries` left
+        // this green.
+        let (sql, _) = list_entries_sql(ListView::All, None);
         assert!(
             !sql.contains("content_html") && !sql.contains("e.*"),
             "the list query reads the article body: {sql}"
@@ -4327,7 +4364,7 @@ mod tests {
 
         // The statement itself carries no per-id placeholders — that is the
         // property, and it is what stops the SQL growing with the reader.
-        let (sql, n) = list_query_sql("e.id", ListView::All, Some(&scope));
+        let (sql, n) = list_query_sql(Projection::Ids, ListView::All, Some(&scope));
         assert_eq!(n, 1, "the scope must contribute exactly one placeholder");
         assert!(
             sql.contains("json_each(?2)") && !sql.contains("?3"),
@@ -5546,11 +5583,29 @@ mod tests {
         Ok(())
     }
 
+    /// **It must actually GROW — the name used to be a lie.**
+    ///
+    /// The earlier body was three lines asserting only `before > 0`. There was
+    /// no second measurement, so `db_size_bytes` returning a constant `1` passed.
+    /// That matters because this number is the poller's disk watermark: a size
+    /// that never moves means the pause never trips and the volume fills
+    /// instead.
     #[tokio::test]
     async fn db_size_is_positive_and_grows() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let before = db_size_bytes(&pool).await?;
         assert!(before > 0, "a schema-initialised DB has a non-zero size");
+
+        // Enough rows that the file must gain pages, not just fill slack.
+        seed_big_entries(&pool, "did:plc:growth", 400).await?;
+
+        let after = db_size_bytes(&pool).await?;
+        assert!(
+            after > before,
+            "the database grew by {} bytes after 400 seeded entries; the size is \
+             not tracking the data, so the disk watermark can never trip",
+            after.saturating_sub(before),
+        );
         Ok(())
     }
 
@@ -7257,12 +7312,27 @@ mod tests {
     /// PDS as authoritative. Local `entry_state` still said read, so the loss was
     /// invisible here and visible only in every other atproto client.
     ///
-    /// The race is a few milliseconds wide, so this does not try to hit it.
-    /// Instead it pins the property that makes it impossible: the scrub reads the
-    /// id-sets itself, inside the same transaction that writes them, so a set
-    /// written after the pass began is the one that gets filtered.
+    /// **⚠️ THIS TEST DOES NOT PROVE THAT, AND THE NAME NO LONGER CLAIMS IT.**
+    ///
+    /// The mark-read below lands BEFORE the scrub is called, not during it — so
+    /// a snapshot-then-write implementation taking its snapshot at the top of
+    /// `prune_orphan_cursor_ids` would see it too, and pass. The discriminator
+    /// does not discriminate; what is actually pinned is the ordinary outcome:
+    /// orphaned ids go, live ids stay.
+    ///
+    /// What the lost-update shape is really prevented by is a TYPE fact, not
+    /// this test: `scrub_one_cursor(pool, did, feed_url)` is handed no id-sets,
+    /// so it cannot write back anything but what it read itself, and
+    /// re-introducing the bug means changing its signature.
+    ///
+    /// Proving it by test needs a real interleave — hold the write lock on a
+    /// second connection, let the scrub block on it, commit a `mark_read`, then
+    /// release — which needs a file-backed database and, without a hook inside
+    /// the pass, a sleep to be sure the key snapshot has already run. A sleep is
+    /// how this suite gets flaky in CI, and a flaky test is worse than an honest
+    /// one, so it is left undone and written down instead.
     #[tokio::test]
-    async fn the_cursor_scrub_reads_the_ids_it_writes() -> Result<()> {
+    async fn the_cursor_scrub_drops_orphans_and_keeps_live_ids() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let did = "did:plc:race";
         let feed_url = "https://race.example/f.xml";
@@ -7317,11 +7387,9 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        // Now a reader marks the surviving entry read — the write that the old
-        // snapshot-then-write shape would have clobbered. It lands BEFORE the
-        // scrub, which is the deterministic stand-in for landing during it: a
-        // scrub that reads its own input sees it, one that reuses a snapshot
-        // taken earlier does not.
+        // A reader marks the surviving entry read. NOTE this lands before the
+        // scrub, not during it — see the caveat on this test. It is here because
+        // the live id must survive the pass, not because it catches the race.
         mark_read(&pool, did, live_id, true).await?;
 
         assert_eq!(prune_orphan_cursor_ids(&pool, None).await?, 1);
@@ -7331,7 +7399,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![live_id.to_string()],
-            "the scrub dropped a mark-read that landed after the pass began"
+            "the scrub dropped a live id"
         );
         assert!(
             !ids.contains(&doomed_id.to_string()),
