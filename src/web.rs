@@ -8015,9 +8015,12 @@ mod tests {
             html.contains("Article"),
             "the row rendered without its title: {html}",
         );
-        // **And it must reflect the mark-read that was just performed.** A row
-        // that comes back rendering as UNREAD passed every assertion above —
-        // which is the entire point of the swap.
+        // **The row carries the read state this request asked for.**
+        //
+        // NOT that the state was PERSISTED — a review showed this does not prove
+        // that: the handler renders `Some(read)` from the form value, so making
+        // `mark_read` roll back instead of commit fails 11 store tests and leaves
+        // this one green. What is pinned here is the override plumbing.
         assert!(
             html.contains("is-read"),
             "the row came back without the read state it was just given: {html}",

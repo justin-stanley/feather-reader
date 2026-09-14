@@ -208,11 +208,17 @@ impl Loop {
 }
 
 /// One loop's offset with the `FEATHERREADER_STARTUP_DELAY_SECS` ceiling applied.
+/// The one place the startup-override variable is named.
+///
+/// **A constant, because the name was untested glue.** `offset_for` is the
+/// production path and no test could reach it without `set_var`, so mistyping
+/// the key by one character left the whole suite AND clippy green while silently
+/// disabling the override for every loop. The test below spells the name
+/// independently, so the two have to agree.
+const STARTUP_DELAY_ENV: &str = "FEATHERREADER_STARTUP_DELAY_SECS";
+
 fn offset_for(which: Loop) -> Duration {
-    offset_from(
-        which,
-        std::env::var("FEATHERREADER_STARTUP_DELAY_SECS").ok(),
-    )
+    offset_from(which, std::env::var(STARTUP_DELAY_ENV).ok())
 }
 
 /// [`offset_for`] with the environment value passed in.
@@ -355,10 +361,8 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     // **Driven off the registry, not five hand-written lines.** Every offset-
     // bearing loop is started here by iterating `Loop::ALL`, so a loop cannot be
     // given another's offset — the variant chooses both.
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Loop::ALL
-        .iter()
-        .map(|l| l.spawn_with(state.clone(), shutdown.clone()))
-        .collect();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for_each_loop(|l| handles.push(l.spawn_with(state.clone(), shutdown.clone())));
 
     // The two loops with NO startup offset. `run_metrics_flusher` deliberately
     // fires immediately at boot; `run_flusher` swallows its first tick. Neither
@@ -375,6 +379,24 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     ));
 
     handles
+}
+
+/// Call `f` once for every offset-bearing loop, in registry order.
+///
+/// **The iteration itself, extracted so a test can watch it.** `spawn` iterated
+/// `Loop::ALL` inline and nothing in the tree reached `spawn` — so a `.filter()`
+/// dropping one loop compiled, passed the whole suite, passed clippy, and the
+/// pending-login sweeper simply never started while nonce rows accumulated
+/// unbounded.
+///
+/// That is the FOURTH form of one defect in this file. Each fix closed the seam
+/// a level down — a wrong constant, then a wrong string key, then a wrong
+/// positional argument — while the untested glue moved a level up. This is the
+/// level `spawn` actually decides at.
+fn for_each_loop(mut f: impl FnMut(Loop)) {
+    for l in Loop::ALL {
+        f(l);
+    }
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -1375,6 +1397,32 @@ mod tests {
             offsets.iter().all(|d| *d > Duration::ZERO),
             "a loop still fires immediately at boot: {offsets:?}",
         );
+    }
+
+    /// **`spawn` really visits every loop — the iteration, not a const array.**
+    ///
+    /// The previous test asserted `Loop::ALL.len() == 5`, which says nothing
+    /// about whether `spawn` reads it. A `.filter()` dropping a loop was green.
+    /// This drives the same function `spawn` drives.
+    #[test]
+    fn every_loop_is_visited_exactly_once() {
+        let mut seen = Vec::new();
+        for_each_loop(|l| seen.push(l));
+        assert_eq!(
+            seen,
+            Loop::ALL.to_vec(),
+            "the iteration `spawn` uses does not visit every loop exactly once, \
+             in registry order",
+        );
+    }
+
+    /// The startup-override key is spelled the same in the code and here.
+    ///
+    /// Independently written on purpose: mistyping it in `offset_for` silently
+    /// disabled the override for every loop with a green suite and green clippy.
+    #[test]
+    fn the_startup_override_env_key_is_the_documented_one() {
+        assert_eq!(STARTUP_DELAY_ENV, "FEATHERREADER_STARTUP_DELAY_SECS");
     }
 
     /// **Every registered loop is actually started, and nothing else is.**
