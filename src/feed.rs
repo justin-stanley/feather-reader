@@ -565,6 +565,11 @@ pub fn build_client() -> Result<Client> {
         .user_agent(crate::USER_AGENT)
         .timeout(FETCH_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        // Ignore ambient proxy configuration, for the same reason the pinned
+        // client does: a proxied request hands the hostname to the proxy to
+        // resolve, so `net`'s IP checks never see the address they are meant to
+        // vet. See `net::build_pinned_client`.
+        .no_proxy()
         // No auto-redirect: net::guarded_get follows + re-validates each hop.
         .redirect(reqwest::redirect::Policy::none())
         .build()
