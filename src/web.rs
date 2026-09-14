@@ -628,11 +628,16 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 // Health
 // ---------------------------------------------------------------------------
 
-/// How long `/health` will wait for its database ping before calling it broken.
-///
-/// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
-/// handler chose rather than a timeout Fly inferred — the difference between a
-/// log line that says why and one that says nothing.
+/// Run `/health`'s database probe. **The single path, so a test cannot assert
+/// on a string the handler is free to ignore** — a named constant alone was not
+/// enough: the test read the constant while the handler passed `query_scalar`
+/// whatever it liked, so degrading the real call to `SELECT 1` shipped green.
+async fn health_db_probe(pool: &store::Pool) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(HEALTH_DB_PROBE_SQL)
+        .fetch_optional(pool)
+        .await
+}
+
 /// The statement `/health` uses to prove the database is readable.
 ///
 /// **A named constant so the test can assert on the query that actually runs.**
@@ -641,6 +646,11 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
 /// and therefore cannot detect a broken database — left the suite green.
 const HEALTH_DB_PROBE_SQL: &str = "SELECT 1 FROM feeds LIMIT 1";
 
+/// How long `/health` will wait for its database ping before calling it broken.
+///
+/// Under `fly.toml`'s 3 s check timeout, so a hung pool produces a 503 this
+/// handler chose rather than a timeout Fly inferred — the difference between a
+/// log line that says why and one that says nothing.
 const HEALTH_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Floor for the poll-heartbeat staleness threshold. **Reported, never fatal** —
@@ -763,29 +773,25 @@ async fn health(State(state): State<AppState>) -> Response {
                 // check claims. `LIMIT 1` keeps it to a single page; an empty
                 // table still opens the b-tree root, which is the part that
                 // matters.
-                let verdict = match tokio::time::timeout(
-                    HEALTH_DB_TIMEOUT,
-                    sqlx::query_scalar::<_, i64>(HEALTH_DB_PROBE_SQL).fetch_optional(&pool),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => DbProbe::Ok,
-                    // Coarse, not the raw error. An unauthenticated caller
-                    // learning exactly which failure it hit is an
-                    // attack-progress oracle; the detail belongs in the log,
-                    // which gets it here.
-                    Ok(Err(err)) => {
-                        warn!(%err, "health: database probe failed");
-                        DbProbe::Failed("unavailable".to_string())
-                    }
-                    Err(_) => {
-                        warn!(
-                            timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
-                            "health: database probe timed out (pool exhausted?)"
-                        );
-                        DbProbe::Failed("timeout".to_string())
-                    }
-                };
+                let verdict =
+                    match tokio::time::timeout(HEALTH_DB_TIMEOUT, health_db_probe(&pool)).await {
+                        Ok(Ok(_)) => DbProbe::Ok,
+                        // Coarse, not the raw error. An unauthenticated caller
+                        // learning exactly which failure it hit is an
+                        // attack-progress oracle; the detail belongs in the log,
+                        // which gets it here.
+                        Ok(Err(err)) => {
+                            warn!(%err, "health: database probe failed");
+                            DbProbe::Failed("unavailable".to_string())
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout_s = HEALTH_DB_TIMEOUT.as_secs(),
+                                "health: database probe timed out (pool exhausted?)"
+                            );
+                            DbProbe::Failed("timeout".to_string())
+                        }
+                    };
                 probe.record(verdict.clone());
                 verdict
             });
@@ -6867,6 +6873,7 @@ mod tests {
     async fn opml_import_under_limit_upload_is_accepted() {
         let state = test_state(&["did:plc:admin"]).await;
         let cookie = session_cookie(&state, "did:plc:admin", None);
+        let db = state.db.clone();
         let app = router(state);
 
         // A small, valid OPML well under the cap: must be accepted (the handler
@@ -6901,6 +6908,15 @@ mod tests {
             "an under-cap OPML upload was not accepted (status {})",
             resp.status(),
         );
+        // **303 alone is not acceptance.** `import_opml` redirects on several
+        // FAILURES too — unparseable OPML, zero feeds found, every feed trimmed
+        // by a cap — so an import that stored nothing satisfied the status check.
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feeds WHERE url = ?1")
+            .bind("https://example.com/feed.xml")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the upload was redirected but imported nothing");
         let location = resp
             .headers()
             .get(header::LOCATION)
@@ -7999,6 +8015,13 @@ mod tests {
             html.contains("Article"),
             "the row rendered without its title: {html}",
         );
+        // **And it must reflect the mark-read that was just performed.** A row
+        // that comes back rendering as UNREAD passed every assertion above —
+        // which is the entire point of the swap.
+        assert!(
+            html.contains("is-read"),
+            "the row came back without the read state it was just given: {html}",
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8817,10 +8840,16 @@ mod tests {
             }
         };
 
-        // The statement /health really runs, not a copy re-typed here.
+        // The statement `health_db_probe` really runs — it is the sole path, so
+        // there is no second string for the handler to use instead.
         let explain: &'static str =
             Box::leak(format!("EXPLAIN {HEALTH_DB_PROBE_SQL}").into_boxed_str());
         let probe = opcodes(explain).await;
+        // And the probe itself works against a real schema.
+        assert!(
+            health_db_probe(&state.db).await.is_ok(),
+            "the probe does not run against the real schema",
+        );
         assert!(
             probe.iter().any(|op| op == "OpenRead"),
             "the health probe reads no page; it cannot detect a broken database: {probe:?}"

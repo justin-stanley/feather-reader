@@ -2012,6 +2012,28 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
     Ok(found.is_some())
 }
 
+/// The exact `(sql, bind_count)` `list_entries` runs, for a view and scope.
+///
+/// **One path, so a test cannot assert on something the query is free to
+/// ignore.** A named `LIST_PROJECTION` constant was not enough: the test read
+/// the constant while `list_entries` passed `list_query_sql` whatever it liked,
+/// so swapping in an inline literal containing `e.content_html` still shipped
+/// green. The test now calls this.
+fn list_entries_sql(view: ListView, feed_ids: Option<&[i64]>) -> (String, usize) {
+    list_query_sql(LIST_PROJECTION, view, feed_ids)
+}
+
+/// The columns the list view reads — deliberately NOT `content_html`.
+///
+/// **A named constant so a test can assert on the projection the query actually
+/// runs.** It used to be an inline literal, and the test that claimed to guard
+/// it re-typed a copy and asserted on its own argument: adding `e.content_html`
+/// to the real query left the suite green. The article body is up to 20 KB per
+/// row and the list renders 50 at a time, so reading it here is the difference
+/// between a bounded response and a megabyte of allocation per page.
+const LIST_PROJECTION: &str = "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
+     COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred";
+
 /// The shared body of every list query: the per-DID `entry_state` LEFT JOIN, the
 /// `sub_ref` authorization predicate, the view predicate and the optional
 /// feed-id restriction. `projection` is spliced in as the `SELECT` list.
@@ -2025,17 +2047,6 @@ pub async fn did_subscribes_to_entry(pool: &SqlitePool, did: &str, entry_id: i64
 /// str` written in this file, and the feed-id restriction contributes only a
 /// COUNT — the ids themselves are bound, never formatted in. Every runtime value
 /// (the DID, the ids, the limit, the offset) reaches SQLite as a bind parameter.
-/// The columns the list view reads — deliberately NOT `content_html`.
-///
-/// **A named constant so a test can assert on the projection the query actually
-/// runs.** It used to be an inline literal, and the test that claimed to guard
-/// it re-typed a copy and asserted on its own argument: adding `e.content_html`
-/// to the real query left the suite green. The article body is up to 20 KB per
-/// row and the list renders 50 at a time, so reading it here is the difference
-/// between a bounded response and a megabyte of allocation per page.
-const LIST_PROJECTION: &str = "e.id, e.feed_id, e.guid, e.url, e.title, e.published, \
-     COALESCE(s.read, 0) AS read, COALESCE(s.starred, 0) AS starred";
-
 fn list_query_sql(
     projection: &'static str,
     view: ListView,
@@ -2118,7 +2129,7 @@ pub async fn list_entries(
     if feed_ids.is_some_and(<[i64]>::is_empty) || limit <= 0 {
         return Ok(Vec::new());
     }
-    let (mut sql, n) = list_query_sql(LIST_PROJECTION, view, feed_ids);
+    let (mut sql, n) = list_entries_sql(view, feed_ids);
     sql.push_str(&format!(
         " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
         n + 2,
@@ -4223,7 +4234,7 @@ mod tests {
         // The earlier version passed its own literal to `list_query_sql` and
         // asserted on that, so adding `e.content_html` to `list_entries` left
         // this green.
-        let (sql, _) = list_query_sql(LIST_PROJECTION, ListView::All, None);
+        let (sql, _) = list_entries_sql(ListView::All, None);
         assert!(
             !sql.contains("content_html") && !sql.contains("e.*"),
             "the list query reads the article body: {sql}"

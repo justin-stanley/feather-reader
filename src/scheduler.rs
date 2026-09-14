@@ -128,48 +128,82 @@ const PENDING_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(45);
 const CODE_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
 
-/// Every background loop's startup offset, in ONE place.
+/// Which background loop an offset belongs to.
 ///
-/// **`spawn` reads this and passes each loop its delay; no loop chooses its
-/// own.** They used to, and the test guarding it compared the CONSTANTS — so
-/// pointing all five call sites at `POLLER_STARTUP_DELAY`, which is exactly the
-/// "everything fires at once at boot" failure the offsets exist to prevent, left
-/// the whole suite green. With the decision here there are no call sites left to
-/// diverge, and `the_startup_delays_are_distinct` asserts on the table the code
-/// actually uses.
-fn startup_offsets() -> [(&'static str, Duration); 5] {
-    [
-        ("poller", POLLER_STARTUP_DELAY),
-        ("pending-sweep", PENDING_SWEEP_STARTUP_DELAY),
-        ("code-sweep", CODE_SWEEP_STARTUP_DELAY),
-        ("retention", RETENTION_STARTUP_DELAY),
-        ("adoption", ADOPTION_STARTUP_DELAY),
-    ]
+/// **An enum, not a string key.** The first cut of this used `&'static str`
+/// names looked up with `.unwrap_or(POLLER_STARTUP_DELAY)`, and a review showed
+/// that was strictly WORSE than the per-loop constants it replaced: mistyping
+/// `offset_for("pending-sweeper")` compiled, passed all 706 tests, and silently
+/// moved that loop onto the poller's tick — the everything-at-once collision the
+/// offsets exist to prevent. A wrong constant name used to be a compile error;
+/// a wrong string was a silent production change.
+///
+/// With an enum and an exhaustive `match` the table is total by construction,
+/// there is no fallback to be wrong, and a typo is a compile error again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Loop {
+    Poller,
+    PendingSweep,
+    CodeSweep,
+    Retention,
+    Adoption,
 }
 
-/// Look up one loop's offset from [`startup_offsets`], with the env ceiling
-/// applied.
-fn offset_for(name: &str) -> Duration {
-    let d = startup_offsets()
-        .into_iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, d)| d)
-        .unwrap_or(POLLER_STARTUP_DELAY);
-    startup_delay(d)
+impl Loop {
+    /// Every loop, so a test can assert the mapping is total and injective.
+    #[cfg(test)]
+    const ALL: [Loop; 5] = [
+        Loop::Poller,
+        Loop::PendingSweep,
+        Loop::CodeSweep,
+        Loop::Retention,
+        Loop::Adoption,
+    ];
+
+    /// This loop's startup offset. Exhaustive: adding a variant without an
+    /// offset does not compile.
+    const fn startup_offset(self) -> Duration {
+        match self {
+            Loop::Poller => POLLER_STARTUP_DELAY,
+            Loop::PendingSweep => PENDING_SWEEP_STARTUP_DELAY,
+            Loop::CodeSweep => CODE_SWEEP_STARTUP_DELAY,
+            Loop::Retention => RETENTION_STARTUP_DELAY,
+            Loop::Adoption => ADOPTION_STARTUP_DELAY,
+        }
+    }
 }
 
-/// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a loop's startup
-/// delay. The variable is a CEILING, not a replacement: it can only shorten the
-/// wait, so setting it cannot accidentally push a production loop out further
-/// than the constant above intends.
-fn startup_delay(default: Duration) -> Duration {
-    startup_delay_from(
-        default,
+/// One loop's offset with the `FEATHERREADER_STARTUP_DELAY_SECS` ceiling applied.
+fn offset_for(which: Loop) -> Duration {
+    offset_from(
+        which,
         std::env::var("FEATHERREADER_STARTUP_DELAY_SECS").ok(),
     )
 }
 
-/// [`startup_delay`] with the environment value passed in.
+/// [`offset_for`] with the environment value passed in.
+///
+/// Split for the same reason `startup_delay_from` is: so the COMPOSITION —
+/// this loop's offset, then the ceiling — is testable without reading the
+/// environment. Deleting the ceiling here disables
+/// `FEATHERREADER_STARTUP_DELAY_SECS` for every loop at once, and asserting it
+/// through `offset_for` could not catch that without `set_var`, which is a
+/// documented data race against the ~39 `env::var` reads in this binary.
+fn offset_from(which: Loop, raw: Option<String>) -> Duration {
+    startup_delay_from(which.startup_offset(), raw)
+}
+
+/// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a startup delay,
+/// with the environment value passed in.
+///
+/// The variable is a CEILING, not a replacement: it can only shorten the wait,
+/// so setting it cannot accidentally push a production loop out further than its
+/// constant intends.
+///
+/// Takes the raw value rather than reading it, so the ceiling behaviour is
+/// testable without `std::env::set_var` — a documented data race against the ~39
+/// `std::env::var` reads elsewhere in this binary, and this was the only
+/// `set_var` in `src/`, in a 650-test multithreaded runner.
 ///
 /// Split out so the ceiling behaviour is testable without `std::env::set_var`,
 /// which is a documented data race against the ~39 `std::env::var` reads
@@ -287,20 +321,20 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     let poller = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_poller(state, shutdown, offset_for("poller")).await })
+        tokio::spawn(async move { run_poller(state, shutdown, offset_for(Loop::Poller)).await })
     };
     let sweeper = {
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(
-            async move { run_code_sweeper(state, shutdown, offset_for("code-sweep")).await },
+            async move { run_code_sweeper(state, shutdown, offset_for(Loop::CodeSweep)).await },
         )
     };
     let retention = {
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            run_retention_sweeper(state, shutdown, offset_for("retention")).await
+            run_retention_sweeper(state, shutdown, offset_for(Loop::Retention)).await
         })
     };
     // NOTE: must be constructed BEFORE the flusher, which consumes the
@@ -308,9 +342,9 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     let probe = {
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(
-            async move { run_adoption_probe(state, shutdown, offset_for("adoption")).await },
-        )
+        tokio::spawn(async move {
+            run_adoption_probe(state, shutdown, offset_for(Loop::Adoption)).await
+        })
     };
     let metrics = {
         let state = state.clone();
@@ -321,7 +355,7 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            run_pending_sweeper(state, shutdown, offset_for("pending-sweep")).await
+            run_pending_sweeper(state, shutdown, offset_for(Loop::PendingSweep)).await
         })
     };
     let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
@@ -1301,48 +1335,55 @@ mod tests {
         assert_eq!(startup_delay_from(d, None), d);
     }
 
-    /// **The loops must not land on the same instant at boot — asserted on the
-    /// table the code actually reads.**
+    /// **The loops must not land on the same instant at boot.**
     ///
-    /// The earlier version compared the CONSTANTS. No call site was involved, so
-    /// pointing all five loops at `POLLER_STARTUP_DELAY` — precisely the
-    /// everything-at-once failure the offsets exist to prevent — left the suite
-    /// green. `spawn` now takes every delay from `startup_offsets`, so there are
-    /// no per-loop call sites left to diverge and this reads the real source.
+    /// The original version compared the CONSTANTS with no call site involved,
+    /// so pointing all five loops at `POLLER_STARTUP_DELAY` passed. The second
+    /// version asserted on a string-keyed table and made things worse — see the
+    /// `Loop` doc. This reads the exhaustive mapping the code actually uses.
+    ///
+    /// Asserts against `startup_offset()` directly, NOT `offset_for()`: the
+    /// latter applies the `FEATHERREADER_STARTUP_DELAY_SECS` ceiling, which is a
+    /// documented dev setting, and asserting through it made the suite fail
+    /// under `FEATHERREADER_STARTUP_DELAY_SECS=0`. Keeping env out of this
+    /// module's tests is why `startup_delay_from` was split out in the first
+    /// place.
     #[test]
     fn the_startup_delays_are_distinct() {
-        let table = startup_offsets();
-        let unique: std::collections::HashSet<Duration> = table.iter().map(|(_, d)| *d).collect();
+        let offsets: Vec<Duration> = Loop::ALL.iter().map(|l| l.startup_offset()).collect();
+        let unique: std::collections::HashSet<Duration> = offsets.iter().copied().collect();
         assert_eq!(
             unique.len(),
-            table.len(),
-            "two loops share a startup delay: {table:?}",
+            Loop::ALL.len(),
+            "two loops share a startup delay: {offsets:?}",
         );
         assert!(
-            table.iter().all(|(_, d)| *d > Duration::ZERO),
-            "a loop still fires immediately at boot: {table:?}",
+            offsets.iter().all(|d| *d > Duration::ZERO),
+            "a loop still fires immediately at boot: {offsets:?}",
         );
     }
 
-    /// Every loop `spawn` starts has an entry, and `offset_for` finds it.
+    /// The ceiling still applies on the way to a loop — the one thing
+    /// `offset_for` adds over the raw table.
     ///
-    /// Without this, a loop could be added to `spawn` with a name that is not in
-    /// the table; `offset_for` falls back to the poller's offset, which silently
-    /// re-creates the collision the table exists to prevent.
+    /// Pinned because a mutation deleting `startup_delay(..)` from `offset_for`
+    /// — disabling `FEATHERREADER_STARTUP_DELAY_SECS` for every loop at once —
+    /// passed the whole suite. Uses `startup_delay_from` so no environment
+    /// variable is read.
     #[test]
-    fn every_named_loop_resolves_to_its_own_offset() {
-        for (name, expected) in startup_offsets() {
+    fn the_startup_ceiling_applies_to_every_loop() {
+        for l in Loop::ALL {
             assert_eq!(
-                offset_for(name),
-                expected,
-                "{name} did not resolve to its own offset",
+                offset_from(l, Some("0".into())),
+                Duration::ZERO,
+                "{l:?} ignored the startup-delay ceiling",
+            );
+            assert_eq!(
+                offset_from(l, None),
+                l.startup_offset(),
+                "{l:?} did not get its own offset with no override set",
             );
         }
-        assert_eq!(
-            offset_for("not-a-real-loop"),
-            POLLER_STARTUP_DELAY,
-            "the fallback moved; the collision risk it documents has changed",
-        );
     }
 
     #[test]
