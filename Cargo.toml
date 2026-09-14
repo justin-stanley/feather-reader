@@ -172,9 +172,9 @@ tokio = { version = "1.45", features = ["test-util"] }
 # rule; a real CA SATISFIES the rule instead of suspending it, which is why this
 # dependency is here rather than a `#[cfg(test)]` `if scheme != "https"` bypass.
 #
-# `ring` for the TEST SERVER. Note this does NOT match the client: reqwest's
-# `rustls` feature resolves to aws-lc-rs and its builder picks that
-# unconditionally. Both are already in the lock; this adds neither.
+# `ring` for the TEST SERVER. reqwest reads the process-installed default and
+# falls back to aws-lc-rs, so installing ring in a test DOES affect clients built
+# after it in the same binary; release builds install nothing and use aws-lc-rs. Both are already in the lock; this adds neither.
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
 
 # The server half of that. rustls 0.23 and tokio-rustls are ALREADY in the lock

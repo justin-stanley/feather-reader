@@ -308,16 +308,24 @@ where
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     // Both `ring` and `aws-lc-rs` are reachable in this tree, so rustls refuses
-    // to guess a process-level provider for the SERVER side here.
+    // to guess a process-level provider for the SERVER side here. Install ring.
     //
-    // **This does NOT match the client, contrary to what this comment used to
-    // say.** reqwest's `rustls` feature resolves to aws-lc-rs and its builder
-    // selects that provider unconditionally — it never reads the process default
-    // — so the client under test uses aws-lc-rs while this server uses ring.
-    // Harmless (they interoperate, and `install_default` cannot influence
-    // reqwest), but worth stating correctly rather than reassuringly.
+    // **Two earlier versions of this comment were wrong in opposite directions;
+    // this is what reqwest 0.13 actually does** (`async_impl/client.rs`):
     //
-    // `install_default` errors if something else got there first, which is fine.
+    //     let provider = rustls::crypto::CryptoProvider::get_default()
+    //         .map(|arc| arc.clone())
+    //         .unwrap_or_else(default_rustls_crypto_provider);
+    //
+    // So it READS the process default and falls back to aws-lc-rs. Installing
+    // ring here therefore DOES affect reqwest clients built afterwards in the
+    // same test binary — which makes the client's provider depend on whether any
+    // test called `spawn_tls` first. Benign (ring and aws-lc-rs interoperate),
+    // and absent from release builds, where nothing installs a default and
+    // production is genuinely aws-lc-rs. Recorded precisely because two previous
+    // attempts at this comment stated a checkable fact without checking it.
+    //
+    // `install_default` errors if something got there first, which is fine.
     static PROVIDER: std::sync::Once = std::sync::Once::new();
     PROVIDER.call_once(|| {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
