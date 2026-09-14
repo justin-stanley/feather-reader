@@ -179,12 +179,12 @@ impl Loop {
     /// than five spawn sites scattered through the file. Catching it would need
     /// each loop to report that it started, i.e. production instrumentation for a
     /// test — not obviously worth it, but it is a hole, not an absence of one.
-    fn spawn_with(
+    fn spawn_at(
         self,
         state: AppState,
         shutdown: watch::Receiver<()>,
+        startup: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let startup = offset_for(self);
         match self {
             Loop::Poller => tokio::spawn(run_poller(state, shutdown, startup)),
             Loop::PendingSweep => tokio::spawn(run_pending_sweeper(state, shutdown, startup)),
@@ -207,18 +207,42 @@ impl Loop {
     }
 }
 
-/// One loop's offset with the `FEATHERREADER_STARTUP_DELAY_SECS` ceiling applied.
-/// The one place the startup-override variable is named.
+/// The startup-override variable. The one place its name is written in
+/// production code.
 ///
-/// **A constant, because the name was untested glue.** `offset_for` is the
-/// production path and no test could reach it without `set_var`, so mistyping
-/// the key by one character left the whole suite AND clippy green while silently
+/// **A constant, because the name was untested glue.** [`startup_plan`] is the
+/// production path and no test can reach it without `set_var`, so mistyping the
+/// key by one character left the whole suite AND clippy green while silently
 /// disabling the override for every loop. The test below spells the name
 /// independently, so the two have to agree.
 const STARTUP_DELAY_ENV: &str = "FEATHERREADER_STARTUP_DELAY_SECS";
 
-fn offset_for(which: Loop) -> Duration {
-    offset_from(which, std::env::var(STARTUP_DELAY_ENV).ok())
+/// The `(loop, resolved startup offset)` pairs `spawn` starts, in registry order.
+///
+/// **The offset decision is a VALUE a test can read, not a call buried in a
+/// match arm.** It used to live inside `spawn_with`, as `offset_for(self)`.
+/// Writing `offset_for(Loop::Poller)` there compiled, passed 697 lib + 15 bin
+/// and clippy, and booted every loop at 30 s — the all-at-once collision this
+/// file's whole history exists to prevent. Nothing could see it, because no test
+/// can observe an argument passed inside a spawn arm.
+///
+/// Pulling it out here does not make the wrong thing unwritable — nothing can —
+/// but it moves the decision somewhere a test can compare against an
+/// independently spelled table. `spawn_at` now only chooses the `run_*`, which
+/// is the one hole this file still documents rather than closes.
+fn startup_plan() -> Vec<(Loop, Duration)> {
+    startup_plan_from(std::env::var(STARTUP_DELAY_ENV).ok())
+}
+
+/// [`startup_plan`] with the environment value passed in.
+///
+/// Split for the same reason `offset_from` and `startup_delay_from` are: so the
+/// composition is testable without `set_var`, which is a documented data race
+/// against the ~39 `env::var` reads in this binary.
+fn startup_plan_from(raw: Option<String>) -> Vec<(Loop, Duration)> {
+    let mut plan = Vec::new();
+    for_each_loop(|l| plan.push((l, offset_from(l, raw.clone()))));
+    plan
 }
 
 /// [`offset_for`] with the environment value passed in.
@@ -362,7 +386,9 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     // bearing loop is started here by iterating `Loop::ALL`, so a loop cannot be
     // given another's offset — the variant chooses both.
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for_each_loop(|l| handles.push(l.spawn_with(state.clone(), shutdown.clone())));
+    for (l, startup) in startup_plan() {
+        handles.push(l.spawn_at(state.clone(), shutdown.clone(), startup));
+    }
 
     // The two loops with NO startup offset. `run_metrics_flusher` deliberately
     // fires immediately at boot; `run_flusher` swallows its first tick. Neither
@@ -1524,27 +1550,73 @@ mod tests {
     /// spells the env key out by hand. Spelling the seconds here rather than
     /// naming the constants is the point: naming them would reintroduce the
     /// tautology one level up.
+    /// The startup offset each loop is documented to run on, spelled out
+    /// independently of `Loop::startup_offset`'s match arms so the two have to
+    /// agree. Naming the constants here instead would reintroduce the tautology.
+    const DOCUMENTED_OFFSETS: [(Loop, u64); 5] = [
+        (Loop::Poller, 30),
+        (Loop::PendingSweep, 45),
+        (Loop::CodeSweep, 60),
+        (Loop::Retention, 90),
+        (Loop::Adoption, 300),
+    ];
+
     #[test]
     fn every_loop_is_on_its_documented_offset() {
-        let documented = [
-            (Loop::Poller, 30),
-            (Loop::PendingSweep, 45),
-            (Loop::CodeSweep, 60),
-            (Loop::Retention, 90),
-            (Loop::Adoption, 300),
-        ];
+        // Guard by SET, not by length. `documented.len() == Loop::ALL.len()`
+        // counts rows, so duplicating one row silently drops a variant from
+        // coverage — verified: duplicating the Poller row and drifting
+        // `PENDING_SWEEP_STARTUP_DELAY` to 47 s passed the whole suite, since
+        // 47 is still distinct and non-zero.
+        let listed: std::collections::HashSet<Loop> =
+            DOCUMENTED_OFFSETS.iter().map(|(l, _)| *l).collect();
+        let registered: std::collections::HashSet<Loop> = Loop::ALL.iter().copied().collect();
         assert_eq!(
-            documented.len(),
-            Loop::ALL.len(),
-            "a loop was added to the registry without an entry in this table",
+            listed, registered,
+            "this table and the registry do not cover the same loops",
         );
-        for (l, secs) in documented {
+        for (l, secs) in DOCUMENTED_OFFSETS {
             assert_eq!(
                 l.startup_offset(),
                 Duration::from_secs(secs),
                 "{l:?} is not on its documented {secs}s offset",
             );
         }
+    }
+
+    /// **The offsets are not just correct in the table — each loop is handed
+    /// ITS OWN on the way to being spawned.**
+    ///
+    /// This restores coverage a previous round deleted as a "tautology". The
+    /// deleted assertion was `offset_from(l, None) == l.startup_offset()`, and
+    /// calling it tautological was WRONG: it is tautological only with respect
+    /// to changing `startup_offset`'s arms, while independently pinning that
+    /// `offset_from` routes through `which` at all. With it gone,
+    ///
+    /// ```ignore
+    /// fn offset_from(which: Loop, raw: Option<String>) -> Duration {
+    ///     let _ = which;
+    ///     startup_delay_from(Loop::Poller.startup_offset(), raw)
+    /// }
+    /// ```
+    ///
+    /// passed 697 lib + 15 bin and clippy, booting every loop at 30 s.
+    ///
+    /// Asserting against the independently spelled seconds rather than against
+    /// `l.startup_offset()` is what keeps this non-tautological — the form that
+    /// invited the deletion in the first place.
+    #[test]
+    fn the_startup_plan_hands_each_loop_its_own_offset() {
+        let expected: Vec<(Loop, Duration)> = DOCUMENTED_OFFSETS
+            .iter()
+            .map(|(l, secs)| (*l, Duration::from_secs(*secs)))
+            .collect();
+        assert_eq!(
+            startup_plan_from(None),
+            expected,
+            "the plan `spawn` starts from does not pair every loop with its own \
+             documented offset, in registry order",
+        );
     }
 
     #[test]
