@@ -6997,12 +6997,27 @@ mod tests {
     /// PDS as authoritative. Local `entry_state` still said read, so the loss was
     /// invisible here and visible only in every other atproto client.
     ///
-    /// The race is a few milliseconds wide, so this does not try to hit it.
-    /// Instead it pins the property that makes it impossible: the scrub reads the
-    /// id-sets itself, inside the same transaction that writes them, so a set
-    /// written after the pass began is the one that gets filtered.
+    /// **⚠️ THIS TEST DOES NOT PROVE THAT, AND THE NAME NO LONGER CLAIMS IT.**
+    ///
+    /// The mark-read below lands BEFORE the scrub is called, not during it — so
+    /// a snapshot-then-write implementation taking its snapshot at the top of
+    /// `prune_orphan_cursor_ids` would see it too, and pass. The discriminator
+    /// does not discriminate; what is actually pinned is the ordinary outcome:
+    /// orphaned ids go, live ids stay.
+    ///
+    /// What the lost-update shape is really prevented by is a TYPE fact, not
+    /// this test: `scrub_one_cursor(pool, did, feed_url)` is handed no id-sets,
+    /// so it cannot write back anything but what it read itself, and
+    /// re-introducing the bug means changing its signature.
+    ///
+    /// Proving it by test needs a real interleave — hold the write lock on a
+    /// second connection, let the scrub block on it, commit a `mark_read`, then
+    /// release — which needs a file-backed database and, without a hook inside
+    /// the pass, a sleep to be sure the key snapshot has already run. A sleep is
+    /// how this suite gets flaky in CI, and a flaky test is worse than an honest
+    /// one, so it is left undone and written down instead.
     #[tokio::test]
-    async fn the_cursor_scrub_reads_the_ids_it_writes() -> Result<()> {
+    async fn the_cursor_scrub_drops_orphans_and_keeps_live_ids() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let did = "did:plc:race";
         let feed_url = "https://race.example/f.xml";
@@ -7057,11 +7072,9 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        // Now a reader marks the surviving entry read — the write that the old
-        // snapshot-then-write shape would have clobbered. It lands BEFORE the
-        // scrub, which is the deterministic stand-in for landing during it: a
-        // scrub that reads its own input sees it, one that reuses a snapshot
-        // taken earlier does not.
+        // A reader marks the surviving entry read. NOTE this lands before the
+        // scrub, not during it — see the caveat on this test. It is here because
+        // the live id must survive the pass, not because it catches the race.
         mark_read(&pool, did, live_id, true).await?;
 
         assert_eq!(prune_orphan_cursor_ids(&pool, None).await?, 1);
@@ -7071,7 +7084,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![live_id.to_string()],
-            "the scrub dropped a mark-read that landed after the pass began"
+            "the scrub dropped a live id"
         );
         assert!(
             !ids.contains(&doomed_id.to_string()),
