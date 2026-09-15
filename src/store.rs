@@ -3023,7 +3023,11 @@ pub async fn dirty_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
 /// sources, two relays behind the same operator degrade together, so `/about`
 /// would sit at the lower figure until a full walk succeeded again. A COMPLETE
 /// observation always wins, even when smaller (repos genuinely can disappear);
-/// a truncated one may only ever raise the floor.
+/// a truncated one may only ever raise the floor — and an EQUAL count raises
+/// nothing, so it is rejected too. That is why the guard reads `<=` and not
+/// `<`: the strict form let a truncated walk that merely matched the stored
+/// number rewrite the row and flip `truncated` on, degrading "2 000" to "at
+/// least 2 000" with no change in adoption.
 pub async fn record_network_stat(pool: &SqlitePool, stat: &NetworkStat) -> Result<()> {
     sqlx::query(
         r#"
@@ -3033,7 +3037,7 @@ pub async fn record_network_stat(pool: &SqlitePool, stat: &NetworkStat) -> Resul
             value       = excluded.value,
             truncated   = excluded.truncated,
             observed_at = excluded.observed_at
-        WHERE NOT (excluded.truncated = 1 AND excluded.value < network_stat.value)
+        WHERE NOT (excluded.truncated = 1 AND excluded.value <= network_stat.value)
         "#,
     )
     .bind(&stat.key)
@@ -7826,6 +7830,28 @@ mod tests {
                 .value,
             42,
             "a complete walk is authoritative even when it shrinks"
+        );
+
+        // An EQUAL-valued truncated observation must not downgrade the row
+        // either: it proves nothing the stored complete count did not already
+        // prove, but flipping `truncated` would silently degrade /about from
+        // "42" to "at least 42" with no change in actual adoption. The strict
+        // `<` in the guard let exactly this through — the equal case is the one
+        // the two assertions above cannot reach, because both move the value.
+        stat.truncated = true;
+        stat.observed_at = "2026-08-15T00:00:00Z".to_string();
+        record_network_stat(&pool, &stat).await?;
+        let kept = latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .expect("a stat");
+        assert_eq!(kept.value, 42);
+        assert!(
+            !kept.truncated,
+            "an equal truncated observation must not mark the kept row truncated"
+        );
+        assert_eq!(
+            kept.observed_at, "2026-08-14T00:00:00Z",
+            "the rejected observation must not have rewritten the row at all"
         );
         Ok(())
     }
