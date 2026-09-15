@@ -268,11 +268,7 @@ impl Store {
     /// Call this ONLY when the app returns a freshly-minted claim — not on an
     /// idempotent re-post of an existing one, so the budget meters real new seats.
     pub fn record_mint(&self, did: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO mint_log (did, minted_at) VALUES (?1, ?2)",
-            rusqlite::params![did, now()],
-        )?;
-        Ok(())
+        self.record_mint_at(did, now())
     }
 
     /// Count fresh mints in the rolling window `[now - window_secs, now]` — the
@@ -304,9 +300,9 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Record a mint at an explicit instant. Test-only: production always
-    /// stamps `now()` via [`record_mint`].
-    #[cfg(test)]
+    /// Record a mint at an explicit instant. [`record_mint`] is this with the
+    /// clock supplied; tests pin a fixed instant so no assertion depends on
+    /// when it runs. One INSERT, so the two cannot drift apart.
     fn record_mint_at(&self, did: &str, at: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO mint_log (did, minted_at) VALUES (?1, ?2)",
@@ -532,8 +528,9 @@ mod tests {
     /// signature.
     ///
     /// Everything below now works from `t0`, so no assertion depends on when it
-    /// runs. One `count_mints_since` call is kept so the `now() - window_secs`
-    /// wiring stays covered.
+    /// runs. The tail still goes through `record_mint` and `count_mints_since`
+    /// — the real write and read the sybil brake uses — because pinning the
+    /// clock everywhere would leave both of them untested.
     #[test]
     fn mint_log_counts_within_window() {
         let s = mem();
@@ -551,5 +548,15 @@ mod tests {
         assert_eq!(s.count_mints_at(t0 - 200).unwrap(), 3);
         // The production wrapper still derives its cutoff from the clock.
         assert_eq!(s.count_mints_since(86_400).unwrap(), 3);
+        // And `record_mint` — the sybil brake's real write path — still writes a
+        // row the brake can see. Stamping the clock is safe here where it was not
+        // above: a day-wide window cannot be crossed by a second boundary.
+        s.record_mint("did:plc:live").unwrap();
+        assert_eq!(s.count_mints_since(86_400).unwrap(), 4);
+        // A row older than the window is excluded. This pins the window's
+        // MAGNITUDE; every assertion above holds for any cutoff below `t0 - 100`,
+        // so none of them would notice `window_secs` being scaled.
+        s.record_mint_at("did:plc:ancient", t0 - 100_000).unwrap();
+        assert_eq!(s.count_mints_since(86_400).unwrap(), 4);
     }
 }
