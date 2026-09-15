@@ -155,13 +155,119 @@ pub async fn complete(
     presented_cookie: Option<&str>,
     now: i64,
 ) -> Result<CompletedLogin> {
+    complete_with(
+        runtime,
+        pool,
+        params,
+        presented_cookie,
+        now,
+        // **These three closures must contain NO decisions.** A review found the
+        // first cut had put `Some(&expected_issuer)` and the DPoP key
+        // reconstruction in here — outside the seam the tests drive — so both
+        // could be broken with the whole suite green. Changing the issuer
+        // argument to `None` disabled the authorization-server mix-up defence
+        // for every real login and 702 tests still passed.
+        //
+        // Everything decided is now decided in `complete_with` and arrives
+        // fully formed; these are transports.
+        |req: Discovery| async move {
+            discovery::discover(
+                http,
+                &req.pds_url,
+                &req.auth_method,
+                req.expected_issuer.as_deref(),
+            )
+            .await
+        },
+        |req: TokenPost| async move {
+            post_form(http, pool, &req.url, &req.key, &req.params, req.retry).await
+        },
+        |did: String| async move {
+            super::resolve::resolve(&runtime.resolver, http, &did, &runtime.plc_directory).await
+        },
+    )
+    .await
+}
+
+/// What `complete_with` hands its discovery transport. Every field is already
+/// decided; the transport only performs the call.
+struct Discovery {
+    pds_url: String,
+    auth_method: String,
+    /// `Some(issuer)` arms the authorization-server mix-up re-check inside
+    /// `discovery::discover`. **The `Option` is constructed here, not in the
+    /// adapter**, so a test can see whether the defence is armed at all.
+    expected_issuer: Option<String>,
+}
+
+/// What `complete_with` hands its token transport.
+struct TokenPost {
+    url: String,
+    params: Vec<(&'static str, String)>,
+    /// The ACTUAL key, not a recipe for one. The first cut passed the JWK string
+    /// and let the adapter re-parse it, which meant a freshly generated key would
+    /// have been accepted — signing the grant under a thumbprint it was never
+    /// bound to — with a green suite. `Arc` rather than a borrow only because the
+    /// key is local to `complete_with`; the guarantee is the same.
+    key: std::sync::Arc<keys::SigningKey>,
+    retry: request::Retry,
+}
+
+/// [`complete`] with the three network boundaries injected.
+///
+/// **The SEQUENCING is the thing worth testing, and it was unreachable.** Each
+/// guard in this function has its own unit test, but nothing drove the whole
+/// callback: it needs discovery, a token endpoint and handle resolution, all
+/// over the network — and an issuer is required to be `https`, so even a local
+/// plain-HTTP server cannot stand in for an authorization server. Injecting the
+/// three calls is what makes the ORDER observable, which is where the mix-up
+/// defence actually lives: the value of the issuer re-check is entirely in it
+/// happening BEFORE the code, the PKCE verifier and a `private_key_jwt`
+/// assertion are posted anywhere.
+///
+/// **Every decision lives here, not in the caller's closures.** A review of the
+/// first cut found the opposite: the `Some(issuer)` that arms the mix-up
+/// re-check and the DPoP key the grant is bound to were both assembled inside
+/// the adapters, where no test could see them — so either could be broken with
+/// the entire suite green. The transports now receive fully-formed arguments.
+///
+/// Same shape as [`discovery::discover_with`], and for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn complete_with<D, DFut, P, PFut, R, RFut>(
+    runtime: &OauthRuntime,
+    pool: &sqlx::SqlitePool,
+    params: &flow::CallbackParams,
+    presented_cookie: Option<&str>,
+    now: i64,
+    discover: D,
+    post: P,
+    resolve_handle: R,
+) -> Result<CompletedLogin>
+where
+    D: Fn(Discovery) -> DFut,
+    DFut: std::future::Future<Output = Result<discovery::AuthorizationServer>>,
+    P: Fn(TokenPost) -> PFut,
+    PFut: std::future::Future<Output = Result<request::PostOutcome>>,
+    R: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = Result<super::resolve::ResolvedAccount>>,
+{
     // Consumes the pending row, checks the browser binding, and validates `iss`
     // — all three, or no code comes back.
     let (pending, code) =
         flow::complete_callback(pool, &runtime.codec, params, presented_cookie, now).await?;
 
-    let key = keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
-        .context("unsealing the login's DPoP key")?;
+    // **Unsealed HERE, before discovery and the exchange.** A DPoP key that will
+    // not parse must stop the login before the authorization code is sent
+    // anywhere, not after — the final outcome is a failed login either way, so
+    // only the absence of a POST distinguishes them.
+    //
+    // The key is then handed to the token transport by reference, so nothing
+    // downstream can substitute a different one: the grant is bound to this
+    // thumbprint and no other.
+    let key = std::sync::Arc::new(
+        keys::SigningKey::from_jwk_json(&pending.dpop_key_jwk, "session")
+            .context("unsealing the login's DPoP key")?,
+    );
 
     // The method the login was STARTED under, not whatever is configured now.
     // A deploy that flipped dev/production between the push and the callback
@@ -192,12 +298,12 @@ pub async fn complete(
         );
     }
 
-    let server = discovery::discover(
-        http,
-        &pending.pds_url,
-        auth_method.as_str(),
-        Some(&pending.issuer),
-    )
+    let server = discover(Discovery {
+        pds_url: pending.pds_url.clone(),
+        auth_method: auth_method.as_str().to_string(),
+        // `Some`, decided here: this is what arms the mix-up re-check.
+        expected_issuer: Some(pending.issuer.clone()),
+    })
     .await?;
 
     // **The re-discovered issuer must be the one PAR was pushed under.**
@@ -218,18 +324,16 @@ pub async fn complete(
     // from a network re-read.
     let token_params = token_exchange_params(runtime, &pending, &code, auth_method, now)?;
 
-    let outcome = post_form(
-        http,
-        pool,
-        &server.token_endpoint,
-        &key,
-        &token_params,
+    let outcome = post(TokenPost {
+        url: server.token_endpoint.clone(),
+        params: token_params,
+        key: std::sync::Arc::clone(&key),
         // A nonce challenge is rejected BEFORE the grant is processed, so the
         // code is not consumed and the request is safe to resend. The nonce
-        // harvested at PAR is routinely stale by now — approval can take
-        // minutes and a server nonce lasts at most five.
-        request::Retry::Allowed,
-    )
+        // harvested at PAR is routinely stale by now — approval can take minutes
+        // and a server nonce lasts at most five.
+        retry: request::Retry::Allowed,
+    })
     .await?;
 
     let did = accept_token_response(pool, &runtime.codec, &pending, &outcome, now).await?;
@@ -238,14 +342,7 @@ pub async fn complete(
     // form: what the user typed is not evidence, and `resolve` returns `None`
     // unless it round-trips. A failure here must not fail the login — the
     // account is already authenticated, and the handle is a display detail.
-    let handle = match super::resolve::resolve(
-        &runtime.resolver,
-        http,
-        &did,
-        &runtime.plc_directory,
-    )
-    .await
-    {
+    let handle = match resolve_handle(did.clone()).await {
         Ok(account) => account.handle,
         Err(err) => {
             tracing::warn!(%err, did = %did, "could not resolve a handle for the new session");
@@ -431,6 +528,10 @@ mod tests {
         serde_json::json!({
             "access_token": "at-abc",
             "token_type": "DPoP",
+            // NARROWED on purpose: the pending row REQUESTS
+            // "atproto transition:generic"; the server grants less. Identical
+            // values made an assertion here pass whichever field was stored —
+            // the same trap as deriving the token endpoint from the issuer.
             "scope": "atproto",
             "sub": sub,
             "expires_in": 3600,
@@ -659,6 +760,30 @@ mod tests {
         );
     }
 
+    /// One DPoP key for the whole test run.
+    ///
+    /// Deterministic on purpose: a freshly generated key per fixture made it
+    /// impossible to assert WHICH key the token request was signed under, and a
+    /// review found that gap was live — substituting a generated key in the
+    /// transport passed the entire suite while binding the grant to a thumbprint
+    /// the `request_uri` was never issued against.
+    fn fixture_dpop_jwk() -> &'static str {
+        static JWK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        JWK.get_or_init(|| {
+            crate::oauth::keys::SigningKey::generate("session")
+                .to_jwk_json()
+                .unwrap()
+        })
+    }
+
+    /// The thumbprint every token request in these tests must carry.
+    fn fixture_thumbprint() -> String {
+        crate::oauth::keys::SigningKey::from_jwk_json(fixture_dpop_jwk(), "session")
+            .unwrap()
+            .thumbprint()
+            .unwrap()
+    }
+
     /// A pending login pushed under [`PUSHED_REDIRECT`], as a value.
     fn pending_auth(cookie_hash: &str) -> crate::oauth::store::PendingAuth {
         crate::oauth::store::PendingAuth {
@@ -669,16 +794,14 @@ mod tests {
             // compares redirects, so a placeholder here refuses the login one
             // step too early and the identity check never runs — which the
             // assertion below caught rather than tolerated.
-            dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session")
-                .to_jwk_json()
-                .unwrap(),
+            dpop_key_jwk: fixture_dpop_jwk().to_string(),
             issuer: PENDING_ISSUER.into(),
             pds_url: "https://pds.example.com".into(),
             did: PENDING_DID.into(),
             auth_method: "private_key_jwt".into(),
             auth_kid: None,
             redirect_uri: PUSHED_REDIRECT.into(),
-            requested_scope: "atproto".into(),
+            requested_scope: "atproto transition:generic".into(),
             request_uri: "urn:x".into(),
             app_return_to: None,
             expires_at: 2_000_000_000,
@@ -703,6 +826,24 @@ mod tests {
             public_url: public_url.into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(TEST_KEY.to_string()),
+                // **Off the repo root.** `key_path` defaults to a RELATIVE
+                // `oauth-signing-key.json`, so a rust-backend runtime here
+                // creates real ES256 key material in whatever the working
+                // directory is — the repo root during `cargo test`. Confirmed by
+                // a review; `runtime.rs` documents this side effect as the very
+                // thing that motivated gating key creation.
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-login-test-key-{}-{:p}.json",
+                    std::process::id(),
+                    &TEST_KEY as *const _
+                )),
+                // **Offline.** The default is the real PLC directory, and
+                // PENDING_DID is a real Bluesky DID — so handle resolution in
+                // these tests was making a live internet call, which is slow,
+                // flaky in CI, and quietly makes the assertion below depend on
+                // someone else's uptime. `.invalid` never resolves (RFC 2606),
+                // so it fails immediately and offline.
+                plc_directory: "https://plc.invalid".to_string(),
                 ..crate::config::OauthConfig::default()
             },
             ..crate::config::Config::default()
@@ -857,6 +998,641 @@ mod tests {
         assert_eq!(
             super::super::metadata::redirect_uri(&cfg),
             super::super::metadata::redirect_uri(&cfg)
+        );
+    }
+
+    // ── END-TO-END: the SEQUENCING, not the individual guards ────────────────
+    //
+    // Every guard in `complete` has its own unit test. Nothing drove the whole
+    // callback, because it needs discovery and a token endpoint over the
+    // network — and an issuer must be `https`, so a local plain-HTTP server
+    // cannot stand in for an authorization server either. `complete_with`
+    // injects those two calls so the ORDER becomes observable.
+    //
+    // What these assert is mostly what did NOT happen: a guard that fires only
+    // after the authorization code has been posted somewhere is not a guard.
+
+    /// Records what the injected boundaries were asked to do — including the
+    /// fields a review found were being decided in untested adapter code.
+    #[derive(Default)]
+    struct Calls {
+        /// `(pds_url, expected_issuer, auth_method)`. The `Option` is the point:
+        /// `None` means the mix-up re-check was never armed.
+        discovered: Vec<(String, Option<String>, String)>,
+        posted: Vec<PostedCall>,
+        resolved: Vec<String>,
+    }
+    type Log = std::sync::Arc<std::sync::Mutex<Calls>>;
+
+    /// One recorded token POST: where, with what, under which key, retryable?
+    struct PostedCall {
+        url: String,
+        params: Vec<(&'static str, String)>,
+        dpop_thumbprint: String,
+        retry: request::Retry,
+    }
+
+    /// The token endpoint a real authorization server would publish: on a
+    /// DIFFERENT host and path from the issuer.
+    ///
+    /// **Deliberately not `{issuer}/token`.** With the endpoints derived from the
+    /// issuer string, ignoring the discovery result entirely — posting to
+    /// `format!("{}/token", pending.issuer)` — passed all 16 tests. Real servers
+    /// do not follow that pattern; this repo's own discovery fixture publishes
+    /// `https://pds.justin-stanley.com/oauth/token` against a different issuer.
+    const DISCOVERED_TOKEN_ENDPOINT: &str = "https://token.example.net/oauth/v2/token";
+
+    fn server_at(issuer: &str) -> crate::oauth::discovery::AuthorizationServer {
+        crate::oauth::discovery::AuthorizationServer {
+            issuer: issuer.into(),
+            par_endpoint: format!("{issuer}/par"),
+            authorization_endpoint: format!("{issuer}/authorize"),
+            token_endpoint: DISCOVERED_TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: None,
+        }
+    }
+
+    /// Drive `complete_with`, recording all three boundaries. Fully OFFLINE:
+    /// handle resolution is injected too, so no test here touches the network.
+    async fn drive(
+        pool: &sqlx::SqlitePool,
+        runtime: &crate::oauth::runtime::OauthRuntime,
+        params: &flow::CallbackParams,
+        cookie: Option<&str>,
+        discovered_issuer: &str,
+        token_status: u16,
+        token_body: serde_json::Value,
+    ) -> (Result<CompletedLogin>, Log) {
+        let log: Log = Default::default();
+        let (s1, s2, s3) = (
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&log),
+            std::sync::Arc::clone(&log),
+        );
+        let issuer = discovered_issuer.to_string();
+        let body = serde_json::to_vec(&token_body).unwrap();
+        let out = complete_with(
+            runtime,
+            pool,
+            params,
+            cookie,
+            1_700_000_000,
+            move |req| {
+                let sink = std::sync::Arc::clone(&s1);
+                let issuer = issuer.clone();
+                async move {
+                    sink.lock().unwrap().discovered.push((
+                        req.pds_url,
+                        req.expected_issuer,
+                        req.auth_method,
+                    ));
+                    Ok(server_at(&issuer))
+                }
+            },
+            move |req: TokenPost| {
+                let sink = std::sync::Arc::clone(&s2);
+                let body = body.clone();
+                async move {
+                    // The thumbprint is what the grant is bound to; recording it
+                    // is how a substituted key becomes visible.
+                    let tp = req.key.thumbprint().unwrap_or_default();
+                    sink.lock().unwrap().posted.push(PostedCall {
+                        url: req.url,
+                        params: req.params,
+                        dpop_thumbprint: tp,
+                        retry: req.retry,
+                    });
+                    Ok(request::PostOutcome {
+                        status: token_status,
+                        body,
+                    })
+                }
+            },
+            move |did| {
+                let sink = std::sync::Arc::clone(&s3);
+                async move {
+                    sink.lock().unwrap().resolved.push(did);
+                    // Offline: the handle lookup is allowed to fail, and the
+                    // login must survive it.
+                    Err(anyhow::anyhow!("handle resolution unavailable in tests"))
+                }
+            },
+        )
+        .await;
+        (out, log)
+    }
+
+    /// **The happy path, start to finish — the first test that drives one.**
+    ///
+    /// Consumes the pending row, checks the browser binding and `iss`, unseals
+    /// the DPoP key, re-discovers, exchanges, and stores a session. The handle
+    /// lookup is left to fail (the runtime points at a `.invalid` PLC host, so
+    /// it fails offline and fast) which also pins that a handle failure does NOT
+    /// fail the login.
+    #[tokio::test]
+    async fn a_full_callback_stores_a_session() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        let done = out.expect("the full callback should complete");
+        assert_eq!(done.did, PENDING_DID);
+        assert!(
+            done.handle.is_none(),
+            "the handle lookup was expected to fail offline"
+        );
+
+        // Copied out in a block so the guard is gone before the `await` below;
+        // a MutexGuard held across an await is a clippy deny in CI.
+        let (
+            discoveries,
+            expected_issuer,
+            auth_method,
+            posts,
+            token_url,
+            thumbprint,
+            retry,
+            token_params,
+        ) = {
+            let calls = log.lock().unwrap();
+            (
+                calls.discovered.len(),
+                calls.discovered[0].1.clone(),
+                calls.discovered[0].2.clone(),
+                calls.posted.len(),
+                calls.posted[0].url.clone(),
+                calls.posted[0].dpop_thumbprint.clone(),
+                calls.posted[0].retry,
+                calls.posted[0].params.clone(),
+            )
+        };
+        assert_eq!(discoveries, 1, "discovery ran once");
+        assert_eq!(
+            auth_method, "private_key_jwt",
+            "discovery was told the wrong auth method; `none` would disable the \
+             token_endpoint_auth_methods_supported check and the server would \
+             then receive a private_key_jwt assertion it never advertised",
+        );
+        assert_eq!(
+            expected_issuer.as_deref(),
+            Some(PENDING_ISSUER),
+            "the mix-up re-check was not armed: discovery got {expected_issuer:?}",
+        );
+        assert_eq!(posts, 1, "the token exchange ran once");
+        assert_eq!(
+            token_url, DISCOVERED_TOKEN_ENDPOINT,
+            "the grant went to an endpoint guessed from the issuer rather than \
+             the one discovery returned",
+        );
+        assert_eq!(
+            retry,
+            request::Retry::Allowed,
+            "the token POST must be retryable: a nonce challenge is rejected \
+             before the grant is processed, so the code is not consumed",
+        );
+        // The grant is bound to the PENDING ROW's DPoP key and no other. A
+        // substituted key also has a non-empty thumbprint, so only an equality
+        // check catches it.
+        // The code from THIS callback is what gets exchanged.
+        assert!(
+            token_params
+                .iter()
+                .any(|(k, v)| *k == "code" && v == "the-code"),
+            "the token request did not carry the callback's authorization code: {token_params:?}",
+        );
+        assert_eq!(
+            thumbprint,
+            fixture_thumbprint(),
+            "the token request was signed under a different key than the one the \
+             authorization request was bound to",
+        );
+
+        // Resolution happens exactly once, and after the exchange.
+        //
+        // NOT "for the DID the grant returned rather than the pending row" — a
+        // review pointed out that claim is unfalsifiable, because
+        // `accept_token_response` bails unless `tokens.sub == pending.did`, so
+        // the two are provably equal on every path that reaches here. What is
+        // left worth asserting is the count and the subject.
+        assert_eq!(
+            log.lock().unwrap().resolved,
+            vec![PENDING_DID.to_string()],
+            "the handle lookup did not run exactly once for this subject",
+        );
+
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let stored = crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+            .await
+            .unwrap()
+            .expect("no session was stored for a successful login");
+
+        // **The session must PERSIST the DPoP key the grant was bound to.**
+        //
+        // A review found this unpinned even after the EXCHANGE's key was fixed:
+        // storing a freshly generated key left 708 tests green. The access token
+        // is DPoP-bound to the pending key's thumbprint, so a session holding any
+        // other key fails proof validation on every later PDS call — a login that
+        // succeeds and then does nothing. That is the worst shape this bug could
+        // take, because the failure surfaces far from its cause.
+        let stored_thumbprint = keys::SigningKey::from_jwk_json(&stored.dpop_key_jwk, "session")
+            .expect("the stored session's DPoP key does not parse")
+            .thumbprint()
+            .unwrap();
+        assert_eq!(
+            stored_thumbprint,
+            fixture_thumbprint(),
+            "the session persisted a different DPoP key than the grant is bound to",
+        );
+
+        // **Every remaining field `accept_token_response` writes.**
+        //
+        // A review found four of the nine unpinned — and the same mapping on the
+        // REFRESH path has dedicated tests for each of them. The login half of a
+        // mapping tested twice over on the refresh half.
+        assert_eq!(stored.access_token, "at-abc");
+        assert_eq!(
+            stored.refresh_token, "rt-abc",
+            "an empty refresh token stores an un-refreshable session: the first \
+             refresh presents \"\" and the server's invalid_grant deletes it, \
+             which is the spurious logout the token module exists to avoid",
+        );
+        assert_eq!(stored.token_type, "DPoP");
+        assert_eq!(
+            stored.granted_scope, "atproto",
+            "the session stored the REQUESTED scope, not the granted one — a \
+             narrowed grant must be visible now rather than as a mystery write \
+             failure later",
+        );
+        assert_eq!(
+            stored.expires_at,
+            Some(1_700_000_000 + 3600),
+            "the session's expiry is not the token's; `None` means `is_stale` is \
+             never true, so it is never proactively refreshed and simply dies",
+        );
+        assert_eq!(stored.issuer, PENDING_ISSUER);
+    }
+
+    /// **A wrong `iss` stops the flow BEFORE anything is posted.**
+    ///
+    /// RFC 9207. The check itself is unit-tested; what was not pinned is that it
+    /// runs early enough to matter. A version that validated `iss` after the
+    /// exchange would still "reject the login" while having already handed the
+    /// code and a client assertion to the wrong server.
+    #[tokio::test]
+    async fn a_mismatched_iss_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let mut params = callback_params();
+        params.iss = Some("https://evil.example.com".into());
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &params,
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a mismatched iss completed the login");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.posted.is_empty(),
+            "the authorization code was posted despite a bad iss: {:?}",
+            calls.posted.iter().map(|p| &p.url).collect::<Vec<_>>(),
+        );
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the iss check",
+        );
+    }
+
+    /// **The browser binding is checked before anything is posted.**
+    ///
+    /// A callback replayed from a different browser must not reach the token
+    /// endpoint with a valid code.
+    #[tokio::test]
+    async fn a_foreign_browser_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some("a-different-browser"),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a foreign browser completed the login");
+        let calls = log.lock().unwrap();
+        assert!(calls.posted.is_empty());
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the browser binding was checked",
+        );
+    }
+
+    /// **Discovery is told which issuer PAR was pushed under.**
+    ///
+    /// The mix-up defence itself lives INSIDE `discovery::discover` — which this
+    /// seam stubs — and is tested there. What belongs at THIS layer is the
+    /// contract that makes it reachable: `complete` must hand discovery the
+    /// issuer from the *pending row*, which is AAD-bound in storage. Passing
+    /// `None`, or the issuer off the callback, would disable the check without
+    /// changing a line inside `discover`.
+    #[tokio::test]
+    async fn discovery_is_given_the_stored_issuer_to_expect() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok());
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.discovered[0].1.as_deref(),
+            Some(PENDING_ISSUER),
+            "discovery was not told which issuer to expect; the mix-up defence \
+             is disabled from the caller's side",
+        );
+        assert_eq!(
+            calls.discovered[0].0, "https://pds.example.com",
+            "discovery was pointed at something other than the stored PDS",
+        );
+    }
+
+    /// **The pending row is consumed: the same callback cannot be replayed.**
+    ///
+    /// Single-use is what makes a leaked `state` worthless. The second attempt
+    /// must fail, and must not reach the token endpoint.
+    #[tokio::test]
+    async fn a_replayed_callback_is_refused_and_posts_nothing() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let first = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(first.0.is_ok(), "the first callback should succeed");
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_err(), "the callback was replayable");
+        assert!(
+            log.lock().unwrap().posted.is_empty(),
+            "a replayed callback still reached the token endpoint",
+        );
+    }
+
+    /// **A DPoP key that will not unseal posts nothing anywhere.**
+    ///
+    /// Added because a comment claimed this ordering mattered and no test held
+    /// it down: moving the unseal to AFTER the token exchange left the whole
+    /// suite green, because every other fixture carries a valid JWK. The final
+    /// outcome is identical either way — the login fails — so only the absence
+    /// of a POST distinguishes them, and that is the whole point. A corrupt key
+    /// must not cost the authorization code a trip to the token endpoint.
+    #[tokio::test]
+    async fn a_corrupt_dpop_key_posts_nothing_anywhere() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.dpop_key_jwk = "{\"kty\":\"EC\",\"crv\":\"bogus\"}".into();
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "a corrupt DPoP key completed the login");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.posted.is_empty(),
+            "the authorization code was posted before the DPoP key was checked",
+        );
+        assert!(
+            calls.discovered.is_empty(),
+            "discovery ran before the DPoP key was checked",
+        );
+    }
+
+    /// **The token request uses the auth method the login was STARTED under.**
+    ///
+    /// A nine-line comment in `complete` explains why this must come from the
+    /// pending row rather than the live runtime: a deploy that flipped
+    /// dev/production between the push and the callback would otherwise present
+    /// credentials that do not match the ones PAR was authenticated with, and the
+    /// exchange fails for a reason nothing in the logs explains.
+    ///
+    /// Nothing tested it. Swapping `auth_method` for `runtime.auth_method` in
+    /// `token_exchange_params` passed the whole suite, because every fixture had
+    /// the two agreeing. Here they disagree: the login was started under `none`
+    /// while the runtime is configured for `private_key_jwt`, so a client
+    /// assertion appearing in the token params can only have come from the
+    /// runtime.
+    #[tokio::test]
+    async fn the_exchange_uses_the_auth_method_the_login_started_under() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.auth_method = "none".into();
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        // The runtime, by contrast, is a private_key_jwt client.
+        let runtime = runtime_at("https://feather-reader.com");
+        assert_eq!(
+            runtime.auth_method.as_str(),
+            "private_key_jwt",
+            "fixture: the runtime must DISAGREE with the pending row",
+        );
+
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok(), "the exchange should complete: {out:?}");
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.discovered[0].2, "none",
+            "discovery was told the runtime's method, not the one PAR was pushed \
+             under",
+        );
+        let params = &calls.posted[0].params;
+        assert!(
+            !params.iter().any(|(k, _)| *k == "client_assertion"),
+            "a private_key_jwt assertion was sent for a login started under \
+             `none`: {params:?}",
+        );
+    }
+
+    /// **The client assertion's `aud`, and the session's, are the right hosts.**
+    ///
+    /// Two more values `complete` decides that nothing checked: swapping the
+    /// assertion's audience from `pending.issuer` to `pending.pds_url`, and the
+    /// stored session's `aud` the other way, each left the whole suite green
+    /// despite being genuinely different hosts in the fixture.
+    ///
+    /// `aud` is the assertion's anti-replay binding — an assertion minted for one
+    /// audience must not be accepted by another — and the session's `aud` is the
+    /// audience every later DPoP-bound PDS call uses. The earlier tests inspected
+    /// only whether `client_assertion` was PRESENT, never what was in it.
+    #[tokio::test]
+    async fn the_assertion_and_session_audiences_are_distinct_and_correct() {
+        let cookie = flow::new_binding_token();
+        let pool = pending_login(&flow::binding_hash(&cookie)).await;
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+        assert!(out.is_ok());
+
+        // The fixture's issuer and PDS are deliberately different hosts, so
+        // these two assertions cannot both be satisfied by one value.
+        let assertion = {
+            let calls = log.lock().unwrap();
+            calls.posted[0]
+                .params
+                .iter()
+                .find(|(k, _)| *k == "client_assertion")
+                .map(|(_, v)| v.clone())
+                .expect("no client_assertion for a private_key_jwt login")
+        };
+        // Decoded inline rather than via a shared helper: this file is merged
+        // into another branch that defines one, and two definitions would clash.
+        let claims: serde_json::Value = {
+            use base64::Engine as _;
+            let seg = assertion.split('.').nth(1).expect("malformed assertion");
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(seg)
+                .expect("assertion payload is not base64url");
+            serde_json::from_slice(&raw).expect("assertion payload is not JSON")
+        };
+        assert_eq!(
+            claims.get("aud").and_then(|v| v.as_str()),
+            Some(PENDING_ISSUER),
+            "the assertion was minted for the wrong audience; its anti-replay \
+             binding names a server it was not sent to",
+        );
+
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let stored = crate::oauth::store::get_session(&pool, &codec, PENDING_DID)
+            .await
+            .unwrap()
+            .expect("session");
+        assert_eq!(
+            stored.aud, "https://pds.example.com",
+            "the session's audience is not the PDS; every later DPoP-bound call \
+             would carry the wrong `htu`/`aud`",
+        );
+    }
+
+    /// **An expired pending row is refused — `now` really reaches the sweep.**
+    ///
+    /// `complete` passes `now` into `flow::complete_callback`, which is what lets
+    /// `take_pending` prune expired rows. Passing `0` instead honoured a pending
+    /// row long past its expiry — a sealed DPoP key and PKCE verifier that should
+    /// have been swept — and the whole suite stayed green, because every fixture
+    /// used an `expires_at` far in the future.
+    ///
+    /// `MAX_PENDING_SECS`'s COMPUTATION is pinned elsewhere; this pins that the
+    /// bound is honoured.
+    #[tokio::test]
+    async fn an_expired_pending_row_is_refused() {
+        let cookie = flow::new_binding_token();
+        let pool = empty_pool().await;
+        let codec = crate::oauth::crypto::Codec::new(Some(TEST_KEY)).unwrap();
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        // Expired an hour before the callback arrives.
+        pending.expires_at = 1_700_000_000 - 3600;
+        crate::oauth::store::put_pending(&pool, &codec, &pending)
+            .await
+            .unwrap();
+
+        let runtime = runtime_at("https://feather-reader.com");
+        let (out, log) = drive(
+            &pool,
+            &runtime,
+            &callback_params(),
+            Some(&cookie),
+            PENDING_ISSUER,
+            200,
+            token_body(PENDING_DID),
+        )
+        .await;
+
+        assert!(out.is_err(), "an expired pending row completed a login");
+        assert!(
+            log.lock().unwrap().posted.is_empty(),
+            "the authorization code was posted for an expired pending row",
         );
     }
 }
