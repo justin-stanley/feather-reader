@@ -166,6 +166,13 @@ jobs:
         # other safety net: session-store encryption and the plaintext migrate-
         # on-read path, the reaper's absolute/idle TTLs, `StoreError` tagging,
         # and `purgeDid`.
+        #
+        # `npm test` runs a `test:guard` step first because `node --test` EXITS 0
+        # when its argument matches no files — a glob pointing at a moved output
+        # directory would have made this step green while running nothing, which
+        # is the exact failure this job exists to prevent. Demonstrated, not
+        # hypothetical: the previous `dist-test/test/*.test.js` also silently
+        # skipped any test file in a subdirectory.
         run: npm test
 
       - name: Lint (oxlint, --max-warnings 0)
@@ -186,10 +193,14 @@ jobs:
         #
         # **A green result here is not an all-clear, and that is not a
         # hypothetical.** `npm audit` queries the npm registry's advisory feed
-        # only. On 2026-09-14 this step passed — at EVERY severity, not just
-        # high — while fastify 5.12.1 was in the lockfile and four PUBLISHED
-        # high-severity advisories applied to it, one an authentication bypass
+        # only. This step once passed — at EVERY severity, not just high — while
+        # fastify 5.12.1 was in the lockfile and four PUBLISHED high-severity
+        # advisories applied to it, one an authentication bypass
         # (GHSA-p68q-wchp-6fh7, `>= 4.0.0, < 5.12.2`).
+        #
+        # That particular exposure is CLOSED: #125 (b74c4bf) took fastify to
+        # 5.12.3, past the 5.12.2 patch line for all four. The lesson is what
+        # remains — the scanner said nothing, before and after.
         #
         # They were visible on GitHub's REPO-level advisory database
         # (`gh api repos/fastify/fastify/security-advisories`) and nowhere a
