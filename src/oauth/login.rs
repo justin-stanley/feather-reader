@@ -49,12 +49,89 @@ pub async fn start(
     subject: &str,
     now: i64,
 ) -> Result<StartedLogin> {
-    let account = super::resolve::resolve(&runtime.resolver, http, subject, &runtime.plc_directory)
+    start_with(
+        runtime,
+        pool,
+        subject,
+        now,
+        |subject| async move {
+            super::resolve::resolve(&runtime.resolver, http, &subject, &runtime.plc_directory).await
+        },
+        |pds_url, auth_method, expected_issuer| async move {
+            discovery::discover(http, &pds_url, auth_method, expected_issuer.as_deref()).await
+        },
+        |req: ParPost| async move {
+            post_form(http, pool, &req.url, &req.key, &req.params, req.retry).await
+        },
+    )
+    .await
+}
+
+/// What [`start_with`] hands its PAR transport: a fully-formed request.
+///
+/// Mirrors [`TokenPost`] deliberately, and for the same reason it exists — a
+/// transport that receives ingredients instead of a request lets the decision
+/// be wrong where no test can see it.
+struct ParPost {
+    url: String,
+    params: Vec<(&'static str, String)>,
+    /// The ACTUAL key the push is signed under, so a test can compare its
+    /// thumbprint against the one the pending row stores. Passing a JWK string
+    /// and re-parsing it inside the adapter would let a freshly generated key
+    /// be accepted — the authorization server binds `request_uri` to this
+    /// key's thumbprint, so a different one stored means every login fails at
+    /// the token endpoint with a binding error nothing explains.
+    key: std::sync::Arc<keys::SigningKey>,
+    retry: request::Retry,
+}
+
+/// [`start`] with its three network boundaries injected.
+///
+/// **Nothing drove `start` at all.** Every guard in `complete` had a test and
+/// the whole callback got one; this half had neither, because it needs handle
+/// resolution, discovery and a PAR endpoint, all over the network. Five
+/// decisions made here were therefore unfalsifiable, and each is a silent
+/// production failure rather than a loud one:
+///
+/// - `client_id` — PAR pushed under a foreign client identity
+/// - `code_challenge` — derived from a different verifier than the one stored,
+///   so PKCE fails at the exchange
+/// - the assertion's audience — RFC 7523 requires the issuer, not the PDS
+/// - `browser_binding_hash` — hashing a token other than the one returned
+///   defeats the login-CSRF binding
+/// - `dpop_key_jwk` — storing a key other than the one PAR was signed under
+///
+/// **Every decision lives here, not in the caller's closures**, which is the
+/// lesson a review of `complete_with`'s first cut paid for: arguments assembled
+/// inside an adapter are invisible to a test, so they can be wrong with the
+/// suite green. The transports receive fully-formed values.
+#[allow(clippy::too_many_arguments)]
+async fn start_with<R, RFut, D, DFut, P, PFut>(
+    runtime: &OauthRuntime,
+    pool: &sqlx::SqlitePool,
+    subject: &str,
+    now: i64,
+    resolve: R,
+    discover: D,
+    push: P,
+) -> Result<StartedLogin>
+where
+    R: FnOnce(String) -> RFut,
+    RFut: std::future::Future<Output = Result<super::resolve::ResolvedAccount>>,
+    D: FnOnce(String, &'static str, Option<String>) -> DFut,
+    DFut: std::future::Future<Output = Result<discovery::AuthorizationServer>>,
+    P: FnOnce(ParPost) -> PFut,
+    PFut: std::future::Future<Output = Result<request::PostOutcome>>,
+{
+    let account = resolve(subject.to_string())
         .await
         .with_context(|| format!("resolving {subject:?}"))?;
 
-    // No prior issuer: this IS the login that establishes one.
-    let server = discovery::discover(http, &account.pds_url, runtime.auth_method.as_str(), None)
+    // No prior issuer: this IS the login that establishes one. Passed
+    // explicitly so the `None` is visible to a test rather than buried in an
+    // adapter — the mix-up re-check on the callback side is armed by the
+    // mirror-image argument, and that one was wrong in review.
+    let server = discover(account.pds_url.clone(), runtime.auth_method.as_str(), None)
         .await
         .with_context(|| {
             format!(
@@ -72,7 +149,6 @@ pub async fn start(
     let binding_token = flow::new_binding_token();
 
     let mut params = flow::par_params(&flow::ParRequest {
-        client_id: &runtime.client_id,
         redirect_uri: &super::metadata::redirect_uri(&runtime.client),
         scope: runtime.client.scope_str(),
         state: &state,
@@ -86,15 +162,16 @@ pub async fn start(
         assertion.as_deref(),
     )?);
 
-    let outcome = post_form(
-        http,
-        pool,
-        &server.par_endpoint,
-        &session_key,
-        &params,
+    // `Arc` so the transport can be handed the real key rather than a recipe
+    // for one, while `put_pending` below still stores from the same value.
+    let session_key = std::sync::Arc::new(session_key);
+    let outcome = push(ParPost {
+        url: server.par_endpoint.clone(),
+        params,
+        key: std::sync::Arc::clone(&session_key),
         // PAR is safe to repeat: a rejected attempt consumes nothing.
-        request::Retry::Allowed,
-    )
+        retry: request::Retry::Allowed,
+    })
     .await?;
     let par = accept_par_response(&outcome)?;
 
@@ -708,6 +785,288 @@ mod tests {
             ..crate::config::Config::default()
         })
         .expect("the test runtime must build")
+    }
+
+    // ── `start`: the half that had no test at all ───────────────────────────
+
+    const START_PDS: &str = "https://pds.example.com";
+    const START_ISSUER: &str = "https://auth.example.com";
+
+    fn started_account() -> crate::oauth::resolve::ResolvedAccount {
+        crate::oauth::resolve::ResolvedAccount {
+            did: PENDING_DID.into(),
+            pds_url: START_PDS.into(),
+            handle: Some("alice.example.com".into()),
+        }
+    }
+
+    fn started_server() -> discovery::AuthorizationServer {
+        discovery::AuthorizationServer {
+            issuer: START_ISSUER.into(),
+            par_endpoint: format!("{START_ISSUER}/par"),
+            authorization_endpoint: format!("{START_ISSUER}/authorize"),
+            token_endpoint: format!("{START_ISSUER}/token"),
+            revocation_endpoint: None,
+        }
+    }
+
+    fn par_ok() -> request::PostOutcome {
+        request::PostOutcome {
+            status: 201,
+            body: br#"{"request_uri":"urn:ietf:params:oauth:request_uri:abc","expires_in":60}"#
+                .to_vec(),
+        }
+    }
+
+    /// Drive `start_with`, capturing the PAR request it pushed.
+    async fn run_start(
+        runtime: &crate::oauth::runtime::OauthRuntime,
+        pool: &sqlx::SqlitePool,
+        now: i64,
+    ) -> (
+        Result<StartedLogin>,
+        std::sync::Arc<std::sync::Mutex<Vec<ParPost>>>,
+    ) {
+        let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&pushed);
+        let r = start_with(
+            runtime,
+            pool,
+            "alice.example.com",
+            now,
+            |_subject| async move { Ok(started_account()) },
+            |_pds, _method, expected| async move {
+                // The mirror image of the callback's mix-up re-check: this side
+                // must pass `None`, because this IS the login that establishes
+                // the issuer. Asserted here so a `Some(..)` cannot creep in.
+                assert!(
+                    expected.is_none(),
+                    "the initial push must not claim a prior issuer, got {expected:?}"
+                );
+                Ok(started_server())
+            },
+            move |req: ParPost| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(req);
+                    Ok(par_ok())
+                }
+            },
+        )
+        .await;
+        (r, pushed)
+    }
+
+    fn param<'a>(params: &'a [(&'static str, String)], k: &str) -> Option<&'a str> {
+        params
+            .iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// **The PAR push carries this client's identity, and the pending row is
+    /// written from the same values.**
+    ///
+    /// Five decisions in `start` were unfalsifiable before this test existed —
+    /// see `start_with`. Each is silent in production: the login simply fails
+    /// later, at the authorization server, for a reason nothing local explains.
+    #[tokio::test]
+    async fn a_start_pushes_this_clients_identity_and_stores_what_it_pushed() -> Result<()> {
+        let pool = empty_pool().await;
+        let runtime = runtime_at("https://app.example.com");
+        let now = 1_700_000_000;
+
+        let (started, pushed) = run_start(&runtime, &pool, now).await;
+        let started = started?;
+        // Copy what the assertions need and DROP the guard: everything below
+        // awaits, and holding a `std::sync::MutexGuard` across an await point
+        // is a deadlock waiting for a multi-threaded runtime (clippy's
+        // `await_holding_lock`, which CI treats as an error).
+        let (url, params, pushed_key_jwk, retry_allowed) = {
+            let pushed = pushed.lock().unwrap();
+            assert_eq!(pushed.len(), 1, "PAR must be pushed exactly once");
+            let r = &pushed[0];
+            (
+                r.url.clone(),
+                r.params.clone(),
+                r.key.to_jwk_json()?,
+                matches!(r.retry, request::Retry::Allowed),
+            )
+        };
+        let req = &params;
+
+        assert_eq!(url, format!("{START_ISSUER}/par"), "wrong PAR endpoint");
+        assert_eq!(
+            param(req, "client_id"),
+            Some(runtime.client_id.as_str()),
+            "PAR was pushed under a client_id that is not ours",
+        );
+        assert_eq!(
+            param(req, "redirect_uri"),
+            Some(crate::oauth::metadata::redirect_uri(&runtime.client).as_str()),
+        );
+        assert!(
+            retry_allowed,
+            "PAR consumes nothing on rejection and must stay retryable",
+        );
+
+        // **The client assertion is addressed to the AUTHORIZATION SERVER.**
+        //
+        // RFC 7523 §3: `aud` is the server the assertion is presented to, and
+        // `iss` = `sub` = the client. Pointing `aud` at the PDS instead — the
+        // other URL in scope here, one line away in this function — survived
+        // every other assertion in this test, because nothing looked inside the
+        // JWT. A wrong audience is rejected by the server as an invalid client
+        // assertion, so the login fails with nothing local explaining why.
+        let assertion = param(req, "client_assertion").expect("a client assertion");
+        let claims: serde_json::Value = {
+            use base64::Engine as _;
+            let payload = assertion.split('.').nth(1).expect("a JWT payload segment");
+            serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .expect("the payload must be base64url"),
+            )
+            .expect("the payload must be JSON")
+        };
+        assert_eq!(
+            claims["aud"].as_str(),
+            Some(START_ISSUER),
+            "the client assertion is addressed to the wrong audience: {claims}",
+        );
+        assert_eq!(
+            claims["iss"].as_str(),
+            Some(runtime.client_id.as_str()),
+            "the client assertion's issuer is not this client",
+        );
+        assert_eq!(
+            claims["sub"].as_str(),
+            Some(runtime.client_id.as_str()),
+            "the client assertion's subject is not this client",
+        );
+        assert_eq!(
+            claims["iat"].as_i64(),
+            Some(now),
+            "iat is not the passed now"
+        );
+        assert!(
+            claims["exp"]
+                .as_i64()
+                .is_some_and(|e| e > now && e <= now + 300),
+            "exp must be ahead of iat and short-lived: {claims}",
+        );
+
+        // The row `complete` will read back.
+        let pending = crate::oauth::store::take_pending(
+            &pool,
+            &runtime.codec,
+            param(req, "state").expect("state in the push"),
+            now,
+        )
+        .await?
+        .expect("the pending row must exist");
+
+        // **PKCE: the challenge pushed must derive from the verifier stored.**
+        // A fresh verifier on either side compiles and fails only at the
+        // exchange, with `invalid_grant` and nothing pointing here.
+        assert_eq!(
+            param(req, "code_challenge"),
+            Some(flow::pkce_challenge(&pending.pkce_verifier).as_str()),
+            "the pushed PKCE challenge does not match the stored verifier",
+        );
+
+        // **DPoP: the key stored must be the key the push was signed under.**
+        // The authorization server binds `request_uri` to this thumbprint.
+        assert_eq!(
+            pending.dpop_key_jwk, pushed_key_jwk,
+            "the pending row stores a different DPoP key than PAR was signed under",
+        );
+
+        // **Browser binding: the hash stored must be of the token returned.**
+        // Hashing anything else leaves the cookie check unable to match, which
+        // is a login-CSRF defence that silently never fires.
+        assert_eq!(
+            pending.browser_binding_hash,
+            flow::binding_hash(&started.binding_token),
+            "the stored binding hash is not of the token handed to the browser",
+        );
+
+        assert_eq!(pending.issuer, START_ISSUER);
+        assert_eq!(pending.pds_url, START_PDS);
+        assert_eq!(pending.did, PENDING_DID);
+        assert_eq!(pending.request_uri, "urn:ietf:params:oauth:request_uri:abc");
+        assert_eq!(
+            pending.redirect_uri,
+            crate::oauth::metadata::redirect_uri(&runtime.client)
+        );
+        assert_eq!(pending.requested_scope, runtime.client.scope_str());
+
+        // The browser is sent to the discovered endpoint, carrying the
+        // request_uri the server just issued.
+        assert!(
+            started
+                .authorize_url
+                .starts_with(&format!("{START_ISSUER}/authorize")),
+            "authorize_url does not point at the discovered endpoint: {}",
+            started.authorize_url,
+        );
+        assert!(
+            started
+                .authorize_url
+                .contains("urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Aabc")
+                || started
+                    .authorize_url
+                    .contains("request_uri=urn:ietf:params:oauth:request_uri:abc"),
+            "authorize_url does not carry the issued request_uri: {}",
+            started.authorize_url,
+        );
+        Ok(())
+    }
+
+    /// **A failed PAR push stores nothing.**
+    ///
+    /// A pending row written before the server accepted would leave a sealed
+    /// DPoP key and PKCE verifier for a grant that does not exist, and the
+    /// row's expiry is derived from the PAR response.
+    #[tokio::test]
+    async fn a_rejected_par_push_stores_no_pending_row() -> Result<()> {
+        let pool = empty_pool().await;
+        let runtime = runtime_at("https://app.example.com");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let r = start_with(
+            &runtime,
+            &pool,
+            "alice.example.com",
+            1_700_000_000,
+            |_s| async move { Ok(started_account()) },
+            |_p, _m, _e| async move { Ok(started_server()) },
+            move |req: ParPost| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(req);
+                    Ok(request::PostOutcome {
+                        status: 400,
+                        body: br#"{"error":"invalid_request"}"#.to_vec(),
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(r.is_err(), "a 400 from PAR must fail the login");
+        let state = {
+            let c = captured.lock().unwrap();
+            param(&c[0].params, "state").expect("state").to_string()
+        };
+        assert!(
+            crate::oauth::store::take_pending(&pool, &runtime.codec, &state, 1_700_000_000)
+                .await?
+                .is_none(),
+            "a rejected push left a pending row behind",
+        );
+        Ok(())
     }
 
     fn callback_params() -> flow::CallbackParams {
