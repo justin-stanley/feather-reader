@@ -11,6 +11,8 @@
 //! reshaped to fit would be a divergence between the two clients, and those
 //! belong in `xrpc.rs` where both can share the fix.
 
+use std::borrow::Cow;
+
 use anyhow::{Context as _, Result};
 
 use crate::lexicon::{Folder, ReadState, Saved, Subscription};
@@ -189,15 +191,20 @@ impl Repo<'_> {
 /// that the two backends cannot drift, and a hand-written arm is exactly where
 /// an argument gets dropped or reordered on one side only.
 macro_rules! dispatch {
+    // Explicit visibility and metric label. Used by the three subscription
+    // writers, which are private here so the only way to reach them is through
+    // the vetting wrapper of the same name; the label is passed explicitly so
+    // the private method's `_unvetted` suffix does not leak into the metric.
     (
         $(#[$meta:meta])*
-        $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
+        $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
+        label: $label:expr,
         sidecar: $sidecar:ident,
         rust: $rust:ident
     ) => {
         $(#[$meta])*
-        pub async fn $name(&self, did: &str $(, $arg: $ty)*) -> Result<$ret> {
-            timed(&self.state.metrics, self.backend(), stringify!($name), async {
+        $vis async fn $name(&self, did: &str $(, $arg: $ty)*) -> Result<$ret> {
+            timed(&self.state.metrics, self.backend(), $label, async {
                 match self.backend() {
                     Backend::Sidecar => self.state.sidecar.$sidecar(did $(, $arg)*).await,
                     Backend::Rust => {
@@ -215,6 +222,68 @@ macro_rules! dispatch {
             .await
         }
     };
+
+    // The common case: public, and the metric label is the method name. Forwards
+    // to the arm above rather than repeating the body — a second copy of the
+    // match is exactly the backend drift this macro exists to prevent.
+    (
+        $(#[$meta:meta])*
+        $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
+        sidecar: $sidecar:ident,
+        rust: $rust:ident
+    ) => {
+        dispatch! {
+            $(#[$meta])*
+            pub $name ( $( $arg : $ty ),* ) -> $ret,
+            label: stringify!($name),
+            sidecar: $sidecar,
+            rust: $rust
+        }
+    };
+}
+
+/// Scheme-check the parts of a subscription record that this reader did not
+/// author, immediately before it is published to the user's repo.
+///
+/// **Why here and not at ingest.** `siteUrl` enters from three places — a remote
+/// feed's `<link>` ([`crate::feed`]), an OPML file's `htmlUrl` ([`crate::opml`]),
+/// and the manage-subscription form — and a guard at each is three things to
+/// remember, which is the shape of defence that issue #114's sibling (#111)
+/// measured as worthless: the check was deleted and all 679 tests still passed.
+/// Every write instead crosses this module, above the backend split, so one vet
+/// covers both backends, all three writers, and whatever is added next.
+///
+/// A rejected URL becomes `None` rather than dropping the subscription — the
+/// feed is what the user asked for; the site link is decoration.
+///
+/// **The record is what makes this worth doing.** Nothing in `templates/`
+/// renders `siteUrl`, so this is not an XSS against our own UI. The lexicon
+/// describes the field as the "human-facing site the feed belongs to", i.e. a
+/// value other atproto clients are expected to render as a link — so publishing
+/// an unchecked `javascript:` URL hands every other reader a stored XSS under
+/// our user's authorship, for a string the user never typed.
+fn vet(sub: &Subscription) -> Cow<'_, Subscription> {
+    let Some(raw) = sub.site_url.as_deref() else {
+        return Cow::Borrowed(sub);
+    };
+    let cleaned = crate::net::safe_link(raw);
+    if cleaned.as_deref() == Some(raw) {
+        return Cow::Borrowed(sub);
+    }
+    let mut owned = sub.clone();
+    owned.site_url = cleaned;
+    Cow::Owned(owned)
+}
+
+/// [`vet`] over a batch, borrowing the slice whole when every record is already
+/// clean — the common case for an import, and the one worth not cloning 200
+/// records for.
+fn vet_all(subs: &[Subscription]) -> Cow<'_, [Subscription]> {
+    if subs.iter().any(|s| matches!(vet(s), Cow::Owned(_))) {
+        Cow::Owned(subs.iter().map(|s| vet(s).into_owned()).collect())
+    } else {
+        Cow::Borrowed(subs)
+    }
 }
 
 impl Repo<'_> {
@@ -228,10 +297,18 @@ impl Repo<'_> {
     }
 
     dispatch! {
-        /// Subscribe. Returns the new record's rkey.
-        add_subscription(sub: &Subscription) -> String,
+        /// Raw subscribe. Private: reach it through [`Repo::add_subscription`].
+        add_subscription_unvetted(sub: &Subscription) -> String,
+        label: "add_subscription",
         sidecar: add_subscription,
         rust: add_subscription
+    }
+
+    /// Subscribe. Returns the new record's rkey.
+    ///
+    /// Vets the record first — see [`vet`].
+    pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
+        self.add_subscription_unvetted(did, &vet(sub)).await
     }
 
     dispatch! {
@@ -242,17 +319,47 @@ impl Repo<'_> {
     }
 
     dispatch! {
-        /// Rename or re-folder a subscription.
-        update_subscription(rkey: &str, sub: &Subscription) -> crate::atproto::WriteResult,
+        /// Raw update. Private: reach it through [`Repo::update_subscription`].
+        update_subscription_unvetted(rkey: &str, sub: &Subscription)
+            -> crate::atproto::WriteResult,
+        label: "update_subscription",
         sidecar: update_subscription,
         rust: update_subscription
     }
 
+    /// Rename or re-folder a subscription.
+    ///
+    /// Vets the record first — see [`vet`].
+    pub async fn update_subscription(
+        &self,
+        did: &str,
+        rkey: &str,
+        sub: &Subscription,
+    ) -> Result<crate::atproto::WriteResult> {
+        self.update_subscription_unvetted(did, rkey, &vet(sub))
+            .await
+    }
+
     dispatch! {
-        /// OPML import — one `applyWrites` for the whole batch.
-        add_subscriptions_bulk(subs: &[Subscription]) -> Vec<String>,
+        /// Raw bulk add. Private: reach it through [`Repo::add_subscriptions_bulk`].
+        add_subscriptions_bulk_unvetted(subs: &[Subscription]) -> Vec<String>,
+        label: "add_subscriptions_bulk",
         sidecar: add_subscriptions_bulk,
         rust: add_subscriptions_bulk
+    }
+
+    /// OPML import — one `applyWrites` for the whole batch.
+    ///
+    /// Vets every record first — see [`vet`]. An import is the path where the
+    /// URLs are least trustworthy: the file is arbitrary, and 200 of them arrive
+    /// at once with nobody reading each line.
+    pub async fn add_subscriptions_bulk(
+        &self,
+        did: &str,
+        subs: &[Subscription],
+    ) -> Result<Vec<String>> {
+        self.add_subscriptions_bulk_unvetted(did, &vet_all(subs))
+            .await
     }
 
     // ── folders ──────────────────────────────────────────────────────────────
@@ -369,6 +476,193 @@ mod tests {
             },
             db,
         )
+    }
+
+    /// A state pointed at a mock sidecar, so a repo write actually goes out.
+    async fn sidecar_state(internal_url: &str) -> anyhow::Result<AppState> {
+        let db = crate::store::init_url("sqlite::memory:").await?;
+        AppState::new(
+            Config {
+                repo_backend: Backend::Sidecar,
+                public_url: "http://localhost:8080".to_string(),
+                sidecar: crate::config::SidecarConfig {
+                    public_url: internal_url.to_string(),
+                    internal_url: internal_url.to_string(),
+                    internal_secret: "test-secret".to_string(),
+                },
+                ..Config::default()
+            },
+            db,
+        )
+    }
+
+    /// A sidecar mock that keeps the body of the first repo write it is sent.
+    ///
+    /// The assertion has to be made on the BYTES ON THE WIRE. Checking the
+    /// `Subscription` we passed in would pass just as happily with the vet
+    /// deleted — the record only becomes safe on the way out.
+    async fn spawn_capturing_sidecar() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 65536];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(body) = req.split("\r\n\r\n").nth(1) {
+                    sink.lock().unwrap().push(body.to_string());
+                }
+                let body = serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk1",
+                        "cid": "bafyreiabc"
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn sub_with_site(site: &str) -> Subscription {
+        let mut sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
+        sub.site_url = Some(site.to_string());
+        sub
+    }
+
+    /// Every write path, against the one scheme that motivated the guard.
+    ///
+    /// Parameterised over the three writers rather than testing one, because the
+    /// vet is applied per-wrapper: a fourth writer, or a wrapper that forgets the
+    /// call, is precisely the regression this is here to catch.
+    #[tokio::test]
+    async fn no_writer_publishes_a_hostile_site_url() {
+        for hostile in [
+            "javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "  javascript:alert(1)  ",
+            "vbscript:msgbox(1)",
+        ] {
+            let (url, seen) = spawn_capturing_sidecar().await;
+            let state = sidecar_state(&url).await.expect("sidecar state");
+            let sub = sub_with_site(hostile);
+
+            let _ = state.repo().add_subscription(DID, &sub).await;
+            let _ = state.repo().update_subscription(DID, "rk1", &sub).await;
+            let _ = state
+                .repo()
+                .add_subscriptions_bulk(DID, std::slice::from_ref(&sub))
+                .await;
+
+            let bodies = seen.lock().unwrap().clone();
+            assert_eq!(
+                bodies.len(),
+                3,
+                "expected one body per writer, got {bodies:?}"
+            );
+            for (writer, body) in ["add", "update", "bulk"].iter().zip(&bodies) {
+                assert!(
+                    !body.contains("javascript:")
+                        && !body.contains("data:")
+                        && !body.contains("vbscript:"),
+                    "{writer} published {hostile:?} to the PDS: {body}"
+                );
+                assert!(
+                    !body.contains("siteUrl"),
+                    "{writer} sent a rejected siteUrl as an empty string; it must be \
+                     omitted, so other clients render no link rather than a broken one: \
+                     {body}"
+                );
+            }
+        }
+    }
+
+    /// The guard must not eat the ordinary case.
+    #[tokio::test]
+    async fn a_legitimate_site_url_is_published_unchanged() {
+        let (url, seen) = spawn_capturing_sidecar().await;
+        let state = sidecar_state(&url).await.expect("sidecar state");
+        let sub = sub_with_site("https://example.com/blog");
+
+        let _ = state.repo().add_subscription(DID, &sub).await;
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected one write, got {bodies:?}");
+        assert!(
+            bodies[0].contains("https://example.com/blog"),
+            "a perfectly good site link was dropped: {}",
+            bodies[0]
+        );
+    }
+
+    #[test]
+    fn vet_rejects_by_scheme_and_keeps_everything_else() {
+        // Rejected -> None, and the rest of the record is untouched.
+        let hostile = sub_with_site("javascript:alert(1)");
+        let vetted = vet(&hostile);
+        assert!(matches!(vetted, Cow::Owned(_)), "a rejection must clone");
+        assert_eq!(vetted.site_url, None);
+        assert_eq!(vetted.url, hostile.url, "the feed URL is not the target");
+
+        // Clean -> borrowed, byte-identical.
+        let clean = sub_with_site("https://example.com/blog");
+        assert!(
+            matches!(vet(&clean), Cow::Borrowed(_)),
+            "a clean record must not be cloned"
+        );
+
+        // Surrounding whitespace is normalised away rather than rejected, which
+        // is what `net::safe_link` already does for entry links.
+        let padded = sub_with_site("  https://example.com/blog  ");
+        assert_eq!(
+            vet(&padded).site_url.as_deref(),
+            Some("https://example.com/blog")
+        );
+
+        // Absent stays absent — no empty string is invented.
+        let bare = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
+        assert!(matches!(vet(&bare), Cow::Borrowed(_)));
+        assert_eq!(vet(&bare).site_url, None);
+    }
+
+    #[test]
+    fn vet_all_borrows_a_clean_batch_and_cleans_a_dirty_one() {
+        let clean = vec![
+            sub_with_site("https://a.example/"),
+            sub_with_site("https://b.example/"),
+        ];
+        assert!(
+            matches!(vet_all(&clean), Cow::Borrowed(_)),
+            "a clean batch must not be cloned — an import is 200 records"
+        );
+
+        let mixed = vec![
+            sub_with_site("https://a.example/"),
+            sub_with_site("javascript:alert(1)"),
+        ];
+        let vetted = vet_all(&mixed);
+        assert!(matches!(vetted, Cow::Owned(_)));
+        assert_eq!(vetted[0].site_url.as_deref(), Some("https://a.example/"));
+        assert_eq!(
+            vetted[1].site_url, None,
+            "one bad record in a batch must be cleaned, not the whole batch dropped"
+        );
     }
 
     /// **Both arms must record under the SAME operation name.**
