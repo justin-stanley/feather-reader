@@ -116,7 +116,7 @@ getrandom = "0.4"
 # paragraph once sqlx-core and hyper-util catch up and one copy is achievable
 # again.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 # Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
 # internal-only helper; `subtle` is the maintained option and is already in the
 # tree, so this adds no package to the lock either.
