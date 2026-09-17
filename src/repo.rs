@@ -11,8 +11,6 @@
 //! reshaped to fit would be a divergence between the two clients, and those
 //! belong in `xrpc.rs` where both can share the fix.
 
-use std::borrow::Cow;
-
 use anyhow::{Context as _, Result};
 
 use crate::lexicon::{Folder, ReadState, Saved, Subscription};
@@ -262,28 +260,15 @@ macro_rules! dispatch {
 /// value other atproto clients are expected to render as a link — so publishing
 /// an unchecked `javascript:` URL hands every other reader a stored XSS under
 /// our user's authorship, for a string the user never typed.
-fn vet(sub: &Subscription) -> Cow<'_, Subscription> {
-    let Some(raw) = sub.site_url.as_deref() else {
-        return Cow::Borrowed(sub);
-    };
-    let cleaned = crate::net::safe_link(raw);
-    if cleaned.as_deref() == Some(raw) {
-        return Cow::Borrowed(sub);
-    }
-    let mut owned = sub.clone();
-    owned.site_url = cleaned;
-    Cow::Owned(owned)
+fn vet(sub: &Subscription) -> Subscription {
+    let mut out = sub.clone();
+    out.site_url = out.site_url.as_deref().and_then(crate::net::safe_link);
+    out
 }
 
-/// [`vet`] over a batch, borrowing the slice whole when every record is already
-/// clean — the common case for an import, and the one worth not cloning 200
-/// records for.
-fn vet_all(subs: &[Subscription]) -> Cow<'_, [Subscription]> {
-    if subs.iter().any(|s| matches!(vet(s), Cow::Owned(_))) {
-        Cow::Owned(subs.iter().map(|s| vet(s).into_owned()).collect())
-    } else {
-        Cow::Borrowed(subs)
-    }
+/// [`vet`] over a batch.
+fn vet_all(subs: &[Subscription]) -> Vec<Subscription> {
+    subs.iter().map(vet).collect()
 }
 
 impl Repo<'_> {
@@ -616,15 +601,14 @@ mod tests {
         // Rejected -> None, and the rest of the record is untouched.
         let hostile = sub_with_site("javascript:alert(1)");
         let vetted = vet(&hostile);
-        assert!(matches!(vetted, Cow::Owned(_)), "a rejection must clone");
         assert_eq!(vetted.site_url, None);
         assert_eq!(vetted.url, hostile.url, "the feed URL is not the target");
 
-        // Clean -> borrowed, byte-identical.
+        // A clean record passes through untouched.
         let clean = sub_with_site("https://example.com/blog");
-        assert!(
-            matches!(vet(&clean), Cow::Borrowed(_)),
-            "a clean record must not be cloned"
+        assert_eq!(
+            vet(&clean).site_url.as_deref(),
+            Some("https://example.com/blog")
         );
 
         // Surrounding whitespace is normalised away rather than rejected, which
@@ -637,27 +621,16 @@ mod tests {
 
         // Absent stays absent — no empty string is invented.
         let bare = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
-        assert!(matches!(vet(&bare), Cow::Borrowed(_)));
         assert_eq!(vet(&bare).site_url, None);
     }
 
     #[test]
-    fn vet_all_borrows_a_clean_batch_and_cleans_a_dirty_one() {
-        let clean = vec![
-            sub_with_site("https://a.example/"),
-            sub_with_site("https://b.example/"),
-        ];
-        assert!(
-            matches!(vet_all(&clean), Cow::Borrowed(_)),
-            "a clean batch must not be cloned — an import is 200 records"
-        );
-
+    fn vet_all_cleans_one_bad_record_without_touching_the_rest() {
         let mixed = vec![
             sub_with_site("https://a.example/"),
             sub_with_site("javascript:alert(1)"),
         ];
         let vetted = vet_all(&mixed);
-        assert!(matches!(vetted, Cow::Owned(_)));
         assert_eq!(vetted[0].site_url.as_deref(), Some("https://a.example/"));
         assert_eq!(
             vetted[1].site_url, None,
@@ -707,6 +680,55 @@ mod tests {
              can never be compared"
         );
         assert_eq!(names[0], "list_subscriptions_sorted");
+    }
+
+    /// **The three hand-typed metric labels must stay what they say.**
+    ///
+    /// Every other method derives its label from its own name via `stringify!`,
+    /// which is what makes drift impossible for them. The subscription writers
+    /// cannot: the macro-generated method behind each wrapper is named
+    /// `*_unvetted`, and that suffix must not reach the metrics table, so the
+    /// label is passed as a literal instead. A literal is exactly the thing that
+    /// can drift, so it is pinned here.
+    ///
+    /// Honest about the limit: this pins the labels, not the correspondence
+    /// between a label and its wrapper's name. Renaming a public wrapper without
+    /// touching its literal would still slip through — the residual cost of
+    /// hand-typing three of the fifteen.
+    ///
+    /// None of the calls can succeed (no session), which is the point: the label
+    /// is recorded either way.
+    #[tokio::test]
+    async fn the_three_hand_typed_labels_are_what_they_claim() {
+        let state = state_with(Backend::Rust, "http://localhost:8080")
+            .await
+            .expect("rust state");
+        let sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
+
+        let _ = state.repo().add_subscription(DID, &sub).await;
+        let _ = state.repo().update_subscription(DID, "rk1", &sub).await;
+        let _ = state
+            .repo()
+            .add_subscriptions_bulk(DID, std::slice::from_ref(&sub))
+            .await;
+
+        let mut ops: Vec<String> = state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .map(|row| row.op)
+            .collect();
+        ops.sort();
+        assert_eq!(
+            ops,
+            vec![
+                "add_subscription".to_string(),
+                "add_subscriptions_bulk".to_string(),
+                "update_subscription".to_string(),
+            ],
+            "a writer's metric label drifted from the operation it names, so its \
+             rows can never be compared against the other backend's"
+        );
     }
 
     /// A failed call is still recorded — as a FAILURE, not as a fast success.
