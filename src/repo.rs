@@ -190,9 +190,19 @@ impl Repo<'_> {
 /// an argument gets dropped or reordered on one side only.
 macro_rules! dispatch {
     // Explicit visibility and metric label. Used by the three subscription
-    // writers, which are private here so the only way to reach them is through
-    // the vetting wrapper of the same name; the label is passed explicitly so
-    // the private method's `_unvetted` suffix does not leak into the metric.
+    // writers, which are private here so that reaching them through `Repo` means
+    // going through the vetting wrapper of the same name; the label is passed
+    // explicitly so the private method's `_unvetted` suffix does not leak into
+    // the metric.
+    //
+    // **This makes `Repo` the vetted path, not the only possible path.** The
+    // layer below is still public — `AppState.sidecar` is a `pub` field and
+    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription`
+    // — so a handler *can* still write a record without vetting it by calling
+    // one of those directly. Nothing does today, and nothing should. Making it
+    // impossible rather than merely unsanctioned needs the `SafeLink` treatment
+    // from `src/safe_link.rs`: a vetted-record type the low-level writers demand
+    // and only one constructor can produce. Tracked in #140.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
@@ -497,13 +507,37 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = vec![0u8; 65536];
-                let Ok(n) = sock.read(&mut buf).await else {
-                    continue;
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                if let Some(body) = req.split("\r\n\r\n").nth(1) {
-                    sink.lock().unwrap().push(body.to_string());
+                // **Read until the body is complete, not until the first
+                // syscall returns.** A single `read` gets whatever one TCP
+                // segment carried; if headers and body arrive separately, the
+                // "body" is empty and every `!contains(...)` assertion below
+                // passes for the wrong reason — a false green in the one test
+                // the mutation argument rests on.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|want| body.len() >= want) {
+                        sink.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(body).to_string());
+                        break;
+                    }
                 }
                 let body = serde_json::json!({
                     "ok": true,
@@ -562,6 +596,13 @@ mod tests {
                 "expected one body per writer, got {bodies:?}"
             );
             for (writer, body) in ["add", "update", "bulk"].iter().zip(&bodies) {
+                // Anchor the negative assertions below: a truncated or empty
+                // capture would satisfy every `!contains(...)` vacuously.
+                assert!(
+                    body.contains("https://example.com/feed.xml"),
+                    "{writer} captured no usable body, so the assertions that \
+                     follow would pass for the wrong reason: {body:?}"
+                );
                 assert!(
                     !body.contains("javascript:")
                         && !body.contains("data:")
