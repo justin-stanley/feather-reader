@@ -515,10 +515,7 @@ mod tests {
                 // the mutation argument rests on.
                 let mut raw: Vec<u8> = Vec::new();
                 let mut chunk = [0u8; 4096];
-                loop {
-                    let Ok(n) = sock.read(&mut chunk).await else {
-                        break;
-                    };
+                while let Ok(n) = sock.read(&mut chunk).await {
                     if n == 0 {
                         break;
                     }
