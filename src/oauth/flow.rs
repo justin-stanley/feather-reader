@@ -90,7 +90,13 @@ pub fn binding_matches(stored_hash: &str, presented: Option<&str>) -> bool {
 
 /// The inputs to a pushed authorization request.
 pub struct ParRequest<'a> {
-    pub client_id: &'a str,
+    // No `client_id`: there was one here, and `par_params` never read it.
+    // The client's identity reaches the push through
+    // `super::client_auth::credential_params`, which is where it belongs —
+    // it depends on the negotiated auth method. A field that cannot affect
+    // the request it names is worse than no field: a mutation setting it to
+    // an attacker's metadata URL left the whole suite green, which reads as
+    // "the client identity is untested" when the real path is covered.
     pub redirect_uri: &'a str,
     pub scope: &'a str,
     pub state: &'a str,
@@ -450,7 +456,6 @@ mod tests {
 
     fn par_input() -> ParRequest<'static> {
         ParRequest {
-            client_id: "https://feather-reader.com/oauth/client-metadata.json",
             redirect_uri: "https://feather-reader.com/oauth/callback",
             scope: "atproto transition:generic",
             state: "state-value",
