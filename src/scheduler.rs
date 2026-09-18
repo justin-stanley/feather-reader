@@ -128,18 +128,146 @@ const PENDING_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(45);
 const CODE_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
 
-/// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a loop's startup
-/// delay. The variable is a CEILING, not a replacement: it can only shorten the
-/// wait, so setting it cannot accidentally push a production loop out further
-/// than the constant above intends.
-fn startup_delay(default: Duration) -> Duration {
-    startup_delay_from(
-        default,
-        std::env::var("FEATHERREADER_STARTUP_DELAY_SECS").ok(),
-    )
+/// Which background loop an offset belongs to.
+///
+/// **An enum, not a string key.** The first cut of this used `&'static str`
+/// names looked up with `.unwrap_or(POLLER_STARTUP_DELAY)`, and a review showed
+/// that was strictly WORSE than the per-loop constants it replaced: mistyping
+/// `offset_for("pending-sweeper")` compiled, passed all 706 tests, and silently
+/// moved that loop onto the poller's tick — the everything-at-once collision the
+/// offsets exist to prevent. A wrong constant name used to be a compile error;
+/// a wrong string was a silent production change.
+///
+/// With an enum and an exhaustive `match` the table is total by construction,
+/// there is no fallback to be wrong, and a typo is a compile error again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Loop {
+    Poller,
+    PendingSweep,
+    CodeSweep,
+    Retention,
+    Adoption,
 }
 
-/// [`startup_delay`] with the environment value passed in.
+impl Loop {
+    /// The registry: every offset-bearing loop, in the order `spawn` starts them.
+    ///
+    /// A variant missing from here is never STARTED — a visible absence — rather
+    /// than started with the wrong offset, which was silent.
+    const ALL: [Loop; 5] = [
+        Loop::Poller,
+        Loop::PendingSweep,
+        Loop::CodeSweep,
+        Loop::Retention,
+        Loop::Adoption,
+    ];
+
+    /// Start this loop, with its own offset.
+    ///
+    /// **The variant names the loop AND the offset, in one place.** The previous
+    /// shape passed `offset_for(Loop::X)` as a positional argument at five
+    /// near-identical `tokio::spawn` lines, ~600 lines from the loop it
+    /// configured — so writing `offset_for(Loop::Poller)` at the pending-sweeper
+    /// site compiled, passed 707 tests and clippy, and silently collided the two
+    /// loops at boot. That is the third form of this same bug; the first two were
+    /// a wrong constant and a mistyped string key.
+    ///
+    /// **What is still NOT prevented:** pairing a variant with the wrong `run_*`
+    /// in an arm below — `Loop::PendingSweep => run_poller(..)` compiles and the
+    /// suite passes. That is a different failure (one loop never starts, another
+    /// runs twice) and it is narrower: one exhaustive match in one place, rather
+    /// than five spawn sites scattered through the file. Catching it would need
+    /// each loop to report that it started, i.e. production instrumentation for a
+    /// test — not obviously worth it, but it is a hole, not an absence of one.
+    fn spawn_at(
+        self,
+        state: AppState,
+        shutdown: watch::Receiver<()>,
+        startup: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        match self {
+            Loop::Poller => tokio::spawn(run_poller(state, shutdown, startup)),
+            Loop::PendingSweep => tokio::spawn(run_pending_sweeper(state, shutdown, startup)),
+            Loop::CodeSweep => tokio::spawn(run_code_sweeper(state, shutdown, startup)),
+            Loop::Retention => tokio::spawn(run_retention_sweeper(state, shutdown, startup)),
+            Loop::Adoption => tokio::spawn(run_adoption_probe(state, shutdown, startup)),
+        }
+    }
+
+    /// This loop's startup offset. Exhaustive: adding a variant without an
+    /// offset does not compile.
+    const fn startup_offset(self) -> Duration {
+        match self {
+            Loop::Poller => POLLER_STARTUP_DELAY,
+            Loop::PendingSweep => PENDING_SWEEP_STARTUP_DELAY,
+            Loop::CodeSweep => CODE_SWEEP_STARTUP_DELAY,
+            Loop::Retention => RETENTION_STARTUP_DELAY,
+            Loop::Adoption => ADOPTION_STARTUP_DELAY,
+        }
+    }
+}
+
+/// The startup-override variable. The one place its name is written in
+/// production code.
+///
+/// **A constant, because the name was untested glue.** [`startup_plan`] is the
+/// production path and no test can reach it without `set_var`, so mistyping the
+/// key by one character left the whole suite AND clippy green while silently
+/// disabling the override for every loop. The test below spells the name
+/// independently, so the two have to agree.
+const STARTUP_DELAY_ENV: &str = "FEATHERREADER_STARTUP_DELAY_SECS";
+
+/// The `(loop, resolved startup offset)` pairs `spawn` starts, in registry order.
+///
+/// **The offset decision is a VALUE a test can read, not a call buried in a
+/// match arm.** It used to live inside `spawn_with`, as `offset_for(self)`.
+/// Writing `offset_for(Loop::Poller)` there compiled, passed 697 lib + 15 bin
+/// and clippy, and booted every loop at 30 s — the all-at-once collision this
+/// file's whole history exists to prevent. Nothing could see it, because no test
+/// can observe an argument passed inside a spawn arm.
+///
+/// Pulling it out here does not make the wrong thing unwritable — nothing can —
+/// but it moves the decision somewhere a test can compare against an
+/// independently spelled table. `spawn_at` now only chooses the `run_*`, which
+/// is the one hole this file still documents rather than closes.
+fn startup_plan() -> Vec<(Loop, Duration)> {
+    startup_plan_from(std::env::var(STARTUP_DELAY_ENV).ok())
+}
+
+/// [`startup_plan`] with the environment value passed in.
+///
+/// Split for the same reason `offset_from` and `startup_delay_from` are: so the
+/// composition is testable without `set_var`, which is a documented data race
+/// against the ~39 `env::var` reads in this binary.
+fn startup_plan_from(raw: Option<String>) -> Vec<(Loop, Duration)> {
+    let mut plan = Vec::new();
+    for_each_loop(|l| plan.push((l, offset_from(l, raw.clone()))));
+    plan
+}
+
+/// [`offset_for`] with the environment value passed in.
+///
+/// Split for the same reason `startup_delay_from` is: so the COMPOSITION —
+/// this loop's offset, then the ceiling — is testable without reading the
+/// environment. Deleting the ceiling here disables
+/// `FEATHERREADER_STARTUP_DELAY_SECS` for every loop at once, and asserting it
+/// through `offset_for` could not catch that without `set_var`, which is a
+/// documented data race against the ~39 `env::var` reads in this binary.
+fn offset_from(which: Loop, raw: Option<String>) -> Duration {
+    startup_delay_from(which.startup_offset(), raw)
+}
+
+/// Apply the `FEATHERREADER_STARTUP_DELAY_SECS` override to a startup delay,
+/// with the environment value passed in.
+///
+/// The variable is a CEILING, not a replacement: it can only shorten the wait,
+/// so setting it cannot accidentally push a production loop out further than its
+/// constant intends.
+///
+/// Takes the raw value rather than reading it, so the ceiling behaviour is
+/// testable without `std::env::set_var` — a documented data race against the ~39
+/// `std::env::var` reads elsewhere in this binary, and this was the only
+/// `set_var` in `src/`, in a 650-test multithreaded runner.
 ///
 /// Split out so the ceiling behaviour is testable without `std::env::set_var`,
 /// which is a documented data race against the ~39 `std::env::var` reads
@@ -254,41 +382,47 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
     );
 
-    let poller = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_poller(state, shutdown).await })
-    };
-    let sweeper = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_code_sweeper(state, shutdown).await })
-    };
-    let retention = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_retention_sweeper(state, shutdown).await })
-    };
-    // NOTE: must be constructed BEFORE the flusher, which consumes the
-    // un-cloned `state` / `shutdown` by move.
-    let probe = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_adoption_probe(state, shutdown).await })
-    };
-    let metrics = {
+    // **Driven off the registry, not five hand-written lines.** Every offset-
+    // bearing loop is started here by iterating `Loop::ALL`, so a loop cannot be
+    // given another's offset — the variant chooses both.
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for (l, startup) in startup_plan() {
+        handles.push(l.spawn_at(state.clone(), shutdown.clone(), startup));
+    }
+
+    // The two loops with NO startup offset. `run_metrics_flusher` deliberately
+    // fires immediately at boot; `run_flusher` swallows its first tick. Neither
+    // is in `Loop`, so neither is covered by the distinctness invariant — stated
+    // here because the test's message would otherwise read as covering all loops.
+    handles.push({
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
-    };
-    let pending = {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { run_pending_sweeper(state, shutdown).await })
-    };
-    let flusher = tokio::spawn(async move { run_flusher(state, shutdown).await });
+    });
+    // Last: consumes the un-cloned `state` / `shutdown` by move.
+    handles.push(tokio::spawn(
+        async move { run_flusher(state, shutdown).await },
+    ));
 
-    vec![poller, sweeper, retention, probe, metrics, pending, flusher]
+    handles
+}
+
+/// Call `f` once for every offset-bearing loop, in registry order.
+///
+/// **The iteration itself, extracted so a test can watch it.** `spawn` iterated
+/// `Loop::ALL` inline and nothing in the tree reached `spawn` — so a `.filter()`
+/// dropping one loop compiled, passed the whole suite, passed clippy, and the
+/// pending-login sweeper simply never started while nonce rows accumulated
+/// unbounded.
+///
+/// That is the FOURTH form of one defect in this file. Each fix closed the seam
+/// a level down — a wrong constant, then a wrong string key, then a wrong
+/// positional argument — while the untested glue moved a level up. This is the
+/// level `spawn` actually decides at.
+fn for_each_loop(mut f: impl FnMut(Loop)) {
+    for l in Loop::ALL {
+        f(l);
+    }
 }
 
 /// Resolve when the `watch` channel fires (the shutdown broadcast) or its sender
@@ -304,7 +438,7 @@ async fn shutdown_fired(rx: &mut watch::Receiver<()>) {
 /// The poll-scheduler loop. Wakes on an interval, selects due feeds, and polls
 /// each (conditional-GET + backoff via [`feed::poll_feed`]), staggered and
 /// concurrency-bounded. Returns when `shutdown` resolves.
-pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, startup: Duration) {
     let tick = env_duration_secs("FEATHERREADER_POLL_TICK_SECS", DEFAULT_POLL_TICK);
     let batch = env_scalar::<i64>("FEATHERREADER_POLL_BATCH", DEFAULT_POLL_BATCH).max(1);
     let concurrency =
@@ -336,7 +470,7 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>) {
 
     // Not an immediate first tick: see `POLLER_STARTUP_DELAY`. Missed ticks are
     // skipped rather than burst through, so a slow poll round does not queue up.
-    let mut ticker = delayed_interval(startup_delay(POLLER_STARTUP_DELAY), tick);
+    let mut ticker = delayed_interval(startup, tick);
 
     loop {
         tokio::select! {
@@ -660,7 +794,11 @@ fn cadence_from_hint(hint: &str, default_interval: Duration) -> Duration {
 /// ([`store::expire_old_codes`]), keeping the closed-beta table tidy. Returns
 /// when `shutdown` resolves. Failures are logged and never kill the loop — a
 /// missed sweep is harmless because `redeem_code` re-checks expiry itself.
-pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_code_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = env_duration_secs("FEATHERREADER_CODE_SWEEP_SECS", DEFAULT_CODE_SWEEP);
     info!(?period, "invite-code TTL sweeper started");
 
@@ -668,7 +806,7 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
     // immediate one this used to have — a long-stale set of codes is still swept
     // a minute into the boot, and `redeem_code` re-checks expiry itself, so the
     // sweep was never on the correctness path to begin with.
-    let mut ticker = delayed_interval(startup_delay(CODE_SWEEP_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -707,7 +845,11 @@ pub async fn run_code_sweeper(state: AppState, mut shutdown: watch::Receiver<()>
 /// return, spawning no ticker; that configuration has no bound at all and says
 /// so. Failures are logged and never kill the loop — a missed sweep just means
 /// the window is enforced on the next tick.
-pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_retention_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let days = state.config.retention_days as i64;
     let hard_days = state.config.retention_hard_days as i64;
     if days <= 0 && hard_days <= 0 {
@@ -733,7 +875,7 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
     // of the local loops — it takes the single write lock for the whole delete —
     // so firing it into a boot that is still opening the database and warming
     // caches was the worst timing available.
-    let mut ticker = delayed_interval(startup_delay(RETENTION_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -783,7 +925,11 @@ pub async fn run_retention_sweeper(state: AppState, mut shutdown: watch::Receive
 /// per boot" into "once per crash-loop restart". Nothing it does can fail the
 /// process: every error path is a `warn!` that leaves the previous observation
 /// in place.
-pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_adoption_probe(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = state.config.adoption_interval;
     if period.is_zero() {
         info!("adoption probe: disabled (FEATHERREADER_ADOPTION_INTERVAL_SECS=0)");
@@ -821,10 +967,7 @@ pub async fn run_adoption_probe(state: AppState, mut shutdown: watch::Receiver<(
         "adoption probe started"
     );
 
-    let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + startup_delay(ADOPTION_STARTUP_DELAY),
-        period,
-    );
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + startup, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -926,12 +1069,16 @@ const NONCE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 ///
 /// Runs on both backends: the rows are written by the Rust login path, and a
 /// deployment that flips back to the sidecar still has whatever it left behind.
-pub async fn run_pending_sweeper(state: AppState, mut shutdown: watch::Receiver<()>) {
+pub async fn run_pending_sweeper(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
     let period = Duration::from_secs(PENDING_SWEEP_SECS);
     info!(?period, "pending-login sweeper started");
 
     // Delayed first tick, like its siblings (see `PENDING_SWEEP_STARTUP_DELAY`).
-    let mut ticker = delayed_interval(startup_delay(PENDING_SWEEP_STARTUP_DELAY), period);
+    let mut ticker = delayed_interval(startup, period);
     loop {
         tokio::select! {
             _ = shutdown_fired(&mut shutdown) => {
@@ -1250,22 +1397,225 @@ mod tests {
         assert_eq!(startup_delay_from(d, None), d);
     }
 
-    /// The four local loops must not land on the same instant at boot — that is
-    /// the whole reason the offsets are distinct rather than one shared value.
+    /// **The loops must not land on the same instant at boot.**
+    ///
+    /// The original version compared the CONSTANTS with no call site involved,
+    /// so pointing all five loops at `POLLER_STARTUP_DELAY` passed. The second
+    /// version asserted on a string-keyed table and made things worse — see the
+    /// `Loop` doc. This reads the exhaustive mapping the code actually uses.
+    ///
+    /// Asserts against `startup_offset()` directly, NOT `offset_for()`: the
+    /// latter applies the `FEATHERREADER_STARTUP_DELAY_SECS` ceiling, which is a
+    /// documented dev setting, and asserting through it made the suite fail
+    /// under `FEATHERREADER_STARTUP_DELAY_SECS=0`. Keeping env out of this
+    /// module's tests is why `startup_delay_from` was split out in the first
+    /// place.
     #[test]
     fn the_startup_delays_are_distinct() {
-        let all = [
-            POLLER_STARTUP_DELAY,
-            PENDING_SWEEP_STARTUP_DELAY,
-            CODE_SWEEP_STARTUP_DELAY,
-            RETENTION_STARTUP_DELAY,
-            ADOPTION_STARTUP_DELAY,
-        ];
-        let unique: std::collections::HashSet<Duration> = all.iter().copied().collect();
-        assert_eq!(unique.len(), all.len(), "two loops share a startup delay");
+        let offsets: Vec<Duration> = Loop::ALL.iter().map(|l| l.startup_offset()).collect();
+        let unique: std::collections::HashSet<Duration> = offsets.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Loop::ALL.len(),
+            "two loops share a startup delay: {offsets:?}",
+        );
         assert!(
-            all.iter().all(|d| *d > Duration::ZERO),
-            "a loop still fires immediately at boot"
+            offsets.iter().all(|d| *d > Duration::ZERO),
+            "a loop still fires immediately at boot: {offsets:?}",
+        );
+    }
+
+    /// **`spawn` really visits every loop — the iteration, not a const array.**
+    ///
+    /// The previous test asserted `Loop::ALL.len() == 5`, which says nothing
+    /// about whether `spawn` reads it. A `.filter()` dropping a loop was green.
+    /// This drives the same function `spawn` drives.
+    #[test]
+    fn every_loop_is_visited_exactly_once() {
+        let mut seen = Vec::new();
+        for_each_loop(|l| seen.push(l));
+        assert_eq!(
+            seen,
+            Loop::ALL.to_vec(),
+            "the iteration `spawn` uses does not visit every loop exactly once, \
+             in registry order",
+        );
+    }
+
+    /// The startup-override key is spelled the same in the code and here.
+    ///
+    /// Independently written on purpose: mistyping it in `offset_for` silently
+    /// disabled the override for every loop with a green suite and green clippy.
+    #[test]
+    fn the_startup_override_env_key_is_the_documented_one() {
+        assert_eq!(STARTUP_DELAY_ENV, "FEATHERREADER_STARTUP_DELAY_SECS");
+    }
+
+    /// The registry holds each loop exactly once.
+    ///
+    /// A pure statement about `Loop::ALL`. It says nothing about `spawn` — see
+    /// `spawn_starts_every_registered_loop` for that, and read the note there
+    /// before trusting a test in this file that has "spawn" in its name.
+    #[test]
+    fn the_registry_lists_each_loop_exactly_once() {
+        let unique: std::collections::HashSet<Loop> = Loop::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Loop::ALL.len(),
+            "a loop is listed twice in the registry and would be started twice",
+        );
+    }
+
+    /// **`spawn` starts one task per registered loop — by calling `spawn`.**
+    ///
+    /// This test previously carried this name while asserting only
+    /// `Loop::ALL.len() == 5` plus uniqueness. It never called `spawn`, so the
+    /// callback `spawn` passes to `for_each_loop` was an untested decision
+    /// point, and dropping a loop there was silent:
+    ///
+    /// ```ignore
+    /// for_each_loop(|l| {
+    ///     if l != Loop::PendingSweep {           // 697 lib + 13 bin green,
+    ///         handles.push(l.spawn_with(..));    // clippy -D warnings clean
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// The pending-login sweeper never starts and nonce rows grow without
+    /// bound. That is the FOURTH form of this file's recurring defect — after a
+    /// wrong constant, a mistyped string key, and a wrong positional argument —
+    /// and the round that introduced `for_each_loop` to close the third form
+    /// also introduced the mis-named test that hid this one.
+    ///
+    /// The `+ 2` is the two loops with no startup offset: the metrics flusher
+    /// (which fires immediately at boot, deliberately) and the read-state
+    /// flusher. Neither is in `Loop`.
+    #[tokio::test]
+    async fn spawn_starts_every_registered_loop() {
+        // `spawn` returns early with an empty Vec when the kill switch is set,
+        // which would make the assertion below vacuously wrong rather than
+        // failing for a real reason. Say so instead of measuring nothing.
+        assert!(
+            schedulers_enabled(),
+            "FEATHERREADER_DISABLE_SCHEDULER is set in this test process, so \
+             `spawn` returns no handles and this test cannot measure anything",
+        );
+        let state = rust_state().await;
+        let (tx, rx) = watch::channel(());
+        let handles = spawn(state, rx);
+        assert_eq!(
+            handles.len(),
+            Loop::ALL.len() + 2,
+            "`spawn` started {} tasks for {} registered loops + 2 unoffset ones \
+             — it is not starting one task per registry entry",
+            handles.len(),
+            Loop::ALL.len(),
+        );
+        // Shut them down rather than leaking tasks into the rest of the suite.
+        drop(tx);
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+
+    /// The ceiling still applies on the way to a loop — the one thing
+    /// `offset_for` adds over the raw table.
+    ///
+    /// Pinned because a mutation deleting `startup_delay(..)` from `offset_for`
+    /// — disabling `FEATHERREADER_STARTUP_DELAY_SECS` for every loop at once —
+    /// passed the whole suite. Uses `startup_delay_from` so no environment
+    /// variable is read.
+    #[test]
+    fn the_startup_ceiling_applies_to_every_loop() {
+        for l in Loop::ALL {
+            assert_eq!(
+                offset_from(l, Some("0".into())),
+                Duration::ZERO,
+                "{l:?} ignored the startup-delay ceiling",
+            );
+        }
+    }
+
+    /// **Each variant gets ITS OWN offset — spelled out, not derived.**
+    ///
+    /// This replaces `assert_eq!(offset_from(l, None), l.startup_offset())`,
+    /// which was a tautology: `offset_from` is
+    /// `startup_delay_from(which.startup_offset(), raw)` and
+    /// `startup_delay_from(d, None)` is `d`, so both sides reduced to the same
+    /// expression and the assertion could not fail for ANY mapping. Swapping
+    /// two variants' arms in `startup_offset` passed the whole suite.
+    ///
+    /// The table below is written independently of the `match`, so the two have
+    /// to agree — the same reason `the_startup_override_env_key_is_the_documented_one`
+    /// spells the env key out by hand. Spelling the seconds here rather than
+    /// naming the constants is the point: naming them would reintroduce the
+    /// tautology one level up.
+    /// The startup offset each loop is documented to run on, spelled out
+    /// independently of `Loop::startup_offset`'s match arms so the two have to
+    /// agree. Naming the constants here instead would reintroduce the tautology.
+    const DOCUMENTED_OFFSETS: [(Loop, u64); 5] = [
+        (Loop::Poller, 30),
+        (Loop::PendingSweep, 45),
+        (Loop::CodeSweep, 60),
+        (Loop::Retention, 90),
+        (Loop::Adoption, 300),
+    ];
+
+    #[test]
+    fn every_loop_is_on_its_documented_offset() {
+        // Guard by SET, not by length. `documented.len() == Loop::ALL.len()`
+        // counts rows, so duplicating one row silently drops a variant from
+        // coverage — verified: duplicating the Poller row and drifting
+        // `PENDING_SWEEP_STARTUP_DELAY` to 47 s passed the whole suite, since
+        // 47 is still distinct and non-zero.
+        let listed: std::collections::HashSet<Loop> =
+            DOCUMENTED_OFFSETS.iter().map(|(l, _)| *l).collect();
+        let registered: std::collections::HashSet<Loop> = Loop::ALL.iter().copied().collect();
+        assert_eq!(
+            listed, registered,
+            "this table and the registry do not cover the same loops",
+        );
+        for (l, secs) in DOCUMENTED_OFFSETS {
+            assert_eq!(
+                l.startup_offset(),
+                Duration::from_secs(secs),
+                "{l:?} is not on its documented {secs}s offset",
+            );
+        }
+    }
+
+    /// **The offsets are not just correct in the table — each loop is handed
+    /// ITS OWN on the way to being spawned.**
+    ///
+    /// This restores coverage a previous round deleted as a "tautology". The
+    /// deleted assertion was `offset_from(l, None) == l.startup_offset()`, and
+    /// calling it tautological was WRONG: it is tautological only with respect
+    /// to changing `startup_offset`'s arms, while independently pinning that
+    /// `offset_from` routes through `which` at all. With it gone,
+    ///
+    /// ```ignore
+    /// fn offset_from(which: Loop, raw: Option<String>) -> Duration {
+    ///     let _ = which;
+    ///     startup_delay_from(Loop::Poller.startup_offset(), raw)
+    /// }
+    /// ```
+    ///
+    /// passed 697 lib + 15 bin and clippy, booting every loop at 30 s.
+    ///
+    /// Asserting against the independently spelled seconds rather than against
+    /// `l.startup_offset()` is what keeps this non-tautological — the form that
+    /// invited the deletion in the first place.
+    #[test]
+    fn the_startup_plan_hands_each_loop_its_own_offset() {
+        let expected: Vec<(Loop, Duration)> = DOCUMENTED_OFFSETS
+            .iter()
+            .map(|(l, secs)| (*l, Duration::from_secs(*secs)))
+            .collect();
+        assert_eq!(
+            startup_plan_from(None),
+            expected,
+            "the plan `spawn` starts from does not pair every loop with its own \
+             documented offset, in registry order",
         );
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "feather-reader"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.94"
 description = "A minimalist, atproto-native RSS/Atom reader in Rust — your feed subscriptions live in your own PDS."
@@ -96,8 +96,27 @@ getrandom = "0.4"
 # likewise already present transitively — pin 0.22, NOT 0.21, so the lock keeps
 # a single copy (`deny.toml` sets multiple-versions = "warn", which would not
 # catch a duplicate).
+#
+# **That single copy holds today and is about to stop holding.** The invariant
+# is maintained by this comment and nothing else — the `warn` above is the
+# reason, and it is deliberate. But the version to match is no longer one
+# number: `reqwest` 0.13.5 requires base64 **0.23**, while `sqlx-core` 0.9.0 and
+# `hyper-util` 0.1.20 still require 0.22. Whichever this is pinned to, the lock
+# carries two copies from the moment reqwest is bumped (pending in the
+# cargo-minor-patch group PR) — and it arrives through reqwest, without anyone
+# editing this line.
+#
+# When that lands, expect the duplicate and do not chase it. The copy count is
+# two either way — pinned at 0.22 we group with sqlx-core and hyper-util, at
+# 0.23 with reqwest — so moving the pin buys nothing. There is no correctness
+# dimension: this crate only encodes its own bytes to `String` via
+# `general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD}`, no base64
+# type crosses into reqwest's API, and the output is byte-identical across
+# versions. Leave it at 0.22 unless a concrete reason appears, and delete this
+# paragraph once sqlx-core and hyper-util catch up and one copy is achievable
+# again.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 # Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
 # internal-only helper; `subtle` is the maintained option and is already in the
 # tree, so this adds no package to the lock either.

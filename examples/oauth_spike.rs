@@ -109,7 +109,6 @@ async fn main() -> Result<()> {
     let binding_token = flow::new_binding_token();
 
     let par_request = flow::ParRequest {
-        client_id: &client_id,
         redirect_uri: &redirect_uri,
         scope: SCOPE,
         state: &state,

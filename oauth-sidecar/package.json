@@ -20,18 +20,20 @@
     "lint:fix": "oxlint src test --fix",
     "format:check": "prettier --check \".oxlintrc.json\" \".prettierrc.json\"",
     "format:write": "prettier --write .",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
+    "test:build": "rm -rf dist-test && tsc -p tsconfig.test.json",
+    "test:guard": "node -e \"const fs=require('node:fs');let f=[];try{f=fs.readdirSync('dist-test/test',{recursive:true}).filter(n=>String(n).endsWith('.test.js'))}catch(e){};if(f.length<5){console.error('FAIL: found '+f.length+' compiled test files under dist-test/test, expected at least 5. node --test exits 0 when it matches nothing, so this guard is what turns a vanished suite into a red build.');process.exit(1)}console.log('[guard] '+f.length+' compiled test files')\"",
+    "test": "npm run test:build && npm run test:guard && node --test 'dist-test/test/**/*.test.js'"
   },
   "dependencies": {
-    "@atproto/api": "^0.20.42",
+    "@atproto/api": "^0.20.44",
     "@atproto/jwk-jose": "^0.2.4",
-    "@atproto/oauth-client-node": "^0.5.4",
+    "@atproto/oauth-client-node": "^0.5.6",
     "@fastify/rate-limit": "^11.2.0",
-    "fastify": "^5.12.1"
+    "fastify": "^5.12.3"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1",
-    "oxlint": "^1.81.0",
+    "@types/node": "^26.5.1",
+    "oxlint": "^1.82.0",
     "prettier": "3.9.6",
     "tsx": "^4.23.13",
     "typescript": "^7.0.0"

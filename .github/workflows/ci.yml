@@ -52,7 +52,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Build
         run: cargo build --all-targets --locked
@@ -87,7 +87,7 @@ jobs:
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -113,7 +113,7 @@ jobs:
           toolchain: stable  # required — SHA-pinned ref no longer selects the toolchain
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       # Dedicated RustSec scan of Cargo.lock. Fails the build on any known
       # vulnerability. Un-actionable transitive advisories (no fixed release, or
@@ -124,7 +124,7 @@ jobs:
       # `cargo install ... || true`, which masked an install failure and let the
       # next step die command-not-found — a green job that skipped the RustSec scan.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -158,6 +158,23 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Test
+        # The sidecar's 71 tests gated NOTHING until this step existed. Every
+        # other job here runs its suite (`rust`, `bot`); this one went install →
+        # build → typecheck → lint → format → audit, so a `npm test` failure
+        # could not fail a PR. The tests cover the parts of the sidecar with no
+        # other safety net: session-store encryption and the plaintext migrate-
+        # on-read path, the reaper's absolute/idle TTLs, `StoreError` tagging,
+        # and `purgeDid`.
+        #
+        # `npm test` runs a `test:guard` step first because `node --test` EXITS 0
+        # when its argument matches no files — a glob pointing at a moved output
+        # directory would have made this step green while running nothing, which
+        # is the exact failure this job exists to prevent. Demonstrated, not
+        # hypothetical: the previous `dist-test/test/*.test.js` also silently
+        # skipped any test file in a subdirectory.
+        run: npm test
+
       - name: Lint (oxlint, --max-warnings 0)
         run: npm run lint
 
@@ -173,6 +190,29 @@ jobs:
       - name: npm audit (prod deps, high+)
         # Sidecar runtime deps only (--omit=dev); dev tooling churn shouldn't
         # break CI. Fails on high/critical advisories.
+        #
+        # **A green result here is not an all-clear, and that is not a
+        # hypothetical.** `npm audit` queries the npm registry's advisory feed
+        # only. This step once passed — at EVERY severity, not just high — while
+        # fastify 5.12.1 was in the lockfile and four PUBLISHED high-severity
+        # advisories applied to it, one an authentication bypass
+        # (GHSA-p68q-wchp-6fh7, `>= 4.0.0, < 5.12.2`).
+        #
+        # That particular exposure is CLOSED: #125 (b74c4bf) took fastify to
+        # 5.12.3, past the 5.12.2 patch line for all four. The lesson is what
+        # remains — the scanner said nothing, before and after.
+        #
+        # They were visible on GitHub's REPO-level advisory database
+        # (`gh api repos/fastify/fastify/security-advisories`) and nowhere a
+        # scanner looks: `gh api advisories/<id>` 404s for all four, and OSV
+        # holds them only under CVE aliases with a GIT range and no npm package
+        # mapping — so an OSV query for `fastify@5.12.1` also returns nothing.
+        # npm audit, OSV-Scanner and Dependabot would all have said the same.
+        #
+        # There is no CI step that closes this today. What closes it is reading
+        # the upstream release notes when a dependabot PR bumps a
+        # network-facing dependency, and checking
+        # `repos/<owner>/<repo>/security-advisories` directly.
         run: npm audit --omit=dev --audit-level=high
 
   bot:
@@ -195,7 +235,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: bot  # cache the bot workspace's target/, not the repo root
 
@@ -217,7 +257,7 @@ jobs:
       # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` OR-expression resolves to a
       # permissive branch automatically.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -230,7 +270,7 @@ jobs:
       # green-looking job that never actually ran the RustSec scan. install-action
       # fails the job loudly if the tool can't be fetched. (Cheap nit.)
       - name: Install cargo-audit
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-audit@0.22.2
 

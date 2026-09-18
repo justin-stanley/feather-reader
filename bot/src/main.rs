@@ -39,6 +39,15 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&config.state_db).context("opening bot state db")?;
     let http = reqwest::Client::builder()
+        // Ignore ambient proxy configuration. reqwest defaults
+        // `auto_sys_proxy: true`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+        // in this process's environment would route every request below through
+        // a proxy — and these requests carry the PDS app password, session
+        // tokens and the invite `bot_secret`. There is no SSRF guard in this
+        // crate to bypass, so this is not the same defect as
+        // `feather_reader::net`, but the exposure argument is identical: one
+        // base image or one debugging session away, with nothing reporting it.
+        .no_proxy()
         .user_agent(concat!(
             "feather-reader-invite-bot/",
             env!("CARGO_PKG_VERSION")
