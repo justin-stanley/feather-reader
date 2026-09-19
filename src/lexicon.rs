@@ -61,6 +61,20 @@ pub enum FetchHint {
     Other(String),
 }
 
+/// Drop a `siteUrl` this reader would refuse to render, at the point a record
+/// crosses into the process.
+///
+/// Absent stays absent and a good URL is passed through trimmed, matching
+/// [`crate::net::safe_link`]'s handling of entry links — the same allow-list, so
+/// the two URL fields on a record cannot disagree about what a link is.
+fn de_scheme_checked<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().and_then(crate::net::safe_link))
+}
+
 /// `community.lexicon.rss.subscription` — a subscription to a syndication feed
 /// (RSS / Atom / JSON Feed). Record key: `tid`.
 ///
@@ -109,7 +123,37 @@ pub struct Subscription {
     pub title: Option<String>,
 
     /// Human-facing site the feed belongs to.
-    #[serde(rename = "siteUrl", skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// **Scheme-checked on the way in.** Any atproto client can write this field
+    /// into the user's repo, and the lexicon invites readers to render it as a
+    /// link, so a record fetched from the PDS is attacker-controlled input. The
+    /// `deserialize_with` below is the read-side counterpart to the write-side
+    /// vet in [`crate::repo`]: together they mean a `Subscription` that entered
+    /// this process from outside cannot be carrying a `javascript:` URL, whatever
+    /// it is later rendered into — an `href`, or an OPML `htmlUrl` we hand back
+    /// to the user as a file.
+    ///
+    /// **The READ side only.** A record built in-process rather than
+    /// deserialised does not pass through here — OPML import parses `htmlUrl`
+    /// out of XML by hand, and the manage form assigns the field directly.
+    /// Those are the write boundary's to vet, which is why both guards exist
+    /// rather than either one being sufficient.
+    ///
+    /// A rejected value becomes `None`, so it is omitted rather than emitted
+    /// empty; a consumer renders no link instead of a broken one.
+    ///
+    /// **Round-trip fidelity is deliberately lost.** Read a record holding a
+    /// hostile `siteUrl`, re-put it, and we write it back cleaned rather than
+    /// preserving what another client stored. That heals the user's repo
+    /// instead of propagating someone else's script URL — but it does mean a
+    /// `putRecord` following a read is not byte-identical to what was there,
+    /// and that is a decision, not an accident.
+    #[serde(
+        rename = "siteUrl",
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "de_scheme_checked"
+    )]
     pub site_url: Option<String>,
 
     /// Optional `at://` strong ref to a [`Folder`] record.
@@ -326,6 +370,86 @@ impl ReadState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A record written by some other client is attacker-controlled input.
+    ///
+    /// Asserted through `serde_json::from_str` rather than by calling the
+    /// deserialiser directly: the production path is a PDS fetch, and a test that
+    /// calls the helper would pass just as happily with `deserialize_with`
+    /// removed from the field.
+    #[test]
+    fn a_hostile_site_url_does_not_survive_deserialisation() {
+        for hostile in [
+            "javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+            "  javascript:alert(1)  ",
+            "not a url at all",
+        ] {
+            let json = serde_json::json!({
+                "$type": "community.lexicon.rss.subscription",
+                "url": "https://example.com/feed.xml",
+                "siteUrl": hostile,
+                "createdAt": "2026-01-01T00:00:00.000Z",
+            })
+            .to_string();
+            let sub: Subscription = serde_json::from_str(&json).expect("record should parse");
+            assert_eq!(
+                sub.site_url, None,
+                "{hostile:?} survived into a record this reader will re-publish and export"
+            );
+            assert_eq!(
+                sub.url, "https://example.com/feed.xml",
+                "the feed URL is not the field under test and must be untouched"
+            );
+        }
+    }
+
+    /// The check must not eat an ordinary record, and must normalise the way the
+    /// entry-link path already does.
+    #[test]
+    fn a_legitimate_site_url_survives_deserialisation() {
+        for (stored, expected) in [
+            ("https://example.com/blog", "https://example.com/blog"),
+            ("http://example.com/blog", "http://example.com/blog"),
+            ("  https://example.com/blog  ", "https://example.com/blog"),
+        ] {
+            let json = serde_json::json!({
+                "$type": "community.lexicon.rss.subscription",
+                "url": "https://example.com/feed.xml",
+                "siteUrl": stored,
+                "createdAt": "2026-01-01T00:00:00.000Z",
+            })
+            .to_string();
+            let sub: Subscription = serde_json::from_str(&json).expect("record should parse");
+            assert_eq!(sub.site_url.as_deref(), Some(expected));
+        }
+    }
+
+    /// An absent `siteUrl` stays absent — no empty string is invented, and the
+    /// `default` path must not trip over the custom deserialiser.
+    #[test]
+    fn an_absent_site_url_stays_absent() {
+        let json = serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/feed.xml",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        let sub: Subscription = serde_json::from_str(&json).expect("record should parse");
+        assert_eq!(sub.site_url, None);
+
+        // Explicit null is the same as absent, not an error.
+        let json = serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/feed.xml",
+            "siteUrl": serde_json::Value::Null,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        let sub: Subscription = serde_json::from_str(&json).expect("explicit null should parse");
+        assert_eq!(sub.site_url, None);
+    }
 
     #[test]
     fn subscription_round_trips_full_record() {

@@ -438,6 +438,61 @@ mod tests {
             .is_empty());
     }
 
+    /// The export sink from #139.
+    ///
+    /// **The record is built by deserialising, not by assignment**, because that
+    /// is the production path — `export_opml` renders what
+    /// `list_subscriptions_sorted` fetched from the PDS, and any other atproto
+    /// client can put a `javascript:` URL there. Assigning the field directly
+    /// would test a path the exporter never sees, and would keep passing if the
+    /// read-side check were removed.
+    #[test]
+    fn export_does_not_hand_back_a_hostile_html_url() {
+        let json = serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/feed.xml",
+            "title": "Example",
+            "siteUrl": "javascript:alert(1)",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        let sub: Subscription = serde_json::from_str(&json).expect("record should parse");
+
+        let opml = to_opml(&[("rk1".to_string(), sub)], &[]);
+
+        assert!(
+            !opml.contains("javascript:"),
+            "the exported file carries a script URL the user never typed, into \
+             whatever reader they import it with:\n{opml}"
+        );
+        assert!(
+            !opml.contains("htmlUrl"),
+            "a rejected siteUrl must be omitted, not exported empty:\n{opml}"
+        );
+        assert!(
+            opml.contains("xmlUrl=\"https://example.com/feed.xml\""),
+            "the feed itself must still export — the site link is decoration:\n{opml}"
+        );
+    }
+
+    /// The ordinary case still exports its `htmlUrl`.
+    #[test]
+    fn export_keeps_a_legitimate_html_url() {
+        let json = serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/feed.xml",
+            "siteUrl": "https://example.com/blog",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        let sub: Subscription = serde_json::from_str(&json).expect("record should parse");
+        let opml = to_opml(&[("rk1".to_string(), sub)], &[]);
+        assert!(
+            opml.contains("htmlUrl=\"https://example.com/blog\""),
+            "a perfectly good site link was dropped from the export:\n{opml}"
+        );
+    }
+
     #[test]
     fn export_nests_feeds_under_folders() {
         let folders = vec![
