@@ -133,8 +133,21 @@ pub struct Subscription {
     /// it is later rendered into — an `href`, or an OPML `htmlUrl` we hand back
     /// to the user as a file.
     ///
+    /// **The READ side only.** A record built in-process rather than
+    /// deserialised does not pass through here — OPML import parses `htmlUrl`
+    /// out of XML by hand, and the manage form assigns the field directly.
+    /// Those are the write boundary's to vet, which is why both guards exist
+    /// rather than either one being sufficient.
+    ///
     /// A rejected value becomes `None`, so it is omitted rather than emitted
     /// empty; a consumer renders no link instead of a broken one.
+    ///
+    /// **Round-trip fidelity is deliberately lost.** Read a record holding a
+    /// hostile `siteUrl`, re-put it, and we write it back cleaned rather than
+    /// preserving what another client stored. That heals the user's repo
+    /// instead of propagating someone else's script URL — but it does mean a
+    /// `putRecord` following a read is not byte-identical to what was there,
+    /// and that is a decision, not an accident.
     #[serde(
         rename = "siteUrl",
         skip_serializing_if = "Option::is_none",
