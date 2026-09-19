@@ -1,0 +1,299 @@
+# Changelog
+
+Engineering detail for the 0.3.x line, newest first. Covers everything released
+since 0.3.0.
+
+Each entry says what changed, the mechanism, and — where a defect is involved —
+how it was established rather than assumed. Several entries record that a test
+passed while proving less than its name; those are noted, because the
+measurement is the load-bearing part.
+
+Versions are git tags (`vX.Y.Z`). A tag publishes to crates.io and ghcr.io;
+deploying is separate.
+
+---
+
+## 0.3.6 — 2026-09-19
+
+Four commits. No features, no schema change, no config change.
+
+### Security
+
+**`siteUrl` stored-XSS class, closed at both boundaries.** The two halves
+landed separately and neither is sufficient alone.
+
+- **Write side** (#138, closes #114). `siteUrl` reached the
+  `community.lexicon.rss.subscription` record on the user's PDS with no scheme
+  check. This was never an XSS against our own UI — nothing in `templates/`
+  renders the field. The exposure is that we are the *writer*: a feed serving
+  `<link>javascript:alert(1)</link>` got that string published into the user's
+  own repo, under their authorship, into a field the lexicon invites other
+  clients to render as a link.
+
+  The check sits at the write boundary rather than at each ingest. That is a
+  trade, not a free win — a guard at ingest is safe against every future sink
+  and exposed to a new ingest; a guard at the exit is the mirror image. The
+  writers are enumerable and closed, the ingests are open-ended.
+
+  The three writers are private `*_unvetted` methods behind wrappers of the
+  same name. That makes `Repo` the vetted path, not the only possible path:
+  `AppState.sidecar` is a `pub` field and the low-level writers are public, so
+  a handler can still take the short path. Nothing does. #140 tracks the type
+  that would make it a guarantee.
+
+- **Read side** (#143, closes #139). OPML export emitted `htmlUrl` XML-escaped
+  but not scheme-checked, from records read back from the PDS — so a hostile
+  record written by any other atproto client became a `javascript:` URL in a
+  file the user downloads and imports into some other reader. We were still the
+  publisher of that file. A `deserialize_with` on the field closes it at the
+  point a record crosses into the process, which also cleans the `feeds` cache
+  row fed from the same read.
+
+Together: a `Subscription` that entered this process from outside cannot carry
+a `javascript:` URL, and one leaving for the PDS cannot either.
+
+Still uncovered, deliberately: `feeds.site_url` written by the poller
+(`feed.rs`), which builds `NewFeed` straight from `feed_metadata` and never
+constructs a `Subscription`. Not a sink today — verified, no template
+references it — so hygiene rather than exposure.
+
+### Behaviour changes
+
+- **A scheme-less `siteUrl` is now dropped rather than published.**
+  `net::safe_link` requires an absolute URL, so `htmlUrl="www.example.com/blog"`
+  — not unusual in OPML exported by other readers — becomes `None` on import.
+  Consistent with how entry links have always been treated; the alternative
+  invents a scheme the file did not carry.
+- **Round-trip fidelity is deliberately lost.** Reading a record holding a
+  hostile `siteUrl` and re-putting it rewrites it cleaned rather than
+  preserving another client's payload. That heals the user's repo instead of
+  propagating someone else's script URL.
+
+### Tests
+
+- **A TLS test CA, closing an adapter gap in the login callback** (#122). The
+  OAuth issuer must be `https` and the SSRF guard refuses loopback, so nothing
+  could drive the real `login::complete` against a local server — the wiring
+  between its tested core and the network had no coverage at all, and all three
+  forwarding steps survived mutation with a green suite. The
+  authorization-server mix-up defence could be disarmed by editing one line in
+  `complete`.
+
+  A test CA *satisfies* the `https` rule rather than suspending it. No
+  `danger_accept_invalid_certs`; one root is **added** under `#[cfg(test)]`,
+  built-in roots stay, chains validate, hostnames match SANs. `test_pki()` is
+  itself `#[cfg(test)]`, so removing the attribute fails to compile rather than
+  silently trusting an extra root. `rcgen` is absent from the production
+  dependency graph.
+
+### Dependencies
+
+- `base64` 0.22.1 → 0.23.1 (#124).
+
+---
+
+## 0.3.5 — 2026-09-17
+
+Fifteen commits. No features, no schema change, no config change.
+
+### Security
+
+- **The SSRF guard could be bypassed by ambient proxy configuration** (#132).
+  reqwest defaults `auto_sys_proxy: true` and no client in this repo called
+  `.no_proxy()`. With `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` in the
+  environment, requests went to a proxy — absolute-form `GET http://host/path`,
+  or `CONNECT host:443` — for the *proxy* to resolve the hostname.
+
+  Measured before the fix: vetted pinned server 0 requests, proxy received the
+  request, result `Ok(200)`. It failed **open**, silently, on both schemes.
+
+  Precisely what breaks: `resolve_and_check` still runs its own lookup and
+  still rejects forbidden IPs — the check is not skipped. What a proxy destroys
+  is the *binding* between the vetted address and the connection, because the
+  proxy re-resolves the name on its own network. DNS rebinding, split-horizon
+  DNS and anything reachable from the proxy all come back.
+
+  `.no_proxy()` on all four production clients. The `AppState` one is
+  load-bearing on its own — hyper-util's matcher has no localhost exemption, so
+  an ambient proxy would have shipped `SIDECAR_INTERNAL_SECRET` to it on every
+  sidecar call.
+
+- `rustls` 0.23.45 for RUSTSEC-2026-0285.
+
+- `fastify` 5.12.3 and the atproto client packages (#125), clearing four
+  published high-severity advisories including an auth bypass. `npm audit`
+  reported zero at every severity throughout, because those advisories live
+  only in GitHub's repo-level database.
+
+### Fixes
+
+- **An equal-valued truncated observation must not downgrade the row** (#136).
+  The upsert guard used a strict `<`, so a truncated observation whose value
+  merely *equalled* the stored one still rewrote the row, flipping `truncated`
+  from 0 to 1. A complete walk recording 2 000 followed by a budget-truncated
+  walk that also counted 2 000 degraded `/about` from "2 000" to "at least
+  2 000" with no change in actual adoption. `<=` is what the doc comment
+  directly above already promised. Verified by reverting only the SQL and
+  watching the new equal-case assertion fail, not by reading it.
+
+### Test and CI integrity
+
+No runtime behaviour change in this section, but the measurements are the point.
+
+- **The sidecar's 71 tests gated nothing** (#134). Every other CI job runs its
+  suite; the sidecar job went install → build → typecheck → lint → format →
+  audit. An `npm test` failure could not fail a PR, and had not been able to
+  for as long as the job existed. Those tests cover the parts with no other
+  safety net: session-store encryption and the plaintext migrate-on-read path,
+  the reaper's TTLs, `StoreError` op tagging, and `purgeDid`. The same change
+  stops reading a green `npm audit` as an all-clear.
+
+- **`login::start` had no test** (#135). Every guard in `complete` had one; this
+  half had none, because it needs handle resolution, discovery and a PAR
+  endpoint over the network. Five decisions were unfalsifiable and every one
+  fails *silently* — the login breaks later, at the authorization server, for a
+  reason nothing local explains. `start_with` injects the three boundaries, and
+  every decision is made in `start_with` rather than in the caller's closures,
+  because an argument assembled inside an adapter is invisible to a test.
+
+- **Mutation-confirmed bad tests, and the scheduler seams behind them** (#127).
+  Tests that passed while proving less than their names, each confirmed by a
+  mutation that left the whole suite green. The blocker found by cold review:
+  `spawn_starts_every_registered_loop` never called `spawn` — filtering
+  `PendingSweep` out of the callback passed 697 lib + 13 bin tests and clippy
+  while the pending-login sweeper never started and nonce rows grew unbounded.
+  The fourth form of that file's recurring defect, added by the round that
+  closed the third.
+
+- **Three SSRF enforcement gaps** (#120). The guard's *decision*
+  (`is_forbidden_ip`) was well covered; what carries that verdict to the socket
+  was not. Per-hop revalidation, cross-origin credential stripping and
+  multi-answer DNS each had a mutation that left 679 tests green. None was
+  testable end to end because a local test server is on loopback, which the
+  guard correctly refuses. The seam is a `#[cfg(test)]` host override — not a
+  parameter, env var or feature flag, so the compiler removes it and there is
+  no runtime bypass to reason about.
+
+- **Two flaky tests fixed by measuring the right thing**, not by loosening
+  thresholds:
+  - the sweep-lock test counted refusals against attempts rather than elapsed
+    wall-clock (#130). Under 4× CPU saturation the writer task simply did not
+    run for 320 ms and the old wall-clock form counted that as a held lock —
+    622 of 626 attempts had actually landed. A starved writer makes no
+    attempts; a held lock refuses them.
+  - the invite bot's mint-window test read the clock twice (#133). `now()` is
+    whole seconds; `record_mint` stamped at one instant and `count_mints_since`
+    computed its cutoff at a later one, so crossing a second boundary between
+    them dropped rows written moments earlier. It failed CI on a base64 bump
+    that cannot touch it — the bot is a separate workspace.
+
+### Dependencies
+
+- `reqwest` 0.13.5, `askama` 0.16.1 (#123); Swatinem/rust-cache (#99); the
+  actions-minor-patch group (#126).
+
+---
+
+## 0.3.4 — 2026-09-13
+
+- **Park unflushable read-state instead of retrying it forever** (#118, closes
+  #117). A dirty `read_cursor` whose DID has no `oauth_session` was re-attempted
+  every round forever — no cap, no backoff, no terminal state. That produced 20
+  failures in 20 minutes in production and would have masked real failures for
+  the whole soak window.
+
+  Landed as a characterization test first, which **passed on the unfixed code**:
+  it pins the defect's exact shape rather than the fix's, and the fix inverts
+  its assertions. A second test established that sign-out can strand unflushed
+  read-state — `revoke_everywhere` deletes the `oauth_session` unconditionally,
+  with no flush first and no clearing of dirty flags that can no longer be acted
+  on — which moved that path from hypothesis to reachable. Whether it is what
+  happened in production remains unknown; the log buffer had rolled past the
+  window.
+
+---
+
+## 0.3.3 — 2026-09-13
+
+- **OAuth backend flipped to Rust** (#110). The in-process Rust atproto OAuth
+  client takes over `/oauth/*` and every `com.atproto.repo.*` call; the Node
+  sidecar is no longer started. Config, not code — both Caddy routings ship in
+  the image and the entrypoint picks one, so this deploys the existing v0.3.2
+  digest with new `[env]`. Every signed-in reader is logged out: nothing under
+  `src/` reads `SIDECAR_DB`, so no token crosses the flip.
+
+- **The `href` defence made structural rather than procedural** (#111).
+  `EntryRow.link` was a `String` and the XSS defence was "remember to call
+  `net::safe_link` before assigning it" — deleting that call left all 679 tests
+  passing. The saved-record URL is attacker-controlled (any atproto client can
+  write the record) and Askama escapes HTML metacharacters but not *schemes*,
+  so `javascript:` survived escaping intact.
+
+  Now a `SafeLink` newtype in its own module — its own module because a private
+  field is private to the *module*, and `web.rs` is 9 000 lines. Two independent
+  reviews falsified the first attempt, both finding the guard was legibility
+  rather than structure. Four mutation classes are now blocked, two by the
+  compiler (`E0061`, `E0423`) and two by a wiring test that renders the real row
+  through the real handler from a hostile record.
+
+- **OAuth refresh and revocation are counted** (#113). The soak criterion for
+  the cutover was "a week with no refresh or revocation failures", and neither
+  was observable — a refresh failure surfaced only as an error on whatever repo
+  call happened to trigger it, and a revocation failure left exactly one
+  `tracing::warn!`. "No failures this week" was a statement about nobody having
+  looked. `oauth_refresh` is timed around `refresh_locked` specifically, not
+  around `valid_session`, which runs on every repo call and would bury a rare
+  failure under thousands of no-op successes.
+
+- **Origin-secret rotation scripted across Cloudflare and Fly** (#109).
+  Rotation moves two sides that must agree; while they disagree every non-
+  `/health` request 403s, and because `/health` is exempt from the lock, Fly
+  reports the machine healthy throughout and nothing alerts. Dry run is the
+  default; preflight refuses to start unless the lock is already healthy.
+  Failure states are distinguished — a Cloudflare failure leaves Fly untouched,
+  a Fly failure after Cloudflare moved says so loudly, because that is the state
+  where the site is already down. Used in production 2026-09-13.
+
+---
+
+## 0.3.2 — 2026-09-13
+
+- **The origin-lock secret was logged in full, and the lock did not fail
+  closed** (#107). `X-Origin-Auth` — the shared secret that *is* the origin lock
+  — was written to every Caddy access-log line. Caddy redacts the standard
+  credential headers by default, which is exactly why a custom name slipped
+  through. Found while reading logs for an unrelated feed investigation.
+
+  A site-level filter alone was not enough: a site `log` directive covers
+  `http.log.access.*`, but errors during handling come from
+  `http.log.error.*`. `caddy validate` passed identically before and after; only
+  running it showed the difference.
+
+  Adversarial review then found the lock **did not fail closed**, contrary to
+  what both `deploy/Caddyfile` and `oauth-sidecar/src/client-ip.ts` asserted.
+  With the secret unset the matcher compared against `""`, which an
+  empty-valued header satisfies — measured: no header 403, junk 403, header
+  sent empty **admitted**. Pre-existing, and in scope because the
+  `cf-connecting-ip` trust model rests on that property and the redaction made
+  the bypass log byte-identically to a legitimate request.
+
+- The sweep-lock test measures shape rather than throughput (#106). CI went red
+  with "only 4 writes landed during a 443 ms sweep" — an assertion that counted
+  writes per unit time measures the runner as much as the lock. Now counts
+  writes whose *completion* falls inside the sweep window: categorical, not a
+  rate.
+
+---
+
+## 0.3.1 — 2026-09-13
+
+- Stats page prose cut 394 → 225 words with every load-bearing fact kept (#104).
+  The cut broke `stats_distinguishes_backoff_from_a_watermark_pause`, and the
+  break was correct — that test had never verified its own name. `test_state`
+  leaves `schedulers_enabled` false, so every render reported "off"; both
+  assertions passed anyway because `contains("running")` matched inside "the
+  poller is not running on this instance" and `contains("paused")` matched the
+  static prose rather than the rendered row. Verified by mutation: deleting the
+  `watermark_paused` arm now fails the test, which it did not before.
+
+- README backend guidance and costs corrected after 0.3.0 shipped (#103).
