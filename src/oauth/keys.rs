@@ -589,7 +589,22 @@ mod tests {
             !rendered.contains("\"d\""),
             "JWKS leaked the private scalar: {rendered}"
         );
-        assert!(!rendered.contains("ltBp9dkK7xkLm9VXOd6CMiLdFRKWQwVrN0Vf8QwC3a4"));
+        // **The scalar of the key UNDER TEST, not a literal.**
+        //
+        // This line used to hard-code the `d` of the fixture JWK above. The key
+        // here is `SigningKey::generate`, freshly random every run, so that
+        // literal could never appear whatever the code did — the assertion was
+        // unconditionally true.
+        //
+        // It also covers what the `"d"` check above cannot: material leaking
+        // under some OTHER member name. A scalar copied into `x` passes a search
+        // for `"d"` and fails this.
+        let private: serde_json::Value = serde_json::from_str(&key.to_jwk_json().unwrap()).unwrap();
+        let scalar = private["d"].as_str().expect("the private JWK has a scalar");
+        assert!(
+            !rendered.contains(scalar),
+            "JWKS leaked the private scalar: {rendered}"
+        );
     }
 
     #[test]
