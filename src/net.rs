@@ -364,11 +364,48 @@ where
                 let Ok(mut tls) = acceptor.accept(sock).await else {
                     return;
                 };
-                let mut buf = vec![0u8; 16384];
-                let Ok(n) = tls.read(&mut buf).await else {
-                    return;
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // **The WHOLE request — head and body — before replying.**
+                //
+                // A single `read` is what the capturing sidecar on the #138
+                // branch did, and the review of that branch found the trap: if
+                // the head and the body land in separate segments, the capture
+                // holds only the head, and every `contains` assertion over it
+                // then passes for the wrong reason.
+                //
+                // Nothing here asserts on a body today — the assertions are the
+                // request line and the DPoP header, and both panic loudly when
+                // absent rather than passing — so that false green is not live
+                // in this harness. It is the NEXT body assertion that would
+                // inherit one, which is the whole reason the same shape was
+                // worth fixing there.
+                //
+                // Draining also stops the reply being written while the client
+                // is still sending, which would make a split request a broken
+                // pipe rather than a response.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(n) = tls.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|want| body.len() >= want) {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw).to_string();
                 let path = req
                     .lines()
                     .next()
