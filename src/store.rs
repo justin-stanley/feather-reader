@@ -6826,17 +6826,71 @@ mod tests {
         Contended,
     }
 
-    /// True for `SQLITE_BUSY` (code 5) anywhere in the chain.
+    /// True for the `SQLITE_BUSY` FAMILY anywhere in the chain.
     ///
     /// Matched on the DRIVER CODE, not on the message text: "database is
     /// locked" is a string another error could plausibly carry, and this
     /// decides whether a test failure is suppressed.
+    ///
+    /// **Masked to the primary code.** sqlx-sqlite's `code()` returns
+    /// `sqlite3_extended_errcode` verbatim, so comparing it to `"5"` matches
+    /// only bare `SQLITE_BUSY` and treats the WAL variants as hard failures:
+    /// `BUSY_RECOVERY` (261), `BUSY_SNAPSHOT` (517), `BUSY_TIMEOUT` (773).
+    /// This database runs in WAL mode and `store.rs` already documents hitting
+    /// `SQLITE_BUSY_SNAPSHOT`, so that gap is not hypothetical — the narrowing
+    /// would have rejected the very class this tolerance exists for.
+    ///
+    /// `& 0xFF` is how SQLite defines the relationship: the low byte of an
+    /// extended code IS the primary code.
     fn is_sqlite_busy(err: &anyhow::Error) -> bool {
         err.chain().any(|e| {
-            e.downcast_ref::<sqlx::Error>().is_some_and(
-                |e| matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("5")),
-            )
+            e.downcast_ref::<sqlx::Error>().is_some_and(|e| match e {
+                sqlx::Error::Database(db) => db
+                    .code()
+                    .and_then(|c| c.parse::<i32>().ok())
+                    .is_some_and(is_busy_code),
+                _ => false,
+            })
         })
+    }
+
+    /// The classification, split out so the WAL variants are TESTABLE.
+    ///
+    /// A `BUSY_SNAPSHOT` cannot be produced on demand in a test, so without
+    /// this the claim that 261/517/773 are tolerated would be a comment and
+    /// nothing else. The wiring — that `is_sqlite_busy` consults this at all —
+    /// is pinned separately by `a_busy_sweep_is_reported_as_contended_not_as_a_failure`,
+    /// which drives a real `SQLITE_BUSY` end to end.
+    fn is_busy_code(code: i32) -> bool {
+        code & 0xFF == 5
+    }
+
+    /// **The whole `SQLITE_BUSY` family, and nothing else.**
+    #[test]
+    fn busy_codes_cover_the_wal_variants() {
+        for code in [
+            5,   // SQLITE_BUSY
+            261, // SQLITE_BUSY_RECOVERY
+            517, // SQLITE_BUSY_SNAPSHOT
+            773, // SQLITE_BUSY_TIMEOUT
+        ] {
+            assert!(
+                is_busy_code(code),
+                "{code} is in the BUSY family but would be treated as a hard failure"
+            );
+        }
+        for code in [
+            0,   // SQLITE_OK
+            1,   // SQLITE_ERROR
+            6,   // SQLITE_LOCKED — adjacent, and deliberately NOT tolerated
+            262, // SQLITE_LOCKED_SHAREDCACHE
+            11,  // SQLITE_CORRUPT
+        ] {
+            assert!(
+                !is_busy_code(code),
+                "{code} is not contention, but would be swallowed as though it were"
+            );
+        }
     }
 
     /// Run the batched delete, separating "the write lock was contended" from

@@ -1951,8 +1951,13 @@ pub(crate) mod tests {
                 let mut raw: Vec<u8> = Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
+                    // **A read error DISCARDS the connection rather than logging
+                    // what arrived so far.** Breaking here and pushing the
+                    // partial would put a truncated request in the log — the
+                    // exact thing this change exists to stop, arriving by a
+                    // different door. `spawn_tls` returns for the same reason.
                     let Ok(n) = sock.read(&mut chunk).await else {
-                        break;
+                        return;
                     };
                     if n == 0 {
                         break;
@@ -2284,13 +2289,17 @@ pub(crate) mod tests {
         let filler = "x".repeat(32 * 1024);
         let body = format!("{{\"pad\":\"{filler}\",\"tail\":\"THE-LAST-BYTES\"}}");
 
-        let _ = guarded_post_json(
+        // Not `let _ =`: a refused POST leaves the capture empty, and
+        // "captured no request at all" would be the only symptom with the
+        // cause thrown away.
+        guarded_post_json(
             &reqwest::Client::builder().build().unwrap(),
             &format!("http://big-body.test:{}/ingest", addr.port()),
             &[],
             body.into_bytes(),
         )
-        .await;
+        .await
+        .expect("the POST to the test server failed before anything was captured");
 
         let seen = log.lock().unwrap().join("\n");
         // Positive anchor first: without it, the tail assertion below could pass
