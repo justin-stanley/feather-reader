@@ -364,7 +364,8 @@ where
                 let Ok(mut tls) = acceptor.accept(sock).await else {
                     return;
                 };
-                // **The WHOLE request — head and body — before replying.**
+                // **The head, and the body when `content-length` says how
+                // much — before replying.**
                 //
                 // A single `read` is what the capturing sidecar on the #138
                 // branch did, and the review of that branch found the trap: if
@@ -378,6 +379,14 @@ where
                 // in this harness. It is the NEXT body assertion that would
                 // inherit one, which is the whole reason the same shape was
                 // worth fixing there.
+                //
+                // **A chunked body is NOT drained.** With no `content-length`
+                // there is nothing to wait for, so this stops after the head —
+                // exactly what the single read did. Every request this harness
+                // sees is a GET or a reqwest-buffered form and carries a length,
+                // but nothing here enforces that, so a future chunked request
+                // would be captured short and quietly. Said plainly rather than
+                // left inside a claim to have read "the whole request".
                 //
                 // Draining also stops the reply being written while the client
                 // is still sending, which would make a split request a broken
