@@ -40,6 +40,7 @@ pub mod repo;
 pub mod runtime_health;
 pub mod safe_link;
 pub mod store;
+pub mod vetted;
 pub mod web;
 
 use std::collections::HashMap;
