@@ -8485,6 +8485,111 @@ mod tests {
         assert_eq!(record["private"], false, "the repoint erased private");
     }
 
+    /// **A rename against an rkey that is not in the repo writes NOTHING.**
+    ///
+    /// `update_subscription` is a `putRecord`, which CREATES the record when the
+    /// rkey does not exist — with whatever `createdAt` we hand it. So without
+    /// this refusal a rename against a stale or wrong rkey manufactures a
+    /// subscription dated today, which is the bug this whole change exists to
+    /// fix, arriving by a different door.
+    ///
+    /// The guard was untested when first written: removing it left all 733 tests
+    /// green. An untested guard against the exact defect being fixed is how the
+    /// two previous rounds of this problem got through.
+    #[tokio::test]
+    async fn renaming_an_unknown_rkey_writes_nothing() {
+        let did = "did:plc:renamer4";
+        // The sidecar serves exactly one record, at rkey `rk-keep`.
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    // ...and this is not it.
+                    .uri("/subscriptions/rk-does-not-exist/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Ghost",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("flash="),
+            "an unknown rkey redirected as though the rename had worked: {loc}"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a rename against an unknown rkey wrote a record — putRecord would \
+             CREATE it, dated today: {:?}",
+            puts.lock().unwrap()
+        );
+    }
+
+    /// **A `site_url` the client actually sends is applied, not dropped.**
+    ///
+    /// `templates/manage_row.html` does not post this field, so it is tempting
+    /// to read the arm that handles it as dead code. It is not:
+    /// `RenameSubForm` carries `site_url`, so a hand-crafted POST reaches it
+    /// today. Discarding the value instead of applying it left all 733 tests
+    /// green.
+    ///
+    /// The value is scheme-checked on the way out by the repo-boundary vet, so
+    /// this is a coverage gap rather than an exposure — but an untested path
+    /// that writes a URL into the reader's PDS should not stay untested.
+    #[tokio::test]
+    async fn a_client_supplied_site_url_reaches_the_record() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // Same feed URL, but carrying a site_url the manage row
+                    // never sends.
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Kept\
+                         &site_url=https%3A%2F%2Ftyped.example%2Fsite",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        assert!(
+            bodies[0].contains("community.lexicon.rss.subscription"),
+            "captured no usable put body: {:?}",
+            bodies[0]
+        );
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("put body is JSON");
+        assert_eq!(
+            sent["record"]["siteUrl"], "https://typed.example/site",
+            "the client's siteUrl was dropped; the seeded record's survived instead"
+        );
+    }
+
     /// **A rename whose read fails writes NOTHING.**
     ///
     /// This is the property most easily lost when someone later touches this
