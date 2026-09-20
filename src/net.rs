@@ -922,7 +922,25 @@ async fn guarded_get_inner(
             .await
             .with_context(|| format!("fetching {current}"))?;
 
-        if resp.status().is_redirection() {
+        // **Only the statuses that actually relocate — NOT all of `3xx`.**
+        //
+        // `is_redirection()` is `300..=399`, which swallows `304 Not Modified`.
+        // A 304 carries no `Location` *by definition*, so it fell into the
+        // branch below and failed the whole fetch with "redirect response
+        // without a usable Location header". `feed.rs` sends `If-None-Match` /
+        // `If-Modified-Since` on every poll and has a correct 304 branch — which
+        // could therefore never be reached. The effect was that "nothing new"
+        // became a recorded failure plus exponential backoff, punishing exactly
+        // the feeds that implement conditional GET properly. Observed in
+        // production against 9to5mac.com, proton.me and kodi.tv, all live.
+        //
+        // `300 Multiple Choices` and `305 Use Proxy` are excluded for their own
+        // reasons rather than by oversight: 300 names no single target, and 305
+        // names a PROXY, so following it would route the request through a host
+        // the response chose. Both now return to the caller, where a non-success
+        // status is handled as one.
+        let relocating = matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308);
+        if relocating {
             if max_redirects == 0 {
                 bail!(
                     "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
@@ -2105,6 +2123,79 @@ pub(crate) mod tests {
     }
     fn redirect_to(loc: &str) -> String {
         format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+    /// No `Location` and no body — which is what a 304 *is*, not a stub of one.
+    fn not_modified_304() -> String {
+        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n".to_string()
+    }
+
+    /// **A `304 Not Modified` must reach the caller, not be read as a redirect.**
+    ///
+    /// `is_redirection()` is `300..=399`, so 304 — which carries no `Location`
+    /// by definition — fell into the redirect branch and failed the whole fetch
+    /// with "redirect response without a usable Location header". `feed.rs`
+    /// sends `If-None-Match`/`If-Modified-Since` on every poll and has a correct
+    /// 304 branch (`feed.rs`, `status == StatusCode::NOT_MODIFIED`) that could
+    /// never be reached, so every feed answering "unchanged" was recorded as a
+    /// failure and backed off exponentially.
+    ///
+    /// This was not theoretical: production logged it against `9to5mac.com`,
+    /// `proton.me` and `kodi.tv`, and `/stats` reported 68 of 111 feeds failing
+    /// while its own copy explained them away as "usually gone rather than
+    /// flaky". Re-running the poller's conditional GET by hand returned
+    /// `HTTP 304` with zero `Location` headers.
+    ///
+    /// The hop count is asserted too: a 304 must not provoke a second request.
+    /// Returning the response but still looping would satisfy a status-only
+    /// assertion while re-fetching every unchanged feed.
+    #[tokio::test]
+    async fn a_304_reaches_the_caller_instead_of_being_read_as_a_redirect() {
+        let (addr, log) = spawn_http(vec![not_modified_304()]).await;
+        test_host_override("not-modified.test", addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://not-modified.test:{}/feed.xml", addr.port()),
+            &[],
+        )
+        .await
+        .expect("a 304 was treated as a redirect");
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_MODIFIED,
+            "the 304 did not survive the guard intact",
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "a 304 caused more than one request — it was followed, not returned",
+        );
+    }
+
+    /// **A real redirect is still followed** — the other half of the narrowing
+    /// above, which would otherwise be satisfied by never following anything.
+    #[tokio::test]
+    async fn a_302_is_still_followed_after_the_304_narrowing() {
+        let (b_addr, _b_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("still-follows-b.test", b_addr);
+        let (a_addr, a_log) = spawn_http(vec![redirect_to(&format!(
+            "http://still-follows-b.test:{}/final",
+            b_addr.port()
+        ))])
+        .await;
+        test_host_override("still-follows-a.test", a_addr);
+
+        let resp = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://still-follows-a.test:{}/feed.xml", a_addr.port()),
+            &[],
+        )
+        .await
+        .expect("the 302 was not followed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(a_log.lock().unwrap().len(), 1);
     }
 
     /// **A redirect to a forbidden address is refused — the marquee SSRF
