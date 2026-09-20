@@ -4540,6 +4540,26 @@ mod tests {
             "paging changed the ordering"
         );
 
+        // **The tie-break is pinned, not left to the engine.** The seed gives
+        // 250 rows only 28 distinct dates, so the order is mostly ties; with
+        // the `id DESC` tie-break deleted, SQLite happened to return ties in a
+        // stable order and both assertions above still held. The expected
+        // order is computed from the seed pattern here — newest date first,
+        // then newest id — and must match exactly.
+        let mut expected: Vec<(i64, i64)> = whole
+            .iter()
+            .map(|e| {
+                let day: i64 = e.published.as_deref().unwrap()[8..10].parse().unwrap();
+                (day, e.id)
+            })
+            .collect();
+        expected.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            walked,
+            expected.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            "ties are not broken by newest id"
+        );
+
         assert_eq!(
             count_entries_for_view(&pool, did, ListView::All, None).await?,
             250,
@@ -5068,6 +5088,34 @@ mod tests {
             0
         );
         assert_eq!(count(mine).await, 2);
+        // **Clearing an already-cleared star is a no-op**, reported as one:
+        // `web::unsave` branches on `Ok(0)` vs `Ok(n)` to decide whether a
+        // local star was actually cleared. This used to be untested — every
+        // article here was starred first — so `starred = 1` in the WHERE clause
+        // could be widened to `IN (0, 1)` with the suite green, rewriting
+        // `updated_at` on rows that changed nothing and logging clears that
+        // never happened.
+        let before: String = sqlx::query_scalar(
+            "SELECT updated_at FROM entry_state WHERE did = ?1 AND entry_id = ?2",
+        )
+        .bind(mine)
+        .bind(target.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            clear_star_by_identity(&pool, mine, target.url.as_deref(), Some(&target.guid)).await?,
+            0,
+            "a second clear reported rows it did not change"
+        );
+        let after: String = sqlx::query_scalar(
+            "SELECT updated_at FROM entry_state WHERE did = ?1 AND entry_id = ?2",
+        )
+        .bind(mine)
+        .bind(target.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(before, after, "a no-op clear rewrote updated_at");
+
         // And neither identifier present does nothing at all.
         assert_eq!(clear_star_by_identity(&pool, mine, None, None).await?, 0);
         assert_eq!(
@@ -5728,6 +5776,37 @@ mod tests {
         let created2 = ensure_seed(&pool, &["did:plc:seed1".to_string()]).await?;
         assert_eq!(created2, 0, "re-seeding an existing DID is a no-op");
         assert!(has_beta_access(&pool, "did:plc:seed1").await?);
+        Ok(())
+    }
+
+    /// **The sweep spares a REDEEMED code that is past its TTL.** The
+    /// existing sweep test seeds one active past-expiry code and one live
+    /// one, so the `status = 'active'` guard never excludes anything — with
+    /// it deleted the suite stayed green. Without it the hourly sweep rewrites
+    /// redeemed codes to `expired`, destroying the redemption the invite audit
+    /// trail depends on and inflating the logged sweep count.
+    #[tokio::test]
+    async fn the_expiry_sweep_spares_redeemed_codes() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let code = mint_code(&pool, "did:plc:creator", 3600).await?;
+        assert!(redeem_code(&pool, &code, "did:plc:new", None, 100)
+            .await?
+            .is_ok());
+        // Time passes: the redeemed code is now past its TTL.
+        sqlx::query("UPDATE invite_codes SET expires_at = ?1 WHERE code = ?2")
+            .bind(now_unix() - 10)
+            .bind(&code)
+            .execute(&pool)
+            .await?;
+        insert_expired_code(&pool, "FEATHER-EXPIRED2", "did:plc:creator").await?;
+
+        let n = expire_old_codes(&pool).await?;
+        assert_eq!(n, 1, "the sweep counted the redeemed code");
+        let status: String = sqlx::query_scalar("SELECT status FROM invite_codes WHERE code = ?1")
+            .bind(&code)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(status, "redeemed", "the sweep rewrote a redemption");
         Ok(())
     }
 
@@ -7116,10 +7195,46 @@ mod tests {
         let c = get_cursor(&pool, did, feed_url).await?.unwrap();
         assert!(!c.pds_created, "first flush must emit a create, not update");
 
+        // Two bystanders: the same DID on another feed, another DID on the same
+        // feed. **The UPDATE must be scoped to exactly one row.** With its WHERE
+        // clause deleted this test still passed — it seeded one cursor, so
+        // "every row" and "this row" were the same row. Unscoped, every DID's
+        // every cursor is flagged as created, their readState records are never
+        // created, and every later flush emits `update` against nothing.
+        for (d, f) in [
+            (did, "https://other.example/feed.xml"),
+            ("did:plc:other", feed_url),
+        ] {
+            upsert_cursor(
+                &pool,
+                &ReadCursor {
+                    did: d.to_string(),
+                    feed_url: f.to_string(),
+                    read_through: None,
+                    read_ids: "[]".to_string(),
+                    unread_ids: "[]".to_string(),
+                    dirty: false,
+                    pds_created: false,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
+
         // After the create-flush lands, the flag flips so future flushes update.
         mark_cursor_pds_created(&pool, did, feed_url).await?;
         let c = get_cursor(&pool, did, feed_url).await?.unwrap();
         assert!(c.pds_created);
+        for (d, f) in [
+            (did, "https://other.example/feed.xml"),
+            ("did:plc:other", feed_url),
+        ] {
+            let bystander = get_cursor(&pool, d, f).await?.unwrap();
+            assert!(
+                !bystander.pds_created,
+                "marking ({did}, {feed_url}) also flagged ({d}, {f})"
+            );
+        }
         Ok(())
     }
 
@@ -8799,6 +8914,40 @@ mod tests {
         Ok(())
     }
 
+    /// **The lookup is keyed.** Every existing network-stat test writes only
+    /// `ADOPTION_STAT_KEY`, so the `WHERE key = ?1` never discriminated; with
+    /// it widened to `OR 1=1` the suite stayed green. The public `/stats`
+    /// page asks for the adoption count, and unkeyed it would render the
+    /// largest value of ANY stat as the network size.
+    #[tokio::test]
+    async fn latest_network_stat_ignores_other_keys() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for (key, source, value) in [
+            (ADOPTION_STAT_KEY, "https://relay1.example", 40),
+            ("some.other.metric", "https://relay1.example", 9_999),
+        ] {
+            record_network_stat(
+                &pool,
+                &NetworkStat {
+                    key: key.to_string(),
+                    source: source.to_string(),
+                    value,
+                    truncated: false,
+                    observed_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
+        let latest = latest_network_stat(&pool, ADOPTION_STAT_KEY)
+            .await?
+            .expect("the adoption stat was recorded");
+        assert_eq!(
+            latest.value, 40,
+            "another key's value was returned as the adoption count"
+        );
+        Ok(())
+    }
+
     // ── poll health (the public stats page) ─────────────────────────────────
 
     async fn feed_polled(
@@ -9269,6 +9418,41 @@ mod tests {
             left,
             vec!["old-starred"],
             "the per-feed trim evicted a starred entry"
+        );
+        Ok(())
+    }
+
+    /// **When more entries are starred than the cap, the NEWEST starred ones
+    /// are spared.** The sparing subquery orders by date and takes `cap`; the
+    /// existing tests seed one starred row (fewer than the cap, so the order
+    /// never chooses) or assert only a count. With `DESC` flipped to `ASC` the
+    /// suite stayed green — and in production the trim would spare the OLDEST
+    /// starred articles and evict the newest, on every poll of every feed.
+    #[tokio::test]
+    async fn the_trim_spares_the_newest_starred_entries_when_over_cap() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // Five starred entries, one per day, cap of two: only the two newest
+        // may survive.
+        let mut ids = Vec::new();
+        for days_old in 1..=5 {
+            let id = aged_entry(&pool, &format!("starred-{days_old}"), days_old).await;
+            mark(&pool, id, 1, 1).await;
+            ids.push((days_old, id));
+        }
+        let feed_id: i64 = sqlx::query_scalar("SELECT feed_id FROM entries WHERE id = ?1")
+            .bind(ids[0].1)
+            .fetch_one(&pool)
+            .await?;
+        insert_entries(&pool, feed_id, &[], 2).await?;
+
+        let mut survivors: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries")
+            .fetch_all(&pool)
+            .await?;
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["starred-1".to_string(), "starred-2".to_string()],
+            "the trim spared the wrong starred entries"
         );
         Ok(())
     }
