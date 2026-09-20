@@ -78,6 +78,11 @@
 			fields {
 				request>headers>X-Origin-Auth replace REDACTED
 				request>headers>Cookie replace REDACTED
+				request>uri query {
+					replace code REDACTED
+					replace state REDACTED
+					replace session_id REDACTED
+				}
 			}
 		}
 	}
@@ -106,6 +111,25 @@
 	# (bypassed Cloudflare) from "arrived with the wrong one" (stale secret,
 	# mid-rotation). Deleting it would collapse those into the same log line, and
 	# they call for opposite responses.
+	# **The OAuth query string is a credential too.** The header filters above
+	# leave `uri` untouched, and `/oauth/callback` carries the PDS's `?code=` —
+	# a single-use authorization code — plus the `state` that binds it to the
+	# pending row. Until this filter existed both appeared verbatim on every
+	# callback access-log line, which is the same distribution the paragraph
+	# above objects to for the origin secret: `fly logs`, any drain, anyone's
+	# scrollback. A logged code is not directly replayable (it is one-shot, and
+	# the exchange also demands the PKCE verifier, a DPoP proof and
+	# `private_key_jwt`), so this is hygiene rather than an open hole — but the
+	# argument for redacting the header is the argument for redacting these.
+	#
+	# `replace`, not `delete`, for the same reason as above: the field survives
+	# with its value gone, so a failed callback still shows WHICH parameters
+	# arrived. `iss`, `error` and `error_description` are deliberately NOT
+	# filtered — they name the issuer and say why a handshake failed, they are
+	# not secrets, and they are most of the diagnostic value of these lines.
+	#
+	# This is a LOG filter and touches nothing else: the `/oauth/callback`
+	# routing below still matches on `session_id`/`error_description` as before.
 	log {
 		output stdout
 		format filter {
@@ -113,6 +137,11 @@
 			fields {
 				request>headers>X-Origin-Auth replace REDACTED
 				request>headers>Cookie replace REDACTED
+				request>uri query {
+					replace code REDACTED
+					replace state REDACTED
+					replace session_id REDACTED
+				}
 			}
 		}
 	}
