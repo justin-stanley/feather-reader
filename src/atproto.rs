@@ -131,6 +131,14 @@ const MAX_LIST_PAGES: usize = 200;
 /// makes the claim true rather than conditional on the server's cooperation.
 const MAX_LIST_RECORDS: usize = 20_000;
 
+/// The same cap for a collection whose records are **large**.
+///
+/// [`MAX_LIST_RECORDS`]'s figure was measured against *minimal* records
+/// (~1 KB). A `site.standard.document` carries the whole article — ~17 KB
+/// measured across 449 real ones — so 20 000 of them is ~340 MB retained on a
+/// 512 MB box. Sized to the record, not to the protocol.
+pub(crate) const MAX_LARGE_RECORDS: usize = 2_000;
+
 /// The at-URI scheme prefix, **the one Rust spelling**. Every Rust guard that
 /// asks "is this an at-URI" strips or compares this; the SQL side is
 /// [`crate::store::UNPOLLABLE_URL_SQL`], and a test pins that the two agree.
@@ -769,6 +777,18 @@ impl PdsClient {
     /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_bounded(collection, MAX_LIST_RECORDS)
+            .await
+    }
+
+    /// [`Self::list_all_records`] with the accumulation cap chosen by the
+    /// caller — for a collection whose records are far larger than the
+    /// protocol-shaped default assumes. See [`MAX_LARGE_RECORDS`].
+    pub async fn list_all_records_bounded(
+        &self,
+        collection: &str,
+        max_records: usize,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
@@ -776,7 +796,7 @@ impl PdsClient {
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
-            extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
+            extend_bounded(&mut out, page.records, max_records, collection)?;
             match page.cursor {
                 // Guard against a PDS that echoes a cursor with an empty page,
                 // or that hands back the SAME cursor forever (an infinite walk
@@ -1243,6 +1263,9 @@ impl SidecarClient {
             body["cursor"] = json!(cursor);
         }
         let data = self.repo(body).await?;
+        // The sidecar proxies the PDS's body, so the 2xx-envelope case arrives
+        // here too — and `RepoOk.data` is a defaulted `Value`.
+        reject_error_envelope(&data)?;
         serde_json::from_value(data).context("parsing sidecar listRecords data")
     }
 
@@ -1855,17 +1878,31 @@ pub(crate) fn urlencode(s: &str) -> String {
 /// place of an error. Some PDS implementations answer 200 for application
 /// failures; the status check in the caller cannot see those.
 pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
-    if let Ok(XrpcErrorBody {
-        error: Some(error),
-        message,
-    }) = serde_json::from_slice::<XrpcErrorBody>(body)
-    {
-        anyhow::bail!(
-            "PDS answered 2xx with an error envelope: {error}{}",
-            message.map(|m| format!(" — {m}")).unwrap_or_default()
-        );
-    }
-    serde_json::from_slice(body).context("parsing listRecords response")
+    let value: Value = serde_json::from_slice(body).context("parsing listRecords response")?;
+    reject_error_envelope(&value)?;
+    serde_json::from_value(value).context("parsing listRecords response")
+}
+
+/// Refuse an atproto error envelope that arrived on a 2xx.
+///
+/// **Every shape that reads a listRecords body goes through this**, not only
+/// the anonymous client: `oauth::xrpc::Repo` takes `records` off the JSON with
+/// `unwrap_or(Array([]))`, and the sidecar's `RepoOk.data` is a defaulted
+/// `Value`. Both turned `200 {"error": …}` into `Ok(empty)`, which is not the
+/// fail-closed branch in `web::resolve_subscriptions` — so `sync_sub_refs`
+/// wrote an empty set and `replace_sub_refs` DELETEd the DID's entire
+/// `sub_ref` projection. One bad response revoked a reader's access to every
+/// feed they have.
+pub(crate) fn reject_error_envelope(value: &Value) -> Result<()> {
+    let Some(error) = value.get("error").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|m| format!(" — {m}"))
+        .unwrap_or_default();
+    anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}")
 }
 
 /// The atproto XRPC error envelope body: `{"error": "...", "message": "..."}`.
@@ -2010,6 +2047,48 @@ mod tests {
             ],
             "cursor": "3ksub0002"
         })
+    }
+
+    /// The sidecar proxies the PDS's body, so the same 2xx envelope arrives
+    /// through `RepoOk.data` — a defaulted `Value` that deserialised into an
+    /// empty page just as happily. Driven through the real client.
+    #[tokio::test]
+    async fn the_sidecar_client_refuses_a_200_error_envelope() {
+        let base = crate::net::tests::serve_body(
+            br#"{"ok":true,"data":{"error":"InvalidRequest","message":"nope"}}"#.to_vec(),
+        )
+        .await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an error envelope was read as an empty page");
+        assert!(
+            format!("{err:#}").contains("InvalidRequest"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **Every listRecords caller refuses a 2xx error envelope, not just the
+    /// anonymous one.** `oauth::xrpc::Repo` reads `records` off the JSON with
+    /// `unwrap_or(Array([]))` and the sidecar's `RepoOk.data` is a defaulted
+    /// `Value`, so a PDS answering 200 with an envelope reached
+    /// `resolve_subscriptions` as `Ok(empty)` — which is not the fail-closed
+    /// branch, so `sync_sub_refs` DELETEd the DID's whole `sub_ref` projection:
+    /// one bad response revokes a reader's access to every feed they have.
+    #[test]
+    fn an_error_envelope_is_refused_whatever_shape_it_arrives_in() {
+        let envelope = serde_json::json!({"error": "InvalidRequest", "message": "bad cursor"});
+        let err = reject_error_envelope(&envelope).expect_err("an envelope passed as data");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+        // A real page, and an empty real page, are both data.
+        reject_error_envelope(&serde_json::json!({"records": []})).expect("an empty page is data");
+        reject_error_envelope(&serde_json::json!({"records": [], "cursor": "c"})).unwrap();
     }
 
     /// **A 200 carrying an error envelope is not an empty page.** `records` is

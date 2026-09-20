@@ -1087,6 +1087,24 @@ pub(crate) fn sanitize_html(raw: &str) -> String {
     ammonia::clean(raw)
 }
 
+/// Render **plain text** into the HTML the `content_html` column holds.
+///
+/// **Not [`sanitize_html`].** `ammonia::clean` parses its input as markup, so a
+/// bare `<` in prose swallows the rest: measured here, `"if x<y then z"` comes
+/// back as `"if x"`. That is correct for an RSS body, which IS markup, and
+/// silent data loss for a field a lexicon defines as text. Escape first, then
+/// add the only markup this needs — line breaks, which the column's consumer
+/// renders as HTML and would otherwise collapse.
+pub(crate) fn plain_text_to_html(raw: &str) -> String {
+    let escaped = raw
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    // Safe by order: every `<` from the input is already `&lt;` before this
+    // adds a real tag.
+    escaped.replace('\n', "<br>")
+}
+
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
 /// store's string columns.
 pub(crate) fn fmt_time(dt: DateTime<Utc>) -> String {
@@ -1480,6 +1498,27 @@ mod tests {
                 FeedPrivacy::Public => panic!("{url} was not refused at all"),
             }
         }
+    }
+
+    /// **Plain text is escaped, not sanitised.** `ammonia::clean` parses its
+    /// input as markup, so a `<` in prose swallows everything after it:
+    /// measured in this tree, `"if x<y then z"` becomes `"if x"`. That is the
+    /// right function for an RSS body (which IS markup) and exactly the wrong
+    /// one for a field the lexicon defines as plain text — it silently deletes
+    /// the reader's content.
+    #[test]
+    fn plain_text_is_escaped_rather_than_swallowed() {
+        assert_eq!(
+            plain_text_to_html("Vec<String> is a type"),
+            "Vec&lt;String&gt; is a type"
+        );
+        assert_eq!(plain_text_to_html("if x<y then z"), "if x&lt;y then z");
+        assert_eq!(plain_text_to_html("a & b"), "a &amp; b");
+        // Line structure survives into a field rendered as HTML.
+        assert_eq!(plain_text_to_html("one\ntwo"), "one<br>two");
+        // And it is still safe: the escaping happens before any markup is added.
+        let hostile = plain_text_to_html("<script>alert(1)</script>");
+        assert!(!hostile.contains("<script"), "{hostile}");
     }
 
     #[test]

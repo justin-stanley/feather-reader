@@ -131,6 +131,11 @@ impl Repo<'_> {
                 "com.atproto.repo.listRecords",
             )
             .await?;
+        // A 2xx carrying an error envelope is NOT an empty page: `records`
+        // defaulting to `[]` turned a PDS failure into `Ok(vec![])`, which
+        // `resolve_subscriptions` reads as "this DID follows nothing" and
+        // `sync_sub_refs` then writes through, revoking every `sub_ref`.
+        crate::atproto::reject_error_envelope(&value)?;
         let records: Vec<RecordEntry> = serde_json::from_value(
             value
                 .get("records")
@@ -644,6 +649,51 @@ mod tests {
             .expect_err("must refuse a loopback PDS");
         assert!(
             format!("{err:#}").contains("forbidden (internal) address"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **A 200 carrying an error envelope must not read as an empty repo.**
+    ///
+    /// `records` was taken off the JSON with `unwrap_or(Array([]))`, so a PDS
+    /// answering `200 {"error": …}` produced `Ok(vec![])`. That is not the
+    /// fail-closed branch in `web::resolve_subscriptions`: `sync_sub_refs`
+    /// writes the empty set through and `replace_sub_refs` DELETEs the DID's
+    /// entire `sub_ref` projection — one bad response revokes the reader's
+    /// access to every feed they have. Driven through the real client against
+    /// a real server, because the bug was the missing CALL, not the check.
+    #[tokio::test]
+    async fn a_200_error_envelope_is_not_an_empty_repo() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"bad cursor"}"#.to_vec(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "envelope-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://envelope-pds.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_records("app.feather.subscription", None, None)
+            .await
+            .expect_err("an error envelope was read as an empty page");
+        assert!(
+            format!("{err:#}").contains("InvalidRequest"),
             "failed for the wrong reason: {err:#}"
         );
     }

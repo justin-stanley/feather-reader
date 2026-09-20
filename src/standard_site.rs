@@ -45,7 +45,7 @@ pub struct AtUri {
 impl AtUri {
     /// Parse, or `None` if this is not a well-formed three-segment at-URI.
     pub fn parse(uri: &str) -> Option<Self> {
-        let rest = uri.strip_prefix("at://")?;
+        let rest = uri.strip_prefix(crate::atproto::AT_URI_PREFIX)?;
         let mut parts = rest.split('/');
         let (authority, collection, rkey) = (parts.next()?, parts.next()?, parts.next()?);
         if parts.next().is_some()
@@ -96,9 +96,14 @@ pub struct Entry {
     /// reading order sorts on this column as a string, so a publisher's
     /// spelling cannot go in verbatim.
     pub published: Option<String>,
-    pub url: String,
-    /// `description`, else `textContent`, passed through
-    /// [`crate::feed::sanitize_html`] exactly as every RSS body is.
+    /// The joined, **scheme-vetted** permalink — `None` when the document's
+    /// `path` does not resolve to a safe href on the publication's origin.
+    /// `Option` because the guarantee cannot be met unconditionally and the
+    /// store's column is optional too; a title-only entry is not a failure.
+    pub url: Option<String>,
+    /// `description`, else `textContent`, escaped by
+    /// [`crate::feed::plain_text_to_html`] — both are plain text in the
+    /// lexicon, and the column they land in is rendered as HTML.
     pub summary: Option<String>,
 }
 
@@ -108,7 +113,7 @@ impl From<Entry> for crate::store::NewEntry {
     fn from(e: Entry) -> Self {
         crate::store::NewEntry {
             guid: e.guid,
-            url: Some(e.url),
+            url: e.url,
             title: Some(e.title),
             author: None,
             published: e.published,
@@ -127,8 +132,12 @@ struct PublicationValue {
 #[derive(Debug, Deserialize)]
 struct DocumentValue {
     title: String,
+    /// Optional so a document without one is an entry with no date, the same
+    /// answer a garbage one gets — the strictness ran the other way, making
+    /// the field this module is willing to DISCARD the one whose absence was
+    /// fatal to the whole record.
     #[serde(rename = "publishedAt")]
-    published_at: String,
+    published_at: Option<String>,
     path: String,
     /// The at-URI of the publication this document belongs to.
     ///
@@ -190,16 +199,18 @@ pub fn entries_from_records(
             Some(Entry {
                 guid: record.uri.clone(),
                 title: doc.title,
-                published: chrono::DateTime::parse_from_rfc3339(&doc.published_at)
-                    .ok()
+                published: doc
+                    .published_at
+                    .as_deref()
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                     .map(|d| crate::feed::fmt_time(d.with_timezone(&chrono::Utc))),
                 url: join_path(base.as_ref(), &doc.path),
                 // `description` first — the authored summary — but only when it
                 // actually says something: a blank one must not shadow the body.
-                // Then sanitised: a stranger's string, rendered as HTML.
+                // Then ESCAPED, not sanitised: both fields are plain text.
                 summary: non_blank(doc.description)
                     .or_else(|| non_blank(doc.text_content))
-                    .map(|raw| crate::feed::sanitize_html(&raw)),
+                    .map(|raw| crate::feed::plain_text_to_html(&raw)),
             })
         })
         .collect()
@@ -216,15 +227,21 @@ fn non_blank(s: Option<String>) -> Option<String> {
 /// path inside the query for a base carrying one. `join` also keeps the result
 /// on the publication's own origin for a relative path, which is the only shape
 /// the lexicon describes.
-fn join_path(base: Option<&url::Url>, path: &str) -> String {
+fn join_path(base: Option<&url::Url>, path: &str) -> Option<String> {
+    // **`safe_link` on the way out, not only on the base.** The scheme
+    // guarantee used to live solely in `publication_from_records`; this
+    // function and `Publication` are both `pub`, so a caller that built a
+    // `Publication` some other way (the step-3 poller, from a stored row) gave
+    // an unparseable base — and the no-base branch then returned the
+    // document's `path` verbatim, putting `javascript:` into an entry link.
     let Some(base) = base else {
-        return path.to_string();
+        return crate::net::safe_link(path);
     };
     match base.join(path) {
         // A path that resolves off the publication's origin is not a path, it
         // is a redirect the publisher smuggled into a field we render as theirs.
-        Ok(joined) if joined.origin() == base.origin() => joined.to_string(),
-        _ => base.to_string(),
+        Ok(joined) if joined.origin() == base.origin() => crate::net::safe_link(joined.as_str()),
+        _ => crate::net::safe_link(base.as_str()),
     }
 }
 
@@ -255,6 +272,16 @@ pub async fn fetch(
 ) -> anyhow::Result<(Publication, Vec<Entry>)> {
     use anyhow::Context;
 
+    // The collection is part of the identity of what was subscribed to, and
+    // this function is `pub`: without the check it lists publications and
+    // matches on rkey alone, so `at://did/app.bsky.feed.post/<rkey>` would be
+    // "read as a publication" whenever a publication shares that rkey.
+    anyhow::ensure!(
+        uri.collection == nsid::STANDARD_PUBLICATION,
+        "{uri} is not a {} URI",
+        nsid::STANDARD_PUBLICATION
+    );
+
     let pds = crate::atproto::resolve_did_to_pds(http, plc_directory, &uri.authority)
         .await
         .with_context(|| format!("resolving the PDS for {}", uri.authority))?;
@@ -267,11 +294,25 @@ pub async fn fetch(
     let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
         .with_context(|| format!("{uri} is not a readable site.standard.publication"))?;
 
+    // Documents carry the whole article (~17 KB measured), so this walk is
+    // bounded by a cap sized to the record rather than the protocol default.
     let documents = client
-        .list_all_records(nsid::STANDARD_DOCUMENT)
+        .list_all_records_bounded(nsid::STANDARD_DOCUMENT, crate::atproto::MAX_LARGE_RECORDS)
         .await
         .with_context(|| format!("listing documents for {canonical_site}"))?;
     let entries = entries_from_records(&canonical_site, &publication, &documents);
+    // **A spelling mismatch on `site` looks exactly like an empty
+    // publication.** A publication with no documents is normal, so the poller
+    // would call this healthy forever; if the repo HAD documents and none
+    // matched, say so, because that is the shape of a bug rather than of a
+    // quiet blog.
+    if entries.is_empty() && !documents.is_empty() {
+        tracing::warn!(
+            site = %canonical_site,
+            documents = documents.len(),
+            "read a publication whose repo has documents but none reference it"
+        );
+    }
     Ok((publication, entries))
 }
 
@@ -416,16 +457,17 @@ mod tests {
             document("a", &site, "Relative", "/a"),
             document("b", &site, "Absolute-looking", "https://evil.example/x"),
         ];
-        let urls: Vec<String> = entries_from_records(&site, &pubn, &docs)
+        let urls: Vec<Option<String>> = entries_from_records(&site, &pubn, &docs)
             .into_iter()
             .map(|e| e.url)
             .collect();
-        assert_eq!(urls[0], "https://example.com/a");
+        assert_eq!(urls[0].as_deref(), Some("https://example.com/a"));
         // Exactly the publication's base, not merely "not evil": a mutation
         // that returned the raw path, or an empty string, passed the weaker
         // negative assertion this used to be.
         assert_eq!(
-            urls[1], "https://example.com/blog",
+            urls[1].as_deref(),
+            Some("https://example.com/blog"),
             "a document path that escapes its publication's origin must fall back to the base"
         );
     }
@@ -448,7 +490,7 @@ mod tests {
         let entries = entries_from_records(&site, &pubn, &[bare]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary, None);
-        assert_eq!(entries[0].url, "https://example.com/bare");
+        assert_eq!(entries[0].url.as_deref(), Some("https://example.com/bare"));
     }
 
     /// `description` is the authored summary; `textContent` is the whole body.
@@ -510,37 +552,129 @@ mod tests {
         );
     }
 
-    /// **Summaries are sanitised on the way in, exactly as RSS bodies are.**
-    /// `description` and `textContent` are a stranger's strings and the
-    /// template renders the stored body as HTML; the RSS path passes every
-    /// body through `feed::sanitize_html`, and this path must not be the one
-    /// that skips it.
+    /// **Summaries are plain text and are escaped, not sanitised.**
+    ///
+    /// The lexicon defines `textContent` and `description` as plain text, and
+    /// the store's `content_html` is rendered as HTML, so the text must be
+    /// escaped on the way in. The first version of this ran `ammonia::clean`
+    /// over them — the RSS body function — which parses its input as markup
+    /// and deletes everything after a bare `<`. 321 of 449 measured documents
+    /// use `textContent` as their summary; any post mentioning `Vec<T>` lost
+    /// the rest of its summary, silently.
     #[test]
-    fn summaries_are_sanitised_like_rss_bodies() {
+    fn summaries_are_escaped_as_plain_text_not_sanitised_as_markup() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let doc = |rkey: &str, body: &str| {
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                rkey,
+                json!({
+                    "title": "T",
+                    "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": "/d",
+                    "site": site,
+                    "textContent": body,
+                }),
+            )
+        };
+        let summaries: Vec<String> = entries_from_records(
+            &site,
+            &pubn,
+            &[
+                doc("a", "Vec<String> is a type"),
+                doc("b", "<script>alert(1)</script>"),
+            ],
+        )
+        .into_iter()
+        .filter_map(|e| e.summary)
+        .collect();
+        assert_eq!(
+            summaries[0], "Vec&lt;String&gt; is a type",
+            "prose was eaten by an HTML parser"
+        );
+        assert!(
+            !summaries[1].contains("<script"),
+            "escaping failed: {}",
+            summaries[1]
+        );
+    }
+
+    /// **`Entry.url` is a vetted href or nothing.** The scheme guarantee lived
+    /// only inside `publication_from_records`; `entries_from_records` and
+    /// `Publication` are both `pub`, so any other constructor — step 3 building
+    /// one from the stored `feeds` row, say — gave an unparseable base, and the
+    /// no-base branch then emitted the document's `path` verbatim. A
+    /// `javascript:` path became the entry link. This is the class `safe_link`
+    /// exists for.
+    #[test]
+    fn an_entry_url_is_never_an_unvetted_path() {
+        let pubn = Publication {
+            name: None,
+            // What a caller that did not go through `publication_from_records`
+            // can hand this function.
+            url: "not a url".to_string(),
+        };
+        let site = canonical("p");
+        let docs = vec![
+            document("a", &site, "Hostile", "javascript:alert(1)"),
+            document("b", &site, "Fine", "https://example.com/ok"),
+        ];
+        let entries = entries_from_records(&site, &pubn, &docs);
+        assert_eq!(
+            entries[0].url, None,
+            "an unvetted path became an entry link"
+        );
+        assert_eq!(entries[1].url.as_deref(), Some("https://example.com/ok"));
+    }
+
+    /// A document with no `publishedAt` is an entry with no date — the same
+    /// answer a garbage one gets. The field the module is willing to discard
+    /// must not be the one whose absence is fatal.
+    #[test]
+    fn a_document_without_published_at_is_still_an_entry() {
         let records = vec![publication("p", "https://example.com")];
         let (site, pubn) = publication_from_records("p", &records).unwrap();
         let doc = rec(
             nsid::STANDARD_DOCUMENT,
             "d",
-            json!({
-                "title": "T",
-                "publishedAt": "2026-07-11T00:00:00Z",
-                "path": "/d",
-                "site": site,
-                "description": "<script>alert(1)</script><b>bold</b> <a href=\"javascript:x\">l</a>",
-            }),
+            json!({ "title": "T", "path": "/d", "site": site }),
         );
         let entries = entries_from_records(&site, &pubn, &[doc]);
-        let summary = entries[0].summary.as_deref().unwrap();
-        assert!(!summary.contains("<script"), "script survived: {summary}");
-        assert!(
-            !summary.contains("javascript:"),
-            "javascript href survived: {summary}"
+        assert_eq!(
+            entries.len(),
+            1,
+            "a missing publishedAt dropped the document"
         );
+        assert_eq!(entries[0].published, None);
+    }
+
+    /// **`fetch` refuses a URI naming another collection, before the network.**
+    /// It lists publications and matches on rkey alone, so without this an
+    /// `app.bsky.feed.post` URI would be "read as a publication" whenever a
+    /// publication in that repo shares the rkey. Storage enforces the
+    /// collection today, but this function is `pub`.
+    #[tokio::test]
+    async fn fetch_refuses_a_uri_for_another_collection() {
+        let uri = AtUri::parse(&format!("at://{DID}/app.bsky.feed.post/3lab")).unwrap();
+        let err = fetch(&reqwest::Client::new(), "https://plc.example", &uri)
+            .await
+            .expect_err("read a feed post as a publication");
         assert!(
-            summary.contains("<b>bold</b>"),
-            "benign markup was destroyed: {summary}"
+            format!("{err:#}").contains(nsid::STANDARD_PUBLICATION),
+            "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// `AtUri` uses the crate's one spelling of the prefix.
+    #[test]
+    fn at_uri_parsing_uses_the_shared_prefix() {
+        let uri = format!(
+            "{}{DID}/{}/abc",
+            crate::atproto::AT_URI_PREFIX,
+            nsid::STANDARD_PUBLICATION
+        );
+        assert!(AtUri::parse(&uri).is_some());
     }
 
     /// The guid is the record's own URI. `path` is mutable; dedup is
