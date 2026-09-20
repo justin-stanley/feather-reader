@@ -6010,6 +6010,73 @@ mod tests {
         Ok(())
     }
 
+    /// **The migration is exercised against a table that predates the columns.**
+    ///
+    /// Every other test here builds a fresh database, where `CREATE TABLE`
+    /// already contains `last_error_kind` / `last_error` — so `ensure_column`,
+    /// the code path that actually runs against the production volume, was
+    /// never executed by any of them. A bad `ALTER` would have been found at
+    /// boot, on the one machine, by crash-looping: `apply_migrations` runs
+    /// inside `init`, and the entrypoint takes the container down when a child
+    /// dies.
+    ///
+    /// Builds the OLD table shape by hand, puts a failing row in it, migrates,
+    /// and asserts both that the columns arrive and that the pre-existing row
+    /// survives with NULLs rather than being rewritten or dropped.
+    #[tokio::test]
+    async fn the_last_error_columns_migrate_onto_a_table_that_predates_them() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        // Drop the current shape and rebuild the pre-migration one.
+        sqlx::query("DROP TABLE feeds").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE feeds (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                url                TEXT NOT NULL UNIQUE,
+                title              TEXT,
+                site_url           TEXT,
+                etag               TEXT,
+                last_modified      TEXT,
+                last_polled        TEXT,
+                next_poll          TEXT,
+                consecutive_errors INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO feeds (url, consecutive_errors) VALUES (?1, 7)")
+            .bind("https://legacy.example/feed.xml")
+            .execute(&pool)
+            .await?;
+
+        apply_migrations(&pool).await?;
+
+        // The columns exist...
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(feeds)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(cols.iter().any(|c| c == "last_error_kind"), "{cols:?}");
+        assert!(cols.iter().any(|c| c == "last_error"), "{cols:?}");
+
+        // ...and the pre-existing row is intact, with no invented cause.
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, last_error FROM feeds WHERE url = ?1",
+        )
+        .bind("https://legacy.example/feed.xml")
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.0, 7, "the migration disturbed an existing error count");
+        assert_eq!(row.1, None, "a legacy row was given a cause it never had");
+        assert_eq!(row.2, None);
+
+        // And it is idempotent — `init` runs this on every boot.
+        apply_migrations(&pool).await?;
+        Ok(())
+    }
+
     /// The stored detail is bounded — it is a remote server's text on an
     /// unattended path.
     #[tokio::test]
