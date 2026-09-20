@@ -33,7 +33,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether `at://…/site.standard.publication/…` feeds may be **subscribed to**. Polling them is NOT implemented yet: `due_feeds` excludes `at://` entirely, so such a row is skipped rather than failed. That is deliberate — handing one to the poller manufactures a permanent failure, published as an unreachable publisher, since `check_scheme` refuses the scheme. When the standard.site reader is wired to the scheduler this flag gates that too. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet (it must fetch what is pasted, and nothing fetches `at://`); that lands with the reader. Polling them is NOT implemented yet: `due_feeds` excludes `at://` entirely, so such a row is skipped rather than failed. That is deliberate — handing one to the poller manufactures a permanent failure, published as an unreachable publisher, since `check_scheme` refuses the scheme. When the standard.site reader is wired to the scheduler this flag gates that too. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -150,8 +150,12 @@ pub struct Config {
     /// switch. Defaults to the sidecar, so deploying the Rust client changes
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
-    /// Whether `at://` standard.site publications may be **subscribed to**.
-    /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
+    /// Whether an `at://` standard.site publication subscription may be
+    /// **stored** — via OPML import or a record another client wrote. The
+    /// subscribe form cannot take one yet: the add path must fetch what is
+    /// pasted and nothing fetches `at://`, so it refuses with its own message
+    /// rather than storing what it cannot poll. From
+    /// `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
     /// **Polling them is not implemented, and that is handled by exclusion
     /// rather than by this flag.** An earlier version of this comment claimed
@@ -558,7 +562,10 @@ impl Config {
             None => defaults.repo_backend,
         };
 
-        let standard_site = parse_standard_site(env_opt("FEATHERREADER_STANDARD_SITE").as_deref())?;
+        let standard_site = parse_standard_site(
+            env_opt("FEATHERREADER_STANDARD_SITE").as_deref(),
+            defaults.standard_site,
+        )?;
 
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
@@ -799,13 +806,14 @@ fn validate_claim_ttl(secs: i64) -> Result<i64> {
     Ok(secs)
 }
 
-/// Decide `FEATHERREADER_STANDARD_SITE` from its raw value: **off unless set
-/// on**. Pure so it can be tested without touching the process environment.
-fn parse_standard_site(raw: Option<&str>) -> Result<bool> {
+/// Decide `FEATHERREADER_STANDARD_SITE` from its raw value; unset means
+/// `default`, which is [`Config::default`]'s so the value lives in one place.
+/// Pure so it can be tested without touching the process environment.
+fn parse_standard_site(raw: Option<&str>, default: bool) -> Result<bool> {
     match raw {
         Some(raw) => parse_bool(raw)
             .with_context(|| format!("FEATHERREADER_STANDARD_SITE={raw:?} is not a boolean")),
-        None => Ok(false),
+        None => Ok(default),
     }
 }
 
@@ -1188,11 +1196,21 @@ mod tests {
     /// start accepting `at://` rows the poller skips.
     #[test]
     fn standard_site_is_off_unless_set_on() {
-        assert!(!parse_standard_site(None).unwrap(), "unset must mean off");
-        assert!(!parse_standard_site(Some("false")).unwrap());
-        assert!(parse_standard_site(Some("true")).unwrap());
-        assert!(parse_standard_site(Some("1")).unwrap());
-        let err = parse_standard_site(Some("maybe")).unwrap_err();
+        let default = Config::default().standard_site;
+        assert!(!default, "the shipped default must be off");
+        // Unset means THE default, whatever it is — not a second copy of it.
+        assert!(
+            !parse_standard_site(None, false).unwrap(),
+            "unset must mean off"
+        );
+        assert!(
+            parse_standard_site(None, true).unwrap(),
+            "unset must follow the default"
+        );
+        assert!(!parse_standard_site(Some("false"), true).unwrap());
+        assert!(parse_standard_site(Some("true"), false).unwrap());
+        assert!(parse_standard_site(Some("1"), false).unwrap());
+        let err = parse_standard_site(Some("maybe"), false).unwrap_err();
         assert!(
             format!("{err:#}").contains("FEATHERREADER_STANDARD_SITE"),
             "the error must name the variable: {err:#}"

@@ -220,9 +220,10 @@ operation in the table has recorded zero errors on both.
 
 ### standard.site publications
 
-`FEATHERREADER_STANDARD_SITE` (default `false`) allows subscribing to a
-[standard.site](https://standard.site) publication by its `at://` URI, as well
-as an RSS feed:
+`FEATHERREADER_STANDARD_SITE` (default `false`) allows this instance to
+**store** a subscription to a [standard.site](https://standard.site)
+publication — one that arrives through an OPML import, or as a record another
+client wrote to your repo:
 
 ```sh
 FEATHERREADER_STANDARD_SITE=true
@@ -240,8 +241,14 @@ otherwise. The scheduler excludes `at://` outright, so such a subscription is
 a broken feature of this reader as somebody else's website being down, which is
 exactly the confusion the failure breakdown exists to prevent.
 
-Setting the flag today therefore lets you record the subscription; articles
-arrive once the reader is wired to the scheduler.
+**Pasting an `at://` URI into the subscribe form does not work yet either**,
+with the flag on or off: the add path must fetch what you paste to find the
+feed in it, and nothing can fetch `at://`. It answers honestly — "not a kind of
+feed this instance can subscribe to" — rather than storing something it cannot
+poll. Both halves land together with the reader.
+
+Setting the flag today therefore lets an imported or externally-written
+subscription be kept; articles arrive once the reader is wired to the scheduler.
 
 ### Switching
 

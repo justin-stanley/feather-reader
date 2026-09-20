@@ -2949,6 +2949,22 @@ async fn add_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
+    // An `at://` input is decided on storability FIRST. The privacy arm fails
+    // closed as `Private` for anything under `at://` that is not a well-formed
+    // publication URI, which is right for a gate but wrong as a message: a
+    // typo'd rkey or a too-short DID is not a paid feed, and telling the reader
+    // it was (and logging a "refused private/paid feed") misdirects both. Only
+    // `at://` is pre-checked — an http(s) or scheme-less paste keeps its
+    // "Couldn't find a feed" path below, which is the accurate answer there.
+    if input.starts_with("at://") && !feed::is_storable_feed_url(&input, state.config.standard_site)
+    {
+        info!(url = %input, %did, "refused an at:// input this instance cannot store (not fetched)");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
+        );
+    }
+
     // Block private/paid feeds BEFORE any fetch/resolve so a secret-bearing URL is
     // never even requested. Public feeds only until atproto permissioned data
     // ships; there is no override and nothing is stored or written.
@@ -4931,6 +4947,12 @@ async fn import_opml(
     // Imported into the PDS but not cached locally, so not pollable until the
     // next import touches them. Counted rather than only logged — see below.
     let mut uncached: usize = 0;
+    // Entries this instance cannot store at all (an `at://` publication with
+    // the flag off, an unsupported scheme). Counted, because the `continue`
+    // below used to increment nothing while the privacy branch beside it
+    // produced a label — so an OPML from a standard.site-enabled instance
+    // imported "successfully" with entries missing and no reason given.
+    let mut skipped_unsupported: usize = 0;
     for f in &feeds {
         // `xmlUrl` is whatever the uploaded file says, and nothing on this path
         // ever parsed it — the single-add path can't reach here because
@@ -4944,6 +4966,7 @@ async fn import_opml(
                 %did,
                 "skipped an OPML entry whose xmlUrl is not a storable feed URL"
             );
+            skipped_unsupported += 1;
             continue;
         }
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
@@ -5075,6 +5098,13 @@ async fn import_opml(
             ". {} feed(s) skipped as private/paid: {} — not supported yet (public feeds only for now).",
             skipped_private.len(),
             skipped_private.join(", ")
+        ));
+    }
+    if skipped_unsupported > 0 {
+        // By count only — the URL is whatever the file said, and unlike the
+        // private branch there is no public-safe label to give.
+        flash.push_str(&format!(
+            ". {skipped_unsupported} feed(s) skipped: not a kind of feed this instance can subscribe to."
         ));
     }
     Ok(Redirect::to(&format!("/?flash={}", qenc(&flash))).into_response())
@@ -7912,6 +7942,108 @@ mod tests {
 
     /// OPML bulk import must honour the PER-DID subscription cap: a DID at its
     /// cap imports zero new feeds.
+    /// **A malformed `at://` on the add path is "not a kind of feed we take",
+    /// not "private/paid".** The first gate was the privacy classifier, whose
+    /// at:// arm fails closed as `Private` for anything not a well-formed
+    /// publication URI — so a typo (`did:plc:TOOSHORT`, a missing rkey) drew
+    /// the private-feed flash and a "refused private/paid feed" log line. On
+    /// main the same input reached `resolve_feed_url` and got "Couldn't find a
+    /// feed". Storability is decided first for an at:// input, with its own
+    /// message.
+    #[tokio::test]
+    async fn a_malformed_at_uri_on_the_add_path_is_refused_as_unsupported_not_private() {
+        let did = "did:plc:typoist";
+        let state = test_state_with_caps(did, 0, 0).await;
+        let cookie = session_cookie(&state, did, None);
+        for input in [
+            "at%3A%2F%2Falice.example.com%2Fsite.standard.publication",
+            "at%3A%2F%2Fdid%3Aplc%3ATOOSHORT%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+        ] {
+            let resp = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/subscriptions")
+                        .header(header::COOKIE, cookie.clone())
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("url={input}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(
+                loc.contains("kind%20of%20feed"),
+                "expected the unsupported-feed flash for {input}, got {loc}"
+            );
+            assert!(
+                !loc.contains("Private"),
+                "a storability refusal was reported as a privacy one for {input}: {loc}"
+            );
+        }
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// **An OPML entry this instance cannot store is counted and reported, not
+    /// silently dropped.** The storability `continue` incremented nothing,
+    /// while the privacy branch beside it produced a user-visible label — so
+    /// an OPML exported from a standard.site-enabled instance imported
+    /// "successfully" with entries missing and no reason given. The reader is
+    /// told how many, and why.
+    #[tokio::test]
+    async fn opml_import_reports_entries_this_instance_cannot_store() {
+        let did = "did:plc:renamer4";
+        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        assert!(!state.config.standard_site);
+        let opml = format!(
+            "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
+             <outline type=\"rss\" text=\"Real\" xmlUrl=\"https://real.example/feed.xml\"/>\n\
+             <outline type=\"rss\" text=\"Pub\" xmlUrl=\"{AT_URI_SUB}\"/>\n\
+             </body></opml>"
+        );
+        let (ct, body) = opml_multipart(opml.as_bytes());
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("Imported%201%20feed"),
+            "unexpected flash: {loc}"
+        );
+        assert!(
+            loc.contains("1%20feed%28s%29%20skipped") && loc.contains("can%20subscribe%20to"),
+            "the dropped entry was not reported: {loc}"
+        );
+        // Reported by count only: the at-URI itself is not echoed back.
+        assert!(
+            !loc.contains("site.standard.publication"),
+            "the URI was echoed: {loc}"
+        );
+    }
+
     #[tokio::test]
     async fn opml_import_enforces_per_did_cap() {
         let did = "did:plc:capped";
