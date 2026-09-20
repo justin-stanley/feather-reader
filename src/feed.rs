@@ -224,33 +224,6 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
     },
 ];
 
-/// Classify whether a feed URL carries a secret credential in the URL itself.
-///
-/// Returns [`FeedPrivacy::Private`] (with a reason) when the URL looks like it
-/// embeds a token / key / auth credential, else [`FeedPrivacy::Public`].
-///
-/// **Design — provider-agnostic first.** The primary defence is a generic
-/// credential-in-URL heuristic that catches paid feeds from *any* provider, not
-/// just the ones we've named; a secondary known-provider table adds precision
-/// (and a nicer reason) for the common paid newsletters and private podcasts. We
-/// deliberately **bias toward flagging**: a false-positive block of a public feed
-/// is low-harm (the user just can't add that one feed yet), whereas a false
-/// negative would leak a paid secret onto the public network — high-harm.
-///
-/// Detection (any one is sufficient):
-/// 1. **Userinfo** — `https://user:pass@host/…` embeds credentials directly.
-/// 2. **Known private-feed path markers** — [`PRIVATE_PATH_MARKERS`]
-///    (`/feed/private/`, `/members/`, `/subscriber/`, …).
-/// 3. **Credential query parameters** — a query key in [`SECRET_QUERY_KEYS`] with
-///    a long/opaque value (Patreon `?auth=`, Ghost `?uuid=`, `?token=`, …).
-/// 4. **High-entropy opaque token segments** — a long opaque blob (hex ≥ 16,
-///    base64url ≥ 16, or a UUID) anywhere in the path or a query value, even
-///    without a telltale name.
-/// 5. **Known providers** — [`KNOWN_PROVIDERS`] host (+ optional marker) match.
-///
-/// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
-/// a malformed URL downstream anyway, and we don't want a parse quirk to
-/// misclassify.
 /// Whether a URL may be **stored or published** as a feed URL at all.
 ///
 /// This is the storage-side twin of the scheme check `net::check_scheme` applies
@@ -275,14 +248,10 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
     // the handle form `at://alice.example.com/…` parses fine. So adding `"at"`
     // to the `matches!` below would appear to work and silently reject every
     // DID-based at-URI, which is all of them in practice.
-    if let Some(rest) = url.strip_prefix("at://") {
-        // **This gates STORING only — polling is handled by exclusion.**
-        // Storing an at-URI while nothing can poll it would manufacture a
-        // permanent failure per row: `poll_feed` reaches `net::guarded_get`,
-        // whose `check_scheme` refuses the scheme, and the result is published
-        // as an unreachable publisher. `store::due_feeds` therefore excludes
-        // `at://` outright, so such a row is skipped rather than failed. This
-        // flag decides whether one may be stored at all.
+    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
+        // **This gates STORING only — polling is handled by exclusion**, on
+        // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
+        // place the why is written down.
         return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
@@ -348,6 +317,33 @@ fn is_storable_at_authority(authority: &str) -> bool {
         .is_ok_and(|canonical| canonical == authority)
 }
 
+/// Classify whether a feed URL carries a secret credential in the URL itself.
+///
+/// Returns [`FeedPrivacy::Private`] (with a reason) when the URL looks like it
+/// embeds a token / key / auth credential, else [`FeedPrivacy::Public`].
+///
+/// **Design — provider-agnostic first.** The primary defence is a generic
+/// credential-in-URL heuristic that catches paid feeds from *any* provider, not
+/// just the ones we've named; a secondary known-provider table adds precision
+/// (and a nicer reason) for the common paid newsletters and private podcasts. We
+/// deliberately **bias toward flagging**: a false-positive block of a public feed
+/// is low-harm (the user just can't add that one feed yet), whereas a false
+/// negative would leak a paid secret onto the public network — high-harm.
+///
+/// Detection (any one is sufficient):
+/// 1. **Userinfo** — `https://user:pass@host/…` embeds credentials directly.
+/// 2. **Known private-feed path markers** — [`PRIVATE_PATH_MARKERS`]
+///    (`/feed/private/`, `/members/`, `/subscriber/`, …).
+/// 3. **Credential query parameters** — a query key in [`SECRET_QUERY_KEYS`] with
+///    a long/opaque value (Patreon `?auth=`, Ghost `?uuid=`, `?token=`, …).
+/// 4. **High-entropy opaque token segments** — a long opaque blob (hex ≥ 16,
+///    base64url ≥ 16, or a UUID) anywhere in the path or a query value, even
+///    without a telltale name.
+/// 5. **Known providers** — [`KNOWN_PROVIDERS`] host (+ optional marker) match.
+///
+/// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
+/// a malformed URL downstream anyway, and we don't want a parse quirk to
+/// misclassify.
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     // **`at://` is classified deliberately, and NOT doing so refused real
     // subscriptions.** An atproto rkey is a TID — 13 base32-sortable characters
@@ -360,7 +356,7 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     // `Public` is the right answer: a publication is a public record in a
     // public repo and the rkey is a handle, not a secret, so there is no
     // private/paid shape for this scheme to carry.
-    if let Some(rest) = url.strip_prefix("at://") {
+    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
         // **Only a WELL-FORMED publication URI is exempt.** The first version
         // of this was a bare prefix match, which declared any attacker-chosen
         // string starting `at://` safe to publish — skipping the userinfo
@@ -1743,18 +1739,6 @@ mod tests {
         assert_eq!(backoff_for(100), BACKOFF_MAX);
     }
 
-    /// **The DID form is the one that matters, and the one `Url::parse` cannot
-    /// read.**
-    ///
-    /// `Url::parse("at://did:plc:…/…")` fails with *invalid port number* — the
-    /// colons in the DID are taken as a port separator. So the obvious
-    /// implementation, adding `"at"` to the `matches!` on `u.scheme()`, silently
-    /// rejects every DID-based at-URI while appearing to work: the handle form
-    /// (`at://alice.example.com/…`) parses fine and would pass such a test.
-    ///
-    /// All 19 at-URI rows in production are the DID form. A test written with a
-    /// handle would have passed against an implementation that cannot store a
-    /// single one of them.
     /// **Storable and pollable are ONE decision.**
     ///
     /// Review found the sequencing error this closes: making `at://` storable
@@ -1886,6 +1870,18 @@ mod tests {
         }
     }
 
+    /// **The DID form is the one that matters, and the one `Url::parse` cannot
+    /// read.**
+    ///
+    /// `Url::parse("at://did:plc:…/…")` fails with *invalid port number* — the
+    /// colons in the DID are taken as a port separator. So the obvious
+    /// implementation, adding `"at"` to the `matches!` on `u.scheme()`, silently
+    /// rejects every DID-based at-URI while appearing to work: the handle form
+    /// (`at://alice.example.com/…`) parses fine and would pass such a test.
+    ///
+    /// All 19 at-URI rows in production are the DID form. A test written with a
+    /// handle would have passed against an implementation that cannot store a
+    /// single one of them.
     #[test]
     fn a_did_form_publication_uri_is_storable() {
         assert!(is_storable_feed_url(

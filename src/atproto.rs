@@ -131,6 +131,16 @@ const MAX_LIST_PAGES: usize = 200;
 /// makes the claim true rather than conditional on the server's cooperation.
 const MAX_LIST_RECORDS: usize = 20_000;
 
+/// The at-URI scheme prefix, **the one Rust spelling**. Every Rust guard that
+/// asks "is this an at-URI" goes through here or [`is_at_uri`]; the SQL side is
+/// [`crate::store::UNPOLLABLE_URL_SQL`], and a test pins that the two agree.
+pub(crate) const AT_URI_PREFIX: &str = "at://";
+
+/// Case-sensitive, like every other at-URI check in this crate.
+pub(crate) fn is_at_uri(s: &str) -> bool {
+    s.starts_with(AT_URI_PREFIX)
+}
+
 /// atproto's record-key rules, all of them: charset `[A-Za-z0-9._:~-]`, length
 /// 1..=512, and not `.` or `..`. The repo's TID tests state the same rule; this
 /// is the one place it is enforced on a key that arrives from outside.

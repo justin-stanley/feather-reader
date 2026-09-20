@@ -33,7 +33,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet (it must fetch what is pasted, and nothing fetches `at://`); that lands with the reader. Polling them is NOT implemented yet: `due_feeds` excludes `at://` entirely, so such a row is skipped rather than failed. That is deliberate — handing one to the poller manufactures a permanent failure, published as an unreachable publisher, since `check_scheme` refuses the scheme. When the standard.site reader is wired to the scheduler this flag gates that too. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet, and nothing polls one: `at://` rows are skipped by scheme, not failed (see `store::UNPOLLABLE_URL_SQL`). Both land with the standard.site reader. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -153,22 +153,14 @@ pub struct Config {
     /// Whether an `at://` standard.site publication subscription may be
     /// **stored** — via OPML import or a record another client wrote. The
     /// subscribe form cannot take one yet: the add path must fetch what is
-    /// pasted and nothing fetches `at://`, so it refuses with its own message
-    /// rather than storing what it cannot poll. From
-    /// `FEATHERREADER_STANDARD_SITE`, default **off**.
+    /// pasted and nothing fetches `at://`, so it refuses with its own message.
+    /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
-    /// **Polling them is not implemented, and that is handled by exclusion
-    /// rather than by this flag.** An earlier version of this comment claimed
-    /// one flag gated both subscribing and polling. It did not: nothing outside
-    /// the two storable-guard call sites ever read it, so turning it on
-    /// produced exactly the permanent failures it promised to prevent —
-    /// `poll_feed` reaches `net::guarded_get`, whose `check_scheme` refuses the
-    /// scheme.
-    ///
-    /// What is true now: [`crate::store::due_feeds`] excludes `at://` outright,
-    /// so such a row is **skipped, not failed**. When the standard.site reader
-    /// is wired to the scheduler, this flag gates that too — and the exclusion
-    /// becomes a dispatch.
+    /// **This flag does not gate polling; nothing does, because nothing polls
+    /// an `at://` row.** An earlier version of this comment claimed one flag
+    /// gated both. It did not — nothing outside the storable guards read it.
+    /// Why `at://` rows are skipped rather than failed, and where that one
+    /// decision lives, is documented once on [`crate::store::UNPOLLABLE_URL_SQL`].
     pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
