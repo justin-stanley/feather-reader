@@ -3713,7 +3713,15 @@ pub struct PollHealth {
 ///
 /// Chosen to mean "this is not a transient blip": `feed::backoff_for` climbs
 /// exponentially, so by this many consecutive failures a feed is being retried
-/// hours apart and is almost certainly gone rather than flaky.
+/// hours apart.
+///
+/// **It says nothing about whose fault that is, and used to claim otherwise.**
+/// This comment — and the matching copy on `/stats` — read "almost certainly
+/// gone rather than flaky" until 2026-09-20, when #159 found that 60-odd feeds
+/// sat here because `guarded_get` was reading every `304 Not Modified` as a
+/// malformed redirect. The publishers were live; the reader was broken. An
+/// assertion about cause that the row cannot support is worse than no
+/// assertion, because it is what stopped anyone looking.
 const BADLY_BROKEN_ERRORS: i64 = 6;
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same

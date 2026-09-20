@@ -93,8 +93,10 @@
         <strong>Failing</strong> feeds retry on a widening delay, so they are
         <em>not</em> in the backlog — a broken feed makes the backlog look
         better, not worse, which is why the two are listed separately. The
-        second figure, when shown, is feeds retrying hours apart: usually gone
-        rather than flaky.
+        second figure, when shown, is feeds retrying hours apart — the far end
+        of that delay. A feed arrives there whether its publisher has gone away
+        or this reader is failing to fetch it correctly, and the count alone
+        cannot tell those apart.
       </p>
       <p>
         <strong>Fetching</strong> says whether new content arrives at all.
