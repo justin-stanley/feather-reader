@@ -181,6 +181,36 @@ pub(crate) fn extend_truncating(
     dropped
 }
 
+/// The result of a bounded walk: what was read, and whether that is all of it.
+///
+/// **`complete` is a fact the caller cannot recover afterwards.** A short list
+/// from a truncating walk looks exactly like a short collection, and the
+/// difference is the one that matters: "this publication has nine articles" and
+/// "this reader gave up after nine" are the same `Vec` and very different
+/// answers.
+#[derive(Debug)]
+pub struct RecordWalk {
+    /// The records kept, in the order the PDS returned them.
+    pub records: Vec<RecordEntry>,
+    /// True when the collection ran out before any bound did.
+    pub complete: bool,
+}
+
+impl RecordWalk {
+    fn complete(records: Vec<RecordEntry>) -> Self {
+        Self {
+            records,
+            complete: true,
+        }
+    }
+    fn partial(records: Vec<RecordEntry>) -> Self {
+        Self {
+            records,
+            complete: false,
+        }
+    }
+}
+
 /// Append a page, refusing to exceed `max`.
 ///
 /// **An error, never a truncation.** The caller of the live walk is
@@ -820,6 +850,7 @@ impl PdsClient {
         Ok(out)
     }
 
+    /// See [`RecordWalk`].
     /// The most recent records of a collection that the caller **keeps**,
     /// truncating rather than refusing.
     ///
@@ -851,7 +882,7 @@ impl PdsClient {
         max_records: usize,
         page_size: u32,
         mut keep: impl FnMut(&RecordEntry) -> bool,
-    ) -> Result<Vec<RecordEntry>> {
+    ) -> Result<RecordWalk> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
@@ -859,24 +890,35 @@ impl PdsClient {
                 .list_records(collection, Some(page_size), cursor.as_deref())
                 .await?;
             let got = page.records.len();
+            // Is there a next page that is actually new? (A PDS may echo a
+            // cursor with an empty page, or hand back the same one forever.)
+            let more =
+                matches!(&page.cursor, Some(next) if got > 0 && Some(next) != cursor.as_ref());
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
             if extend_truncating(&mut out, kept, max_records) {
-                tracing::warn!(
-                    collection,
-                    kept = out.len(),
-                    "record walk hit its cap; reading part of the archive only"
-                );
-                break;
+                return Ok(RecordWalk::partial(out));
             }
             if out.len() >= max_records {
-                break;
+                // Landing exactly on the cap is only a truncation if the
+                // collection had more to give — `extend_truncating` cannot see
+                // that, so the caller's "incomplete" signal is decided here.
+                return Ok(RecordWalk {
+                    complete: !more,
+                    records: out,
+                });
             }
-            match page.cursor {
-                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
-                _ => break,
+            if !more {
+                return Ok(RecordWalk::complete(out));
             }
+            cursor = page.cursor;
         }
-        Ok(out)
+        // **The page budget ran out with the collection still going.** Silence
+        // here reintroduces the starvation this function exists to prevent, one
+        // order of magnitude further out: a quiet publication in a repo whose
+        // busy sibling has more records than MAX_LIST_PAGES × page_size can
+        // reach returns nothing at all, forever, having spent every round trip
+        // to find out. The caller is told so it can say which feed.
+        Ok(RecordWalk::partial(out))
     }
 
     /// `com.atproto.repo.createRecord` — create a new record (server assigns the
@@ -1336,8 +1378,7 @@ impl SidecarClient {
         let data = self.repo(body).await?;
         // The sidecar proxies the PDS's body, so the 2xx-envelope case arrives
         // here too — and `RepoOk.data` is a defaulted `Value`.
-        reject_error_envelope(&data)?;
-        serde_json::from_value(data).context("parsing sidecar listRecords data")
+        list_records_from_value(data).context("parsing sidecar listRecords data")
     }
 
     /// Page through **all** records in a collection for `did`.
@@ -1957,7 +1998,29 @@ pub(crate) fn urlencode(s: &str) -> String {
 /// failures; the status check in the caller cannot see those.
 pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     let value: Value = serde_json::from_slice(body).context("parsing listRecords response")?;
+    list_records_from_value(value)
+}
+
+/// Turn an already-parsed `listRecords` body into a page, enforcing **both**
+/// invariants every caller needs.
+///
+/// **One function, because the guards kept being added to one caller at a
+/// time.** The error-envelope check landed on the anonymous client first and
+/// had to be added to the OAuth and sidecar clients a round later; the
+/// records-presence check landed on the OAuth client and had to be added to
+/// the other two a round after that. Both failures are the same: a body that
+/// is not a listing deserialises to an empty page, `resolve_subscriptions`
+/// reads that as "this DID follows nothing" instead of taking its fail-closed
+/// branch, and `replace_sub_refs` DELETEs the reader's whole `sub_ref`
+/// projection. Anything that reads a listRecords body goes through here.
+pub(crate) fn list_records_from_value(value: Value) -> Result<ListRecordsResponse> {
     reject_error_envelope(&value)?;
+    // `records` is `#[serde(default)]`, so `{}` — what a proxy produces from an
+    // empty or unexpected upstream body — is otherwise a page of zero records.
+    anyhow::ensure!(
+        value.get("records").is_some(),
+        "listRecords returned no records field (empty or unexpected body)"
+    );
     serde_json::from_value(value).context("parsing listRecords response")
 }
 
@@ -2202,10 +2265,124 @@ mod tests {
                     .unwrap_or(false)
             })
             .await
-            .expect("walk failed");
+            .expect("walk failed")
+            .records;
         // One page, no cursor: one match survives. The point is that the three
         // non-matching records did NOT consume the cap.
         assert_eq!(kept.len(), 1, "the filter ran after the cap, not before it");
+    }
+
+    /// **A walk that stopped early says so.** Landing exactly on the cap, or
+    /// running out of page budget, returns the same short `Vec` as a small
+    /// collection — and the caller cannot tell them apart afterwards. That
+    /// silence is how the starvation this walk exists to prevent came back one
+    /// order of magnitude further out: a quiet publication whose busy sibling
+    /// fills every page returns nothing, forever, looking healthy.
+    #[tokio::test]
+    async fn a_walk_that_stops_early_reports_itself_incomplete() {
+        let records: Vec<Value> = (0..2)
+            .map(|i| serde_json::json!({"uri": format!("at://did:plc:x/c/{i}"), "value": {}}))
+            .collect();
+        // Every page is full AND advertises another — the shape that lands on
+        // the cap with the collection still going.
+        let body = serde_json::json!({ "records": records, "cursor": "next" }).to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "incomplete-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://incomplete-pds.test:{port}"),
+            "did:plc:x",
+        );
+
+        let walk = client
+            .list_recent_matching("c", 2, 100, |_| true)
+            .await
+            .expect("walk failed");
+        assert_eq!(walk.records.len(), 2);
+        assert!(
+            !walk.complete,
+            "a walk that filled its cap with pages still to come called itself complete"
+        );
+    }
+
+    /// The other side: a collection that runs out IS complete, so the caller
+    /// does not warn about every ordinary small publication.
+    #[tokio::test]
+    async fn a_walk_that_exhausts_the_collection_reports_itself_complete() {
+        let body = serde_json::json!({
+            "records": [{"uri": "at://did:plc:x/c/1", "value": {}}]
+        })
+        .to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "complete-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://complete-pds.test:{port}"),
+            "did:plc:x",
+        );
+
+        let walk = client
+            .list_recent_matching("c", 100, 100, |_| true)
+            .await
+            .expect("walk failed");
+        assert_eq!(walk.records.len(), 1);
+        assert!(walk.complete, "an exhausted collection is a complete read");
+    }
+
+    /// **`{}` is not a page of zero records.** The records-presence guard
+    /// landed on the OAuth client first; a proxy answering
+    /// `{"ok":true,"data":{}}` kept the same `sub_ref`-wipe open on the
+    /// sidecar path, and `{}` from a stranger's PDS made an empty publication
+    /// look healthy.
+    #[test]
+    fn a_body_without_a_records_field_is_not_an_empty_page() {
+        let err = list_records_from_value(serde_json::json!({}))
+            .expect_err("`{}` was read as a page of zero records");
+        assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+        let err = list_records_from_value(serde_json::json!({"cursor": "c"}))
+            .expect_err("a cursor-only body was read as a page");
+        assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+        let page = list_records_from_value(serde_json::json!({"records": []})).unwrap();
+        assert!(page.records.is_empty());
+    }
+
+    /// The sidecar path needs the records guard too, not only the envelope
+    /// one: `{"ok":true,"data":{}}` is what a proxy makes of an empty or
+    /// unexpected upstream body.
+    #[tokio::test]
+    async fn the_sidecar_client_refuses_a_data_object_without_records() {
+        let base = crate::net::tests::serve_body(br#"{"ok":true,"data":{}}"#.to_vec()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                None,
+                None,
+            )
+            .await
+            .expect_err("`data: {}` was read as an empty repo");
+        assert!(format!("{err:#}").contains("no records field"), "{err:#}");
     }
 
     /// An exactly-full final page dropped nothing, so it must not warn that it
@@ -2262,11 +2439,19 @@ mod tests {
             "did:plc:x",
         );
 
-        let kept = client
+        let walk = client
             .list_recent_matching("site.standard.document", 3, 100, |_| true)
             .await
             .expect("a big archive must be readable, not an error");
-        assert_eq!(kept.len(), 3, "the walk did not truncate to its cap");
+        assert_eq!(
+            walk.records.len(),
+            3,
+            "the walk did not truncate to its cap"
+        );
+        assert!(
+            !walk.complete,
+            "a truncated walk must not report completeness"
+        );
 
         // The fail-closed walk still refuses the same overshoot.
         let err = client

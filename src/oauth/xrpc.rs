@@ -135,28 +135,11 @@ impl Repo<'_> {
         // defaulting to `[]` turned a PDS failure into `Ok(vec![])`, which
         // `resolve_subscriptions` reads as "this DID follows nothing" and
         // `sync_sub_refs` then writes through, revoking every `sub_ref`.
-        crate::atproto::reject_error_envelope(&value)?;
-        // **An empty body is not an empty repo.** `send` maps a zero-length
-        // 2xx to `Value::Null` — deliberately, for `deleteRecord` and
-        // `applyWrites` — so on this path it walked straight past the envelope
-        // guard into `unwrap_or(Array([]))`, which is the same `sub_ref` wipe
-        // through the sibling door. A listRecords response HAS a `records`
-        // field; anything without one is not an answer to this question.
-        anyhow::ensure!(
-            value.get("records").is_some(),
-            "listRecords returned no records field (empty or non-JSON body)"
-        );
-        let records: Vec<RecordEntry> = serde_json::from_value(
-            value
-                .get("records")
-                .cloned()
-                .unwrap_or(Value::Array(vec![])),
-        )
-        .context("listRecords returned records this client cannot parse")?;
-        let cursor = value
-            .get("cursor")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        // Both invariants, through the one function every listRecords caller
+        // shares — this check was added here first and had to be fitted to the
+        // other two clients a round later.
+        let page = crate::atproto::list_records_from_value(value)?;
+        let (records, cursor) = (page.records, page.cursor);
         Ok((records, cursor))
     }
 

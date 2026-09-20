@@ -198,7 +198,17 @@ pub fn entries_from_records(
     publication: &Publication,
     records: &[crate::atproto::RecordEntry],
 ) -> Vec<Entry> {
-    let base = url::Url::parse(&publication.url).ok();
+    // **Normalised to a directory.** `Url::join` is RFC-3986: against a base of
+    // `https://example.com/blog`, a relative `posts/a` resolves to
+    // `/posts/a`, silently dropping the subpath every permalink needs. A
+    // trailing slash makes the base a directory, which is what a publication
+    // URL means.
+    let base = url::Url::parse(&publication.url).ok().map(|mut u| {
+        if !u.path().ends_with('/') {
+            u.set_path(&format!("{}/", u.path()));
+        }
+        u
+    });
     records
         .iter()
         .filter_map(|record| {
@@ -252,9 +262,14 @@ fn join_path(base: Option<&url::Url>, path: &str) -> Option<String> {
     // `Publication` some other way (the step-3 poller, from a stored row) gave
     // an unparseable base — and the no-base branch then returned the
     // document's `path` verbatim, putting `javascript:` into an entry link.
-    let Some(base) = base else {
-        return crate::net::safe_link(path);
-    };
+    // **No base, no URL.** This branch used to return `safe_link(path)`, which
+    // vets the scheme but NOT the origin — so a caller holding a `Publication`
+    // it did not build through `publication_from_records` (the step-3 poller,
+    // from a stored row whose `site_url` is NULL or malformed) would publish a
+    // publisher-controlled `https://evil.example/x` as a permalink under that
+    // publication's name. The two branches agree now: off-origin is `None`, and
+    // "no origin to be off" is also `None`.
+    let base = base?;
     match base.join(path) {
         // A path that resolves off the publication's origin is not a path, it
         // is a redirect the publisher smuggled into a field we render as theirs.
@@ -380,7 +395,20 @@ pub async fn fetch(
         )
         .await
         .with_context(|| format!("listing documents for {canonical_site}"))?;
-    let entries = entries_from_records(&canonical_site, &publication, &documents);
+    let entries = entries_from_records(&canonical_site, &publication, &documents.records);
+
+    // **A walk that stopped early is not a short archive.** Reading part of a
+    // publication is acceptable; reporting it as the whole of one is not, and
+    // when the part is empty — a quiet publication whose busy sibling fills
+    // every page this reader will fetch — the feed looks healthy and stays
+    // empty forever.
+    if !documents.complete {
+        tracing::warn!(
+            site = %canonical_site,
+            kept = entries.len(),
+            "stopped reading this publication before its documents ran out"
+        );
+    }
     // **A spelling mismatch on `site` looks exactly like an empty
     // publication.** A publication with no documents is normal, so the poller
     // would call this healthy forever; if the repo HAD documents and none
@@ -708,7 +736,14 @@ mod tests {
             entries[0].url, None,
             "an unvetted path became an entry link"
         );
-        assert_eq!(entries[1].url.as_deref(), Some("https://example.com/ok"));
+        // Contract change: with no parseable base there is no origin to check,
+        // so a well-formed absolute URL is refused too. `safe_link` alone vets
+        // the SCHEME; it would have published a publisher-controlled host under
+        // this publication's name. See `no_parseable_base_means_no_url_not_any_url`.
+        assert_eq!(
+            entries[1].url, None,
+            "an off-origin absolute URL was published under the publication's name"
+        );
     }
 
     /// A document with no `publishedAt` is an entry with no date — the same
@@ -746,6 +781,40 @@ mod tests {
         assert!(
             format!("{err:#}").contains(nsid::STANDARD_PUBLICATION),
             "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **A publication on a subpath keeps it.** `Url::join` is RFC-3986, so a
+    /// relative `posts/a` against `https://example.com/blog` resolves to
+    /// `/posts/a` — dropping the subpath every permalink needs, while still
+    /// passing the origin check. The base is normalised to a directory.
+    #[test]
+    fn a_subpath_publication_keeps_its_base_path() {
+        let records = vec![publication("p", "https://example.com/blog")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![document("a", &site, "Relative", "posts/a")];
+        let urls: Vec<Option<String>> = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .map(|e| e.url)
+            .collect();
+        assert_eq!(urls[0].as_deref(), Some("https://example.com/blog/posts/a"));
+    }
+
+    /// With no parseable base there is no origin to check, so there is no URL
+    /// — `safe_link` alone vets the scheme and would pass any absolute URL a
+    /// publisher chose, under this publication's name.
+    #[test]
+    fn no_parseable_base_means_no_url_not_any_url() {
+        let pubn = Publication {
+            name: None,
+            url: "not a url".to_string(),
+        };
+        let site = canonical("p");
+        let docs = vec![document("a", &site, "Absolute", "https://evil.example/x")];
+        let entries = entries_from_records(&site, &pubn, &docs);
+        assert_eq!(
+            entries[0].url, None,
+            "an off-origin absolute URL was published"
         );
     }
 
