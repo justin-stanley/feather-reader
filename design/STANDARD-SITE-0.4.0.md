@@ -261,15 +261,48 @@ a_document_with_neither_textContent_nor_description_still_yields_an_entry
     // failure state. Mutation: `?` on the summary → 8% of entries vanish.
 ```
 
-### 2. Make `at://` storable
+### 2. Make `at://` storable — **behind the same flag that makes it pollable**
 
-`feed::is_storable_feed_url` (`feed.rs:271`) learns `at://` as an **allowlist
-entry**, not a loosening. Nothing polls it yet — this only stops *new* `at://`
-subscriptions being refused.
+`feed::is_storable_feed_url` learns `at://` as an **allowlist entry**, not a
+loosening.
+
+> **Correction (2026-09-20).** This step previously read *"Nothing polls it yet
+> — this only stops new `at://` subscriptions being refused."* **That is false,
+> and it is the sentence that produced the bug.**
+>
+> Storing an at-URI does not leave the feature dormant. The two callers upsert
+> with `next_poll` NULL, and `due_feeds` sorts NULLs **first**, so the row is
+> polled on the very next tick, dies in `Url::parse`, and is recorded as a
+> `fetch` failure. Since #166 that failure is *published* — this reader's
+> unimplemented feature displayed as an unreachable publisher, which is exactly
+> the conflation the cause histogram exists to end.
+>
+> The 19 rows already in production are the proof: they have never been polled
+> successfully and sit at 35 consecutive errors each.
+>
+> So steps 2 and 3 are gated by **one** flag, `FEATHERREADER_STANDARD_SITE`,
+> defaulting off. Not two flags that could drift into the state above — one, so
+> "storable" and "pollable" cannot disagree. The step below that reads "wire
+> into the poller behind a flag" is that same flag, not another.
 
 ```rust
+an_at_uri_is_not_storable_while_standard_site_is_off
+    // The sequencing test. GREEN when the flag gates BOTH halves.
+
 an_at_uri_is_storable
-    // GREEN when: is_storable_feed_url("at://did:plc:x/site.standard.publication/y")
+    // GREEN when: is_storable_feed_url("at://did:plc:x/site.standard.publication/y", true)
+
+a_hostile_at_uri_authority_is_not_storable
+    // Reuse `normalize_handle`: a bare dot-check admits 169.254.169.254,
+    // pds.internal, printer.local, host:port and uppercase — the hole
+    // `is_bare_did_web_host` records having fixed once for did:web.
+
+a_realistic_at_uri_rkey_is_not_mistaken_for_a_secret
+    // MEASURED: an rkey is a TID, and classify_feed_privacy's generic
+    // "high-entropy token in path" heuristic calls one a credential — so a
+    // handle-form subscription was REFUSED as a private feed. A short fake
+    // rkey does not trip it, which is why the first test of this passed with
+    // and without the fix.
 
 a_javascript_or_file_url_is_still_refused
     // The reason the function exists. Mutation: widen to "any scheme" → this
@@ -281,11 +314,14 @@ check_scheme_still_rejects_at_uris
     // quietly grown a scheme it cannot resolve or pin.
 ```
 
-### 3. Wire into the poller behind a flag, defaulting off
+### 3. Wire into the poller — the SAME flag as step 2
 
-Same shape as `FEATHERREADER_REPO_BACKEND` in 0.3.0 — the house pattern, and it
-lets the 19 existing rows be exercised in production with nothing visible to
-anyone.
+`FEATHERREADER_STANDARD_SITE`, not a second one. See the correction under step 2
+for why two flags is the shape that produced the bug.
+
+Until this step lands the flag stays off, so step 2 changes nothing observable;
+turning it on is what makes both halves live at once. That also lets the 19
+existing rows be exercised deliberately rather than on the next deploy.
 
 ```rust
 an_at_uri_feed_is_skipped_when_the_flag_is_off
