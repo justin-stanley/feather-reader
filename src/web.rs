@@ -6907,7 +6907,15 @@ mod tests {
             "public, max-age=300"
         );
         // The security headers are still intact.
-        assert!(about.headers().contains_key("content-security-policy"));
+        // The VALUE, spelled out here rather than compared to the constant —
+        // `== CONTENT_SECURITY_POLICY` passes with the constant gutted. This
+        // used to assert only that the header existed, which a policy of
+        // `default-src *` satisfies.
+        assert_eq!(
+            about.headers()["content-security-policy"],
+            EXPECTED_CSP,
+            "the CSP is not the policy the router promises"
+        );
         assert_eq!(about.headers().get("x-frame-options").unwrap(), "DENY");
 
         // /privacy and /terms are static public pages → public, cacheable.
@@ -6924,7 +6932,7 @@ mod tests {
                 "{path} should be publicly cacheable"
             );
             // Security headers apply to these pages too.
-            assert!(resp.headers().contains_key("content-security-policy"));
+            assert_eq!(resp.headers()["content-security-policy"], EXPECTED_CSP);
             assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
         }
 
@@ -7023,18 +7031,28 @@ mod tests {
         assert!(saw_429, "expected a 429 after exhausting the burst");
     }
 
+    /// **A forged `X-Forwarded-For` does not key the limiter** — the property
+    /// the middleware's comment cites this test as proof of.
+    ///
+    /// The previous version rotated the forged header and asserted that no
+    /// request was EVER 429'd. Rotating addresses can never exhaust a per-IP
+    /// burst, so that assertion held whether the header was trusted or
+    /// ignored — it passed in the vulnerable configuration too. And with no
+    /// socket peer the limiter fails open, so nothing could have been keyed on
+    /// anything. Now one real peer sends `RATE_BURST + 5` requests, each with
+    /// a DIFFERENT forged header, and the last must be 429: they all landed in
+    /// the peer's bucket. A limiter keying on the header mints a fresh bucket
+    /// per request and never trips — which is exactly what the mutation does.
     #[tokio::test]
-    async fn rate_limit_ignores_spoofed_xff_rotation() {
-        // WITHOUT a trusted header, rotating a forged X-Forwarded-For per request
-        // must NOT mint a fresh bucket each time: the oneshot harness sets no
-        // socket peer, so client_ip yields None and the limiter fails open —
-        // crucially it never keys on the attacker-chosen XFF. We assert every
-        // request is admitted (no 429), proving the forged header is not being
-        // used as the bucket key (which would be the vulnerable behaviour only if
-        // it *were* trusted; here the burst can't be exhausted per-IP because the
-        // attacker can't address a single victim bucket via XFF).
+    async fn a_forged_forwarded_for_header_does_not_key_the_limiter() {
         let state = test_state(&[]).await;
+        assert!(
+            state.config.trusted_ip_header.is_none(),
+            "no proxy header is trusted here"
+        );
         let app = router(state);
+        let peer = std::net::SocketAddr::from(([203, 0, 113, 7], 40000));
+        let mut saw_429 = false;
         for i in 0..(RATE_BURST as usize + 5) {
             let forged = format!("10.9.8.{}", i % 250);
             let resp = app
@@ -7045,20 +7063,292 @@ mod tests {
                         .uri("/beta/redeem")
                         .header("content-type", "application/x-www-form-urlencoded")
                         .header("x-forwarded-for", forged)
+                        .extension(axum::extract::ConnectInfo(peer))
                         .body(Body::from("code=FEATHER-NOPENOPE"))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_ne!(
-                resp.status(),
-                StatusCode::TOO_MANY_REQUESTS,
-                "untrusted XFF must not be used as the rate-limit key"
-            );
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
         }
+        assert!(
+            saw_429,
+            "rotating a forged X-Forwarded-For minted fresh buckets: the limiter is keyed on an attacker-chosen header"
+        );
     }
 
     // -- OPML import body cap (DefaultBodyLimit → 413) -------------------------
+
+    /// **A private feed is refused BEFORE it is fetched.** The add path's
+    /// privacy gate had no test at all — `private_feeds_are_classified_private_
+    /// across_providers` says "the add + OPML paths both gate on this
+    /// classifier" and nothing checked either. The gate exists so a
+    /// token-bearing URL never reaches the network; the assertion that
+    /// matters is the server's hit count: zero.
+    #[tokio::test]
+    async fn subscribing_to_a_private_feed_never_reaches_the_network() {
+        let did = "did:plc:privateadder";
+        let state = test_state_with_caps(did, 0, 0).await;
+        let (base, hits) = crate::net::tests::serve_body_counted(b"<rss/>".to_vec()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "private-add.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "url=http%3A%2F%2Fprivate-add.test%3A{port}%2Ffeed%2Fprivate%2Fdeadbeefcafe1234"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.contains("Private"), "not refused as private: {loc}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the private feed was FETCHED before being refused"
+        );
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// **OPML import skips a private feed without storing or publishing it.**
+    /// The import path does not fetch, so "never fetched" is not the signal
+    /// here; "never stored, never written to the PDS" is. The batch write's
+    /// bytes are captured and must not carry the URL.
+    #[tokio::test]
+    async fn opml_import_skips_a_private_feed_without_storing_or_publishing_it() {
+        let did = "did:plc:renamer4";
+        let (sidecar, bodies) = spawn_logging_sidecar().await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let tokened = "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4";
+        let opml = format!(
+            "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
+             <outline type=\"rss\" text=\"Public\" xmlUrl=\"https://public.example/feed.xml\"/>\n\
+             <outline type=\"rss\" text=\"Paid\" xmlUrl=\"{tokened}\"/>\n\
+             </body></opml>"
+        );
+        let (ct, body) = opml_multipart(opml.as_bytes());
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("skipped%20as%20private"),
+            "not reported as skipped: {loc}"
+        );
+        assert!(store::get_feed_by_url(&state.db, tokened)
+            .await
+            .unwrap()
+            .is_none());
+        let sent = bodies.lock().unwrap().join("\n");
+        assert!(
+            sent.contains("public.example"),
+            "the public feed was not written: {sent}"
+        );
+        assert!(
+            !sent.contains("Zm9vYmFyc2VjcmV0dG9rZW4"),
+            "the secret was PUBLISHED to the PDS: {sent}"
+        );
+    }
+
+    /// **`GET /login?handle=` is gated like `POST /login`.** Only the POST was
+    /// tested; the GET form starts the same handshake and had no test, so
+    /// deleting its gate left the suite green.
+    #[tokio::test]
+    async fn get_login_without_a_seat_is_refused() {
+        let state = test_state(&[]).await;
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/login?handle=alice.bsky.social")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/beta/redeem"
+        );
+    }
+
+    /// A sidecar fake that answers every request `ok` and records the PATH of
+    /// each in arrival order, plus every body — for asserting what was sent,
+    /// and in what order.
+    async fn spawn_logging_sidecar() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let text = loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        break String::new();
+                    };
+                    if n == 0 {
+                        break String::from_utf8_lossy(&raw).to_string();
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|w| body.len() >= w) {
+                        break String::from_utf8_lossy(&raw).to_string();
+                    }
+                };
+                let path = text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let body_text = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or("")
+                    .to_string();
+                sink.lock().unwrap().push(format!("{path} {body_text}"));
+                let body = serde_json::json!({ "ok": true, "did": "did:plc:x", "revoked": true, "hadSession": true, "data": {"uri": "at://did:plc:x/c/r", "cid": "bafy"} }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    /// **Sign-out flushes dirty read-state BEFORE it revokes — through the
+    /// route.** The previous version of this test called
+    /// `flush_before_revoke` and `revoke_everywhere` itself and asserted one
+    /// flush attempt; its doc claimed deleting the call from the handler
+    /// "drops that to zero", which was false — the handler was never run.
+    /// Deleting the call left the suite green: #117 regressing in full, with
+    /// the test named after it still passing. Now `POST /logout` is driven and
+    /// the sidecar's log must show a repo write BEFORE the revoke.
+    #[tokio::test]
+    async fn signing_out_flushes_before_it_revokes_through_the_route() {
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let (sidecar, log) = spawn_logging_sidecar().await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        crate::store::upsert_cursor(
+            &state.db,
+            &crate::store::ReadCursor {
+                did: did.to_string(),
+                feed_url: "https://example.com/feed.xml".into(),
+                read_through: None,
+                read_ids: "[\"1\"]".into(),
+                unread_ids: "[]".into(),
+                dirty: true,
+                pds_created: false,
+                updated_at: "2026-09-13T21:22:40Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let entries = log.lock().unwrap().clone();
+        let flush = entries
+            .iter()
+            .position(|e| e.starts_with("/internal/repo "));
+        let revoke = entries
+            .iter()
+            .position(|e| e.starts_with("/internal/revoke "));
+        assert!(revoke.is_some(), "sign-out did not revoke: {entries:?}");
+        assert!(
+            flush.is_some(),
+            "sign-out did not attempt a flush before revoking: {entries:?}"
+        );
+        assert!(
+            flush < revoke,
+            "the flush arrived AFTER the revoke — no session left to send it with: {entries:?}"
+        );
+    }
+
+    /// The policy, as a literal: the backstop the router calls "neutralises any
+    /// XSS that slips past sanitization". `script-src 'self'` and no
+    /// `'unsafe-inline'` on it are the two clauses that make it one.
+    const EXPECTED_CSP: &str = "default-src 'self'; \
+     script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; \
+     img-src 'self' https: data:; \
+     font-src 'self'; \
+     connect-src 'self'; \
+     form-action 'self'; \
+     base-uri 'self'; \
+     frame-ancestors 'none'; \
+     object-src 'none'";
 
     /// Build a `multipart/form-data` body carrying a single `file` field whose
     /// contents are `payload`, returning `(content_type, body_bytes)`.
@@ -8545,29 +8835,35 @@ mod tests {
     // Rename parity (POST /subscriptions/{rkey}/rename)
     // -----------------------------------------------------------------------
 
-    /// **`FEATHERREADER_STANDARD_SITE=false` cannot be bypassed through
-    /// autodiscovery.**
+    /// **Autodiscovery cannot smuggle a non-http(s) URL into storage.**
     ///
     /// The add path gates the URL the user *typed*; the URL it *stores* is
     /// whatever `resolve_feed_url` returns, which for an HTML page is a
-    /// publisher-controlled `<link rel="alternate">` href. With the flag off, a
-    /// page linking an `at://` publication URI must not get one stored — on
-    /// main the same URI was refused, so anything less is a regression. Driven
-    /// through the real route against a real local server, not the helper.
+    /// publisher-controlled `<link rel="alternate">` href. Two layers stop
+    /// that: `discover_feed` yields only http(s), and the add path re-checks
+    /// storability on the resolved URL. This test pins the DISJUNCTION —
+    /// each layer alone holds it, both removed fails it — driven through the
+    /// real route against a real local server.
+    ///
+    /// **Why the fixture is `ftp://`, not `at://`.** This began as the
+    /// at-URI bypass test from #164, and it was vacuous twice over. Handle
+    /// form: once storage became DID-only the privacy classifier refused it
+    /// at its own gate. DID form: `Url::parse` cannot read it (invalid port
+    /// — the colons in the DID), so `discover_feed` drops it before either
+    /// layer exists. An at:// link cannot come out of autodiscovery under
+    /// ANY mutation of the layers, so no test through this route can pin
+    /// them with one. `ftp://` reaches both. The at:// case is guaranteed by
+    /// structure and pinned where it lives: `discover_skips_a_non_http_
+    /// alternate` and the storability tests in `feed.rs`.
     #[tokio::test]
-    async fn autodiscovery_cannot_smuggle_an_at_uri_past_the_flag() {
+    async fn autodiscovery_cannot_smuggle_a_non_http_url_into_storage() {
         let did = "did:plc:autodiscovered";
-        // Access granted, both caps disabled — the only gate left is the one
-        // under test.
+        // Access granted, both caps disabled — the only gates left are the
+        // two under test.
         let state = test_state_with_caps(did, 0, 0).await;
-        assert!(
-            !state.config.standard_site,
-            "the flag must be off for this test"
-        );
 
         let page = r#"<!doctype html><html><head><title>Blog</title>
-            <link rel="alternate" type="application/rss+xml"
-                  href="at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h">
+            <link rel="alternate" type="application/rss+xml" href="ftp://files.example/feed.xml">
             </head><body>hi</body></html>"#;
         let base = crate::net::tests::serve_body(page.as_bytes().to_vec()).await;
         let port: u16 = base
@@ -8578,13 +8874,12 @@ mod tests {
             .parse()
             .unwrap();
         crate::net::test_host_override(
-            "autodiscover-at.test",
+            "autodiscover-ftp.test",
             std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         );
 
         let cookie = session_cookie(&state, did, None);
-        let app = router(state.clone());
-        let resp = app
+        let resp = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -8592,7 +8887,7 @@ mod tests {
                     .header(header::COOKIE, cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!(
-                        "url=http://autodiscover-at.test:{port}/"
+                        "url=http://autodiscover-ftp.test:{port}/"
                     )))
                     .unwrap(),
             )
@@ -8604,23 +8899,20 @@ mod tests {
             .get(header::LOCATION)
             .unwrap()
             .to_str()
-            .unwrap()
-            .to_string();
+            .unwrap();
         assert_ne!(loc, "/login", "the test never reached the add path");
+        assert_ne!(loc, "/", "the subscribe succeeded");
 
-        let smuggled: i64 = store::count_unpollable_feeds(&state.db).await.unwrap();
-        assert_eq!(smuggled, 0, "an at:// row was stored with the flag off");
         assert_eq!(
             store::count_feeds(&state.db).await.unwrap(),
             0,
-            "something was stored for a page with no usable feed"
+            "a non-http(s) URL from autodiscovery was stored"
         );
         assert_eq!(
             store::count_subscriptions_for_did(&state.db, did)
                 .await
                 .unwrap(),
-            0,
-            "a subscription was recorded for a refused feed"
+            0
         );
     }
 
@@ -11323,87 +11615,6 @@ mod tests {
         assert!(is_rate_limited_path("/saved/3abc/delete", &Method::POST));
         // And the neighbours still are.
         assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
-    }
-
-    /// **#117 — sign-out ATTEMPTS the flush before it revokes.**
-    ///
-    /// This replaces the test that proved the opposite. `revoke_everywhere`
-    /// deletes the OAuth session, so anything still dirty afterwards has nothing
-    /// left to send it — the reads park until the user signs in again, which may
-    /// be never. Flushing first is what keeps the common case out of that state.
-    ///
-    /// The flush FAILS here: the fixture PDS is unreachable, so the cursor is
-    /// still dirty at the end. That is deliberate and is the weaker half of the
-    /// assertion. What is actually pinned is that the attempt HAPPENED — one
-    /// recorded `flush_read_states` call, made while the session still existed.
-    /// Deleting the `flush_before_revoke` call drops that to zero.
-    ///
-    /// The failure path is also the point: sign-out completes regardless. A user
-    /// leaving must never be held by a PDS that is not answering.
-    #[tokio::test]
-    async fn signing_out_flushes_before_it_revokes() {
-        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let state = test_state(&[]).await;
-        let runtime = state.oauth.as_deref().expect("oauth runtime");
-        crate::oauth::store::put_session(
-            &state.db,
-            &runtime.codec,
-            &crate::oauth::store::OAuthSession {
-                sub: did.into(),
-                issuer: "https://auth.invalid".into(),
-                aud: "https://pds.invalid".into(),
-                dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
-                    .to_jwk_json()
-                    .unwrap(),
-                access_token: "at".into(),
-                refresh_token: "rt".into(),
-                token_type: "DPoP".into(),
-                granted_scope: "atproto".into(),
-                expires_at: Some(crate::store::now_unix() + 3600),
-            },
-        )
-        .await
-        .unwrap();
-        crate::store::upsert_cursor(
-            &state.db,
-            &crate::store::ReadCursor {
-                did: did.to_string(),
-                feed_url: "https://example.com/feed.xml".into(),
-                read_through: None,
-                read_ids: "[\"1\"]".into(),
-                unread_ids: "[]".into(),
-                dirty: true,
-                pds_created: false,
-                updated_at: "2026-09-13T21:22:40Z".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        flush_before_revoke(&state, did).await;
-        revoke_everywhere(&state, did).await;
-
-        // The flush was attempted, and while the session was still usable.
-        let attempts = state
-            .metrics
-            .snapshot()
-            .into_iter()
-            .find(|r| r.op == "flush_read_states")
-            .map(|r| r.stats.ok_count + r.stats.err_count)
-            .unwrap_or(0);
-        assert_eq!(
-            attempts, 1,
-            "sign-out revoked without attempting a final flush",
-        );
-
-        // And sign-out still completed, despite the flush failing.
-        assert!(
-            crate::oauth::store::get_session(&state.db, &runtime.codec, did)
-                .await
-                .unwrap()
-                .is_none(),
-            "a failed flush must not block the revoke",
-        );
     }
 
     /// **The probe detects a broken database — asserted through `/health`
