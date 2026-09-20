@@ -256,7 +256,13 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
     }
     match Url::parse(url) {
         Ok(u) => {
-            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+            // No host check: for http(s) the `url` crate refuses every hostless
+            // spelling at parse (`http://`, `https://?q`, `http:///` are all
+            // "empty host") and turns `https:///x` into host `x`. A conjunct
+            // requiring a non-empty host was unreachable — a test hunt listed
+            // it as untested, and the honest answer was that no input reaches
+            // it. The `Err` arm below is what refuses a hostless URL.
+            matches!(u.scheme(), "http" | "https")
         }
         Err(_) => false,
     }
@@ -1270,6 +1276,24 @@ mod tests {
   </entry>
 </feed>"#;
 
+    /// [`ATOM_SAMPLE`] with the `self` link before the `alternate` one.
+    const ATOM_SELF_FIRST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Atom Feed</title>
+  <link rel="self" href="https://atom.example.com/feed.xml"/>
+  <link rel="alternate" href="https://atom.example.com/"/>
+  <id>urn:uuid:feed-1</id>
+  <updated>2026-07-11T08:00:00Z</updated>
+  <entry>
+    <title>Atom entry</title>
+    <id>urn:uuid:entry-1</id>
+    <link rel="alternate" href="https://atom.example.com/a"/>
+    <author><name>Bob</name></author>
+    <updated>2026-07-11T08:00:00Z</updated>
+    <content type="html"><![CDATA[<p>Safe <em>text</em>.</p><script>steal()</script><iframe src="evil"></iframe>]]></content>
+  </entry>
+</feed>"#;
+
     /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
     /// (no network) and assert the entries come out sanitized and well-shaped.
     #[test]
@@ -1308,6 +1332,21 @@ mod tests {
 
     /// Same, for an Atom sample: alternate link is the site URL, dangerous
     /// elements are stripped from entry content.
+    /// **`rel="alternate"` is preferred over a `rel="self"` listed FIRST.** In
+    /// `ATOM_SAMPLE` the alternate link is already first, so "prefer alternate"
+    /// and "take the first link" were indistinguishable; the selection could
+    /// be replaced by `links.first()` with the suite green. A feed listing
+    /// `self` first — very common in Atom — would store the feed XML URL as
+    /// the subscription's `siteUrl`, published to the reader's PDS.
+    #[test]
+    fn atom_prefers_alternate_over_a_self_link_listed_first() {
+        let parsed = feed_rs::parser::parse(ATOM_SELF_FIRST.as_bytes()).expect("Atom should parse");
+        let (title, site) = feed_metadata(&parsed);
+        assert_eq!(title.as_deref(), Some("Example Atom Feed"));
+        // alternate link preferred over rel="self".
+        assert_eq!(site.as_deref(), Some("https://atom.example.com/"));
+    }
+
     #[test]
     fn atom_parses_and_sanitizes() {
         let parsed = feed_rs::parser::parse(ATOM_SAMPLE.as_bytes()).expect("Atom should parse");
@@ -1355,6 +1394,92 @@ mod tests {
             "an rkey of exactly 512 bytes is valid"
         );
         assert!(is_storable_feed_url(&uri("3lab2c4d5e6f7g8h"), true));
+    }
+
+    /// **Every `KNOWN_PROVIDERS` row is pinned by its own reason.**
+    ///
+    /// The provider test used URLs that the generic heuristics catch on their
+    /// own — Substack's `/feed/private/` is also a path marker, Patreon's
+    /// `?auth=…` an opaque secret key — and never asserted the reason. With
+    /// 17 of 18 rows deleted, the suite stayed green. The provider layer runs
+    /// FIRST so its specific reason wins; asserting the reason pins each row
+    /// even where a generic rule would still refuse the URL. Values are kept
+    /// short and plain so the generic query rule (`value_is_opaque`) does not
+    /// fire — most of these are refused by the provider row alone.
+    #[test]
+    fn each_known_provider_is_caught_by_its_own_row() {
+        for (url, reason) in [
+            (
+                "https://author.substack.com/feed/private/x",
+                "Substack private feed",
+            ),
+            (
+                "https://www.patreon.com/rss/creator?auth=ab",
+                "Patreon member feed",
+            ),
+            ("https://blog.ghost.io/rss/?uuid=x", "Ghost members feed"),
+            (
+                "https://buttondown.email/me/rss?token=x",
+                "Buttondown premium feed",
+            ),
+            (
+                "https://buttondown.com/me/rss?token=x",
+                "Buttondown premium feed",
+            ),
+            (
+                "https://rss.beehiiv.com/feeds/x.xml?token=x",
+                "Beehiiv premium feed",
+            ),
+            (
+                "https://example.memberful.com/feed",
+                "Memberful members feed",
+            ),
+            ("https://example.pico.link/feed", "Pico member feed"),
+            ("https://steadyhq.com/rss/example", "Steady member feed"),
+            (
+                "https://example.supercast.com/feed",
+                "Supercast private podcast",
+            ),
+            (
+                "https://example.supercast.tech/feed",
+                "Supercast private podcast",
+            ),
+            (
+                "https://example.supportingcast.fm/feed",
+                "Supporting Cast private podcast",
+            ),
+            (
+                "https://feeds.redcircle.com/x?private=1",
+                "RedCircle private podcast",
+            ),
+            (
+                "https://feeds.megaphone.fm/x?token=x",
+                "Megaphone private podcast",
+            ),
+            (
+                "https://feeds.acast.com/public/shows/x?token=x",
+                "Acast+ private podcast",
+            ),
+            (
+                "https://omny.fm/shows/x/playlists/podcast.rss?token=x",
+                "Omny private podcast",
+            ),
+            (
+                "https://podcasts.apple.com/feed/x?token=x",
+                "Apple subscriber podcast",
+            ),
+            (
+                "https://anchor.spotify.com/s/x/podcast/rss?token=x",
+                "Spotify subscriber podcast",
+            ),
+        ] {
+            match classify_feed_privacy(url) {
+                FeedPrivacy::Private(r) => {
+                    assert_eq!(r, reason, "{url} was refused by another rule")
+                }
+                FeedPrivacy::Public => panic!("{url} was not refused at all"),
+            }
+        }
     }
 
     #[test]
@@ -1527,6 +1652,19 @@ mod tests {
     /// backstop, so the secret is never fetched or stored.
     #[test]
     fn classify_privacy_catches_tokened_filenames_on_unknown_hosts() {
+        // **A stem only the extension-strip branch can see.** Every other case
+        // here is also caught by the sub-part scan (branch 3) or the UUID scan,
+        // so deleting the strip left the suite green — `FEED_EXTENSIONS` was
+        // effectively dead. This stem's `-`-separated parts are each too short
+        // to look like a secret on their own, and the whole segment fails on
+        // the `.` — only stripping `.rss` and re-testing the 26-char stem sees
+        // it. That is exactly the shape a hyphen-bearing base64url token
+        // filename takes.
+        assert!(
+            classify_feed_privacy("https://cdn.example/feeds/aB3xK9pQ-7mZ2vN8w-Qr5tYuW.rss")
+                .is_private(),
+            "a token stem visible only after stripping the extension was not caught"
+        );
         // hex-32 token as an .xml filename.
         assert!(classify_feed_privacy(
             "https://cdn.somepod.io/f/a1b2c3d4e5f60718293a4b5c6d7e8f90.xml"
@@ -1930,6 +2068,15 @@ mod tests {
             "at:did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
         ] {
             assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+        // A hostless http(s) URL is a PARSE error, not a parsed URL with no
+        // host — `https:///feed.xml` even parses as host `feed.xml`. What
+        // refuses these is the `Err` arm, so that is what this pins.
+        for hostless in ["http://", "https://?q=1", "http:///"] {
+            assert!(
+                !is_storable_feed_url(hostless, true),
+                "a hostless URL {hostless:?} was storable"
+            );
         }
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
         assert!(is_storable_feed_url("http://example.com/feed.xml", true));

@@ -384,7 +384,8 @@ mod tests {
     /// `!=` against some value we guess a broken implementation would return.
     /// Two earlier versions of this test guessed wrong: `[b'a'; 32]` (the ASCII
     /// bytes) and then `69 A6 9A…` (the lenient decode Node's `Buffer` would
-    /// produce). base64 0.22's engines are strict and reject `"a"×43` outright
+    /// produce). base64's engines (0.22 then, re-verified on 0.23.1) are strict
+    /// and reject `"a"×43` outright
     /// — `InvalidPadding` / `InvalidLastSymbol` — so neither value is reachable
     /// and both assertions held for the wrong reason.
     ///
