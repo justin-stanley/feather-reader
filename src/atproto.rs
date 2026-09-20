@@ -837,7 +837,10 @@ impl PdsClient {
     }
 
     /// Create a [`Subscription`] record (subscribe to a feed).
-    pub async fn create_subscription(&self, sub: &Subscription) -> Result<WriteResult> {
+    pub async fn create_subscription(
+        &self,
+        sub: &crate::vetted::VettedSubscription,
+    ) -> Result<WriteResult> {
         self.create_record(lexicon::nsid::SUBSCRIPTION, sub).await
     }
 
@@ -857,7 +860,7 @@ impl PdsClient {
     }
 
     /// Create a [`Saved`] record (star an article).
-    pub async fn create_saved(&self, saved: &Saved) -> Result<WriteResult> {
+    pub async fn create_saved(&self, saved: &crate::vetted::VettedSaved) -> Result<WriteResult> {
         self.create_record(lexicon::nsid::SAVED, saved).await
     }
 
@@ -1253,7 +1256,11 @@ impl SidecarClient {
     }
 
     /// Create a [`Subscription`] record (subscribe to a feed).
-    pub async fn create_subscription(&self, did: &str, sub: &Subscription) -> Result<WriteResult> {
+    pub async fn create_subscription(
+        &self,
+        did: &str,
+        sub: &crate::vetted::VettedSubscription,
+    ) -> Result<WriteResult> {
         self.create_record(did, lexicon::nsid::SUBSCRIPTION, sub)
             .await
     }
@@ -1343,7 +1350,11 @@ impl SidecarClient {
     /// Add a subscription (subscribe to a feed) — `createRecord`, server-assigned
     /// `tid` rkey. Returns the new record's **rkey** so the web layer can offer
     /// unsubscribe/rename immediately.
-    pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
+    pub async fn add_subscription(
+        &self,
+        did: &str,
+        sub: &crate::vetted::VettedSubscription,
+    ) -> Result<String> {
         Ok(self.create_subscription(did, sub).await?.into_rkey())
     }
 
@@ -1362,7 +1373,7 @@ impl SidecarClient {
         &self,
         did: &str,
         rkey: &str,
-        sub: &Subscription,
+        sub: &crate::vetted::VettedSubscription,
     ) -> Result<WriteResult> {
         self.put_record(did, lexicon::nsid::SUBSCRIPTION, rkey, sub)
             .await
@@ -1393,7 +1404,7 @@ impl SidecarClient {
     pub async fn add_subscriptions_bulk(
         &self,
         did: &str,
-        subs: &[Subscription],
+        subs: &[crate::vetted::VettedSubscription],
     ) -> Result<Vec<String>> {
         let mut gen = TidGenerator::new();
         let mut rkeys = Vec::with_capacity(subs.len());
@@ -1453,7 +1464,7 @@ impl SidecarClient {
 
     /// Add a saved (starred / save-for-later) entry — `createRecord`,
     /// server-assigned `tid` rkey. Returns the new record's rkey.
-    pub async fn add_saved(&self, did: &str, saved: &Saved) -> Result<String> {
+    pub async fn add_saved(&self, did: &str, saved: &crate::vetted::VettedSaved) -> Result<String> {
         Ok(self
             .create_record(did, lexicon::nsid::SAVED, saved)
             .await?

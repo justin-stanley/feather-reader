@@ -16,6 +16,7 @@ use anyhow::{Context as _, Result};
 use crate::lexicon::{Folder, ReadState, Saved, Subscription};
 use crate::metrics::{timed, Backend};
 use crate::oauth;
+use crate::vetted::VettedSubscription;
 use crate::AppState;
 
 /// A dispatcher bound to one request's state.
@@ -250,37 +251,6 @@ macro_rules! dispatch {
     };
 }
 
-/// Scheme-check the parts of a subscription record that this reader did not
-/// author, immediately before it is published to the user's repo.
-///
-/// **Why here and not at ingest.** `siteUrl` enters from three places — a remote
-/// feed's `<link>` ([`crate::feed`]), an OPML file's `htmlUrl` ([`crate::opml`]),
-/// and the manage-subscription form — and a guard at each is three things to
-/// remember, which is the shape of defence that issue #114's sibling (#111)
-/// measured as worthless: the check was deleted and all 679 tests still passed.
-/// Every write instead crosses this module, above the backend split, so one vet
-/// covers both backends, all three writers, and whatever is added next.
-///
-/// A rejected URL becomes `None` rather than dropping the subscription — the
-/// feed is what the user asked for; the site link is decoration.
-///
-/// **The record is what makes this worth doing.** Nothing in `templates/`
-/// renders `siteUrl`, so this is not an XSS against our own UI. The lexicon
-/// describes the field as the "human-facing site the feed belongs to", i.e. a
-/// value other atproto clients are expected to render as a link — so publishing
-/// an unchecked `javascript:` URL hands every other reader a stored XSS under
-/// our user's authorship, for a string the user never typed.
-fn vet(sub: &Subscription) -> Subscription {
-    let mut out = sub.clone();
-    out.site_url = out.site_url.as_deref().and_then(crate::net::safe_link);
-    out
-}
-
-/// [`vet`] over a batch.
-fn vet_all(subs: &[Subscription]) -> Vec<Subscription> {
-    subs.iter().map(vet).collect()
-}
-
 impl Repo<'_> {
     // ── subscriptions ────────────────────────────────────────────────────────
 
@@ -293,7 +263,7 @@ impl Repo<'_> {
 
     dispatch! {
         /// Raw subscribe. Private: reach it through [`Repo::add_subscription`].
-        add_subscription_unvetted(sub: &Subscription) -> String,
+        add_subscription_unvetted(sub: &crate::vetted::VettedSubscription) -> String,
         label: "add_subscription",
         sidecar: add_subscription,
         rust: add_subscription
@@ -303,7 +273,8 @@ impl Repo<'_> {
     ///
     /// Vets the record first — see [`vet`].
     pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
-        self.add_subscription_unvetted(did, &vet(sub)).await
+        self.add_subscription_unvetted(did, &VettedSubscription::new(sub))
+            .await
     }
 
     dispatch! {
@@ -315,7 +286,7 @@ impl Repo<'_> {
 
     dispatch! {
         /// Raw update. Private: reach it through [`Repo::update_subscription`].
-        update_subscription_unvetted(rkey: &str, sub: &Subscription)
+        update_subscription_unvetted(rkey: &str, sub: &crate::vetted::VettedSubscription)
             -> crate::atproto::WriteResult,
         label: "update_subscription",
         sidecar: update_subscription,
@@ -331,13 +302,13 @@ impl Repo<'_> {
         rkey: &str,
         sub: &Subscription,
     ) -> Result<crate::atproto::WriteResult> {
-        self.update_subscription_unvetted(did, rkey, &vet(sub))
+        self.update_subscription_unvetted(did, rkey, &VettedSubscription::new(sub))
             .await
     }
 
     dispatch! {
         /// Raw bulk add. Private: reach it through [`Repo::add_subscriptions_bulk`].
-        add_subscriptions_bulk_unvetted(subs: &[Subscription]) -> Vec<String>,
+        add_subscriptions_bulk_unvetted(subs: &[crate::vetted::VettedSubscription]) -> Vec<String>,
         label: "add_subscriptions_bulk",
         sidecar: add_subscriptions_bulk,
         rust: add_subscriptions_bulk
@@ -353,7 +324,7 @@ impl Repo<'_> {
         did: &str,
         subs: &[Subscription],
     ) -> Result<Vec<String>> {
-        self.add_subscriptions_bulk_unvetted(did, &vet_all(subs))
+        self.add_subscriptions_bulk_unvetted(did, &VettedSubscription::all(subs))
             .await
     }
 
@@ -397,10 +368,24 @@ impl Repo<'_> {
     }
 
     dispatch! {
-        /// Save an entry. Returns its rkey.
-        add_saved(saved: &Saved) -> String,
+        /// Raw save. Private: reach it through [`Repo::add_saved`].
+        add_saved_unvetted(saved: &crate::vetted::VettedSaved) -> String,
+        label: "add_saved",
         sidecar: add_saved,
         rust: add_saved
+    }
+
+    /// Save an entry. Returns its rkey.
+    ///
+    /// **Refuses rather than publishing a URL we would not render.** `url` is
+    /// required on this record, so unlike a subscription's `siteUrl` there is no
+    /// honest resting place for a rejected value — see [`crate::vetted::VettedSaved`].
+    /// The only caller already treats a failed PDS write as recoverable: it logs
+    /// and keeps the entry starred locally, so the reader loses nothing but the
+    /// hostile record.
+    pub async fn add_saved(&self, did: &str, saved: &Saved) -> Result<String> {
+        self.add_saved_unvetted(did, &crate::vetted::VettedSaved::new(saved)?)
+            .await
     }
 
     dispatch! {
@@ -616,6 +601,42 @@ mod tests {
         }
     }
 
+    /// **A hostile saved URL must not reach the PDS either.**
+    ///
+    /// `community.lexicon.rss.saved` publishes `url` into the reader's own repo,
+    /// into a field `safe_link.rs` already treats as attacker-controlled on the
+    /// RENDER side — that is what `SafeLink::external` exists for. The write side
+    /// had no equivalent: `add_saved` went straight through `dispatch!` with no
+    /// vet, so `entries.url` rows that arrived before the ingest guard existed,
+    /// or by any future path that does not go through `feed.rs`, were published
+    /// verbatim when the reader starred them.
+    ///
+    /// Asserted on the bytes on the wire, for the same reason as the
+    /// subscription writers: the record only becomes unsafe on the way out.
+    #[tokio::test]
+    async fn starring_does_not_publish_a_hostile_url() {
+        for hostile in [
+            "javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+        ] {
+            let (url, seen) = spawn_capturing_sidecar().await;
+            let state = sidecar_state(&url).await.expect("sidecar state");
+            let mut saved = Saved::new(hostile, "2026-01-01T00:00:00.000Z");
+            saved.title = Some("Hostile".to_string());
+
+            let _ = state.repo().add_saved(DID, &saved).await;
+
+            let bodies = seen.lock().unwrap().clone();
+            assert!(
+                !bodies.iter().any(|b| b.contains("javascript:")
+                    || b.contains("data:")
+                    || b.contains("vbscript:")),
+                "starring published {hostile:?} to the PDS: {bodies:?}"
+            );
+        }
+    }
+
     /// The guard must not eat the ordinary case.
     #[tokio::test]
     async fn a_legitimate_site_url_is_published_unchanged() {
@@ -631,48 +652,6 @@ mod tests {
             bodies[0].contains("https://example.com/blog"),
             "a perfectly good site link was dropped: {}",
             bodies[0]
-        );
-    }
-
-    #[test]
-    fn vet_rejects_by_scheme_and_keeps_everything_else() {
-        // Rejected -> None, and the rest of the record is untouched.
-        let hostile = sub_with_site("javascript:alert(1)");
-        let vetted = vet(&hostile);
-        assert_eq!(vetted.site_url, None);
-        assert_eq!(vetted.url, hostile.url, "the feed URL is not the target");
-
-        // A clean record passes through untouched.
-        let clean = sub_with_site("https://example.com/blog");
-        assert_eq!(
-            vet(&clean).site_url.as_deref(),
-            Some("https://example.com/blog")
-        );
-
-        // Surrounding whitespace is normalised away rather than rejected, which
-        // is what `net::safe_link` already does for entry links.
-        let padded = sub_with_site("  https://example.com/blog  ");
-        assert_eq!(
-            vet(&padded).site_url.as_deref(),
-            Some("https://example.com/blog")
-        );
-
-        // Absent stays absent — no empty string is invented.
-        let bare = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
-        assert_eq!(vet(&bare).site_url, None);
-    }
-
-    #[test]
-    fn vet_all_cleans_one_bad_record_without_touching_the_rest() {
-        let mixed = vec![
-            sub_with_site("https://a.example/"),
-            sub_with_site("javascript:alert(1)"),
-        ];
-        let vetted = vet_all(&mixed);
-        assert_eq!(vetted[0].site_url.as_deref(), Some("https://a.example/"));
-        assert_eq!(
-            vetted[1].site_url, None,
-            "one bad record in a batch must be cleaned, not the whole batch dropped"
         );
     }
 
