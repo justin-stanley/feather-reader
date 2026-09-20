@@ -234,12 +234,14 @@ collections rather than fetching one URL. Only `textContent` / `description` are
 rendered, never the `content` union: that is per-platform rather than
 standardised, and implementing it would mean a renderer per publisher.
 
-**One flag gates both subscribing and polling**, and that is not an accident.
-Permitting the subscription without the poller would not leave the feature
-dormant: the row stores with a NULL `next_poll`, which the scheduler sorts
-first, so it is polled immediately, fails, and is reported as an unreachable
-publisher — a broken feature of this reader, displayed as somebody else's
-website being down.
+**Polling a publication is not implemented yet**, and the flag does not pretend
+otherwise. The scheduler excludes `at://` outright, so such a subscription is
+*skipped* rather than repeatedly failed — handing one to the poller would report
+a broken feature of this reader as somebody else's website being down, which is
+exactly the confusion the failure breakdown exists to prevent.
+
+Setting the flag today therefore lets you record the subscription; articles
+arrive once the reader is wired to the scheduler.
 
 ### Switching
 

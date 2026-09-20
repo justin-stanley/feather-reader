@@ -33,7 +33,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether `at://…/site.standard.publication/…` feeds may be subscribed to AND polled. **One flag for both, deliberately**: permitting the subscription without the poller does not leave the feature dormant — the row stores with a NULL `next_poll`, which `due_feeds` sorts FIRST, so it is polled immediately, fails, and is recorded as an unreachable publisher. Two flags could drift into exactly that state. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether `at://…/site.standard.publication/…` feeds may be **subscribed to**. Polling them is NOT implemented yet: `due_feeds` excludes `at://` entirely, so such a row is skipped rather than failed. That is deliberate — handing one to the poller manufactures a permanent failure, published as an unreachable publisher, since `check_scheme` refuses the scheme. When the standard.site reader is wired to the scheduler this flag gates that too. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -150,14 +150,21 @@ pub struct Config {
     /// switch. Defaults to the sidecar, so deploying the Rust client changes
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
-    /// Whether `at://` standard.site publications may be subscribed to AND
-    /// polled. From `FEATHERREADER_STANDARD_SITE`, default **off**.
+    /// Whether `at://` standard.site publications may be **subscribed to**.
+    /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
-    /// **One flag for both, deliberately.** Permitting the subscription without
-    /// the poller does not leave the feature dormant — the row is stored with a
-    /// NULL `next_poll`, which `due_feeds` sorts FIRST, so it is polled
-    /// immediately, fails, and is recorded as an unreachable publisher. Two
-    /// flags could drift into exactly that state; one cannot.
+    /// **Polling them is not implemented, and that is handled by exclusion
+    /// rather than by this flag.** An earlier version of this comment claimed
+    /// one flag gated both subscribing and polling. It did not: nothing outside
+    /// the two storable-guard call sites ever read it, so turning it on
+    /// produced exactly the permanent failures it promised to prevent —
+    /// `poll_feed` reaches `net::guarded_get`, whose `check_scheme` refuses the
+    /// scheme.
+    ///
+    /// What is true now: [`crate::store::due_feeds`] excludes `at://` outright,
+    /// so such a row is **skipped, not failed**. When the standard.site reader
+    /// is wired to the scheduler, this flag gates that too — and the exclusion
+    /// becomes a dispatch.
     pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted

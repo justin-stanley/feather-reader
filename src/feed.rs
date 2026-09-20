@@ -276,12 +276,13 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
     // to the `matches!` below would appear to work and silently reject every
     // DID-based at-URI, which is all of them in practice.
     if let Some(rest) = url.strip_prefix("at://") {
-        // **Storable and pollable are ONE decision.** Storing an at-URI while
-        // nothing can poll it does not leave the feature dormant: the callers
-        // upsert with `next_poll` NULL, `due_feeds` sorts NULLs FIRST, so it is
-        // polled on the next tick, dies in `Url::parse`, and is recorded as a
-        // `fetch` failure — our unimplemented feature published as an
-        // unreachable publisher. One flag gates both, so they cannot drift.
+        // **This gates STORING only — polling is handled by exclusion.**
+        // Storing an at-URI while nothing can poll it would manufacture a
+        // permanent failure per row: `poll_feed` reaches `net::guarded_get`,
+        // whose `check_scheme` refuses the scheme, and the result is published
+        // as an unreachable publisher. `store::due_feeds` therefore excludes
+        // `at://` outright, so such a row is skipped rather than failed. This
+        // flag decides whether one may be stored at all.
         return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
