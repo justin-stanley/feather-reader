@@ -58,6 +58,26 @@ impl SafeLink {
         Self(crate::net::safe_link(raw).unwrap_or_default())
     }
 
+    /// [`SafeLink::external`], for a template that omits the link rather than
+    /// rendering it empty.
+    ///
+    /// The two shapes are not interchangeable, and which one a call site wants
+    /// is decided by whether anything else lives on the link. The saved-record
+    /// row keeps the EMPTY link because dropping the row would take the un-save
+    /// button with it — the record would become unremovable from here. The
+    /// reader view has no such passenger: `entry.html` already renders a
+    /// disabled open-original button for an entry with no URL, so `None`
+    /// selects a path that exists and is styled, and an empty `href` would only
+    /// invent a third state meaning the same thing.
+    ///
+    /// It lives here rather than as `.filter(|l| !l.is_empty())` at the call
+    /// site so that "empty means refused" stays a fact of this module. That is
+    /// the same reason the field is in this file at all.
+    pub fn external_opt(raw: &str) -> Option<Self> {
+        let link = Self::external(raw);
+        (!link.is_empty()).then_some(link)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

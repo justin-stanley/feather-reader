@@ -1387,7 +1387,16 @@ struct EntryTemplate {
     feed_title: String,
     author: Option<String>,
     published: String,
-    url: Option<String>,
+    /// The entry's own link, for `entry.html`'s two `href`s.
+    ///
+    /// `Option<SafeLink>`, not `Option<String>`: the column it comes from holds
+    /// a remote feed's `<link>`. Ingest scheme-checks it, but that guard is a
+    /// long way from the `href` and holds only while every future writer to
+    /// `entries.url` remembers to go through `feed.rs` — the same procedural
+    /// defence that, on the saved-record row, turned out to be deletable with
+    /// all 679 tests still green. `None` is the refusal: the template's
+    /// no-URL branch already renders a disabled open-original button.
+    url: Option<SafeLink>,
     content_html: Option<String>,
     read: bool,
     starred: bool,
@@ -2568,7 +2577,7 @@ async fn entry_view(
         feed_title,
         author: entry.author.clone().filter(|a| !a.trim().is_empty()),
         published: display_date(entry.published.as_deref()),
-        url: entry.url.clone().filter(|u| !u.trim().is_empty()),
+        url: entry.url.as_deref().and_then(SafeLink::external_opt),
         content_html: entry.content_html.clone(),
         read,
         starred,
@@ -7519,6 +7528,155 @@ mod tests {
         assert!(
             body.contains("unusable link"),
             "the row was dropped instead of rendering without an anchor",
+        );
+    }
+
+    /// **The reader view's two `href`s, through the actual handler.**
+    ///
+    /// The sibling above covers the LIST row. `entry.html` has its own pair of
+    /// `href`s fed by `EntryTemplate.url`, and they were a raw `Option<String>`
+    /// taken straight off the `entries.url` column — a remote feed's `<link>`.
+    ///
+    /// Ingest already scheme-checks that column (`feed.rs`'s `entry_link`), so
+    /// this was never a live hole. But that guard is procedural and sits a long
+    /// way from the `href`: it holds only as long as every future writer to
+    /// `entries.url` remembers to go through `feed.rs`. This test does not
+    /// depend on it — it writes the hostile URL into the column DIRECTLY, which
+    /// is precisely the state the ingest check cannot speak for.
+    ///
+    /// **Both directions, deliberately.** A fix that renders no link at all
+    /// satisfies every negative assertion here, and would break every real
+    /// entry. The second half is what makes the first half mean something.
+    #[tokio::test]
+    async fn a_hostile_entry_url_renders_the_reader_without_an_original_link() {
+        let did = "did:plc:readerhref";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://href.example/feed.xml".to_string(),
+                title: Some("Href".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Straight into the column, bypassing `feed.rs` — the whole point.
+        store::insert_entries(
+            &state.db,
+            feed,
+            &[
+                store::NewEntry {
+                    guid: "hostile-1".to_string(),
+                    url: Some("javascript:alert(1)".to_string()),
+                    title: Some("Hostile entry".to_string()),
+                    published: Some("2026-07-11T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                store::NewEntry {
+                    guid: "benign-1".to_string(),
+                    url: Some("https://href.example/post".to_string()),
+                    title: Some("Benign entry".to_string()),
+                    published: Some("2026-07-10T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        let rows = store::entries_for_feed(&state.db, did, feed).await.unwrap();
+        let id_of = |guid: &str| {
+            rows.iter()
+                .find(|r| r.guid == guid)
+                .unwrap_or_else(|| panic!("{guid} was not inserted"))
+                .id
+        };
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+
+        let render = |id: i64| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/entries/{id}"))
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                String::from_utf8(
+                    axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            }
+        };
+
+        let hostile = render(id_of("hostile-1")).await;
+        // The reader page for THIS entry actually rendered. Without this the
+        // three negatives below are satisfied by an empty body.
+        assert!(
+            hostile.contains("Hostile entry"),
+            "the reader did not render the entry: {hostile}",
+        );
+        assert!(
+            !hostile.to_ascii_lowercase().contains("javascript:"),
+            "the hostile scheme reached the reader page: {hostile}",
+        );
+        // Not merely escaped — the template took its no-link branch. Both
+        // `href`s are gated on the same `Option`, so this covers the byline
+        // link and the action-bar button together.
+        assert!(
+            !hostile.contains("actionbar-open"),
+            "the action bar rendered an open-original link for a refused URL: {hostile}",
+        );
+        assert!(
+            !hostile.contains("Original \u{2197}"),
+            "the byline rendered an original link for a refused URL: {hostile}",
+        );
+
+        // The other direction: a legitimate entry still links out, so "render
+        // nothing" cannot pass as a fix.
+        let benign = render(id_of("benign-1")).await;
+        assert!(
+            benign.contains("Benign entry"),
+            "the reader did not render the benign entry: {benign}",
+        );
+        // BOTH `href`s, counted. The negatives above fire on the action bar
+        // first, so without this the byline needle `Original \u{2197}` is never
+        // once observed failing — a misspelled needle would pass forever.
+        assert_eq!(
+            benign
+                .matches(r#"href="https://href.example/post""#)
+                .count(),
+            2,
+            "entry.html has two `href`s for the entry URL — the byline link and \
+             the action-bar button — and this render produced a different \
+             number: {benign}",
+        );
+        assert!(
+            benign.contains("actionbar-open"),
+            "a legitimate entry lost its open-original button: {benign}",
+        );
+        assert!(
+            benign.contains("Original \u{2197}"),
+            "a legitimate entry lost its byline link: {benign}",
         );
     }
 
