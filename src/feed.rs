@@ -578,6 +578,58 @@ pub enum FailureKind {
     Parse,
 }
 
+/// Apply a [`PollOutcome`] to the feed's row: settle the error columns AND
+/// reschedule it. **Both halves, always, from one place.**
+///
+/// The scheduler did this inline. `web::add_subscription` then copied only the
+/// first half, so a poll taken off the scheduler could clear a stale failure's
+/// COUNT while leaving the feed parked on its stale backoff HORIZON — reported
+/// healthy, not polled for up to 24h. And its failures fed `consecutive_errors`
+/// with no reschedule, so repeated Subscribe clicks drove a shared feed to the
+/// 24h ceiling for every subscriber. Two copies of a sequence drift; this is
+/// the one copy.
+///
+/// `cadence` is the interval to use on success; the scheduler derives it from
+/// the feed's hint, a direct caller passes the configured default. A store
+/// failure is logged and the reschedule still attempted, so a hiccup writing
+/// the count cannot strand the feed at a NULL `next_poll` that `due_feeds`
+/// would then re-poll every tick.
+pub async fn settle_poll(
+    pool: &sqlx::SqlitePool,
+    url: &str,
+    outcome: &PollOutcome,
+    cadence: Duration,
+) {
+    let delay = match outcome {
+        // A 304 is a healthy poll: it proves the fetch worked and nothing changed.
+        PollOutcome::Updated { .. } | PollOutcome::NotModified => {
+            if let Err(err) = crate::store::reset_feed_errors(pool, url).await {
+                tracing::warn!(feed = %url, %err, "failed to reset feed error count");
+            }
+            cadence
+        }
+        PollOutcome::Failed {
+            backoff,
+            kind,
+            detail,
+        } => {
+            // Recompute from the feed's REAL consecutive-error count so a
+            // persistently-broken feed climbs toward the ceiling instead of
+            // retrying at the floor forever; fall back to the outcome's floor.
+            match crate::store::bump_feed_errors(pool, url, *kind, detail).await {
+                Ok(count) => backoff_for(count.max(1) as u32),
+                Err(err) => {
+                    tracing::warn!(feed = %url, %err, "failed to bump feed error count; using floor backoff");
+                    *backoff
+                }
+            }
+        }
+    };
+    if let Err(err) = crate::store::set_next_poll(pool, url, delay).await {
+        tracing::error!(feed = %url, %err, "failed to persist next_poll");
+    }
+}
+
 /// Cap on a failure detail, applied where the string is BUILT.
 ///
 /// It was originally applied only inside `store::bump_feed_errors`, which

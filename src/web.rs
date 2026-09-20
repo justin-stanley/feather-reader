@@ -2925,31 +2925,6 @@ struct SubscribeForm {
     folder: Option<String>,
 }
 
-/// Apply a directly-taken [`feed::PollOutcome`] to a feed's error columns.
-///
-/// The scheduler does this inline; every other caller of `feed::poll_feed`
-/// previously did not, which meant a poll taken outside the scheduler could
-/// neither clear a stale failure nor record a new one. `poll_feed` itself only
-/// writes validators and `last_polled` — deliberately, since the backoff is the
-/// scheduler's concern — so the settling has to live with each caller.
-async fn settle_direct_poll(
-    pool: &store::Pool,
-    url: &str,
-    outcome: &feed::PollOutcome,
-) -> anyhow::Result<()> {
-    match outcome {
-        // A 304 is a success: it proves the fetch worked and nothing changed.
-        feed::PollOutcome::Updated { .. } | feed::PollOutcome::NotModified => {
-            store::reset_feed_errors(pool, url).await
-        }
-        feed::PollOutcome::Failed { kind, detail, .. } => {
-            store::bump_feed_errors(pool, url, *kind, detail)
-                .await
-                .map(|_| ())
-        }
-    }
-}
-
 /// `POST /subscriptions` — subscribe by URL.
 async fn add_subscription(
     State(state): State<AppState>,
@@ -3058,9 +3033,7 @@ async fn add_subscription(
                     // **This path is not the scheduler, so it must settle the
                     // error columns itself.** `poll_feed` writes validators and
                     // `last_polled` and nothing else.
-                    if let Err(err) = settle_direct_poll(pool, &feed_url, &outcome).await {
-                        warn!(%err, feed = %feed_url, "could not settle the poll outcome");
-                    }
+                    feed::settle_poll(pool, &feed_url, &outcome, state.config.poll_interval).await;
                 }
                 Err(err) => warn!(%err, feed = %feed_url, "initial poll failed"),
             }
@@ -4256,6 +4229,9 @@ async fn oauth_jwks(State(state): State<AppState>) -> Response {
     }
 }
 
+/// How many failing feeds `/admin/metrics` will name. One response, so bounded.
+const ADMIN_FAILING_FEED_LIMIT: i64 = 200;
+
 /// `GET /admin/metrics` — repo-op latency for both backends, as plain text.
 ///
 /// Admin-gated on the same rule as the invite minter: the table names every
@@ -4264,9 +4240,6 @@ async fn oauth_jwks(State(state): State<AppState>) -> Response {
 ///
 /// Text, not JSON or HTML: it is read by a person deciding whether the cutover
 /// is safe, and the comparison is two rows side by side.
-/// How many failing feeds `/admin/metrics` will name. One response, so bounded.
-const ADMIN_FAILING_FEED_LIMIT: i64 = 200;
-
 async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let did = match current_did(&state, &headers).await {
         Some(d) => d,
@@ -9340,20 +9313,47 @@ mod tests {
         store::bump_feed_errors(&state.db, url, feed::FailureKind::Fetch, "SENTINEL_OLD")
             .await
             .unwrap();
-
-        // The publisher is fixed: a successful poll happens on this path.
-        settle_direct_poll(&state.db, url, &feed::PollOutcome::NotModified)
+        // Park it on a stale backoff horizon, as a real failing feed would be.
+        sqlx::query("UPDATE feeds SET next_poll = '2099-01-01T00:00:00Z' WHERE url = ?1")
+            .bind(url)
+            .execute(&state.db)
             .await
             .unwrap();
 
-        let row: (i64, Option<String>) =
-            sqlx::query_as("SELECT consecutive_errors, last_error_kind FROM feeds WHERE url = ?1")
-                .bind(url)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
+        // The publisher is fixed: a successful poll happens on this path.
+        feed::settle_poll(
+            &state.db,
+            url,
+            &feed::PollOutcome::NotModified,
+            state.config.poll_interval,
+        )
+        .await;
+
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, next_poll FROM feeds WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
         assert_eq!(row.0, 0, "a successful direct poll left the error streak");
         assert_eq!(row.1, None, "a successful direct poll left a stale cause");
+        // **The half the first fix missed.** Clearing the count fixed the
+        // REPORTING; the feed stayed parked until 2099. A working feed must be
+        // rescheduled on its normal cadence, not left on the failure horizon.
+        let next = row.2.expect("next_poll was cleared to NULL");
+        // Not merely "moved off 2099" — rescheduled on the CADENCE, not a
+        // backoff. A mutation that reschedules successes with backoff_for(1)
+        // (5 min) also moves it off 2099, so the interval is asserted.
+        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
+        let delta = parsed
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        let cadence = state.config.poll_interval.as_secs() as i64;
+        assert!(
+            (cadence - 60..=cadence + 60).contains(&delta),
+            "expected rescheduling on the {cadence}s cadence, got {delta}s (next_poll={next})"
+        );
     }
 
     /// The mirror case: a first poll that FAILS must be visible at all.
@@ -9375,7 +9375,7 @@ mod tests {
         .await
         .unwrap();
 
-        settle_direct_poll(
+        feed::settle_poll(
             &state.db,
             url,
             &feed::PollOutcome::Failed {
@@ -9383,21 +9383,34 @@ mod tests {
                 kind: feed::FailureKind::Parse,
                 detail: "SENTINEL_BORN_BROKEN".to_string(),
             },
+            state.config.poll_interval,
         )
+        .await;
+
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, next_poll FROM feeds WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&state.db)
         .await
         .unwrap();
-
-        let row: (i64, Option<String>) =
-            sqlx::query_as("SELECT consecutive_errors, last_error_kind FROM feeds WHERE url = ?1")
-                .bind(url)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
         assert_eq!(row.0, 1, "a failed first poll was not counted");
         assert_eq!(
             row.1.as_deref(),
             Some("parse"),
             "its cause was not recorded"
+        );
+        // And it is BACKED OFF on the schedule the scheduler would use — not
+        // left with a NULL next_poll that `due_feeds` sorts first and re-polls
+        // on the very next tick.
+        let next = row.2.expect("a failed direct poll left next_poll NULL");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
+        let delta = parsed
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            (240..=360).contains(&delta),
+            "expected ~300s backoff after one failure, got {delta}s (next_poll={next})"
         );
     }
 

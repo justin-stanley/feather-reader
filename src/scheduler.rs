@@ -673,80 +673,33 @@ async fn poll_and_reschedule_with<'a, F, Fut>(
     //
     // The cost is one extra tiny UPDATE per feed per poll on a single-writer
     // database. Against an unrecoverable instance, that is not a close call.
-    if let Err(err) = set_next_poll(pool, &feed.url, cadence_for(feed, default_interval)).await {
+    if let Err(err) =
+        store::set_next_poll(pool, &feed.url, cadence_for(feed, default_interval)).await
+    {
         // Non-fatal: the poll is still worth attempting. It just means a crash
         // during THIS fetch is not protected.
         warn!(feed = %feed.url, %err, "failed to lease next_poll before fetching; \
                                        a crash during this poll would re-select this feed first");
     }
 
-    let next_delay = match poll(pool, feed).await {
-        Ok(PollOutcome::Updated { new_entries }) => {
-            debug!(feed = %feed.url, new_entries, "polled: updated");
-            // A successful poll clears the consecutive-error streak so a
-            // previously-broken feed returns to its normal cadence.
-            if let Err(err) = store::reset_feed_errors(pool, &feed.url).await {
-                warn!(feed = %feed.url, %err, "failed to reset feed error count");
-            }
-            cadence_for(feed, default_interval)
-        }
-        Ok(PollOutcome::NotModified) => {
-            debug!(feed = %feed.url, "polled: not modified");
-            // 304 is a healthy poll too — reset the error streak.
-            if let Err(err) = store::reset_feed_errors(pool, &feed.url).await {
-                warn!(feed = %feed.url, %err, "failed to reset feed error count");
-            }
-            cadence_for(feed, default_interval)
-        }
-        Ok(PollOutcome::Failed {
-            backoff,
-            kind,
-            detail,
-        }) => {
-            // Record the failure and recompute the backoff from the feed's REAL
-            // consecutive-error count so a persistently-broken feed climbs toward
-            // the ceiling instead of retrying at the 5-min floor forever. If the
-            // bump fails (store hiccup) fall back to the outcome's floor backoff.
-            let backoff = match store::bump_feed_errors(pool, &feed.url, kind, &detail).await {
-                Ok(count) => feed::backoff_for(count.max(1) as u32),
-                Err(err) => {
-                    warn!(feed = %feed.url, %err, "failed to bump feed error count; using floor backoff");
-                    backoff
-                }
-            };
-            warn!(feed = %feed.url, ?backoff, "polled: failed, backing off");
-            backoff
-        }
+    // One shared sequence for every outcome the poll produced: settle the
+    // error columns and reschedule. `feed::settle_poll` is the only copy — a
+    // second, inlined copy here is how `web::add_subscription` came to have a
+    // third that did half the job.
+    let outcome = poll(pool, feed).await;
+    match &outcome {
+        Ok(o) => feed::settle_poll(pool, &feed.url, o, cadence_for(feed, default_interval)).await,
         Err(err) => {
             // Store-level error for this feed — log and reschedule on the normal
             // cadence so we retry rather than getting stuck re-polling instantly.
             error!(feed = %feed.url, %err, "polled: store error");
-            cadence_for(feed, default_interval)
+            if let Err(err) =
+                store::set_next_poll(pool, &feed.url, cadence_for(feed, default_interval)).await
+            {
+                error!(feed = %feed.url, %err, "failed to persist next_poll");
+            }
         }
-    };
-
-    if let Err(err) = set_next_poll(pool, &feed.url, next_delay).await {
-        error!(feed = %feed.url, %err, "failed to persist next_poll");
     }
-}
-
-/// Persist a feed's `next_poll = now + delay` via the store's feed upsert.
-async fn set_next_poll(pool: &Pool, url: &str, delay: Duration) -> anyhow::Result<()> {
-    let next = Utc::now()
-        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
-    let next_poll = next.to_rfc3339_opts(SecondsFormat::Secs, true);
-    // upsert_feed COALESCEs unset fields, so supplying only url + next_poll bumps
-    // the schedule without clobbering title/validators/last_polled. That claim
-    // was false when it was written — etag and last_modified were assigned
-    // unconditionally, so this call, which runs after EVERY poll of EVERY feed,
-    // erased both and made conditional GET dead code instance-wide. The store
-    // now COALESCEs them; `validators_survive_a_partial_upsert` pins it.
-    let nf = store::NewFeed {
-        url: url.to_string(),
-        next_poll: Some(next_poll),
-        ..Default::default()
-    };
-    store::upsert_feed(pool, &nf).await.map(|_| ())
 }
 
 /// The per-feed poll cadence. Honours the feed's `fetchHint` when the feed row

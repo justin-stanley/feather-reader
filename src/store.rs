@@ -802,6 +802,27 @@ pub async fn bump_feed_errors(
         .unwrap_or(1))
 }
 
+/// Schedule a feed's next poll `delay` from now.
+///
+/// Lived as a private fn in the scheduler until `web::add_subscription`
+/// needed it too: a poll taken off the scheduler settled the error columns but
+/// never rescheduled, so a re-subscribed working feed stayed parked on its stale
+/// backoff horizon for up to 24h. One implementation, two callers.
+///
+/// `upsert_feed` COALESCEs unset fields, so supplying only url + next_poll bumps
+/// the schedule without clobbering title/validators/last_polled.
+pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Duration) -> Result<()> {
+    let next = chrono::Utc::now()
+        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
+    let next_poll = next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let nf = NewFeed {
+        url: url.to_string(),
+        next_poll: Some(next_poll),
+        ..Default::default()
+    };
+    upsert_feed(pool, &nf).await.map(|_| ())
+}
+
 /// Reset a feed's `consecutive_errors` to 0 after a successful poll (or a 304).
 /// A no-op UPDATE if the row is missing.
 pub async fn reset_feed_errors(pool: &SqlitePool, url: &str) -> Result<()> {
@@ -3897,6 +3918,25 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     .await
     .context("computing the failure-cause histogram")?;
 
+    // **Close the vocabulary where it is READ.** `FailureKind::parse` promised
+    // that a kind from a newer build would not be attributed to a cause this
+    // one recognises — but nothing called it, so the raw column reached the
+    // public template and an unrecognised string rendered as its own bucket.
+    // Fold anything `parse` rejects into `unknown`, then re-aggregate and
+    // re-order, so the histogram only ever shows the four kinds this build
+    // knows plus the one honest bucket for what it does not.
+    let mut folded: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (kind, n) in kinds {
+        let key = if kind == "unknown" || crate::feed::FailureKind::parse(&kind).is_some() {
+            kind
+        } else {
+            "unknown".to_string()
+        };
+        *folded.entry(key).or_insert(0) += n;
+    }
+    let mut kinds: Vec<(String, i64)> = folded.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     Ok(PollHealth {
         feeds_tracked: row.0,
         polled_last_hour: row.1,
@@ -6085,6 +6125,58 @@ mod tests {
         assert_eq!(
             recovered.1, None,
             "a healthy feed still carries error detail"
+        );
+        Ok(())
+    }
+
+    /// **The closed vocabulary is closed where it is READ, not only written.**
+    ///
+    /// `FailureKind::parse` promises that a kind string from a newer build is
+    /// not "silently attributed to a cause this one recognises" — and the
+    /// histogram's comment leaned on it. But review found `parse` had zero
+    /// production callers: `poll_health` handed the raw column to the public
+    /// template, so an unrecognised string got its own bucket, rendered
+    /// verbatim. The protection existed only as a doc comment.
+    ///
+    /// A row written by a future build must land in `unknown`.
+    #[tokio::test]
+    async fn an_unrecognised_failure_kind_folds_into_unknown() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for (url, kind) in [
+            ("https://a.example/f.xml", Some("fetch")),
+            ("https://b.example/f.xml", Some("quota")), // a newer build's kind
+            ("https://c.example/f.xml", None),          // a legacy row
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE feeds SET consecutive_errors = 1, last_error_kind = ?2 WHERE url = ?1",
+            )
+            .bind(url)
+            .bind(kind)
+            .execute(&pool)
+            .await?;
+        }
+        let now = chrono::Utc::now();
+        let health = poll_health(
+            &pool,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await?;
+        let mut kinds = health.failure_kinds.clone();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![("fetch".to_string(), 1), ("unknown".to_string(), 2)],
+            "an unrecognised kind reached the public histogram as its own bucket: {:?}",
+            health.failure_kinds
         );
         Ok(())
     }
