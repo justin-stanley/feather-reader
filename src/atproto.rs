@@ -759,7 +759,7 @@ impl PdsClient {
             return Err(xrpc_error_from(resp).await.into());
         }
         let body = crate::net::read_capped(resp).await?;
-        serde_json::from_slice(&body).context("parsing listRecords response")
+        parse_list_records(&body)
     }
 
     /// Page through **all** records in a collection, following the cursor until
@@ -1848,6 +1848,26 @@ pub(crate) fn urlencode(s: &str) -> String {
     out
 }
 
+/// Parse a `listRecords` body, refusing an error envelope that arrived on a
+/// 2xx. `ListRecordsResponse.records` is `#[serde(default)]`, so
+/// `{"error","message"}` would otherwise deserialise as an EMPTY page — and a
+/// walk over a stranger's collection would return a healthy, empty result in
+/// place of an error. Some PDS implementations answer 200 for application
+/// failures; the status check in the caller cannot see those.
+pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
+    if let Ok(XrpcErrorBody {
+        error: Some(error),
+        message,
+    }) = serde_json::from_slice::<XrpcErrorBody>(body)
+    {
+        anyhow::bail!(
+            "PDS answered 2xx with an error envelope: {error}{}",
+            message.map(|m| format!(" — {m}")).unwrap_or_default()
+        );
+    }
+    serde_json::from_slice(body).context("parsing listRecords response")
+}
+
 /// The atproto XRPC error envelope body: `{"error": "...", "message": "..."}`.
 #[derive(Debug, Deserialize)]
 struct XrpcErrorBody {
@@ -1990,6 +2010,20 @@ mod tests {
             ],
             "cursor": "3ksub0002"
         })
+    }
+
+    /// **A 200 carrying an error envelope is not an empty page.** `records` is
+    /// `#[serde(default)]`, so `{"error": "...", "message": "..."}` on a 200
+    /// deserialised as zero records — and a walk over a stranger's documents
+    /// then returned a healthy, empty feed instead of an error. Some PDS
+    /// implementations do answer 200 for application-level failures.
+    #[test]
+    fn a_200_with_an_error_envelope_is_not_an_empty_page() {
+        let err = parse_list_records(br#"{"error":"InvalidRequest","message":"bad cursor"}"#)
+            .expect_err("an error envelope parsed as a page");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+        let page = parse_list_records(br#"{"records":[]}"#).expect("an empty page is a page");
+        assert!(page.records.is_empty() && page.cursor.is_none());
     }
 
     #[test]

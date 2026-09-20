@@ -1083,13 +1083,13 @@ fn text_plain(t: &Text) -> String {
 /// Sanitize hostile feed HTML with ammonia's whitelist cleaner. Safe on plain
 /// text too (it will simply escape/strip as needed), so it's applied to *all*
 /// entry bodies unconditionally.
-fn sanitize_html(raw: &str) -> String {
+pub(crate) fn sanitize_html(raw: &str) -> String {
     ammonia::clean(raw)
 }
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
 /// store's string columns.
-fn fmt_time(dt: DateTime<Utc>) -> String {
+pub(crate) fn fmt_time(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 

@@ -91,9 +91,31 @@ pub struct Entry {
     /// dedup is `UNIQUE (feed_id, guid)`.
     pub guid: String,
     pub title: String,
-    pub published: String,
+    /// `publishedAt` parsed and re-spelled by [`crate::feed::fmt_time`], the
+    /// store's one RFC3339 shape — or `None` when it does not parse. The
+    /// reading order sorts on this column as a string, so a publisher's
+    /// spelling cannot go in verbatim.
+    pub published: Option<String>,
     pub url: String,
+    /// `description`, else `textContent`, passed through
+    /// [`crate::feed::sanitize_html`] exactly as every RSS body is.
     pub summary: Option<String>,
+}
+
+impl From<Entry> for crate::store::NewEntry {
+    /// The shape the poller stores. Kept here, next to the fields it maps,
+    /// so wiring the reader to the scheduler has nothing left to decide.
+    fn from(e: Entry) -> Self {
+        crate::store::NewEntry {
+            guid: e.guid,
+            url: Some(e.url),
+            title: Some(e.title),
+            author: None,
+            published: e.published,
+            content_html: e.summary,
+            fetched_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,12 +143,11 @@ struct DocumentValue {
 
 /// Find the publication named by `rkey` among a repo's publication records.
 ///
-/// Returns its **canonical** at-URI — the one the PDS itself minted, always
-/// DID-form — alongside the record. That canonical URI is what documents
-/// reference in their `site` field, and using it rather than the URI the reader
-/// subscribed with is what makes a handle-form subscription work: the two are
-/// different strings for the same publication, and only one of them appears in
-/// the data.
+/// Returns its **canonical** at-URI — the one the PDS itself minted — alongside
+/// the record. That canonical URI is what documents reference in their `site`
+/// field, so it is the key the filter uses, rather than the string the reader
+/// subscribed with. Storage is DID-form only (#164), so today the two agree;
+/// taking the PDS's spelling keeps them agreeing if they ever stop.
 pub fn publication_from_records(
     rkey: &str,
     records: &[crate::atproto::RecordEntry],
@@ -169,11 +190,16 @@ pub fn entries_from_records(
             Some(Entry {
                 guid: record.uri.clone(),
                 title: doc.title,
-                published: doc.published_at,
+                published: chrono::DateTime::parse_from_rfc3339(&doc.published_at)
+                    .ok()
+                    .map(|d| crate::feed::fmt_time(d.with_timezone(&chrono::Utc))),
                 url: join_path(base.as_ref(), &doc.path),
                 // `description` first — the authored summary — but only when it
                 // actually says something: a blank one must not shadow the body.
-                summary: non_blank(doc.description).or_else(|| non_blank(doc.text_content)),
+                // Then sanitised: a stranger's string, rendered as HTML.
+                summary: non_blank(doc.description)
+                    .or_else(|| non_blank(doc.text_content))
+                    .map(|raw| crate::feed::sanitize_html(&raw)),
             })
         })
         .collect()
@@ -291,25 +317,50 @@ mod tests {
         format!("at://{DID}/{}/{rkey}", nsid::STANDARD_PUBLICATION)
     }
 
-    /// **A handle-form subscription must still match DID-form documents.**
-    ///
-    /// #164 deliberately admits `at://alice.example.com/...`, and getRecord and
-    /// listRecords both accept a handle as `repo` — but documents reference
-    /// their publication canonically, by DID, and every measured document does.
-    /// Comparing against the string the reader subscribed with returned a
-    /// permanently empty feed that the module then declared healthy.
-    ///
-    /// Taking the canonical URI from the record the PDS returned removes the
-    /// skew rather than compensating for it.
+    /// **The `site` filter keys on the URI the PDS minted, not the string the
+    /// reader subscribed with.** Documents reference their publication by the
+    /// canonical URI, and every measured document does. An earlier draft
+    /// compared against the subscribed string; storage was then meant to admit
+    /// handle-form URIs, and a handle-form subscription found nothing forever
+    /// while the module declared the feed healthy. #164 made storage DID-only,
+    /// so the two strings agree today — the canonical one is still the right
+    /// key, and this pins it.
     #[test]
-    fn a_handle_form_subscription_matches_did_form_documents() {
+    fn the_site_filter_uses_the_uri_the_pds_minted() {
         let records = vec![publication("p", "https://scanash.com")];
         let (site, pubn) = publication_from_records("p", &records).expect("publication not found");
         assert_eq!(site, canonical("p"), "did not take the PDS's canonical URI");
 
         let docs = vec![document("d1", &canonical("p"), "Hello", "/hello")];
         let entries = entries_from_records(&site, &pubn, &docs);
-        assert_eq!(entries.len(), 1, "a handle-form subscription found nothing");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a canonical-site document was not matched"
+        );
+    }
+
+    /// The mapping into the store's row is total and loses nothing the poller
+    /// would need — so wiring the reader has nothing to invent.
+    #[test]
+    fn an_entry_maps_onto_the_stores_row() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![document("rk1", &site, "Hello", "/hello")];
+        let row: crate::store::NewEntry = entries_from_records(&site, &pubn, &docs)
+            .pop()
+            .unwrap()
+            .into();
+        assert_eq!(
+            row.guid,
+            format!("at://{DID}/{}/rk1", nsid::STANDARD_DOCUMENT)
+        );
+        assert_eq!(row.url.as_deref(), Some("https://example.com/hello"));
+        assert_eq!(row.title.as_deref(), Some("Hello"));
+        assert_eq!(row.published.as_deref(), Some("2026-07-11T00:00:00Z"));
+        assert_eq!(row.content_html.as_deref(), Some("body"));
+        assert_eq!(row.author, None);
+        assert_eq!(row.fetched_at, None);
     }
 
     /// A repo can hold several publications — measured, some do — and
@@ -370,10 +421,12 @@ mod tests {
             .map(|e| e.url)
             .collect();
         assert_eq!(urls[0], "https://example.com/a");
-        assert!(
-            !urls[1].starts_with("https://evil.example"),
-            "a document path escaped its publication's origin: {}",
-            urls[1],
+        // Exactly the publication's base, not merely "not evil": a mutation
+        // that returned the raw path, or an empty string, passed the weaker
+        // negative assertion this used to be.
+        assert_eq!(
+            urls[1], "https://example.com/blog",
+            "a document path that escapes its publication's origin must fall back to the base"
         );
     }
 
@@ -418,6 +471,76 @@ mod tests {
         );
         let entries = entries_from_records(&site, &pubn, &[doc]);
         assert_eq!(entries[0].summary.as_deref(), Some("the real body"));
+    }
+
+    /// **`publishedAt` is parsed, not passed through.** The store's `published`
+    /// column is the RFC3339 shape `feed::fmt_time` writes, and the reading
+    /// order sorts on it as a string. A publisher's string went in verbatim —
+    /// a garbage value would have sorted arbitrarily among real ones, and a
+    /// valid-but-differently-spelled one (`+00:00`, fractional seconds) would
+    /// not have matched the RSS path's spelling for the same instant.
+    #[test]
+    fn published_at_is_normalised_or_dropped() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let with = |rkey: &str, published_at: serde_json::Value| {
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                rkey,
+                json!({ "title": "T", "publishedAt": published_at, "path": "/x", "site": site }),
+            )
+        };
+        let docs = vec![
+            with("a", json!("2026-07-11T09:30:00.123+02:00")),
+            with("b", json!("yesterday-ish")),
+            with("c", json!("2026-07-11T00:00:00Z")),
+        ];
+        let published: Vec<Option<String>> = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .map(|e| e.published)
+            .collect();
+        assert_eq!(
+            published,
+            vec![
+                Some("2026-07-11T07:30:00Z".to_string()),
+                None,
+                Some("2026-07-11T00:00:00Z".to_string()),
+            ],
+            "publishedAt was not normalised to the store's spelling"
+        );
+    }
+
+    /// **Summaries are sanitised on the way in, exactly as RSS bodies are.**
+    /// `description` and `textContent` are a stranger's strings and the
+    /// template renders the stored body as HTML; the RSS path passes every
+    /// body through `feed::sanitize_html`, and this path must not be the one
+    /// that skips it.
+    #[test]
+    fn summaries_are_sanitised_like_rss_bodies() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let doc = rec(
+            nsid::STANDARD_DOCUMENT,
+            "d",
+            json!({
+                "title": "T",
+                "publishedAt": "2026-07-11T00:00:00Z",
+                "path": "/d",
+                "site": site,
+                "description": "<script>alert(1)</script><b>bold</b> <a href=\"javascript:x\">l</a>",
+            }),
+        );
+        let entries = entries_from_records(&site, &pubn, &[doc]);
+        let summary = entries[0].summary.as_deref().unwrap();
+        assert!(!summary.contains("<script"), "script survived: {summary}");
+        assert!(
+            !summary.contains("javascript:"),
+            "javascript href survived: {summary}"
+        );
+        assert!(
+            summary.contains("<b>bold</b>"),
+            "benign markup was destroyed: {summary}"
+        );
     }
 
     /// The guid is the record's own URI. `path` is mutable; dedup is
