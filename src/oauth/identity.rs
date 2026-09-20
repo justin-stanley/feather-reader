@@ -115,18 +115,20 @@ fn is_bare_did_web_host(host: &str) -> bool {
             return false;
         }
     }
-    // An IP literal is not a name, and `did:web:169.254.169.254` is a cloud
-    // metadata endpoint. A dotted-quad passes the label rules below, so it has
-    // to be refused explicitly.
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return false;
-    }
-    // `IpAddr` only parses the CANONICAL spelling, while the URL parser the
-    // fetch path uses accepts far more: `127.1`, `0177.0.0.1` and `0x7f.0.0.1`
-    // all resolve to 127.0.0.1 and all passed the check above. A real TLD is
-    // never entirely numeric, so refusing a numeric final label catches every
-    // such spelling without needing to reimplement the URL parser's arithmetic.
-    // It is the same rule `normalize_handle` applies to handles.
+    // **An IP literal is refused by the numeric-final-label rule**, not by a
+    // parse. An earlier version parsed the host as `IpAddr` first and refused
+    // on success; that branch was dead — `IpAddr` accepts only the canonical
+    // dotted-quad, whose final label is numeric and is refused below anyway,
+    // and IPv6 cannot reach here at all because `:` is refused above. A test
+    // named for the IP rule kept passing with it deleted, which is how a
+    // check that does nothing gets mistaken for one that does.
+    //
+    // The URL parser the fetch path uses accepts far more than `IpAddr`:
+    // `127.1`, `0177.0.0.1` and `0x7f.0.0.1` all resolve to 127.0.0.1. A real
+    // TLD is never entirely numeric, so refusing a numeric final label catches
+    // `did:web:169.254.169.254` (cloud metadata) and every non-canonical
+    // spelling of it, without reimplementing the URL parser's arithmetic. It
+    // is the same rule `normalize_handle` applies to handles.
     if let Some(tld) = host.rsplit('.').next() {
         if tld.starts_with(|c: char| c.is_ascii_digit()) {
             return false;
@@ -818,6 +820,11 @@ mod tests {
     /// no IP literal. The SSRF guard blocks these at fetch time, but this module
     /// states that rejecting here is what makes the guard a second line of
     /// defence rather than the only one.
+    ///
+    /// Every IP case below is refused by the numeric-final-label rule — there
+    /// is no separate IP check, and there was a dead one until a mutation
+    /// showed this test green with it deleted. Deleting the label rule instead
+    /// fails every IP case here.
     #[test]
     fn did_web_hosts_obey_the_reserved_tld_and_ip_policy() {
         for did in [
