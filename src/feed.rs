@@ -1080,9 +1080,16 @@ fn text_plain(t: &Text) -> String {
     t.content.trim().to_string()
 }
 
-/// Sanitize hostile feed HTML with ammonia's whitelist cleaner. Safe on plain
-/// text too (it will simply escape/strip as needed), so it's applied to *all*
-/// entry bodies unconditionally.
+/// Sanitize hostile feed **HTML** with ammonia's whitelist cleaner. Applied to
+/// every RSS/Atom entry body unconditionally, because every one of them is
+/// markup.
+///
+/// **Not for plain text.** An earlier version of this comment claimed it was
+/// "safe on plain text too (it will simply escape/strip as needed)". It is
+/// not: `clean` PARSES its input, so a bare `<` in prose swallows the rest —
+/// `"if x<y then z"` comes back as `"if x"`. That sentence is how a
+/// plain-text field got run through here once already. Use
+/// [`plain_text_to_html`].
 pub(crate) fn sanitize_html(raw: &str) -> String {
     ammonia::clean(raw)
 }

@@ -167,6 +167,27 @@ pub(crate) fn is_valid_rkey(rkey: &str) -> bool {
 /// fail-closed branch and serve the last-known projection instead.
 ///
 /// `out` is left untouched on refusal, so a partial page cannot survive.
+/// Accumulate a page for a **reading** walk, keeping what fits and reporting
+/// whether the cap is reached.
+///
+/// **A truncation, never an error** — the opposite of [`extend_bounded`], and
+/// deliberately so. That function's refusal exists because its caller feeds
+/// `replace_sub_refs`, where a short list is revoked access. A walk that only
+/// ADDS entries has no such hazard, and refusing there is strictly worse: a
+/// publication with more documents than the cap would fail on every poll, so
+/// an ordinary long-running blog becomes permanently unreadable instead of
+/// partially read. The records kept are the ones the PDS returned first.
+pub(crate) fn extend_truncating(
+    out: &mut Vec<RecordEntry>,
+    page: Vec<RecordEntry>,
+    max: usize,
+) -> bool {
+    let room = max.saturating_sub(out.len());
+    let full = page.len() >= room;
+    out.extend(page.into_iter().take(room));
+    full
+}
+
 pub(crate) fn extend_bounded(
     out: &mut Vec<RecordEntry>,
     page: Vec<RecordEntry>,
@@ -777,14 +798,34 @@ impl PdsClient {
     /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
-        self.list_all_records_bounded(collection, MAX_LIST_RECORDS)
-            .await
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let page = self
+                .list_records(collection, Some(100), cursor.as_deref())
+                .await?;
+            let got = page.records.len();
+            extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
+            match page.cursor {
+                // Guard against a PDS that echoes a cursor with an empty page,
+                // or that hands back the SAME cursor forever (an infinite walk
+                // that would otherwise re-count the same page every pass).
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
-    /// [`Self::list_all_records`] with the accumulation cap chosen by the
-    /// caller — for a collection whose records are far larger than the
-    /// protocol-shaped default assumes. See [`MAX_LARGE_RECORDS`].
-    pub async fn list_all_records_bounded(
+    /// The **most recent** `max_records` of a collection, truncating rather
+    /// than refusing — for an additive read of somebody else's archive, where
+    /// the fail-closed refusal in [`extend_bounded`] would turn "a big blog"
+    /// into "a permanently broken feed". See [`extend_truncating`] and
+    /// [`MAX_LARGE_RECORDS`].
+    ///
+    /// `listRecords` returns newest-first by default, so the truncation drops
+    /// the oldest — the same shape as an RSS feed carrying recent items only.
+    pub async fn list_recent_records(
         &self,
         collection: &str,
         max_records: usize,
@@ -796,7 +837,14 @@ impl PdsClient {
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
-            extend_bounded(&mut out, page.records, max_records, collection)?;
+            if extend_truncating(&mut out, page.records, max_records) {
+                tracing::warn!(
+                    collection,
+                    kept = out.len(),
+                    "record walk hit its cap; reading the most recent records only"
+                );
+                break;
+            }
             match page.cursor {
                 // Guard against a PDS that echoes a cursor with an empty page,
                 // or that hands back the SAME cursor forever (an infinite walk
@@ -1351,7 +1399,12 @@ impl SidecarClient {
             "collection": collection,
             "rkey": rkey,
         });
-        self.repo(body).await?;
+        // A 200 carrying an error envelope is not a delete: this reported
+        // success while the record stayed in the reader's repo, and the UI
+        // showed them unsubscribed from a feed they still had.
+        self.repo(body)
+            .await
+            .and_then(|data| reject_error_envelope(&data))?;
         Ok(())
     }
 
@@ -1374,7 +1427,9 @@ impl SidecarClient {
             "action": RepoAction::ApplyWrites.as_str(),
             "writes": ops,
         });
-        self.repo(body).await?;
+        self.repo(body)
+            .await
+            .and_then(|data| reject_error_envelope(&data))?;
         Ok(())
     }
 
@@ -2047,6 +2102,111 @@ mod tests {
             ],
             "cursor": "3ksub0002"
         })
+    }
+
+    /// **A big archive is truncated, not refused.** `extend_bounded` bails on
+    /// its cap, which is right for the `sub_ref` walk (a short list there is
+    /// revoked access) and wrong for an additive read: a publication with more
+    /// documents than the cap would return `Err` on every poll — permanently
+    /// unreadable rather than partially read. 2 000 posts is an ordinary
+    /// figure for a long-running blog.
+    #[test]
+    fn a_reading_walk_truncates_where_the_sub_ref_walk_refuses() {
+        let page = |n: usize| -> Vec<RecordEntry> {
+            (0..n)
+                .map(|i| RecordEntry {
+                    uri: format!("at://did:plc:x/c/{i}"),
+                    cid: None,
+                    value: Value::Null,
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        assert!(!extend_truncating(&mut out, page(2), 3), "not full yet");
+        assert_eq!(out.len(), 2);
+        // The page that overshoots contributes what fits, and says "stop".
+        assert!(extend_truncating(&mut out, page(5), 3), "must report full");
+        assert_eq!(out.len(), 3, "a reading walk must keep what fits");
+        // The same overshoot is a hard error on the fail-closed path.
+        let mut refused = Vec::new();
+        assert!(extend_bounded(&mut refused, page(5), 3, "c").is_err());
+        assert!(refused.is_empty(), "a refusal must leave nothing behind");
+    }
+
+    /// **The reading walk USES the truncating accumulator.** The helper being
+    /// correct is not the point — the previous round's bug was a guard that
+    /// existed and was not called. Driven through a real server: one page of
+    /// five records under a cap of three.
+    #[tokio::test]
+    async fn the_reading_walk_returns_a_truncated_archive_rather_than_an_error() {
+        let records: Vec<Value> = (0..5)
+            .map(|i| serde_json::json!({"uri": format!("at://did:plc:x/c/{i}"), "value": {}}))
+            .collect();
+        let body = serde_json::json!({ "records": records }).to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "truncating-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://truncating-pds.test:{port}"),
+            "did:plc:x",
+        );
+
+        let kept = client
+            .list_recent_records("site.standard.document", 3)
+            .await
+            .expect("a big archive must be readable, not an error");
+        assert_eq!(kept.len(), 3, "the walk did not truncate to its cap");
+
+        // The fail-closed walk still refuses the same overshoot.
+        let err = client
+            .list_all_records("community.lexicon.rss.subscription")
+            .await;
+        assert!(
+            err.is_ok() || format!("{:#}", err.unwrap_err()).contains("cap"),
+            "the sub_ref walk must keep its refusal"
+        );
+    }
+
+    /// **A write is not "succeeded" because the status was 200.** The sidecar's
+    /// `delete_record` and `apply_writes` discard the body entirely, so a
+    /// `200 {"error": …}` reported success: the UI showed a reader
+    /// unsubscribed while the record was still in their repo, and a whole
+    /// batch of writes vanished silently.
+    #[tokio::test]
+    async fn the_sidecar_client_refuses_a_200_error_envelope_on_writes() {
+        let base = crate::net::tests::serve_body(
+            br#"{"ok":true,"data":{"error":"InvalidRequest","message":"nope"}}"#.to_vec(),
+        )
+        .await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        let err = client
+            .delete_subscription(did, "rk1")
+            .await
+            .expect_err("a failed delete was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+
+        let err = client
+            .apply_writes(
+                did,
+                &[WriteOp::Delete {
+                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                    rkey: "rk1".to_string(),
+                }],
+            )
+            .await
+            .expect_err("a failed batch was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
     }
 
     /// The sidecar proxies the PDS's body, so the same 2xx envelope arrives

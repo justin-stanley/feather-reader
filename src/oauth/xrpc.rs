@@ -225,7 +225,8 @@ impl Repo<'_> {
             DpopBody::Json(serde_json::to_vec(&body)?),
             "com.atproto.repo.deleteRecord",
         )
-        .await?;
+        .await
+        .and_then(|v| crate::atproto::reject_error_envelope(&v))?;
         Ok(())
     }
 
@@ -241,7 +242,8 @@ impl Repo<'_> {
             DpopBody::Json(serde_json::to_vec(&body)?),
             "com.atproto.repo.applyWrites",
         )
-        .await?;
+        .await
+        .and_then(|v| crate::atproto::reject_error_envelope(&v))?;
         Ok(())
     }
 
@@ -696,6 +698,50 @@ mod tests {
             format!("{err:#}").contains("InvalidRequest"),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// The write paths discarded the body too: `delete_record` and
+    /// `apply_writes` are `send(..).await?; Ok(())`, so a 200 carrying an
+    /// error envelope reported success for a delete that did not happen.
+    #[tokio::test]
+    async fn a_200_error_envelope_is_not_a_successful_write() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"nope"}"#.to_vec(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "envelope-write.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://envelope-write.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .delete_record("app.feather.subscription", "rk1")
+            .await
+            .expect_err("a failed delete was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+
+        let err = repo
+            .apply_writes(&[crate::atproto::WriteOp::Delete {
+                collection: "app.feather.subscription".to_string(),
+                rkey: "rk1".to_string(),
+            }])
+            .await
+            .expect_err("a failed batch was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
     }
 
     /// An empty batch must not produce a request at all — an `applyWrites` with

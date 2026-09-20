@@ -138,7 +138,10 @@ struct DocumentValue {
     /// fatal to the whole record.
     #[serde(rename = "publishedAt")]
     published_at: Option<String>,
-    path: String,
+    /// Optional for the same reason as `publishedAt`: a document with no
+    /// `path` keeps its title, date and summary rather than vanishing from
+    /// the feed entirely. `Entry.url` is already `Option`.
+    path: Option<String>,
     /// The at-URI of the publication this document belongs to.
     ///
     /// **Load-bearing.** A repo can hold several publications — measured, some
@@ -204,7 +207,10 @@ pub fn entries_from_records(
                     .as_deref()
                     .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                     .map(|d| crate::feed::fmt_time(d.with_timezone(&chrono::Utc))),
-                url: join_path(base.as_ref(), &doc.path),
+                url: doc
+                    .path
+                    .as_deref()
+                    .and_then(|path| join_path(base.as_ref(), path)),
                 // `description` first — the authored summary — but only when it
                 // actually says something: a blank one must not shadow the body.
                 // Then ESCAPED, not sanitised: both fields are plain text.
@@ -241,8 +247,36 @@ fn join_path(base: Option<&url::Url>, path: &str) -> Option<String> {
         // A path that resolves off the publication's origin is not a path, it
         // is a redirect the publisher smuggled into a field we render as theirs.
         Ok(joined) if joined.origin() == base.origin() => crate::net::safe_link(joined.as_str()),
-        _ => crate::net::safe_link(base.as_str()),
+        // **No URL, not the homepage.** Falling back to the base gave every
+        // affected entry the same href pointing at the site root — which is
+        // what a publication on an apex domain whose documents live on `www.`
+        // or a CDN would produce for its whole archive, with nothing to say
+        // anything had been dropped.
+        _ => None,
     }
+}
+
+/// How many documents reference no publication in this repo.
+///
+/// **The signal is an orphan, not an empty feed.** A publication with no
+/// documents is normal, and so is polling an empty publication in a repo where
+/// a SIBLING has hundreds — that is the shape the `site` filter exists for, and
+/// warning on it would be noise on every poll forever. A document whose `site`
+/// matches nothing in the repo is the other thing: a spelling nothing can ever
+/// match, which otherwise looks exactly like a quiet blog.
+fn orphaned_document_count(
+    publications: &[crate::atproto::RecordEntry],
+    documents: &[crate::atproto::RecordEntry],
+) -> usize {
+    let known: std::collections::HashSet<&str> =
+        publications.iter().map(|p| p.uri.as_str()).collect();
+    documents
+        .iter()
+        .filter(|d| {
+            serde_json::from_value::<DocumentValue>(d.value.clone())
+                .is_ok_and(|doc| !known.contains(doc.site.as_str()))
+        })
+        .count()
 }
 
 /// Read a publication and its documents through the hardened anonymous client.
@@ -297,7 +331,7 @@ pub async fn fetch(
     // Documents carry the whole article (~17 KB measured), so this walk is
     // bounded by a cap sized to the record rather than the protocol default.
     let documents = client
-        .list_all_records_bounded(nsid::STANDARD_DOCUMENT, crate::atproto::MAX_LARGE_RECORDS)
+        .list_recent_records(nsid::STANDARD_DOCUMENT, crate::atproto::MAX_LARGE_RECORDS)
         .await
         .with_context(|| format!("listing documents for {canonical_site}"))?;
     let entries = entries_from_records(&canonical_site, &publication, &documents);
@@ -306,11 +340,12 @@ pub async fn fetch(
     // would call this healthy forever; if the repo HAD documents and none
     // matched, say so, because that is the shape of a bug rather than of a
     // quiet blog.
-    if entries.is_empty() && !documents.is_empty() {
+    let orphaned = orphaned_document_count(&publications, &documents);
+    if orphaned > 0 {
         tracing::warn!(
             site = %canonical_site,
-            documents = documents.len(),
-            "read a publication whose repo has documents but none reference it"
+            orphaned,
+            "documents in this repo reference no publication in it — a `site` spelling nothing matches"
         );
     }
     Ok((publication, entries))
@@ -465,10 +500,13 @@ mod tests {
         // Exactly the publication's base, not merely "not evil": a mutation
         // that returned the raw path, or an empty string, passed the weaker
         // negative assertion this used to be.
+        // Off-origin is dropped, not rewritten to the base. This assertion has
+        // moved twice: it began as "not evil" (a mutant returning the raw path
+        // passed it), was tightened to the base fallback, and is now `None` —
+        // the base gave every affected entry the same homepage href.
         assert_eq!(
-            urls[1].as_deref(),
-            Some("https://example.com/blog"),
-            "a document path that escapes its publication's origin must fall back to the base"
+            urls[1], None,
+            "a document path that escapes its publication's origin must yield no URL"
         );
     }
 
@@ -664,6 +702,80 @@ mod tests {
             format!("{err:#}").contains(nsid::STANDARD_PUBLICATION),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// **An off-origin path is dropped, not rewritten to the homepage.**
+    /// Returning the base gave every affected entry the SAME href pointing at
+    /// the site root — realistic whenever a publication's `url` is the apex
+    /// and its documents sit on `www.` or a CDN domain. `None` is the honest
+    /// answer, and the template already has a no-URL branch.
+    #[test]
+    fn an_off_origin_path_yields_no_url_rather_than_the_homepage() {
+        let records = vec![publication("p", "https://example.com/blog")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![
+            document("a", &site, "Elsewhere", "https://www.example.com/post"),
+            document("b", &site, "Home", "/ok"),
+        ];
+        let urls: Vec<Option<String>> = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .map(|e| e.url)
+            .collect();
+        assert_eq!(
+            urls[0], None,
+            "an off-origin path was rewritten to the base"
+        );
+        assert_eq!(urls[1].as_deref(), Some("https://example.com/ok"));
+    }
+
+    /// A document without `path` keeps its title, date and summary — the
+    /// policy `publishedAt` and `Entry.url` already follow.
+    #[test]
+    fn a_document_without_a_path_is_still_an_entry() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let doc = rec(
+            nsid::STANDARD_DOCUMENT,
+            "d",
+            json!({ "title": "T", "publishedAt": "2026-07-11T00:00:00Z", "site": site }),
+        );
+        let entries = entries_from_records(&site, &pubn, &[doc]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a missing path dropped the whole document"
+        );
+        assert_eq!(entries[0].title, "T");
+        assert_eq!(entries[0].url, None);
+    }
+
+    /// **The "nothing matched" warning must not fire for a sibling.** A repo
+    /// with an empty publication A and a busy publication B is the exact shape
+    /// this module's `site` filter exists for; warning on every poll of A
+    /// would be noise forever. The signal is a document that references NO
+    /// publication in the repo — a `site` spelling nothing can match.
+    #[test]
+    fn orphaned_documents_are_counted_but_siblings_are_not() {
+        let pubs = vec![
+            publication("a", "https://example.com"),
+            publication("b", "https://b.example"),
+        ];
+        let docs = vec![
+            document("d1", &canonical("b"), "B's", "/1"),
+            document("d2", &canonical("b"), "B's too", "/2"),
+        ];
+        assert_eq!(
+            orphaned_document_count(&pubs, &docs),
+            0,
+            "a sibling publication's documents are not orphans"
+        );
+        let orphan = vec![document(
+            "d3",
+            "at://did:plc:other/site.standard.publication/x",
+            "?",
+            "/3",
+        )];
+        assert_eq!(orphaned_document_count(&pubs, &orphan), 1);
     }
 
     /// `AtUri` uses the crate's one spelling of the prefix.
