@@ -2925,6 +2925,31 @@ struct SubscribeForm {
     folder: Option<String>,
 }
 
+/// Apply a directly-taken [`feed::PollOutcome`] to a feed's error columns.
+///
+/// The scheduler does this inline; every other caller of `feed::poll_feed`
+/// previously did not, which meant a poll taken outside the scheduler could
+/// neither clear a stale failure nor record a new one. `poll_feed` itself only
+/// writes validators and `last_polled` — deliberately, since the backoff is the
+/// scheduler's concern — so the settling has to live with each caller.
+async fn settle_direct_poll(
+    pool: &store::Pool,
+    url: &str,
+    outcome: &feed::PollOutcome,
+) -> anyhow::Result<()> {
+    match outcome {
+        // A 304 is a success: it proves the fetch worked and nothing changed.
+        feed::PollOutcome::Updated { .. } | feed::PollOutcome::NotModified => {
+            store::reset_feed_errors(pool, url).await
+        }
+        feed::PollOutcome::Failed { kind, detail, .. } => {
+            store::bump_feed_errors(pool, url, *kind, detail)
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
 /// `POST /subscriptions` — subscribe by URL.
 async fn add_subscription(
     State(state): State<AppState>,
@@ -3028,7 +3053,15 @@ async fn add_subscription(
         if let Some(feed_row) = store::get_feed_by_url(pool, &feed_url).await? {
             match feed::poll_feed(pool, &client, &feed_row, state.config.max_entries_per_feed).await
             {
-                Ok(outcome) => info!(feed = %feed_url, ?outcome, "polled new subscription"),
+                Ok(outcome) => {
+                    info!(feed = %feed_url, ?outcome, "polled new subscription");
+                    // **This path is not the scheduler, so it must settle the
+                    // error columns itself.** `poll_feed` writes validators and
+                    // `last_polled` and nothing else.
+                    if let Err(err) = settle_direct_poll(pool, &feed_url, &outcome).await {
+                        warn!(%err, feed = %feed_url, "could not settle the poll outcome");
+                    }
+                }
                 Err(err) => warn!(%err, feed = %feed_url, "initial poll failed"),
             }
         }
@@ -9057,6 +9090,226 @@ mod tests {
                 "the public page leaked {leak:?} while reporting failures"
             );
         }
+    }
+
+    /// **A direct poll must settle the error columns, like the scheduler does.**
+    ///
+    /// `add_subscription` polls through `feed::poll_feed` rather than the
+    /// scheduler, and `poll_feed` writes validators and `last_polled` but never
+    /// touches `consecutive_errors` — that is the scheduler's job, and this path
+    /// is not the scheduler.
+    ///
+    /// So a feed that was failing, is re-subscribed, and polls SUCCESSFULLY kept
+    /// its old count and its old cause: the public page went on reporting it
+    /// under `Failing`, under `badly_broken`, and under a cause, for as long as
+    /// the stale backoff horizon lasted — up to 24h — while the reader was
+    /// demonstrably fetching it.
+    #[tokio::test]
+    async fn a_successful_direct_poll_clears_a_stale_failure() {
+        let state = test_state(&[]).await;
+        let url = "https://recovered.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(&state.db, url, feed::FailureKind::Fetch, "SENTINEL_OLD")
+            .await
+            .unwrap();
+
+        // The publisher is fixed: a successful poll happens on this path.
+        settle_direct_poll(&state.db, url, &feed::PollOutcome::NotModified)
+            .await
+            .unwrap();
+
+        let row: (i64, Option<String>) =
+            sqlx::query_as("SELECT consecutive_errors, last_error_kind FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0, "a successful direct poll left the error streak");
+        assert_eq!(row.1, None, "a successful direct poll left a stale cause");
+    }
+
+    /// The mirror case: a first poll that FAILS must be visible at all.
+    ///
+    /// `Ok(outcome) => info!(...)` discarded a `PollOutcome::Failed`, so a
+    /// subscription whose very first fetch failed sat at `consecutive_errors = 0`
+    /// with a NULL cause — invisible to the page built to count exactly that.
+    #[tokio::test]
+    async fn a_failing_direct_poll_is_recorded() {
+        let state = test_state(&[]).await;
+        let url = "https://born-broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        settle_direct_poll(
+            &state.db,
+            url,
+            &feed::PollOutcome::Failed {
+                backoff: std::time::Duration::from_secs(300),
+                kind: feed::FailureKind::Parse,
+                detail: "SENTINEL_BORN_BROKEN".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let row: (i64, Option<String>) =
+            sqlx::query_as("SELECT consecutive_errors, last_error_kind FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 1, "a failed first poll was not counted");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("parse"),
+            "its cause was not recorded"
+        );
+    }
+
+    /// **The breakdown must sum to the Failing figure above it.**
+    ///
+    /// The histogram counts `last_error_kind IS NOT NULL`; `Failing` counts
+    /// `consecutive_errors > 0`. On a migrated database every row that was
+    /// already failing has a NULL kind — correctly, it was never recorded — so
+    /// the two do not reconcile and the page shows "70 failing" beside "3
+    /// fetch" with 67 silently unaccounted for. On deploy day the row vanishes
+    /// entirely while the prose still promises a breakdown.
+    ///
+    /// An explicit `unknown` bucket is the honest shape: the page says how many
+    /// it cannot explain rather than omitting them.
+    #[tokio::test]
+    async fn the_failure_breakdown_accounts_for_every_failing_feed() {
+        let state = test_state(&[]).await;
+        // Two legacy rows: failing, with no recorded cause.
+        for url in [
+            "https://legacy1.example/f.xml",
+            "https://legacy2.example/f.xml",
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE feeds SET consecutive_errors = 4 WHERE url = ?1")
+                .bind(url)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        // One row with a recorded cause.
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://known.example/f.xml".to_string(),
+                next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            "https://known.example/f.xml",
+            feed::FailureKind::Status,
+            "SENTINEL",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now();
+        let health = store::poll_health(
+            &state.db,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await
+        .unwrap();
+        let counted: i64 = health.failure_kinds.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            counted, health.in_backoff,
+            "the breakdown ({counted}) does not account for all {} failing feeds: {:?}",
+            health.in_backoff, health.failure_kinds,
+        );
+        assert!(
+            health
+                .failure_kinds
+                .iter()
+                .any(|(k, n)| k == "unknown" && *n == 2),
+            "no unknown bucket for the legacy rows: {:?}",
+            health.failure_kinds,
+        );
+    }
+
+    /// **The breakdown is ordered by count, and the assertion can see it.**
+    ///
+    /// The first version of this asserted with three `contains` calls, which
+    /// cannot observe order — deleting `ORDER BY` from the query passed.
+    #[tokio::test]
+    async fn the_failure_breakdown_is_ordered_by_count() {
+        let state = test_state(&[]).await;
+        for (url, kind, n) in [
+            ("https://p1.example/f.xml", feed::FailureKind::Parse, 1),
+            ("https://f1.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://f2.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://f3.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://s1.example/f.xml", feed::FailureKind::Status, 1),
+            ("https://s2.example/f.xml", feed::FailureKind::Status, 1),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..n {
+                store::bump_feed_errors(&state.db, url, kind, "d")
+                    .await
+                    .unwrap();
+            }
+        }
+        let now = chrono::Utc::now();
+        let health = store::poll_health(
+            &state.db,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await
+        .unwrap();
+        let labels: Vec<&str> = health
+            .failure_kinds
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["fetch", "status", "parse"],
+            "not ordered by count, descending: {:?}",
+            health.failure_kinds,
+        );
     }
 
     /// **Failing feeds are grouped by CAUSE, and still never named.**

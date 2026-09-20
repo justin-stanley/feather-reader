@@ -578,6 +578,29 @@ pub enum FailureKind {
     Parse,
 }
 
+/// Cap on a failure detail, applied where the string is BUILT.
+///
+/// It was originally applied only inside `store::bump_feed_errors`, which
+/// bounded the database row and nothing else — and widening
+/// [`PollOutcome::Failed`] with this field had quietly opened a second sink:
+/// `web::add_subscription` logs `?outcome` at INFO on a user-facing request
+/// path. Bounding at construction bounds every sink, including ones added
+/// later by someone who never reads this comment.
+pub const MAX_FAILURE_DETAIL_CHARS: usize = 300;
+
+/// Render an error chain into a bounded [`PollOutcome::Failed`] detail.
+///
+/// `{e:#}` — the anyhow CHAIN, not just the outermost context. "fetching
+/// https://…" alone says nothing; the cause is the part that would have named
+/// the 304 bug in #159.
+pub fn failure_detail(err: impl std::fmt::Display) -> String {
+    let s = err.to_string();
+    if s.chars().count() <= MAX_FAILURE_DETAIL_CHARS {
+        return s;
+    }
+    s.chars().take(MAX_FAILURE_DETAIL_CHARS).collect()
+}
+
 impl FailureKind {
     /// The stable string stored in `feeds.last_error_kind` and aggregated on
     /// `/stats`. Changing one of these silently rewrites history in the
@@ -700,10 +723,7 @@ pub async fn poll_feed(
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
                 kind: FailureKind::Fetch,
-                // `{e:#}` — the anyhow CHAIN, not just the outermost context.
-                // "fetching https://…" alone says nothing; the cause is the
-                // part that would have named the 304 bug.
-                detail: format!("{e:#}"),
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -722,7 +742,7 @@ pub async fn poll_feed(
         return Ok(PollOutcome::Failed {
             backoff: backoff_for(1),
             kind: FailureKind::Status,
-            detail: status.to_string(),
+            detail: failure_detail(status),
         });
     }
 
@@ -740,7 +760,7 @@ pub async fn poll_feed(
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
                 kind: FailureKind::Body,
-                detail: format!("{e:#}"),
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -753,7 +773,7 @@ pub async fn poll_feed(
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
                 kind: FailureKind::Parse,
-                detail: format!("{e:#}"),
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -1435,6 +1455,39 @@ mod tests {
         );
         // Unparseable URL: treated as Public (add path rejects it downstream).
         assert_eq!(classify_feed_privacy("not a url"), FeedPrivacy::Public);
+    }
+
+    /// **The detail is bounded where it is CONSTRUCTED, not only where it is
+    /// stored.**
+    ///
+    /// Review found that widening `PollOutcome::Failed` with this field opened a
+    /// second sink nobody looked at: `web.rs`'s `add_subscription` logs
+    /// `?outcome` at INFO on a user-facing request path, so the whole
+    /// untruncated anyhow chain — redirect-hop URLs, the SSRF guard's refusal
+    /// text naming a resolved internal address — went to the access log.
+    ///
+    /// Bounding inside `bump_feed_errors` protected the database and nothing
+    /// else. Bounding at construction protects every sink, including the ones
+    /// added later.
+    #[test]
+    fn a_failure_detail_is_bounded_at_construction() {
+        let huge = "x".repeat(10_000);
+        let outcome = PollOutcome::Failed {
+            backoff: BACKOFF_BASE,
+            kind: FailureKind::Fetch,
+            detail: failure_detail(&huge),
+        };
+        let PollOutcome::Failed { detail, .. } = &outcome else {
+            panic!("wrong variant");
+        };
+        assert!(
+            detail.chars().count() <= MAX_FAILURE_DETAIL_CHARS,
+            "detail was {} chars",
+            detail.chars().count(),
+        );
+        // And the Debug rendering — which is what actually reached the log — is
+        // bounded with it.
+        assert!(format!("{outcome:?}").len() < 1_000);
     }
 
     /// **Every failure kind has its own label, and they round-trip.**

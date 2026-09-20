@@ -3826,16 +3826,25 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     // aggregate above collapses, and one statement doing both would make the
     // counts above harder to read than the extra round trip is worth.
     //
-    // `last_error_kind IS NOT NULL` rather than `consecutive_errors > 0`: a row
-    // that predates this column is failing without a recorded cause, and must
-    // not be counted under some other feed's reason.
+    // **Every failing feed lands in a bucket, so this sums to `in_backoff`.**
+    //
+    // A row that predates the column is failing with no recorded cause, and it
+    // must not be attributed to some other feed's reason — but it must not
+    // vanish either. Filtering them out made the breakdown silently disagree
+    // with the `Failing` figure beside it: on a migrated database that is EVERY
+    // currently-failing feed, so the page would have read "70 failing" next to
+    // "3 fetch" with 67 unexplained and no indication a remainder existed.
+    //
+    // `unknown` is a deliberate bucket rather than an omission. It cannot
+    // collide with a real kind — `FailureKind::as_str` never returns it, and
+    // `FailureKind::parse("unknown")` is `None`.
     let kinds: Vec<(String, i64)> = sqlx::query_as(
         r#"
-        SELECT last_error_kind, COUNT(*) AS n
+        SELECT COALESCE(last_error_kind, 'unknown') AS kind, COUNT(*) AS n
         FROM feeds
-        WHERE consecutive_errors > 0 AND last_error_kind IS NOT NULL
-        GROUP BY last_error_kind
-        ORDER BY n DESC, last_error_kind ASC
+        WHERE consecutive_errors > 0
+        GROUP BY kind
+        ORDER BY n DESC, kind ASC
         "#,
     )
     .fetch_all(pool)
