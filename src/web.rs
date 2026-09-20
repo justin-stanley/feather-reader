@@ -3128,19 +3128,86 @@ async fn rename_subscription(
         }
     }
 
-    let mut sub = Subscription::new(feed_url, now_rfc3339());
+    // **Read before write — `update_subscription` is a `putRecord`, and a
+    // putRecord replaces the WHOLE record** (see its doc on `atproto.rs`).
+    //
+    // This used to build a fresh `Subscription::new(feed_url, now_rfc3339())`
+    // and hand that over, so every field the form does not carry was written
+    // back as its default. `templates/manage_row.html` posts `url`, `title` and
+    // `folder` — and nothing else — so a rename silently destroyed four fields:
+    // `siteUrl`, `fetchHint`, `private`, and `createdAt`.
+    //
+    // `createdAt` is the one that matters most: it is the reader's subscribe
+    // time, it is the sort key for "when did I subscribe", it lives in THEIR
+    // repo rather than our cache, and once overwritten it is gone with nothing
+    // in the UI to say so.
+    //
+    // There is no single-record read on `Repo` (no `getRecord`), so this lists
+    // and filters. That is one extra round trip on an action that is already
+    // doing a PDS write, and it is bounded; a `get_subscription` would be
+    // strictly better if this ever measures badly.
+    //
+    // **A failed read refuses the rename.** Falling back to the old
+    // rebuild-from-scratch here would reinstate the data loss on exactly the
+    // flaky path, which is the worst place to have it. The write below already
+    // takes this stance — "a failure here means nothing was renamed or moved" —
+    // and the read gets the same one.
+    let existing = match state.repo().list_subscriptions_sorted(&did).await {
+        Ok(subs) => subs.into_iter().find(|(k, _)| *k == rkey).map(|(_, s)| s),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not read the subscription before renaming it");
+            return Ok(Redirect::to(&format!(
+                "/?flash={}",
+                qenc("Could not reach your PDS — nothing was renamed or moved.")
+            ))
+            .into_response());
+        }
+    };
+    let Some(existing) = existing else {
+        // The rkey is not in the reader's repo. Renaming a record that is not
+        // there would CREATE one, which is not what "rename" means and would
+        // give it a fresh `createdAt` — the bug this read exists to prevent.
+        warn!(%did, %rkey, "refused rename: no such subscription in the repo");
+        return Ok(Redirect::to(&format!(
+            "/?flash={}",
+            qenc("That subscription is no longer in your repo — nothing was renamed or moved.")
+        ))
+        .into_response());
+    };
+
+    // The subscription can be repointed at a different feed URL, which is what
+    // the global-feeds-ceiling check above exists for.
+    let url_changed = existing.url != feed_url;
+
+    let mut sub = existing;
+    sub.url = feed_url;
     sub.title = form
         .title
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
-    sub.site_url = form
-        .site_url
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     sub.folder = form
         .folder
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
+    // `createdAt` and `private` carry over untouched — neither is a property of
+    // which feed URL the subscription points at.
+    //
+    // `siteUrl` and `fetchHint` ARE properties of the specific feed, so a
+    // repoint drops them rather than leaving a site link for the old feed
+    // hanging off the new one. An explicit form value still wins if the form
+    // ever starts carrying one.
+    match form
+        .site_url
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        Some(site) => sub.site_url = Some(site),
+        None if url_changed => sub.site_url = None,
+        None => {}
+    }
+    if url_changed {
+        sub.fetch_hint = None;
+    }
 
     // Keep the local cache title in step for the loose-feed fallback path.
     if let Err(err) = store::upsert_feed(
@@ -8194,6 +8261,384 @@ mod tests {
             store::count_feeds(&state.db).await.unwrap(),
             0,
             "blank-URL rename wrote a junk feeds row"
+        );
+    }
+
+    /// A sidecar mock that serves ONE existing subscription record and captures
+    /// every `put` body a rename produces.
+    ///
+    /// **Reads to `content-length` rather than taking one `read`.** A single
+    /// read gets whatever one segment carried; if the head and body land
+    /// separately the capture holds no record and every field assertion below
+    /// passes for the wrong reason. Each captured body must also mention the
+    /// collection, so an empty capture fails loudly instead of quietly.
+    async fn spawn_rename_sidecar(
+        existing: serde_json::Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let puts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body_text = loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        break String::new();
+                    };
+                    if n == 0 {
+                        break String::from_utf8_lossy(&raw).to_string();
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|want| body.len() >= want) {
+                        break String::from_utf8_lossy(body).to_string();
+                    }
+                };
+
+                // `"action":"put"` is the rename write; anything else is the read.
+                let is_put = body_text.contains("\"action\":\"put\"");
+                let data = if is_put {
+                    sink.lock().unwrap().push(body_text.clone());
+                    serde_json::json!({
+                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-keep",
+                        "cid": "bafyreiafter"
+                    })
+                } else {
+                    serde_json::json!({ "records": [existing.clone()] })
+                };
+                let body = serde_json::json!({ "ok": true, "data": data }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), puts)
+    }
+
+    /// The existing record a rename must not destroy.
+    fn seeded_subscription() -> serde_json::Value {
+        serde_json::json!({
+            "uri": "at://did:plc:renamer4/community.lexicon.rss.subscription/rk-keep",
+            "cid": "bafyreibefore",
+            "value": {
+                "$type": "community.lexicon.rss.subscription",
+                "url": "https://example.com/feed.xml",
+                "title": "Old title",
+                "siteUrl": "https://example.com/blog",
+                "fetchHint": "hourly",
+                "private": false,
+                "createdAt": "2024-03-01T00:00:00.000Z"
+            }
+        })
+    }
+
+    /// **A rename must not destroy the fields the form never carries.**
+    ///
+    /// `update_subscription` is a `putRecord` — the WHOLE record is replaced, per
+    /// its own doc. The handler built a fresh `Subscription::new(url, now())`, so
+    /// every field absent from `templates/manage_row.html` (which posts only
+    /// `url`, `title`, `folder`) was written back as its default:
+    ///
+    /// | field | before | after |
+    /// |---|---|---|
+    /// | `siteUrl` | whatever the feed advertised | gone |
+    /// | `fetchHint` | as set | gone |
+    /// | `private` | as set | gone |
+    /// | `createdAt` | original subscribe time | reset to now |
+    ///
+    /// `createdAt` is the worst of the four: it is the sort key for "when did I
+    /// subscribe", it is unrecoverable once overwritten, and nothing in the UI
+    /// tells the reader it moved.
+    ///
+    /// Asserted on the BYTES THE SIDECAR RECEIVES, not on a `Subscription` built
+    /// in the test — the record only becomes wrong on the way out, so checking
+    /// the value we passed in would pass just as happily with the fix removed.
+    #[tokio::test]
+    async fn renaming_preserves_the_fields_the_form_never_carries() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // Exactly what the manage row posts: url, title, folder.
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&folder=Tech",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        let body = &bodies[0];
+        // Anchors the negative assertions: an empty capture would satisfy them.
+        assert!(
+            body.contains("community.lexicon.rss.subscription"),
+            "captured no usable put body: {body:?}"
+        );
+
+        let sent: serde_json::Value = serde_json::from_str(body).expect("put body is JSON");
+        let record = &sent["record"];
+
+        // What the form DID carry must be applied.
+        assert_eq!(record["title"], "New title", "the rename did not apply");
+        assert_eq!(record["folder"], "Tech", "the re-folder did not apply");
+
+        // What the form did NOT carry must survive.
+        assert_eq!(
+            record["createdAt"], "2024-03-01T00:00:00.000Z",
+            "the rename reset createdAt — the reader's subscribe time is gone \
+             from their own repo, and nothing told them"
+        );
+        assert_eq!(
+            record["siteUrl"], "https://example.com/blog",
+            "the rename erased siteUrl"
+        );
+        assert_eq!(record["fetchHint"], "hourly", "the rename erased fetchHint");
+        assert_eq!(record["private"], false, "the rename erased private");
+    }
+
+    /// **Repointing at a different feed drops that feed's properties, but not
+    /// the subscription's.**
+    ///
+    /// `siteUrl` and `fetchHint` describe the feed the subscription points at,
+    /// so carrying them onto a different URL would leave a site link for the old
+    /// feed hanging off the new one. `createdAt` and `private` are properties of
+    /// the SUBSCRIPTION and survive a repoint — the reader subscribed when they
+    /// subscribed, whatever the URL was later corrected to.
+    #[tokio::test]
+    async fn repointing_a_feed_drops_the_old_feeds_properties_but_keeps_the_subscriptions() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // A DIFFERENT feed URL from the seeded record.
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fother.example%2Ffeed.xml&title=Repointed",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        assert!(
+            bodies[0].contains("community.lexicon.rss.subscription"),
+            "captured no usable put body: {:?}",
+            bodies[0]
+        );
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("put body is JSON");
+        let record = &sent["record"];
+
+        assert_eq!(record["url"], "https://other.example/feed.xml");
+        // The old feed's properties are gone rather than misattributed.
+        assert!(
+            record.get("siteUrl").is_none() || record["siteUrl"].is_null(),
+            "the old feed's site link followed the subscription to a new feed: {record}"
+        );
+        assert!(
+            record.get("fetchHint").is_none() || record["fetchHint"].is_null(),
+            "the old feed's fetch hint followed the subscription to a new feed: {record}"
+        );
+        // The subscription's own properties survive.
+        assert_eq!(
+            record["createdAt"], "2024-03-01T00:00:00.000Z",
+            "a repoint is still not a new subscription; createdAt must not move"
+        );
+        assert_eq!(record["private"], false, "the repoint erased private");
+    }
+
+    /// **A rename against an rkey that is not in the repo writes NOTHING.**
+    ///
+    /// `update_subscription` is a `putRecord`, which CREATES the record when the
+    /// rkey does not exist — with whatever `createdAt` we hand it. So without
+    /// this refusal a rename against a stale or wrong rkey manufactures a
+    /// subscription dated today, which is the bug this whole change exists to
+    /// fix, arriving by a different door.
+    ///
+    /// The guard was untested when first written: removing it left all 733 tests
+    /// green. An untested guard against the exact defect being fixed is how the
+    /// two previous rounds of this problem got through.
+    #[tokio::test]
+    async fn renaming_an_unknown_rkey_writes_nothing() {
+        let did = "did:plc:renamer4";
+        // The sidecar serves exactly one record, at rkey `rk-keep`.
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    // ...and this is not it.
+                    .uri("/subscriptions/rk-does-not-exist/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Ghost",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("flash="),
+            "an unknown rkey redirected as though the rename had worked: {loc}"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a rename against an unknown rkey wrote a record — putRecord would \
+             CREATE it, dated today: {:?}",
+            puts.lock().unwrap()
+        );
+    }
+
+    /// **A `site_url` the client actually sends is applied, not dropped.**
+    ///
+    /// `templates/manage_row.html` does not post this field, so it is tempting
+    /// to read the arm that handles it as dead code. It is not:
+    /// `RenameSubForm` carries `site_url`, so a hand-crafted POST reaches it
+    /// today. Discarding the value instead of applying it left all 733 tests
+    /// green.
+    ///
+    /// The value is scheme-checked on the way out by the repo-boundary vet, so
+    /// this is a coverage gap rather than an exposure — but an untested path
+    /// that writes a URL into the reader's PDS should not stay untested.
+    #[tokio::test]
+    async fn a_client_supplied_site_url_reaches_the_record() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // Same feed URL, but carrying a site_url the manage row
+                    // never sends.
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Kept\
+                         &site_url=https%3A%2F%2Ftyped.example%2Fsite",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        assert!(
+            bodies[0].contains("community.lexicon.rss.subscription"),
+            "captured no usable put body: {:?}",
+            bodies[0]
+        );
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("put body is JSON");
+        assert_eq!(
+            sent["record"]["siteUrl"], "https://typed.example/site",
+            "the client's siteUrl was dropped; the seeded record's survived instead"
+        );
+    }
+
+    /// **A rename whose read fails writes NOTHING.**
+    ///
+    /// This is the property most easily lost when someone later touches this
+    /// handler: falling back to `Subscription::new` on a read error looks like
+    /// graceful degradation and is in fact the original bug, reinstated on
+    /// exactly the path where it is hardest to notice. The reader must be told
+    /// instead.
+    #[tokio::test]
+    async fn a_rename_whose_read_fails_writes_nothing() {
+        let did = "did:plc:renamer5";
+        // A port that accepts nothing: the read cannot succeed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let state = test_state_with_sidecar(&[did], &dead).await;
+        let cookie = session_cookie(&state, did, None);
+        let before = store::count_feeds(&state.db).await.unwrap();
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Doomed",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("flash="),
+            "a failed read redirected as though the rename had worked: {loc}"
+        );
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            before,
+            "a rename that could not read the record still wrote to the cache"
         );
     }
 
