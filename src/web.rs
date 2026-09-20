@@ -1071,6 +1071,7 @@ async fn stats(State(state): State<AppState>) -> Response {
         // detail, so they sit inside the page's stated contract.
         in_backoff: health.in_backoff,
         badly_broken: health.badly_broken,
+        failure_kinds: health.failure_kinds,
         fetching: fetching_state(&state.runtime_health, now.timestamp()),
     })
 }
@@ -1334,8 +1335,12 @@ struct StatsTemplate {
     poll_interval_mins: i64,
     /// Feeds in error backoff. Invisible before, and excluded from `overdue`.
     in_backoff: i64,
-    /// Of those, the ones deep enough into backoff to be effectively dead.
+    /// Of those, the ones retried hours apart rather than minutes. **Not
+    /// "effectively dead"** — see `store::BADLY_BROKEN_ERRORS`; they recover on
+    /// their next successful poll, and most of this instance's did.
     badly_broken: i64,
+    /// Failing feeds by cause, descending — counts only, never which feed.
+    failure_kinds: Vec<(String, i64)>,
     /// What the poller is actually doing: `running`, `paused` (at the size
     /// watermark), `starting` (no tick completed yet) or `off` (schedulers
     /// disabled). Three of those four used to render as "running".
@@ -3023,7 +3028,13 @@ async fn add_subscription(
         if let Some(feed_row) = store::get_feed_by_url(pool, &feed_url).await? {
             match feed::poll_feed(pool, &client, &feed_row, state.config.max_entries_per_feed).await
             {
-                Ok(outcome) => info!(feed = %feed_url, ?outcome, "polled new subscription"),
+                Ok(outcome) => {
+                    info!(feed = %feed_url, ?outcome, "polled new subscription");
+                    // **This path is not the scheduler, so it must settle the
+                    // error columns itself.** `poll_feed` writes validators and
+                    // `last_polled` and nothing else.
+                    feed::settle_poll(pool, &feed_url, &outcome, state.config.poll_interval).await;
+                }
                 Err(err) => warn!(%err, feed = %feed_url, "initial poll failed"),
             }
         }
@@ -4218,6 +4229,9 @@ async fn oauth_jwks(State(state): State<AppState>) -> Response {
     }
 }
 
+/// How many failing feeds `/admin/metrics` will name. One response, so bounded.
+const ADMIN_FAILING_FEED_LIMIT: i64 = 200;
+
 /// `GET /admin/metrics` — repo-op latency for both backends, as plain text.
 ///
 /// Admin-gated on the same rule as the invite minter: the table names every
@@ -4265,11 +4279,39 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
             "unknown".to_string()
         }
     };
+    // **The half the public histogram cannot carry.** `/stats` reports counts by
+    // cause and nothing else, deliberately — but `fetch` covers DNS failure,
+    // timeout, SSRF refusal AND this reader's own bugs, so the count alone
+    // cannot separate "the publishers are gone" from "we are broken". #159 was
+    // the latter and took a production investigation to establish. Named feeds
+    // and their error text belong here, behind ALLOWED_DIDS.
+    let failing = match crate::store::failing_feeds(&state.db, ADMIN_FAILING_FEED_LIMIT).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn!(%err, "could not list failing feeds");
+            Vec::new()
+        }
+    };
+    let mut failing_block = String::new();
+    if !failing.is_empty() {
+        failing_block.push_str("\nfailing feeds (worst first)\n");
+        for f in &failing {
+            failing_block.push_str(&format!(
+                "  {:>4}x  {:<8}  {}\n          {}\n",
+                f.consecutive_errors,
+                f.kind.as_deref().unwrap_or("unknown"),
+                f.url,
+                f.detail.as_deref().unwrap_or("(no detail recorded)"),
+            ));
+        }
+    }
+
     let body = format!(
-        "live backend: {}\nparked read-state DIDs: {}\n\n{}",
+        "live backend: {}\nparked read-state DIDs: {}\n\n{}{}",
         state.config.repo_backend.as_str(),
         parked,
         crate::metrics::render(&rows),
+        failing_block,
     );
     (StatusCode::OK, body).into_response()
 }
@@ -8957,7 +8999,14 @@ mod tests {
             .await
             .unwrap();
             for _ in 0..errors {
-                store::bump_feed_errors(&state.db, url).await.unwrap();
+                store::bump_feed_errors(
+                    &state.db,
+                    url,
+                    feed::FailureKind::Fetch,
+                    "connection refused",
+                )
+                .await
+                .unwrap();
             }
         }
 
@@ -9043,6 +9092,560 @@ mod tests {
             assert!(
                 !paused.contains(leak),
                 "the public page leaked {leak:?} while reporting failures"
+            );
+        }
+    }
+
+    /// **`/admin/metrics` is gated, and nothing checked that it was.**
+    ///
+    /// Deleting the `admin_seed_dids` check left the entire suite green. That
+    /// was survivable while the page held only aggregate timings; it is not now,
+    /// because this branch puts **per-feed URLs and remote error text** behind
+    /// that gate. A guarantee nothing checks is a comment, and this one is now
+    /// the only thing standing between a signed-in stranger and the operational
+    /// picture the handler's own doc says is not public.
+    ///
+    /// All three doors: no session, a session that is not an admin, and the
+    /// admin itself.
+    #[tokio::test]
+    async fn admin_metrics_is_refused_to_everyone_but_an_admin() {
+        let admin = "did:plc:adminseed";
+        // **Only the admin is in ALLOWED_DIDS**, because `admin_seed_dids()`
+        // IS that list — deliberately, per its doc: "the same people I trust on
+        // this instance". Production sets it to the bootstrap DID alone.
+        //
+        // A genuine non-admin is therefore someone holding a beta seat granted
+        // by an invite, not by the allow-list. Seeding both would have made
+        // both admins and quietly turned the 403 assertion below into a test of
+        // nothing — which is exactly what the first draft of this did.
+        let state = test_state(&[admin]).await;
+        store::grant_access(&state.db, "did:plc:ordinaryuser", None, "invite", None)
+            .await
+            .unwrap();
+        let url = "https://broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            url,
+            feed::FailureKind::Fetch,
+            "SENTINEL_ADMIN_ONLY",
+        )
+        .await
+        .unwrap();
+
+        let get = |state: AppState, cookie: Option<String>| async move {
+            let mut req = Request::builder().uri("/admin/metrics");
+            if let Some(c) = cookie {
+                req = req.header(header::COOKIE, c);
+            }
+            let resp = router(state)
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        };
+
+        // No session at all.
+        let (status, body) = get(state.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            !body.contains("SENTINEL_ADMIN_ONLY"),
+            "leaked to anonymous: {body}"
+        );
+
+        // A real, signed-in user who is not an admin.
+        let ordinary = session_cookie(&state, "did:plc:ordinaryuser", None);
+        let (status, body) = get(state.clone(), Some(ordinary)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a non-admin session was let in"
+        );
+        assert!(
+            !body.contains("SENTINEL_ADMIN_ONLY") && !body.contains("broken.example"),
+            "leaked to a non-admin: {body}",
+        );
+
+        // The admin does get it — otherwise the two refusals above are
+        // satisfied by the endpoint being broken for everyone.
+        let admin_cookie = session_cookie(&state, admin, None);
+        let (status, body) = get(state, Some(admin_cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("SENTINEL_ADMIN_ONLY"),
+            "admin cannot see it: {body}"
+        );
+    }
+
+    /// **The cause a public count cannot carry belongs on the admin page.**
+    ///
+    /// The public histogram is four coarse buckets, and `fetch` is the coarsest:
+    /// #159's own error — `guarded_get` bailing on a 304 — lands there beside
+    /// DNS failure, timeout and SSRF refusal. So the histogram alone would NOT
+    /// have separated "sixty dead publishers" from "one bug here", which is the
+    /// case it was justified by.
+    ///
+    /// The answer is not a finer public vocabulary — `/stats` promises never
+    /// which feed and never whose, and a bucket per error string would break
+    /// that. It is to put the detail where per-feed data is already allowed.
+    /// `/admin/metrics` is gated on `ALLOWED_DIDS` and already carries an
+    /// operational picture.
+    ///
+    /// Asserts both halves: the detail IS on the admin page, and is NOT on the
+    /// public one.
+    #[tokio::test]
+    async fn the_admin_page_names_failing_feeds_and_the_public_page_does_not() {
+        let admin = "did:plc:adminseed";
+        let state = test_state(&[admin]).await;
+        let url = "https://broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            url,
+            feed::FailureKind::Fetch,
+            "SENTINEL_REDIRECT_NO_LOCATION",
+        )
+        .await
+        .unwrap();
+
+        let cookie = session_cookie(&state, admin, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/metrics")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let admin_body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            admin_body.contains("SENTINEL_REDIRECT_NO_LOCATION"),
+            "the admin page does not carry the failure detail: {admin_body}",
+        );
+        assert!(
+            admin_body.contains("broken.example"),
+            "the admin page does not name the failing feed: {admin_body}",
+        );
+
+        // The public page still carries neither.
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let public = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for secret in ["SENTINEL_REDIRECT_NO_LOCATION", "broken.example"] {
+            assert!(
+                !public.contains(secret),
+                "{secret:?} reached the PUBLIC stats page: {public}",
+            );
+        }
+    }
+
+    /// **A direct poll must settle the error columns, like the scheduler does.**
+    ///
+    /// `add_subscription` polls through `feed::poll_feed` rather than the
+    /// scheduler, and `poll_feed` writes validators and `last_polled` but never
+    /// touches `consecutive_errors` — that is the scheduler's job, and this path
+    /// is not the scheduler.
+    ///
+    /// So a feed that was failing, is re-subscribed, and polls SUCCESSFULLY kept
+    /// its old count and its old cause: the public page went on reporting it
+    /// under `Failing`, under `badly_broken`, and under a cause, for as long as
+    /// the stale backoff horizon lasted — up to 24h — while the reader was
+    /// demonstrably fetching it.
+    #[tokio::test]
+    async fn a_successful_direct_poll_clears_a_stale_failure() {
+        let state = test_state(&[]).await;
+        let url = "https://recovered.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(&state.db, url, feed::FailureKind::Fetch, "SENTINEL_OLD")
+            .await
+            .unwrap();
+        // Park it on a stale backoff horizon, as a real failing feed would be.
+        sqlx::query("UPDATE feeds SET next_poll = '2099-01-01T00:00:00Z' WHERE url = ?1")
+            .bind(url)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // The publisher is fixed: a successful poll happens on this path.
+        feed::settle_poll(
+            &state.db,
+            url,
+            &feed::PollOutcome::NotModified,
+            state.config.poll_interval,
+        )
+        .await;
+
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, next_poll FROM feeds WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 0, "a successful direct poll left the error streak");
+        assert_eq!(row.1, None, "a successful direct poll left a stale cause");
+        // **The half the first fix missed.** Clearing the count fixed the
+        // REPORTING; the feed stayed parked until 2099. A working feed must be
+        // rescheduled on its normal cadence, not left on the failure horizon.
+        let next = row.2.expect("next_poll was cleared to NULL");
+        // Not merely "moved off 2099" — rescheduled on the CADENCE, not a
+        // backoff. A mutation that reschedules successes with backoff_for(1)
+        // (5 min) also moves it off 2099, so the interval is asserted.
+        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
+        let delta = parsed
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        let cadence = state.config.poll_interval.as_secs() as i64;
+        assert!(
+            (cadence - 60..=cadence + 60).contains(&delta),
+            "expected rescheduling on the {cadence}s cadence, got {delta}s (next_poll={next})"
+        );
+    }
+
+    /// The mirror case: a first poll that FAILS must be visible at all.
+    ///
+    /// `Ok(outcome) => info!(...)` discarded a `PollOutcome::Failed`, so a
+    /// subscription whose very first fetch failed sat at `consecutive_errors = 0`
+    /// with a NULL cause — invisible to the page built to count exactly that.
+    #[tokio::test]
+    async fn a_failing_direct_poll_is_recorded() {
+        let state = test_state(&[]).await;
+        let url = "https://born-broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        feed::settle_poll(
+            &state.db,
+            url,
+            &feed::PollOutcome::Failed {
+                backoff: std::time::Duration::from_secs(300),
+                kind: feed::FailureKind::Parse,
+                detail: "SENTINEL_BORN_BROKEN".to_string(),
+            },
+            state.config.poll_interval,
+        )
+        .await;
+
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, next_poll FROM feeds WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1, "a failed first poll was not counted");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("parse"),
+            "its cause was not recorded"
+        );
+        // And it is BACKED OFF on the schedule the scheduler would use — not
+        // left with a NULL next_poll that `due_feeds` sorts first and re-polls
+        // on the very next tick.
+        let next = row.2.expect("a failed direct poll left next_poll NULL");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
+        let delta = parsed
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            (240..=360).contains(&delta),
+            "expected ~300s backoff after one failure, got {delta}s (next_poll={next})"
+        );
+    }
+
+    /// **The breakdown must sum to the Failing figure above it.**
+    ///
+    /// The histogram counts `last_error_kind IS NOT NULL`; `Failing` counts
+    /// `consecutive_errors > 0`. On a migrated database every row that was
+    /// already failing has a NULL kind — correctly, it was never recorded — so
+    /// the two do not reconcile and the page shows "70 failing" beside "3
+    /// fetch" with 67 silently unaccounted for. On deploy day the row vanishes
+    /// entirely while the prose still promises a breakdown.
+    ///
+    /// An explicit `unknown` bucket is the honest shape: the page says how many
+    /// it cannot explain rather than omitting them.
+    #[tokio::test]
+    async fn the_failure_breakdown_accounts_for_every_failing_feed() {
+        let state = test_state(&[]).await;
+        // Two legacy rows: failing, with no recorded cause.
+        for url in [
+            "https://legacy1.example/f.xml",
+            "https://legacy2.example/f.xml",
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE feeds SET consecutive_errors = 4 WHERE url = ?1")
+                .bind(url)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        // One row with a recorded cause.
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://known.example/f.xml".to_string(),
+                next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            "https://known.example/f.xml",
+            feed::FailureKind::Status,
+            "SENTINEL",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now();
+        let health = store::poll_health(
+            &state.db,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await
+        .unwrap();
+        let counted: i64 = health.failure_kinds.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            counted, health.in_backoff,
+            "the breakdown ({counted}) does not account for all {} failing feeds: {:?}",
+            health.in_backoff, health.failure_kinds,
+        );
+        assert!(
+            health
+                .failure_kinds
+                .iter()
+                .any(|(k, n)| k == "unknown" && *n == 2),
+            "no unknown bucket for the legacy rows: {:?}",
+            health.failure_kinds,
+        );
+    }
+
+    /// **The breakdown is ordered by count, and the assertion can see it.**
+    ///
+    /// The first version of this asserted with three `contains` calls, which
+    /// cannot observe order — deleting `ORDER BY` from the query passed.
+    #[tokio::test]
+    async fn the_failure_breakdown_is_ordered_by_count() {
+        let state = test_state(&[]).await;
+        for (url, kind, n) in [
+            ("https://p1.example/f.xml", feed::FailureKind::Parse, 1),
+            ("https://f1.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://f2.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://f3.example/f.xml", feed::FailureKind::Fetch, 1),
+            ("https://s1.example/f.xml", feed::FailureKind::Status, 1),
+            ("https://s2.example/f.xml", feed::FailureKind::Status, 1),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..n {
+                store::bump_feed_errors(&state.db, url, kind, "d")
+                    .await
+                    .unwrap();
+            }
+        }
+        let now = chrono::Utc::now();
+        let health = store::poll_health(
+            &state.db,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await
+        .unwrap();
+        let labels: Vec<&str> = health
+            .failure_kinds
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["fetch", "status", "parse"],
+            "not ordered by count, descending: {:?}",
+            health.failure_kinds,
+        );
+    }
+
+    /// **Failing feeds are grouped by CAUSE, and still never named.**
+    ///
+    /// `badly_broken` could say that sixty feeds were failing and not whether
+    /// that was sixty dead publishers or one bug here. It was the latter — #159,
+    /// a `304 Not Modified` read as a malformed redirect — and the page could
+    /// not say so, which is most of why it went unexamined.
+    ///
+    /// The second half of this test is the constraint that shapes the first:
+    /// `/stats` is public and promises machines-not-people, *never which feed
+    /// and never whose*. A histogram of causes keeps that promise; a list of
+    /// failing URLs would break it, and is the obvious way to build this.
+    #[tokio::test]
+    async fn stats_groups_failures_by_cause_without_naming_any_feed() {
+        let state = test_state(&[]).await;
+        for (url, kind, detail, errors) in [
+            // Detail strings are distinctive SENTINELS, not plausible English.
+            // A first pass used "not a feed", which the page's own explanation
+            // of the `parse` kind contains verbatim — the privacy assertion
+            // fired on static copy rather than on a leak. A sentinel cannot
+            // collide with prose.
+            (
+                "https://a.example/f.xml",
+                feed::FailureKind::Fetch,
+                "SENTINEL_CONNREFUSED",
+                3,
+            ),
+            (
+                "https://b.example/f.xml",
+                feed::FailureKind::Fetch,
+                "SENTINEL_DNSFAIL",
+                2,
+            ),
+            (
+                "https://c.example/f.xml",
+                feed::FailureKind::Status,
+                "SENTINEL_404",
+                1,
+            ),
+            (
+                "https://d.example/f.xml",
+                feed::FailureKind::Parse,
+                "SENTINEL_UNPARSEABLE",
+                1,
+            ),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..errors {
+                store::bump_feed_errors(&state.db, url, kind, detail)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Descending by count: two fetch, then one each, tie-broken by name.
+        assert!(
+            body.contains("2 fetch") && body.contains("1 status") && body.contains("1 parse"),
+            "the cause histogram did not render: {body}",
+        );
+
+        // **The privacy half.** No feed URL, host, or error detail reaches the
+        // public page — only counts by kind.
+        for secret in [
+            "a.example",
+            "b.example",
+            "c.example",
+            "d.example",
+            "SENTINEL_CONNREFUSED",
+            "SENTINEL_DNSFAIL",
+            "SENTINEL_404",
+            "SENTINEL_UNPARSEABLE",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "{secret:?} reached the PUBLIC stats page: {body}",
             );
         }
     }

@@ -546,7 +546,143 @@ pub enum PollOutcome {
     NotModified,
     /// The fetch or parse failed; the feed was left intact and skipped. Carries
     /// the suggested backoff before the next attempt. Never a panic.
-    Failed { backoff: Duration },
+    ///
+    /// **`kind` and `detail` are the reason, and they exist because their
+    /// absence cost a production investigation.** Until #159 the error was
+    /// logged here and discarded, so `feeds` recorded that a feed was failing
+    /// and never why — which is how sixty feeds broken by our own 304 handling
+    /// looked exactly like sixty dead blogs. `kind` is a small closed
+    /// vocabulary so failures can be counted by cause; `detail` is the message
+    /// for a human reading one row.
+    Failed {
+        backoff: Duration,
+        kind: FailureKind,
+        detail: String,
+    },
+}
+
+/// Why a poll failed, as a closed set.
+///
+/// Closed on purpose: the point is to *count* failures by cause, and a free-text
+/// kind cannot be counted. The detail string carries whatever else matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The request never produced a response — DNS, TLS, timeout, connection
+    /// refused, or a refusal by the SSRF guard.
+    Fetch,
+    /// A response arrived with a non-success status.
+    Status,
+    /// The body was too large, or reading it failed part-way.
+    Body,
+    /// The body arrived and is not a feed this parser can read.
+    Parse,
+}
+
+/// Apply a [`PollOutcome`] to the feed's row: settle the error columns AND
+/// reschedule it. **Both halves, always, from one place.**
+///
+/// The scheduler did this inline. `web::add_subscription` then copied only the
+/// first half, so a poll taken off the scheduler could clear a stale failure's
+/// COUNT while leaving the feed parked on its stale backoff HORIZON — reported
+/// healthy, not polled for up to 24h. And its failures fed `consecutive_errors`
+/// with no reschedule, so repeated Subscribe clicks drove a shared feed to the
+/// 24h ceiling for every subscriber. Two copies of a sequence drift; this is
+/// the one copy.
+///
+/// `cadence` is the interval to use on success; the scheduler derives it from
+/// the feed's hint, a direct caller passes the configured default. A store
+/// failure is logged and the reschedule still attempted, so a hiccup writing
+/// the count cannot strand the feed at a NULL `next_poll` that `due_feeds`
+/// would then re-poll every tick.
+pub async fn settle_poll(
+    pool: &sqlx::SqlitePool,
+    url: &str,
+    outcome: &PollOutcome,
+    cadence: Duration,
+) {
+    let delay = match outcome {
+        // A 304 is a healthy poll: it proves the fetch worked and nothing changed.
+        PollOutcome::Updated { .. } | PollOutcome::NotModified => {
+            if let Err(err) = crate::store::reset_feed_errors(pool, url).await {
+                tracing::warn!(feed = %url, %err, "failed to reset feed error count");
+            }
+            cadence
+        }
+        PollOutcome::Failed {
+            backoff,
+            kind,
+            detail,
+        } => {
+            // Recompute from the feed's REAL consecutive-error count so a
+            // persistently-broken feed climbs toward the ceiling instead of
+            // retrying at the floor forever; fall back to the outcome's floor.
+            match crate::store::bump_feed_errors(pool, url, *kind, detail).await {
+                Ok(count) => backoff_for(count.max(1) as u32),
+                Err(err) => {
+                    tracing::warn!(feed = %url, %err, "failed to bump feed error count; using floor backoff");
+                    *backoff
+                }
+            }
+        }
+    };
+    if let Err(err) = crate::store::set_next_poll(pool, url, delay).await {
+        tracing::error!(feed = %url, %err, "failed to persist next_poll");
+    }
+}
+
+/// Cap on a failure detail, applied where the string is BUILT.
+///
+/// It was originally applied only inside `store::bump_feed_errors`, which
+/// bounded the database row and nothing else — and widening
+/// [`PollOutcome::Failed`] with this field had quietly opened a second sink:
+/// `web::add_subscription` logs `?outcome` at INFO on a user-facing request
+/// path. Bounding at construction bounds every sink, including ones added
+/// later by someone who never reads this comment.
+pub const MAX_FAILURE_DETAIL_CHARS: usize = 300;
+
+/// Render an error chain into a bounded [`PollOutcome::Failed`] detail.
+///
+/// `{e:#}` — the anyhow CHAIN, not just the outermost context. "fetching
+/// https://…" alone says nothing; the cause is the part that would have named
+/// the 304 bug in #159.
+pub fn failure_detail(err: impl std::fmt::Display) -> String {
+    let s = err.to_string();
+    if s.chars().count() <= MAX_FAILURE_DETAIL_CHARS {
+        return s;
+    }
+    s.chars().take(MAX_FAILURE_DETAIL_CHARS).collect()
+}
+
+impl FailureKind {
+    /// The stable string stored in `feeds.last_error_kind` and aggregated on
+    /// `/stats`. Changing one of these silently rewrites history in the
+    /// aggregate, so they are spelled out rather than derived from the variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Status => "status",
+            Self::Body => "body",
+            Self::Parse => "parse",
+        }
+    }
+
+    /// Read back a persisted `last_error_kind`. `None` for anything this
+    /// version does not know, so a row written by a newer build is not
+    /// silently attributed to a cause this one recognises — the same contract
+    /// [`crate::metrics::Backend::parse`] keeps for the same reason.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "fetch" => Some(Self::Fetch),
+            "status" => Some(Self::Status),
+            "body" => Some(Self::Body),
+            "parse" => Some(Self::Parse),
+            _ => None,
+        }
+    }
+
+    /// Every variant, so a test can assert over the whole set rather than a
+    /// list that drifts when a variant is added.
+    pub const ALL: [Self; 4] = [Self::Fetch, Self::Status, Self::Body, Self::Parse];
 }
 
 /// Build a `reqwest::Client` configured for polite **and safe** feed fetching.
@@ -638,6 +774,8 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "feed fetch failed (or blocked by SSRF guard)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Fetch,
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -655,6 +793,8 @@ pub async fn poll_feed(
         tracing::warn!(feed = %feed.url, %status, "feed returned non-success status");
         return Ok(PollOutcome::Failed {
             backoff: backoff_for(1),
+            kind: FailureKind::Status,
+            detail: failure_detail(status),
         });
     }
 
@@ -671,6 +811,8 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "feed body rejected (too large / read error)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Body,
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -682,6 +824,8 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "malformed feed; skipping");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Parse,
+                detail: failure_detail(format!("{e:#}")),
             });
         }
     };
@@ -1365,8 +1509,72 @@ mod tests {
         assert_eq!(classify_feed_privacy("not a url"), FeedPrivacy::Public);
     }
 
+    /// **The detail is bounded where it is CONSTRUCTED, not only where it is
+    /// stored.**
+    ///
+    /// Review found that widening `PollOutcome::Failed` with this field opened a
+    /// second sink nobody looked at: `web.rs`'s `add_subscription` logs
+    /// `?outcome` at INFO on a user-facing request path, so the whole
+    /// untruncated anyhow chain — redirect-hop URLs, the SSRF guard's refusal
+    /// text naming a resolved internal address — went to the access log.
+    ///
+    /// Bounding inside `bump_feed_errors` protected the database and nothing
+    /// else. Bounding at construction protects every sink, including the ones
+    /// added later.
     #[test]
-    fn backoff_grows_and_caps() {
+    fn a_failure_detail_is_bounded_at_construction() {
+        let huge = "x".repeat(10_000);
+        let outcome = PollOutcome::Failed {
+            backoff: BACKOFF_BASE,
+            kind: FailureKind::Fetch,
+            detail: failure_detail(&huge),
+        };
+        let PollOutcome::Failed { detail, .. } = &outcome else {
+            panic!("wrong variant");
+        };
+        assert!(
+            detail.chars().count() <= MAX_FAILURE_DETAIL_CHARS,
+            "detail was {} chars",
+            detail.chars().count(),
+        );
+        // And the Debug rendering — which is what actually reached the log — is
+        // bounded with it.
+        assert!(format!("{outcome:?}").len() < 1_000);
+    }
+
+    /// **Every failure kind has its own label, and they round-trip.**
+    ///
+    /// Review found that collapsing all four `as_str` arms to `"fetch"` left
+    /// the whole suite green: every test of these columns passed string
+    /// literals, so nothing tied a variant to its label. A histogram whose
+    /// buckets all say the same thing is worse than no histogram — it reports a
+    /// single confident cause for four different failures.
+    ///
+    /// Asserted over `ALL` rather than a hand-written list, so adding a variant
+    /// without a label fails here instead of silently sharing one.
+    #[test]
+    fn every_failure_kind_has_a_distinct_round_tripping_label() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in FailureKind::ALL {
+            let label = kind.as_str();
+            assert!(
+                seen.insert(label),
+                "{label:?} is used by more than one FailureKind",
+            );
+            assert_eq!(
+                FailureKind::parse(label),
+                Some(kind),
+                "{label:?} does not read back as the kind that wrote it",
+            );
+        }
+        assert_eq!(seen.len(), FailureKind::ALL.len());
+        // A label from a newer build is not attributed to a cause this one
+        // knows — the `metrics::Backend::parse` contract.
+        assert_eq!(FailureKind::parse("quota"), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
         assert!(backoff_for(2) > backoff_for(1));
         assert_eq!(backoff_for(100), BACKOFF_MAX);

@@ -58,6 +58,14 @@
               {{ in_backoff }}{% if badly_broken > 0 %}, {{ badly_broken }} badly{% endif %}
             </td>
           </tr>
+          {% if !failure_kinds.is_empty() %}
+          <tr>
+            <th scope="row">Why they are failing</th>
+            <td>
+              {% for (kind, count) in failure_kinds %}{% if !loop.first %}, {% endif %}{{ count }} {{ kind }}{% endfor %}
+            </td>
+          </tr>
+          {% endif %}
           <tr>
             <th scope="row">Fetching</th>
             <td>
@@ -93,8 +101,18 @@
         <strong>Failing</strong> feeds retry on a widening delay, so they are
         <em>not</em> in the backlog — a broken feed makes the backlog look
         better, not worse, which is why the two are listed separately. The
-        second figure, when shown, is feeds retrying hours apart: usually gone
-        rather than flaky.
+        second figure, when shown, is feeds retrying hours apart rather than
+        minutes. They are not beyond recovery: any of them returns to the normal
+        interval on its next successful fetch.
+      </p>
+      <p>
+        <strong>Why they are failing</strong> groups those feeds by cause:
+        <em>fetch</em> never got a response, <em>status</em> got a bad one,
+        <em>body</em> could not be read, <em>parse</em> was not a feed this
+        reader understands. It is there because a count on its own cannot
+        distinguish many dead publishers from one bug here — and once, it did
+        not: sixty feeds failed for a single reason in this reader's own code
+        while the page said only that sixty feeds were failing.
       </p>
       <p>
         <strong>Fetching</strong> says whether new content arrives at all.

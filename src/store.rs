@@ -260,7 +260,9 @@ CREATE TABLE IF NOT EXISTS feeds (
     last_modified      TEXT,
     last_polled        TEXT,
     next_poll          TEXT,
-    consecutive_errors INTEGER NOT NULL DEFAULT 0
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    last_error_kind    TEXT,
+    last_error         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
 
@@ -544,6 +546,25 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE feeds ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    // feeds.last_error_kind / feeds.last_error — WHY a feed is failing, not just
+    // how often. `consecutive_errors` recorded a count and nothing else, which is
+    // how a systematic defect across sixty feeds stayed indistinguishable from
+    // sixty dead blogs until #159: every one of them was our own 304 handling,
+    // and the table could not say so. Nullable, and NULL once a poll succeeds.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "last_error_kind",
+        "ALTER TABLE feeds ADD COLUMN last_error_kind TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "last_error",
+        "ALTER TABLE feeds ADD COLUMN last_error TEXT",
+    )
+    .await?;
     // read_cursor.pds_created — tracks whether a feed's readState record has been
     // created in the PDS, so the first flush emits a `create` (not a bare
     // `update`, which errors on a not-yet-existing record). Older DBs predate it.
@@ -696,17 +717,82 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
+/// One failing feed, named, for the ADMIN view only.
+///
+/// The public `/stats` histogram is counts by cause and nothing else, by that
+/// page's own stated promise. This is the other half: the coarse bucket
+/// `fetch` covers DNS failure, timeout, SSRF refusal and — as #159 proved —
+/// this reader's own bugs, so a count alone cannot separate "the publishers are
+/// gone" from "we are broken". The detail can, and it lives behind the
+/// `ALLOWED_DIDS` gate where per-feed data is already permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailingFeed {
+    pub url: String,
+    pub consecutive_errors: i64,
+    /// `None` for a row that predates the column — see the `unknown` bucket.
+    pub kind: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Every currently-failing feed with its recorded cause, worst first.
+///
+/// **Admin-gated callers only.** Bounded because this renders into one response
+/// and a large instance should not be able to make that response unbounded.
+pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingFeed>> {
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT url, consecutive_errors, last_error_kind, last_error
+        FROM feeds
+        WHERE consecutive_errors > 0
+        ORDER BY consecutive_errors DESC, url ASC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing failing feeds")?;
+    Ok(rows
+        .into_iter()
+        .map(|(url, consecutive_errors, kind, detail)| FailingFeed {
+            url,
+            consecutive_errors,
+            kind,
+            detail,
+        })
+        .collect())
+}
+
+/// Cap on the stored `last_error` detail. Remote text on an unattended path.
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
 /// Record a poll FAILURE for a feed: bump its `consecutive_errors` by one and
 /// return the NEW count. The count drives the exponential poll backoff, so a
 /// persistently-failing feed spaces its retries out toward the ceiling instead of
 /// hammering the 5-minute floor forever. Reset to 0 by [`reset_feed_errors`] on
 /// any success/304.
-pub async fn bump_feed_errors(pool: &SqlitePool, url: &str) -> Result<i64> {
+pub async fn bump_feed_errors(
+    pool: &SqlitePool,
+    url: &str,
+    kind: crate::feed::FailureKind,
+    detail: &str,
+) -> Result<i64> {
     let row = sqlx::query(
-        "UPDATE feeds SET consecutive_errors = consecutive_errors + 1 \
+        "UPDATE feeds SET consecutive_errors = consecutive_errors + 1, \
+         last_error_kind = ?2, last_error = ?3 \
          WHERE url = ?1 RETURNING consecutive_errors",
     )
     .bind(url)
+    .bind(kind.as_str())
+    // **Truncated.** This is a remote server's error text on an unattended path;
+    // an upstream that returns a megabyte of prose should cost a bounded row,
+    // not an unbounded one.
+    .bind(
+        detail
+            .chars()
+            .take(MAX_ERROR_DETAIL_CHARS)
+            .collect::<String>(),
+    )
     .fetch_optional(pool)
     .await
     .with_context(|| format!("bump_feed_errors failed for {url}"))?;
@@ -716,14 +802,41 @@ pub async fn bump_feed_errors(pool: &SqlitePool, url: &str) -> Result<i64> {
         .unwrap_or(1))
 }
 
+/// Schedule a feed's next poll `delay` from now.
+///
+/// Lived as a private fn in the scheduler until `web::add_subscription`
+/// needed it too: a poll taken off the scheduler settled the error columns but
+/// never rescheduled, so a re-subscribed working feed stayed parked on its stale
+/// backoff horizon for up to 24h. One implementation, two callers.
+///
+/// `upsert_feed` COALESCEs unset fields, so supplying only url + next_poll bumps
+/// the schedule without clobbering title/validators/last_polled.
+pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Duration) -> Result<()> {
+    let next = chrono::Utc::now()
+        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
+    let next_poll = next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let nf = NewFeed {
+        url: url.to_string(),
+        next_poll: Some(next_poll),
+        ..Default::default()
+    };
+    upsert_feed(pool, &nf).await.map(|_| ())
+}
+
 /// Reset a feed's `consecutive_errors` to 0 after a successful poll (or a 304).
 /// A no-op UPDATE if the row is missing.
 pub async fn reset_feed_errors(pool: &SqlitePool, url: &str) -> Result<()> {
-    sqlx::query("UPDATE feeds SET consecutive_errors = 0 WHERE url = ?1")
-        .bind(url)
-        .execute(pool)
-        .await
-        .with_context(|| format!("reset_feed_errors failed for {url}"))?;
+    // **Clears the reason too.** A stale `last_error` on a feed that is now
+    // succeeding is worse than none: it is the aggregate below reporting a cause
+    // that stopped applying, which is the failure this column exists to end.
+    sqlx::query(
+        "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
+         WHERE url = ?1",
+    )
+    .bind(url)
+    .execute(pool)
+    .await
+    .with_context(|| format!("reset_feed_errors failed for {url}"))?;
     Ok(())
 }
 
@@ -3704,16 +3817,45 @@ pub struct PollHealth {
     /// checked moved the wrong way: a feed failing every fetch made `overdue`
     /// look BETTER.
     pub in_backoff: i64,
-    /// Of those, how many have failed enough times to be at or near the backoff
-    /// ceiling — the ones that will not recover on their own.
+    /// Of those, how many have reached [`BADLY_BROKEN_ERRORS`] consecutive
+    /// failures — retried 2h40m apart rather than every 5 minutes.
+    ///
+    /// Not "will not recover on their own": the backoff ceiling is 24h at ten
+    /// errors, and any of these recovers on its next successful poll. See
+    /// [`BADLY_BROKEN_ERRORS`].
     pub badly_broken: i64,
+    /// Failing feeds grouped by **cause**, descending, as
+    /// `(kind, count)` — `fetch`, `status`, `body`, `parse`.
+    ///
+    /// **Counts, never identities.** `/stats` is public and states that it
+    /// reports machines rather than people: no per-feed detail, never which feed
+    /// and never whose. A cause histogram keeps that promise and still answers
+    /// the question `badly_broken` could not — whether sixty feeds are failing
+    /// for sixty reasons or for one. Had this existed, #159 would have read
+    /// `fetch: 60` on a page anyone could load, instead of costing a production
+    /// investigation.
+    pub failure_kinds: Vec<(String, i64)>,
 }
 
 /// `consecutive_errors` at or above which a feed counts as `badly_broken`.
 ///
 /// Chosen to mean "this is not a transient blip": `feed::backoff_for` climbs
 /// exponentially, so by this many consecutive failures a feed is being retried
-/// hours apart and is almost certainly gone rather than flaky.
+/// **2h40m apart** — `backoff_for(6)`.
+///
+/// **Not "at or near the ceiling", and not "effectively dead".** `BACKOFF_MAX`
+/// is 24h and is first reached at *ten* errors, so a feed at this threshold is
+/// still retried around nine times a day and recovers on its own the moment the
+/// cause clears. Three doc comments claimed otherwise, and the claim was
+/// load-bearing in the wrong direction.
+///
+/// **It says nothing about whose fault the failure is, and used to claim it
+/// did.** This comment and the matching `/stats` copy read "almost certainly
+/// gone rather than flaky" until 2026-09-20, when #159 found that 60-odd feeds
+/// sat here because `guarded_get` was reading every `304 Not Modified` as a
+/// malformed redirect. The publishers were live; the reader was broken. That
+/// assertion is what stopped anyone looking, which is why `last_error_kind`
+/// now exists — the row can answer the question the count never could.
 const BADLY_BROKEN_ERRORS: i64 = 6;
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
@@ -3747,6 +3889,54 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     .await
     .context("computing poll health")?;
 
+    // A second, tiny query rather than a join: the histogram groups rows the
+    // aggregate above collapses, and one statement doing both would make the
+    // counts above harder to read than the extra round trip is worth.
+    //
+    // **Every failing feed lands in a bucket, so this sums to `in_backoff`.**
+    //
+    // A row that predates the column is failing with no recorded cause, and it
+    // must not be attributed to some other feed's reason — but it must not
+    // vanish either. Filtering them out made the breakdown silently disagree
+    // with the `Failing` figure beside it: on a migrated database that is EVERY
+    // currently-failing feed, so the page would have read "70 failing" next to
+    // "3 fetch" with 67 unexplained and no indication a remainder existed.
+    //
+    // `unknown` is a deliberate bucket rather than an omission. It cannot
+    // collide with a real kind — `FailureKind::as_str` never returns it, and
+    // `FailureKind::parse("unknown")` is `None`.
+    let kinds: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT COALESCE(last_error_kind, 'unknown') AS kind, COUNT(*) AS n
+        FROM feeds
+        WHERE consecutive_errors > 0
+        GROUP BY kind
+        ORDER BY n DESC, kind ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("computing the failure-cause histogram")?;
+
+    // **Close the vocabulary where it is READ.** `FailureKind::parse` promised
+    // that a kind from a newer build would not be attributed to a cause this
+    // one recognises — but nothing called it, so the raw column reached the
+    // public template and an unrecognised string rendered as its own bucket.
+    // Fold anything `parse` rejects into `unknown`, then re-aggregate and
+    // re-order, so the histogram only ever shows the four kinds this build
+    // knows plus the one honest bucket for what it does not.
+    let mut folded: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (kind, n) in kinds {
+        let key = if kind == "unknown" || crate::feed::FailureKind::parse(&kind).is_some() {
+            kind
+        } else {
+            "unknown".to_string()
+        };
+        *folded.entry(key).or_insert(0) += n;
+    }
+    let mut kinds: Vec<(String, i64)> = folded.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     Ok(PollHealth {
         feeds_tracked: row.0,
         polled_last_hour: row.1,
@@ -3756,6 +3946,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
         never_polled: row.5,
         in_backoff: row.6,
         badly_broken: row.7,
+        failure_kinds: kinds,
     })
 }
 
@@ -5845,7 +6036,13 @@ mod tests {
         // `backoff_for` — the backoff grows with it (never latched at the floor).
         let mut last = std::time::Duration::ZERO;
         for expected in 1..=3 {
-            let count = bump_feed_errors(&pool, url).await?;
+            let count = bump_feed_errors(
+                &pool,
+                url,
+                crate::feed::FailureKind::Fetch,
+                "connection refused",
+            )
+            .await?;
             assert_eq!(count, expected, "bump returns the new count");
             let backoff = crate::feed::backoff_for(count as u32);
             assert!(
@@ -5873,6 +6070,211 @@ mod tests {
                 .consecutive_errors,
             0
         );
+        Ok(())
+    }
+
+    /// **A recovered feed keeps no reason for having failed.**
+    ///
+    /// Added because a mutation found this untested: deleting the
+    /// `last_error_kind = NULL, last_error = NULL` half of `reset_feed_errors`
+    /// left the entire suite green. The histogram filters on
+    /// `consecutive_errors > 0`, so a stale row would not inflate the public
+    /// count — but anything reading the row directly would be handed a cause
+    /// that stopped applying, which is the exact failure this column was added
+    /// to end. A guarantee nothing checks is a comment.
+    #[tokio::test]
+    async fn a_successful_poll_clears_the_recorded_failure_reason() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://recovers.example/feed.xml";
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "SENTINEL_WHY").await?;
+        let failing: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            failing.0.as_deref(),
+            Some("fetch"),
+            "the kind was not stored"
+        );
+        assert_eq!(
+            failing.1.as_deref(),
+            Some("SENTINEL_WHY"),
+            "the detail was not stored"
+        );
+
+        reset_feed_errors(&pool, url).await?;
+        let recovered: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            recovered.0, None,
+            "a healthy feed still names a failure kind"
+        );
+        assert_eq!(
+            recovered.1, None,
+            "a healthy feed still carries error detail"
+        );
+        Ok(())
+    }
+
+    /// **The closed vocabulary is closed where it is READ, not only written.**
+    ///
+    /// `FailureKind::parse` promises that a kind string from a newer build is
+    /// not "silently attributed to a cause this one recognises" — and the
+    /// histogram's comment leaned on it. But review found `parse` had zero
+    /// production callers: `poll_health` handed the raw column to the public
+    /// template, so an unrecognised string got its own bucket, rendered
+    /// verbatim. The protection existed only as a doc comment.
+    ///
+    /// A row written by a future build must land in `unknown`.
+    #[tokio::test]
+    async fn an_unrecognised_failure_kind_folds_into_unknown() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for (url, kind) in [
+            ("https://a.example/f.xml", Some("fetch")),
+            ("https://b.example/f.xml", Some("quota")), // a newer build's kind
+            ("https://c.example/f.xml", None),          // a legacy row
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE feeds SET consecutive_errors = 1, last_error_kind = ?2 WHERE url = ?1",
+            )
+            .bind(url)
+            .bind(kind)
+            .execute(&pool)
+            .await?;
+        }
+        let now = chrono::Utc::now();
+        let health = poll_health(
+            &pool,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .await?;
+        let mut kinds = health.failure_kinds.clone();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![("fetch".to_string(), 1), ("unknown".to_string(), 2)],
+            "an unrecognised kind reached the public histogram as its own bucket: {:?}",
+            health.failure_kinds
+        );
+        Ok(())
+    }
+
+    /// **The migration is exercised against a table that predates the columns.**
+    ///
+    /// Every other test here builds a fresh database, where `CREATE TABLE`
+    /// already contains `last_error_kind` / `last_error` — so `ensure_column`,
+    /// the code path that actually runs against the production volume, was
+    /// never executed by any of them. A bad `ALTER` would have been found at
+    /// boot, on the one machine, by crash-looping: `apply_migrations` runs
+    /// inside `init`, and the entrypoint takes the container down when a child
+    /// dies.
+    ///
+    /// Builds the OLD table shape by hand, puts a failing row in it, migrates,
+    /// and asserts both that the columns arrive and that the pre-existing row
+    /// survives with NULLs rather than being rewritten or dropped.
+    #[tokio::test]
+    async fn the_last_error_columns_migrate_onto_a_table_that_predates_them() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+
+        // Drop the current shape and rebuild the pre-migration one.
+        sqlx::query("DROP TABLE feeds").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE feeds (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                url                TEXT NOT NULL UNIQUE,
+                title              TEXT,
+                site_url           TEXT,
+                etag               TEXT,
+                last_modified      TEXT,
+                last_polled        TEXT,
+                next_poll          TEXT,
+                consecutive_errors INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO feeds (url, consecutive_errors) VALUES (?1, 7)")
+            .bind("https://legacy.example/feed.xml")
+            .execute(&pool)
+            .await?;
+
+        apply_migrations(&pool).await?;
+
+        // The columns exist...
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(feeds)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(cols.iter().any(|c| c == "last_error_kind"), "{cols:?}");
+        assert!(cols.iter().any(|c| c == "last_error"), "{cols:?}");
+
+        // ...and the pre-existing row is intact, with no invented cause.
+        let row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT consecutive_errors, last_error_kind, last_error FROM feeds WHERE url = ?1",
+        )
+        .bind("https://legacy.example/feed.xml")
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.0, 7, "the migration disturbed an existing error count");
+        assert_eq!(row.1, None, "a legacy row was given a cause it never had");
+        assert_eq!(row.2, None);
+
+        // And it is idempotent — `init` runs this on every boot.
+        apply_migrations(&pool).await?;
+        Ok(())
+    }
+
+    /// The stored detail is bounded — it is a remote server's text on an
+    /// unattended path.
+    #[tokio::test]
+    async fn the_stored_error_detail_is_truncated() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://verbose.example/feed.xml";
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        bump_feed_errors(
+            &pool,
+            url,
+            crate::feed::FailureKind::Body,
+            &"x".repeat(10_000),
+        )
+        .await?;
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(stored.0.unwrap().chars().count(), MAX_ERROR_DETAIL_CHARS);
         Ok(())
     }
 
