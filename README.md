@@ -75,7 +75,7 @@ Your subscriptions and read-state are records in **your** PDS, so the local cach
 is throwaway and your reading list follows you to any reader that speaks the same
 lexicon.
 
-**Runtime — one container, three processes**
+**Runtime — one container, two or three processes**
 
 <p align="center">
   <picture>
@@ -94,6 +94,11 @@ The dashed links are the Node sidecar, used only on the default `sidecar`
 backend. On `FEATHERREADER_REPO_BACKEND=rust` the app owns the OAuth flow itself,
 those links do not exist, and the `:8081` process is not started — see
 [Choosing an OAuth backend](#choosing-an-oauth-backend).
+
+So the container runs **three** processes on the `sidecar` backend and **two** on
+`rust`. That count includes Caddy, which runs either way; [Build &
+run](#build--run) counts only the application processes behind it, and so says
+one or two for the same two topologies.
 
 <sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
 
