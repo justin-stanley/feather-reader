@@ -1271,22 +1271,6 @@ impl SidecarClient {
             .await
     }
 
-    /// Batch-create many [`Subscription`] records in one `applyWrites` — the OPML
-    /// import path (one create op per feed, server-assigned rkeys).
-    pub async fn create_subscriptions_batch(&self, did: &str, subs: &[Subscription]) -> Result<()> {
-        let writes: Vec<WriteOp> = subs
-            .iter()
-            .map(|sub| {
-                Ok(WriteOp::Create {
-                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
-                    rkey: None,
-                    value: serde_json::to_value(sub)?,
-                })
-            })
-            .collect::<Result<_>>()?;
-        self.apply_writes(did, &writes).await
-    }
-
     /// List every [`Folder`] record in `did`'s repo.
     pub async fn list_folders(&self, did: &str) -> Result<Vec<(String, Folder)>> {
         self.list_typed(did, lexicon::nsid::FOLDER).await

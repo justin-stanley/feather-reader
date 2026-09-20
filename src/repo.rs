@@ -196,16 +196,30 @@ macro_rules! dispatch {
     // explicitly so the private method's `_unvetted` suffix does not leak into
     // the metric.
     //
-    // **`Repo` is the vetted path, and since #150 there is no unvetted one.**
-    // The layer below is still public — `AppState.sidecar` is a `pub` field and
-    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription` —
-    // so a handler *can* still reach past `Repo` and call one directly. What it
+    // **`Repo` is the vetted path, and the layer below now demands vetted
+    // records too.** `AppState.sidecar` is a `pub` field and
+    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription`,
+    // so a handler *can* reach past `Repo` and call one directly. What it
     // cannot do is write an unvetted record: those writers take
     // `&vetted::VettedSubscription` (and `add_saved` a `&vetted::VettedSaved`),
-    // whose inner field is private to `src/vetted.rs` and reachable only through
-    // a constructor that vets. There is nothing to hand them that skipped the
-    // check. This is the `SafeLink` treatment from `src/safe_link.rs` applied to
-    // whole records — the convention became a compiler error.
+    // whose inner field is private to `src/vetted.rs` and reachable only
+    // through a constructor that vets.
+    //
+    // **This comment previously said "there is nothing to hand them that
+    // skipped the check", and that was false when written.** #150 enumerated
+    // three routes and closed them; a fourth,
+    // `SidecarClient::create_subscriptions_batch`, took a raw
+    // `&[Subscription]` and serialised it straight into `applyWrites`. It had
+    // no callers and so drew no attention, but it type-checked, and a review
+    // found it by enumerating every writer rather than re-reading the three the
+    // commit message named. It is deleted.
+    //
+    // The guarantee therefore still rests on the SET of writers being closed,
+    // which is a property nothing checks. Ending the class outright means
+    // removing `Serialize` from `lexicon::Subscription` so a raw record cannot
+    // be serialised into a write at all — blocked today because
+    // `VettedSubscription` is `#[serde(transparent)]` over it, so that needs a
+    // hand-written impl and a wire-format test to match.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
