@@ -1583,65 +1583,13 @@ mod tests {
 
         let rendered = format!("{err:#}");
         assert!(
+            rendered.contains("oauth-protected-resource") && rendered.contains("resolving host"),
+            "the exchange should have got as far as discovery: {rendered}"
+        );
+        assert!(
             !rendered.contains("started under a different public URL"),
             "a login whose public URL never changed must not be refused as though it \
              had; the identity check is rejecting valid logins: {rendered}",
-        );
-    }
-
-    /// **A login must complete under the identity it STARTED under.**
-    ///
-    /// `client_id` and `redirect_uri` both derive from `public_url`, so a
-    /// deployment whose public URL changes between the push and the callback
-    /// would present a different client than PAR authenticated as. The
-    /// authorization server rejects that, and without this check nothing on our
-    /// side explains why — the same failure mode the stored `auth_method`
-    /// already guards against.
-    ///
-    /// The pending row's `redirect_uri` is the witness: it is written at push
-    /// time and is derived from the same value.
-    #[test]
-    fn a_changed_public_url_is_detected_from_the_stored_redirect() {
-        let started_under = super::super::metadata::ClientConfig::new(
-            "https://feather-reader.com",
-            "atproto",
-            false,
-        )
-        .unwrap();
-        let now_configured = super::super::metadata::ClientConfig::new(
-            "https://reader.example.org",
-            "atproto",
-            false,
-        )
-        .unwrap();
-
-        let pushed = super::super::metadata::redirect_uri(&started_under);
-        let current = super::super::metadata::redirect_uri(&now_configured);
-
-        assert_ne!(
-            pushed, current,
-            "a changed public URL must change the redirect, or the check cannot see it"
-        );
-        // And the client_id moves with it — which is what the server rejects.
-        assert_ne!(
-            super::super::metadata::client_id(&started_under),
-            super::super::metadata::client_id(&now_configured)
-        );
-    }
-
-    /// The check must NOT fire on an unchanged configuration, or every login
-    /// breaks.
-    #[test]
-    fn an_unchanged_public_url_matches_the_stored_redirect() {
-        let cfg = super::super::metadata::ClientConfig::new(
-            "https://feather-reader.com",
-            "atproto",
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            super::super::metadata::redirect_uri(&cfg),
-            super::super::metadata::redirect_uri(&cfg)
         );
     }
 

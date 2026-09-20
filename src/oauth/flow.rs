@@ -486,10 +486,16 @@ mod tests {
     }
 
     /// `plain` is not allowed, so the method is a constant rather than a choice.
+    /// Asserted as the exact value: "is not `plain`" admitted every wrong
+    /// method but one, and `S384` passed it.
     #[test]
     fn the_challenge_method_is_always_s256() {
         let params = par_params(&par_input());
-        assert!(!params.iter().any(|(_, v)| v == "plain"));
+        let method = params
+            .iter()
+            .find(|(name, _)| *name == "code_challenge_method")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(method, Some("S256"));
     }
 
     /// **`response_mode=query` must be explicit.** A server-side handler cannot

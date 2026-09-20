@@ -791,6 +791,72 @@ mod tests {
         Ok(())
     }
 
+    /// **A session secret moved between columns of the same row does not
+    /// decrypt** — the `oauth_state` twin above, which never got written for
+    /// `oauth_session`. `an_unbound_session_ciphertext_is_refused` says in its
+    /// own doc that the column is part of the binding; nothing checked it, so
+    /// dropping `column` from `session_aad` left the suite green. Against the
+    /// declared adversary — anything that can write the database — that is
+    /// `access_token` ↔ `refresh_token` swapped inside one row with both
+    /// still authenticating, and `get_session` handing the refresh token to
+    /// the PDS as an access token.
+    #[tokio::test]
+    async fn a_session_secret_moved_between_columns_does_not_decrypt() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_session(&pool, &codec, &session()).await?;
+        let access: String =
+            sqlx::query_scalar("SELECT access_token FROM oauth_session WHERE sub = ?")
+                .bind(DID)
+                .fetch_one(&pool)
+                .await?;
+        sqlx::query("UPDATE oauth_session SET refresh_token = ? WHERE sub = ?")
+            .bind(&access)
+            .bind(DID)
+            .execute(&pool)
+            .await?;
+        assert!(
+            get_session(&pool, &codec, DID).await.is_err(),
+            "the access token's ciphertext was accepted in the refresh_token column"
+        );
+        Ok(())
+    }
+
+    /// **An absent expiry and a zero expiry are different sessions.** The AAD
+    /// comment says `None` and `0` must not collide; the only tamper test
+    /// stored `Some(NOW + 3600)` and flipped it to NULL, which differs under
+    /// either encoding — so `unwrap_or(0)` in place of the `"none"` marker
+    /// left the suite green. Flipping between NULL and 0 with every token
+    /// still decrypting pins `is_stale` permanently one way or the other.
+    #[tokio::test]
+    async fn an_absent_expiry_and_a_zero_expiry_are_different_sessions() -> anyhow::Result<()> {
+        for (stored, flipped_to) in [(None, "0"), (Some(0), "NULL")] {
+            let (pool, codec) = db().await;
+            put_session(
+                &pool,
+                &codec,
+                &OAuthSession {
+                    expires_at: stored,
+                    ..session()
+                },
+            )
+            .await?;
+            // Two literals, chosen by the loop — not a bound parameter, because
+            // binding `None` would write NULL through the same path the code
+            // under test uses, and the point is a raw flip.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE oauth_session SET expires_at = {flipped_to} WHERE sub = ?"
+            )))
+            .bind(DID)
+            .execute(&pool)
+            .await?;
+            assert!(
+                get_session(&pool, &codec, DID).await.is_err(),
+                "expires_at {stored:?} → {flipped_to} still decrypted"
+            );
+        }
+        Ok(())
+    }
+
     /// **Binding the secrets is not enough: the DESTINATIONS must be bound too.**
     ///
     /// The declared adversary is anything able to write the database. Against

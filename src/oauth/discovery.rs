@@ -954,10 +954,21 @@ mod tests {
             for bad in ["/par", "http://auth.example.com/par", "not a url"] {
                 let mut doc = as_metadata();
                 doc[field] = json!(bad);
-                assert!(
-                    validate_authorization_server(&doc, ISS, PDS, "private_key_jwt").is_err(),
-                    "accepted {field} = {bad}"
-                );
+                let err = validate_authorization_server(&doc, ISS, PDS, "private_key_jwt")
+                    .expect_err(&format!("accepted {field} = {bad}"));
+                // **By message.** All three used to be `is_err()` only, and all
+                // three are refused by OTHER checks — the malformed ones by
+                // `Url::parse`, the `http://` one by the issuer-origin check
+                // (`http://` and `https://` are different origins). With the
+                // scheme check deleted this test stayed green. An AS
+                // publishing `http://` endpoints on its own origin — credentials
+                // POSTed in the clear — must be refused for THAT reason.
+                if bad.starts_with("http://") {
+                    assert!(
+                        format!("{err:#}").contains("must be https"),
+                        "{field} = {bad} was refused for the wrong reason: {err:#}"
+                    );
+                }
             }
         }
     }
