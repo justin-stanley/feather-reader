@@ -1071,6 +1071,7 @@ async fn stats(State(state): State<AppState>) -> Response {
         // detail, so they sit inside the page's stated contract.
         in_backoff: health.in_backoff,
         badly_broken: health.badly_broken,
+        failure_kinds: health.failure_kinds,
         fetching: fetching_state(&state.runtime_health, now.timestamp()),
     })
 }
@@ -1336,6 +1337,8 @@ struct StatsTemplate {
     in_backoff: i64,
     /// Of those, the ones deep enough into backoff to be effectively dead.
     badly_broken: i64,
+    /// Failing feeds by cause, descending — counts only, never which feed.
+    failure_kinds: Vec<(String, i64)>,
     /// What the poller is actually doing: `running`, `paused` (at the size
     /// watermark), `starting` (no tick completed yet) or `off` (schedulers
     /// disabled). Three of those four used to render as "running".
@@ -8957,7 +8960,9 @@ mod tests {
             .await
             .unwrap();
             for _ in 0..errors {
-                store::bump_feed_errors(&state.db, url).await.unwrap();
+                store::bump_feed_errors(&state.db, url, "fetch", "connection refused")
+                    .await
+                    .unwrap();
             }
         }
 
@@ -9043,6 +9048,101 @@ mod tests {
             assert!(
                 !paused.contains(leak),
                 "the public page leaked {leak:?} while reporting failures"
+            );
+        }
+    }
+
+    /// **Failing feeds are grouped by CAUSE, and still never named.**
+    ///
+    /// `badly_broken` could say that sixty feeds were failing and not whether
+    /// that was sixty dead publishers or one bug here. It was the latter — #159,
+    /// a `304 Not Modified` read as a malformed redirect — and the page could
+    /// not say so, which is most of why it went unexamined.
+    ///
+    /// The second half of this test is the constraint that shapes the first:
+    /// `/stats` is public and promises machines-not-people, *never which feed
+    /// and never whose*. A histogram of causes keeps that promise; a list of
+    /// failing URLs would break it, and is the obvious way to build this.
+    #[tokio::test]
+    async fn stats_groups_failures_by_cause_without_naming_any_feed() {
+        let state = test_state(&[]).await;
+        for (url, kind, detail, errors) in [
+            // Detail strings are distinctive SENTINELS, not plausible English.
+            // A first pass used "not a feed", which the page's own explanation
+            // of the `parse` kind contains verbatim — the privacy assertion
+            // fired on static copy rather than on a leak. A sentinel cannot
+            // collide with prose.
+            (
+                "https://a.example/f.xml",
+                "fetch",
+                "SENTINEL_CONNREFUSED",
+                3,
+            ),
+            ("https://b.example/f.xml", "fetch", "SENTINEL_DNSFAIL", 2),
+            ("https://c.example/f.xml", "status", "SENTINEL_404", 1),
+            (
+                "https://d.example/f.xml",
+                "parse",
+                "SENTINEL_UNPARSEABLE",
+                1,
+            ),
+        ] {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    next_poll: Some("2099-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..errors {
+                store::bump_feed_errors(&state.db, url, kind, detail)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Descending by count: two fetch, then one each, tie-broken by name.
+        assert!(
+            body.contains("2 fetch") && body.contains("1 status") && body.contains("1 parse"),
+            "the cause histogram did not render: {body}",
+        );
+
+        // **The privacy half.** No feed URL, host, or error detail reaches the
+        // public page — only counts by kind.
+        for secret in [
+            "a.example",
+            "b.example",
+            "c.example",
+            "d.example",
+            "SENTINEL_CONNREFUSED",
+            "SENTINEL_DNSFAIL",
+            "SENTINEL_404",
+            "SENTINEL_UNPARSEABLE",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "{secret:?} reached the PUBLIC stats page: {body}",
             );
         }
     }

@@ -260,7 +260,9 @@ CREATE TABLE IF NOT EXISTS feeds (
     last_modified      TEXT,
     last_polled        TEXT,
     next_poll          TEXT,
-    consecutive_errors INTEGER NOT NULL DEFAULT 0
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    last_error_kind    TEXT,
+    last_error         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
 
@@ -544,6 +546,25 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE feeds ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    // feeds.last_error_kind / feeds.last_error — WHY a feed is failing, not just
+    // how often. `consecutive_errors` recorded a count and nothing else, which is
+    // how a systematic defect across sixty feeds stayed indistinguishable from
+    // sixty dead blogs until #159: every one of them was our own 304 handling,
+    // and the table could not say so. Nullable, and NULL once a poll succeeds.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "last_error_kind",
+        "ALTER TABLE feeds ADD COLUMN last_error_kind TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "last_error",
+        "ALTER TABLE feeds ADD COLUMN last_error TEXT",
+    )
+    .await?;
     // read_cursor.pds_created — tracks whether a feed's readState record has been
     // created in the PDS, so the first flush emits a `create` (not a bare
     // `update`, which errors on a not-yet-existing record). Older DBs predate it.
@@ -696,17 +717,36 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
+/// Cap on the stored `last_error` detail. Remote text on an unattended path.
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
 /// Record a poll FAILURE for a feed: bump its `consecutive_errors` by one and
 /// return the NEW count. The count drives the exponential poll backoff, so a
 /// persistently-failing feed spaces its retries out toward the ceiling instead of
 /// hammering the 5-minute floor forever. Reset to 0 by [`reset_feed_errors`] on
 /// any success/304.
-pub async fn bump_feed_errors(pool: &SqlitePool, url: &str) -> Result<i64> {
+pub async fn bump_feed_errors(
+    pool: &SqlitePool,
+    url: &str,
+    kind: &str,
+    detail: &str,
+) -> Result<i64> {
     let row = sqlx::query(
-        "UPDATE feeds SET consecutive_errors = consecutive_errors + 1 \
+        "UPDATE feeds SET consecutive_errors = consecutive_errors + 1, \
+         last_error_kind = ?2, last_error = ?3 \
          WHERE url = ?1 RETURNING consecutive_errors",
     )
     .bind(url)
+    .bind(kind)
+    // **Truncated.** This is a remote server's error text on an unattended path;
+    // an upstream that returns a megabyte of prose should cost a bounded row,
+    // not an unbounded one.
+    .bind(
+        detail
+            .chars()
+            .take(MAX_ERROR_DETAIL_CHARS)
+            .collect::<String>(),
+    )
     .fetch_optional(pool)
     .await
     .with_context(|| format!("bump_feed_errors failed for {url}"))?;
@@ -719,11 +759,17 @@ pub async fn bump_feed_errors(pool: &SqlitePool, url: &str) -> Result<i64> {
 /// Reset a feed's `consecutive_errors` to 0 after a successful poll (or a 304).
 /// A no-op UPDATE if the row is missing.
 pub async fn reset_feed_errors(pool: &SqlitePool, url: &str) -> Result<()> {
-    sqlx::query("UPDATE feeds SET consecutive_errors = 0 WHERE url = ?1")
-        .bind(url)
-        .execute(pool)
-        .await
-        .with_context(|| format!("reset_feed_errors failed for {url}"))?;
+    // **Clears the reason too.** A stale `last_error` on a feed that is now
+    // succeeding is worse than none: it is the aggregate below reporting a cause
+    // that stopped applying, which is the failure this column exists to end.
+    sqlx::query(
+        "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
+         WHERE url = ?1",
+    )
+    .bind(url)
+    .execute(pool)
+    .await
+    .with_context(|| format!("reset_feed_errors failed for {url}"))?;
     Ok(())
 }
 
@@ -3707,6 +3753,17 @@ pub struct PollHealth {
     /// Of those, how many have failed enough times to be at or near the backoff
     /// ceiling — the ones that will not recover on their own.
     pub badly_broken: i64,
+    /// Failing feeds grouped by **cause**, descending, as
+    /// `(kind, count)` — `fetch`, `status`, `body`, `parse`.
+    ///
+    /// **Counts, never identities.** `/stats` is public and states that it
+    /// reports machines rather than people: no per-feed detail, never which feed
+    /// and never whose. A cause histogram keeps that promise and still answers
+    /// the question `badly_broken` could not — whether sixty feeds are failing
+    /// for sixty reasons or for one. Had this existed, #159 would have read
+    /// `fetch: 60` on a page anyone could load, instead of costing a production
+    /// investigation.
+    pub failure_kinds: Vec<(String, i64)>,
 }
 
 /// `consecutive_errors` at or above which a feed counts as `badly_broken`.
@@ -3747,6 +3804,26 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     .await
     .context("computing poll health")?;
 
+    // A second, tiny query rather than a join: the histogram groups rows the
+    // aggregate above collapses, and one statement doing both would make the
+    // counts above harder to read than the extra round trip is worth.
+    //
+    // `last_error_kind IS NOT NULL` rather than `consecutive_errors > 0`: a row
+    // that predates this column is failing without a recorded cause, and must
+    // not be counted under some other feed's reason.
+    let kinds: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT last_error_kind, COUNT(*) AS n
+        FROM feeds
+        WHERE consecutive_errors > 0 AND last_error_kind IS NOT NULL
+        GROUP BY last_error_kind
+        ORDER BY n DESC, last_error_kind ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("computing the failure-cause histogram")?;
+
     Ok(PollHealth {
         feeds_tracked: row.0,
         polled_last_hour: row.1,
@@ -3756,6 +3833,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
         never_polled: row.5,
         in_backoff: row.6,
         badly_broken: row.7,
+        failure_kinds: kinds,
     })
 }
 
@@ -5845,7 +5923,7 @@ mod tests {
         // `backoff_for` — the backoff grows with it (never latched at the floor).
         let mut last = std::time::Duration::ZERO;
         for expected in 1..=3 {
-            let count = bump_feed_errors(&pool, url).await?;
+            let count = bump_feed_errors(&pool, url, "fetch", "connection refused").await?;
             assert_eq!(count, expected, "bump returns the new count");
             let backoff = crate::feed::backoff_for(count as u32);
             assert!(
@@ -5873,6 +5951,86 @@ mod tests {
                 .consecutive_errors,
             0
         );
+        Ok(())
+    }
+
+    /// **A recovered feed keeps no reason for having failed.**
+    ///
+    /// Added because a mutation found this untested: deleting the
+    /// `last_error_kind = NULL, last_error = NULL` half of `reset_feed_errors`
+    /// left the entire suite green. The histogram filters on
+    /// `consecutive_errors > 0`, so a stale row would not inflate the public
+    /// count — but anything reading the row directly would be handed a cause
+    /// that stopped applying, which is the exact failure this column was added
+    /// to end. A guarantee nothing checks is a comment.
+    #[tokio::test]
+    async fn a_successful_poll_clears_the_recorded_failure_reason() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://recovers.example/feed.xml";
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        bump_feed_errors(&pool, url, "fetch", "SENTINEL_WHY").await?;
+        let failing: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            failing.0.as_deref(),
+            Some("fetch"),
+            "the kind was not stored"
+        );
+        assert_eq!(
+            failing.1.as_deref(),
+            Some("SENTINEL_WHY"),
+            "the detail was not stored"
+        );
+
+        reset_feed_errors(&pool, url).await?;
+        let recovered: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            recovered.0, None,
+            "a healthy feed still names a failure kind"
+        );
+        assert_eq!(
+            recovered.1, None,
+            "a healthy feed still carries error detail"
+        );
+        Ok(())
+    }
+
+    /// The stored detail is bounded — it is a remote server's text on an
+    /// unattended path.
+    #[tokio::test]
+    async fn the_stored_error_detail_is_truncated() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://verbose.example/feed.xml";
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        bump_feed_errors(&pool, url, "body", &"x".repeat(10_000)).await?;
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(stored.0.unwrap().chars().count(), MAX_ERROR_DETAIL_CHARS);
         Ok(())
     }
 

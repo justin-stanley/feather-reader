@@ -546,7 +546,50 @@ pub enum PollOutcome {
     NotModified,
     /// The fetch or parse failed; the feed was left intact and skipped. Carries
     /// the suggested backoff before the next attempt. Never a panic.
-    Failed { backoff: Duration },
+    ///
+    /// **`kind` and `detail` are the reason, and they exist because their
+    /// absence cost a production investigation.** Until #159 the error was
+    /// logged here and discarded, so `feeds` recorded that a feed was failing
+    /// and never why — which is how sixty feeds broken by our own 304 handling
+    /// looked exactly like sixty dead blogs. `kind` is a small closed
+    /// vocabulary so failures can be counted by cause; `detail` is the message
+    /// for a human reading one row.
+    Failed {
+        backoff: Duration,
+        kind: FailureKind,
+        detail: String,
+    },
+}
+
+/// Why a poll failed, as a closed set.
+///
+/// Closed on purpose: the point is to *count* failures by cause, and a free-text
+/// kind cannot be counted. The detail string carries whatever else matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The request never produced a response — DNS, TLS, timeout, connection
+    /// refused, or a refusal by the SSRF guard.
+    Fetch,
+    /// A response arrived with a non-success status.
+    Status,
+    /// The body was too large, or reading it failed part-way.
+    Body,
+    /// The body arrived and is not a feed this parser can read.
+    Parse,
+}
+
+impl FailureKind {
+    /// The stable string stored in `feeds.last_error_kind` and aggregated on
+    /// `/stats`. Changing one of these silently rewrites history in the
+    /// aggregate, so they are spelled out rather than derived from the variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Status => "status",
+            Self::Body => "body",
+            Self::Parse => "parse",
+        }
+    }
 }
 
 /// Build a `reqwest::Client` configured for polite **and safe** feed fetching.
@@ -638,6 +681,11 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "feed fetch failed (or blocked by SSRF guard)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Fetch,
+                // `{e:#}` — the anyhow CHAIN, not just the outermost context.
+                // "fetching https://…" alone says nothing; the cause is the
+                // part that would have named the 304 bug.
+                detail: format!("{e:#}"),
             });
         }
     };
@@ -655,6 +703,8 @@ pub async fn poll_feed(
         tracing::warn!(feed = %feed.url, %status, "feed returned non-success status");
         return Ok(PollOutcome::Failed {
             backoff: backoff_for(1),
+            kind: FailureKind::Status,
+            detail: status.to_string(),
         });
     }
 
@@ -671,6 +721,8 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "feed body rejected (too large / read error)");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Body,
+                detail: format!("{e:#}"),
             });
         }
     };
@@ -682,6 +734,8 @@ pub async fn poll_feed(
             tracing::warn!(feed = %feed.url, error = %e, "malformed feed; skipping");
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
+                kind: FailureKind::Parse,
+                detail: format!("{e:#}"),
             });
         }
     };

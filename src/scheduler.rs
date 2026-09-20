@@ -698,12 +698,18 @@ async fn poll_and_reschedule_with<'a, F, Fut>(
             }
             cadence_for(feed, default_interval)
         }
-        Ok(PollOutcome::Failed { backoff }) => {
+        Ok(PollOutcome::Failed {
+            backoff,
+            kind,
+            detail,
+        }) => {
             // Record the failure and recompute the backoff from the feed's REAL
             // consecutive-error count so a persistently-broken feed climbs toward
             // the ceiling instead of retrying at the 5-min floor forever. If the
             // bump fails (store hiccup) fall back to the outcome's floor backoff.
-            let backoff = match store::bump_feed_errors(pool, &feed.url).await {
+            let backoff = match store::bump_feed_errors(pool, &feed.url, kind.as_str(), &detail)
+                .await
+            {
                 Ok(count) => feed::backoff_for(count.max(1) as u32),
                 Err(err) => {
                     warn!(feed = %feed.url, %err, "failed to bump feed error count; using floor backoff");
@@ -1354,6 +1360,8 @@ mod tests {
         poll_and_reschedule_with(&pool, &feed, Duration::from_secs(86_400), |_, _| async {
             Ok(PollOutcome::Failed {
                 backoff: Duration::from_secs(300),
+                kind: feather_reader::feed::FailureKind::Fetch,
+                detail: "test".to_string(),
             })
         })
         .await;
