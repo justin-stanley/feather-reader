@@ -131,6 +131,19 @@ const MAX_LIST_PAGES: usize = 200;
 /// makes the claim true rather than conditional on the server's cooperation.
 const MAX_LIST_RECORDS: usize = 20_000;
 
+/// atproto's record-key rules, all of them: charset `[A-Za-z0-9._:~-]`, length
+/// 1..=512, and not `.` or `..`. The repo's TID tests state the same rule; this
+/// is the one place it is enforced on a key that arrives from outside.
+pub(crate) fn is_valid_rkey(rkey: &str) -> bool {
+    !rkey.is_empty()
+        && rkey.len() <= 512
+        && rkey != "."
+        && rkey != ".."
+        && rkey
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '~' | '-'))
+}
+
 /// Append a page, refusing to exceed `max`.
 ///
 /// **An error, never a truncation.** The caller of the live walk is

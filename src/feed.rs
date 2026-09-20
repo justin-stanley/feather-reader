@@ -310,8 +310,7 @@ fn is_storable_publication_uri(rest: &str) -> bool {
     };
     parts.next().is_none()
         && collection == crate::lexicon::nsid::STANDARD_PUBLICATION
-        && !rkey.is_empty()
-        // **The rkey is validated against atproto's charset, not a blacklist.**
+        // **The rkey is validated against atproto's rules, not a blacklist.**
         //
         // A blacklist was the first attempt and it leaked twice: `is_control()`
         // is Unicode category Cc only, so a bidi override (Cf) passed — and it
@@ -322,7 +321,9 @@ fn is_storable_publication_uri(rest: &str) -> bool {
         // smuggled there would have been declared public.
         //
         // An allowlist cannot leak the next character class someone finds.
-        && rkey.chars().all(is_rkey_char)
+        // The charset alone still admitted `.`, `..` and a 10 000-byte key;
+        // `is_valid_rkey` carries the length and reserved-name rules too.
+        && crate::atproto::is_valid_rkey(rkey)
         && is_storable_at_authority(authority)
 }
 
@@ -331,11 +332,6 @@ fn is_storable_publication_uri(rest: &str) -> bool {
 /// The DID arm reuses [`crate::oauth::identity::is_atproto_did`] rather than
 /// checking the `did:` prefix: `did:plc:` identifiers are 24 base32-sortable
 /// characters, so a prefix check would accept `did:plc:TOOSHORT`.
-/// The atproto record-key charset: `[A-Za-z0-9._:~-]`.
-fn is_rkey_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '~' | '-')
-}
-
 fn is_storable_at_authority(authority: &str) -> bool {
     if authority.starts_with("did:") {
         return crate::oauth::identity::is_atproto_did(authority);
@@ -1340,6 +1336,33 @@ mod tests {
         assert!(html.contains("Safe"));
         assert!(!html.to_ascii_lowercase().contains("<script"));
         assert!(!html.to_ascii_lowercase().contains("<iframe"));
+    }
+
+    /// **The rkey obeys all of atproto's record-key rules, not just the
+    /// charset.** `.` and `..` are reserved and the length is 1..=512; the
+    /// charset alone admitted both and a 10 000-character key, into a UNIQUE
+    /// column and the user's public PDS. The rule is the one the repo's own
+    /// TID tests already state.
+    #[test]
+    fn an_rkey_must_obey_atprotos_length_and_dot_rules() {
+        let uri = |rkey: &str| format!("at://alice.example.com/site.standard.publication/{rkey}");
+        assert!(
+            !is_storable_feed_url(&uri("."), true),
+            "`.` is a reserved rkey"
+        );
+        assert!(
+            !is_storable_feed_url(&uri(".."), true),
+            "`..` is a reserved rkey"
+        );
+        assert!(
+            !is_storable_feed_url(&uri(&"a".repeat(513)), true),
+            "an rkey over 512 bytes was accepted"
+        );
+        assert!(
+            is_storable_feed_url(&uri(&"a".repeat(512)), true),
+            "an rkey of exactly 512 bytes is valid"
+        );
+        assert!(is_storable_feed_url(&uri("3lab2c4d5e6f7g8h"), true));
     }
 
     #[test]
