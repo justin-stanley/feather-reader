@@ -311,3 +311,65 @@ jobs:
       - name: gitleaks (history + tree)
         run: |
           "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --redact --exit-code 1
+
+  caddyfile:
+    name: Caddyfile (validate both OAuth routings)
+    # Nothing validated deploy/Caddyfile. It is baked into the image and parsed
+    # at container start by a Caddy running under the two-phase entrypoint — and
+    # that entrypoint brings the WHOLE box down if any child dies, so a syntax
+    # error here is not a degraded edge, it is a crash-loop on a single machine
+    # with no on-call. The only prior check was whoever edited it running
+    # `caddy validate` by hand, if they thought to.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # **The digest comes from the Dockerfile, not from a second pin here.**
+      # Validating with a different Caddy than the one that ships is how a config
+      # passes CI and crash-loops in production: directives and log filters are
+      # version-sensitive (`request>uri query` needs a recent 2.x). Reading the
+      # pin keeps the two in lockstep by construction rather than by discipline,
+      # and fails loudly if the Dockerfile stops pinning by digest.
+      - name: Read the pinned Caddy image from the Dockerfile
+        id: caddy
+        run: |
+          set -euo pipefail
+          image=$(grep -oE 'caddy:[0-9a-z.-]+@sha256:[0-9a-f]{64}' Dockerfile | head -1)
+          if [ -z "$image" ]; then
+            echo "::error file=Dockerfile::no digest-pinned caddy image found — this job validates against whatever the Dockerfile ships, so it cannot run without one"
+            exit 1
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "validating against $image"
+
+      # **Both routings, because the entrypoint installs ONE of them at runtime.**
+      # `container-entrypoint.sh` picks deploy/caddy-oauth-{rust,sidecar}.conf by
+      # FEATHERREADER_REPO_BACKEND and writes it to /etc/caddy/oauth-routes.conf,
+      # which Caddyfile imports. Validating only the live one would let the other
+      # rot until a rollback tried to boot it — and a rollback is exactly when
+      # nobody wants to discover a parse error.
+      #
+      # **What this catches, measured rather than assumed.** Imported files ARE
+      # covered: a bogus directive added to caddy-oauth-rust.conf fails with
+      # `oauth-routes.conf:30: unrecognized directive`, naming the imported file
+      # and line. What it does NOT catch is anything syntactically legal — a bare
+      # `reverse_proxy` with no upstream validates clean, and an unterminated
+      # block near the end of an imported file can be absorbed by the enclosing
+      # site block's brace. So this is a parse gate, not a behaviour gate: it
+      # stops the crash-loop, it does not prove the routing is right.
+      - name: caddy validate — both OAuth routings
+        run: |
+          set -euo pipefail
+          for variant in rust sidecar; do
+            conf="deploy/caddy-oauth-${variant}.conf"
+            [ -f "$conf" ] || { echo "::error::missing $conf"; exit 1; }
+            echo "::group::${variant}"
+            docker run --rm \
+              -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+              -v "$PWD/${conf}:/etc/caddy/oauth-routes.conf:ro" \
+              --entrypoint caddy \
+              "${{ steps.caddy.outputs.image }}" \
+              validate --adapter caddyfile --config /etc/caddy/Caddyfile
+            echo "::endgroup::"
+          done
