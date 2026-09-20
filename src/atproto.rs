@@ -157,18 +157,8 @@ pub(crate) fn is_valid_rkey(rkey: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '~' | '-'))
 }
 
-/// Append a page, refusing to exceed `max`.
-///
-/// **An error, never a truncation.** The caller of the live walk is
-/// `web::resolve_subscriptions`, whose result reaches `store::replace_sub_refs`
-/// — a `DELETE` followed by reinserting exactly what it was handed. A short
-/// list there is not a short list, it is revoked access to whatever fell off
-/// the end. Returning `Err` lets `resolve_subscriptions` take its documented
-/// fail-closed branch and serve the last-known projection instead.
-///
-/// `out` is left untouched on refusal, so a partial page cannot survive.
 /// Accumulate a page for a **reading** walk, keeping what fits and reporting
-/// whether the cap is reached.
+/// whether anything was dropped.
 ///
 /// **A truncation, never an error** — the opposite of [`extend_bounded`], and
 /// deliberately so. That function's refusal exists because its caller feeds
@@ -183,11 +173,24 @@ pub(crate) fn extend_truncating(
     max: usize,
 ) -> bool {
     let room = max.saturating_sub(out.len());
-    let full = page.len() >= room;
+    // **Strictly greater.** `>=` called an exactly-full final page a
+    // truncation, so a collection holding exactly `max` records warned that it
+    // had dropped something on every poll.
+    let dropped = page.len() > room;
     out.extend(page.into_iter().take(room));
-    full
+    dropped
 }
 
+/// Append a page, refusing to exceed `max`.
+///
+/// **An error, never a truncation.** The caller of the live walk is
+/// `web::resolve_subscriptions`, whose result reaches `store::replace_sub_refs`
+/// — a `DELETE` followed by reinserting exactly what it was handed. A short
+/// list there is not a short list, it is revoked access to whatever fell off
+/// the end. Returning `Err` lets `resolve_subscriptions` take its documented
+/// fail-closed branch and serve the last-known projection instead.
+///
+/// `out` is left untouched on refusal, so a partial page cannot survive.
 pub(crate) fn extend_bounded(
     out: &mut Vec<RecordEntry>,
     page: Vec<RecordEntry>,
@@ -817,38 +820,58 @@ impl PdsClient {
         Ok(out)
     }
 
-    /// The **most recent** `max_records` of a collection, truncating rather
-    /// than refusing — for an additive read of somebody else's archive, where
-    /// the fail-closed refusal in [`extend_bounded`] would turn "a big blog"
-    /// into "a permanently broken feed". See [`extend_truncating`] and
-    /// [`MAX_LARGE_RECORDS`].
+    /// The most recent records of a collection that the caller **keeps**,
+    /// truncating rather than refusing.
     ///
-    /// `listRecords` returns newest-first by default, so the truncation drops
-    /// the oldest — the same shape as an RSS feed carrying recent items only.
-    pub async fn list_recent_records(
+    /// **The cap counts kept records, not walked ones.** Applying it to the
+    /// raw collection starves a caller whose filter is selective: a quiet
+    /// standard.site publication in a repo whose busy sibling fills the
+    /// window returns nothing at all, permanently, and worse with every post
+    /// the sibling makes. `MAX_LIST_PAGES` still bounds the request count, so
+    /// a filter that matches nothing costs a fixed number of round trips.
+    ///
+    /// Truncating, not refusing, because this is an additive read: see
+    /// [`extend_truncating`] for why the [`extend_bounded`] refusal would be
+    /// strictly worse here.
+    ///
+    /// `page_size` is the caller's, because the right page depends on how big
+    /// the records are: [`crate::net::read_capped`] bounds a response at 8 MB,
+    /// so 100 long-form articles per page can exceed it and fail the whole
+    /// walk.
+    ///
+    /// **Ordering is the PDS's**: `listRecords` is descending by *rkey*, which
+    /// is newest-first only when rkeys are TIDs. For a publisher using slug
+    /// rkeys the truncation keeps a lexicographic subset rather than a recent
+    /// one — acceptable because the cap is now per-publication rather than
+    /// per-repo, so reaching it at all means an archive larger than this
+    /// reader stores.
+    pub async fn list_recent_matching(
         &self,
         collection: &str,
         max_records: usize,
+        page_size: u32,
+        mut keep: impl FnMut(&RecordEntry) -> bool,
     ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
-                .list_records(collection, Some(100), cursor.as_deref())
+                .list_records(collection, Some(page_size), cursor.as_deref())
                 .await?;
             let got = page.records.len();
-            if extend_truncating(&mut out, page.records, max_records) {
+            let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
+            if extend_truncating(&mut out, kept, max_records) {
                 tracing::warn!(
                     collection,
                     kept = out.len(),
-                    "record walk hit its cap; reading the most recent records only"
+                    "record walk hit its cap; reading part of the archive only"
                 );
                 break;
             }
+            if out.len() >= max_records {
+                break;
+            }
             match page.cursor {
-                // Guard against a PDS that echoes a cursor with an empty page,
-                // or that hands back the SAME cursor forever (an infinite walk
-                // that would otherwise re-count the same page every pass).
                 Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
             }
@@ -2133,6 +2156,84 @@ mod tests {
         assert!(refused.is_empty(), "a refusal must leave nothing behind");
     }
 
+    /// **The cap counts the records the caller KEEPS, not the ones the repo
+    /// holds.** A repo-wide cap applied before the caller's filter starves a
+    /// quiet publication whose busy sibling fills the window: poll it, walk
+    /// the newest 2 000 documents, discard all of them as the sibling's,
+    /// return nothing — permanently, and worse with every post the sibling
+    /// makes. The walk pages on until it has `max` MATCHING records (still
+    /// bounded by `MAX_LIST_PAGES` requests).
+    #[tokio::test]
+    async fn the_cap_counts_matching_records_not_walked_ones() {
+        // Every page: 4 records, only the last of which the caller wants.
+        let records: Vec<Value> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "uri": format!("at://did:plc:x/c/{i}"),
+                    "value": {"mine": i == 3}
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "records": records, "cursor": serde_json::Value::Null })
+            .to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "matching-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://matching-pds.test:{port}"),
+            "did:plc:x",
+        );
+
+        let kept = client
+            .list_recent_matching("site.standard.document", 3, 100, |r| {
+                r.value
+                    .get("mine")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .await
+            .expect("walk failed");
+        // One page, no cursor: one match survives. The point is that the three
+        // non-matching records did NOT consume the cap.
+        assert_eq!(kept.len(), 1, "the filter ran after the cap, not before it");
+    }
+
+    /// An exactly-full final page dropped nothing, so it must not warn that it
+    /// did: `>=` reported truncation whenever the last page landed flush.
+    #[test]
+    fn an_exactly_full_page_is_not_a_truncation() {
+        let page = |n: usize| -> Vec<RecordEntry> {
+            (0..n)
+                .map(|i| RecordEntry {
+                    uri: format!("at://did:plc:x/c/{i}"),
+                    cid: None,
+                    value: Value::Null,
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        assert!(
+            !extend_truncating(&mut out, page(3), 3),
+            "a page that exactly fills the cap dropped nothing"
+        );
+        assert_eq!(out.len(), 3);
+        assert!(
+            extend_truncating(&mut out, page(1), 3),
+            "one more IS a drop"
+        );
+        assert_eq!(out.len(), 3);
+    }
+
     /// **The reading walk USES the truncating accumulator.** The helper being
     /// correct is not the point — the previous round's bug was a guard that
     /// existed and was not called. Driven through a real server: one page of
@@ -2162,7 +2263,7 @@ mod tests {
         );
 
         let kept = client
-            .list_recent_records("site.standard.document", 3)
+            .list_recent_matching("site.standard.document", 3, 100, |_| true)
             .await
             .expect("a big archive must be readable, not an error");
         assert_eq!(kept.len(), 3, "the walk did not truncate to its cap");

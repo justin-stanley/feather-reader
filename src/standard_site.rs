@@ -29,6 +29,15 @@ use serde::Deserialize;
 
 use crate::lexicon::nsid;
 
+/// Documents per `listRecords` page.
+///
+/// Smaller than the protocol default of 100 because a `site.standard.document`
+/// carries the whole article — ~17 KB measured, and the `content` union this
+/// module ignores is still in the wire bytes — while
+/// [`crate::net::read_capped`] bounds a response at 8 MB. 100 long-form
+/// articles per page can exceed that and fail the walk outright.
+const DOCUMENT_PAGE_SIZE: u32 = 25;
+
 /// A parsed `at://` URI: `at://<authority>/<collection>/<rkey>`.
 ///
 /// Parsed by hand rather than with `url::Url`, which **cannot read the form that
@@ -207,8 +216,11 @@ pub fn entries_from_records(
                     .as_deref()
                     .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                     .map(|d| crate::feed::fmt_time(d.with_timezone(&chrono::Utc))),
-                url: doc
-                    .path
+                // `non_blank` for the same reason the summary uses it: a blank
+                // path joins to the publication's own base, so a handful of
+                // documents with an empty `path` became a handful of entries
+                // all linking to the site root.
+                url: non_blank(doc.path)
                     .as_deref()
                     .and_then(|path| join_path(base.as_ref(), path)),
                 // `description` first — the authored summary — but only when it
@@ -256,27 +268,36 @@ fn join_path(base: Option<&url::Url>, path: &str) -> Option<String> {
     }
 }
 
-/// How many documents reference no publication in this repo.
+/// What the document walk should do with one record.
 ///
-/// **The signal is an orphan, not an empty feed.** A publication with no
-/// documents is normal, and so is polling an empty publication in a repo where
-/// a SIBLING has hundreds — that is the shape the `site` filter exists for, and
-/// warning on it would be noise on every poll forever. A document whose `site`
-/// matches nothing in the repo is the other thing: a spelling nothing can ever
-/// match, which otherwise looks exactly like a quiet blog.
-fn orphaned_document_count(
-    publications: &[crate::atproto::RecordEntry],
-    documents: &[crate::atproto::RecordEntry],
-) -> usize {
-    let known: std::collections::HashSet<&str> =
-        publications.iter().map(|p| p.uri.as_str()).collect();
-    documents
-        .iter()
-        .filter(|d| {
-            serde_json::from_value::<DocumentValue>(d.value.clone())
-                .is_ok_and(|doc| !known.contains(doc.site.as_str()))
-        })
-        .count()
+/// A pure decision so it can be tested without a PDS: the walk itself is a
+/// closure over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentFate {
+    /// Belongs to the publication being read.
+    Keep,
+    /// Belongs to another publication **in this repo** — normal, and the
+    /// reason the `site` filter exists. Not a signal of anything.
+    Sibling,
+    /// References a publication this repo does not have: a `site` spelling
+    /// nothing can ever match. Indistinguishable from a quiet blog without
+    /// saying so, which is why it is counted.
+    Orphan,
+    /// Not a document this reader understands.
+    Malformed,
+}
+
+fn classify_document(
+    record: &crate::atproto::RecordEntry,
+    canonical_site: &str,
+    known: &std::collections::HashSet<&str>,
+) -> DocumentFate {
+    match serde_json::from_value::<DocumentValue>(record.value.clone()) {
+        Ok(doc) if doc.site == canonical_site => DocumentFate::Keep,
+        Ok(doc) if known.contains(doc.site.as_str()) => DocumentFate::Sibling,
+        Ok(_) => DocumentFate::Orphan,
+        Err(_) => DocumentFate::Malformed,
+    }
 }
 
 /// Read a publication and its documents through the hardened anonymous client.
@@ -328,10 +349,35 @@ pub async fn fetch(
     let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
         .with_context(|| format!("{uri} is not a readable site.standard.publication"))?;
 
-    // Documents carry the whole article (~17 KB measured), so this walk is
-    // bounded by a cap sized to the record rather than the protocol default.
+    // **Filtered inside the walk, so the cap counts THIS publication's
+    // documents.** A repo-wide cap applied before the filter starves a quiet
+    // publication whose busy sibling fills the window — it returns nothing,
+    // permanently, and worse with every post the sibling makes.
+    //
+    // The page is smaller than the protocol default because a document
+    // carries the whole article (~17 KB measured, and the `content` union this
+    // module ignores is still on the wire): 100 long-form articles per page
+    // can exceed `read_capped`'s 8 MB and fail the walk outright.
+    let known: std::collections::HashSet<&str> =
+        publications.iter().map(|p| p.uri.as_str()).collect();
+    let mut orphaned = 0usize;
     let documents = client
-        .list_recent_records(nsid::STANDARD_DOCUMENT, crate::atproto::MAX_LARGE_RECORDS)
+        .list_recent_matching(
+            nsid::STANDARD_DOCUMENT,
+            crate::atproto::MAX_LARGE_RECORDS,
+            DOCUMENT_PAGE_SIZE,
+            // Orphans are counted while WALKING, not over the kept window: a
+            // truncated slice would both miss orphans and stay silent in
+            // exactly the case where the feed went empty structurally.
+            |record| match classify_document(record, &canonical_site, &known) {
+                DocumentFate::Keep => true,
+                DocumentFate::Orphan => {
+                    orphaned += 1;
+                    false
+                }
+                DocumentFate::Sibling | DocumentFate::Malformed => false,
+            },
+        )
         .await
         .with_context(|| format!("listing documents for {canonical_site}"))?;
     let entries = entries_from_records(&canonical_site, &publication, &documents);
@@ -340,7 +386,6 @@ pub async fn fetch(
     // would call this healthy forever; if the repo HAD documents and none
     // matched, say so, because that is the shape of a bug rather than of a
     // quiet blog.
-    let orphaned = orphaned_document_count(&publications, &documents);
     if orphaned > 0 {
         tracing::warn!(
             site = %canonical_site,
@@ -728,6 +773,28 @@ mod tests {
         assert_eq!(urls[1].as_deref(), Some("https://example.com/ok"));
     }
 
+    /// **A blank `path` is no URL, not the homepage** — the same answer the
+    /// off-origin branch now gives, and for the same reason: several
+    /// documents with an empty `path` otherwise became several entries all
+    /// linking to the site root.
+    #[test]
+    fn a_blank_path_yields_no_url() {
+        let records = vec![publication("p", "https://example.com/blog")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![
+            document("a", &site, "Blank", ""),
+            document("b", &site, "Spaces", "   "),
+            document("c", &site, "Real", "/real"),
+        ];
+        let urls: Vec<Option<String>> = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .map(|e| e.url)
+            .collect();
+        assert_eq!(urls[0], None, "a blank path became the homepage");
+        assert_eq!(urls[1], None, "a whitespace path became the homepage");
+        assert_eq!(urls[2].as_deref(), Some("https://example.com/real"));
+    }
+
     /// A document without `path` keeps its title, date and summary — the
     /// policy `publishedAt` and `Entry.url` already follow.
     #[test]
@@ -749,33 +816,47 @@ mod tests {
         assert_eq!(entries[0].url, None);
     }
 
-    /// **The "nothing matched" warning must not fire for a sibling.** A repo
-    /// with an empty publication A and a busy publication B is the exact shape
-    /// this module's `site` filter exists for; warning on every poll of A
-    /// would be noise forever. The signal is a document that references NO
-    /// publication in the repo — a `site` spelling nothing can match.
+    /// **A sibling is not an orphan.** A repo with an empty publication A and
+    /// a busy publication B is the exact shape the `site` filter exists for;
+    /// treating B's documents as a signal would warn on every poll of A
+    /// forever. The signal is a document referencing a publication this repo
+    /// does not have — a spelling nothing can ever match.
     #[test]
-    fn orphaned_documents_are_counted_but_siblings_are_not() {
-        let pubs = vec![
+    fn documents_are_classified_keep_sibling_or_orphan() {
+        let pubs = [
             publication("a", "https://example.com"),
             publication("b", "https://b.example"),
         ];
-        let docs = vec![
-            document("d1", &canonical("b"), "B's", "/1"),
-            document("d2", &canonical("b"), "B's too", "/2"),
-        ];
+        let known: std::collections::HashSet<&str> = pubs.iter().map(|p| p.uri.as_str()).collect();
+        let mine = canonical("a");
+        let fate = |d: &crate::atproto::RecordEntry| classify_document(d, &mine, &known);
+
         assert_eq!(
-            orphaned_document_count(&pubs, &docs),
-            0,
-            "a sibling publication's documents are not orphans"
+            fate(&document("d1", &mine, "Mine", "/1")),
+            DocumentFate::Keep
         );
-        let orphan = vec![document(
-            "d3",
-            "at://did:plc:other/site.standard.publication/x",
-            "?",
-            "/3",
-        )];
-        assert_eq!(orphaned_document_count(&pubs, &orphan), 1);
+        assert_eq!(
+            fate(&document("d2", &canonical("b"), "B's", "/2")),
+            DocumentFate::Sibling,
+            "a sibling publication's document is not an orphan"
+        );
+        assert_eq!(
+            fate(&document(
+                "d3",
+                "at://did:plc:other/site.standard.publication/x",
+                "?",
+                "/3"
+            )),
+            DocumentFate::Orphan
+        );
+        assert_eq!(
+            fate(&rec(
+                nsid::STANDARD_DOCUMENT,
+                "d4",
+                json!({"title": "no rest"})
+            )),
+            DocumentFate::Malformed
+        );
     }
 
     /// `AtUri` uses the crate's one spelling of the prefix.

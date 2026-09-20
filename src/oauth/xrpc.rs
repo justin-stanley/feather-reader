@@ -136,6 +136,16 @@ impl Repo<'_> {
         // `resolve_subscriptions` reads as "this DID follows nothing" and
         // `sync_sub_refs` then writes through, revoking every `sub_ref`.
         crate::atproto::reject_error_envelope(&value)?;
+        // **An empty body is not an empty repo.** `send` maps a zero-length
+        // 2xx to `Value::Null` — deliberately, for `deleteRecord` and
+        // `applyWrites` — so on this path it walked straight past the envelope
+        // guard into `unwrap_or(Array([]))`, which is the same `sub_ref` wipe
+        // through the sibling door. A listRecords response HAS a `records`
+        // field; anything without one is not an answer to this question.
+        anyhow::ensure!(
+            value.get("records").is_some(),
+            "listRecords returned no records field (empty or non-JSON body)"
+        );
         let records: Vec<RecordEntry> = serde_json::from_value(
             value
                 .get("records")
@@ -696,6 +706,43 @@ mod tests {
             .expect_err("an error envelope was read as an empty page");
         assert!(
             format!("{err:#}").contains("InvalidRequest"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **An empty 2xx body is not an empty repo either.** `send` maps a
+    /// zero-length 2xx to `Value::Null` — deliberately, for `deleteRecord` and
+    /// `applyWrites` — so on `listRecords` it slipped past the envelope guard
+    /// and `records.unwrap_or(Array([]))` produced `Ok(vec![])`: the same
+    /// `sub_ref` wipe the guard was added to prevent, through the sibling door.
+    #[tokio::test]
+    async fn an_empty_200_body_is_not_an_empty_repo() {
+        let base = crate::net::tests::serve_body(Vec::new()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "empty-body.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://empty-body.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_records("app.feather.subscription", None, None)
+            .await
+            .expect_err("an empty body was read as an empty repo");
+        assert!(
+            format!("{err:#}").contains("no records"),
             "failed for the wrong reason: {err:#}"
         );
     }
