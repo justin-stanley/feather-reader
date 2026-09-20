@@ -218,6 +218,29 @@ Nearly all are one signed-out account's read-state being retried every 60 s unti
 identically under either backend, not a difference between them. Every other
 operation in the table has recorded zero errors on both.
 
+### standard.site publications
+
+`FEATHERREADER_STANDARD_SITE` (default `false`) allows subscribing to a
+[standard.site](https://standard.site) publication by its `at://` URI, as well
+as an RSS feed:
+
+```sh
+FEATHERREADER_STANDARD_SITE=true
+```
+
+A publication is not a feed document — it is a record in the author's atproto
+repo, and its articles are separate records in the same repo, so this reads two
+collections rather than fetching one URL. Only `textContent` / `description` are
+rendered, never the `content` union: that is per-platform rather than
+standardised, and implementing it would mean a renderer per publisher.
+
+**One flag gates both subscribing and polling**, and that is not an accident.
+Permitting the subscription without the poller would not leave the feature
+dormant: the row stores with a NULL `next_poll`, which the scheduler sorts
+first, so it is polled immediately, fails, and is reported as an unreachable
+publisher — a broken feature of this reader, displayed as somebody else's
+website being down.
+
 ### Switching
 
 ```sh
