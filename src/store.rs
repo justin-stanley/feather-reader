@@ -532,11 +532,6 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// `PRAGMA user_version` after the one-shot step that cleared the failure
-/// history on unpollable `at://` rows. A database below it has not had the
-/// step; one at or above it must never have it again.
-const AT_URI_ERRORS_CLEARED_VERSION: i32 = 1;
-
 /// Apply additive, idempotent migrations to bring an EXISTING database up to the
 /// current [`SCHEMA`]. `CREATE TABLE IF NOT EXISTS` never alters a table that
 /// already exists, so a column added to a shipped table must be back-filled here
@@ -582,33 +577,23 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // recorded reason goes with the count: a row with no errors must carry no
     // reason, which is what `reset_feed_errors` promises and a test asserts.
     //
-    // **Once, not every boot.** This function runs at every start, and the
-    // clearing was "idempotent" only because nothing polls an `at://` row
-    // today. The moment the standard.site reader is wired to the scheduler, a
-    // re-running UPDATE zeroes a real publisher's failure history at every
-    // restart — and nobody editing the scheduler would find that here. So the
-    // step is stamped into `PRAGMA user_version`: applied when the database is
-    // behind, recorded, never again. The first versioned step this schema has;
-    // later one-shot steps bump the constant and compare against their own.
-    let version: i32 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
-        .await
-        .context("reading the schema version")?;
-    if version < AT_URI_ERRORS_CLEARED_VERSION {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
-             WHERE {UNPOLLABLE_URL_SQL} AND consecutive_errors > 0"
-        )))
-        .execute(pool)
-        .await
-        .context("clearing error counts on unpollable at:// feeds")?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "PRAGMA user_version = {AT_URI_ERRORS_CLEARED_VERSION}"
-        )))
-        .execute(pool)
-        .await
-        .context("stamping the schema version")?;
-    }
+    // **Idempotent by predicate.** `last_polled` is set only by a successful
+    // poll — `bump_feed_errors` never touches it — so `last_polled IS NULL`
+    // selects exactly the rows whose every error came from our own refusal.
+    // A row a wired standard.site reader has fetched once keeps its later
+    // failures across restarts; a row that only ever failed under the refusal
+    // is cleared at every boot, including after a rollback to a build that
+    // polled it. A version stamp was the first design and left that rollback
+    // case a permanent hole (re-accumulated errors hidden by the filters,
+    // never cleared). Trade-off accepted: a publication that has never once
+    // succeeded restarts its backoff at the floor on every boot.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
+         WHERE {UNPOLLABLE_URL_SQL} AND last_polled IS NULL AND consecutive_errors > 0"
+    )))
+    .execute(pool)
+    .await
+    .context("clearing error counts on unpollable at:// feeds")?;
     // read_cursor.pds_created — tracks whether a feed's readState record has been
     // created in the PDS, so the first flush emits a `create` (not a bare
     // `update`, which errors on a not-yet-existing record). Older DBs predate it.
@@ -756,7 +741,7 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 ///
 /// **One predicate, four readers** — the scheduler's `due_feeds`, the public
 /// `/stats` aggregates in `poll_health`, the admin's `failing_feeds`, and the
-/// one-shot migration that clears the errors our own refusal produced — so
+/// boot-time clearing of the errors our own refusal produced — so
 /// they cannot drift: a row the scheduler skips must not be a row a health
 /// page counts as overdue or failing. When the reader is wired, every site
 /// that uses this constant is the list of what must change.
@@ -6124,8 +6109,9 @@ mod tests {
     /// unsupported feeds as broken publishers forever, with no poll that could
     /// ever clear them since they are no longer selected.
     ///
-    /// Safe to re-run: `at://` rows are never polled, so the count cannot grow
-    /// back.
+    /// Safe to re-run because of WHAT it clears, not because the count cannot
+    /// grow: only rows never polled successfully (`last_polled IS NULL`) — see
+    /// `the_at_uri_error_clearing_spares_a_row_that_has_been_polled`.
     #[tokio::test]
     async fn the_migration_clears_error_counts_on_unpollable_at_uri_rows() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
@@ -6149,11 +6135,6 @@ mod tests {
             .execute(&pool)
             .await?;
         }
-        // `init_url` already ran the migrations and stamped the version; this
-        // is a database from BEFORE the step, so put it back there.
-        sqlx::query("PRAGMA user_version = 0")
-            .execute(&pool)
-            .await?;
 
         apply_migrations(&pool).await?;
 
@@ -8979,66 +8960,55 @@ mod tests {
         Ok(())
     }
 
-    /// **The error-clearing step runs once, not on every boot.**
-    ///
-    /// `apply_migrations` runs at every start. The clearing is safe today
-    /// only because nothing polls an `at://` row; the moment the standard.site
-    /// reader is wired to the scheduler, a re-running UPDATE would zero a real
-    /// publisher's failure history at every restart — and nobody editing the
-    /// scheduler would find that in `store.rs`. So it is versioned: applied
-    /// when the database is behind, recorded, never again.
+    /// **The clearing is idempotent by predicate, not by stamp.** It touches
+    /// only rows that have never been polled successfully: `bump_feed_errors`
+    /// never sets `last_polled`, both success paths do. So a row a wired
+    /// reader has fetched once keeps its later failures across restarts, and
+    /// a row that only ever failed under our own refusal is cleared at every
+    /// boot — including after a rollback to a build that polled it. No
+    /// version stamp, nothing for a test to rewind.
     #[tokio::test]
-    async fn the_at_uri_error_clearing_runs_once() -> anyhow::Result<()> {
+    async fn the_at_uri_error_clearing_spares_a_row_that_has_been_polled() -> anyhow::Result<()> {
         let pool = init_url("sqlite::memory:").await?;
-        let url = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
-        upsert_feed(
-            &pool,
-            &NewFeed {
-                url: url.to_string(),
-                ..Default::default()
-            },
-        )
-        .await?;
-        // The first pass clears the history our own refusal produced. `init_url`
-        // already stamped the version, so rewind to a database from before.
-        bump_feed_errors(
-            &pool,
-            url,
-            crate::feed::FailureKind::Fetch,
-            "refused scheme",
-        )
-        .await?;
-        sqlx::query("PRAGMA user_version = 0")
+        let polled = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/polled";
+        let never = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/never";
+        for url in [polled, never] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "down").await?;
+        }
+        // A wired reader fetched this one once, then it started failing.
+        sqlx::query("UPDATE feeds SET last_polled = '2026-01-01T00:00:00Z' WHERE url = ?1")
+            .bind(polled)
             .execute(&pool)
             .await?;
-        apply_migrations(&pool).await?;
-        let n: i64 = sqlx::query_scalar("SELECT consecutive_errors FROM feeds WHERE url = ?1")
-            .bind(url)
-            .fetch_one(&pool)
-            .await?;
-        assert_eq!(n, 0, "the first pass did not clear");
 
-        // A LATER failure — a wired reader finding the publisher down — must
-        // survive the next boot.
-        bump_feed_errors(
-            &pool,
-            url,
-            crate::feed::FailureKind::Fetch,
-            "publisher down",
-        )
-        .await?;
-        apply_migrations(&pool).await?;
-        let (n, kind): (i64, Option<String>) =
-            sqlx::query_as("SELECT consecutive_errors, last_error_kind FROM feeds WHERE url = ?1")
-                .bind(url)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(n, 1, "a restart wiped a real failure");
-        assert_eq!(
-            kind.as_deref(),
-            Some("fetch"),
-            "a restart wiped a real reason"
-        );
+        for boot in 1..=2 {
+            apply_migrations(&pool).await?;
+            let mut errors = std::collections::HashMap::new();
+            for url in [polled, never] {
+                let n: i64 =
+                    sqlx::query_scalar("SELECT consecutive_errors FROM feeds WHERE url = ?1")
+                        .bind(url)
+                        .fetch_one(&pool)
+                        .await?;
+                errors.insert(url, n);
+            }
+            assert_eq!(
+                errors[polled], 1,
+                "boot {boot} wiped a polled row's failure"
+            );
+            assert_eq!(
+                errors[never], 0,
+                "boot {boot} left a never-polled row failing"
+            );
+        }
         Ok(())
     }
 

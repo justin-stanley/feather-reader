@@ -230,10 +230,16 @@ FEATHERREADER_STANDARD_SITE=true
 ```
 
 A publication is not a feed document — it is a record in the author's atproto
-repo, and its articles are separate records in the same repo, so this reads two
-collections rather than fetching one URL. Only `textContent` / `description` are
-rendered, never the `content` union: that is per-platform rather than
-standardised, and implementing it would mean a renderer per publisher.
+repo, and its articles are separate records in the same repo. The reader, when
+it lands, will read two collections rather than fetch one URL, and the plan is
+to render only `textContent` / `description`, never the `content` union: that
+is per-platform rather than standardised, and would mean a renderer per
+publisher. None of that exists in this tree yet.
+
+Only the **DID form** of a publication URI is stored
+(`at://did:plc:…/site.standard.publication/…`). A handle is a mutable name for
+a DID, and the feed table is keyed on identity; resolving a handle belongs to
+the input path and lands with the reader.
 
 **Polling a publication is not implemented yet**, and the flag does not pretend
 otherwise. The scheduler excludes `at://` outright, so such a subscription is
