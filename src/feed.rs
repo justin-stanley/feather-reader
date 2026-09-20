@@ -269,12 +269,54 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
 /// Note that `javascript:alert(1)` and `file:///etc/passwd` both *parse* cleanly
 /// as URLs, so parsing is not the check — the scheme is.
 pub fn is_storable_feed_url(url: &str) -> bool {
+    // **`at://` is checked BEFORE `Url::parse`, because `Url::parse` cannot read
+    // the form that matters.** `at://did:plc:…/…` fails to parse with *invalid
+    // port number* — the colons in the DID are taken as a port separator — while
+    // the handle form `at://alice.example.com/…` parses fine. So adding `"at"`
+    // to the `matches!` below would appear to work and silently reject every
+    // DID-based at-URI, which is all of them in practice.
+    if let Some(rest) = url.strip_prefix("at://") {
+        return is_storable_publication_uri(rest);
+    }
     match Url::parse(url) {
         Ok(u) => {
             matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
         }
         Err(_) => false,
     }
+}
+
+/// The body of an `at://` URI — `<did-or-handle>/<collection>/<rkey>` — judged
+/// as a **storable feed**.
+///
+/// An allowlist entry, not a loosening: exactly one foreign collection is
+/// accepted, `site.standard.publication`. The two paths this guard exists for
+/// (`resolve_subscriptions`, the OPML import) take records written by any
+/// atproto client, so "it is an at-URI" is not a reason to store it — only "it
+/// is a publication this reader knows how to poll" is.
+fn is_storable_publication_uri(rest: &str) -> bool {
+    let mut parts = rest.split('/');
+    let (Some(authority), Some(collection), Some(rkey)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    parts.next().is_none()
+        && collection == crate::lexicon::nsid::STANDARD_PUBLICATION
+        && !rkey.is_empty()
+        && is_storable_at_authority(authority)
+}
+
+/// A DID validated properly, or a handle with at least one non-empty label.
+///
+/// The DID arm reuses [`crate::oauth::identity::is_atproto_did`] rather than
+/// checking the `did:` prefix: `did:plc:` identifiers are 24 base32-sortable
+/// characters, so a prefix check would accept `did:plc:TOOSHORT`.
+fn is_storable_at_authority(authority: &str) -> bool {
+    if authority.starts_with("did:") {
+        return crate::oauth::identity::is_atproto_did(authority);
+    }
+    !authority.is_empty() && authority.contains('.') && !authority.split('.').any(str::is_empty)
 }
 
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
@@ -1578,5 +1620,80 @@ mod tests {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
         assert!(backoff_for(2) > backoff_for(1));
         assert_eq!(backoff_for(100), BACKOFF_MAX);
+    }
+
+    /// **The DID form is the one that matters, and the one `Url::parse` cannot
+    /// read.**
+    ///
+    /// `Url::parse("at://did:plc:…/…")` fails with *invalid port number* — the
+    /// colons in the DID are taken as a port separator. So the obvious
+    /// implementation, adding `"at"` to the `matches!` on `u.scheme()`, silently
+    /// rejects every DID-based at-URI while appearing to work: the handle form
+    /// (`at://alice.example.com/…`) parses fine and would pass such a test.
+    ///
+    /// All 19 at-URI rows in production are the DID form. A test written with a
+    /// handle would have passed against an implementation that cannot store a
+    /// single one of them.
+    #[test]
+    fn a_did_form_publication_uri_is_storable() {
+        assert!(is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
+        ));
+    }
+
+    #[test]
+    fn a_handle_form_publication_uri_is_storable() {
+        assert!(is_storable_feed_url(
+            "at://alice.example.com/site.standard.publication/3lab"
+        ));
+    }
+
+    /// **An allowlist entry, not a loosening.** `at://` is accepted for exactly
+    /// one foreign collection. Any other collection is somebody else's lexicon
+    /// arriving through a path (`resolve_subscriptions`, OPML import) that takes
+    /// records from outside with no add-path to reject them.
+    #[test]
+    fn an_at_uri_for_another_collection_is_not_storable() {
+        assert!(!is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab"
+        ));
+        assert!(!is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab"
+        ));
+    }
+
+    /// The malformed shapes, each of which a naive `split('/')` would accept.
+    #[test]
+    fn a_malformed_at_uri_is_not_storable() {
+        for bad in [
+            "at://",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/",
+            "at:///site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab/extra",
+            "at://not-a-did-or-handle/site.standard.publication/3lab",
+            "at://did:plc:TOOSHORT/site.standard.publication/3lab",
+        ] {
+            assert!(!is_storable_feed_url(bad), "accepted {bad:?}");
+        }
+    }
+
+    /// **The reason the function exists, unchanged.** Mutating the new branch to
+    /// accept any scheme makes this fail while the at-URI tests keep passing —
+    /// that asymmetry is what says the change was an allowlist entry.
+    #[test]
+    fn the_refused_schemes_are_still_refused() {
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>",
+            "ftp://example.com/feed.xml",
+            "at:did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            assert!(!is_storable_feed_url(bad), "accepted {bad:?}");
+        }
+        assert!(is_storable_feed_url("https://example.com/feed.xml"));
+        assert!(is_storable_feed_url("http://example.com/feed.xml"));
     }
 }

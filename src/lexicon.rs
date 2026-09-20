@@ -37,6 +37,11 @@ pub mod nsid {
     pub const SAVED: &str = "community.lexicon.rss.saved";
     /// `community.lexicon.rss.readState` — batched per-feed read cursor.
     pub const READ_STATE: &str = "community.lexicon.rss.readState";
+
+    /// `site.standard.publication` — a standard.site publication. NOT one of
+    /// ours: it is another project's lexicon, named here because it is the only
+    /// foreign collection this reader will accept as a subscribable feed.
+    pub const STANDARD_PUBLICATION: &str = "site.standard.publication";
 }
 
 /// Optional polling-cadence hint on a [`Subscription`]. Readers MAY honor or
