@@ -1,8 +1,8 @@
 # Changelog
 
 Engineering detail for the 0.3.x line, newest first. Covers everything since
-0.3.0, including work that has landed on `main` but is not yet tagged — see
-**Unreleased**.
+0.3.0. Work that has landed on `main` but is not yet tagged appears under
+**Unreleased**, when there is any.
 
 Each entry says what changed, the mechanism, and — where a defect is involved —
 how it was established rather than assumed. Several entries record that a test
@@ -14,15 +14,14 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.3.7 — 2026-09-20
 
-Seven PRs on `main` since the `v0.3.6` tag. No features, no schema change, no
-`fly.toml` change. One config change — the Caddy log filter — which is baked into
-the image and so takes effect at the next build and deploy, not on the running
-machine.
+Eight PRs. No features, no schema change, no `fly.toml` change. One config
+change — the Caddy log filter — which is baked into the image and so takes
+effect on deploy, not on the running machine.
 
-Production still runs **0.3.4** as of the v0.3.6 deploy on 2026-09-20; none of
-this is live until a tag is cut and deployed.
+**The headline is #159:** the poller was recording "nothing new" as a failure,
+which is most of why 68 of 111 feeds read as failing on `/stats`.
 
 ### Security
 
@@ -109,6 +108,51 @@ the callback with sentinel values, with a negative control confirming the probe
 can fail.
 
 ### Fixes
+
+**A `304 Not Modified` was read as a malformed redirect, failing every unchanged
+feed** (#159). `guarded_get_inner` gated its redirect branch on
+`is_redirection()` — `300..=399`, which includes 304. A 304 carries no
+`Location` by definition, so it fell through to *"redirect response without a
+usable Location header"* and failed the whole fetch. `feed.rs` sends
+`If-None-Match`/`If-Modified-Since` on every poll and has a correct 304 branch
+that was therefore **unreachable**.
+
+The effect: "nothing new" became a recorded failure. `consecutive_errors`
+bumped, `touch_polled` never ran, the feed backed off exponentially — so the
+feeds punished hardest were the ones implementing conditional GET *properly*,
+and the quieter a feed was the more it was ignored.
+
+```
+before   9to5mac.com/feed/ -> HTTP 304 -> "redirect response without a usable
+                                           Location header" -> error, backoff
+after    9to5mac.com/feed/ -> HTTP 304 -> PollOutcome::NotModified, normal cadence
+```
+
+Found from production logs, against `9to5mac.com`, `proton.me` and `kodi.tv` —
+all live and serving. `/stats` reported 68 of 111 feeds failing while its own
+copy explained them away as "usually gone rather than flaky". **The metric had
+inverted:** a backing-off feed leaves the backlog smaller, so the dashboard
+improved as the bug spread, which is why it went unexamined for so long.
+
+Only 304 is carved out; every other `3xx` stays inside the branch, because
+`guarded_get_no_redirect` documents that it "refuses redirects outright" and the
+OAuth mix-up defence rests on that. Of the relocating statuses only
+`301|302|303|307|308` are followed — the rest are **refused rather than
+returned**, since `web::resolve_feed_url` reads the body straight into feed
+autodiscovery without checking the status, so a `305` error page carrying a
+`<link rel="alternate">` could otherwise have become a subscription. That also
+makes `305` stricter than before: it carries a `Location`, so it used to be
+*followed*, routing the request through a proxy the response chose.
+
+Confirmed red first and again after review restructured it: mutating the guard
+back to a bare `is_redirection()` fails the new 304 test and nothing else — 44
+passed, 1 failed — so this path had no coverage at all. The test asserts the hop
+count as well as the status, because returning the 304 while still looping would
+satisfy a status-only assertion and re-fetch every unchanged feed.
+
+**Not fixed here:** `feeds` stores `consecutive_errors` and no error text, which
+is why a systematic failure across sixty feeds was indistinguishable from sixty
+dead blogs.
 
 **A rename no longer destroys four fields of the subscription record** (#147,
 closes #141). `update_subscription` is a `putRecord`, and a putRecord replaces
