@@ -127,13 +127,24 @@ impl Repo<'_> {
                 "com.atproto.repo.listRecords",
             )
             .await?;
-        let records: Vec<RecordEntry> = serde_json::from_value(
+        // Shared with `atproto::PdsClient`: one unreadable envelope must not
+        // cost the page. These are records in the READER'S OWN repo, writable
+        // by any atproto client, so an all-or-nothing parse meant a single
+        // malformed record cost them their whole subscription list at login.
+        let (records, dropped) = crate::atproto::records_from_json(
             value
                 .get("records")
                 .cloned()
                 .unwrap_or(Value::Array(vec![])),
-        )
-        .context("listRecords returned records this client cannot parse")?;
+        );
+        if dropped > 0 {
+            tracing::warn!(
+                collection,
+                dropped,
+                kept = records.len(),
+                "listRecords returned envelopes this client cannot read; skipping them"
+            );
+        }
         let cursor = value
             .get("cursor")
             .and_then(Value::as_str)

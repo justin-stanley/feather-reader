@@ -518,6 +518,37 @@ impl RecordEntry {
     }
 }
 
+/// Split a `listRecords` `records` array into the envelopes this client can
+/// read and a count of those it could not.
+///
+/// **One unreadable envelope must not cost the whole page.** `RecordEntry.uri`
+/// is required, so parsing the array in a single `from_value` failed everything
+/// on one malformed record — and these are records in a user's repo, writable
+/// by any atproto client. `oauth::xrpc::Repo` shares this type on the live
+/// `backend=rust` path, where that meant losing a reader's entire subscription
+/// list at login.
+///
+/// **The count is returned rather than swallowed.** A silent skip would rebuild
+/// the failure #159 was: breakage that looks like absence. Callers log it.
+///
+/// `list_typed` already treats a record's *value* this way; this brings the
+/// envelope into line with it.
+pub(crate) fn records_from_json(value: Value) -> (Vec<RecordEntry>, usize) {
+    let Value::Array(items) = value else {
+        // Not an array at all: a malformed page, which is NOT an empty one.
+        return (Vec::new(), 1);
+    };
+    let mut kept = Vec::with_capacity(items.len());
+    let mut dropped = 0usize;
+    for item in items {
+        match serde_json::from_value::<RecordEntry>(item) {
+            Ok(entry) => kept.push(entry),
+            Err(_) => dropped += 1,
+        }
+    }
+    (kept, dropped)
+}
+
 /// The `com.atproto.repo.listRecords` response envelope.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListRecordsResponse {
@@ -700,7 +731,24 @@ impl PdsClient {
             return Err(xrpc_error_from(resp).await.into());
         }
         let body = crate::net::read_capped(resp).await?;
-        serde_json::from_slice(&body).context("parsing listRecords response")
+        let raw: Value = serde_json::from_slice(&body).context("parsing listRecords response")?;
+        let (records, dropped) =
+            records_from_json(raw.get("records").cloned().unwrap_or(Value::Array(vec![])));
+        if dropped > 0 {
+            tracing::warn!(
+                collection,
+                dropped,
+                kept = records.len(),
+                "listRecords returned envelopes this client cannot read; skipping them"
+            );
+        }
+        Ok(ListRecordsResponse {
+            records,
+            cursor: raw
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// Page through **all** records in a collection, following the cursor until
@@ -2562,5 +2610,56 @@ mod tests {
         // microsecond timestamp shifted into bits 63..10, plus the clock id).
         let max_tid = (0x001f_ffff_ffff_ffffu64 << 10) | 0x3ff;
         assert!(encode_s32_tid(max_tid - 1) < encode_s32_tid(max_tid));
+    }
+    /// **One unreadable envelope must not cost the whole page.**
+    ///
+    /// `RecordEntry.uri` is required, and the array was parsed in a single
+    /// `from_value`, so a record whose envelope lacks `uri` — or carries a
+    /// non-string one — failed the entire page with `missing field \`uri\``.
+    ///
+    /// That is not a standard.site concern. `oauth::xrpc::Repo` shares this type
+    /// and is the live `backend=rust` path for a user's OWN repo, whose records
+    /// can be written by any atproto client. So one malformed record cost that
+    /// reader their entire subscription list at login.
+    ///
+    /// The asymmetry is what gives it away: `list_typed` already parses each
+    /// record's *value* individually and warns on failure, keeping the rest.
+    /// Only the envelope was all-or-nothing.
+    #[test]
+    fn a_page_with_one_unreadable_envelope_keeps_the_rest() {
+        let page = serde_json::json!([
+            { "cid": "bare", "value": { "a": 1 } },
+            { "uri": "at://did:plc:x/c/good", "value": { "a": 2 } },
+            { "uri": 42, "value": { "a": 3 } },
+        ]);
+        let (kept, dropped) = records_from_json(page);
+        assert_eq!(kept.len(), 1, "the readable record was lost");
+        assert_eq!(kept[0].uri, "at://did:plc:x/c/good");
+        assert_eq!(dropped, 2, "the drop count is what makes the loss visible");
+    }
+
+    /// A page of entirely good records drops nothing — otherwise the test above
+    /// is satisfied by a function that drops everything.
+    #[test]
+    fn a_clean_page_drops_nothing() {
+        let page = serde_json::json!([
+            { "uri": "at://did:plc:x/c/a", "value": {} },
+            { "uri": "at://did:plc:x/c/b", "value": {} },
+        ]);
+        let (kept, dropped) = records_from_json(page);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped, 0);
+    }
+
+    /// A non-array `records` is a malformed page, not an empty one — the
+    /// distinction #159 was about.
+    #[test]
+    fn a_non_array_records_field_yields_nothing_and_counts_as_loss() {
+        let (kept, dropped) = records_from_json(serde_json::json!({ "not": "an array" }));
+        assert!(kept.is_empty());
+        assert_eq!(
+            dropped, 1,
+            "a malformed page must not look like an empty one"
+        );
     }
 }
