@@ -731,7 +731,13 @@ impl PdsClient {
 
     /// `com.atproto.repo.createRecord` — create a new record (server assigns the
     /// rkey, `key: tid`). Returns the written record's strong ref.
-    pub async fn create_record<T: Serialize>(
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn create_record<T: Serialize>(
         &self,
         collection: &str,
         record: &T,
@@ -747,7 +753,13 @@ impl PdsClient {
     /// `com.atproto.repo.putRecord` — upsert a record at a **known** rkey
     /// (`key: any`). This is the `readState` upsert primitive: a feed-derived
     /// rkey makes the write idempotent (one record per feed).
-    pub async fn put_record<T: Serialize>(
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn put_record<T: Serialize>(
         &self,
         collection: &str,
         rkey: &str,
@@ -801,7 +813,13 @@ impl PdsClient {
     /// This is the read-state flusher's workhorse: dozens of dirty per-feed
     /// [`ReadState`] cursors coalesce into one call rather than one `putRecord`
     /// each. See [`flush_read_states`](Self::flush_read_states).
-    pub async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
         let url = self.xrpc_url("com.atproto.repo.applyWrites");
         let ops: Vec<Value> = writes.iter().map(WriteOp::to_json).collect();
         let body = json!({
@@ -1186,7 +1204,13 @@ impl SidecarClient {
     }
 
     /// `create` — create a record (server-assigned rkey). Returns its strong ref.
-    pub async fn create_record<T: Serialize>(
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn create_record<T: Serialize>(
         &self,
         did: &str,
         collection: &str,
@@ -1203,7 +1227,13 @@ impl SidecarClient {
     }
 
     /// `put` — upsert a record at a known rkey. Returns its strong ref.
-    pub async fn put_record<T: Serialize>(
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn put_record<T: Serialize>(
         &self,
         did: &str,
         collection: &str,
@@ -1234,7 +1264,13 @@ impl SidecarClient {
     }
 
     /// `applyWrites` — a batch of create/update/delete ops in one round-trip.
-    pub async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
+    /// **`pub(crate)`, not `pub`.** This is generic over `T: Serialize`, so it
+    /// will happily write a raw `lexicon::Subscription` — the general case of
+    /// the hole `create_subscriptions_batch` was one instance of. The vetted
+    /// wrappers above are the sanctioned entry points; narrowing the visibility
+    /// is what makes that a fact rather than a convention, and it is free
+    /// because nothing outside this module ever called it.
+    pub(crate) async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }

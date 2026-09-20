@@ -196,30 +196,39 @@ macro_rules! dispatch {
     // explicitly so the private method's `_unvetted` suffix does not leak into
     // the metric.
     //
-    // **`Repo` is the vetted path, and the layer below now demands vetted
-    // records too.** `AppState.sidecar` is a `pub` field and
-    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription`,
-    // so a handler *can* reach past `Repo` and call one directly. What it
-    // cannot do is write an unvetted record: those writers take
-    // `&vetted::VettedSubscription` (and `add_saved` a `&vetted::VettedSaved`),
-    // whose inner field is private to `src/vetted.rs` and reachable only
-    // through a constructor that vets.
+    // **`Repo` is the vetted path. The layer below is narrower than it was,
+    // and still not closed.**
     //
-    // **This comment previously said "there is nothing to hand them that
-    // skipped the check", and that was false when written.** #150 enumerated
-    // three routes and closed them; a fourth,
-    // `SidecarClient::create_subscriptions_batch`, took a raw
-    // `&[Subscription]` and serialised it straight into `applyWrites`. It had
-    // no callers and so drew no attention, but it type-checked, and a review
-    // found it by enumerating every writer rather than re-reading the three the
-    // commit message named. It is deleted.
+    // The named writers demand vetted records: `add_subscription`,
+    // `update_subscription`, `add_subscriptions_bulk` and `add_saved` on both
+    // backends take `&vetted::Vetted*`, whose inner field is private to
+    // `src/vetted.rs` and reachable only through a constructor that vets.
     //
-    // The guarantee therefore still rests on the SET of writers being closed,
-    // which is a property nothing checks. Ending the class outright means
-    // removing `Serialize` from `lexicon::Subscription` so a raw record cannot
-    // be serialised into a write at all — blocked today because
+    // **That sentence has now been wrong twice, so read what follows as the
+    // correction rather than the guarantee.** #150 closed three routes and its
+    // message implied the class; #154 said "there is nothing to hand them that
+    // skipped the check" and a review found a fourth,
+    // `SidecarClient::create_subscriptions_batch`, taking a raw
+    // `&[Subscription]`. Deleting it, this comment then said "the layer below
+    // now demands vetted records too" — and a second review found the *general*
+    // case the deleted function had been one instance of: `create_record`,
+    // `put_record` and `apply_writes` are generic over `T: Serialize`, and
+    // `lexicon::Subscription` derives `Serialize`, so any of them writes an
+    // unvetted record. Verified by compiling it.
+    //
+    // What changed: those three are now `pub(crate)` on `PdsClient` and
+    // `SidecarClient`, so nothing outside `atproto.rs` can reach them. The
+    // three on `oauth::xrpc::Repo` remain `pub` because
+    // `examples/oauth_spike.rs` is a separate crate target and drives them
+    // against a scratch collection. So a handler in THIS crate can still write
+    // an unvetted record through `state.oauth`'s repo — narrower than before,
+    // not absent.
+    //
+    // Ending the class means removing `Serialize` from `lexicon::Subscription`
+    // so a raw record cannot be serialised into a write at all. Blocked today:
     // `VettedSubscription` is `#[serde(transparent)]` over it, so that needs a
-    // hand-written impl and a wire-format test to match.
+    // hand-written impl plus a wire-format test, and a record-shape slip there
+    // would silently migrate every reader's repo.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
