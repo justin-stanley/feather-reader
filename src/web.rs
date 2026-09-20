@@ -3130,19 +3130,6 @@ async fn rename_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
-    // **Storability, on the same terms as the add and OPML paths.** This handler
-    // writes `feeds` via `upsert_feed` and had only the privacy check below —
-    // so `FEATHERREADER_STANDARD_SITE` was bypassable here, and an `at://` row
-    // could reach the shared table on an instance that never opted in. A
-    // review found it by enumerating every writer rather than the two call
-    // sites the flag was added to; there were three.
-    if !feed::is_storable_feed_url(&feed_url, state.config.standard_site) {
-        info!(url = %feed_url, %did, %rkey, "refused a non-storable feed URL at rename");
-        return Ok(
-            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
-        );
-    }
-
     // Block private/paid feeds on rename too. `url` is attacker-controllable, and
     // rename both upserts it to the local cache AND rewrites the PDS subscription
     // record (a public `putRecord`), so without this guard a crafted rename could
@@ -3232,6 +3219,25 @@ async fn rename_subscription(
     // the global-feeds-ceiling check above exists for.
     let url_changed = existing.url != feed_url;
 
+    // **Storability, on the same terms as the add and OPML paths — for a
+    // REPOINT.** This handler writes `feeds` via `upsert_feed` and had only the
+    // privacy check above, so `FEATHERREADER_STANDARD_SITE` was bypassable
+    // here; a review found it by enumerating every writer of the table. The
+    // first fix ran this check before the repo lookup, on the URL as posted —
+    // which refused a pure retitle of a subscription that already IS an
+    // at-URI, on every instance with the flag off. The flag gates what the
+    // cache may store, not whether a reader may edit their own record: an
+    // unchanged non-storable URL keeps its PDS write and simply gets no cache
+    // row below.
+    let storable = feed::is_storable_feed_url(&feed_url, state.config.standard_site);
+    if url_changed && !storable {
+        info!(url = %feed_url, %did, %rkey, "refused a repoint to a non-storable feed URL");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
+        );
+    }
+
     let mut sub = existing;
     sub.url = feed_url;
     sub.title = form
@@ -3262,8 +3268,13 @@ async fn rename_subscription(
         sub.fetch_hint = None;
     }
 
-    // Keep the local cache title in step for the loose-feed fallback path.
-    if let Err(err) = store::upsert_feed(
+    // Keep the local cache title in step for the loose-feed fallback path —
+    // unless the URL is one this instance does not store (an existing at-URI
+    // with the flag off): the record is the reader's to edit, the cache row is
+    // not this instance's to create.
+    if !storable {
+        info!(%did, %rkey, url = %sub.url, "renamed a subscription this instance does not cache");
+    } else if let Err(err) = store::upsert_feed(
         &state.db,
         &store::NewFeed {
             url: sub.url.clone(),
@@ -8667,6 +8678,131 @@ mod tests {
                 "createdAt": "2024-03-01T00:00:00.000Z"
             }
         })
+    }
+
+    /// An existing standard.site subscription, as the 19 in production are:
+    /// written before this reader refused the scheme, still in the repo.
+    fn seeded_at_uri_subscription() -> serde_json::Value {
+        serde_json::json!({
+            "uri": "at://did:plc:renamer5/community.lexicon.rss.subscription/rk-keep",
+            "cid": "bafyreibefore",
+            "value": {
+                "$type": "community.lexicon.rss.subscription",
+                "url": AT_URI_SUB,
+                "title": "Old title",
+                "private": false,
+                "createdAt": "2024-03-01T00:00:00.000Z"
+            }
+        })
+    }
+    const AT_URI_SUB: &str =
+        "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h";
+    const AT_URI_SUB_ENC: &str =
+        "at%3A%2F%2Fdid%3Aplc%3Aohutz6x5acjmpuulp3x7wxxc%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h";
+
+    /// **Retitling an existing `at://` subscription must work with the flag off.**
+    ///
+    /// The storability guard was placed before the repo lookup, so it refused
+    /// any rename whose URL is an at-URI — including a pure title or folder
+    /// change on a record that already exists. On main that rename succeeded;
+    /// the 19 production records would have become un-editable. The flag gates
+    /// what may be STORED in the cache, not whether a reader may edit their own
+    /// record: the PDS write goes through, the cache row is simply not created.
+    #[tokio::test]
+    async fn retitling_an_existing_at_uri_subscription_survives_the_flag_being_off() {
+        let did = "did:plc:renamer5";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        assert!(
+            !state.config.standard_site,
+            "the flag must be off for this test"
+        );
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}&title=New+title")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("put body is JSON");
+        assert_eq!(
+            sent["record"]["title"], "New title",
+            "the rename did not apply"
+        );
+        assert_eq!(
+            sent["record"]["url"], AT_URI_SUB,
+            "the rename changed the URL"
+        );
+
+        // The flag still means what it says for the CACHE: no at:// row.
+        let cached: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feeds WHERE substr(url, 1, 5) = 'at://'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(cached, 0, "a retitle stored an at:// row with the flag off");
+    }
+
+    /// **Repointing a subscription AT an `at://` URI is still refused with the
+    /// flag off** — the half of the guard that has to survive the fix above.
+    /// Nothing reaches the PDS and nothing reaches the cache.
+    #[tokio::test]
+    async fn repointing_a_subscription_at_an_at_uri_is_refused_with_the_flag_off() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}&title=Moved")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.contains("flash="), "the repoint was not refused: {loc}");
+        assert!(
+            !loc.contains("Private"),
+            "a storability refusal was reported as a privacy one: {loc}"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "the repoint reached the PDS"
+        );
+        let cached: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feeds WHERE substr(url, 1, 5) = 'at://'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(cached, 0);
     }
 
     /// **A rename must not destroy the fields the form never carries.**
