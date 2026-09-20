@@ -153,7 +153,8 @@ pub struct AppState {
     pub db: Pool,
     /// Shared HTTP client (feed fetch + sidecar internal API).
     pub http: reqwest::Client,
-    /// The atproto OAuth sidecar client — the live repo-op path.
+    /// The atproto OAuth sidecar client — the repo-op path when
+    /// [`Config::repo_backend`] selects `Sidecar`. Production selects `Rust`.
     pub sidecar: SidecarClient,
     /// DID ↔ handle session registry (cookie-resolved identity).
     pub sessions: SessionRegistry,

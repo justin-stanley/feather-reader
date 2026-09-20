@@ -196,14 +196,16 @@ macro_rules! dispatch {
     // explicitly so the private method's `_unvetted` suffix does not leak into
     // the metric.
     //
-    // **This makes `Repo` the vetted path, not the only possible path.** The
-    // layer below is still public — `AppState.sidecar` is a `pub` field and
-    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription`
-    // — so a handler *can* still write a record without vetting it by calling
-    // one of those directly. Nothing does today, and nothing should. Making it
-    // impossible rather than merely unsanctioned needs the `SafeLink` treatment
-    // from `src/safe_link.rs`: a vetted-record type the low-level writers demand
-    // and only one constructor can produce. Tracked in #140.
+    // **`Repo` is the vetted path, and since #150 there is no unvetted one.**
+    // The layer below is still public — `AppState.sidecar` is a `pub` field and
+    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription` —
+    // so a handler *can* still reach past `Repo` and call one directly. What it
+    // cannot do is write an unvetted record: those writers take
+    // `&vetted::VettedSubscription` (and `add_saved` a `&vetted::VettedSaved`),
+    // whose inner field is private to `src/vetted.rs` and reachable only through
+    // a constructor that vets. There is nothing to hand them that skipped the
+    // check. This is the `SafeLink` treatment from `src/safe_link.rs` applied to
+    // whole records — the convention became a compiler error.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
