@@ -514,23 +514,56 @@ mod tests {
         );
     }
 
-    /// Bulk import assigns its own rkeys, in input order, and returns them —
-    /// the sidecar client's contract, which `web.rs` logs the length of.
-    #[test]
-    fn bulk_subscription_rkeys_are_client_assigned_and_ordered() {
-        let mut gen = crate::atproto::TidGenerator::new();
-        let rkeys: Vec<String> = (0..5).map(|_| gen.next()).collect();
+    /// **Bulk import, through the real `Repo`, asserted on the bytes.** The
+    /// test this replaces exercised `TidGenerator` directly and never called
+    /// `add_subscriptions_bulk`; the function could stop assigning rkeys and
+    /// return garbage with the suite green.
+    #[tokio::test]
+    async fn bulk_subscribe_writes_client_assigned_ordered_rkeys_to_the_right_collection() {
+        let (base, log) = crate::net::tests::serve_json_capturing(b"{}".to_vec()).await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        crate::net::test_host_override(
+            "bulk-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://bulk-pds.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+        let subs: Vec<crate::vetted::VettedSubscription> = (0..3)
+            .map(|i| {
+                crate::vetted::VettedSubscription::new(&crate::lexicon::Subscription::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    "2026-07-12T00:00:00.000Z",
+                ))
+            })
+            .collect();
+
+        let rkeys = repo
+            .add_subscriptions_bulk(&subs)
+            .await
+            .expect("bulk write failed");
+
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected one applyWrites request, got {sent:?}"
+        );
+        let body: Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap())
+            .expect("request body is JSON");
+        let writes = body["writes"].as_array().expect("writes array");
+        assert_eq!(writes.len(), 3);
+        for (i, w) in writes.iter().enumerate() {
+            assert_eq!(w["collection"], crate::lexicon::nsid::SUBSCRIPTION);
+            assert_eq!(w["rkey"].as_str(), Some(rkeys[i].as_str()));
+        }
         let mut sorted = rkeys.clone();
         sorted.sort();
-        assert_eq!(
-            rkeys, sorted,
-            "client-assigned rkeys must ascend so an import keeps its input order"
-        );
-        assert_eq!(
-            rkeys.iter().collect::<std::collections::HashSet<_>>().len(),
-            5,
-            "a same-microsecond burst must still yield distinct rkeys"
-        );
+        assert_eq!(rkeys, sorted, "client-assigned rkeys must ascend");
     }
 
     fn session() -> OAuthSession {

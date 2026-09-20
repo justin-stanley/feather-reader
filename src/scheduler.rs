@@ -1323,15 +1323,20 @@ mod tests {
             .unwrap()
             .next_poll
             .expect("next_poll must be set after a poll");
-        let horizon =
-            (Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        // **A window around the first-failure backoff, not "less than an
+        // hour".** The old assertion admitted any value in the whole hour —
+        // and the `backoff: 300` this test passes is discarded by
+        // `settle_poll`, which computes from the error count, so the test's
+        // own input never reached the calculation it named. The value here
+        // is `feed::backoff_for(1)` = 5 min; the bin cannot see that private
+        // function, so the window is written out.
+        let after_dt = chrono::DateTime::parse_from_rfc3339(&after)
+            .expect("next_poll is RFC3339")
+            .with_timezone(&chrono::Utc);
+        let delay = (after_dt - chrono::Utc::now()).num_seconds();
         assert!(
-            after < horizon,
-            "the failure backoff did not overwrite the 24h lease: next_poll={after}"
-        );
-        assert!(
-            after > now_rfc3339(),
-            "next_poll must still be in the future"
+            (240..=360).contains(&delay),
+            "a first failure must land on its 5-minute backoff, not the lease: next_poll={after} ({delay}s out)"
         );
     }
 

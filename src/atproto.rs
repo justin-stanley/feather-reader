@@ -2466,149 +2466,99 @@ mod tests {
     // `list_*` read, so we exercise the *comparator* here on representative
     // data (parsed from a listRecords-shaped envelope) with no network.
 
-    fn parse_all<T: DeserializeOwned>(v: Value) -> Vec<(String, T)> {
-        let resp: ListRecordsResponse = serde_json::from_value(v).expect("envelope");
-        resp.records
-            .into_iter()
-            .map(|r| {
-                let rkey = r.rkey().unwrap_or_default().to_string();
-                (rkey, r.parse::<T>().expect("parse"))
-            })
-            .collect()
-    }
-
-    fn sort_subscriptions(subs: &mut [(String, Subscription)]) {
-        subs.sort_by(|(a_key, a), (b_key, b)| {
-            let a_title = a.title.as_deref().unwrap_or(&a.url).to_lowercase();
-            let b_title = b.title.as_deref().unwrap_or(&b.url).to_lowercase();
-            a_title
-                .cmp(&b_title)
-                .then_with(|| a.url.cmp(&b.url))
-                .then_with(|| a_key.cmp(b_key))
-        });
-    }
-
-    #[test]
-    fn subscriptions_sort_by_title_then_url_then_rkey() {
-        let mut subs: Vec<(String, Subscription)> = parse_all(json!({
-            "records": [
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-zebra",
-                    "value": { "url": "https://z.example/feed", "title": "Zebra News",
-                               "createdAt": "2026-07-12T00:00:00.000Z" }
-                },
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-untitled",
-                    "value": { "url": "https://aaa.example/feed",
-                               "createdAt": "2026-07-12T00:00:00.000Z" }
-                },
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-apple",
-                    "value": { "url": "https://apple.example/feed", "title": "apple blog",
-                               "createdAt": "2026-07-12T00:00:00.000Z" }
-                }
-            ]
-        }));
-        sort_subscriptions(&mut subs);
-        // Case-insensitive by the display key (title, or URL when untitled):
-        // "apple blog" < "https://aaa.example/feed" < "zebra news".
-        let order: Vec<&str> = subs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(order, vec!["rk-apple", "rk-untitled", "rk-zebra"]);
-    }
-
-    #[test]
-    fn folders_sort_by_position_then_name_then_rkey() {
-        let mut folders: Vec<(String, Folder)> = parse_all(json!({
-            "records": [
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-nopos",
-                    "value": { "name": "Aardvark", "createdAt": "2026-07-12T00:00:00.000Z" }
-                },
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-pos2",
-                    "value": { "name": "Tech", "position": 2, "createdAt": "2026-07-12T00:00:00.000Z" }
-                },
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.folder/rk-pos0",
-                    "value": { "name": "News", "position": 0, "createdAt": "2026-07-12T00:00:00.000Z" }
-                }
-            ]
-        }));
-        folders.sort_by(|(a_key, a), (b_key, b)| {
-            a.position
-                .unwrap_or(u64::MAX)
-                .cmp(&b.position.unwrap_or(u64::MAX))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then_with(|| a_key.cmp(b_key))
-        });
-        let order: Vec<&str> = folders.iter().map(|(k, _)| k.as_str()).collect();
-        // position 0, then 2, then the unset (sorts last despite name "Aardvark").
-        assert_eq!(order, vec!["rk-pos0", "rk-pos2", "rk-nopos"]);
-    }
-
-    #[test]
-    fn saved_sort_newest_first_by_created_at() {
-        let mut saved: Vec<(String, Saved)> = parse_all(json!({
-            "records": [
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.saved/rk-old",
-                    "value": { "url": "https://e.example/1", "createdAt": "2026-07-10T00:00:00.000Z" }
-                },
-                {
-                    "uri": "at://did:plc:x/community.lexicon.rss.saved/rk-new",
-                    "value": { "url": "https://e.example/2", "createdAt": "2026-07-12T00:00:00.000Z" }
-                }
-            ]
-        }));
-        saved.sort_by(|(a_key, a), (b_key, b)| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a_key.cmp(b_key))
-        });
-        assert_eq!(saved[0].0, "rk-new");
-        assert_eq!(saved[1].0, "rk-old");
-    }
-
     // -- reader-facing CRUD: bulk applyWrites shape (OPML import) ------------
 
-    #[test]
-    fn bulk_subscription_creates_render_sidecar_applywrites_ops() {
-        // Mirror what `add_subscriptions_bulk` builds: one create op per feed,
-        // each with a client-assigned rkey, in the sidecar's `applyWrites` shape.
-        let subs = [
-            Subscription::new("https://a.example/feed", "2026-07-12T00:00:00.000Z"),
-            Subscription::new("https://b.example/feed", "2026-07-12T00:00:00.000Z"),
-        ];
-        let mut gen = TidGenerator::new();
-        let ops: Vec<Value> = subs
-            .iter()
-            .map(|sub| {
-                WriteOp::Create {
-                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
-                    rkey: Some(gen.next()),
-                    value: serde_json::to_value(sub).expect("value"),
-                }
-                .to_sidecar_json()
+    /// **Bulk subscribe, through the real client, asserted on the bytes it
+    /// sent.** The test this replaces built the `WriteOp::Create` ops itself
+    /// ("mirror what `add_subscriptions_bulk` builds") and asserted on its own
+    /// construction; the function was never called, and writing every feed
+    /// into the wrong collection with server-assigned rkeys left the suite
+    /// green. Three atproto sort tests that re-implemented the comparator
+    /// inline are deleted alongside — `lexicon::sort_tests` fails their
+    /// mutation, and they added nothing but a misleading name.
+    #[tokio::test]
+    async fn bulk_subscribe_writes_client_assigned_ordered_rkeys_to_the_right_collection() {
+        let (base, log) =
+            crate::net::tests::serve_json_capturing(br#"{"ok":true,"data":{}}"#.to_vec()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let subs: Vec<crate::vetted::VettedSubscription> = (0..3)
+            .map(|i| {
+                crate::vetted::VettedSubscription::new(&lexicon::Subscription::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    "2026-07-12T00:00:00.000Z",
+                ))
             })
             .collect();
 
-        assert_eq!(ops.len(), 2);
-        for op in &ops {
-            assert_eq!(op["action"], json!("create"));
+        let rkeys = client
+            .add_subscriptions_bulk("did:plc:ewvi7nxzyoun6zhxrhs64oiz", &subs)
+            .await
+            .expect("bulk write failed");
+
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected one applyWrites request, got {sent:?}"
+        );
+        let body: Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap())
+            .expect("request body is JSON");
+        let writes = body["writes"].as_array().expect("writes array");
+        assert_eq!(writes.len(), 3);
+        for (i, w) in writes.iter().enumerate() {
             assert_eq!(
-                op["collection"],
-                json!("community.lexicon.rss.subscription")
+                w["collection"],
+                lexicon::nsid::SUBSCRIPTION,
+                "write {i} went to the wrong collection"
             );
-            assert!(op["rkey"].is_string(), "bulk import pins client-side rkeys");
             assert_eq!(
-                op["value"]["$type"],
-                json!("community.lexicon.rss.subscription")
+                w["rkey"].as_str(),
+                Some(rkeys[i].as_str()),
+                "write {i} does not carry the rkey the client returned"
             );
         }
-        // Distinct, ascending rkeys keep OPML order deterministic.
-        let k0 = ops[0]["rkey"].as_str().unwrap();
-        let k1 = ops[1]["rkey"].as_str().unwrap();
-        assert!(k0 < k1, "bulk rkeys must sort in input order ({k0} < {k1})");
+        let mut sorted = rkeys.clone();
+        sorted.sort();
+        assert_eq!(rkeys, sorted, "client-assigned rkeys must ascend");
+        assert_eq!(
+            rkeys.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "rkeys must be distinct"
+        );
+    }
+
+    /// **The walk stops on a repeated cursor.** `MAX_LIST_PAGES`, the
+    /// same-cursor guard and the `got > 0` guard had no test; only
+    /// `extend_bounded` was covered directly. A PDS that echoes the same
+    /// cursor forever would otherwise be walked for 200 pages.
+    #[tokio::test]
+    async fn list_all_records_stops_on_a_repeated_cursor() {
+        let body = serde_json::json!({
+            "records": [{"uri": "at://did:plc:x/c/1", "value": {}}],
+            "cursor": "same-every-time"
+        })
+        .to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "repeated-cursor.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let client = PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://repeated-cursor.test:{port}"),
+            "did:plc:x",
+        );
+        let records = client.list_all_records("c").await.expect("walk failed");
+        // Page 1: cursor None → "same". Page 2: "same" again → stop, after
+        // taking that page. Two pages, not two hundred.
+        assert_eq!(records.len(), 2, "a repeated cursor was followed");
     }
 
     // -- TID rkeys ----------------------------------------------------------
