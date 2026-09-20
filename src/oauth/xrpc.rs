@@ -304,7 +304,10 @@ impl Repo<'_> {
 
     /// Subscribe to a feed. Returns the new record's rkey so the caller can
     /// address it (rename, delete) without re-listing.
-    pub async fn add_subscription(&self, sub: &crate::lexicon::Subscription) -> Result<String> {
+    pub async fn add_subscription(
+        &self,
+        sub: &crate::vetted::VettedSubscription,
+    ) -> Result<String> {
         Ok(self
             .create_record(crate::lexicon::nsid::SUBSCRIPTION, sub)
             .await?
@@ -323,7 +326,7 @@ impl Repo<'_> {
     pub async fn update_subscription(
         &self,
         rkey: &str,
-        sub: &crate::lexicon::Subscription,
+        sub: &crate::vetted::VettedSubscription,
     ) -> Result<WriteResult> {
         self.put_record(crate::lexicon::nsid::SUBSCRIPTION, rkey, sub)
             .await
@@ -339,7 +342,7 @@ impl Repo<'_> {
     /// generator.
     pub async fn add_subscriptions_bulk(
         &self,
-        subs: &[crate::lexicon::Subscription],
+        subs: &[crate::vetted::VettedSubscription],
     ) -> Result<Vec<String>> {
         let mut gen = crate::atproto::TidGenerator::new();
         let mut rkeys = Vec::with_capacity(subs.len());
@@ -410,7 +413,7 @@ impl Repo<'_> {
         Ok(saved)
     }
 
-    pub async fn add_saved(&self, saved: &crate::lexicon::Saved) -> Result<String> {
+    pub async fn add_saved(&self, saved: &crate::vetted::VettedSaved) -> Result<String> {
         Ok(self
             .create_record(crate::lexicon::nsid::SAVED, saved)
             .await?
