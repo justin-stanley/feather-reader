@@ -772,7 +772,15 @@ impl PdsClient {
 
     /// `com.atproto.repo.createRecord` — create a new record (server assigns the
     /// rkey, `key: tid`). Returns the written record's strong ref.
-    pub async fn create_record<T: Serialize>(
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn create_record<T: Serialize>(
         &self,
         collection: &str,
         record: &T,
@@ -788,7 +796,15 @@ impl PdsClient {
     /// `com.atproto.repo.putRecord` — upsert a record at a **known** rkey
     /// (`key: any`). This is the `readState` upsert primitive: a feed-derived
     /// rkey makes the write idempotent (one record per feed).
-    pub async fn put_record<T: Serialize>(
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn put_record<T: Serialize>(
         &self,
         collection: &str,
         rkey: &str,
@@ -842,7 +858,15 @@ impl PdsClient {
     /// This is the read-state flusher's workhorse: dozens of dirty per-feed
     /// [`ReadState`] cursors coalesce into one call rather than one `putRecord`
     /// each. See [`flush_read_states`](Self::flush_read_states).
-    pub async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
         let url = self.xrpc_url("com.atproto.repo.applyWrites");
         let ops: Vec<Value> = writes.iter().map(WriteOp::to_json).collect();
         let body = json!({
@@ -1227,7 +1251,15 @@ impl SidecarClient {
     }
 
     /// `create` — create a record (server-assigned rkey). Returns its strong ref.
-    pub async fn create_record<T: Serialize>(
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn create_record<T: Serialize>(
         &self,
         did: &str,
         collection: &str,
@@ -1244,7 +1276,15 @@ impl SidecarClient {
     }
 
     /// `put` — upsert a record at a known rkey. Returns its strong ref.
-    pub async fn put_record<T: Serialize>(
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn put_record<T: Serialize>(
         &self,
         did: &str,
         collection: &str,
@@ -1275,7 +1315,15 @@ impl SidecarClient {
     }
 
     /// `applyWrites` — a batch of create/update/delete ops in one round-trip.
-    pub async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
+    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
+    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
+    /// the general case of the hole `create_subscriptions_batch` was one
+    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
+    /// points. `pub(crate)` was tried first and stops nothing that matters — a
+    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
+    /// a fact rather than a convention, and it costs nothing: nothing outside
+    /// this module ever called it.
+    async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -1310,22 +1358,6 @@ impl SidecarClient {
     pub async fn delete_subscription(&self, did: &str, rkey: &str) -> Result<()> {
         self.delete_record(did, lexicon::nsid::SUBSCRIPTION, rkey)
             .await
-    }
-
-    /// Batch-create many [`Subscription`] records in one `applyWrites` — the OPML
-    /// import path (one create op per feed, server-assigned rkeys).
-    pub async fn create_subscriptions_batch(&self, did: &str, subs: &[Subscription]) -> Result<()> {
-        let writes: Vec<WriteOp> = subs
-            .iter()
-            .map(|sub| {
-                Ok(WriteOp::Create {
-                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
-                    rkey: None,
-                    value: serde_json::to_value(sub)?,
-                })
-            })
-            .collect::<Result<_>>()?;
-        self.apply_writes(did, &writes).await
     }
 
     /// List every [`Folder`] record in `did`'s repo.

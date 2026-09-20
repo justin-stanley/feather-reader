@@ -196,16 +196,45 @@ macro_rules! dispatch {
     // explicitly so the private method's `_unvetted` suffix does not leak into
     // the metric.
     //
-    // **`Repo` is the vetted path, and since #150 there is no unvetted one.**
-    // The layer below is still public — `AppState.sidecar` is a `pub` field and
-    // `SidecarClient`/`oauth::xrpc::Repo` expose their own `add_subscription` —
-    // so a handler *can* still reach past `Repo` and call one directly. What it
-    // cannot do is write an unvetted record: those writers take
-    // `&vetted::VettedSubscription` (and `add_saved` a `&vetted::VettedSaved`),
-    // whose inner field is private to `src/vetted.rs` and reachable only through
-    // a constructor that vets. There is nothing to hand them that skipped the
-    // check. This is the `SafeLink` treatment from `src/safe_link.rs` applied to
-    // whole records — the convention became a compiler error.
+    // **`Repo` is the vetted path. The layer below is narrower than it was,
+    // and still not closed.**
+    //
+    // The named writers demand vetted records: `add_subscription`,
+    // `update_subscription`, `add_subscriptions_bulk` and `add_saved` on both
+    // backends take `&vetted::Vetted*`, whose inner field is private to
+    // `src/vetted.rs` and reachable only through a constructor that vets.
+    //
+    // **That sentence has now been wrong twice, so read what follows as the
+    // correction rather than the guarantee.** #150 closed three routes and its
+    // message implied the class; #154 said "there is nothing to hand them that
+    // skipped the check" and a review found a fourth,
+    // `SidecarClient::create_subscriptions_batch`, taking a raw
+    // `&[Subscription]`. Deleting it, this comment then said "the layer below
+    // now demands vetted records too" — and a second review found the *general*
+    // case the deleted function had been one instance of: `create_record`,
+    // `put_record` and `apply_writes` are generic over `T: Serialize`, and
+    // `lexicon::Subscription` derives `Serialize`, so any of them writes an
+    // unvetted record. Verified by compiling it.
+    //
+    // What changed: those three are now PRIVATE on `PdsClient` and
+    // `SidecarClient` — not `pub(crate)`, which was the first attempt and
+    // which a self-review caught doing nothing for the actual threat: a
+    // handler in `web.rs` is in this crate, so `pub(crate)` left it fully
+    // able to call them. Verified both ways by compiling a probe from `web.rs`:
+    // `pub(crate)` → builds clean; private → three "private method" errors.
+    // The vetted wrappers sit in the same `impl` block and need no visibility.
+    //
+    // The three on `oauth::xrpc::Repo` remain `pub` because
+    // `examples/oauth_spike.rs` is a separate crate target and drives them
+    // against a scratch collection. So a handler in this crate can still write
+    // an unvetted record through `state.oauth`'s repo — narrower than before,
+    // not absent.
+    //
+    // Ending the class means removing `Serialize` from `lexicon::Subscription`
+    // so a raw record cannot be serialised into a write at all. Blocked today:
+    // `VettedSubscription` is `#[serde(transparent)]` over it, so that needs a
+    // hand-written impl plus a wire-format test, and a record-shape slip there
+    // would silently migrate every reader's repo.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
