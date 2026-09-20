@@ -934,17 +934,33 @@ async fn guarded_get_inner(
         // the feeds that implement conditional GET properly. Observed in
         // production against 9to5mac.com, proton.me and kodi.tv, all live.
         //
-        // `300 Multiple Choices` and `305 Use Proxy` are excluded for their own
-        // reasons rather than by oversight: 300 names no single target, and 305
-        // names a PROXY, so following it would route the request through a host
-        // the response chose. Both now return to the caller, where a non-success
-        // status is handled as one.
-        let relocating = matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308);
-        if relocating {
+        // **304 is the ONLY status carved out.** Everything else in `3xx`
+        // relocates in some sense, and stays inside this branch — because
+        // `guarded_get_no_redirect` documents that it "refuses redirects
+        // outright", and the OAuth mix-up defence rests on that holding for all
+        // of them, not just the five we would otherwise follow.
+        if resp.status() != reqwest::StatusCode::NOT_MODIFIED && resp.status().is_redirection() {
             if max_redirects == 0 {
                 bail!(
                     "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
                      this document's origin is load-bearing and must not be moved",
+                    resp.status()
+                );
+            }
+            // Of the relocating statuses, only these five name a single target
+            // worth following. `300 Multiple Choices` names no one target, and
+            // `305 Use Proxy` names a PROXY — following it would route the
+            // request through a host the RESPONSE chose.
+            //
+            // **Refused, not returned.** Handing one back would be worse than
+            // erroring: callers do not uniformly check the status.
+            // `web::resolve_feed_url` reads the body straight into feed
+            // autodiscovery, so a `305` whose error page carries a
+            // `<link rel="alternate">` would become a subscription.
+            if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                bail!(
+                    "refusing to act on a {} response while fetching {url:?} \u{2014} \
+                     it names no single target that can be followed safely",
                     resp.status()
                 );
             }
@@ -1087,7 +1103,22 @@ async fn guarded_post(
         .await
         .with_context(|| format!("posting to {target}"))?;
 
+    // Unlike the GET path this refuses the WHOLE of `3xx`, `304` included, and
+    // that is deliberate: nothing here sends `If-None-Match`/`If-Modified-Since`,
+    // so a 304 to a POST is a server protocol violation rather than a
+    // conditional-GET success, and there is no sane way to act on it.
+    //
+    // It is worded separately all the same. Calling a 304 "a redirect we refused
+    // to follow" is the same misattribution that made the GET bug take a
+    // production investigation to find — the message should not send the next
+    // reader looking for a `Location` that was never supposed to exist.
     if resp.status().is_redirection() {
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            bail!(
+                "a POST to {url:?} answered 304 Not Modified, which is not a valid \
+                 response to a request carrying no conditional headers"
+            );
+        }
         let location = resp
             .headers()
             .get(reqwest::header::LOCATION)
@@ -2127,6 +2158,44 @@ pub(crate) mod tests {
     /// No `Location` and no body — which is what a 304 *is*, not a stub of one.
     fn not_modified_304() -> String {
         "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n".to_string()
+    }
+    /// `305 Use Proxy` — a relocating 3xx that names a PROXY, WITH a `Location`,
+    /// so it would have been followed before the narrowing.
+    fn use_proxy_305(loc: &str) -> String {
+        format!("HTTP/1.1 305 Use Proxy\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    /// **An unfollowable 3xx is refused, not handed back.**
+    ///
+    /// Narrowing the follow set to `301|302|303|307|308` left a choice for the
+    /// rest: return them, or refuse. Returning is the worse one, because callers
+    /// do not uniformly check the status — `web::resolve_feed_url` reads the body
+    /// straight into feed autodiscovery, so a `305` whose error page carries a
+    /// `<link rel="alternate">` would quietly become a subscription.
+    ///
+    /// A 305 also carries a `Location`, so before the narrowing it was FOLLOWED:
+    /// the request went through a proxy the response chose. Refusing is the
+    /// stricter behaviour in both directions.
+    #[tokio::test]
+    async fn an_unfollowable_3xx_is_refused_rather_than_returned() {
+        let (addr, log) = spawn_http(vec![use_proxy_305("http://proxy.invalid:3128/")]).await;
+        test_host_override("use-proxy.test", addr);
+
+        let err = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://use-proxy.test:{}/feed.xml", addr.port()),
+            &[],
+        )
+        .await
+        .expect_err("a 305 was returned to the caller instead of refused");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("305") && msg.contains("no single target"),
+            "refused, but not as an unfollowable status: {msg}",
+        );
+        // Refused at the first hop: the proxy it named was never contacted.
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 
     /// **A `304 Not Modified` must reach the caller, not be read as a redirect.**
