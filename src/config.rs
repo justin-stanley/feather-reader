@@ -149,6 +149,15 @@ pub struct Config {
     /// switch. Defaults to the sidecar, so deploying the Rust client changes
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
+    /// Whether `at://` standard.site publications may be subscribed to AND
+    /// polled. From `FEATHERREADER_STANDARD_SITE`, default **off**.
+    ///
+    /// **One flag for both, deliberately.** Permitting the subscription without
+    /// the poller does not leave the feature dormant — the row is stored with a
+    /// NULL `next_poll`, which `due_feeds` sorts FIRST, so it is polled
+    /// immediately, fails, and is recorded as an unreachable publisher. Two
+    /// flags could drift into exactly that state; one cannot.
+    pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
     /// handle into a DID so an existing seat can be honored on a cookie-less first
@@ -336,6 +345,9 @@ impl Default for Config {
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             // The sidecar stays the live path until the switch is thrown.
             repo_backend: crate::metrics::Backend::Sidecar,
+            // Off by default: one flag gates both storing and polling, and a
+            // stored row nothing can poll is worse than no row at all.
+            standard_site: false,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
@@ -537,6 +549,12 @@ impl Config {
             None => defaults.repo_backend,
         };
 
+        let standard_site = match env_opt("FEATHERREADER_STANDARD_SITE") {
+            Some(raw) => parse_bool(&raw)
+                .with_context(|| format!("FEATHERREADER_STANDARD_SITE={raw:?} is not a boolean"))?,
+            None => false,
+        };
+
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
                 format!("FEATHERREADER_SHOW_ADOPTION: expected a boolean, got {raw:?}")
@@ -547,6 +565,7 @@ impl Config {
         let config = Self {
             oauth,
             repo_backend,
+            standard_site,
             bind,
             db_path,
             public_url,

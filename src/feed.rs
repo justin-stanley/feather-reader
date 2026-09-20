@@ -268,7 +268,7 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
 ///
 /// Note that `javascript:alert(1)` and `file:///etc/passwd` both *parse* cleanly
 /// as URLs, so parsing is not the check — the scheme is.
-pub fn is_storable_feed_url(url: &str) -> bool {
+pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
     // **`at://` is checked BEFORE `Url::parse`, because `Url::parse` cannot read
     // the form that matters.** `at://did:plc:…/…` fails to parse with *invalid
     // port number* — the colons in the DID are taken as a port separator — while
@@ -276,7 +276,13 @@ pub fn is_storable_feed_url(url: &str) -> bool {
     // to the `matches!` below would appear to work and silently reject every
     // DID-based at-URI, which is all of them in practice.
     if let Some(rest) = url.strip_prefix("at://") {
-        return is_storable_publication_uri(rest);
+        // **Storable and pollable are ONE decision.** Storing an at-URI while
+        // nothing can poll it does not leave the feature dormant: the callers
+        // upsert with `next_poll` NULL, `due_feeds` sorts NULLs FIRST, so it is
+        // polled on the next tick, dies in `Url::parse`, and is recorded as a
+        // `fetch` failure — our unimplemented feature published as an
+        // unreachable publisher. One flag gates both, so they cannot drift.
+        return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
         Ok(u) => {
@@ -304,6 +310,12 @@ fn is_storable_publication_uri(rest: &str) -> bool {
     parts.next().is_none()
         && collection == crate::lexicon::nsid::STANDARD_PUBLICATION
         && !rkey.is_empty()
+        // **No control characters or whitespace, anywhere.** Splitting on '/'
+        // accepted what `Url::parse` rejected. `scheduler.rs` logs `%feed.url`
+        // with Display, so a newline lets a record author split one log line
+        // into two; and `feeds.url` is UNIQUE, so a trailing space makes two
+        // rows with independent schedules for one publication.
+        && !rest.chars().any(|c| c.is_control() || c.is_whitespace())
         && is_storable_at_authority(authority)
 }
 
@@ -316,10 +328,33 @@ fn is_storable_at_authority(authority: &str) -> bool {
     if authority.starts_with("did:") {
         return crate::oauth::identity::is_atproto_did(authority);
     }
-    !authority.is_empty() && authority.contains('.') && !authority.split('.').any(str::is_empty)
+    // **Reuses `normalize_handle`, for the reason its sibling documents.** A
+    // bare dot-check admits IP literals, reserved TLDs (`.internal`, `.local`),
+    // `host:port`, uppercase and whitespace — the hole `is_bare_did_web_host`
+    // carries a note about having fixed once already for `did:web`.
+    //
+    // Must already BE canonical, not merely normalisable: `normalize_handle`
+    // lowercases, and `feeds.url` is UNIQUE, so accepting `at://EXAMPLE.COM/…`
+    // beside `at://example.com/…` is two rows for one publication.
+    crate::oauth::identity::normalize_handle(authority)
+        .is_ok_and(|canonical| canonical == authority)
 }
 
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
+    // **`at://` is classified deliberately, and NOT doing so refused real
+    // subscriptions.** An atproto rkey is a TID — 13 base32-sortable characters
+    // — which is exactly what the generic "high-entropy token in path"
+    // heuristic below is looking for. Measured: without this arm,
+    // `at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h` is
+    // classified PRIVATE and the subscription refused, while the DID form slips
+    // through only because it fails to parse as a `Url` at all.
+    //
+    // `Public` is the right answer: a publication is a public record in a
+    // public repo and the rkey is a handle, not a secret, so there is no
+    // private/paid shape for this scheme to carry.
+    if url.starts_with("at://") {
+        return FeedPrivacy::Public;
+    }
     let parsed = match Url::parse(url) {
         Ok(u) => u,
         // Can't parse => the add path will reject it as a malformed URL regardless.
@@ -1634,17 +1669,102 @@ mod tests {
     /// All 19 at-URI rows in production are the DID form. A test written with a
     /// handle would have passed against an implementation that cannot store a
     /// single one of them.
+    /// **Storable and pollable are ONE decision.**
+    ///
+    /// Review found the sequencing error this closes: making `at://` storable
+    /// while nothing can poll it does not leave the feature dormant, it creates
+    /// permanent failures that the cause histogram then publishes as
+    /// unreachable publishers — the exact conflation it exists to end.
+    #[test]
+    fn an_at_uri_is_not_storable_while_standard_site_is_off() {
+        let uri = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        assert!(
+            !is_storable_feed_url(uri, false),
+            "stored a feed nothing can poll"
+        );
+        assert!(is_storable_feed_url(uri, true));
+        assert!(is_storable_feed_url("https://example.com/feed.xml", false));
+        assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+    }
+
+    /// The handle arm rejects what `normalize_handle` rejects — and anything
+    /// not already canonical, because `feeds.url` is UNIQUE.
+    #[test]
+    fn a_hostile_at_uri_authority_is_not_storable() {
+        for authority in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "pds.internal",
+            "printer.local",
+            "metadata.google.internal",
+            "example.com:9999",
+            "EXAMPLE.COM",
+            "-.-",
+            "a b.c",
+        ] {
+            let uri = format!("at://{authority}/site.standard.publication/3lab");
+            assert!(
+                !is_storable_feed_url(&uri, true),
+                "accepted authority {authority:?}"
+            );
+        }
+        assert!(is_storable_feed_url(
+            "at://alice.example.com/site.standard.publication/3lab",
+            true
+        ));
+    }
+
+    /// A control character or space in the at-URI is refused: `scheduler.rs`
+    /// logs `%feed.url` with Display, and `feeds.url` is UNIQUE.
+    #[test]
+    fn an_at_uri_with_control_characters_is_not_storable() {
+        for bad in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab\n",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab ",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3l\tab",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+    }
+
+    /// **A real rkey is a TID, and a TID looks exactly like a secret.**
+    ///
+    /// Without an explicit `at://` arm, `classify_feed_privacy` runs the generic
+    /// "high-entropy token in path" heuristic over the rkey. Measured: a
+    /// realistic 16-char rkey on a handle-form at-URI is classified PRIVATE and
+    /// the subscription REFUSED. The DID form escaped only because it fails to
+    /// parse as a `Url` at all — so the bug was invisible from that side.
+    ///
+    /// The first version of this test used the rkey `3lab`, which is too short
+    /// to trip the heuristic, so it passed with and without the fix.
+    #[test]
+    fn a_realistic_at_uri_rkey_is_not_mistaken_for_a_secret() {
+        for uri in [
+            "at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h",
+            "at://alice.example.com/site.standard.publication/aB3xK9pQ7mZ2vN8w",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h",
+        ] {
+            assert_eq!(
+                classify_feed_privacy(uri),
+                FeedPrivacy::Public,
+                "a publication rkey was mistaken for a credential: {uri}"
+            );
+        }
+    }
+
     #[test]
     fn a_did_form_publication_uri_is_storable() {
         assert!(is_storable_feed_url(
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            true
         ));
     }
 
     #[test]
     fn a_handle_form_publication_uri_is_storable() {
         assert!(is_storable_feed_url(
-            "at://alice.example.com/site.standard.publication/3lab"
+            "at://alice.example.com/site.standard.publication/3lab",
+            true
         ));
     }
 
@@ -1655,10 +1775,12 @@ mod tests {
     #[test]
     fn an_at_uri_for_another_collection_is_not_storable() {
         assert!(!is_storable_feed_url(
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab"
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab",
+            true
         ));
         assert!(!is_storable_feed_url(
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab"
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
+            true
         ));
     }
 
@@ -1675,7 +1797,7 @@ mod tests {
             "at://not-a-did-or-handle/site.standard.publication/3lab",
             "at://did:plc:TOOSHORT/site.standard.publication/3lab",
         ] {
-            assert!(!is_storable_feed_url(bad), "accepted {bad:?}");
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
         }
     }
 
@@ -1691,9 +1813,9 @@ mod tests {
             "ftp://example.com/feed.xml",
             "at:did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
         ] {
-            assert!(!is_storable_feed_url(bad), "accepted {bad:?}");
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
         }
-        assert!(is_storable_feed_url("https://example.com/feed.xml"));
-        assert!(is_storable_feed_url("http://example.com/feed.xml"));
+        assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+        assert!(is_storable_feed_url("http://example.com/feed.xml", true));
     }
 }

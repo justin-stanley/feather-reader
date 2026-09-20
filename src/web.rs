@@ -1745,7 +1745,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                 // `…/feed/private/<token>` into the SHARED `feeds` table breaks
                 // that promise even though `net::guarded_get` still refuses to
                 // fetch it.
-                if !feed::is_storable_feed_url(&sub.url)
+                if !feed::is_storable_feed_url(&sub.url, state.config.standard_site)
                     || feed::classify_feed_privacy(&sub.url).is_private()
                 {
                     warn!(
@@ -4895,8 +4895,11 @@ async fn import_opml(
         // cached, and published as records to the user's PUBLIC repo. Note that
         // `classify_feed_privacy` does not catch these: both parse cleanly, and
         // it returns `Public` for anything unparseable by design.
-        if !feed::is_storable_feed_url(&f.feed_url) {
-            info!(%did, "skipped an OPML entry whose xmlUrl is not an http(s) URL");
+        if !feed::is_storable_feed_url(&f.feed_url, state.config.standard_site) {
+            info!(
+                %did,
+                "skipped an OPML entry whose xmlUrl is not a storable feed URL"
+            );
             continue;
         }
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
