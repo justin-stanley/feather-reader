@@ -311,12 +311,18 @@ fn is_storable_publication_uri(rest: &str) -> bool {
     parts.next().is_none()
         && collection == crate::lexicon::nsid::STANDARD_PUBLICATION
         && !rkey.is_empty()
-        // **No control characters or whitespace, anywhere.** Splitting on '/'
-        // accepted what `Url::parse` rejected. `scheduler.rs` logs `%feed.url`
-        // with Display, so a newline lets a record author split one log line
-        // into two; and `feeds.url` is UNIQUE, so a trailing space makes two
-        // rows with independent schedules for one publication.
-        && !rest.chars().any(|c| c.is_control() || c.is_whitespace())
+        // **The rkey is validated against atproto's charset, not a blacklist.**
+        //
+        // A blacklist was the first attempt and it leaked twice: `is_control()`
+        // is Unicode category Cc only, so a bidi override (Cf) passed — and it
+        // reordered both the manage page and `scheduler.rs`'s `%feed.url` log
+        // line. Worse, nothing stopped a query string or fragment living inside
+        // the rkey, which satisfies the three-segment check and is exactly what
+        // `classify_feed_privacy`'s `at://` exemption keys off: a token
+        // smuggled there would have been declared public.
+        //
+        // An allowlist cannot leak the next character class someone finds.
+        && rkey.chars().all(is_rkey_char)
         && is_storable_at_authority(authority)
 }
 
@@ -325,6 +331,11 @@ fn is_storable_publication_uri(rest: &str) -> bool {
 /// The DID arm reuses [`crate::oauth::identity::is_atproto_did`] rather than
 /// checking the `did:` prefix: `did:plc:` identifiers are 24 base32-sortable
 /// characters, so a prefix check would accept `did:plc:TOOSHORT`.
+/// The atproto record-key charset: `[A-Za-z0-9._:~-]`.
+fn is_rkey_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '~' | '-')
+}
+
 fn is_storable_at_authority(authority: &str) -> bool {
     if authority.starts_with("did:") {
         return crate::oauth::identity::is_atproto_did(authority);
@@ -353,8 +364,29 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     // `Public` is the right answer: a publication is a public record in a
     // public repo and the rkey is a handle, not a secret, so there is no
     // private/paid shape for this scheme to carry.
-    if url.starts_with("at://") {
-        return FeedPrivacy::Public;
+    if let Some(rest) = url.strip_prefix("at://") {
+        // **Only a WELL-FORMED publication URI is exempt.** The first version
+        // of this was a bare prefix match, which declared any attacker-chosen
+        // string starting `at://` safe to publish — skipping the userinfo
+        // check, the known-provider table, the private-path markers, the
+        // secret-query keys and the entropy heuristics all at once. That is a
+        // regression against every one of them, on a path
+        // (`rename_subscription`) where this function is the only gate and the
+        // value is written to the user's PUBLIC repo.
+        //
+        // Anything else falls through to the generic checks below, which is
+        // where a credential-bearing string belongs.
+        if is_storable_publication_uri(rest) {
+            return FeedPrivacy::Public;
+        }
+        // **Malformed `at://` is REFUSED, not passed through.** Falling through
+        // reaches `Url::parse`, which fails on the DID form and lands on the
+        // `Err(_) => Public` arm below — whose justification is "the add path
+        // will reject it as a malformed URL regardless". That justification is
+        // false on the `rename_subscription` path, where this function is the
+        // only gate. So a string we cannot even recognise as a publication is
+        // refused here rather than declared safe to publish.
+        return FeedPrivacy::Private("not a well-formed at:// publication URI".to_string());
     }
     let parsed = match Url::parse(url) {
         Ok(u) => u,
@@ -1725,6 +1757,54 @@ mod tests {
             "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3l\tab",
         ] {
             assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+    }
+
+    /// **The `at://` exemption is a REGRESSION unless it is narrow.**
+    ///
+    /// Fan-out review found the arm I added was a bare prefix match, so *any*
+    /// attacker-chosen string starting `at://` was declared safe to publish —
+    /// skipping the userinfo check, the known-provider table, the private-path
+    /// markers, the secret-query keys and the entropy heuristics. Measured
+    /// against `main`, these three went from `Private` to `Public`.
+    ///
+    /// That matters because `rename_subscription` caches the URL AND rewrites
+    /// the user's PUBLIC PDS record, with `classify_feed_privacy` as its only
+    /// gate.
+    #[test]
+    fn a_credential_bearing_at_uri_is_still_private() {
+        for hostile in [
+            "at://user:pass@private.example.com/feed/private/TOKEN?apikey=deadbeefdeadbeef",
+            "at://patreon.com/rss/12345?auth=deadbeefdeadbeefdeadbeef",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab?apikey=sekrit",
+        ] {
+            assert!(
+                matches!(classify_feed_privacy(hostile), FeedPrivacy::Private(_)),
+                "declared public: {hostile}"
+            );
+        }
+    }
+
+    /// An rkey is `[A-Za-z0-9._:~-]` per atproto. Without that, a query string
+    /// or path fragment smuggled into the rkey satisfies the three-segment
+    /// check — which is what the exemption above keys off.
+    #[test]
+    fn an_rkey_outside_the_atproto_charset_is_not_storable() {
+        for bad in [
+            "at://alice.example.com/site.standard.publication/3lab?apikey=sekrit",
+            "at://alice.example.com/site.standard.publication/3lab#frag",
+            "at://alice.example.com/site.standard.publication/3lab%2Fevil",
+            "at://alice.example.com/site.standard.publication/caf\u{e9}",
+            "at://alice.example.com/site.standard.publication/3lab\u{202e}x",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted rkey in {bad:?}");
+        }
+        // The legitimate charset still passes.
+        for good in [
+            "at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h",
+            "at://alice.example.com/site.standard.publication/a.b_c~d-e",
+        ] {
+            assert!(is_storable_feed_url(good, true), "refused {good:?}");
         }
     }
 

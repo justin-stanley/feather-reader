@@ -3110,6 +3110,19 @@ async fn rename_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
+    // **Storability, on the same terms as the add and OPML paths.** This handler
+    // writes `feeds` via `upsert_feed` and had only the privacy check below —
+    // so `FEATHERREADER_STANDARD_SITE` was bypassable here, and an `at://` row
+    // could reach the shared table on an instance that never opted in. A
+    // review found it by enumerating every writer rather than the two call
+    // sites the flag was added to; there were three.
+    if !feed::is_storable_feed_url(&feed_url, state.config.standard_site) {
+        info!(url = %feed_url, %did, %rkey, "refused a non-storable feed URL at rename");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+        );
+    }
+
     // Block private/paid feeds on rename too. `url` is attacker-controllable, and
     // rename both upserts it to the local cache AND rewrites the PDS subscription
     // record (a public `putRecord`), so without this guard a crafted rename could
