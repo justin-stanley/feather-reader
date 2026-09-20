@@ -6073,19 +6073,29 @@ mod tests {
                 },
             )
             .await?;
-            sqlx::query("UPDATE feeds SET consecutive_errors = 35 WHERE url = ?1")
-                .bind(url)
-                .execute(&pool)
-                .await?;
+            sqlx::query(
+                "UPDATE feeds SET consecutive_errors = 35, last_error_kind = 'fetch', \
+                 last_error = 'unsupported scheme' WHERE url = ?1",
+            )
+            .bind(url)
+            .execute(&pool)
+            .await?;
         }
 
         apply_migrations(&pool).await?;
 
-        let at_errors: i64 =
-            sqlx::query_scalar("SELECT consecutive_errors FROM feeds WHERE url LIKE 'at://%'")
-                .fetch_one(&pool)
-                .await?;
+        let (at_errors, at_kind, at_detail): (i64, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT consecutive_errors, last_error_kind, last_error FROM feeds \
+                 WHERE url LIKE 'at://%'",
+            )
+            .fetch_one(&pool)
+            .await?;
         assert_eq!(at_errors, 0, "an unpollable row kept its failure count");
+        // A row with no errors carries no reason — the invariant
+        // `reset_feed_errors` upholds, and the migration must too.
+        assert_eq!(at_kind, None, "an unpollable row kept its failure kind");
+        assert_eq!(at_detail, None, "an unpollable row kept its failure detail");
 
         // A real feed's failure history is NOT touched — it is still meaningful.
         let http_errors: i64 = sqlx::query_scalar(

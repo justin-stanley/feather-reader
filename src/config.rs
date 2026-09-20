@@ -353,8 +353,9 @@ impl Default for Config {
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             // The sidecar stays the live path until the switch is thrown.
             repo_backend: crate::metrics::Backend::Sidecar,
-            // Off by default: one flag gates both storing and polling, and a
-            // stored row nothing can poll is worse than no row at all.
+            // Off by default. The flag gates STORING an at:// feed; polling is
+            // excluded by scheme in `due_feeds` regardless, until the
+            // standard.site reader is wired to the scheduler.
             standard_site: false,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
@@ -557,11 +558,7 @@ impl Config {
             None => defaults.repo_backend,
         };
 
-        let standard_site = match env_opt("FEATHERREADER_STANDARD_SITE") {
-            Some(raw) => parse_bool(&raw)
-                .with_context(|| format!("FEATHERREADER_STANDARD_SITE={raw:?} is not a boolean"))?,
-            None => false,
-        };
+        let standard_site = parse_standard_site(env_opt("FEATHERREADER_STANDARD_SITE").as_deref())?;
 
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
@@ -800,6 +797,16 @@ fn validate_claim_ttl(secs: i64) -> Result<i64> {
         );
     }
     Ok(secs)
+}
+
+/// Decide `FEATHERREADER_STANDARD_SITE` from its raw value: **off unless set
+/// on**. Pure so it can be tested without touching the process environment.
+fn parse_standard_site(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        Some(raw) => parse_bool(raw)
+            .with_context(|| format!("FEATHERREADER_STANDARD_SITE={raw:?} is not a boolean")),
+        None => Ok(false),
+    }
 }
 
 /// Read an env var, treating an empty value the same as unset.
@@ -1170,6 +1177,26 @@ mod tests {
         };
         assert!(c.did_allowed("did:plc:me"));
         assert!(!c.did_allowed("did:plc:stranger"));
+    }
+
+    /// **`FEATHERREADER_STANDARD_SITE` is off unless it is set on.**
+    ///
+    /// The loader reads the process environment, which parallel tests cannot
+    /// safely mutate, so the decision is a pure function of the raw value and
+    /// tested as one. The case that matters is `None`: an unset flag must be
+    /// `false`, or every deployment that never heard of standard.site would
+    /// start accepting `at://` rows the poller skips.
+    #[test]
+    fn standard_site_is_off_unless_set_on() {
+        assert!(!parse_standard_site(None).unwrap(), "unset must mean off");
+        assert!(!parse_standard_site(Some("false")).unwrap());
+        assert!(parse_standard_site(Some("true")).unwrap());
+        assert!(parse_standard_site(Some("1")).unwrap());
+        let err = parse_standard_site(Some("maybe")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("FEATHERREADER_STANDARD_SITE"),
+            "the error must name the variable: {err:#}"
+        );
     }
 
     #[test]
