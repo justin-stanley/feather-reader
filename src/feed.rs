@@ -1154,13 +1154,18 @@ pub fn discover_feed(site_html: &str, base: Option<&Url>) -> Option<Url> {
                     continue;
                 }
                 // Absolute URL wins directly; otherwise resolve against `base`.
-                if let Ok(u) = Url::parse(href) {
-                    return Some(u);
-                }
-                if let Some(b) = base {
-                    if let Ok(u) = b.join(href) {
-                        return Some(u);
-                    }
+                // Either way, only http(s): the href is publisher-controlled and
+                // `Url::parse` accepts any scheme, so this is where an `at://`
+                // (or `file:`, `javascript:`) alternate would otherwise become
+                // the URL the add path stores — after its input gate has run.
+                // Skip, don't stop: a later real feed link still wins.
+                let resolved = match Url::parse(href) {
+                    Ok(u) => Some(u),
+                    Err(_) => base.and_then(|b| b.join(href).ok()),
+                };
+                match resolved {
+                    Some(u) if matches!(u.scheme(), "http" | "https") => return Some(u),
+                    _ => continue,
                 }
             }
         }
@@ -1353,6 +1358,31 @@ mod tests {
     fn discover_finds_atom_absolute_link() {
         let html = r#"<head><link rel="alternate" type="application/atom+xml" href="https://x.example/atom"></head>"#;
         let found = discover_feed(html, None).expect("should discover absolute feed");
+        assert_eq!(found.as_str(), "https://x.example/atom");
+    }
+
+    /// **Autodiscovery only ever yields an http(s) URL.**
+    ///
+    /// The href is publisher-controlled and `Url::parse` accepts any scheme, so
+    /// a page could hand the add path an `at://` publication URI (or anything
+    /// else) that the user never typed — and the add path's input gate has
+    /// already run by then. A non-http(s) alternate is skipped, not returned,
+    /// so a later real feed link still wins.
+    #[test]
+    fn discover_skips_a_non_http_alternate() {
+        let at_link = r#"<link rel="alternate" type="application/rss+xml" href="at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h">"#;
+        assert!(
+            discover_feed(&format!("<head>{at_link}</head>"), None).is_none(),
+            "an at:// alternate was handed back as a feed URL"
+        );
+        let ftp_link =
+            r#"<link rel="alternate" type="application/atom+xml" href="ftp://x.example/atom">"#;
+        assert!(discover_feed(&format!("<head>{ftp_link}</head>"), None).is_none());
+
+        let real =
+            r#"<link rel="alternate" type="application/atom+xml" href="https://x.example/atom">"#;
+        let found = discover_feed(&format!("<head>{at_link}{real}</head>"), None)
+            .expect("the http(s) link after a skipped one must still be found");
         assert_eq!(found.as_str(), "https://x.example/atom");
     }
 

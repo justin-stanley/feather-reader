@@ -2906,6 +2906,14 @@ async fn mark_all_read(
 // Subscribe by URL
 // ---------------------------------------------------------------------------
 
+/// Flash for a URL this instance cannot store as a feed — not private, just
+/// not a kind of feed it supports (an `at://` publication with
+/// `FEATHERREADER_STANDARD_SITE` off, an unsupported scheme). Distinct from
+/// [`PRIVATE_FEED_REFUSAL`], whose "not saved or sent anywhere" would be a
+/// false promise for a record that may already exist in the user's PDS.
+const UNSUPPORTED_FEED_URL_REFUSAL: &str =
+    "That isn't a kind of feed this instance can subscribe to. Nothing was saved.";
+
 /// Refusal message shown when a private/paid feed is submitted. FeatherReader
 /// stores subscriptions in the user's PUBLIC PDS, so it supports public feeds
 /// only for now — a private feed's secret URL is never saved, fetched, or sent
@@ -2991,6 +2999,18 @@ async fn add_subscription(
         info!(url = %feed_url, %reason, %did, "refused private/paid feed after resolution (not stored)");
         return Ok(
             Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+        );
+    }
+
+    // The URL about to be STORED is what must be storable — not the one the
+    // user typed. Autodiscovery already yields only http(s), but this is the
+    // path that writes the row and the PDS record, so the check lives here too:
+    // the same gate the OPML and rename paths apply, on the same terms.
+    if !feed::is_storable_feed_url(&feed_url, state.config.standard_site) {
+        info!(url = %feed_url, %did, "refused unsupported feed URL after resolution (not stored)");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
         );
     }
 
@@ -8328,6 +8348,89 @@ mod tests {
     /// its global ceiling must be refused (capacity flash) and must NOT insert a
     /// new `feeds` row — parity with add_subscription's global-cap guard, so a
     /// rename loop can't inflate the shared cache past the cap.
+    /// **`FEATHERREADER_STANDARD_SITE=false` cannot be bypassed through
+    /// autodiscovery.**
+    ///
+    /// The add path gates the URL the user *typed*; the URL it *stores* is
+    /// whatever `resolve_feed_url` returns, which for an HTML page is a
+    /// publisher-controlled `<link rel="alternate">` href. With the flag off, a
+    /// page linking an `at://` publication URI must not get one stored — on
+    /// main the same URI was refused, so anything less is a regression. Driven
+    /// through the real route against a real local server, not the helper.
+    #[tokio::test]
+    async fn autodiscovery_cannot_smuggle_an_at_uri_past_the_flag() {
+        let did = "did:plc:autodiscovered";
+        // Access granted, both caps disabled — the only gate left is the one
+        // under test.
+        let state = test_state_with_caps(did, 0, 0).await;
+        assert!(
+            !state.config.standard_site,
+            "the flag must be off for this test"
+        );
+
+        let page = r#"<!doctype html><html><head><title>Blog</title>
+            <link rel="alternate" type="application/rss+xml"
+                  href="at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h">
+            </head><body>hi</body></html>"#;
+        let base = crate::net::tests::serve_body(page.as_bytes().to_vec()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "autodiscover-at.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "url=http://autodiscover-at.test:{port}/"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(loc, "/login", "the test never reached the add path");
+
+        let smuggled: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feeds WHERE substr(url, 1, 5) = 'at://'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(smuggled, 0, "an at:// row was stored with the flag off");
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            0,
+            "something was stored for a page with no usable feed"
+        );
+        assert_eq!(
+            store::count_subscriptions_for_did(&state.db, did)
+                .await
+                .unwrap(),
+            0,
+            "a subscription was recorded for a refused feed"
+        );
+    }
+
     #[tokio::test]
     async fn rename_to_new_url_refused_at_global_feeds_cap() {
         let did = "did:plc:renamer";
