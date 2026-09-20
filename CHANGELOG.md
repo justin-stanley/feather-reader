@@ -1,7 +1,8 @@
 # Changelog
 
-Engineering detail for the 0.3.x line, newest first. Covers everything released
-since 0.3.0.
+Engineering detail for the 0.3.x line, newest first. Covers everything since
+0.3.0, including work that has landed on `main` but is not yet tagged — see
+**Unreleased**.
 
 Each entry says what changed, the mechanism, and — where a defect is involved —
 how it was established rather than assumed. Several entries record that a test
@@ -10,6 +11,166 @@ measurement is the load-bearing part.
 
 Versions are git tags (`vX.Y.Z`). A tag publishes to crates.io and ghcr.io;
 deploying is separate.
+
+---
+
+## Unreleased
+
+Seven PRs on `main` since the `v0.3.6` tag. No features, no schema change, no
+`fly.toml` change. One config change — the Caddy log filter — which is baked into
+the image and so takes effect at the next build and deploy, not on the running
+machine.
+
+Production still runs **0.3.4** as of the v0.3.6 deploy on 2026-09-20; none of
+this is live until a tag is cut and deployed.
+
+### Security
+
+**The unvetted record write no longer type-checks** (#150, closes #140 and
+#142). 0.3.6 routed every subscription write through a vet and made the
+macro-generated writers private, but the layer below stayed reachable:
+`AppState.sidecar` is a `pub` field and both `SidecarClient` and
+`oauth::xrpc::Repo` expose their own writers. The 0.3.6 entry below records that
+honestly as "the vetted path, not the only possible path" — a convention, and
+#138's own argument is that conventions are worth what their tests measure.
+
+`src/vetted.rs` now holds `VettedSubscription` and `VettedSaved`, in their own
+module for the `safe_link.rs` reason: a private field is private to the MODULE,
+and `repo.rs` is where every record write is assembled, so a type declared beside
+its own constructor would be forgeable again. The eight low-level writers across
+both backends demand the vetted type.
+
+Verified by writing the bypass out and compiling it:
+
+```
+before                                      after
+state.sidecar.add_subscription(did, sub)    error: expected `&VettedSubscription`
+state.sidecar.add_saved(did, saved)         error: expected `&VettedSaved`
+xrpc_repo.add_subscription(sub)             error: expected `&VettedSubscription`
+```
+
+`VettedSaved` is fallible where `VettedSubscription` is not, and the asymmetry is
+forced: `url` is required on `community.lexicon.rss.saved`, so unlike an optional
+`siteUrl` there is no honest resting place for a rejected value.
+
+**The reader view's two `href`s take a checked type** (#152, closes #115).
+`EntryTemplate.url` was a raw `Option<String>` assigned straight off the
+`entries.url` column — a remote feed's `<link>`.
+
+```
+before   url: Option<String>     any non-empty string reaches both `href`s
+after    url: Option<SafeLink>   http/https only; None takes the no-link branch
+```
+
+Not a live hole — `feed.rs`'s `entry_link` scheme-checks at ingest, and that
+wiring is tested. What made it worth doing is that the guard is procedural and
+sits a long way from the `href`: it holds only while every future writer to
+`entries.url` remembers to route through `feed.rs`, which is the same shape of
+defence that, on the saved-record row, turned out to be deletable with a green
+suite.
+
+One user-visible narrowing, deliberate: a stored URL with any other scheme now
+loses its link, relative URLs included. `feed.rs:707` is the only production
+writer to that column and there is no `UPDATE` touching it, so only a pre-0.2.7
+row can be affected — and a stored `/foo` used to render as a same-origin link
+into the reader app rather than to the article, so the refusal is a fix.
+
+Established by mutation: `external_opt` forced to `Some`, forced to `None`, and
+the whole wiring reverted — each in isolation, each `745 passed; 1 failed`, the
+single failure being the new test every time. The render side had no other
+coverage, which is the issue's claim, now measured rather than asserted.
+
+**The OAuth authorization code and `state` are redacted from the access log**
+(#155). The Caddy log filter redacted two headers and left `uri` alone, so every
+`/oauth/callback` line carried the PDS's single-use `code` and the `state` that
+binds it to the pending row, verbatim — into `fly logs`, any drain, and the
+scrollback of anyone tailing the app.
+
+```
+before   "uri": "/oauth/callback?state=SENTINEL_STATE_VALUE&code=SENTINEL_CODE_VALUE"
+after    "uri": "/oauth/callback?code=REDACTED&iss=https%3A%2F%2F…&state=REDACTED"
+```
+
+Not an open hole: the code is one-shot and the exchange also demands the PKCE
+verifier, a DPoP proof and `private_key_jwt`, so a reader of the logs cannot
+replay it. But the argument for redacting `X-Origin-Auth` — already made at
+length in that file — is the argument for redacting these.
+
+`replace` rather than `delete`, matching the existing reasoning: the field
+survives with its value gone, so a failed callback still shows which parameters
+arrived. `iss`, `error` and `error_description` are deliberately untouched —
+they are not secrets and are most of the diagnostic value of those lines.
+Applied to **both** log blocks, because `origin_errors` is a separate logger that
+inherits nothing from the site log.
+
+Verified against caddy v2.11.4 — the version the pinned `caddy:2-alpine` digest
+resolves to, read from the image config blob — by running the config and probing
+the callback with sentinel values, with a negative control confirming the probe
+can fail.
+
+### Fixes
+
+**A rename no longer destroys four fields of the subscription record** (#147,
+closes #141). `update_subscription` is a `putRecord`, and a putRecord replaces
+the whole record. The handler built a fresh
+`Subscription::new(feed_url, now_rfc3339())`, so every field the form does not
+carry was written back as its default — and `manage_row.html` posts `url`,
+`title` and `folder`, nothing else.
+
+```
+field        stored value                    after a rename, before this fix
+siteUrl      whatever the feed advertised    gone
+fetchHint    as set                          gone
+private      as set                          gone
+createdAt    original subscribe time         reset to now
+```
+
+Four fields, not the three #141 names — `private` is the one the issue missed,
+because `Subscription::new` sets it to `None` and the handler never assigns it.
+`createdAt` is the worst of them: it is the reader's subscribe time, the sort key
+for "when did I subscribe", it lives in *their* repo rather than our cache, and
+once overwritten it is gone with nothing in the UI to say so.
+
+Now a read-modify-write. There is no single-record read on `Repo`, so this lists
+and filters by rkey; a `get_subscription` drops in behind the same handler logic
+if it ever measures badly.
+
+### Test and CI integrity
+
+**Three capture-based tests now mean what their names say** (#148, closes #144
+and #146). Test-only; no production behaviour changed.
+
+- `spawn_http` reads to content-length instead of a single 8 KB read, so the
+  negative assertions over the capture can no longer be satisfied by truncation.
+  A positive anchor on the cross-origin credential test makes an empty capture
+  fail loudly.
+- A contended sweep is reported as `Contended` rather than an error, matching
+  what `scheduler.rs` already does in production. `is_sqlite_busy` masks with
+  `& 0xFF` so the WAL extended codes (261/517/773) classify correctly, and
+  `a_non_busy_sweep_error_still_fails` stops the tolerance widening again.
+- `the_public_jwk_and_jwks_never_contain_the_private_scalar` asserted against a
+  literal from a *different* key, so it could never match; now derived from the
+  key under test.
+
+### Documentation
+
+- **The comment describing the unvetted-write bypass is corrected** (#154). It
+  still said `Repo` is "the vetted path, not the only possible path" and pointed
+  at #140 as open, after #150 had closed it — directing a reader to guard
+  something the compiler already guards, and advertising a surface that no longer
+  exists. Also corrects `AppState.sidecar`'s field doc, which called the sidecar
+  "the live repo-op path" after the 2026-09-13 cutover selected `rust`.
+- **`Choosing an OAuth backend` gains the measured comparison, and the process
+  count is made honest** (#156). Production `/admin/metrics` latencies for the
+  three operations both backends have run, stated with their limits: the two were
+  measured *sequentially*, not side by side — `sidecar` before the cutover,
+  `rust` after — over different weeks and a different cache size, with small and
+  unequal samples. Separately, the runtime heading said "three processes"
+  unconditionally, which has been false on `rust` since the cutover, and
+  contradicted "Build & run"'s "one or two" eleven lines later; the two counted
+  Caddy differently and neither said so. The diagram itself needed nothing —
+  `runtime.mmd` was updated at the cutover and already marks the sidecar
+  conditional.
 
 ---
 
