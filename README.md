@@ -75,7 +75,7 @@ Your subscriptions and read-state are records in **your** PDS, so the local cach
 is throwaway and your reading list follows you to any reader that speaks the same
 lexicon.
 
-**Runtime — one container, three processes**
+**Runtime — one container, two or three processes**
 
 <p align="center">
   <picture>
@@ -94,6 +94,11 @@ The dashed links are the Node sidecar, used only on the default `sidecar`
 backend. On `FEATHERREADER_REPO_BACKEND=rust` the app owns the OAuth flow itself,
 those links do not exist, and the `:8081` process is not started — see
 [Choosing an OAuth backend](#choosing-an-oauth-backend).
+
+So the container runs **three** processes on the `sidecar` backend and **two** on
+`rust`. That count includes Caddy, which runs either way; [Build &
+run](#build--run) counts only the application processes behind it, and so says
+one or two for the same two topologies.
 
 <sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
 
@@ -178,6 +183,40 @@ OAuth handshake and every `com.atproto.repo.*` call:
 
 **Upgrading to 0.3.0 changes nothing.** The default is `sidecar`, so an existing
 deployment keeps the topology it already has until you choose otherwise.
+
+### Measured in production
+
+One deployment — a single 512 MB `shared-cpu-1x` machine in Fly's `ord`, talking
+to one PDS. Latencies are milliseconds from `/admin/metrics`; `n` is the number
+of successful calls each percentile is drawn from.
+
+| operation | `rust` p50 / p95 | n | `sidecar` p50 / p95 | n |
+|---|---|---|---|---|
+| `list_folders_sorted` | **61.3** / **78.0** | 48 | 253.3 / 274.3 | 6 |
+| `list_subscriptions_sorted` | **125.5** / **299.3** | 76 | 259.9 / 537.2 | 9 |
+| `flush_read_states` | 968.7 / **1569.3** | 15 | **849.1** / 3267.3 | 12 |
+
+**Read these as indicative, not as a benchmark.** The two backends were not
+measured concurrently: the `sidecar` figures accumulated before the 2026-09-13
+cutover and the `rust` ones after it, so they cover different weeks, a different
+cache size, and whatever the network was doing at the time. The samples are small
+and unequal, and a p50 over six calls is barely a median.
+
+What they are good for is ruling out the thing worth ruling out — the Rust client
+is not slower in a way that would argue against it. On the read paths it is
+comfortably faster; on `flush_read_states` it trades a slightly worse median for
+less than half the tail latency.
+
+The comparison is trustworthy in one narrow respect that is easy to lose:
+`FEATHERREADER_REPO_BACKEND` fails startup on an unrecognised value rather than
+falling back, so a row labelled `sidecar` was always really the sidecar, and the
+two columns are never the same implementation measured twice.
+
+`flush_read_states` on `rust` also carries 100 errors against those 15 successes.
+Nearly all are one signed-out account's read-state being retried every 60 s until
+#117 added parking in 0.3.4 — a scheduler bug, on shared code that runs
+identically under either backend, not a difference between them. Every other
+operation in the table has recorded zero errors on both.
 
 ### Switching
 
