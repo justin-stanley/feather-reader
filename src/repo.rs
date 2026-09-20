@@ -216,11 +216,17 @@ macro_rules! dispatch {
     // `lexicon::Subscription` derives `Serialize`, so any of them writes an
     // unvetted record. Verified by compiling it.
     //
-    // What changed: those three are now `pub(crate)` on `PdsClient` and
-    // `SidecarClient`, so nothing outside `atproto.rs` can reach them. The
-    // three on `oauth::xrpc::Repo` remain `pub` because
+    // What changed: those three are now PRIVATE on `PdsClient` and
+    // `SidecarClient` — not `pub(crate)`, which was the first attempt and
+    // which a self-review caught doing nothing for the actual threat: a
+    // handler in `web.rs` is in this crate, so `pub(crate)` left it fully
+    // able to call them. Verified both ways by compiling a probe from `web.rs`:
+    // `pub(crate)` → builds clean; private → three "private method" errors.
+    // The vetted wrappers sit in the same `impl` block and need no visibility.
+    //
+    // The three on `oauth::xrpc::Repo` remain `pub` because
     // `examples/oauth_spike.rs` is a separate crate target and drives them
-    // against a scratch collection. So a handler in THIS crate can still write
+    // against a scratch collection. So a handler in this crate can still write
     // an unvetted record through `state.oauth`'s repo — narrower than before,
     // not absent.
     //

@@ -14,6 +14,51 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+**The generic write primitives are private, and the 0.3.7 entry below
+overclaimed.** That entry says "the eight low-level writers across both backends
+demand the vetted type" and backs it with three compiled bypasses. Two things
+were wrong with it when it shipped, and they are corrected here rather than
+edited there, because the shipped record should show what was believed at the
+time.
+
+First, there were nine writers, not eight: `SidecarClient::create_subscriptions_batch`
+took a raw `&[Subscription]` straight into `applyWrites`. It had no callers and
+so drew no attention. Deleted (#169).
+
+Second — and this is the general case the first was one instance of —
+`create_record`, `put_record` and `apply_writes` are generic over
+`T: Serialize`, and `lexicon::Subscription` derives `Serialize`. Any handler
+holding `state.sidecar` could write an unvetted record through them with no
+more effort than the deleted function required. Verified by compiling it.
+
+Those three are now **private** on `PdsClient` and `SidecarClient`. Not
+`pub(crate)` — that was the first attempt, and a self-review caught it stopping
+nothing that mattered: a handler in `web.rs` is in this crate. Both were
+verified by compiling a probe from `web.rs`:
+
+```
+pub(crate)   builds clean          — the handler can still write unvetted
+private      3 "private method" errors
+```
+
+The three on `oauth::xrpc::Repo` stay `pub`: `examples/oauth_spike.rs` is a
+separate crate target and drives them against a scratch collection. So a
+handler in this crate can still write an unvetted record through the OAuth repo.
+**Narrower than before, not absent.** Ending the class means removing
+`Serialize` from `lexicon::Subscription`; that needs a hand-written impl for
+the `#[serde(transparent)]` `VettedSubscription` plus a wire-format test, and is
+tracked rather than done.
+
+The claim "there is nothing to hand them that skipped the check" has now been
+wrong in three consecutive corrections. Each enumerated what was in front of it
+and described the result as the population.
+
+---
+
 ## 0.3.7 — 2026-09-20
 
 Eight PRs. No features, no schema change, no `fly.toml` change. One config
