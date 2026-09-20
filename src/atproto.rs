@@ -118,6 +118,47 @@ pub const DEFAULT_RESOLVER_HOST: &str = "https://bsky.social";
 /// the relay walk for the same reason.
 const MAX_LIST_PAGES: usize = 200;
 
+/// Hard cap on the records a single `list_all_records` walk will accumulate.
+///
+/// [`MAX_LIST_PAGES`] bounds how many REQUESTS a walk makes. It bounds the
+/// accumulated memory only if the server honours `limit=100` — and a repo host
+/// we did not choose has no obligation to. Measured: an 8 MB page (the
+/// [`crate::net::read_capped`] ceiling) holds ~95 000 minimal records and
+/// retains ~23 MB as `Vec<RecordEntry>`, so the page cap alone admits gigabytes
+/// on a 512 MB box.
+///
+/// 20 000 is the number [`MAX_LIST_PAGES`]'s own comment already claimed — this
+/// makes the claim true rather than conditional on the server's cooperation.
+const MAX_LIST_RECORDS: usize = 20_000;
+
+/// Append a page, refusing to exceed `max`.
+///
+/// **An error, never a truncation.** The caller of the live walk is
+/// `web::resolve_subscriptions`, whose result reaches `store::replace_sub_refs`
+/// — a `DELETE` followed by reinserting exactly what it was handed. A short
+/// list there is not a short list, it is revoked access to whatever fell off
+/// the end. Returning `Err` lets `resolve_subscriptions` take its documented
+/// fail-closed branch and serve the last-known projection instead.
+///
+/// `out` is left untouched on refusal, so a partial page cannot survive.
+pub(crate) fn extend_bounded(
+    out: &mut Vec<RecordEntry>,
+    page: Vec<RecordEntry>,
+    max: usize,
+    collection: &str,
+) -> Result<()> {
+    if out.len() + page.len() > max {
+        anyhow::bail!(
+            "listRecords for {collection} exceeded the {max}-record cap \
+             ({} held, {} more offered) — refusing to accumulate further",
+            out.len(),
+            page.len(),
+        );
+    }
+    out.extend(page);
+    Ok(())
+}
+
 /// Errors from the atproto identity + PDS layer.
 ///
 /// Wraps the transport, the atproto XRPC error envelope (`{"error","message"}`),
@@ -717,7 +758,7 @@ impl PdsClient {
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
-            out.extend(page.records);
+            extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
                 // Guard against a PDS that echoes a cursor with an empty page,
                 // or that hands back the SAME cursor forever (an infinite walk
@@ -1200,7 +1241,7 @@ impl SidecarClient {
                 .list_records(did, collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
-            out.extend(page.records);
+            extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
                 Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
                 _ => break,
@@ -2594,5 +2635,60 @@ mod tests {
         // microsecond timestamp shifted into bits 63..10, plus the clock id).
         let max_tid = (0x001f_ffff_ffff_ffffu64 << 10) | 0x3ff;
         assert!(encode_s32_tid(max_tid - 1) < encode_s32_tid(max_tid));
+    }
+    /// **Exceeding the record cap is an ERROR, not a silent truncation.**
+    ///
+    /// The page cap bounds how many requests a walk makes; it bounds the
+    /// accumulated memory only if the server honours `limit=100`, and a host we
+    /// did not choose has no obligation to. A review measured an 8 MB page
+    /// holding ~95 000 minimal records and retaining 23 MB as
+    /// `Vec&lt;RecordEntry&gt;` — 200 such pages is gigabytes on a 512 MB box.
+    ///
+    /// Truncating instead would be worse than the OOM it prevents. The caller
+    /// of the live walk is `resolve_subscriptions`, whose result feeds
+    /// `replace_sub_refs` — a `DELETE` plus reinsert of exactly what it was
+    /// handed. A short list there is not a short list, it is **revoked access**
+    /// to the feeds that fell off the end. That is the failure PR #167 was
+    /// closed for reintroducing, so this returns `Err` and lets the existing
+    /// fail-closed branch serve the last-known projection.
+    #[test]
+    fn exceeding_the_record_cap_is_an_error_not_a_truncation() {
+        let page = |n: usize| -> Vec<RecordEntry> {
+            (0..n)
+                .map(|i| RecordEntry {
+                    uri: format!("at://did:plc:x/c/{i}"),
+                    cid: None,
+                    value: serde_json::Value::Null,
+                })
+                .collect()
+        };
+
+        let mut out = page(90);
+        let err = extend_bounded(&mut out, page(20), 100, "c")
+            .expect_err("a page past the cap was accepted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("100"), "the cap is not named: {msg}");
+        assert_eq!(
+            out.len(),
+            90,
+            "the partial page was kept — a truncated list must not survive the error"
+        );
+    }
+
+    #[test]
+    fn accumulating_within_the_cap_succeeds() {
+        let page = |n: usize| -> Vec<RecordEntry> {
+            (0..n)
+                .map(|i| RecordEntry {
+                    uri: format!("at://did:plc:x/c/{i}"),
+                    cid: None,
+                    value: serde_json::Value::Null,
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        extend_bounded(&mut out, page(60), 100, "c").unwrap();
+        extend_bounded(&mut out, page(40), 100, "c").unwrap();
+        assert_eq!(out.len(), 100, "exactly the cap must be allowed");
     }
 }

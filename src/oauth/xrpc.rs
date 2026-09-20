@@ -33,6 +33,11 @@ use super::store::OAuthSession;
 /// unbounded walk is a denial-of-service against ourselves.
 const MAX_LIST_PAGES: usize = 50;
 
+/// Hard cap on records accumulated by one walk — 50 pages x the 100 we request.
+/// See [`crate::atproto::extend_bounded`] for why exceeding it is an error
+/// rather than a truncation.
+const MAX_LIST_RECORDS: usize = 5_000;
+
 /// An authenticated handle on one account's repo.
 pub struct Repo<'a> {
     pub http: &'a Client,
@@ -155,7 +160,11 @@ impl Repo<'_> {
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.len();
-            out.extend(page);
+            // Same cap, same reason as `atproto::extend_bounded`: MAX_LIST_PAGES
+            // bounds requests, not memory, unless the server honours our limit.
+            // This is the LIVE walk on `backend=rust` — its result reaches
+            // `replace_sub_refs`, so a truncation here is revoked access.
+            crate::atproto::extend_bounded(&mut out, page, MAX_LIST_RECORDS, collection)?;
             match next {
                 // `got > 0` is not defensive tidiness -- it is a whole round
                 // trip. This project's own PDS returns a cursor ALONGSIDE a
