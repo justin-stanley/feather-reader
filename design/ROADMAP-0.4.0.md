@@ -11,13 +11,16 @@ entirely.
 
 **Every number here was read from production or the tree on 2026-09-20.**
 
-> **Revised the same day.** Step 1 was an investigation; it came back with a
-> defect (#159 — a `304 Not Modified` read as a malformed redirect), which
-> explains most of the failure numbers below and invalidates the capacity
-> baseline they were taken against. The original framing is kept rather than
-> rewritten, with the finding folded in where it lands, because *what the
-> instrument said before the fix* is the part worth not forgetting: the
-> dashboard looked healthier the worse the bug got.
+> **Revised twice the same day.** Step 1 was an investigation; it came back with
+> a defect (#159 — a `304 Not Modified` read as a malformed redirect), which
+> explains most of the failure numbers below. That fix **shipped in v0.3.7 and is
+> live in production as of 2026-09-20 03:57Z**, and the failure count is now
+> falling. The original framing is kept rather than rewritten, because *what the
+> instrument said before the fix* is the part worth not forgetting: the dashboard
+> looked healthier the worse the bug got.
+>
+> The second revision also settles a question the first one left open — whether
+> the fix reopens the capacity argument. It does not. See step 5.
 
 ---
 
@@ -76,10 +79,31 @@ product does not visibly work for the three readers it already has.** Capacity i
 a problem you earn the right to have. Opening registration against a 53% feed
 failure rate would multiply the experience, not the value.
 
-> **Since drafted: step 1 has been answered, and these numbers are mostly a
-> bug.** See below and #159. The table above should be read as the *symptom*,
-> not the baseline — in particular the backlog of 0 is not evidence of headroom,
-> because most of those 68 feeds were not being polled at all.
+> **That table is the PRE-FIX snapshot, and it is already history.** #159 shipped
+> in v0.3.7 on 2026-09-20 and the numbers are moving:
+>
+> | time | failing | badly | polled last hour |
+> |---|---|---|---|
+> | 03:55Z (pre-deploy) | 67 | 65 | 44 (39%) |
+> | 04:23Z | 66 | 65 | 45 (40%) |
+> | 04:33Z | 65 | 64 | 46 (41%) |
+>
+> Read the table above as the *symptom*, not a baseline — in particular its
+> backlog of 0 was not evidence of headroom, because most of those feeds were
+> not being polled at all.
+>
+> **Recovery runs on each feed's own clock.** Backoff is
+> `min(5m × 2^(n−1), 24h)` (`feed::backoff_for`), `BADLY_BROKEN_ERRORS = 6`, and
+> a feed resets to zero on its first *successful* poll. Crucially the windows
+> count from each feed's last failure, not from the deploy, so many were already
+> part-elapsed — recovery is running ahead of a naive from-deploy estimate. The
+> tail is feeds at the 24h cap.
+>
+> **The floor is not zero — expect ~19 + genuinely-dead feeds.** The 19 `at://`
+> rows fail before a request is made (`check_scheme` allows `http`/`https`
+> only), so #159 does nothing for them; they need step 3. For the same reason
+> **`Least recent poll` stays pinned at `never`** through all of this, which is a
+> limit of the indicator rather than of the repair.
 
 ---
 
@@ -109,15 +133,24 @@ The stats copy asserting that badly-failing feeds are *"usually gone rather than
 flaky"* was the hypothesis that stopped anyone looking. It is wrong and should
 change.
 
-**What is still open on this step:** *how much* of the 68 is this bug. That
-needs the prod DB (`flyctl ssh sftp get /data/featherreader.db`), and `fly ssh`
-currently times out from at least one workstation while `fly doctor` passes
-WireGuard — so the census has not been done. Four failures in a 100-line log
-window, three of them this, is strong but is not a count.
+**Shipped.** #159 is in **v0.3.7**, deployed 2026-09-20 03:57Z. `/health` reports
+`ok featherreader/0.3.7`; the log has recorded **zero** further "usable Location
+header" errors since, against three in a comparable window before it.
 
-**Exit, revised:** ship #159, then re-read `/stats`. The failing count should
-fall sharply. Whatever remains after that *is* the genuine dead-feed population,
-and it is measured rather than assumed.
+**What is still open on this step:** the residual number. The failing count is
+falling (67 → 65 in the first 36 minutes) but the tail runs ~24h, and the
+interesting figure is where it *stops*. Subtract the ~19 `at://` rows and what
+remains is the genuine dead-feed population — measured rather than assumed, which
+is what this step asked for in the first place.
+
+A per-feed census would still be better than an aggregate, and still is not
+possible: `fly ssh` times out from at least one workstation while `fly doctor`
+passes WireGuard, so `flyctl ssh sftp get /data/featherreader.db` cannot run.
+Storing the error text (step 1b) would make the aggregate sufficient and the
+census unnecessary.
+
+**Exit, revised:** re-read `/stats` once the count stops falling — call it 24h
+after the deploy.
 
 ### 1b. Make this class diagnosable, and stop the copy that hid it
 
@@ -129,6 +162,10 @@ Both cheap, both follow directly from the above.
   would have made this visible from `/stats` alone.
 - **Fix the `/stats` copy.** "Usually gone rather than flaky" is an assertion the
   instance had never tested, and it actively discouraged investigation.
+
+*(Related and already done: `deploy/Caddyfile` is now validated in CI against
+both OAuth routings, #161 — a `docs/sustaining-plan.md` Part 2 item that this
+release's own deploy work made urgent.)*
 
 ### 2. Tell the affected reader about the 19 `at://` rows
 
@@ -186,17 +223,26 @@ count both collapse to one topology.
 after step 1: raising throughput against a 53% failure rate optimises the wrong
 number, and would make the backlog metric look better while nothing improves.
 
-> **Every capacity number in this document predates #159 and must be re-taken
-> after it deploys.** The backlog of 0 was measured while roughly 60 feeds were
-> backed off and effectively not being polled. Fixing the 304 returns all of
-> them to normal cadence, so **real poll load goes up sharply** the moment it
-> ships — this release's first act increases the work the poller does, and the
-> honest baseline does not exist yet.
+> **Settled by arithmetic, now that #159 has shipped.** The previous revision
+> said the fix might reopen the old roadmap's "the poller is the limit" claim,
+> because the backlog of 0 had been manufactured by the bug. It does not, and the
+> numbers say so without waiting for recovery to finish:
 >
-> That cuts both ways and is the more interesting half: the draft roadmap's
-> "poller is the limit" claim was dismissed above on a backlog of 0 that the bug
-> manufactured. It may turn out to be right after all. Re-measure before
-> concluding either way.
+> | | |
+> |---|---|
+> | ceiling | `DEFAULT_POLL_BATCH` 50 per `DEFAULT_POLL_TICK` 60 s = **3,000 feeds/hour** |
+> | demand at 100% feed health | 111 feeds on the 1 h default interval = **111 feeds/hour** |
+> | utilisation | **3.7%** |
+>
+> Full recovery roughly doubles real poll load — from ~46 feeds/hour to ~111 —
+> and lands at under four percent of the measured ceiling. The poller does not
+> bind until roughly **3,000 distinct feeds**, which at this instance's ~37
+> feeds per reader is on the order of **80–140 readers**. That is the old
+> roadmap's own estimate, and it was right; it simply is not a constraint at
+> three readers.
+>
+> So the knobs below are **not** 0.4.0 work. They are what step 5 does *after*
+> the cap is raised, not a precondition for raising it.
 
 - The knobs exist: `FEATHERREADER_POLL_TICK_SECS`, `_POLL_BATCH`,
   `_POLL_CONCURRENCY`, `_POLL_STAGGER_MS` (`scheduler.rs`). Raise, then measure
@@ -209,8 +255,10 @@ number, and would make the backlog metric look better while nothing improves.
 - **Then** raise `FEATHERREADER_BETA_CAP` in steps and watch, rather than
   removing the gate in one move.
 
-**Exit:** backlog near zero at the new cap **against post-#159 numbers**, and the
-residual failure rate from step 1 not regressing as feeds are added.
+**Exit:** backlog near zero at the new cap, and the residual failure rate from
+step 1 not regressing as feeds are added. Given the 3.7% figure above, the first
+cap raise should need no throughput work at all — if it does, something other
+than arithmetic is wrong and that is the finding.
 
 ---
 
