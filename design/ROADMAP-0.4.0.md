@@ -11,6 +11,14 @@ entirely.
 
 **Every number here was read from production or the tree on 2026-09-20.**
 
+> **Revised the same day.** Step 1 was an investigation; it came back with a
+> defect (#159 — a `304 Not Modified` read as a malformed redirect), which
+> explains most of the failure numbers below and invalidates the capacity
+> baseline they were taken against. The original framing is kept rather than
+> rewritten, with the finding folded in where it lands, because *what the
+> instrument said before the fix* is the part worth not forgetting: the
+> dashboard looked healthier the worse the bug got.
+
 ---
 
 ## What changed since that draft
@@ -68,25 +76,59 @@ product does not visibly work for the three readers it already has.** Capacity i
 a problem you earn the right to have. Opening registration against a 53% feed
 failure rate would multiply the experience, not the value.
 
+> **Since drafted: step 1 has been answered, and these numbers are mostly a
+> bug.** See below and #159. The table above should be read as the *symptom*,
+> not the baseline — in particular the backlog of 0 is not evidence of headroom,
+> because most of those 68 feeds were not being polled at all.
+
 ---
 
 ## Sequence
 
-### 1. Find out why half the HTTP feeds fail
+### 1. Why half the HTTP feeds fail — **answered: a 304 was read as a redirect**
 
-Nothing below is worth sequencing until this is understood. `/stats` reports the
-aggregate and cannot distinguish "these feeds are genuinely gone" from "we have a
-defect".
+This step asked for a breakdown by cause, and said *"anything systematic … is
+the real content of 0.4.0"*. It is systematic.
 
-- Group the failing rows by error and host. The prod DB is the source:
-  `flyctl ssh sftp get /data/featherreader.db -a featherreader`, then query
-  locally — the runtime image has no `sqlite3`.
-- The stats copy asserts that badly-failing feeds are "usually gone rather than
-  flaky". That is a hypothesis this has never tested.
+`guarded_get_inner` gated its redirect branch on `is_redirection()`, which is
+`300..=399` and so includes **`304 Not Modified`**. A 304 carries no `Location`
+by definition, so every conditional GET that correctly answered "unchanged"
+failed with *"redirect response without a usable Location header"* — and
+`feed.rs`'s own 304 branch, which is correct, was unreachable. The poller
+therefore recorded **"nothing new" as a failure**, bumping `consecutive_errors`
+and backing the feed off exponentially. The feeds punished hardest were the ones
+implementing conditional GET *properly*.
 
-**Exit:** a breakdown by cause. *"Mostly dead feeds"* is a perfectly good answer
-and closes the step. Anything systematic — a class of feed, a TLS or redirect or
-encoding case — is the real content of 0.4.0 and outranks everything below.
+Found in the production log against **9to5mac.com**, **proton.me** and
+**kodi.tv** — all live. Re-running the poller's own conditional GET by hand
+returns `HTTP 304` with zero `Location` headers. Fix and regression test in
+**#159**; mutating the guard back fails the new test and nothing else, so this
+had no coverage at all.
+
+The stats copy asserting that badly-failing feeds are *"usually gone rather than
+flaky"* was the hypothesis that stopped anyone looking. It is wrong and should
+change.
+
+**What is still open on this step:** *how much* of the 68 is this bug. That
+needs the prod DB (`flyctl ssh sftp get /data/featherreader.db`), and `fly ssh`
+currently times out from at least one workstation while `fly doctor` passes
+WireGuard — so the census has not been done. Four failures in a 100-line log
+window, three of them this, is strong but is not a count.
+
+**Exit, revised:** ship #159, then re-read `/stats`. The failing count should
+fall sharply. Whatever remains after that *is* the genuine dead-feed population,
+and it is measured rather than assumed.
+
+### 1b. Make this class diagnosable, and stop the copy that hid it
+
+Both cheap, both follow directly from the above.
+
+- **`feeds` stores an error count and no error text** (`consecutive_errors`, and
+  nothing else). That is why a systematic failure across 60-odd feeds looked
+  identical to sixty dead blogs. Storing the last error — and surfacing it —
+  would have made this visible from `/stats` alone.
+- **Fix the `/stats` copy.** "Usually gone rather than flaky" is an assertion the
+  instance had never tested, and it actively discouraged investigation.
 
 ### 2. Tell the affected reader about the 19 `at://` rows
 
@@ -144,6 +186,18 @@ count both collapse to one topology.
 after step 1: raising throughput against a 53% failure rate optimises the wrong
 number, and would make the backlog metric look better while nothing improves.
 
+> **Every capacity number in this document predates #159 and must be re-taken
+> after it deploys.** The backlog of 0 was measured while roughly 60 feeds were
+> backed off and effectively not being polled. Fixing the 304 returns all of
+> them to normal cadence, so **real poll load goes up sharply** the moment it
+> ships — this release's first act increases the work the poller does, and the
+> honest baseline does not exist yet.
+>
+> That cuts both ways and is the more interesting half: the draft roadmap's
+> "poller is the limit" claim was dismissed above on a backlog of 0 that the bug
+> manufactured. It may turn out to be right after all. Re-measure before
+> concluding either way.
+
 - The knobs exist: `FEATHERREADER_POLL_TICK_SECS`, `_POLL_BATCH`,
   `_POLL_CONCURRENCY`, `_POLL_STAGGER_MS` (`scheduler.rs`). Raise, then measure
   the backlog again rather than assuming it helped.
@@ -155,8 +209,8 @@ number, and would make the backlog metric look better while nothing improves.
 - **Then** raise `FEATHERREADER_BETA_CAP` in steps and watch, rather than
   removing the gate in one move.
 
-**Exit:** backlog near zero at the new cap, and the failure rate from step 1 not
-regressing as feeds are added.
+**Exit:** backlog near zero at the new cap **against post-#159 numbers**, and the
+residual failure rate from step 1 not regressing as feeds are added.
 
 ---
 
