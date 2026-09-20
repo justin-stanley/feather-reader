@@ -4264,6 +4264,9 @@ async fn oauth_jwks(State(state): State<AppState>) -> Response {
 ///
 /// Text, not JSON or HTML: it is read by a person deciding whether the cutover
 /// is safe, and the comparison is two rows side by side.
+/// How many failing feeds `/admin/metrics` will name. One response, so bounded.
+const ADMIN_FAILING_FEED_LIMIT: i64 = 200;
+
 async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let did = match current_did(&state, &headers).await {
         Some(d) => d,
@@ -4303,11 +4306,39 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
             "unknown".to_string()
         }
     };
+    // **The half the public histogram cannot carry.** `/stats` reports counts by
+    // cause and nothing else, deliberately — but `fetch` covers DNS failure,
+    // timeout, SSRF refusal AND this reader's own bugs, so the count alone
+    // cannot separate "the publishers are gone" from "we are broken". #159 was
+    // the latter and took a production investigation to establish. Named feeds
+    // and their error text belong here, behind ALLOWED_DIDS.
+    let failing = match crate::store::failing_feeds(&state.db, ADMIN_FAILING_FEED_LIMIT).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn!(%err, "could not list failing feeds");
+            Vec::new()
+        }
+    };
+    let mut failing_block = String::new();
+    if !failing.is_empty() {
+        failing_block.push_str("\nfailing feeds (worst first)\n");
+        for f in &failing {
+            failing_block.push_str(&format!(
+                "  {:>4}x  {:<8}  {}\n          {}\n",
+                f.consecutive_errors,
+                f.kind.as_deref().unwrap_or("unknown"),
+                f.url,
+                f.detail.as_deref().unwrap_or("(no detail recorded)"),
+            ));
+        }
+    }
+
     let body = format!(
-        "live backend: {}\nparked read-state DIDs: {}\n\n{}",
+        "live backend: {}\nparked read-state DIDs: {}\n\n{}{}",
         state.config.repo_backend.as_str(),
         parked,
         crate::metrics::render(&rows),
+        failing_block,
     );
     (StatusCode::OK, body).into_response()
 }
@@ -9088,6 +9119,195 @@ mod tests {
             assert!(
                 !paused.contains(leak),
                 "the public page leaked {leak:?} while reporting failures"
+            );
+        }
+    }
+
+    /// **`/admin/metrics` is gated, and nothing checked that it was.**
+    ///
+    /// Deleting the `admin_seed_dids` check left the entire suite green. That
+    /// was survivable while the page held only aggregate timings; it is not now,
+    /// because this branch puts **per-feed URLs and remote error text** behind
+    /// that gate. A guarantee nothing checks is a comment, and this one is now
+    /// the only thing standing between a signed-in stranger and the operational
+    /// picture the handler's own doc says is not public.
+    ///
+    /// All three doors: no session, a session that is not an admin, and the
+    /// admin itself.
+    #[tokio::test]
+    async fn admin_metrics_is_refused_to_everyone_but_an_admin() {
+        let admin = "did:plc:adminseed";
+        // **Only the admin is in ALLOWED_DIDS**, because `admin_seed_dids()`
+        // IS that list — deliberately, per its doc: "the same people I trust on
+        // this instance". Production sets it to the bootstrap DID alone.
+        //
+        // A genuine non-admin is therefore someone holding a beta seat granted
+        // by an invite, not by the allow-list. Seeding both would have made
+        // both admins and quietly turned the 403 assertion below into a test of
+        // nothing — which is exactly what the first draft of this did.
+        let state = test_state(&[admin]).await;
+        store::grant_access(&state.db, "did:plc:ordinaryuser", None, "invite", None)
+            .await
+            .unwrap();
+        let url = "https://broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            url,
+            feed::FailureKind::Fetch,
+            "SENTINEL_ADMIN_ONLY",
+        )
+        .await
+        .unwrap();
+
+        let get = |state: AppState, cookie: Option<String>| async move {
+            let mut req = Request::builder().uri("/admin/metrics");
+            if let Some(c) = cookie {
+                req = req.header(header::COOKIE, c);
+            }
+            let resp = router(state)
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        };
+
+        // No session at all.
+        let (status, body) = get(state.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            !body.contains("SENTINEL_ADMIN_ONLY"),
+            "leaked to anonymous: {body}"
+        );
+
+        // A real, signed-in user who is not an admin.
+        let ordinary = session_cookie(&state, "did:plc:ordinaryuser", None);
+        let (status, body) = get(state.clone(), Some(ordinary)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a non-admin session was let in"
+        );
+        assert!(
+            !body.contains("SENTINEL_ADMIN_ONLY") && !body.contains("broken.example"),
+            "leaked to a non-admin: {body}",
+        );
+
+        // The admin does get it — otherwise the two refusals above are
+        // satisfied by the endpoint being broken for everyone.
+        let admin_cookie = session_cookie(&state, admin, None);
+        let (status, body) = get(state, Some(admin_cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("SENTINEL_ADMIN_ONLY"),
+            "admin cannot see it: {body}"
+        );
+    }
+
+    /// **The cause a public count cannot carry belongs on the admin page.**
+    ///
+    /// The public histogram is four coarse buckets, and `fetch` is the coarsest:
+    /// #159's own error — `guarded_get` bailing on a 304 — lands there beside
+    /// DNS failure, timeout and SSRF refusal. So the histogram alone would NOT
+    /// have separated "sixty dead publishers" from "one bug here", which is the
+    /// case it was justified by.
+    ///
+    /// The answer is not a finer public vocabulary — `/stats` promises never
+    /// which feed and never whose, and a bucket per error string would break
+    /// that. It is to put the detail where per-feed data is already allowed.
+    /// `/admin/metrics` is gated on `ALLOWED_DIDS` and already carries an
+    /// operational picture.
+    ///
+    /// Asserts both halves: the detail IS on the admin page, and is NOT on the
+    /// public one.
+    #[tokio::test]
+    async fn the_admin_page_names_failing_feeds_and_the_public_page_does_not() {
+        let admin = "did:plc:adminseed";
+        let state = test_state(&[admin]).await;
+        let url = "https://broken.example/f.xml";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::bump_feed_errors(
+            &state.db,
+            url,
+            feed::FailureKind::Fetch,
+            "SENTINEL_REDIRECT_NO_LOCATION",
+        )
+        .await
+        .unwrap();
+
+        let cookie = session_cookie(&state, admin, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/metrics")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let admin_body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            admin_body.contains("SENTINEL_REDIRECT_NO_LOCATION"),
+            "the admin page does not carry the failure detail: {admin_body}",
+        );
+        assert!(
+            admin_body.contains("broken.example"),
+            "the admin page does not name the failing feed: {admin_body}",
+        );
+
+        // The public page still carries neither.
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let public = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for secret in ["SENTINEL_REDIRECT_NO_LOCATION", "broken.example"] {
+            assert!(
+                !public.contains(secret),
+                "{secret:?} reached the PUBLIC stats page: {public}",
             );
         }
     }

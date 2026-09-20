@@ -717,6 +717,52 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
     Ok(feeds)
 }
 
+/// One failing feed, named, for the ADMIN view only.
+///
+/// The public `/stats` histogram is counts by cause and nothing else, by that
+/// page's own stated promise. This is the other half: the coarse bucket
+/// `fetch` covers DNS failure, timeout, SSRF refusal and — as #159 proved —
+/// this reader's own bugs, so a count alone cannot separate "the publishers are
+/// gone" from "we are broken". The detail can, and it lives behind the
+/// `ALLOWED_DIDS` gate where per-feed data is already permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailingFeed {
+    pub url: String,
+    pub consecutive_errors: i64,
+    /// `None` for a row that predates the column — see the `unknown` bucket.
+    pub kind: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Every currently-failing feed with its recorded cause, worst first.
+///
+/// **Admin-gated callers only.** Bounded because this renders into one response
+/// and a large instance should not be able to make that response unbounded.
+pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingFeed>> {
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT url, consecutive_errors, last_error_kind, last_error
+        FROM feeds
+        WHERE consecutive_errors > 0
+        ORDER BY consecutive_errors DESC, url ASC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing failing feeds")?;
+    Ok(rows
+        .into_iter()
+        .map(|(url, consecutive_errors, kind, detail)| FailingFeed {
+            url,
+            consecutive_errors,
+            kind,
+            detail,
+        })
+        .collect())
+}
+
 /// Cap on the stored `last_error` detail. Remote text on an unattended path.
 const MAX_ERROR_DETAIL_CHARS: usize = 300;
 
