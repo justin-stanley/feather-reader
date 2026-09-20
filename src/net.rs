@@ -1934,13 +1934,54 @@ pub(crate) mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = vec![0u8; 8192];
-                let Ok(n) = sock.read(&mut buf).await else {
+                // **The whole request, not the first 8 KB of it.**
+                //
+                // This used to be one `read` into a fixed buffer. Anything past
+                // it was never captured, and the assertions over this log are
+                // NEGATIVE — `!seen.contains("authorization:")` in the
+                // cross-origin credential test — so a short capture satisfies
+                // them exactly as well as a stripped header does. The two are
+                // indistinguishable, and only one of them means the guard works.
+                //
+                // Same shape as `spawn_tls`, deliberately: three test servers
+                // that read alike means the next one copied from any of them
+                // starts correct. And the same limit applies — with no
+                // `content-length` there is nothing to wait for, so a chunked
+                // body stops after the head.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    // **A read error DISCARDS the connection rather than logging
+                    // what arrived so far.** Breaking here and pushing the
+                    // partial would put a truncated request in the log — the
+                    // exact thing this change exists to stop, arriving by a
+                    // different door. `spawn_tls` returns for the same reason.
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|want| body.len() >= want) {
+                        break;
+                    }
+                }
+                if raw.is_empty() {
                     continue;
-                };
+                }
                 sink.lock()
                     .unwrap()
-                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    .push(String::from_utf8_lossy(&raw).to_string());
                 let body = responses
                     .get(i)
                     .cloned()
@@ -2136,6 +2177,16 @@ pub(crate) mod tests {
         assert!(resp.status().is_success());
 
         let seen = b_log.lock().unwrap().join("\n").to_ascii_lowercase();
+        // **Anchor the two negatives below.** `!contains` is satisfied by the
+        // header being absent OR by the capture being short, and those are
+        // indistinguishable from here. Asserting the hop was recorded at all
+        // means an empty or truncated capture fails loudly instead of reading
+        // as a pass — which, for a check about not leaking a bearer token
+        // across origins, is the difference that matters.
+        assert!(
+            seen.contains("get /next"),
+            "hop B recorded no request, so the assertions below prove nothing:\n{seen}",
+        );
         assert!(
             !seen.contains("super-secret"),
             "the bearer token was forwarded across origins:\n{seen}",
@@ -2213,6 +2264,59 @@ pub(crate) mod tests {
         }
         // No answers at all is an error, not a silent pass.
         assert!(first_vetted("empty.example", std::iter::empty()).is_err());
+    }
+
+    /// **The capture must hold the whole request, not the first 8 KB of it.**
+    ///
+    /// `spawn_http` recorded one `sock.read()` into a fixed 8 KB buffer and
+    /// treated that as the request. Anything past it was never captured — and
+    /// never seen by the assertions that read the capture.
+    ///
+    /// That matters because the assertions downstream are NEGATIVE:
+    /// `credentials_are_dropped_when_a_redirect_leaves_the_origin` checks
+    /// `!seen.contains("authorization:")`. A short capture satisfies that exactly
+    /// as well as a stripped header does, and the two are indistinguishable.
+    ///
+    /// A body larger than the buffer makes the truncation deterministic rather
+    /// than waiting on TCP segmentation, which is why this test can go red at
+    /// all.
+    #[tokio::test]
+    async fn the_request_capture_is_not_truncated_at_the_buffer_size() {
+        let (addr, log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("big-body.test", addr);
+
+        // Comfortably past the old 8 KB read, with a sentinel at the very end.
+        let filler = "x".repeat(32 * 1024);
+        let body = format!("{{\"pad\":\"{filler}\",\"tail\":\"THE-LAST-BYTES\"}}");
+
+        // Not `let _ =`: a refused POST leaves the capture empty, and
+        // "captured no request at all" would be the only symptom with the
+        // cause thrown away.
+        guarded_post_json(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://big-body.test:{}/ingest", addr.port()),
+            &[],
+            body.into_bytes(),
+        )
+        .await
+        .expect("the POST to the test server failed before anything was captured");
+
+        let seen = log.lock().unwrap().join("\n");
+        // Positive anchor first: without it, the tail assertion below could pass
+        // vacuously on an empty capture in some future refactor.
+        assert!(
+            seen.contains("POST /ingest"),
+            "the server captured no request at all: {} bytes",
+            seen.len()
+        );
+        assert!(
+            seen.contains("THE-LAST-BYTES"),
+            "the capture stops short of the request's end, so every negative \
+             assertion over it — including the one about not leaking an \
+             Authorization header across origins — can pass for the wrong \
+             reason. captured {} bytes",
+            seen.len()
+        );
     }
 
     // ── TLS test server ──────────────────────────────────────────────────────

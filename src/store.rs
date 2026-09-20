@@ -6814,6 +6814,292 @@ mod tests {
         Ok(())
     }
 
+    /// What a sweep driven by a lock test actually did.
+    ///
+    /// `Contended` is NOT a failure. `SQLITE_BUSY` on the pruner is an outcome
+    /// production expects and handles — `scheduler.rs` logs it and the next tick
+    /// retries — so a test that treats it as a regression is stricter than the
+    /// system it guards, and fails for a reason its own assertions are not
+    /// about. See #146.
+    enum SweepOutcome {
+        Completed(u64),
+        Contended,
+    }
+
+    /// True for the `SQLITE_BUSY` FAMILY anywhere in the chain.
+    ///
+    /// Matched on the DRIVER CODE, not on the message text: "database is
+    /// locked" is a string another error could plausibly carry, and this
+    /// decides whether a test failure is suppressed.
+    ///
+    /// **Masked to the primary code.** sqlx-sqlite's `code()` returns
+    /// `sqlite3_extended_errcode` verbatim, so comparing it to `"5"` matches
+    /// only bare `SQLITE_BUSY` and treats the WAL variants as hard failures:
+    /// `BUSY_RECOVERY` (261), `BUSY_SNAPSHOT` (517), `BUSY_TIMEOUT` (773).
+    /// This database runs in WAL mode and `store.rs` already documents hitting
+    /// `SQLITE_BUSY_SNAPSHOT`, so that gap is not hypothetical — the narrowing
+    /// would have rejected the very class this tolerance exists for.
+    ///
+    /// `& 0xFF` is how SQLite defines the relationship: the low byte of an
+    /// extended code IS the primary code.
+    fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+        err.chain().any(|e| {
+            e.downcast_ref::<sqlx::Error>().is_some_and(|e| match e {
+                sqlx::Error::Database(db) => db
+                    .code()
+                    .and_then(|c| c.parse::<i32>().ok())
+                    .is_some_and(is_busy_code),
+                _ => false,
+            })
+        })
+    }
+
+    /// The classification, split out so the WAL variants are TESTABLE.
+    ///
+    /// A `BUSY_SNAPSHOT` cannot be produced on demand in a test, so without
+    /// this the claim that 261/517/773 are tolerated would be a comment and
+    /// nothing else. The wiring — that `is_sqlite_busy` consults this at all —
+    /// is pinned separately by `a_busy_sweep_is_reported_as_contended_not_as_a_failure`,
+    /// which drives a real `SQLITE_BUSY` end to end.
+    fn is_busy_code(code: i32) -> bool {
+        code & 0xFF == 5
+    }
+
+    /// **The whole `SQLITE_BUSY` family, and nothing else.**
+    #[test]
+    fn busy_codes_cover_the_wal_variants() {
+        for code in [
+            5,   // SQLITE_BUSY
+            261, // SQLITE_BUSY_RECOVERY
+            517, // SQLITE_BUSY_SNAPSHOT
+            773, // SQLITE_BUSY_TIMEOUT
+        ] {
+            assert!(
+                is_busy_code(code),
+                "{code} is in the BUSY family but would be treated as a hard failure"
+            );
+        }
+        for code in [
+            0,   // SQLITE_OK
+            1,   // SQLITE_ERROR
+            6,   // SQLITE_LOCKED — adjacent, and deliberately NOT tolerated
+            262, // SQLITE_LOCKED_SHAREDCACHE
+            11,  // SQLITE_CORRUPT
+        ] {
+            assert!(
+                !is_busy_code(code),
+                "{code} is not contention, but would be swallowed as though it were"
+            );
+        }
+    }
+
+    /// Run the batched delete, separating "the write lock was contended" from
+    /// "the loop misbehaved". Only the second is this test's subject.
+    async fn sweep_tolerating_busy(
+        pool: &SqlitePool,
+        select_ids: &str,
+        cutoff: &str,
+        label: &str,
+    ) -> Result<SweepOutcome> {
+        match delete_in_batches(pool, select_ids, cutoff, label).await {
+            Ok(n) => Ok(SweepOutcome::Completed(n)),
+            // Contended, not broken. Narrowed to SQLITE_BUSY on purpose: every
+            // other error still fails the caller, so this is not a blanket
+            // `let _ =` that would delete the test while keeping its name.
+            Err(err) if is_sqlite_busy(&err) => Ok(SweepOutcome::Contended),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// **A sweep that loses the write lock is inconclusive, not a failure.**
+    ///
+    /// CI hit this on `main` at `d05a716`: the sweeper took `SQLITE_BUSY` and
+    /// the test reported a regression, on a tree whose only changes were two
+    /// version strings and a changelog.
+    ///
+    /// Forced deterministically rather than waiting for a contended runner — it
+    /// did not reproduce in 48 local runs — by holding a write transaction open
+    /// and giving the sweep a `busy_timeout` short enough to give up at once.
+    #[tokio::test]
+    async fn a_busy_sweep_is_reported_as_contended_not_as_a_failure() -> Result<()> {
+        struct TempDb(std::path::PathBuf);
+        impl Drop for TempDb {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm"] {
+                    std::fs::remove_file(format!("{}{suffix}", self.0.display())).ok();
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("fr-busysweep-{}.db", std::process::id()));
+        drop(TempDb(path.clone()));
+        let _tmp = TempDb(path.clone());
+        let url = format!("sqlite://{}", path.display());
+        let pool = init_url(&url).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://busy.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let entries: Vec<NewEntry> = (0..4)
+            .map(|i| NewEntry {
+                guid: format!("busy-{i}"),
+                url: Some(format!("https://busy.example/{i}")),
+                title: Some(format!("e{i}")),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 1_000).await?;
+
+        // A sweep pool that gives up on a contended write immediately.
+        let sweep_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                url.parse::<sqlx::sqlite::SqliteConnectOptions>()?
+                    .busy_timeout(std::time::Duration::from_millis(2)),
+            )
+            .await?;
+
+        // Hold the write lock for the duration of the sweep below.
+        let mut blocker = pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await?;
+
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let outcome = sweep_tolerating_busy(
+            &sweep_pool,
+            "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
+            &cutoff,
+            "busy-sweep-test",
+        )
+        .await;
+
+        sqlx::query("ROLLBACK").execute(&mut *blocker).await.ok();
+
+        match outcome {
+            Ok(SweepOutcome::Contended) => Ok(()),
+            Ok(SweepOutcome::Completed(n)) => panic!(
+                "the sweep completed ({n} rows) while the write lock was held — \
+                 the fixture is not actually contending, so this test proves nothing"
+            ),
+            Err(err) => panic!(
+                "a contended sweep was reported as a failure rather than as \
+                 inconclusive; production logs this and retries on the next \
+                 tick (scheduler.rs): {err:#}"
+            ),
+        }
+    }
+
+    /// **A sweep error that is NOT `SQLITE_BUSY` must still fail.**
+    ///
+    /// `sweep_tolerating_busy` claims to narrow its tolerance to contention.
+    /// Without this, that claim is unenforced: widening the arm to `Err(_) =>
+    /// Contended` swallows every sweep error — a malformed query, a missing
+    /// table, a corrupt file — and the whole suite stays green. Measured, not
+    /// assumed: that mutation passed 733 tests before this test existed.
+    #[tokio::test]
+    async fn a_non_busy_sweep_error_still_fails() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // A table that does not exist: SQLITE_ERROR (1), not SQLITE_BUSY (5).
+        let outcome = sweep_tolerating_busy(
+            &pool,
+            "SELECT id FROM no_such_table WHERE created < ?1",
+            "2026-01-01T00:00:00Z",
+            "bad-query-test",
+        )
+        .await;
+
+        match outcome {
+            Err(err) => {
+                assert!(
+                    !is_sqlite_busy(&err),
+                    "fixture drifted: this must be a non-BUSY error, got {err:#}"
+                );
+                Ok(())
+            }
+            Ok(SweepOutcome::Contended) => panic!(
+                "a malformed sweep was reported as lock contention — the \
+                 tolerance is a blanket error swallow, not a narrowing"
+            ),
+            Ok(SweepOutcome::Completed(n)) => {
+                panic!("a sweep over a missing table reported {n} rows deleted")
+            }
+        }
+    }
+
+    /// **An UNCONTENDED sweep must report `Completed`.**
+    ///
+    /// This exists to stop the `Contended` arm above becoming a way to never
+    /// run the hand-off assertions. Make `sweep_tolerating_busy` return
+    /// `Contended` unconditionally and the sweep-lock test still passes — it
+    /// just silently stops testing anything. This one fails instead.
+    ///
+    /// That is the difference between tolerating a real contention loss and
+    /// deleting a test while keeping its name.
+    #[tokio::test]
+    async fn a_sweep_with_no_contention_completes() -> Result<()> {
+        struct TempDb(std::path::PathBuf);
+        impl Drop for TempDb {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm"] {
+                    std::fs::remove_file(format!("{}{suffix}", self.0.display())).ok();
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("fr-calmsweep-{}.db", std::process::id()));
+        drop(TempDb(path.clone()));
+        let _tmp = TempDb(path.clone());
+        let pool = init_url(&format!("sqlite://{}", path.display())).await?;
+
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://calm.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let entries: Vec<NewEntry> = (0..3)
+            .map(|i| NewEntry {
+                guid: format!("calm-{i}"),
+                published: Some(old.clone()),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 1_000).await?;
+
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        match sweep_tolerating_busy(
+            &pool,
+            "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
+            &cutoff,
+            "calm-sweep-test",
+        )
+        .await?
+        {
+            SweepOutcome::Completed(n) => {
+                assert_eq!(n, 3, "the uncontended sweep did not delete the fixture");
+                Ok(())
+            }
+            SweepOutcome::Contended => panic!(
+                "nothing was holding the write lock, yet the sweep reported \
+                 contention — every test that skips on `Contended` is now \
+                 skipping unconditionally"
+            ),
+        }
+    }
+
     /// **The sweep must not lock other writers out for its duration.**
     ///
     /// The whole sweep used to be one transaction — both deletes plus a global
@@ -7005,7 +7291,7 @@ mod tests {
         let hard_cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let t0 = std::time::Instant::now();
-        let deleted = delete_in_batches(
+        let outcome = sweep_tolerating_busy(
             &pool,
             "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
             &hard_cutoff,
@@ -7013,8 +7299,37 @@ mod tests {
         )
         .await?;
         let sweep = t0.elapsed();
+
+        // **Teardown happens on BOTH paths, before the outcome is inspected.**
+        //
+        // The contended arm below used to carry its own copy of these two lines.
+        // A probe proved that arm is never reached by the suite — a `panic!` in
+        // it failed nothing — so it was five lines of unexercised teardown that
+        // would run for the first time on a contended CI runner, which is
+        // exactly when it has to work. Hoisting leaves the arm with nothing that
+        // can be wrong.
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let (outcomes, first_err) = writer.await?;
+
+        let deleted = match outcome {
+            SweepOutcome::Completed(n) => n,
+            // **Inconclusive, not a regression.** The sweeper lost the write
+            // lock, which says nothing about whether it hands the lock over
+            // between batches — the property below. Production logs this and
+            // retries on the next tick (`scheduler.rs`), so a test that failed
+            // here would be stricter than the system it guards. Observed on CI
+            // at `d05a716`, on a tree with no `.rs` change at all.
+            //
+            // `a_sweep_with_no_contention_completes` is what stops this arm
+            // becoming a way to never run the assertions.
+            SweepOutcome::Contended => {
+                eprintln!(
+                    "sweep-lock test INCONCLUSIVE: the sweeper took SQLITE_BUSY; \
+                     the hand-off assertions did not run"
+                );
+                return Ok(());
+            }
+        };
         let sweep_end = t0 + sweep;
         // Attempts actually made inside the measured window, in order.
         let inside: Vec<bool> = outcomes
