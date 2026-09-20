@@ -42,6 +42,9 @@ pub mod nsid {
     /// ours: it is another project's lexicon, named here because it is the only
     /// foreign collection this reader will accept as a subscribable feed.
     pub const STANDARD_PUBLICATION: &str = "site.standard.publication";
+
+    /// `site.standard.document` — one standard.site article. Also not ours.
+    pub const STANDARD_DOCUMENT: &str = "site.standard.document";
 }
 
 /// Optional polling-cadence hint on a [`Subscription`]. Readers MAY honor or
