@@ -263,12 +263,9 @@ mod tests {
         let b = read_state_rkey("https://example.com/feed.xml");
         assert_eq!(a, b, "rkey must be deterministic");
         assert_ne!(a, read_state_rkey("https://other.example/feed.xml"));
-        // Valid atproto rkey charset and length.
-        assert!(a.len() <= 512 && !a.is_empty());
-        assert!(a
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b':')));
-        assert!(a != "." && a != "..");
+        // Valid atproto rkey: charset, length and the reserved names, as the
+        // one shared rule states them.
+        assert!(crate::atproto::is_valid_rkey(&a), "{a:?}");
     }
     #[test]
     fn parse_id_array_tolerates_shapes() {

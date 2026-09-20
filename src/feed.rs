@@ -224,6 +224,93 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
     },
 ];
 
+/// Whether a URL may be **stored or published** as a feed URL at all.
+///
+/// This is the storage-side twin of the scheme check `net::check_scheme` applies
+/// before fetching. The fetch side has always been safe, because nothing can
+/// reach the network except through `net.rs` — but "safe to fetch" and "safe to
+/// write down" are different questions, and only the first had an answer.
+///
+/// Two paths took a URL from outside and stored it with no validation at all:
+/// `resolve_subscriptions` (any atproto client can write a subscription record
+/// into a user's repo) and the OPML import (`xmlUrl` is whatever the file says).
+/// `classify_feed_privacy` does not cover this — it deliberately returns
+/// `Public` for an unparseable URL, on the stated assumption that "the add path
+/// will reject it as malformed regardless", and those two paths are the ones
+/// that never had an add path to do the rejecting.
+///
+/// Note that `javascript:alert(1)` and `file:///etc/passwd` both *parse* cleanly
+/// as URLs, so parsing is not the check — the scheme is.
+pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
+    // **`at://` is checked BEFORE `Url::parse`, because `Url::parse` cannot read
+    // the form that matters.** `at://did:plc:…/…` fails to parse with *invalid
+    // port number* — the colons in the DID are taken as a port separator — while
+    // the handle form `at://alice.example.com/…` parses fine. So adding `"at"`
+    // to the `matches!` below would appear to work and silently reject every
+    // DID-based at-URI, which is all of them in practice.
+    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
+        // **This gates STORING only — polling is handled by exclusion**, on
+        // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
+        // place the why is written down.
+        return allow_at_uri && is_storable_publication_uri(rest);
+    }
+    match Url::parse(url) {
+        Ok(u) => {
+            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
+/// The body of an `at://` URI — `<did-or-handle>/<collection>/<rkey>` — judged
+/// as a **storable feed**.
+///
+/// An allowlist entry, not a loosening: exactly one foreign collection is
+/// accepted, `site.standard.publication`. The two paths this guard exists for
+/// (`resolve_subscriptions`, the OPML import) take records written by any
+/// atproto client, so "it is an at-URI" is not a reason to store it — only "it
+/// is a publication this reader knows how to poll" is.
+fn is_storable_publication_uri(rest: &str) -> bool {
+    let mut parts = rest.split('/');
+    let (Some(authority), Some(collection), Some(rkey)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    parts.next().is_none()
+        && collection == crate::lexicon::nsid::STANDARD_PUBLICATION
+        // **The rkey is validated against atproto's rules, not a blacklist.**
+        //
+        // A blacklist was the first attempt and it leaked twice: `is_control()`
+        // is Unicode category Cc only, so a bidi override (Cf) passed — and it
+        // reordered both the manage page and `scheduler.rs`'s `%feed.url` log
+        // line. Worse, nothing stopped a query string or fragment living inside
+        // the rkey, which satisfies the three-segment check and is exactly what
+        // `classify_feed_privacy`'s `at://` exemption keys off: a token
+        // smuggled there would have been declared public.
+        //
+        // An allowlist cannot leak the next character class someone finds.
+        // The charset alone still admitted `.`, `..` and a 10 000-byte key;
+        // `is_valid_rkey` carries the length and reserved-name rules too.
+        && crate::atproto::is_valid_rkey(rkey)
+        && is_storable_at_authority(authority)
+}
+
+/// The DID form only. `did:plc:` identifiers are validated by
+/// [`crate::oauth::identity::is_atproto_did`] rather than a `did:` prefix check,
+/// which would accept `did:plc:TOOSHORT`.
+///
+/// **The handle form is not storable, for the reason the canonical-handle rule
+/// already gave:** `feeds.url` is UNIQUE, so `at://alice.example.com/…` beside
+/// `at://did:plc:…/…` is two rows — two sidebar entries, and two polled copies
+/// once the reader is wired — for one publication. A handle is a mutable name
+/// for a DID; the row is keyed on the identity. Resolving a pasted or imported
+/// handle to its DID is the reader's job (#165 already resolves DIDs to their
+/// PDS), and belongs at input, not in storage.
+fn is_storable_at_authority(authority: &str) -> bool {
+    crate::oauth::identity::is_atproto_did(authority)
+}
+
 /// Classify whether a feed URL carries a secret credential in the URL itself.
 ///
 /// Returns [`FeedPrivacy::Private`] (with a reason) when the URL looks like it
@@ -251,33 +338,42 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
 /// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
 /// a malformed URL downstream anyway, and we don't want a parse quirk to
 /// misclassify.
-/// Whether a URL may be **stored or published** as a feed URL at all.
-///
-/// This is the storage-side twin of the scheme check `net::check_scheme` applies
-/// before fetching. The fetch side has always been safe, because nothing can
-/// reach the network except through `net.rs` — but "safe to fetch" and "safe to
-/// write down" are different questions, and only the first had an answer.
-///
-/// Two paths took a URL from outside and stored it with no validation at all:
-/// `resolve_subscriptions` (any atproto client can write a subscription record
-/// into a user's repo) and the OPML import (`xmlUrl` is whatever the file says).
-/// `classify_feed_privacy` does not cover this — it deliberately returns
-/// `Public` for an unparseable URL, on the stated assumption that "the add path
-/// will reject it as malformed regardless", and those two paths are the ones
-/// that never had an add path to do the rejecting.
-///
-/// Note that `javascript:alert(1)` and `file:///etc/passwd` both *parse* cleanly
-/// as URLs, so parsing is not the check — the scheme is.
-pub fn is_storable_feed_url(url: &str) -> bool {
-    match Url::parse(url) {
-        Ok(u) => {
-            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
-        }
-        Err(_) => false,
-    }
-}
-
 pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
+    // **`at://` is classified deliberately, and NOT doing so refused real
+    // subscriptions.** An atproto rkey is a TID — 13 base32-sortable characters
+    // — which is exactly what the generic "high-entropy token in path"
+    // heuristic below is looking for. Measured: without this arm,
+    // `at://did:plc:…/site.standard.publication/3lab2c4d5e6f7g8h` is
+    // classified PRIVATE and the subscription refused, while the DID form slips
+    // through only because it fails to parse as a `Url` at all.
+    //
+    // `Public` is the right answer: a publication is a public record in a
+    // public repo and the rkey is a handle, not a secret, so there is no
+    // private/paid shape for this scheme to carry.
+    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
+        // **Only a WELL-FORMED publication URI is exempt.** The first version
+        // of this was a bare prefix match, which declared any attacker-chosen
+        // string starting `at://` safe to publish — skipping the userinfo
+        // check, the known-provider table, the private-path markers, the
+        // secret-query keys and the entropy heuristics all at once. That is a
+        // regression against every one of them, on a path
+        // (`rename_subscription`) where this function is the only gate and the
+        // value is written to the user's PUBLIC repo.
+        //
+        // Anything else falls through to the generic checks below, which is
+        // where a credential-bearing string belongs.
+        if is_storable_publication_uri(rest) {
+            return FeedPrivacy::Public;
+        }
+        // **Malformed `at://` is REFUSED, not passed through.** Falling through
+        // reaches `Url::parse`, which fails on the DID form and lands on the
+        // `Err(_) => Public` arm below — whose justification is "the add path
+        // will reject it as a malformed URL regardless". That justification is
+        // false on the `rename_subscription` path, where this function is the
+        // only gate. So a string we cannot even recognise as a publication is
+        // refused here rather than declared safe to publish.
+        return FeedPrivacy::Private("not a well-formed at:// publication URI".to_string());
+    }
     let parsed = match Url::parse(url) {
         Ok(u) => u,
         // Can't parse => the add path will reject it as a malformed URL regardless.
@@ -1044,13 +1140,18 @@ pub fn discover_feed(site_html: &str, base: Option<&Url>) -> Option<Url> {
                     continue;
                 }
                 // Absolute URL wins directly; otherwise resolve against `base`.
-                if let Ok(u) = Url::parse(href) {
-                    return Some(u);
-                }
-                if let Some(b) = base {
-                    if let Ok(u) = b.join(href) {
-                        return Some(u);
-                    }
+                // Either way, only http(s): the href is publisher-controlled and
+                // `Url::parse` accepts any scheme, so this is where an `at://`
+                // (or `file:`, `javascript:`) alternate would otherwise become
+                // the URL the add path stores — after its input gate has run.
+                // Skip, don't stop: a later real feed link still wins.
+                let resolved = match Url::parse(href) {
+                    Ok(u) => Some(u),
+                    Err(_) => base.and_then(|b| b.join(href).ok()),
+                };
+                match resolved {
+                    Some(u) if matches!(u.scheme(), "http" | "https") => return Some(u),
+                    _ => continue,
                 }
             }
         }
@@ -1227,6 +1328,35 @@ mod tests {
         assert!(!html.to_ascii_lowercase().contains("<iframe"));
     }
 
+    /// **The rkey obeys all of atproto's record-key rules, not just the
+    /// charset.** `.` and `..` are reserved and the length is 1..=512; the
+    /// charset alone admitted both and a 10 000-character key, into a UNIQUE
+    /// column and the user's public PDS. The rule is the one the repo's own
+    /// TID tests already state.
+    #[test]
+    fn an_rkey_must_obey_atprotos_length_and_dot_rules() {
+        let uri = |rkey: &str| {
+            format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/{rkey}")
+        };
+        assert!(
+            !is_storable_feed_url(&uri("."), true),
+            "`.` is a reserved rkey"
+        );
+        assert!(
+            !is_storable_feed_url(&uri(".."), true),
+            "`..` is a reserved rkey"
+        );
+        assert!(
+            !is_storable_feed_url(&uri(&"a".repeat(513)), true),
+            "an rkey over 512 bytes was accepted"
+        );
+        assert!(
+            is_storable_feed_url(&uri(&"a".repeat(512)), true),
+            "an rkey of exactly 512 bytes is valid"
+        );
+        assert!(is_storable_feed_url(&uri("3lab2c4d5e6f7g8h"), true));
+    }
+
     #[test]
     fn discover_finds_rss_link() {
         let html = r#"<!doctype html><html><head>
@@ -1243,6 +1373,31 @@ mod tests {
     fn discover_finds_atom_absolute_link() {
         let html = r#"<head><link rel="alternate" type="application/atom+xml" href="https://x.example/atom"></head>"#;
         let found = discover_feed(html, None).expect("should discover absolute feed");
+        assert_eq!(found.as_str(), "https://x.example/atom");
+    }
+
+    /// **Autodiscovery only ever yields an http(s) URL.**
+    ///
+    /// The href is publisher-controlled and `Url::parse` accepts any scheme, so
+    /// a page could hand the add path an `at://` publication URI (or anything
+    /// else) that the user never typed — and the add path's input gate has
+    /// already run by then. A non-http(s) alternate is skipped, not returned,
+    /// so a later real feed link still wins.
+    #[test]
+    fn discover_skips_a_non_http_alternate() {
+        let at_link = r#"<link rel="alternate" type="application/rss+xml" href="at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h">"#;
+        assert!(
+            discover_feed(&format!("<head>{at_link}</head>"), None).is_none(),
+            "an at:// alternate was handed back as a feed URL"
+        );
+        let ftp_link =
+            r#"<link rel="alternate" type="application/atom+xml" href="ftp://x.example/atom">"#;
+        assert!(discover_feed(&format!("<head>{ftp_link}</head>"), None).is_none());
+
+        let real =
+            r#"<link rel="alternate" type="application/atom+xml" href="https://x.example/atom">"#;
+        let found = discover_feed(&format!("<head>{at_link}{real}</head>"), None)
+            .expect("the http(s) link after a skipped one must still be found");
         assert_eq!(found.as_str(), "https://x.example/atom");
     }
 
@@ -1578,5 +1733,205 @@ mod tests {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
         assert!(backoff_for(2) > backoff_for(1));
         assert_eq!(backoff_for(100), BACKOFF_MAX);
+    }
+
+    /// **Storable and pollable are ONE decision.**
+    ///
+    /// Review found the sequencing error this closes: making `at://` storable
+    /// while nothing can poll it does not leave the feature dormant, it creates
+    /// permanent failures that the cause histogram then publishes as
+    /// unreachable publishers — the exact conflation it exists to end.
+    #[test]
+    fn an_at_uri_is_not_storable_while_standard_site_is_off() {
+        let uri = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        assert!(
+            !is_storable_feed_url(uri, false),
+            "stored a feed nothing can poll"
+        );
+        assert!(is_storable_feed_url(uri, true));
+        assert!(is_storable_feed_url("https://example.com/feed.xml", false));
+        assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+    }
+
+    /// **The handle form is not storable — the DID form is the identity.**
+    ///
+    /// `feeds.url` is UNIQUE; a handle and its DID would be two rows for one
+    /// publication, and a handle can change hands. Every spelling is refused,
+    /// canonical or not; resolving one to a DID is the input path's job.
+    #[test]
+    fn a_handle_form_publication_uri_is_not_storable() {
+        for authority in [
+            "alice.example.com",
+            "EXAMPLE.COM",
+            "169.254.169.254",
+            "pds.internal",
+            "printer.local",
+            "host:8080",
+            "-.-",
+            "a b.c",
+        ] {
+            let uri = format!("at://{authority}/site.standard.publication/3lab");
+            assert!(
+                !is_storable_feed_url(&uri, true),
+                "accepted authority {authority:?}"
+            );
+        }
+    }
+
+    /// A control character or space in the at-URI is refused: `scheduler.rs`
+    /// logs `%feed.url` with Display, and `feeds.url` is UNIQUE.
+    #[test]
+    fn an_at_uri_with_control_characters_is_not_storable() {
+        for bad in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab\n",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab ",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3l\tab",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+    }
+
+    /// **The `at://` exemption is a REGRESSION unless it is narrow.**
+    ///
+    /// Fan-out review found the arm I added was a bare prefix match, so *any*
+    /// attacker-chosen string starting `at://` was declared safe to publish —
+    /// skipping the userinfo check, the known-provider table, the private-path
+    /// markers, the secret-query keys and the entropy heuristics. Measured
+    /// against `main`, these three went from `Private` to `Public`.
+    ///
+    /// That matters because `rename_subscription` caches the URL AND rewrites
+    /// the user's PUBLIC PDS record, with `classify_feed_privacy` as its only
+    /// gate.
+    #[test]
+    fn a_credential_bearing_at_uri_is_still_private() {
+        for hostile in [
+            "at://user:pass@private.example.com/feed/private/TOKEN?apikey=deadbeefdeadbeef",
+            "at://patreon.com/rss/12345?auth=deadbeefdeadbeefdeadbeef",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab?apikey=sekrit",
+        ] {
+            assert!(
+                matches!(classify_feed_privacy(hostile), FeedPrivacy::Private(_)),
+                "declared public: {hostile}"
+            );
+        }
+    }
+
+    /// An rkey is `[A-Za-z0-9._:~-]` per atproto. Without that, a query string
+    /// or path fragment smuggled into the rkey satisfies the three-segment
+    /// check — which is what the exemption above keys off.
+    #[test]
+    fn an_rkey_outside_the_atproto_charset_is_not_storable() {
+        for bad in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab?apikey=sekrit",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab#frag",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab%2Fevil",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/caf\u{e9}",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab\u{202e}x",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted rkey in {bad:?}");
+        }
+        // The legitimate charset still passes.
+        for good in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/a.b_c~d-e",
+        ] {
+            assert!(is_storable_feed_url(good, true), "refused {good:?}");
+        }
+    }
+
+    /// **A real rkey is a TID, and a TID looks exactly like a secret.**
+    ///
+    /// Without an explicit `at://` arm, `classify_feed_privacy` runs the generic
+    /// "high-entropy token in path" heuristic over the rkey. Measured: a
+    /// realistic 16-char rkey on a handle-form at-URI is classified PRIVATE and
+    /// the subscription REFUSED. The DID form escaped only because it fails to
+    /// parse as a `Url` at all — so the bug was invisible from that side.
+    ///
+    /// The first version of this test used the rkey `3lab`, which is too short
+    /// to trip the heuristic, so it passed with and without the fix.
+    #[test]
+    fn a_realistic_at_uri_rkey_is_not_mistaken_for_a_secret() {
+        for uri in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/aB3xK9pQ7mZ2vN8w",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h",
+        ] {
+            assert_eq!(
+                classify_feed_privacy(uri),
+                FeedPrivacy::Public,
+                "a publication rkey was mistaken for a credential: {uri}"
+            );
+        }
+    }
+
+    /// **The DID form is the one that matters, and the one `Url::parse` cannot
+    /// read.**
+    ///
+    /// `Url::parse("at://did:plc:…/…")` fails with *invalid port number* — the
+    /// colons in the DID are taken as a port separator. So the obvious
+    /// implementation, adding `"at"` to the `matches!` on `u.scheme()`, silently
+    /// rejects every DID-based at-URI while appearing to work: the handle form
+    /// (`at://alice.example.com/…`) parses fine and would pass such a test.
+    ///
+    /// All 19 at-URI rows in production are the DID form. A test written with a
+    /// handle would have passed against an implementation that cannot store a
+    /// single one of them.
+    #[test]
+    fn a_did_form_publication_uri_is_storable() {
+        assert!(is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            true
+        ));
+    }
+
+    /// **An allowlist entry, not a loosening.** `at://` is accepted for exactly
+    /// one foreign collection. Any other collection is somebody else's lexicon
+    /// arriving through a path (`resolve_subscriptions`, OPML import) that takes
+    /// records from outside with no add-path to reject them.
+    #[test]
+    fn an_at_uri_for_another_collection_is_not_storable() {
+        assert!(!is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab",
+            true
+        ));
+        assert!(!is_storable_feed_url(
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
+            true
+        ));
+    }
+
+    /// The malformed shapes, each of which a naive `split('/')` would accept.
+    #[test]
+    fn a_malformed_at_uri_is_not_storable() {
+        for bad in [
+            "at://",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/",
+            "at:///site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab/extra",
+            "at://not-a-did-or-handle/site.standard.publication/3lab",
+            "at://did:plc:TOOSHORT/site.standard.publication/3lab",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+    }
+
+    /// **The reason the function exists, unchanged.** Mutating the new branch to
+    /// accept any scheme makes this fail while the at-URI tests keep passing —
+    /// that asymmetry is what says the change was an allowlist entry.
+    #[test]
+    fn the_refused_schemes_are_still_refused() {
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>",
+            "ftp://example.com/feed.xml",
+            "at:did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            assert!(!is_storable_feed_url(bad, true), "accepted {bad:?}");
+        }
+        assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+        assert!(is_storable_feed_url("http://example.com/feed.xml", true));
     }
 }

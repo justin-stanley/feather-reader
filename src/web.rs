@@ -1745,7 +1745,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                 // `…/feed/private/<token>` into the SHARED `feeds` table breaks
                 // that promise even though `net::guarded_get` still refuses to
                 // fetch it.
-                if !feed::is_storable_feed_url(&sub.url)
+                if !feed::is_storable_feed_url(&sub.url, state.config.standard_site)
                     || feed::classify_feed_privacy(&sub.url).is_private()
                 {
                     warn!(
@@ -2906,6 +2906,14 @@ async fn mark_all_read(
 // Subscribe by URL
 // ---------------------------------------------------------------------------
 
+/// Flash for a URL this instance cannot store as a feed — not private, just
+/// not a kind of feed it supports (an `at://` publication with
+/// `FEATHERREADER_STANDARD_SITE` off, an unsupported scheme). Distinct from
+/// [`PRIVATE_FEED_REFUSAL`], whose "not saved or sent anywhere" would be a
+/// false promise for a record that may already exist in the user's PDS.
+const UNSUPPORTED_FEED_URL_REFUSAL: &str =
+    "That isn't a kind of feed this instance can subscribe to. Nothing was saved.";
+
 /// Refusal message shown when a private/paid feed is submitted. FeatherReader
 /// stores subscriptions in the user's PUBLIC PDS, so it supports public feeds
 /// only for now — a private feed's secret URL is never saved, fetched, or sent
@@ -2939,6 +2947,29 @@ async fn add_subscription(
     let input = form.url.trim().to_string();
     if input.is_empty() {
         return Ok(Redirect::to("/").into_response());
+    }
+
+    // An `at://` paste is refused here, whatever the flag says: this path must
+    // FETCH what was pasted to find the feed in it, and nothing fetches
+    // `at://` until the standard.site reader is wired. Letting a well-formed
+    // one through produced "Couldn't find a feed" and a `warn!` for an
+    // expected condition; letting a malformed one reach the privacy arm, which
+    // fails closed as `Private`, told the reader a typo was a paid feed. Only
+    // `at://` is pre-checked — an http(s) or scheme-less paste keeps its
+    // "Couldn't find a feed" path below, which is the accurate answer there.
+    // Case-insensitive, unlike the storage guards: `Url::parse` folds the
+    // scheme, so `AT://…` would otherwise skip both this and the classifier's
+    // at:// arm, parse as `at`, and draw the private/paid flash off the rkey.
+    // This decides a MESSAGE; nothing about storage keys off it.
+    if input
+        .get(..crate::atproto::AT_URI_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(crate::atproto::AT_URI_PREFIX))
+    {
+        info!(url = %input, %did, "refused an at:// paste: the add path cannot fetch one (not stored)");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
+        );
     }
 
     // Block private/paid feeds BEFORE any fetch/resolve so a secret-bearing URL is
@@ -2991,6 +3022,18 @@ async fn add_subscription(
         info!(url = %feed_url, %reason, %did, "refused private/paid feed after resolution (not stored)");
         return Ok(
             Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+        );
+    }
+
+    // The URL about to be STORED is what must be storable — not the one the
+    // user typed. Autodiscovery already yields only http(s), but this is the
+    // path that writes the row and the PDS record, so the check lives here too:
+    // the same gate the OPML and rename paths apply, on the same terms.
+    if !feed::is_storable_feed_url(&feed_url, state.config.standard_site) {
+        info!(url = %feed_url, %did, "refused unsupported feed URL after resolution (not stored)");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
         );
     }
 
@@ -3110,44 +3153,6 @@ async fn rename_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
-    // Block private/paid feeds on rename too. `url` is attacker-controllable, and
-    // rename both upserts it to the local cache AND rewrites the PDS subscription
-    // record (a public `putRecord`), so without this guard a crafted rename could
-    // land a secret-bearing URL in the public PDS — the exact leak the add and
-    // OPML paths already prevent. Refuse before touching either store.
-    if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
-        info!(url = %feed_url, %reason, %did, %rkey, "refused private/paid feed at rename (not stored or written)");
-        return Ok(
-            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
-        );
-    }
-
-    // Global feeds ceiling parity with add_subscription: a rename can point at a
-    // brand-new feed URL (not just retitle an existing one), which would insert a
-    // NEW `feeds` row. Refuse that when the shared cache is at capacity (an
-    // existing/duplicate URL adds no row and is always fine). `<= 0` disables.
-    let feeds_cap = state.config.max_feeds_global;
-    if feeds_cap > 0
-        && store::get_feed_by_url(&state.db, &feed_url)
-            .await?
-            .is_none()
-    {
-        match store::count_feeds(&state.db).await {
-            Ok(n) if n >= feeds_cap => {
-                warn!(%did, %rkey, feeds = n, cap = feeds_cap, feed = %feed_url, "refused rename: global feeds ceiling reached");
-                return Ok(Redirect::to(&format!(
-                    "/?flash={}",
-                    qenc(
-                        "This instance is at its feed capacity right now. Please try again later."
-                    )
-                ))
-                .into_response());
-            }
-            Ok(_) => {}
-            Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
-        }
-    }
-
     // **Read before write — `update_subscription` is a `putRecord`, and a
     // putRecord replaces the WHOLE record** (see its doc on `atproto.rs`).
     //
@@ -3195,9 +3200,87 @@ async fn rename_subscription(
         .into_response());
     };
 
-    // The subscription can be repointed at a different feed URL, which is what
-    // the global-feeds-ceiling check above exists for.
-    let url_changed = existing.url != feed_url;
+    // The subscription can be repointed at a different feed URL. **Every gate
+    // on the URL applies to a repoint and only a repoint** — the three below
+    // were each, at one time, run before this line on the URL as posted, and
+    // each refused a pure retitle of a record that already existed:
+    //
+    // - privacy: the narrowed at:// arm fails closed as `Private` for an
+    //   at-URI that is not a publication (a feed generator another client
+    //   subscribed to), so the record became un-editable with a flash saying
+    //   it "was not saved or sent anywhere";
+    // - the global feeds ceiling keyed on "URL not in the cache", and an
+    //   at:// record is never cached with the flag off, so at capacity a
+    //   retitle was refused for a row the handler would not insert;
+    // - storability, the same way.
+    //
+    // An unchanged URL is already in the reader's repo; refusing to retitle
+    // it protects nothing and takes their own record away from them.
+    // Like for like: the form value is trimmed, and a record another client
+    // wrote may carry padding — compared raw, every retitle of it was a repoint.
+    let url_changed = existing.url.trim() != feed_url;
+
+    // **Storability, on the same terms as the add and OPML paths — for a
+    // REPOINT, and FIRST.** A target this instance cannot store gets that
+    // answer, not "private" (the at:// arm fails closed) or "at capacity"
+    // (it would never be inserted) — the ordering the add path has. This handler writes `feeds` via `upsert_feed` and had only the
+    // privacy check above, so `FEATHERREADER_STANDARD_SITE` was bypassable
+    // here; a review found it by enumerating every writer of the table. The
+    // first fix ran this check before the repo lookup, on the URL as posted —
+    // which refused a pure retitle of a subscription that already IS an
+    // at-URI, on every instance with the flag off. The flag gates what the
+    // cache may store, not whether a reader may edit their own record: an
+    // unchanged non-storable URL keeps its PDS write and simply gets no cache
+    // row below.
+    let storable = feed::is_storable_feed_url(&feed_url, state.config.standard_site);
+    if url_changed && !storable {
+        info!(url = %feed_url, %did, %rkey, "refused a repoint to a non-storable feed URL");
+        return Ok(
+            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                .into_response(),
+        );
+    }
+
+    // Block private/paid feeds on a repoint. `url` is attacker-controllable,
+    // and rename both upserts it to the local cache AND rewrites the PDS
+    // subscription record (a public `putRecord`), so without this guard a
+    // crafted rename could land a secret-bearing URL in the public PDS — the
+    // exact leak the add and OPML paths already prevent.
+    if url_changed {
+        if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
+            info!(url = %feed_url, %reason, %did, %rkey, "refused private/paid feed at rename (not stored or written)");
+            return Ok(
+                Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+            );
+        }
+    }
+
+    // Global feeds ceiling parity with add_subscription: a repoint to a
+    // brand-new feed URL would insert a NEW `feeds` row. Refuse that when the
+    // shared cache is at capacity (an existing/duplicate URL adds no row and
+    // is always fine). `<= 0` disables.
+    let feeds_cap = state.config.max_feeds_global;
+    if url_changed
+        && feeds_cap > 0
+        && store::get_feed_by_url(&state.db, &feed_url)
+            .await?
+            .is_none()
+    {
+        match store::count_feeds(&state.db).await {
+            Ok(n) if n >= feeds_cap => {
+                warn!(%did, %rkey, feeds = n, cap = feeds_cap, feed = %feed_url, "refused rename: global feeds ceiling reached");
+                return Ok(Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc(
+                        "This instance is at its feed capacity right now. Please try again later."
+                    )
+                ))
+                .into_response());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
+        }
+    }
 
     let mut sub = existing;
     sub.url = feed_url;
@@ -3229,8 +3312,25 @@ async fn rename_subscription(
         sub.fetch_hint = None;
     }
 
-    // Keep the local cache title in step for the loose-feed fallback path.
-    if let Err(err) = store::upsert_feed(
+    // Keep the local cache title in step for the loose-feed fallback path —
+    // for a row this instance would have. Two cases write nothing:
+    //
+    // - not storable (an existing at-URI with the flag off): the record is the
+    //   reader's to edit, the cache row is not this instance's to create;
+    // - an unchanged URL with no cache row: a retitle is never the write that
+    //   CREATES a row. That covers two findings at once — the ceiling is
+    //   checked on a repoint only, so a retitle must not insert past it; and
+    //   a secret-bearing URL another client subscribed to has no row (the
+    //   privacy gate above runs on a repoint only, and `resolve_subscriptions`
+    //   refuses to cache it), so it cannot enter the shared table here, be
+    //   polled, fail, and be printed on the admin page. A privacy re-check on
+    //   this write was the first draft; mutation showed it dead — the row
+    //   rule already refused every case it would have.
+    let cache_write =
+        storable && (url_changed || store::get_feed_by_url(&state.db, &sub.url).await?.is_some());
+    if !cache_write {
+        info!(%did, %rkey, url = %sub.url, "renamed a subscription without touching the cache");
+    } else if let Err(err) = store::upsert_feed(
         &state.db,
         &store::NewFeed {
             url: sub.url.clone(),
@@ -4887,6 +4987,12 @@ async fn import_opml(
     // Imported into the PDS but not cached locally, so not pollable until the
     // next import touches them. Counted rather than only logged — see below.
     let mut uncached: usize = 0;
+    // Entries this instance cannot store at all (an `at://` publication with
+    // the flag off, an unsupported scheme). Counted, because the `continue`
+    // below used to increment nothing while the privacy branch beside it
+    // produced a label — so an OPML from a standard.site-enabled instance
+    // imported "successfully" with entries missing and no reason given.
+    let mut skipped_unsupported: usize = 0;
     for f in &feeds {
         // `xmlUrl` is whatever the uploaded file says, and nothing on this path
         // ever parsed it — the single-add path can't reach here because
@@ -4895,8 +5001,12 @@ async fn import_opml(
         // cached, and published as records to the user's PUBLIC repo. Note that
         // `classify_feed_privacy` does not catch these: both parse cleanly, and
         // it returns `Public` for anything unparseable by design.
-        if !feed::is_storable_feed_url(&f.feed_url) {
-            info!(%did, "skipped an OPML entry whose xmlUrl is not an http(s) URL");
+        if !feed::is_storable_feed_url(&f.feed_url, state.config.standard_site) {
+            info!(
+                %did,
+                "skipped an OPML entry whose xmlUrl is not a storable feed URL"
+            );
+            skipped_unsupported += 1;
             continue;
         }
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
@@ -5028,6 +5138,13 @@ async fn import_opml(
             ". {} feed(s) skipped as private/paid: {} — not supported yet (public feeds only for now).",
             skipped_private.len(),
             skipped_private.join(", ")
+        ));
+    }
+    if skipped_unsupported > 0 {
+        // By count only — the URL is whatever the file said, and unlike the
+        // private branch there is no public-safe label to give.
+        flash.push_str(&format!(
+            ". {skipped_unsupported} feed(s) skipped: not a kind of feed this instance can subscribe to."
         ));
     }
     Ok(Redirect::to(&format!("/?flash={}", qenc(&flash))).into_response())
@@ -7116,6 +7233,24 @@ mod tests {
 
     /// Build an [`AppState`] whose sidecar points at `sidecar_url`.
     async fn test_state_with_sidecar(allowed: &[&str], sidecar_url: &str) -> AppState {
+        let defaults = Config::default();
+        test_state_with_sidecar_and(
+            allowed,
+            sidecar_url,
+            defaults.standard_site,
+            defaults.max_feeds_global,
+        )
+        .await
+    }
+
+    /// [`test_state_with_sidecar`] with the standard.site flag and the global
+    /// feeds ceiling chosen — the two settings the at:// paths branch on.
+    async fn test_state_with_sidecar_and(
+        allowed: &[&str],
+        sidecar_url: &str,
+        standard_site: bool,
+        max_feeds_global: i64,
+    ) -> AppState {
         let db = store::init_url("sqlite::memory:").await.unwrap();
         let dids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
         store::ensure_seed(&db, &dids).await.unwrap();
@@ -7123,11 +7258,11 @@ mod tests {
             allowed_dids: dids,
             cookie_secret: "test-cookie-secret-000".to_string(),
             beta_cap: 3,
+            standard_site,
+            max_feeds_global,
             ..Config::default()
         };
         config.sidecar.public_url = sidecar_url.to_string();
-        // The revoke/session/repo calls go over the internal URL; point it at the
-        // same mock so `/internal/*` requests land there.
         config.sidecar.internal_url = sidecar_url.to_string();
         AppState::new(config, db).unwrap()
     }
@@ -7863,6 +7998,108 @@ mod tests {
         );
     }
 
+    /// **A malformed `at://` on the add path is "not a kind of feed we take",
+    /// not "private/paid".** The first gate was the privacy classifier, whose
+    /// at:// arm fails closed as `Private` for anything not a well-formed
+    /// publication URI — so a typo (`did:plc:TOOSHORT`, a missing rkey) drew
+    /// the private-feed flash and a "refused private/paid feed" log line. On
+    /// main the same input reached `resolve_feed_url` and got "Couldn't find a
+    /// feed". Storability is decided first for an at:// input, with its own
+    /// message.
+    #[tokio::test]
+    async fn a_malformed_at_uri_on_the_add_path_is_refused_as_unsupported_not_private() {
+        let did = "did:plc:typoist";
+        let state = test_state_with_caps(did, 0, 0).await;
+        let cookie = session_cookie(&state, did, None);
+        for input in [
+            "at%3A%2F%2Falice.example.com%2Fsite.standard.publication",
+            "at%3A%2F%2Fdid%3Aplc%3ATOOSHORT%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+        ] {
+            let resp = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/subscriptions")
+                        .header(header::COOKIE, cookie.clone())
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("url={input}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(
+                loc.contains("kind%20of%20feed"),
+                "expected the unsupported-feed flash for {input}, got {loc}"
+            );
+            assert!(
+                !loc.contains("Private"),
+                "a storability refusal was reported as a privacy one for {input}: {loc}"
+            );
+        }
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// **An OPML entry this instance cannot store is counted and reported, not
+    /// silently dropped.** The storability `continue` incremented nothing,
+    /// while the privacy branch beside it produced a user-visible label — so
+    /// an OPML exported from a standard.site-enabled instance imported
+    /// "successfully" with entries missing and no reason given. The reader is
+    /// told how many, and why.
+    #[tokio::test]
+    async fn opml_import_reports_entries_this_instance_cannot_store() {
+        let did = "did:plc:renamer4";
+        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        assert!(!state.config.standard_site);
+        let opml = format!(
+            "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
+             <outline type=\"rss\" text=\"Real\" xmlUrl=\"https://real.example/feed.xml\"/>\n\
+             <outline type=\"rss\" text=\"Pub\" xmlUrl=\"{AT_URI_SUB}\"/>\n\
+             </body></opml>"
+        );
+        let (ct, body) = opml_multipart(opml.as_bytes());
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("Imported%201%20feed"),
+            "unexpected flash: {loc}"
+        );
+        assert!(
+            loc.contains("1%20feed%28s%29%20skipped") && loc.contains("can%20subscribe%20to"),
+            "the dropped entry was not reported: {loc}"
+        );
+        // Reported by count only: the at-URI itself is not echoed back.
+        assert!(
+            !loc.contains("site.standard.publication"),
+            "the URI was echoed: {loc}"
+        );
+    }
+
     /// OPML bulk import must honour the PER-DID subscription cap: a DID at its
     /// cap imports zero new feeds.
     #[tokio::test]
@@ -8308,15 +8545,95 @@ mod tests {
     // Rename parity (POST /subscriptions/{rkey}/rename)
     // -----------------------------------------------------------------------
 
+    /// **`FEATHERREADER_STANDARD_SITE=false` cannot be bypassed through
+    /// autodiscovery.**
+    ///
+    /// The add path gates the URL the user *typed*; the URL it *stores* is
+    /// whatever `resolve_feed_url` returns, which for an HTML page is a
+    /// publisher-controlled `<link rel="alternate">` href. With the flag off, a
+    /// page linking an `at://` publication URI must not get one stored — on
+    /// main the same URI was refused, so anything less is a regression. Driven
+    /// through the real route against a real local server, not the helper.
+    #[tokio::test]
+    async fn autodiscovery_cannot_smuggle_an_at_uri_past_the_flag() {
+        let did = "did:plc:autodiscovered";
+        // Access granted, both caps disabled — the only gate left is the one
+        // under test.
+        let state = test_state_with_caps(did, 0, 0).await;
+        assert!(
+            !state.config.standard_site,
+            "the flag must be off for this test"
+        );
+
+        let page = r#"<!doctype html><html><head><title>Blog</title>
+            <link rel="alternate" type="application/rss+xml"
+                  href="at://alice.example.com/site.standard.publication/3lab2c4d5e6f7g8h">
+            </head><body>hi</body></html>"#;
+        let base = crate::net::tests::serve_body(page.as_bytes().to_vec()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "autodiscover-at.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "url=http://autodiscover-at.test:{port}/"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(loc, "/login", "the test never reached the add path");
+
+        let smuggled: i64 = store::count_unpollable_feeds(&state.db).await.unwrap();
+        assert_eq!(smuggled, 0, "an at:// row was stored with the flag off");
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            0,
+            "something was stored for a page with no usable feed"
+        );
+        assert_eq!(
+            store::count_subscriptions_for_did(&state.db, did)
+                .await
+                .unwrap(),
+            0,
+            "a subscription was recorded for a refused feed"
+        );
+    }
+
     /// A rename that points at a BRAND-NEW feed URL while the shared cache is at
     /// its global ceiling must be refused (capacity flash) and must NOT insert a
     /// new `feeds` row — parity with add_subscription's global-cap guard, so a
     /// rename loop can't inflate the shared cache past the cap.
     #[tokio::test]
     async fn rename_to_new_url_refused_at_global_feeds_cap() {
-        let did = "did:plc:renamer";
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
         // Global cap 1; pre-fill it with one feed so headroom is 0.
-        let state = test_state_with_caps(did, 0, 1).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -8330,12 +8647,11 @@ mod tests {
         assert_eq!(before, 1);
 
         let cookie = session_cookie(&state, did, None);
-        let app = router(state.clone());
-        let resp = app
+        let resp = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/subscriptions/rkey123/rename")
+                    .uri("/subscriptions/rk-keep/rename")
                     .header(header::COOKIE, cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     // A URL not in the cache → would be a NEW feeds row.
@@ -8357,20 +8673,25 @@ mod tests {
             loc.contains("feed%20capacity"),
             "expected the feed-capacity flash, got {loc}"
         );
-        // No new feeds row was inserted.
-        let after = store::count_feeds(&state.db).await.unwrap();
-        assert_eq!(
-            after, before,
-            "rename inflated the shared cache past the cap"
+        // No new feeds row was inserted, and nothing reached the PDS.
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), before);
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a refused repoint reached the PDS"
         );
     }
 
-    /// A rename to an EXISTING URL adds no row, so it is allowed even at the
+    /// A repoint to an EXISTING URL adds no row, so it is allowed even at the
     /// global cap (only new URLs are gated) — the other half of the guard.
+    ///
+    /// On the sidecar fake, so "allowed" means the put actually happened: the
+    /// earlier harness had no sidecar, and this passed on a "could not reach
+    /// your PDS" flash that merely was not the capacity one.
     #[tokio::test]
     async fn rename_to_existing_url_allowed_at_global_feeds_cap() {
-        let did = "did:plc:renamer2";
-        let state = test_state_with_caps(did, 0, 1).await;
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -8383,12 +8704,11 @@ mod tests {
         let before = store::count_feeds(&state.db).await.unwrap();
 
         let cookie = session_cookie(&state, did, None);
-        let app = router(state.clone());
-        let resp = app
+        let resp = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/subscriptions/rkey123/rename")
+                    .uri("/subscriptions/rk-keep/rename")
                     .header(header::COOKIE, cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(
@@ -8405,26 +8725,16 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        // What this test is about is the CAP, so assert on the cap. It used to
-        // assert `loc == "/"`, which passed only because a failed PDS write was
-        // silently reported as success — there is no PDS in this test. Now that
-        // the handler tells the truth, the plain "/" redirect is the
-        // everything-worked case and is not reachable here; the property that
-        // matters is that the request was not refused by the feed-capacity
-        // guard, and that no row was added.
-        assert!(
-            !loc.contains("feed%20capacity"),
-            "retitle of an EXISTING feed must not be refused by the global cap, got {loc}"
-        );
+        assert_eq!(loc, "/", "the repoint to a cached URL was refused: {loc}");
         assert_eq!(
-            store::count_feeds(&state.db).await.unwrap(),
-            before,
-            "retitle must not add a feeds row"
+            puts.lock().unwrap().len(),
+            1,
+            "the repoint did not reach the PDS"
         );
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), before);
     }
 
-    /// A rename with a blank/empty `url` must write NOTHING — no `feeds` row and
-    /// no PDS update — and just redirect home. Guards the empty-URL early return.
+    /// A rename with a blank URL writes nothing anywhere.
     #[tokio::test]
     async fn rename_with_blank_url_writes_nothing() {
         let did = "did:plc:renamer3";
@@ -8548,6 +8858,559 @@ mod tests {
                 "createdAt": "2024-03-01T00:00:00.000Z"
             }
         })
+    }
+
+    /// An existing standard.site subscription, as the 19 in production are:
+    /// written before this reader refused the scheme, still in the repo.
+    fn seeded_at_uri_subscription() -> serde_json::Value {
+        seeded_subscription_with_url(AT_URI_SUB)
+    }
+    /// An existing subscription record at `rk-keep` with the given URL.
+    fn seeded_subscription_with_url(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uri": "at://did:plc:renamer5/community.lexicon.rss.subscription/rk-keep",
+            "cid": "bafyreibefore",
+            "value": {
+                "$type": "community.lexicon.rss.subscription",
+                "url": url,
+                "title": "Old title",
+                "private": false,
+                "createdAt": "2024-03-01T00:00:00.000Z"
+            }
+        })
+    }
+    const AT_URI_SUB: &str =
+        "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab2c4d5e6f7g8h";
+    const AT_URI_SUB_ENC: &str =
+        "at%3A%2F%2Fdid%3Aplc%3Aohutz6x5acjmpuulp3x7wxxc%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h";
+
+    /// **Retitling an existing `at://` subscription must work with the flag off.**
+    ///
+    /// The storability guard was placed before the repo lookup, so it refused
+    /// any rename whose URL is an at-URI — including a pure title or folder
+    /// change on a record that already exists. On main that rename succeeded;
+    /// the 19 production records would have become un-editable. The flag gates
+    /// what may be STORED in the cache, not whether a reader may edit their own
+    /// record: the PDS write goes through, the cache row is simply not created.
+    #[tokio::test]
+    async fn retitling_an_existing_at_uri_subscription_survives_the_flag_being_off() {
+        let did = "did:plc:renamer5";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        assert!(
+            !state.config.standard_site,
+            "the flag must be off for this test"
+        );
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}&title=New+title")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("put body is JSON");
+        assert_eq!(
+            sent["record"]["title"], "New title",
+            "the rename did not apply"
+        );
+        assert_eq!(
+            sent["record"]["url"], AT_URI_SUB,
+            "the rename changed the URL"
+        );
+
+        // The flag still means what it says for the CACHE: no at:// row.
+        let cached: i64 = store::count_unpollable_feeds(&state.db).await.unwrap();
+        assert_eq!(cached, 0, "a retitle stored an at:// row with the flag off");
+    }
+
+    /// **Repointing a subscription AT an `at://` URI is still refused with the
+    /// flag off** — the half of the guard that has to survive the fix above.
+    /// Nothing reaches the PDS and nothing reaches the cache.
+    #[tokio::test]
+    async fn repointing_a_subscription_at_an_at_uri_is_refused_with_the_flag_off() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}&title=Moved")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.contains("flash="), "the repoint was not refused: {loc}");
+        assert!(
+            !loc.contains("Private"),
+            "a storability refusal was reported as a privacy one: {loc}"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "the repoint reached the PDS"
+        );
+        let cached: i64 = store::count_unpollable_feeds(&state.db).await.unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    /// Posts a retitle of `rk-keep` with its URL unchanged; returns the
+    /// redirect location.
+    async fn retitle_unchanged(state: &AppState, did: &str, url_enc: &str) -> String {
+        let cookie = session_cookie(state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={url_enc}&title=New+title")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// **The privacy gate has the same ordering bug the storable gate had.**
+    ///
+    /// Another client can write a subscription whose URL is an at-URI that is
+    /// not a well-formed publication URI at all — a feed generator, say. On
+    /// main a retitle of it succeeded (the DID form fails `Url::parse`, which
+    /// the classifier reads as `Public`). The narrowed at:// arm now fails
+    /// closed as `Private` for it, and the gate ran before `url_changed` was
+    /// known — so the record became un-editable, with a flash claiming it "was
+    /// not saved or sent anywhere". Both gates now apply to a repoint only.
+    #[tokio::test]
+    async fn retitling_an_existing_at_uri_record_that_is_not_a_publication_survives() {
+        let did = "did:plc:renamer5";
+        let other = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.generator/whats-hot";
+        let other_enc =
+            "at%3A%2F%2Fdid%3Aplc%3Aohutz6x5acjmpuulp3x7wxxc%2Fapp.bsky.feed.generator%2Fwhats-hot";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(other)).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let loc = retitle_unchanged(&state, did, other_enc).await;
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "expected exactly one put, got {bodies:?}");
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(sent["record"]["title"], "New title");
+        assert_eq!(sent["record"]["url"], other);
+    }
+
+    /// **A repoint to a secret-bearing URL is still refused** — the half of
+    /// the privacy gate that has to survive moving it behind `url_changed`.
+    /// Found by mutation: with the gate deleted outright, nothing failed.
+    #[tokio::test]
+    async fn repointing_a_subscription_at_a_private_feed_is_refused() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fpaid.example%2Ffeed.xml%3Ftoken%3DZm9vYmFyc2VjcmV0dG9rZW4&title=Moved",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("Private"),
+            "the private repoint was not refused: {loc}"
+        );
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a secret-bearing URL reached the PDS"
+        );
+        // The repo's fixture token: opaque enough for the classifier, not a real
+        // key shape (a Stripe-shaped fixture tripped the secret scanner — rightly).
+        let leaked = "https://paid.example/feed.xml?token=Zm9vYmFyc2VjcmV0dG9rZW4";
+        assert!(store::get_feed_by_url(&state.db, leaked)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// **A retitle of a never-cached at:// subscription is not "at feed
+    /// capacity".** The global-ceiling check keyed on "URL not in the cache",
+    /// and an at:// record is never cached with the flag off — so at capacity,
+    /// a pure retitle was refused for a row the handler would not insert. The
+    /// check now runs once `url_changed` is known and only for a repoint.
+    #[tokio::test]
+    async fn retitling_an_uncached_at_uri_subscription_is_not_refused_at_feed_capacity() {
+        let did = "did:plc:renamer5";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
+        // Ceiling 1, and one real feed already fills it.
+        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://filler.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let loc = retitle_unchanged(&state, did, AT_URI_SUB_ENC).await;
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "the retitle did not reach the PDS"
+        );
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            1,
+            "a row was inserted"
+        );
+    }
+
+    /// **With the flag ON, a well-formed at:// paste is still refused as
+    /// unsupported** — not "Couldn't find a feed" plus a `warn!`. Nothing can
+    /// fetch `at://` until the reader is wired, whatever the flag says, and the
+    /// docs promise this answer "with the flag on or off". This is also the
+    /// suite's first state with the flag on: every other site passes the flag
+    /// through with `false`, where a literal `false` would be indistinguishable.
+    #[tokio::test]
+    async fn a_well_formed_at_uri_paste_is_refused_as_unsupported_with_the_flag_on() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("kind%20of%20feed"),
+            "expected the unsupported flash: {loc}"
+        );
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// **With the flag ON, an OPML at:// entry is stored.** The one storage
+    /// path that is meant to work today, asserted with the flag actually on.
+    #[tokio::test]
+    async fn opml_import_stores_an_at_uri_entry_with_the_flag_on() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
+        let opml = format!(
+            "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
+             <outline type=\"rss\" text=\"Real\" xmlUrl=\"https://real.example/feed.xml\"/>\n\
+             <outline type=\"rss\" text=\"Pub\" xmlUrl=\"{AT_URI_SUB}\"/>\n\
+             </body></opml>"
+        );
+        let (ct, body) = opml_multipart(opml.as_bytes());
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("Imported%202%20feeds"),
+            "unexpected flash: {loc}"
+        );
+        assert!(
+            !loc.contains("skipped"),
+            "the at:// entry was skipped with the flag on: {loc}"
+        );
+        let stored = store::get_feed_by_url(&state.db, AT_URI_SUB).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "the at:// entry was not stored with the flag on"
+        );
+    }
+
+    /// **A retitle must not cache a secret-bearing URL.** Moving the privacy
+    /// gate behind `url_changed` was right for the PDS write — the record is
+    /// the reader's — but the cache write was gated only on `storable`, which
+    /// any http(s) URL is. So a retitle of a record another client wrote with
+    /// a tokened feed URL inserted that URL into the shared `feeds` table,
+    /// where the poller would fail it every cycle and print it on the admin
+    /// page. main refused the whole rename; this keeps the record editable and
+    /// the cache clean, as `resolve_subscriptions` already does for the same
+    /// record.
+    #[tokio::test]
+    async fn retitling_a_secret_bearing_record_does_not_cache_its_url() {
+        let did = "did:plc:renamer5";
+        let tokened = "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4";
+        let tokened_enc =
+            "https%3A%2F%2Fwww.patreon.com%2Frss%2Fauthor%3Fauth%3DZm9vYmFyc2VjcmV0dG9rZW4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(tokened)).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let loc = retitle_unchanged(&state, did, tokened_enc).await;
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "the retitle did not reach the PDS"
+        );
+        assert!(
+            store::get_feed_by_url(&state.db, tokened)
+                .await
+                .unwrap()
+                .is_none(),
+            "a secret-bearing URL was written to the shared cache by a retitle"
+        );
+    }
+
+    /// **On a repoint, storability is decided before privacy and capacity** —
+    /// the same ordering the add path got. A malformed at:// target drew the
+    /// private/paid flash, and at capacity a well-formed one drew "try again
+    /// later" for a URL that can never be accepted with the flag off.
+    #[tokio::test]
+    async fn repointing_at_a_malformed_at_uri_is_refused_as_unsupported() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=at%3A%2F%2Fdid%3Aplc%3ATOOSHORT%2Fsite.standard.publication%2F3lab&title=Moved",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("kind%20of%20feed"),
+            "expected the unsupported flash: {loc}"
+        );
+        assert!(
+            !loc.contains("Private"),
+            "a typo was reported as a paid feed: {loc}"
+        );
+        assert!(puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repointing_at_an_at_uri_at_capacity_is_refused_as_unsupported_not_capacity() {
+        let did = "did:plc:renamer4";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://filler.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("url={AT_URI_SUB_ENC}&title=Moved")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("kind%20of%20feed"),
+            "expected the unsupported flash: {loc}"
+        );
+        assert!(
+            !loc.contains("capacity"),
+            "an unacceptable URL was reported as a capacity problem: {loc}"
+        );
+        assert!(puts.lock().unwrap().is_empty());
+    }
+
+    /// **`url_changed` compares like for like.** The form value is trimmed;
+    /// the record's URL was compared raw, so a record another client wrote
+    /// with a trailing space read as a repoint on every retitle and re-armed
+    /// every gate — including the one that made an at:// record un-editable.
+    #[tokio::test]
+    async fn retitling_a_record_whose_url_carries_whitespace_is_not_a_repoint() {
+        let did = "did:plc:renamer5";
+        let padded = format!("{AT_URI_SUB} ");
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(&padded)).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        // The manage row posts the record's URL verbatim, padding included.
+        let loc = retitle_unchanged(&state, did, &format!("{AT_URI_SUB_ENC}%20")).await;
+        assert_eq!(
+            loc, "/",
+            "the retitle was treated as a repoint and refused: {loc}"
+        );
+        let bodies = puts.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(
+            sent["record"]["url"], AT_URI_SUB,
+            "the padding was not normalised away"
+        );
+    }
+
+    /// **A retitle inserts no cache row.** The ceiling is checked on a repoint
+    /// only, so the trailing upsert must not create a row for an unchanged URL
+    /// that has none — with the flag on and the cache full, each retitle of a
+    /// never-cached at:// record was a row past the cap. An existing row still
+    /// gets its title kept in step.
+    #[tokio::test]
+    async fn retitling_an_uncached_record_at_capacity_inserts_no_row() {
+        let did = "did:plc:renamer5";
+        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 1).await;
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://filler.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let loc = retitle_unchanged(&state, did, AT_URI_SUB_ENC).await;
+        assert_eq!(loc, "/", "the retitle was refused: {loc}");
+        assert_eq!(puts.lock().unwrap().len(), 1);
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            1,
+            "a retitle inserted a cache row past the ceiling"
+        );
+    }
+
+    /// **The add path's at:// pre-check is about the MESSAGE, so it is
+    /// case-insensitive.** `Url::parse` folds the scheme, so `AT://…` skipped
+    /// the pre-check and the classifier's at:// arm alike, parsed as `at`, and
+    /// tripped the secret heuristic on the rkey — the private/paid flash the
+    /// pre-check exists to avoid. Storage stays case-sensitive; this does not
+    /// touch it.
+    #[tokio::test]
+    async fn an_uppercase_at_scheme_paste_is_refused_as_unsupported() {
+        let did = "did:plc:typoist";
+        let state = test_state_with_caps(did, 0, 0).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=AT%3A%2F%2Falice.example.com%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("kind%20of%20feed"),
+            "expected the unsupported flash: {loc}"
+        );
+        assert!(!loc.contains("Private"), "reported as a paid feed: {loc}");
     }
 
     /// **A rename must not destroy the fields the form never carries.**

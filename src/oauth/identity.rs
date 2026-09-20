@@ -33,8 +33,9 @@ const RESERVED_TLDS: [&str; 8] = [
     "onion",
 ];
 
-/// The `at://` prefix an `alsoKnownAs` handle claim carries.
-const AT_URI_PREFIX: &str = "at://";
+// The `at://` prefix an `alsoKnownAs` handle claim carries — the crate's one
+// spelling of it.
+use crate::atproto::AT_URI_PREFIX;
 
 /// Normalize and validate a handle: lowercase, then check it against the
 /// handle grammar and the reserved-TLD list.

@@ -131,6 +131,24 @@ const MAX_LIST_PAGES: usize = 200;
 /// makes the claim true rather than conditional on the server's cooperation.
 const MAX_LIST_RECORDS: usize = 20_000;
 
+/// The at-URI scheme prefix, **the one Rust spelling**. Every Rust guard that
+/// asks "is this an at-URI" strips or compares this; the SQL side is
+/// [`crate::store::UNPOLLABLE_URL_SQL`], and a test pins that the two agree.
+pub(crate) const AT_URI_PREFIX: &str = "at://";
+
+/// atproto's record-key rules, all of them: charset `[A-Za-z0-9._:~-]`, length
+/// 1..=512, and not `.` or `..`. The repo's TID tests state the same rule; this
+/// is the one place it is enforced on a key that arrives from outside.
+pub(crate) fn is_valid_rkey(rkey: &str) -> bool {
+    !rkey.is_empty()
+        && rkey.len() <= 512
+        && rkey != "."
+        && rkey != ".."
+        && rkey
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '~' | '-'))
+}
+
 /// Append a page, refusing to exceed `max`.
 ///
 /// **An error, never a truncation.** The caller of the live walk is
@@ -2618,8 +2636,7 @@ mod tests {
         // atproto rkey charset: [A-Za-z0-9._~:-], length 1..=512, not "."/"..".
         let mut gen = TidGenerator::new();
         let tid = gen.next();
-        assert!(!tid.is_empty() && tid.len() <= 512);
-        assert!(tid != "." && tid != "..");
+        assert!(is_valid_rkey(&tid), "{tid:?}");
         assert!(tid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b':' | b'-')));

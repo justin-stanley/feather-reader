@@ -33,6 +33,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet, and nothing polls one: `at://` rows are skipped by scheme, not failed (see `store::UNPOLLABLE_URL_SQL`). Both land with the standard.site reader. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -149,6 +150,18 @@ pub struct Config {
     /// switch. Defaults to the sidecar, so deploying the Rust client changes
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
+    /// Whether an `at://` standard.site publication subscription may be
+    /// **stored** — via OPML import or a record another client wrote. The
+    /// subscribe form cannot take one yet: the add path must fetch what is
+    /// pasted and nothing fetches `at://`, so it refuses with its own message.
+    /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
+    ///
+    /// **This flag does not gate polling; nothing does, because nothing polls
+    /// an `at://` row.** An earlier version of this comment claimed one flag
+    /// gated both. It did not — nothing outside the storable guards read it.
+    /// Why `at://` rows are skipped rather than failed, and where that one
+    /// decision lives, is documented once on [`crate::store::UNPOLLABLE_URL_SQL`].
+    pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
     /// handle into a DID so an existing seat can be honored on a cookie-less first
@@ -336,6 +349,10 @@ impl Default for Config {
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             // The sidecar stays the live path until the switch is thrown.
             repo_backend: crate::metrics::Backend::Sidecar,
+            // Off by default. The flag gates STORING an at:// feed; polling is
+            // excluded by scheme in `due_feeds` regardless, until the
+            // standard.site reader is wired to the scheduler.
+            standard_site: false,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
             bot_secret: None,
@@ -537,6 +554,11 @@ impl Config {
             None => defaults.repo_backend,
         };
 
+        let standard_site = parse_standard_site(
+            env_opt("FEATHERREADER_STANDARD_SITE").as_deref(),
+            defaults.standard_site,
+        )?;
+
         let show_adoption = match env_opt("FEATHERREADER_SHOW_ADOPTION") {
             Some(raw) => parse_bool(&raw).with_context(|| {
                 format!("FEATHERREADER_SHOW_ADOPTION: expected a boolean, got {raw:?}")
@@ -547,6 +569,7 @@ impl Config {
         let config = Self {
             oauth,
             repo_backend,
+            standard_site,
             bind,
             db_path,
             public_url,
@@ -773,6 +796,17 @@ fn validate_claim_ttl(secs: i64) -> Result<i64> {
         );
     }
     Ok(secs)
+}
+
+/// Decide `FEATHERREADER_STANDARD_SITE` from its raw value; unset means
+/// `default`, which is [`Config::default`]'s so the value lives in one place.
+/// Pure so it can be tested without touching the process environment.
+fn parse_standard_site(raw: Option<&str>, default: bool) -> Result<bool> {
+    match raw {
+        Some(raw) => parse_bool(raw)
+            .with_context(|| format!("FEATHERREADER_STANDARD_SITE={raw:?} is not a boolean")),
+        None => Ok(default),
+    }
 }
 
 /// Read an env var, treating an empty value the same as unset.
@@ -1143,6 +1177,36 @@ mod tests {
         };
         assert!(c.did_allowed("did:plc:me"));
         assert!(!c.did_allowed("did:plc:stranger"));
+    }
+
+    /// **`FEATHERREADER_STANDARD_SITE` is off unless it is set on.**
+    ///
+    /// The loader reads the process environment, which parallel tests cannot
+    /// safely mutate, so the decision is a pure function of the raw value and
+    /// tested as one. The case that matters is `None`: an unset flag must be
+    /// `false`, or every deployment that never heard of standard.site would
+    /// start accepting `at://` rows the poller skips.
+    #[test]
+    fn standard_site_is_off_unless_set_on() {
+        let default = Config::default().standard_site;
+        assert!(!default, "the shipped default must be off");
+        // Unset means THE default, whatever it is — not a second copy of it.
+        assert!(
+            !parse_standard_site(None, false).unwrap(),
+            "unset must mean off"
+        );
+        assert!(
+            parse_standard_site(None, true).unwrap(),
+            "unset must follow the default"
+        );
+        assert!(!parse_standard_site(Some("false"), true).unwrap());
+        assert!(parse_standard_site(Some("true"), false).unwrap());
+        assert!(parse_standard_site(Some("1"), false).unwrap());
+        let err = parse_standard_site(Some("maybe"), false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("FEATHERREADER_STANDARD_SITE"),
+            "the error must name the variable: {err:#}"
+        );
     }
 
     #[test]

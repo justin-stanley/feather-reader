@@ -565,6 +565,35 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE feeds ADD COLUMN last_error TEXT",
     )
     .await?;
+
+    // **Clear failure counts on rows we never actually polled.**
+    //
+    // `due_feeds` excludes `at://` (see `UNPOLLABLE_URL_SQL`) — but rows
+    // subscribed before the scheme check already carry the errors OUR refusal
+    // produced. Left alone they would count as failing forever, since no poll
+    // that could clear them will ever be scheduled.
+    //
+    // A real feed's history is untouched: it still means something. The
+    // recorded reason goes with the count: a row with no errors must carry no
+    // reason, which is what `reset_feed_errors` promises and a test asserts.
+    //
+    // **Idempotent by predicate.** `last_polled` is set only by a successful
+    // poll — `bump_feed_errors` never touches it — so `last_polled IS NULL`
+    // selects exactly the rows whose every error came from our own refusal.
+    // A row a wired standard.site reader has fetched once keeps its later
+    // failures across restarts; a row that only ever failed under the refusal
+    // is cleared at every boot, including after a rollback to a build that
+    // polled it. A version stamp was the first design and left that rollback
+    // case a permanent hole (re-accumulated errors hidden by the filters,
+    // never cleared). Trade-off accepted: a publication that has never once
+    // succeeded restarts its backoff at the floor on every boot.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
+         WHERE {UNPOLLABLE_URL_SQL} AND last_polled IS NULL AND consecutive_errors > 0"
+    )))
+    .execute(pool)
+    .await
+    .context("clearing error counts on unpollable at:// feeds")?;
     // read_cursor.pds_created — tracks whether a feed's readState record has been
     // created in the PDS, so the first flush emits a `create` (not a bare
     // `update`, which errors on a not-yet-existing record). Older DBs predate it.
@@ -698,22 +727,63 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
     Ok(feed)
 }
 
+/// SQL for "this row is an `at://` publication, which nothing can poll".
+///
+/// **This is the canonical home of the at:// exclusion; the other sites point
+/// here.** Why skip rather than fail: `poll_feed` reaches `net::guarded_get`,
+/// whose `check_scheme` refuses any non-http(s) scheme, and the standard.site
+/// reader is not yet wired to the scheduler. Handing such a row to the poller
+/// does not leave the feature dormant — it manufactures one permanent failure
+/// per row, which the public cause histogram then reports as an unreachable
+/// publisher. Unsupported is not broken, and telling those apart is the entire
+/// reason a failure cause is recorded. (Rows like this exist: subscriptions
+/// written by other clients before this reader refused the scheme.)
+///
+/// **One predicate, four readers** — the scheduler's `due_feeds`, the public
+/// `/stats` aggregates in `poll_health`, the admin's `failing_feeds`, and the
+/// boot-time clearing of the errors our own refusal produced — so
+/// they cannot drift: a row the scheduler skips must not be a row a health
+/// page counts as overdue or failing. When the reader is wired, every site
+/// that uses this constant is the list of what must change.
+///
+/// `substr(...) = 'at://'` rather than `LIKE 'at://%'`: SQLite's `LIKE` is
+/// case-insensitive and the Rust guards (`strip_prefix("at://")`) are not, so a
+/// mixed-case `At://` row was an at-URI to SQL and a plain URL to every other
+/// check. Both sides now agree it is not one.
+pub(crate) const UNPOLLABLE_URL_SQL: &str = "substr(url, 1, 5) = 'at://'";
+
+/// How many rows the poller will never select. Test-only: the assertion the
+/// at:// tests make, spelled once, against the predicate the code uses.
+#[cfg(test)]
+pub(crate) async fn count_unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM feeds WHERE {UNPOLLABLE_URL_SQL}"
+    )))
+    .fetch_one(pool)
+    .await
+    .context("counting unpollable feeds")
+}
+
 /// The scheduler's hot query: feeds whose `next_poll` is due (`<= as_of`, or
 /// never polled), oldest-due first. `as_of` is an RFC3339 timestamp.
 pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec<Feed>> {
-    let feeds = sqlx::query_as::<_, Feed>(
+    let sql = format!(
         r#"
         SELECT * FROM feeds
-        WHERE next_poll IS NULL OR next_poll <= ?1
+        WHERE (next_poll IS NULL OR next_poll <= ?1)
+          -- `at://` is not pollable, so it is not due: skipped, not failed.
+          -- The why lives on `UNPOLLABLE_URL_SQL`.
+          AND NOT ({UNPOLLABLE_URL_SQL})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
-        "#,
-    )
-    .bind(as_of)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("due_feeds failed")?;
+        "#
+    );
+    let feeds = sqlx::query_as::<_, Feed>(sqlx::AssertSqlSafe(sql))
+        .bind(as_of)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("due_feeds failed")?;
     Ok(feeds)
 }
 
@@ -739,19 +809,24 @@ pub struct FailingFeed {
 /// **Admin-gated callers only.** Bounded because this renders into one response
 /// and a large instance should not be able to make that response unbounded.
 pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingFeed>> {
-    let rows: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    // The same exclusion as `poll_health`: a row the poller never selects
+    // can never have its errors cleared, so listing it here would pin it to
+    // the top of the operator's page for good.
+    let sql = format!(
         r#"
         SELECT url, consecutive_errors, last_error_kind, last_error
         FROM feeds
-        WHERE consecutive_errors > 0
+        WHERE consecutive_errors > 0 AND NOT ({UNPOLLABLE_URL_SQL})
         ORDER BY consecutive_errors DESC, url ASC
         LIMIT ?1
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("listing failing feeds")?;
+        "#
+    );
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .context("listing failing feeds")?;
     Ok(rows
         .into_iter()
         .map(|(url, consecutive_errors, kind, detail)| FailingFeed {
@@ -3861,8 +3936,12 @@ const BADLY_BROKEN_ERRORS: i64 = 6;
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
 /// format the scheduler writes, so the comparisons are lexicographic).
 pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
-    #[allow(clippy::type_complexity)]
-    let row: (i64, i64, i64, Option<String>, Option<String>, i64, i64, i64) = sqlx::query_as(
+    // **Only what the poller sees.** `due_feeds` skips `at://` rows, so nothing
+    // ever advances their `next_poll` or sets `last_polled`; counted here they
+    // read as overdue and never-polled forever and force "oldest poll" to
+    // `never` — unsupported shown as broken, on a public page, permanently.
+    // The same predicate as the scheduler's, so the two cannot disagree.
+    let aggregate = format!(
         r#"
         SELECT
             COUNT(*),
@@ -3880,14 +3959,18 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
             COALESCE(SUM(CASE WHEN consecutive_errors > 0 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN consecutive_errors >= ?3 THEN 1 ELSE 0 END), 0)
         FROM feeds
-        "#,
-    )
-    .bind(now)
-    .bind(hour_ago)
-    .bind(BADLY_BROKEN_ERRORS)
-    .fetch_one(pool)
-    .await
-    .context("computing poll health")?;
+        WHERE NOT ({UNPOLLABLE_URL_SQL})
+        "#
+    );
+    #[allow(clippy::type_complexity)]
+    let row: (i64, i64, i64, Option<String>, Option<String>, i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(aggregate))
+            .bind(now)
+            .bind(hour_ago)
+            .bind(BADLY_BROKEN_ERRORS)
+            .fetch_one(pool)
+            .await
+            .context("computing poll health")?;
 
     // A second, tiny query rather than a join: the histogram groups rows the
     // aggregate above collapses, and one statement doing both would make the
@@ -3905,18 +3988,19 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     // `unknown` is a deliberate bucket rather than an omission. It cannot
     // collide with a real kind — `FailureKind::as_str` never returns it, and
     // `FailureKind::parse("unknown")` is `None`.
-    let kinds: Vec<(String, i64)> = sqlx::query_as(
+    let histogram = format!(
         r#"
         SELECT COALESCE(last_error_kind, 'unknown') AS kind, COUNT(*) AS n
         FROM feeds
-        WHERE consecutive_errors > 0
+        WHERE consecutive_errors > 0 AND NOT ({UNPOLLABLE_URL_SQL})
         GROUP BY kind
         ORDER BY n DESC, kind ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("computing the failure-cause histogram")?;
+        "#
+    );
+    let kinds: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(histogram))
+        .fetch_all(pool)
+        .await
+        .context("computing the failure-cause histogram")?;
 
     // **Close the vocabulary where it is READ.** `FailureKind::parse` promised
     // that a kind from a newer build would not be attributed to a cause this
@@ -6014,6 +6098,109 @@ mod tests {
     }
 
     // -- F2: consecutive-error count drives the poll backoff -----------------
+
+    /// **Rows that failed only because we could not poll them are cleared.**
+    ///
+    /// Excluding `at://` from `due_feeds` stops NEW failures; it does nothing
+    /// about the ones already recorded. This instance carries 19 such rows at
+    /// 35+ consecutive errors each — accumulated entirely by our own refusal to
+    /// fetch a scheme we had not implemented. Left alone they keep counting
+    /// toward `in_backoff` and `badly_broken`, so a public page would report
+    /// unsupported feeds as broken publishers forever, with no poll that could
+    /// ever clear them since they are no longer selected.
+    ///
+    /// Safe to re-run because of WHAT it clears, not because the count cannot
+    /// grow: only rows never polled successfully (`last_polled IS NULL`) — see
+    /// `the_at_uri_error_clearing_spares_a_row_that_has_been_polled`.
+    #[tokio::test]
+    async fn the_migration_clears_error_counts_on_unpollable_at_uri_rows() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for url in [
+            "https://real.example/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE feeds SET consecutive_errors = 35, last_error_kind = 'fetch', \
+                 last_error = 'unsupported scheme' WHERE url = ?1",
+            )
+            .bind(url)
+            .execute(&pool)
+            .await?;
+        }
+
+        apply_migrations(&pool).await?;
+
+        let (at_errors, at_kind, at_detail): (i64, Option<String>, Option<String>) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT consecutive_errors, last_error_kind, last_error FROM feeds \
+                 WHERE {UNPOLLABLE_URL_SQL}"
+            )))
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(at_errors, 0, "an unpollable row kept its failure count");
+        // A row with no errors carries no reason — the invariant
+        // `reset_feed_errors` upholds, and the migration must too.
+        assert_eq!(at_kind, None, "an unpollable row kept its failure kind");
+        assert_eq!(at_detail, None, "an unpollable row kept its failure detail");
+
+        // A real feed's failure history is NOT touched — it is still meaningful.
+        let http_errors: i64 = sqlx::query_scalar(
+            "SELECT consecutive_errors FROM feeds WHERE url = 'https://real.example/feed.xml'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(http_errors, 35, "a real feed's history was discarded");
+        Ok(())
+    }
+
+    /// **An `at://` feed is never selected for polling.**
+    ///
+    /// Nothing can poll one: `poll_feed` goes through `net::guarded_get`, whose
+    /// `check_scheme` refuses any non-http(s) scheme, and the standard.site
+    /// reader is not wired to the scheduler. Selecting them anyway does not
+    /// leave the feature dormant — it manufactures a permanent failure per row,
+    /// which since the cause histogram is *published* as an unreachable
+    /// publisher. This instance already carries 19 such rows, subscribed before
+    /// the scheme was refused.
+    ///
+    /// They are skipped rather than failed: unsupported is not broken, and the
+    /// difference is the whole point of recording a cause at all.
+    #[tokio::test]
+    async fn an_at_uri_feed_is_never_due_for_polling() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for url in [
+            "https://example.com/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://alice.example.com/site.standard.publication/3lab",
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        // All three have a NULL next_poll, which sorts FIRST — so if at:// were
+        // selectable at all it would be selected before the http feed.
+        let due = due_feeds(&pool, "2026-09-20T00:00:00Z", 50).await?;
+        let urls: Vec<&str> = due.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://example.com/feed.xml"],
+            "an at:// feed was handed to the poller"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn feed_error_count_bumps_and_resets() -> Result<()> {
@@ -8689,6 +8876,169 @@ mod tests {
         let h = poll_health(&pool, now, hour_ago).await?;
         assert_eq!(h.never_polled, 0);
         assert_eq!(h.oldest_poll_secs_ago, Some(10_800));
+        Ok(())
+    }
+
+    /// **`/stats` measures the poller, so it counts only what the poller sees.**
+    ///
+    /// `due_feeds` skips `at://` rows; nothing ever advances their `next_poll`
+    /// or sets `last_polled`. Counted, they read as overdue and never-polled
+    /// forever, and force "oldest poll" to `never` — the same "unsupported
+    /// shown as broken" the exclusion exists to end, moved to different rows on
+    /// a public page. The same predicate decides both queries so they cannot
+    /// drift.
+    #[tokio::test]
+    async fn poll_health_ignores_unpollable_at_uri_rows() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let now = "2026-01-01T12:00:00Z";
+        let hour_ago = "2026-01-01T11:00:00Z";
+        feed_polled(
+            &pool,
+            "https://a.example/f",
+            Some("2026-01-01T11:50:00Z"),
+            Some("2026-01-01T12:50:00Z"),
+        )
+        .await;
+        // Never polled, never due: the shape every at:// row has.
+        feed_polled(
+            &pool,
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            None,
+            None,
+        )
+        .await;
+
+        let h = poll_health(&pool, now, hour_ago).await?;
+        assert_eq!(
+            h.feeds_tracked, 1,
+            "an unpollable row was counted as tracked"
+        );
+        assert_eq!(h.overdue, 0, "an unpollable row was counted as overdue");
+        assert_eq!(
+            h.never_polled, 0,
+            "an unpollable row was counted as never polled"
+        );
+        assert_eq!(
+            h.oldest_poll_secs_ago,
+            Some(600),
+            "an unpollable row forced the oldest poll to `never`"
+        );
+        assert_eq!(h.polled_last_hour, 1);
+        Ok(())
+    }
+
+    /// **The admin's failing-feeds list is the poller's too.** `failing_feeds`
+    /// feeds `/admin/metrics`; it was not given the exclusion both `/stats`
+    /// queries got. An `at://` row that carries errors — from a rollback to a
+    /// build that polled them, say — would then sit at the top of the one page
+    /// an operator uses to diagnose "unsupported shown as broken", with no
+    /// poll ever coming to clear it and the one-shot migration already spent.
+    #[tokio::test]
+    async fn failing_feeds_ignores_unpollable_at_uri_rows() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for url in [
+            "https://broken.example/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "down").await?;
+        }
+        let failing = failing_feeds(&pool, 10).await?;
+        let urls: Vec<&str> = failing.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://broken.example/feed.xml"],
+            "an unpollable row was listed as a failing feed"
+        );
+        Ok(())
+    }
+
+    /// **The clearing is idempotent by predicate, not by stamp.** It touches
+    /// only rows that have never been polled successfully: `bump_feed_errors`
+    /// never sets `last_polled`, both success paths do. So a row a wired
+    /// reader has fetched once keeps its later failures across restarts, and
+    /// a row that only ever failed under our own refusal is cleared at every
+    /// boot — including after a rollback to a build that polled it. No
+    /// version stamp, nothing for a test to rewind.
+    #[tokio::test]
+    async fn the_at_uri_error_clearing_spares_a_row_that_has_been_polled() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let polled = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/polled";
+        let never = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/never";
+        for url in [polled, never] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "down").await?;
+        }
+        // A wired reader fetched this one once, then it started failing.
+        sqlx::query("UPDATE feeds SET last_polled = '2026-01-01T00:00:00Z' WHERE url = ?1")
+            .bind(polled)
+            .execute(&pool)
+            .await?;
+
+        for boot in 1..=2 {
+            apply_migrations(&pool).await?;
+            let mut errors = std::collections::HashMap::new();
+            for url in [polled, never] {
+                let n: i64 =
+                    sqlx::query_scalar("SELECT consecutive_errors FROM feeds WHERE url = ?1")
+                        .bind(url)
+                        .fetch_one(&pool)
+                        .await?;
+                errors.insert(url, n);
+            }
+            assert_eq!(
+                errors[polled], 1,
+                "boot {boot} wiped a polled row's failure"
+            );
+            assert_eq!(
+                errors[never], 0,
+                "boot {boot} left a never-polled row failing"
+            );
+        }
+        Ok(())
+    }
+
+    /// **SQL and Rust agree on what an at-URI is.** SQLite's `LIKE` is
+    /// case-insensitive; the Rust guards use `strip_prefix("at://")`. A
+    /// mixed-case `At://` row is not an at-URI to `is_storable_feed_url`, so it
+    /// must not be one to the poller's exclusion either — otherwise it is
+    /// silently never polled while every other check treats it as a plain URL.
+    #[tokio::test]
+    async fn the_at_uri_predicate_is_case_sensitive_like_the_rust_guards() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let odd = "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        assert!(
+            !crate::feed::is_storable_feed_url(odd, true),
+            "the Rust side must not treat this as an at-URI"
+        );
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: odd.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let due = due_feeds(&pool, "2026-01-01T12:00:00Z", 10).await?;
+        assert_eq!(
+            due.len(),
+            1,
+            "the SQL side excluded a row the Rust side does not consider an at-URI"
+        );
         Ok(())
     }
 
