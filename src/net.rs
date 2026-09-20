@@ -1736,41 +1736,49 @@ pub(crate) mod tests {
         }
     }
 
-    /// A public first hop that `30x`-redirects to a private, secret-bearing feed
-    /// URL must be REFUSED before the private target is ever fetched — the
-    /// per-hop privacy re-check in [`guarded_get`]. We serve a `302` on loopback
-    /// pointing at a private URL and assert the guard aborts with a privacy
-    /// reason (not merely the SSRF/loopback rejection).
+    /// **A public first hop that `30x`es to a private, secret-bearing feed is
+    /// refused BEFORE the private target is fetched** — the per-hop privacy
+    /// re-check in [`guarded_get`].
+    ///
+    /// The previous version of this test spawned a redirecting server and then
+    /// threw it away (`let _ = addr;`), asserting on the private URL passed in
+    /// directly — so it exercised the FIRST-hop check only, and a mutation that
+    /// skipped privacy on every later hop left the whole suite green. Now a
+    /// real server really redirects, and the assertion that matters is on the
+    /// private target's request log: **zero**. "Never fetched" is the half of
+    /// the public-feeds-only guarantee this check exists for.
     #[tokio::test]
-    async fn guarded_get_refuses_private_redirect_target() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let resp = "HTTP/1.1 302 Found\r\nLocation: https://author.substack.com/feed/private/deadbeefcafe1234\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        // Fetch the loopback URL directly. The FIRST hop is loopback, which the
-        // SSRF guard already forbids — so to isolate the privacy check we assert
-        // on the private URL passed straight in instead.
-        let _ = addr; // (loopback first hop is SSRF-blocked; see direct check below)
-        let client = Client::builder().build().unwrap();
+    async fn a_redirect_to_a_private_feed_is_refused_before_it_is_fetched() {
+        let (target_addr, target_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("private-target.test", target_addr);
+        let (hop_addr, hop_log) = spawn_http(vec![redirect_to(&format!(
+            "http://private-target.test:{}/feed/private/deadbeefcafe1234",
+            target_addr.port()
+        ))])
+        .await;
+        test_host_override("private-hop.test", hop_addr);
+
         let err = guarded_get(
-            &client,
-            "https://author.substack.com/feed/private/deadbeefcafe1234",
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://private-hop.test:{}/feed.xml", hop_addr.port()),
             &[],
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .expect_err("a redirect to a private feed was followed");
+        let rendered = format!("{err:#}");
         assert!(
-            err.contains("private/paid feed"),
-            "expected privacy refusal, got: {err}"
+            rendered.contains("private/paid feed URL (redirect target)"),
+            "refused for the wrong reason: {rendered}"
+        );
+        assert_eq!(
+            hop_log.lock().unwrap().len(),
+            1,
+            "the public first hop is fetched"
+        );
+        assert_eq!(
+            target_log.lock().unwrap().len(),
+            0,
+            "the private target was FETCHED before being refused"
         );
     }
 
@@ -1918,6 +1926,124 @@ pub(crate) mod tests {
         assert!(format!("{err:#}").contains("non-http(s) URL scheme"));
     }
 
+    /// **`guarded_get_no_redirect` does not follow even one hop.** Its sibling
+    /// above proves the SSRF guard on this path; nothing proved the ZERO. Every
+    /// case there is an internal address or a bad scheme, so `max_redirects =
+    /// 0` — the function's reason to exist — was never exercised, and a
+    /// mutation passing `MAX_REDIRECTS` instead left the whole suite green.
+    ///
+    /// That mutation is the authorization-server mix-up defence collapsing:
+    /// OAuth metadata, `plc.directory`, `did:web` documents and the client
+    /// metadata self-fetch would all be read from wherever a `302` pointed,
+    /// while `issuer` is compared against the URL that was asked for.
+    #[tokio::test]
+    async fn guarded_get_no_redirect_refuses_to_follow_even_one_hop() {
+        let (b_addr, b_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("no-redirect-b.test", b_addr);
+        let (a_addr, a_log) = spawn_http(vec![redirect_to(&format!(
+            "http://no-redirect-b.test:{}/.well-known/oauth-authorization-server",
+            b_addr.port()
+        ))])
+        .await;
+        test_host_override("no-redirect-a.test", a_addr);
+
+        let err = guarded_get_no_redirect(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!(
+                "http://no-redirect-a.test:{}/.well-known/oauth-authorization-server",
+                a_addr.port()
+            ),
+            &[],
+        )
+        .await
+        .expect_err("a redirect was followed on the no-redirect path");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("origin is load-bearing"),
+            "refused for the wrong reason: {rendered}"
+        );
+        assert_eq!(a_log.lock().unwrap().len(), 1);
+        assert_eq!(
+            b_log.lock().unwrap().len(),
+            0,
+            "the redirect target was fetched — the hop was followed"
+        );
+    }
+
+    /// **A POST is never redirected.** The code comment on `guarded_post` says
+    /// this branch is "not exercised here"; now it is. A `307` re-sends the
+    /// method AND the body — an app password or an authorization code — to the
+    /// host the response chose.
+    #[tokio::test]
+    async fn guarded_post_refuses_a_redirect_rather_than_resending_the_body() {
+        let (elsewhere_addr, elsewhere_log) = spawn_http(vec![ok_200()]).await;
+        test_host_override("post-elsewhere.test", elsewhere_addr);
+        let (addr, log) = spawn_http(vec![format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://post-elsewhere.test:{}/token\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+            elsewhere_addr.port()
+        )])
+        .await;
+        test_host_override("post-redirect.test", addr);
+
+        let err = guarded_post_form(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://post-redirect.test:{}/token", addr.port()),
+            &[],
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "SECRET-CODE"),
+            ],
+        )
+        .await
+        .expect_err("a POST followed a redirect");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("re-send the request body"),
+            "refused for the wrong reason: {rendered}"
+        );
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(
+            elsewhere_log.lock().unwrap().len(),
+            0,
+            "the body was re-sent to the host the response chose"
+        );
+    }
+
+    /// **The redirect budget is enforced.** `MAX_REDIRECTS` bounds every
+    /// outbound fetch, and until now nothing drove a chain long enough to
+    /// reach it. One host redirects to itself `MAX_REDIRECTS + 2` times; the
+    /// guard must give up after `MAX_REDIRECTS + 1` requests, not loop on.
+    #[tokio::test]
+    async fn too_many_redirects_is_refused() {
+        // Bound first so every Location can name this server's own port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hops: Vec<String> = (0..MAX_REDIRECTS + 2)
+            .map(|i| redirect_to(&format!("http://redirect-loop.test:{port}/hop{i}")))
+            .collect();
+        let (addr, log) = spawn_http_on(listener, hops).await;
+        test_host_override("redirect-loop.test", addr);
+
+        let err = guarded_get(
+            &reqwest::Client::builder().build().unwrap(),
+            &format!("http://redirect-loop.test:{port}/hop0"),
+            &[],
+        )
+        .await
+        .expect_err("an endless redirect chain was not refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("too many redirects"),
+            "refused for the wrong reason: {rendered}"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            MAX_REDIRECTS + 1,
+            "the guard made a different number of requests than its budget allows"
+        );
+    }
+
     /// The content type must follow the body it describes. Because both come
     /// from the same value, a JSON body can never be labelled as a form.
     #[test]
@@ -1972,8 +2098,17 @@ pub(crate) mod tests {
     async fn spawn_http(
         responses: Vec<String>,
     ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        spawn_http_on(listener, responses).await
+    }
+
+    /// [`spawn_http`] on a listener the caller already bound — for a test whose
+    /// canned responses must name the server's own port (a redirect loop).
+    async fn spawn_http_on(
+        listener: tokio::net::TcpListener,
+        responses: Vec<String>,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let addr = listener.local_addr().unwrap();
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&log);
