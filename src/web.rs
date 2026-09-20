@@ -1335,7 +1335,9 @@ struct StatsTemplate {
     poll_interval_mins: i64,
     /// Feeds in error backoff. Invisible before, and excluded from `overdue`.
     in_backoff: i64,
-    /// Of those, the ones deep enough into backoff to be effectively dead.
+    /// Of those, the ones retried hours apart rather than minutes. **Not
+    /// "effectively dead"** — see `store::BADLY_BROKEN_ERRORS`; they recover on
+    /// their next successful poll, and most of this instance's did.
     badly_broken: i64,
     /// Failing feeds by cause, descending — counts only, never which feed.
     failure_kinds: Vec<(String, i64)>,
@@ -8960,9 +8962,14 @@ mod tests {
             .await
             .unwrap();
             for _ in 0..errors {
-                store::bump_feed_errors(&state.db, url, "fetch", "connection refused")
-                    .await
-                    .unwrap();
+                store::bump_feed_errors(
+                    &state.db,
+                    url,
+                    feed::FailureKind::Fetch,
+                    "connection refused",
+                )
+                .await
+                .unwrap();
             }
         }
 
@@ -9074,15 +9081,25 @@ mod tests {
             // collide with prose.
             (
                 "https://a.example/f.xml",
-                "fetch",
+                feed::FailureKind::Fetch,
                 "SENTINEL_CONNREFUSED",
                 3,
             ),
-            ("https://b.example/f.xml", "fetch", "SENTINEL_DNSFAIL", 2),
-            ("https://c.example/f.xml", "status", "SENTINEL_404", 1),
+            (
+                "https://b.example/f.xml",
+                feed::FailureKind::Fetch,
+                "SENTINEL_DNSFAIL",
+                2,
+            ),
+            (
+                "https://c.example/f.xml",
+                feed::FailureKind::Status,
+                "SENTINEL_404",
+                1,
+            ),
             (
                 "https://d.example/f.xml",
-                "parse",
+                feed::FailureKind::Parse,
                 "SENTINEL_UNPARSEABLE",
                 1,
             ),

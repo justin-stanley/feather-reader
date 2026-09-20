@@ -707,9 +707,7 @@ async fn poll_and_reschedule_with<'a, F, Fut>(
             // consecutive-error count so a persistently-broken feed climbs toward
             // the ceiling instead of retrying at the 5-min floor forever. If the
             // bump fails (store hiccup) fall back to the outcome's floor backoff.
-            let backoff = match store::bump_feed_errors(pool, &feed.url, kind.as_str(), &detail)
-                .await
-            {
+            let backoff = match store::bump_feed_errors(pool, &feed.url, kind, &detail).await {
                 Ok(count) => feed::backoff_for(count.max(1) as u32),
                 Err(err) => {
                     warn!(feed = %feed.url, %err, "failed to bump feed error count; using floor backoff");

@@ -590,6 +590,24 @@ impl FailureKind {
             Self::Parse => "parse",
         }
     }
+
+    /// Read back a persisted `last_error_kind`. `None` for anything this
+    /// version does not know, so a row written by a newer build is not
+    /// silently attributed to a cause this one recognises — the same contract
+    /// [`crate::metrics::Backend::parse`] keeps for the same reason.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "fetch" => Some(Self::Fetch),
+            "status" => Some(Self::Status),
+            "body" => Some(Self::Body),
+            "parse" => Some(Self::Parse),
+            _ => None,
+        }
+    }
+
+    /// Every variant, so a test can assert over the whole set rather than a
+    /// list that drifts when a variant is added.
+    pub const ALL: [Self; 4] = [Self::Fetch, Self::Status, Self::Body, Self::Parse];
 }
 
 /// Build a `reqwest::Client` configured for polite **and safe** feed fetching.
@@ -1419,8 +1437,39 @@ mod tests {
         assert_eq!(classify_feed_privacy("not a url"), FeedPrivacy::Public);
     }
 
+    /// **Every failure kind has its own label, and they round-trip.**
+    ///
+    /// Review found that collapsing all four `as_str` arms to `"fetch"` left
+    /// the whole suite green: every test of these columns passed string
+    /// literals, so nothing tied a variant to its label. A histogram whose
+    /// buckets all say the same thing is worse than no histogram — it reports a
+    /// single confident cause for four different failures.
+    ///
+    /// Asserted over `ALL` rather than a hand-written list, so adding a variant
+    /// without a label fails here instead of silently sharing one.
     #[test]
-    fn backoff_grows_and_caps() {
+    fn every_failure_kind_has_a_distinct_round_tripping_label() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in FailureKind::ALL {
+            let label = kind.as_str();
+            assert!(
+                seen.insert(label),
+                "{label:?} is used by more than one FailureKind",
+            );
+            assert_eq!(
+                FailureKind::parse(label),
+                Some(kind),
+                "{label:?} does not read back as the kind that wrote it",
+            );
+        }
+        assert_eq!(seen.len(), FailureKind::ALL.len());
+        // A label from a newer build is not attributed to a cause this one
+        // knows — the `metrics::Backend::parse` contract.
+        assert_eq!(FailureKind::parse("quota"), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
         assert!(backoff_for(2) > backoff_for(1));
         assert_eq!(backoff_for(100), BACKOFF_MAX);

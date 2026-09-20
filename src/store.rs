@@ -728,7 +728,7 @@ const MAX_ERROR_DETAIL_CHARS: usize = 300;
 pub async fn bump_feed_errors(
     pool: &SqlitePool,
     url: &str,
-    kind: &str,
+    kind: crate::feed::FailureKind,
     detail: &str,
 ) -> Result<i64> {
     let row = sqlx::query(
@@ -737,7 +737,7 @@ pub async fn bump_feed_errors(
          WHERE url = ?1 RETURNING consecutive_errors",
     )
     .bind(url)
-    .bind(kind)
+    .bind(kind.as_str())
     // **Truncated.** This is a remote server's error text on an unattended path;
     // an upstream that returns a megabyte of prose should cost a bounded row,
     // not an unbounded one.
@@ -3750,8 +3750,12 @@ pub struct PollHealth {
     /// checked moved the wrong way: a feed failing every fetch made `overdue`
     /// look BETTER.
     pub in_backoff: i64,
-    /// Of those, how many have failed enough times to be at or near the backoff
-    /// ceiling — the ones that will not recover on their own.
+    /// Of those, how many have reached [`BADLY_BROKEN_ERRORS`] consecutive
+    /// failures — retried 2h40m apart rather than every 5 minutes.
+    ///
+    /// Not "will not recover on their own": the backoff ceiling is 24h at ten
+    /// errors, and any of these recovers on its next successful poll. See
+    /// [`BADLY_BROKEN_ERRORS`].
     pub badly_broken: i64,
     /// Failing feeds grouped by **cause**, descending, as
     /// `(kind, count)` — `fetch`, `status`, `body`, `parse`.
@@ -3770,7 +3774,21 @@ pub struct PollHealth {
 ///
 /// Chosen to mean "this is not a transient blip": `feed::backoff_for` climbs
 /// exponentially, so by this many consecutive failures a feed is being retried
-/// hours apart and is almost certainly gone rather than flaky.
+/// **2h40m apart** — `backoff_for(6)`.
+///
+/// **Not "at or near the ceiling", and not "effectively dead".** `BACKOFF_MAX`
+/// is 24h and is first reached at *ten* errors, so a feed at this threshold is
+/// still retried around nine times a day and recovers on its own the moment the
+/// cause clears. Three doc comments claimed otherwise, and the claim was
+/// load-bearing in the wrong direction.
+///
+/// **It says nothing about whose fault the failure is, and used to claim it
+/// did.** This comment and the matching `/stats` copy read "almost certainly
+/// gone rather than flaky" until 2026-09-20, when #159 found that 60-odd feeds
+/// sat here because `guarded_get` was reading every `304 Not Modified` as a
+/// malformed redirect. The publishers were live; the reader was broken. That
+/// assertion is what stopped anyone looking, which is why `last_error_kind`
+/// now exists — the row can answer the question the count never could.
 const BADLY_BROKEN_ERRORS: i64 = 6;
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
@@ -5923,7 +5941,13 @@ mod tests {
         // `backoff_for` — the backoff grows with it (never latched at the floor).
         let mut last = std::time::Duration::ZERO;
         for expected in 1..=3 {
-            let count = bump_feed_errors(&pool, url, "fetch", "connection refused").await?;
+            let count = bump_feed_errors(
+                &pool,
+                url,
+                crate::feed::FailureKind::Fetch,
+                "connection refused",
+            )
+            .await?;
             assert_eq!(count, expected, "bump returns the new count");
             let backoff = crate::feed::backoff_for(count as u32);
             assert!(
@@ -5976,7 +6000,7 @@ mod tests {
         )
         .await?;
 
-        bump_feed_errors(&pool, url, "fetch", "SENTINEL_WHY").await?;
+        bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "SENTINEL_WHY").await?;
         let failing: (Option<String>, Option<String>) =
             sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
                 .bind(url)
@@ -6091,7 +6115,13 @@ mod tests {
             },
         )
         .await?;
-        bump_feed_errors(&pool, url, "body", &"x".repeat(10_000)).await?;
+        bump_feed_errors(
+            &pool,
+            url,
+            crate::feed::FailureKind::Body,
+            &"x".repeat(10_000),
+        )
+        .await?;
         let stored: (Option<String>,) =
             sqlx::query_as("SELECT last_error FROM feeds WHERE url = ?1")
                 .bind(url)
