@@ -563,6 +563,52 @@ mod tests {
         assert!(opml.contains("xmlUrl=\"https://lobste.rs/rss\" htmlUrl=\"https://lobste.rs/\"/>"));
     }
 
+    /// **Every attribute is escaped, not only the display label.** The module
+    /// promises "every attribute value properly XML-escaped"; the only escape
+    /// any test exercised was the `text` label. Dropping `escape_attr` from
+    /// the folder name, the feed URL and the site URL left the suite green.
+    /// A folder named `R&D` produces a malformed document strict importers
+    /// reject, and a `"` breaks out of the attribute.
+    #[test]
+    fn export_escapes_folder_names_and_urls() {
+        let folders = vec![(
+            "at://did:plc:x/community.lexicon.rss.folder/rd".to_string(),
+            Folder {
+                r#type: crate::lexicon::nsid::FOLDER.to_string(),
+                name: r#"R&D "x" <y>"#.to_string(),
+                position: Some(0),
+                created_at: "2026-07-12T00:00:00.000Z".to_string(),
+            },
+        )];
+        let mut a = Subscription::new(
+            "https://ex.example/feed?a=1&b=2",
+            "2026-07-12T00:00:00.000Z",
+        );
+        a.title = Some("A & B".to_string());
+        a.site_url = Some(r#"https://ex.example/"q""#.to_string());
+        a.folder = Some("at://did:plc:x/community.lexicon.rss.folder/rd".to_string());
+        let subs = vec![("rk1".to_string(), a)];
+
+        let opml = to_opml(&subs, &folders);
+        assert!(
+            opml.contains(r#"R&amp;D &quot;x&quot; &lt;y&gt;"#),
+            "folder name not escaped: {opml}"
+        );
+        assert!(
+            opml.contains("feed?a=1&amp;b=2"),
+            "feed URL not escaped: {opml}"
+        );
+        assert!(
+            opml.contains(r#"https://ex.example/&quot;q&quot;"#),
+            "site URL not escaped: {opml}"
+        );
+        assert!(
+            !opml.contains("R&D"),
+            "a raw ampersand reached the document: {opml}"
+        );
+        parse_opml(&opml).expect("the escaped document must re-parse");
+    }
+
     #[test]
     fn export_import_round_trip() {
         let folders = vec![(

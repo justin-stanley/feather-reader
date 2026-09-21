@@ -281,6 +281,38 @@ mod tests {
         let capped = cap(ids, 3);
         assert_eq!(capped, vec!["7", "8", "9"]);
     }
+    /// **The cap is APPLIED, not just correct.** `cap` had its own unit test
+    /// and every record-building test used 1–3 ids, so `read_state_record`
+    /// could stop calling it with the suite green — and the flusher would
+    /// publish id arrays past the lexicon's bound, the PDS would reject the
+    /// atomic batch, and every feed's read-state would stop syncing.
+    #[test]
+    fn read_state_record_applies_the_id_cap() {
+        let ids: Vec<String> = (0..ReadState::MAX_IDS + 5).map(|i| i.to_string()).collect();
+        let json = serde_json::to_string(&ids).unwrap();
+        let cursor = crate::store::ReadCursor {
+            did: "did:plc:x".into(),
+            feed_url: "https://example.com/feed.xml".into(),
+            read_through: None,
+            read_ids: json.clone(),
+            unread_ids: json,
+            dirty: true,
+            pds_created: false,
+            updated_at: "2026-07-12T00:00:00Z".into(),
+        };
+        let rec = read_state_record(&cursor);
+        assert_eq!(
+            rec.read_ids.len(),
+            ReadState::MAX_IDS,
+            "read_ids not capped"
+        );
+        assert_eq!(
+            rec.unread_ids.len(),
+            ReadState::MAX_IDS,
+            "unread_ids not capped"
+        );
+    }
+
     #[test]
     fn record_maps_cursor_fields() {
         let cursor = ReadCursor {

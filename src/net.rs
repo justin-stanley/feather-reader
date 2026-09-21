@@ -1429,6 +1429,59 @@ pub(crate) mod tests {
     /// A raw HTTP server on loopback that answers every request with `body`
     /// (fixed Content-Length). Returns its `http://127.0.0.1:port/` base URL.
     /// Used to exercise [`read_capped`] against a real reqwest `Response`.
+    /// A JSON server that records every raw request (head and body, read to
+    /// `content-length`) and answers each with `reply`. For asserting on the
+    /// BYTES a client sent — the only assertion that catches a record that is
+    /// wrong on the way out.
+    pub(crate) async fn serve_json_capturing(
+        reply: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let text = loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        break String::new();
+                    };
+                    if n == 0 {
+                        break String::from_utf8_lossy(&raw).to_string();
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let (head, body) = raw.split_at(split + 4);
+                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    });
+                    if want.is_none_or(|w| body.len() >= w) {
+                        break String::from_utf8_lossy(&raw).to_string();
+                    }
+                };
+                sink.lock().unwrap().push(text);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&reply).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
     /// [`serve_body`] that also counts requests — for an assertion that a URL
     /// was NEVER fetched, which a body alone cannot make.
     pub(crate) async fn serve_body_counted(

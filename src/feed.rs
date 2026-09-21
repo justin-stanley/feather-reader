@@ -1866,6 +1866,56 @@ mod tests {
         assert_eq!(FailureKind::parse("quota"), None);
     }
 
+    /// **Escalation reaches `settle_poll`.** `backoff_for` grows with the
+    /// count and is tested alone; nothing asserted that the poll path passes
+    /// the COUNT in. `backoff_for(1)` in its place left the whole suite green
+    /// — a permanently dead feed retrying forever at the first-failure floor,
+    /// which the comment on that line says must not happen.
+    #[tokio::test]
+    async fn backoff_escalates_with_consecutive_failures() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        let url = "https://dead.example/feed.xml";
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        for _ in 0..5 {
+            crate::store::bump_feed_errors(&pool, url, FailureKind::Fetch, "down").await?;
+        }
+        let before = chrono::Utc::now();
+        settle_poll(
+            &pool,
+            url,
+            &PollOutcome::Failed {
+                backoff: Duration::from_secs(300),
+                kind: FailureKind::Fetch,
+                detail: "still down".to_string(),
+            },
+            Duration::from_secs(3600),
+        )
+        .await;
+        let next: String = sqlx::query_scalar("SELECT next_poll FROM feeds WHERE url = ?1")
+            .bind(url)
+            .fetch_one(&pool)
+            .await?;
+        let next = chrono::DateTime::parse_from_rfc3339(&next)?.with_timezone(&chrono::Utc);
+        let delay = (next - before).num_seconds();
+        let expected = backoff_for(6).as_secs() as i64;
+        assert!(
+            (delay - expected).abs() <= 60,
+            "sixth failure scheduled {delay}s out; escalation says {expected}s"
+        );
+        assert!(
+            delay > backoff_for(1).as_secs() as i64 + 60,
+            "the sixth failure landed on the first-failure floor"
+        );
+        Ok(())
+    }
+
     #[test]
     fn backoff_grows_and_is_capped() {
         assert_eq!(backoff_for(1), BACKOFF_BASE);
