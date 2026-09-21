@@ -144,6 +144,19 @@ pub(crate) const MAX_LARGE_RECORDS: usize = 2_000;
 /// [`crate::store::UNPOLLABLE_URL_SQL`], and a test pins that the two agree.
 pub(crate) const AT_URI_PREFIX: &str = "at://";
 
+/// Strip the at-URI scheme **case-insensitively**, returning the body.
+///
+/// Schemes are case-insensitive per RFC 3986 and `Url::parse` folds them, so
+/// `At://` names the same thing as `at://`. Recognition has to match that, or a
+/// mixed-case row is an at-URI to the fetcher (which refuses it) and an
+/// ordinary URL to every guard — polled forever, failing forever. Whether such
+/// a spelling may be STORED is a separate question, answered no.
+pub(crate) fn strip_at_prefix(url: &str) -> Option<&str> {
+    url.get(..AT_URI_PREFIX.len())
+        .filter(|p| p.eq_ignore_ascii_case(AT_URI_PREFIX))
+        .map(|p| &url[p.len()..])
+}
+
 /// atproto's record-key rules, all of them: charset `[A-Za-z0-9._:~-]`, length
 /// 1..=512, and not `.` or `..`. The repo's TID tests state the same rule; this
 /// is the one place it is enforced on a key that arrives from outside.

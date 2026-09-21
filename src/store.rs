@@ -739,18 +739,51 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// reason a failure cause is recorded. (Rows like this exist: subscriptions
 /// written by other clients before this reader refused the scheme.)
 ///
-/// **One predicate, four readers** — the scheduler's `due_feeds`, the public
-/// `/stats` aggregates in `poll_health`, the admin's `failing_feeds`, and the
-/// boot-time clearing of the errors our own refusal produced — so
-/// they cannot drift: a row the scheduler skips must not be a row a health
-/// page counts as overdue or failing. When the reader is wired, every site
-/// that uses this constant is the list of what must change.
+/// **One predicate, five readers** — the scheduler's `due_feeds`, the public
+/// `/stats` aggregates in `poll_health`, the admin's `failing_feeds`, the
+/// boot-time clearing of the errors our own refusal produced, and
+/// [`unpollable_feeds`] — so they cannot drift: a row the scheduler skips must
+/// not be a row a health page counts as overdue or failing. When the reader is
+/// wired, every site that uses this constant is the list of what must change.
 ///
-/// `substr(...) = 'at://'` rather than `LIKE 'at://%'`: SQLite's `LIKE` is
-/// case-insensitive and the Rust guards (`strip_prefix("at://")`) are not, so a
-/// mixed-case `At://` row was an at-URI to SQL and a plain URL to every other
-/// check. Both sides now agree it is not one.
-pub(crate) const UNPOLLABLE_URL_SQL: &str = "substr(url, 1, 5) = 'at://'";
+/// **[`count_feeds`] is deliberately NOT one of them.** The global ceiling
+/// bounds storage on a small box, and an unpollable row occupies a row, so it
+/// counts against the cap. An earlier version of this doc said "four readers"
+/// without naming the exception, which read as completeness it did not have:
+/// a review found the ceiling consuming capacity that appeared on no surface,
+/// since `/stats` measures the poller and excludes these rows. `/admin/metrics`
+/// renders [`unpollable_feeds`] for exactly that reason.
+///
+/// `lower(substr(...)) = 'at://'` rather than `LIKE 'at://%'`: `LIKE` is
+/// case-insensitive for ASCII but its semantics are a SQLite setting
+/// (`PRAGMA case_sensitive_like`), and this must not depend on one.
+///
+/// **Case-insensitive on purpose, and the Rust guards match.** An earlier
+/// version was case-sensitive on both sides, with a test pinning that a
+/// mixed-case `At://` row IS handed to the poller — reasoning that if Rust does
+/// not call it an at-URI, SQL should not either. That was wrong in the
+/// direction that matters: URL schemes are case-insensitive, so `Url::parse`
+/// folds `At://` to scheme `at` and `net::check_scheme` refuses it (the DID
+/// form does not parse at all). The row could only fail, every tick, forever,
+/// and be published in the `fetch` bucket as an unreachable publisher.
+/// Recognition is now case-insensitive everywhere; storing a non-canonical
+/// spelling is separately refused, because `feeds.url` is UNIQUE.
+pub(crate) const UNPOLLABLE_URL_SQL: &str = "lower(substr(url, 1, 5)) = 'at://'";
+
+/// How many rows the poller will never select — the capacity consumed by feeds
+/// that cannot be fetched.
+///
+/// Rendered on `/admin/metrics` because the global ceiling counts these rows
+/// (see [`count_feeds`]) while `/stats` does not, so without this the cap could
+/// be reached with every public number saying otherwise.
+pub async fn unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM feeds WHERE {UNPOLLABLE_URL_SQL}"
+    )))
+    .fetch_one(pool)
+    .await
+    .context("counting unpollable feeds")
+}
 
 /// How many rows the poller will never select. Test-only: the assertion the
 /// at:// tests make, spelled once, against the predicate the code uses.
@@ -9161,18 +9194,28 @@ mod tests {
         Ok(())
     }
 
-    /// **SQL and Rust agree on what an at-URI is.** SQLite's `LIKE` is
-    /// case-insensitive; the Rust guards use `strip_prefix("at://")`. A
-    /// mixed-case `At://` row is not an at-URI to `is_storable_feed_url`, so it
-    /// must not be one to the poller's exclusion either — otherwise it is
-    /// silently never polled while every other check treats it as a plain URL.
+    /// **SQL and Rust agree on what an at-URI is — case-insensitively.**
+    ///
+    /// This test used to pin the opposite, and pinned a bug. It asserted that a
+    /// mixed-case `At://` row IS handed to the poller, reasoning that the Rust
+    /// guards use a case-sensitive `strip_prefix` so "every other check treats
+    /// it as a plain URL". They do not: URL schemes are case-insensitive, so
+    /// `Url::parse` folds `At://` to scheme `at`, which `net::check_scheme`
+    /// refuses — and the DID form does not parse at all. Such a row can only
+    /// fail, every tick, forever, and be published in the `fetch` bucket as an
+    /// unreachable publisher. That is the exact conflation the exclusion exists
+    /// to end.
+    ///
+    /// Recognition is case-insensitive on both sides now. Storing one is still
+    /// refused: `feeds.url` is UNIQUE, so two spellings of one publication are
+    /// two rows — the same rule the canonical-handle check applies.
     #[tokio::test]
-    async fn the_at_uri_predicate_is_case_sensitive_like_the_rust_guards() -> anyhow::Result<()> {
+    async fn a_mixed_case_at_uri_is_unpollable_on_both_sides() -> anyhow::Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let odd = "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
         assert!(
             !crate::feed::is_storable_feed_url(odd, true),
-            "the Rust side must not treat this as an at-URI"
+            "a non-canonical spelling must not be storable"
         );
         upsert_feed(
             &pool,
@@ -9183,10 +9226,60 @@ mod tests {
         )
         .await?;
         let due = due_feeds(&pool, "2026-01-01T12:00:00Z", 10).await?;
+        assert!(
+            due.is_empty(),
+            "a row nothing can fetch was handed to the poller: {:?}",
+            due.iter().map(|f| &f.url).collect::<Vec<_>>()
+        );
+
+        // And the boot-time clearing reaches it, so a legacy row that already
+        // accrued errors stops counting as a broken publisher.
+        bump_feed_errors(&pool, odd, crate::feed::FailureKind::Fetch, "refused").await?;
+        apply_migrations(&pool).await?;
+        let n: i64 = sqlx::query_scalar("SELECT consecutive_errors FROM feeds WHERE url = ?1")
+            .bind(odd)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(n, 0, "the clearing skipped a mixed-case at-URI row");
+        Ok(())
+    }
+
+    /// **The global feeds ceiling counts every row, including unpollable ones
+    /// — deliberately, and visibly.**
+    ///
+    /// `count_feeds` is a fifth reader of "is this an at-URI" that does NOT use
+    /// `UNPOLLABLE_URL_SQL`, and that is the right call: the ceiling bounds
+    /// STORAGE on a small box, and an unpollable row occupies a row. What was
+    /// wrong is that the capacity it consumed appeared on no surface — `/stats`
+    /// measures the poller and excludes them, so an operator could be at the
+    /// cap while every page said otherwise. `unpollable_feeds` is what
+    /// `/admin/metrics` renders to close that gap.
+    #[tokio::test]
+    async fn the_ceiling_counts_unpollable_rows_and_they_are_countable() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for url in [
+            "https://real.example/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac",
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         assert_eq!(
-            due.len(),
-            1,
-            "the SQL side excluded a row the Rust side does not consider an at-URI"
+            count_feeds(&pool).await?,
+            3,
+            "the ceiling must bound storage, so every row counts"
+        );
+        assert_eq!(
+            unpollable_feeds(&pool).await?,
+            2,
+            "both at-URI spellings are unpollable and must be countable"
         );
         Ok(())
     }
