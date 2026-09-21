@@ -14,9 +14,38 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.3.8 — 2026-09-20
+
+Fourteen PRs. Two additive nullable columns, no `fly.toml` change, one new
+config flag (`FEATHERREADER_STANDARD_SITE`, off by default, gating storage
+only).
+
+**The headline is not a feature.** Six of the fourteen changed no behaviour at
+all: they replaced 35 tests that stayed green with the code they named deleted,
+each found by mutating the implementation and watching the suite pass. A
+seventh added CI validation, and an eighth changed only a type bound.
+
+This file's preamble says entries should record where a test proved
+less than its name; most of this release is that.
 
 ### Security
+
+**A vacuous test is a guard nobody would notice breaking.** Each of these
+stayed green against the *whole* suite with the code it names removed:
+
+| guard | the mutation that passed | what it hid |
+|---|---|---|
+| `guarded_get_no_redirect` | follow `MAX_REDIRECTS` instead of `0` | OAuth metadata, `plc.directory` and `did:web` documents read from wherever a `302` points, while `issuer` is compared against the URL that was asked for — the authorization-server mix-up defence |
+| per-hop privacy re-check | check the first hop only | a public feed `30x`-ing to a tokened Substack/Patreon URL is fetched and streamed into the UI before storage refuses it |
+| add-path privacy gate | *(no test existed)* | a token-bearing URL reaches the network on subscribe |
+| rate limiter | key on `X-Forwarded-For` | unlimited `/login` and `/beta/redeem` by rotating one header value |
+| CSP | `default-src * 'unsafe-inline'` | the XSS backstop gutted |
+| `mark_cursor_pds_created` | delete its `WHERE` | every DID's cursors flagged as created, so their readState records are never created and every later flush updates nothing |
+| session AAD | drop the column from the binding | `access_token` ↔ `refresh_token` swapped inside one row, both still authenticating |
+
+Each is now driven through the real route or client and asserts on something
+the mutation changes — a request log that must be empty, the bytes a client
+sent, a bystander row that must not move (#170, #171, #172, #173).
 
 **The generic write primitives are private, and the 0.3.7 entry below
 overclaimed.** That entry says "the eight low-level writers across both backends
@@ -50,16 +79,135 @@ separate crate target and drives them against a scratch collection. So a
 handler in this crate can still write an unvetted record through the OAuth repo.
 **Narrower than before, not absent.** Ending the class means removing
 `Serialize` from `lexicon::Subscription`; that needs a hand-written impl for
-the `#[serde(transparent)]` `VettedSubscription` plus a wire-format test, and is
-tracked rather than done.
+the `#[serde(transparent)]` `VettedSubscription` plus a wire-format test, and
+was tracked rather than done — **closed later in this release by #178**, which
+gets the same guarantee from a sealed trait instead, leaving the derive alone.
 
 The claim "there is nothing to hand them that skipped the check" has now been
 wrong in three consecutive corrections. Each enumerated what was in front of it
 and described the result as the population.
 
+**An unvetted record no longer type-checks** (#178). The 0.3.7 entry below
+claimed this; the correction under it narrowed the claim to "narrower than
+before, not absent" and named removing `Serialize` from `lexicon::Subscription`
+as the way to end the class — then recorded that as blocked, because
+`VettedSubscription` is `#[serde(transparent)]` over it and a hand-written impl
+could silently migrate every reader's repo.
+
+`vetted::WritableRecord` is a **sealed** marker trait: implementing it requires
+a trait private to that module, so its implementors are the whole list — the
+vetted wrappers, plus `Folder` and `ReadState`, which carry no field rendered as
+an href. `create_record` and `put_record` take that bound, so
+`create_record(nsid::SUBSCRIPTION, &raw_subscription)` no longer compiles, and
+the wire format still comes from one derive.
+
+The evidence is a `compile_fail` doctest, which CI runs. A `compile_fail` that
+passes for the wrong reason is the trap here, so it is mutation-checked: adding
+`Subscription` to the implementor list makes its snippet compile and the doctest
+fails.
+
+`apply_writes` stays reachable — `WriteOp::Create.value` is a
+`serde_json::Value`, so a hand-built record goes through. That is a deliberate
+two-step rather than an accidental one-liner, and `repo.rs` now names it instead
+of implying the class is closed.
+
+**The OPML upload cap is the route's own** (#176). `OPML_BODY_LIMIT` was exactly
+2 MiB — axum's `DefaultBodyLimit` — so the route's layer was a no-op, and the
+test named for it was really testing axum. Lowered to 1 MiB, which is the
+direction that makes the layer mean something: raising it above the default
+would have made it testable by *weakening* the bound. One outline is ~92 bytes,
+so 1 MiB carries ~11 000 of them against a per-DID cap of 500 the import trims
+to anyway. A compile-time assertion keeps it under the framework default.
+
+### Added
+
+**`/stats` says WHY feeds are failing, and `/admin/metrics` says which**
+(#166). `feeds` recorded `consecutive_errors` and nothing else, so a systematic
+defect across sixty feeds was indistinguishable from sixty dead blogs — which is
+exactly what 0.3.7's #159 was. `PollOutcome::Failed` now carries a closed
+`FailureKind` (`fetch | status | body | parse`) and a detail capped at 300
+characters, in two additive nullable columns.
+
+The public page gets a cause histogram: counts only, never which feed and never
+whose. Had it existed, #159 would have read `60 fetch` on a page anyone could
+load. Rows that predate the columns, or carry a kind this build does not know,
+fold into `unknown` rather than vanishing — so the breakdown always sums to the
+`Failing` figure beside it. `/admin/metrics` (ALLOWED_DIDS only) names the
+failing feeds with kind, detail and count.
+
+**standard.site publications, dormant** (#164, #165). `FEATHERREADER_STANDARD_SITE`
+(default off) lets an `at://…/site.standard.publication/…` subscription be
+**stored** — one arriving by OPML import or written by another client. The
+subscribe form cannot take one: the add path must fetch what is pasted and
+nothing fetches `at://`.
+
+Nothing polls one either, and that is by exclusion rather than by the flag:
+`due_feeds`, `/stats`, the admin list and a boot-time clearing all share one
+predicate, so an `at://` row is **skipped, not failed**. Handing one to the
+poller would manufacture a permanent failure per row and publish it as an
+unreachable publisher — the conflation the cause histogram exists to end. The
+19 such rows on this instance predate the scheme check and are cleared by a step
+that touches only rows never polled successfully.
+
+`src/standard_site.rs` reads a publication and its documents (#165), reusing
+everything that makes the fetch safe rather than rebuilding it. Only
+`textContent` / `description` are read — `content` is an open union, six
+wrappers and twenty-two block types across 449 measured documents — and they are
+**escaped, not sanitised**: both are plain text, and `ammonia::clean` parses its
+input as markup, so `"if x<y then z"` comes back as `"if x"`. Documents are
+filtered by the URI the PDS minted, the guid is the record URI rather than the
+mutable `path`, and a walk that stops early says so. **Not wired to the poller**
+— that is the next release.
+
+### Fixed
+
+**A feed failing its first fetch is now backed off** (#166). The scheduler
+bumped the error count *and* wrote `next_poll`; the direct poll on subscribe did
+only the first, so the backoff the counter implied was never applied — the
+scheduler picked the feed up on the next tick anyway, because a NULL `next_poll`
+is due. Both callers go through one settle path.
+
+**A `listRecords` walk is bounded by records, not just pages** (#168). The page
+cap bounded requests; a server ignoring `limit=100` could still return
+gigabytes. `extend_bounded` refuses past 20 000 records rather than truncating,
+because its caller feeds `replace_sub_refs` — where a short list is revoked
+access, not a short list.
+
+**A 2xx carrying an error envelope is not an empty page** (#165). `records` is
+`#[serde(default)]`, so `{"error": …}` on a 200 deserialised as zero records —
+and on the OAuth path that reaches `resolve_subscriptions` as "this DID follows
+nothing", which `sync_sub_refs` writes through, deleting the reader's whole
+`sub_ref` projection. One shared parse now enforces both invariants (no error
+envelope, `records` present) for all three clients, and the four write paths
+refuse an envelope too. An empty body is refused for the same reason.
+
+### Tests
+
+Thirty-five vacuous tests replaced or retired across #170–#175, each proven by
+breaking the implementation and showing the suite still passed. Besides the
+security guards above: six `store.rs` queries that passed with their `WHERE` or
+`ORDER BY` deleted — including a starred-entry trim that, with its ordering
+flipped, spares the *oldest* starred articles and evicts the newest on every
+poll; bulk-write tests that built the `applyWrites` ops themselves and never
+called the function; a `ReadState` cap that was unit-tested but never proven to
+be applied; OPML escaping exercised only on the display label.
+
+Three pieces of dead code were deleted rather than tested: a `did:web`
+IP-literal branch whose every case the numeric-TLD rule already refused, a host
+conjunct in `is_storable_feed_url` that no input could reach, and two sort
+helpers left behind by tautological tests. Two of the hunt's own findings were
+wrong, and saying so is the point: both were verified by probe before anything
+was removed.
+
+### CI
+
+`deploy/Caddyfile` is validated against both OAuth routings (#161), so a syntax
+error or a routing change that breaks one of them fails the build rather than
+the deploy.
+
 ---
 
-## 0.3.7 — 2026-09-20
+## 0.3.7 — 2026-09-19
 
 Eight PRs. No features, no schema change, no `fly.toml` change. One config
 change — the Caddy log filter — which is baked into the image and so takes
