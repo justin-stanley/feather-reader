@@ -382,6 +382,7 @@ async fn run_writes(
     created: &mut Vec<String>,
 ) -> Result<()> {
     use feather_reader::atproto::WriteOp;
+    use feather_reader::vetted::SpikeRecord;
     use serde_json::json;
 
     let record = json!({
@@ -390,7 +391,9 @@ async fn run_writes(
         "createdAt": chrono::Utc::now().to_rfc3339(),
     });
 
-    let written = repo.create_record(collection, &record).await?;
+    let written = repo
+        .create_record(collection, &SpikeRecord(record.clone()))
+        .await?;
     let rkey = written
         .rkey()
         .context("createRecord returned no usable rkey")?
@@ -406,7 +409,8 @@ async fn run_writes(
         "note": "feather-reader OAuth spike; updated",
         "createdAt": chrono::Utc::now().to_rfc3339(),
     });
-    repo.put_record(collection, &rkey, &updated).await?;
+    repo.put_record(collection, &rkey, &SpikeRecord(updated))
+        .await?;
     println!("  put        OK (same rkey)");
 
     // applyWrites: a batch create, to prove the batch body is accepted.

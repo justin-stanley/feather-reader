@@ -16,7 +16,6 @@
 
 use anyhow::{bail, Context as _, Result};
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
@@ -183,7 +182,7 @@ impl Repo<'_> {
     }
 
     /// Create a record, letting the PDS assign the key.
-    pub async fn create_record<T: Serialize>(
+    pub async fn create_record<T: crate::vetted::WritableRecord>(
         &self,
         collection: &str,
         record: &T,
@@ -196,7 +195,7 @@ impl Repo<'_> {
     }
 
     /// Create or replace a record at a known key.
-    pub async fn put_record<T: Serialize>(
+    pub async fn put_record<T: crate::vetted::WritableRecord>(
         &self,
         collection: &str,
         rkey: &str,
