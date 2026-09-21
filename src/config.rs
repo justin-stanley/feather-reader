@@ -33,7 +33,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet, and nothing polls one: `at://` rows are skipped by scheme, not failed (see `store::UNPOLLABLE_URL_SQL`). Both land with the standard.site reader. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether `at://…/site.standard.publication/…` subscriptions are **stored and polled**. One flag, both halves: `feed::FeedKind::pollable` decides what `due_feeds` selects, so with it off a publication is simply not due rather than selected-and-refused. The subscribe form still cannot take one — the add path must fetch what is pasted, and nothing fetches `at://`; an import or another client's record is how one arrives. |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -150,17 +150,20 @@ pub struct Config {
     /// switch. Defaults to the sidecar, so deploying the Rust client changes
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
-    /// Whether an `at://` standard.site publication subscription may be
-    /// **stored** — via OPML import or a record another client wrote. The
-    /// subscribe form cannot take one yet: the add path must fetch what is
-    /// pasted and nothing fetches `at://`, so it refuses with its own message.
-    /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
+    /// Whether an `at://` standard.site publication subscription is **stored
+    /// and polled**. From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
-    /// **This flag does not gate polling; nothing does, because nothing polls
-    /// an `at://` row.** An earlier version of this comment claimed one flag
-    /// gated both. It did not — nothing outside the storable guards read it.
-    /// Why `at://` rows are skipped rather than failed, and where that one
-    /// decision lives, is documented once on [`crate::store::UNPOLLABLE_URL_SQL`].
+    /// **One flag, both halves — finally true.** Two earlier versions of this
+    /// comment got it wrong in opposite directions: the first claimed it gated
+    /// polling when nothing read it, the second said nothing gated polling
+    /// because nothing polled. Now [`crate::feed::FeedKind::pollable`] takes
+    /// it and decides what `due_feeds` selects, so with the flag off a
+    /// publication is not due — rather than selected and then refused, which
+    /// would manufacture a failure per row per tick.
+    ///
+    /// The subscribe form still cannot take one: the add path must fetch what
+    /// is pasted and nothing fetches `at://`. An OPML import, or a record
+    /// another client wrote, is how one arrives.
     pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted

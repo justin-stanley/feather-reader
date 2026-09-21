@@ -54,7 +54,12 @@ pub struct AtUri {
 impl AtUri {
     /// Parse, or `None` if this is not a well-formed three-segment at-URI.
     pub fn parse(uri: &str) -> Option<Self> {
-        let rest = uri.strip_prefix(crate::atproto::AT_URI_PREFIX)?;
+        // Case-insensitive, like every other at-URI recogniser in the tree
+        // (#183). A legacy `At://` row is marked `kind = 'publication'` by the
+        // back-fill and dispatched here; a case-sensitive parse would refuse
+        // it on every tick forever — the manufactured per-tick failure the
+        // flag-gates-selection design exists to prevent.
+        let rest = crate::atproto::strip_at_prefix(uri)?;
         let mut parts = rest.split('/');
         let (authority, collection, rkey) = (parts.next()?, parts.next()?, parts.next()?);
         if parts.next().is_some()
@@ -370,20 +375,31 @@ pub async fn store_publication(
         .await
         .with_context(|| format!("insert_entries for {url}"))?;
 
-    // **A partial read is not a clean poll.** `RecordWalk.complete` exists to
-    // carry "I did not read all of it" out of the walk; reporting `Updated`
-    // here would throw that away and leave the feed looking healthy while
-    // silently missing articles. The entries it DID read are already stored —
-    // a partial read is not a discarded one — but the outcome says so, which
-    // puts the feed on a backoff and names the cause on `/stats`.
+    // **A truncated read is a SUCCESSFUL poll of a large publication.**
+    //
+    // The first version of this returned `Failed { Body }` when the walk
+    // stopped early, on the reasoning that reporting `Updated` would hide
+    // missing articles. That was wrong, and it contradicted the argument
+    // `extend_truncating` was written on: truncation is a steady state, not a
+    // transient. A publication past `MAX_LARGE_RECORDS`, or a quiet one whose
+    // busy sibling fills every page, is incomplete on EVERY poll — so
+    // `settle_poll` would bump the error count every time and never reset it,
+    // climbing past `BADLY_BROKEN_ERRORS` into the public "badly broken"
+    // figure and parking the feed at the 24h backoff ceiling. A big publisher
+    // would become permanently unreadable, which is precisely what
+    // `extend_truncating` exists to prevent.
+    //
+    // RSS is the analogy that settles it: a feed document carries its last few
+    // dozen items and nobody calls that a failure. The recent articles are
+    // stored; the walk's bound is a design limit, not an error. It is logged
+    // with the feed named, so an operator can see it — a signal, not a
+    // failure count.
     if !complete {
-        return Ok(crate::feed::PollOutcome::Failed {
-            backoff: std::time::Duration::from_secs(0),
-            kind: crate::feed::FailureKind::Body,
-            detail: crate::feed::failure_detail(format!(
-                "incomplete read: stored {n} entries but the document walk stopped early"
-            )),
-        });
+        tracing::warn!(
+            feed = %url,
+            stored = n,
+            "read part of this publication's archive; its document walk hit a bound"
+        );
     }
     Ok(crate::feed::PollOutcome::Updated { new_entries: n })
 }
@@ -395,6 +411,17 @@ pub async fn store_publication(
 /// error counting, backoff and the cause histogram all come for free. A read
 /// error is a `fetch` failure with the anyhow chain as its detail, the same
 /// shape `poll_feed` produces.
+/// How long one publication poll may take in total.
+///
+/// **An RSS poll is one request; this is up to 401.** `resolve_did_to_pds`
+/// plus two cursor walks of `MAX_LIST_PAGES` pages each, against a PDS this
+/// instance did not choose, with only a per-REQUEST timeout. A slow or
+/// adversarial host answering each page just inside that timeout holds one of
+/// the poller's few permits for hours — and `poll_due_once` awaits every
+/// spawned handle, so the next tick, and therefore every RSS feed, waits
+/// behind it.
+pub const PUBLICATION_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub async fn poll_publication(
     pool: &sqlx::SqlitePool,
     http: &reqwest::Client,
@@ -409,16 +436,24 @@ pub async fn poll_publication(
             detail: crate::feed::failure_detail(format!("not a readable at:// URI: {url}")),
         });
     };
-    let read = match fetch(http, plc_directory, &uri).await {
-        Ok(read) => read,
-        Err(e) => {
-            return Ok(crate::feed::PollOutcome::Failed {
-                backoff: std::time::Duration::from_secs(0),
-                kind: crate::feed::FailureKind::Fetch,
-                detail: crate::feed::failure_detail(format!("{e:#}")),
-            })
-        }
-    };
+    let read =
+        match tokio::time::timeout(PUBLICATION_POLL_TIMEOUT, fetch(http, plc_directory, &uri))
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "publication read exceeded {}s",
+                    PUBLICATION_POLL_TIMEOUT.as_secs()
+                ))
+            }) {
+            Ok(read) => read,
+            Err(e) => {
+                return Ok(crate::feed::PollOutcome::Failed {
+                    backoff: std::time::Duration::from_secs(0),
+                    kind: crate::feed::FailureKind::Fetch,
+                    detail: crate::feed::failure_detail(format!("{e:#}")),
+                })
+            }
+        };
     store_publication(
         pool,
         url,
@@ -955,12 +990,21 @@ mod tests {
         Ok(())
     }
 
-    /// **An incomplete read is not a complete poll.** `RecordWalk.complete`
-    /// exists to carry "I did not read all of it" out to the caller; settling
-    /// it as a clean `Updated` throws that away, and the feed looks healthy
-    /// while silently missing articles.
+    /// **A truncated read is a successful poll, not a failure.**
+    ///
+    /// This test asserted the opposite when it was written — `Failed { Body }`
+    /// — and the assertion was wrong for the reason `extend_truncating` was
+    /// built on. Truncation is a STEADY state: a publication past the record
+    /// cap, or a quiet one whose busy sibling fills every page, is incomplete
+    /// on every poll. Counting that as an error climbs past
+    /// `BADLY_BROKEN_ERRORS`, parks the feed at the 24h ceiling and publishes a
+    /// working publisher as broken — permanently unreadable instead of
+    /// partially read, exactly what the truncating walk exists to prevent.
+    ///
+    /// An RSS document carries its last few dozen items and nobody calls that
+    /// a failure. The bound is a design limit; it is logged, not counted.
     #[tokio::test]
-    async fn an_incomplete_read_is_not_reported_as_a_clean_poll() -> anyhow::Result<()> {
+    async fn a_truncated_read_is_a_successful_poll() -> anyhow::Result<()> {
         let pool = crate::store::init_url("sqlite::memory:").await?;
         let uri = format!("at://{DID}/{}/p", nsid::STANDARD_PUBLICATION);
         crate::store::upsert_feed(
@@ -976,22 +1020,29 @@ mod tests {
         let entries = entries_from_records(&site, &pubn, &[document("d1", &site, "One", "/one")]);
 
         let outcome = store_publication(&pool, &uri, &pubn, entries, false, 100).await?;
-        match outcome {
-            crate::feed::PollOutcome::Failed {
-                kind, ref detail, ..
-            } => {
-                assert_eq!(kind, crate::feed::FailureKind::Body);
-                assert!(detail.contains("incomplete"), "detail: {detail}");
-            }
-            other => panic!("an incomplete read was settled as {other:?}"),
-        }
-        // The entries it DID read are still stored — a partial read is not a
-        // discarded one.
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 1 }
+            ),
+            "a truncated read must not be an error outcome, got {outcome:?}"
+        );
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
             .fetch_one(&pool)
             .await?;
         assert_eq!(n, 1, "a partial read discarded the articles it had");
         Ok(())
+    }
+
+    /// A legacy `At://` row reaches the reader — the back-fill marks it
+    /// `publication`, so with the flag on it is selected every tick. A
+    /// case-sensitive parse would refuse it forever.
+    #[test]
+    fn a_non_canonical_scheme_spelling_still_parses_as_an_at_uri() {
+        let uri = AtUri::parse(&format!("At://{DID}/{}/3lab", nsid::STANDARD_PUBLICATION))
+            .expect("a legacy mixed-case row must still be readable");
+        assert_eq!(uri.authority, DID);
+        assert_eq!(uri.collection, nsid::STANDARD_PUBLICATION);
     }
 
     /// **A publication on a subpath keeps it.** `Url::join` is RFC-3986, so a

@@ -719,8 +719,9 @@ pub enum FeedKind {
     /// An RSS/Atom/JSON feed document fetched over http(s).
     Rss,
     /// An `at://…/site.standard.publication/…` record pair in somebody's PDS.
-    /// Storable behind `FEATHERREADER_STANDARD_SITE`; **not yet pollable**, so
-    /// [`FeedKind::POLLABLE`] excludes it. Wiring the reader is what moves it.
+    /// Storable behind `FEATHERREADER_STANDARD_SITE`, and pollable behind the
+    /// same flag — see [`FeedKind::pollable`], which is the one place that
+    /// decides.
     Publication,
 }
 
