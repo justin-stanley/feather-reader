@@ -30,3 +30,8 @@
 .env
 .env.*
 !.env.example
+
+# Claude Code's per-checkout local settings (tool permissions, model choice).
+# Personal to whoever is working here, and `settings.json` is the committed
+# shared form if one is ever wanted.
+/.claude/settings.local.json

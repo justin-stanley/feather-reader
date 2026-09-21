@@ -301,9 +301,43 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Body-size ceiling for the OPML import upload (~2 MiB). Large enough for any
-/// realistic subscription list, small enough to make an OOM upload impossible.
-const OPML_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Body-size ceiling for the OPML import upload: **1 MiB, deliberately below
+/// axum's 2 MiB default.**
+///
+/// The value used to BE the framework default, which made the route's own
+/// `DefaultBodyLimit` layer a no-op: removing the layer changed nothing, so
+/// nothing could test it, and the ceiling this route wanted was whatever the
+/// framework happened to pick. Sized to this route instead — one outline is
+/// ~92 bytes, so 1 MiB carries ~11 000 of them against a per-DID cap
+/// (`max_subs_per_did`, default 500) the import trims to anyway. Anything
+/// larger is not a subscription list.
+///
+/// Being strictly tighter than the default is what makes the layer both real
+/// and pinnable: `opml_import_over_the_route_cap_is_refused_below_the_framework_default`
+/// uploads a payload that only this limit refuses.
+const OPML_BODY_LIMIT: usize = 1024 * 1024;
+
+/// axum's own `DefaultBodyLimit` (2 MiB as of axum 0.8), for the test that
+/// uploads a payload between the two ceilings.
+///
+/// **What matters is only that it EXCEEDS [`OPML_BODY_LIMIT`]**, not that this
+/// number is exact — axum does not export it, so it cannot be imported. The
+/// exceeding is what the test's mutation demonstrates: with the route's layer
+/// removed, a payload of this size is accepted. If axum ever lowers its
+/// default below ours, that mutation stops failing and the compile-time
+/// assertion below is the thing to revisit.
+#[cfg(test)]
+const AXUM_DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The route's cap must stay strictly tighter than the framework's, or its
+/// layer is a no-op again. A compile error, not a test failure: this is a
+/// property of the two constants, and nothing should be able to build a binary
+/// where it is false.
+#[cfg(test)]
+const _: () = assert!(
+    OPML_BODY_LIMIT < AXUM_DEFAULT_BODY_LIMIT,
+    "OPML_BODY_LIMIT must be tighter than axum's default, or the route's layer does nothing"
+);
 
 /// A response-header layer that sets `name: value` on every response, overriding
 /// any existing header of that name. `name`/`value` must be valid static header
@@ -7371,7 +7405,7 @@ mod tests {
         let cookie = session_cookie(&state, "did:plc:admin", None);
         let app = router(state);
 
-        // A payload comfortably above the 2 MiB route cap.
+        // A payload comfortably above the route cap.
         let payload = vec![b'a'; OPML_BODY_LIMIT + 1024];
         let (content_type, body) = opml_multipart(&payload);
 
@@ -7391,6 +7425,46 @@ mod tests {
             resp.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "an over-cap OPML upload must be rejected with 413, not collapsed to 500"
+        );
+    }
+
+    /// **The route's own cap is what refuses this, not the framework's.**
+    ///
+    /// `OPML_BODY_LIMIT` used to equal axum's `DefaultBodyLimit` (2 MiB), so
+    /// the route's layer was a no-op — deleting it left every test green, and
+    /// `opml_import_oversize_upload_returns_413` was really testing axum. The
+    /// limit is 1 MiB now, strictly tighter, and this uploads a payload that
+    /// sits BETWEEN the two: over ours, under the framework's. Only the
+    /// route's layer can refuse it — remove the layer and this payload is
+    /// accepted, which is also what demonstrates the framework's default is
+    /// the larger of the two.
+    #[tokio::test]
+    async fn opml_import_over_the_route_cap_is_refused_below_the_framework_default() {
+        let state = test_state(&["did:plc:admin"]).await;
+        let cookie = session_cookie(&state, "did:plc:admin", None);
+        let app = router(state);
+
+        // Between the two ceilings: the framework would accept this.
+        let payload = vec![b'a'; (OPML_BODY_LIMIT + AXUM_DEFAULT_BODY_LIMIT) / 2];
+        let (content_type, body) = opml_multipart(&payload);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header("content-type", content_type)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a payload over the route's cap but under the framework's was accepted — \
+             the route's own DefaultBodyLimit layer is not doing anything"
         );
     }
 
