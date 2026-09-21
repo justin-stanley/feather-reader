@@ -20,10 +20,12 @@ Fourteen PRs. Two additive nullable columns, no `fly.toml` change, one new
 config flag (`FEATHERREADER_STANDARD_SITE`, off by default, gating storage
 only).
 
-**The headline is not a feature.** Seven of the fourteen changed no behaviour
-at all: they replaced tests that stayed green with the code they named deleted.
-Thirty-five of those, found by mutating the implementation and watching the
-suite pass. This file's preamble says entries should record where a test proved
+**The headline is not a feature.** Six of the fourteen changed no behaviour at
+all: they replaced 35 tests that stayed green with the code they named deleted,
+each found by mutating the implementation and watching the suite pass. A
+seventh added CI validation, and an eighth changed only a type bound.
+
+This file's preamble says entries should record where a test proved
 less than its name; most of this release is that.
 
 ### Security
@@ -133,10 +135,6 @@ fold into `unknown` rather than vanishing — so the breakdown always sums to th
 `Failing` figure beside it. `/admin/metrics` (ALLOWED_DIDS only) names the
 failing feeds with kind, detail and count.
 
-One settle path (#166): the scheduler bumped the error count *and* wrote
-`next_poll`; the direct poll on subscribe did only the first, so a feed failing
-its first fetch was recorded as failing but never backed off.
-
 **standard.site publications, dormant** (#164, #165). `FEATHERREADER_STANDARD_SITE`
 (default off) lets an `at://…/site.standard.publication/…` subscription be
 **stored** — one arriving by OPML import or written by another client. The
@@ -162,6 +160,12 @@ mutable `path`, and a walk that stops early says so. **Not wired to the poller**
 — that is the next release.
 
 ### Fixed
+
+**A feed failing its first fetch is now backed off** (#166). The scheduler
+bumped the error count *and* wrote `next_poll`; the direct poll on subscribe did
+only the first, so the backoff the counter implied was never applied — the
+scheduler picked the feed up on the next tick anyway, because a NULL `next_poll`
+is due. Both callers go through one settle path.
 
 **A `listRecords` walk is bounded by records, not just pages** (#168). The page
 cap bounded requests; a server ignoring `limit=100` could still return
@@ -203,7 +207,7 @@ the deploy.
 
 ---
 
-## 0.3.7 — 2026-09-20
+## 0.3.7 — 2026-09-19
 
 Eight PRs. No features, no schema change, no `fly.toml` change. One config
 change — the Caddy log filter — which is baked into the image and so takes
