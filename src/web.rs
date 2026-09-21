@@ -4440,10 +4440,27 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
         }
     }
 
+    // **Capacity that no other page can show.** The global ceiling counts every
+    // row (`store::count_feeds`), but `/stats` measures the poller and excludes
+    // unpollable ones — so an instance can be at its cap with every public
+    // number saying otherwise. A review found exactly that gap.
+    let unpollable = match crate::store::unpollable_feeds(&state.db).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(%err, "could not count unpollable feeds");
+            -1
+        }
+    };
+    let cached = crate::store::count_feeds(&state.db).await.unwrap_or(-1);
+
     let body = format!(
-        "live backend: {}\nparked read-state DIDs: {}\n\n{}{}",
+        "live backend: {}\nparked read-state DIDs: {}\n\
+         feeds cached: {} (ceiling {}), of which unpollable: {}\n\n{}{}",
         state.config.repo_backend.as_str(),
         parked,
+        cached,
+        state.config.max_feeds_global,
+        unpollable,
         crate::metrics::render(&rows),
         failing_block,
     );

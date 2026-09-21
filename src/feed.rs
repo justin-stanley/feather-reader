@@ -248,7 +248,17 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
     // the handle form `at://alice.example.com/…` parses fine. So adding `"at"`
     // to the `matches!` below would appear to work and silently reject every
     // DID-based at-URI, which is all of them in practice.
-    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
+    if let Some(rest) = crate::atproto::strip_at_prefix(url) {
+        // **Recognised case-insensitively, stored canonically.** Schemes are
+        // case-insensitive, so `At://` names the same publication — but
+        // `feeds.url` is UNIQUE, so accepting both spellings is two rows for
+        // one publication, the hazard the canonical-handle rule exists for.
+        // Recognising it here rather than letting it fall through to the
+        // generic checks is what keeps it out of the poller: nothing can fetch
+        // it under any spelling.
+        if !url.starts_with(crate::atproto::AT_URI_PREFIX) {
+            return false;
+        }
         // **This gates STORING only — polling is handled by exclusion**, on
         // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
         // place the why is written down.
@@ -356,7 +366,13 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
     // `Public` is the right answer: a publication is a public record in a
     // public repo and the rkey is a handle, not a secret, so there is no
     // private/paid shape for this scheme to carry.
-    if let Some(rest) = url.strip_prefix(crate::atproto::AT_URI_PREFIX) {
+    if let Some(rest) = crate::atproto::strip_at_prefix(url) {
+        // A non-canonical scheme spelling is an at-URI this reader will not
+        // store, not an unparseable string for the `Err(_) => Public` arm below
+        // to wave through. Fail closed.
+        if !url.starts_with(crate::atproto::AT_URI_PREFIX) {
+            return FeedPrivacy::Private("non-canonical at:// scheme spelling".to_string());
+        }
         // **Only a WELL-FORMED publication URI is exempt.** The first version
         // of this was a bare prefix match, which declared any attacker-chosen
         // string starting `at://` safe to publish — skipping the userinfo
@@ -374,10 +390,19 @@ pub fn classify_feed_privacy(url: &str) -> FeedPrivacy {
         // **Malformed `at://` is REFUSED, not passed through.** Falling through
         // reaches `Url::parse`, which fails on the DID form and lands on the
         // `Err(_) => Public` arm below — whose justification is "the add path
-        // will reject it as a malformed URL regardless". That justification is
-        // false on the `rename_subscription` path, where this function is the
-        // only gate. So a string we cannot even recognise as a publication is
-        // refused here rather than declared safe to publish.
+        // will reject it as a malformed URL regardless".
+        //
+        // **Defence in depth, not a live gate.** This comment used to say the
+        // justification is false on the `rename_subscription` path, "where this
+        // function is the only gate". That stopped being true when storability
+        // moved ahead of privacy on the repoint: a review then found no
+        // production caller can reach this arm at all — add pre-checks the
+        // `at://` prefix, rename and OPML and `resolve_subscriptions` all
+        // refuse a non-storable URL first. It stays because a fail-closed
+        // branch is worth its keep for the next caller that arrives without
+        // one, and because deleting a guard on the grounds that nothing
+        // currently reaches it is how the next one gets it wrong. It is not
+        // load-bearing today, and saying so is the honest version.
         return FeedPrivacy::Private("not a well-formed at:// publication URI".to_string());
     }
     let parsed = match Url::parse(url) {
@@ -1985,6 +2010,27 @@ mod tests {
         assert!(is_storable_feed_url(uri, true));
         assert!(is_storable_feed_url("https://example.com/feed.xml", false));
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+    }
+
+    /// **A non-canonical scheme spelling is recognised and refused.** URL
+    /// schemes are case-insensitive, so `At://` names the same thing as
+    /// `at://` — but `feeds.url` is UNIQUE, so accepting both is two rows for
+    /// one publication. Recognised (not passed through to the generic checks
+    /// as if it were an ordinary URL), then refused for the spelling.
+    #[test]
+    fn a_non_canonical_at_uri_spelling_is_recognised_and_refused() {
+        for odd in [
+            "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "AT://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            assert!(!is_storable_feed_url(odd, true), "stored {odd:?}");
+            // Fails CLOSED: it is an at-URI this reader will not store, not an
+            // unparseable string that the `Err(_) => Public` arm waves through.
+            assert!(
+                classify_feed_privacy(odd).is_private(),
+                "{odd:?} was declared publishable"
+            );
+        }
     }
 
     /// **The handle form is not storable — the DID form is the identity.**
