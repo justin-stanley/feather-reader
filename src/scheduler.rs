@@ -590,6 +590,7 @@ async fn poll_due_once(
         let default_interval = state.config.poll_interval;
         let max_entries_per_feed = state.config.max_entries_per_feed;
         let plc_directory = state.config.oauth.plc_directory.clone();
+        let retention_days = i64::from(state.config.retention_days);
         handles.push(tokio::spawn(async move {
             let _permit = permit; // held for the duration of this poll
             poll_and_reschedule(
@@ -599,6 +600,7 @@ async fn poll_due_once(
                 default_interval,
                 max_entries_per_feed,
                 &plc_directory,
+                retention_days,
             )
             .await;
         }));
@@ -639,6 +641,7 @@ async fn poll_and_reschedule(
     default_interval: Duration,
     max_entries_per_feed: i64,
     plc_directory: &str,
+    retention_days: i64,
 ) {
     poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| async move {
         // **Dispatch on the recorded kind, not on the URL.** `due_feeds` only
@@ -657,11 +660,23 @@ async fn poll_and_reschedule(
                     plc_directory,
                     &feed.url,
                     max_entries_per_feed,
+                    retention_days,
                 )
                 .await
             }
+            // Never selected by `due_feeds` — `pollable` excludes it under
+            // every flag — so reaching here means the two disagree. Refused
+            // loudly rather than fetched.
+            Some(feed::FeedKind::Unsupported) => Ok(feed::PollOutcome::Failed {
+                backoff: feed::backoff_for(1),
+                kind: feed::FailureKind::Parse,
+                detail: feed::failure_detail(format!(
+                    "unsupported feed kind selected for polling: {}",
+                    feed.url
+                )),
+            }),
             None => Ok(feed::PollOutcome::Failed {
-                backoff: std::time::Duration::from_secs(0),
+                backoff: feed::backoff_for(1),
                 kind: feed::FailureKind::Parse,
                 detail: feed::failure_detail(format!(
                     "unknown feed kind {:?} — written by a newer build?",
@@ -1359,6 +1374,7 @@ mod tests {
             Duration::from_secs(3600),
             100,
             "https://plc.invalid",
+            14,
         )
         .await;
 

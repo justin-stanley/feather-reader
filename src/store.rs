@@ -770,13 +770,15 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 
 /// SQL for "this row is an `at://` publication, which nothing can poll".
 ///
-/// **This is the canonical home of the at:// exclusion; the other sites point
-/// here.** Why skip rather than fail: `poll_feed` reaches `net::guarded_get`,
-/// whose `check_scheme` refuses any non-http(s) scheme, and the standard.site
-/// reader is not yet wired to the scheduler. Handing such a row to the poller
+/// **Historical: the reader IS wired now.** This predicate was the canonical
+/// home of the at:// exclusion, back when nothing could poll one. Since the
+/// standard.site reader was connected, what a row is has been a column
+/// (`feeds.kind`) and whether it is pollable is
+/// [`crate::feed::FeedKind::pollable`], which takes the flag. Handing such a row to the poller
 /// does not leave the feature dormant — it manufactures one permanent failure
 /// per row, which the public cause histogram then reports as an unreachable
-/// publisher. Unsupported is not broken, and telling those apart is the entire
+/// publisher. That argument is why `pollable` gates SELECTION rather than
+/// dispatch. Unsupported is not broken, and telling those apart is the entire
 /// reason a failure cause is recorded. (Rows like this exist: subscriptions
 /// written by other clients before this reader refused the scheme.)
 ///
@@ -871,8 +873,9 @@ pub async fn due_feeds(
         r#"
         SELECT * FROM feeds
         WHERE (next_poll IS NULL OR next_poll <= ?1)
-          -- `at://` is not pollable, so it is not due: skipped, not failed.
-          -- The why lives on `UNPOLLABLE_URL_SQL`.
+          -- Only kinds this instance can actually fetch, which depends on
+          -- `FEATHERREADER_STANDARD_SITE` — see `feed::FeedKind::pollable`.
+          -- A kind that is not selected is skipped, never failed.
           AND kind IN ({pollable_kinds_sql})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
@@ -4047,11 +4050,12 @@ pub async fn poll_health(
     pollable: &[crate::feed::FeedKind],
 ) -> Result<PollHealth> {
     let pollable_kinds_sql = kinds_sql(pollable);
-    // **Only what the poller sees.** `due_feeds` skips `at://` rows, so nothing
-    // ever advances their `next_poll` or sets `last_polled`; counted here they
-    // read as overdue and never-polled forever and force "oldest poll" to
-    // `never` — unsupported shown as broken, on a public page, permanently.
-    // The same predicate as the scheduler's, so the two cannot disagree.
+    // **Only what the poller sees.** A kind `due_feeds` does not select never
+    // has its `next_poll` advanced or its `last_polled` set; counted here it
+    // would read as overdue and never-polled forever and force "oldest poll"
+    // to `never` — unsupported shown as broken, on a public page,
+    // permanently. Takes the same `pollable` list as the scheduler, so the two
+    // cannot disagree about which rows are in scope.
     let aggregate = format!(
         r#"
         SELECT

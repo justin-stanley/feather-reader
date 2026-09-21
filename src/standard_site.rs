@@ -351,10 +351,46 @@ pub async fn store_publication(
     entries: Vec<Entry>,
     complete: bool,
     max_entries_per_feed: i64,
+    retention_days: i64,
 ) -> anyhow::Result<crate::feed::PollOutcome> {
     use anyhow::Context;
 
-    let rows: Vec<crate::store::NewEntry> = entries.into_iter().map(Into::into).collect();
+    // **Never insert what the retention sweep will delete.**
+    //
+    // This is the one place a publication differs from a feed in a way that
+    // matters. An RSS document carries its last few dozen items, so the poller
+    // physically cannot re-offer an article the sweep removed. `listRecords`
+    // carries the WHOLE archive, every poll — so without this filter the cycle
+    // is: a reader reads a 2023 article, the daily sweep deletes it as read and
+    // old, the next hourly poll re-inserts it with a fresh `entries.id`, its
+    // `entry_state` is gone (cascade), and it is UNREAD again. Forever, hourly,
+    // for the entire back catalogue of any publication older than the hard
+    // ceiling.
+    //
+    // The horizon is the sweep's own, so the two cannot disagree about which
+    // articles this instance keeps. A document with no date is kept: the sweep
+    // reads `COALESCE(published, fetched_at)`, so it will be judged from when
+    // it was first seen, like any undated RSS entry.
+    let floor = (retention_days > 0).then(|| {
+        (chrono::Utc::now() - chrono::Duration::days(retention_days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    });
+    let offered = entries.len();
+    let rows: Vec<crate::store::NewEntry> = entries
+        .into_iter()
+        .filter(|e| match (&floor, &e.published) {
+            (Some(floor), Some(published)) => published.as_str() >= floor.as_str(),
+            _ => true,
+        })
+        .map(Into::into)
+        .collect();
+    if rows.len() < offered {
+        tracing::debug!(
+            feed = %url,
+            dropped = offered - rows.len(),
+            "skipped documents older than the retention horizon"
+        );
+    }
     let new_feed = crate::store::NewFeed {
         url: url.to_string(),
         title: publication.name.clone(),
@@ -374,6 +410,13 @@ pub async fn store_publication(
     let n = crate::store::insert_entries(pool, feed_id, &rows, max_entries_per_feed)
         .await
         .with_context(|| format!("insert_entries for {url}"))?;
+    // What the feed HOLDS, not what this poll added: a re-poll of a healthy
+    // publication legitimately inserts zero new entries.
+    let stored_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE feed_id = ?1")
+        .bind(feed_id)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("counting stored entries for {url}"))?;
 
     // **A truncated read is a SUCCESSFUL poll of a large publication.**
     //
@@ -394,6 +437,24 @@ pub async fn store_publication(
     // stored; the walk's bound is a design limit, not an error. It is logged
     // with the feed named, so an operator can see it — a signal, not a
     // failure count.
+    // **Truncated-with-articles and truncated-with-nothing are different
+    // states.** The first is a large publisher read in part, which is what
+    // `extend_truncating` exists to allow. The second is the starvation case
+    // `list_recent_matching`'s own doc names: a quiet publication whose busy
+    // sibling fills every page this reader will fetch, so the walk ends having
+    // matched nothing. Settling that as `Updated` calls `reset_feed_errors` and
+    // the feed reads as perfectly healthy on `/stats` while staying
+    // permanently empty, with a log line as the only evidence.
+    if !complete && stored_total == 0 {
+        return Ok(crate::feed::PollOutcome::Failed {
+            backoff: crate::feed::backoff_for(1),
+            kind: crate::feed::FailureKind::Body,
+            detail: crate::feed::failure_detail(
+                "the document walk ended without matching any of this publication's documents"
+                    .to_string(),
+            ),
+        });
+    }
     if !complete {
         tracing::warn!(
             feed = %url,
@@ -404,13 +465,6 @@ pub async fn store_publication(
     Ok(crate::feed::PollOutcome::Updated { new_entries: n })
 }
 
-/// Poll one publication: read it, then store it. The scheduler's entry point.
-///
-/// Returns a [`crate::feed::PollOutcome`] for every path including failure, so
-/// `feed::settle_poll` handles a publication exactly as it handles a feed —
-/// error counting, backoff and the cause histogram all come for free. A read
-/// error is a `fetch` failure with the anyhow chain as its detail, the same
-/// shape `poll_feed` produces.
 /// How long one publication poll may take in total.
 ///
 /// **An RSS poll is one request; this is up to 401.** `resolve_did_to_pds`
@@ -422,16 +476,27 @@ pub async fn store_publication(
 /// behind it.
 pub const PUBLICATION_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Poll one publication: read it, then store it. The scheduler's entry point.
+///
+/// Returns a [`crate::feed::PollOutcome`] for every path including failure, so
+/// `feed::settle_poll` handles a publication exactly as it handles a feed —
+/// error counting, backoff and the cause histogram all come for free. A read
+/// error is a `fetch` failure with the anyhow chain as its detail, the same
+/// shape `poll_feed` produces.
 pub async fn poll_publication(
     pool: &sqlx::SqlitePool,
     http: &reqwest::Client,
     plc_directory: &str,
     url: &str,
     max_entries_per_feed: i64,
+    retention_days: i64,
 ) -> anyhow::Result<crate::feed::PollOutcome> {
     let Some(uri) = AtUri::parse(url) else {
         return Ok(crate::feed::PollOutcome::Failed {
-            backoff: std::time::Duration::from_secs(0),
+            // The floor `poll_feed` uses: `settle_poll` falls back to this
+            // verbatim when `bump_feed_errors` itself fails, and zero would make
+            // `next_poll = now` — a tight re-poll loop against a stranger's PDS.
+            backoff: crate::feed::backoff_for(1),
             kind: crate::feed::FailureKind::Fetch,
             detail: crate::feed::failure_detail(format!("not a readable at:// URI: {url}")),
         });
@@ -448,10 +513,13 @@ pub async fn poll_publication(
             Ok(read) => read,
             Err(e) => {
                 return Ok(crate::feed::PollOutcome::Failed {
-                    backoff: std::time::Duration::from_secs(0),
+                    // The floor `poll_feed` uses: `settle_poll` falls back to this
+                    // verbatim when `bump_feed_errors` itself fails, and zero would make
+                    // `next_poll = now` — a tight re-poll loop against a stranger's PDS.
+                    backoff: crate::feed::backoff_for(1),
                     kind: crate::feed::FailureKind::Fetch,
                     detail: crate::feed::failure_detail(format!("{e:#}")),
-                })
+                });
             }
         };
     store_publication(
@@ -461,6 +529,7 @@ pub async fn poll_publication(
         read.entries,
         read.complete,
         max_entries_per_feed,
+        retention_days,
     )
     .await
 }
@@ -963,7 +1032,7 @@ mod tests {
         ];
         let entries = entries_from_records(&site, &pubn, &docs);
 
-        let outcome = store_publication(&pool, &uri, &pubn, entries, true, 100).await?;
+        let outcome = store_publication(&pool, &uri, &pubn, entries, true, 100, 0).await?;
         assert!(
             matches!(
                 outcome,
@@ -986,6 +1055,114 @@ mod tests {
                 format!("at://{DID}/{}/d1", nsid::STANDARD_DOCUMENT),
                 format!("at://{DID}/{}/d2", nsid::STANDARD_DOCUMENT),
             ]
+        );
+        Ok(())
+    }
+
+    /// **A failure carries a real backoff floor, never zero.** `settle_poll`
+    /// falls back to the outcome's own `backoff` verbatim when
+    /// `bump_feed_errors` itself fails — `SQLITE_BUSY` during the retention
+    /// sweep is a measured event here — and `set_next_poll(.., 0)` makes
+    /// `next_poll = now`: a tight re-poll loop against a stranger's PDS.
+    #[tokio::test]
+    async fn a_failed_publication_poll_carries_a_backoff_floor() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        // An unparseable at-URI: fails before any network.
+        let outcome = poll_publication(
+            &pool,
+            &reqwest::Client::new(),
+            "https://plc.invalid",
+            "at://",
+            100,
+            0,
+        )
+        .await?;
+        match outcome {
+            crate::feed::PollOutcome::Failed { backoff, .. } => assert_eq!(
+                backoff,
+                crate::feed::backoff_for(1),
+                "a zero backoff makes next_poll = now"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// **A truncated read that matched NOTHING is not a healthy poll.**
+    ///
+    /// The starvation case `list_recent_matching` names: a quiet publication
+    /// whose busy sibling fills every page walked. Settling it as `Updated`
+    /// calls `reset_feed_errors`, so the feed reads as perfectly healthy while
+    /// staying permanently empty. Distinct from a truncated read that DID
+    /// match — that one is a large publisher read in part, which is fine.
+    #[tokio::test]
+    async fn a_truncated_read_that_matched_nothing_is_a_failure() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        let uri = format!("at://{DID}/{}/p", nsid::STANDARD_PUBLICATION);
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: uri.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let records = vec![publication("p", "https://example.com")];
+        let (_site, pubn) = publication_from_records("p", &records).unwrap();
+
+        let outcome = store_publication(&pool, &uri, &pubn, Vec::new(), false, 100, 0).await?;
+        match outcome {
+            crate::feed::PollOutcome::Failed { kind, .. } => {
+                assert_eq!(kind, crate::feed::FailureKind::Body)
+            }
+            other => panic!("a starved read was settled as {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// **A document older than the retention horizon is never inserted.**
+    ///
+    /// `listRecords` carries the whole archive on every poll, unlike an RSS
+    /// document. Without this the cycle is: a reader reads an old article, the
+    /// daily sweep deletes it as read-and-old, the next hourly poll re-inserts
+    /// it with a fresh id and no `entry_state` — unread again, forever.
+    #[tokio::test]
+    async fn documents_past_the_retention_horizon_are_not_re_inserted() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        let uri = format!("at://{DID}/{}/p", nsid::STANDARD_PUBLICATION);
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: uri.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let docs = vec![
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                "ancient",
+                json!({"title": "Ancient", "publishedAt": old, "path": "/a", "site": site}),
+            ),
+            document("recent", &site, "Recent", "/r"),
+        ];
+        let entries = entries_from_records(&site, &pubn, &docs);
+        assert_eq!(entries.len(), 2, "both documents parsed");
+
+        // A window that keeps the shared fixture's date but not the ancient
+        // one — the boundary is what this test is about, not the constant.
+        store_publication(&pool, &uri, &pubn, entries, true, 100, 365).await?;
+        let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM entries ORDER BY title")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            titles,
+            vec!["Recent".to_string()],
+            "an article the retention sweep would delete was inserted anyway"
         );
         Ok(())
     }
@@ -1019,7 +1196,7 @@ mod tests {
         let (site, pubn) = publication_from_records("p", &records).unwrap();
         let entries = entries_from_records(&site, &pubn, &[document("d1", &site, "One", "/one")]);
 
-        let outcome = store_publication(&pool, &uri, &pubn, entries, false, 100).await?;
+        let outcome = store_publication(&pool, &uri, &pubn, entries, false, 100, 0).await?;
         assert!(
             matches!(
                 outcome,

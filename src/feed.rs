@@ -259,9 +259,9 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
         if !url.starts_with(crate::atproto::AT_URI_PREFIX) {
             return false;
         }
-        // **This gates STORING only — polling is handled by exclusion**, on
-        // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
-        // place the why is written down.
+        // **This gates STORING.** Polling is gated by the same flag, one
+        // layer down: `FeedKind::pollable` decides what `due_feeds` selects,
+        // so a stored publication is polled exactly when the reader is wired.
         return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
@@ -723,6 +723,19 @@ pub enum FeedKind {
     /// same flag — see [`FeedKind::pollable`], which is the one place that
     /// decides.
     Publication,
+    /// An `at://` row this reader cannot fetch: a collection it has no reader
+    /// for, or a malformed URI.
+    ///
+    /// **Never pollable, under any flag.** Rows like this exist — they predate
+    /// the storability guard, and `resolve_subscriptions` cached whatever was
+    /// in the repo. Calling them `Publication` would hand each one to the
+    /// standard.site reader every tick once the flag is on, to fail its
+    /// collection check every time and be published as an unreachable
+    /// publisher: the "unsupported reported as broken" conflation this whole
+    /// design exists to prevent. They are counted by
+    /// [`crate::store::unpollable_feeds`] instead, which is the surface that
+    /// exists to show them.
+    Unsupported,
 }
 
 impl FeedKind {
@@ -747,6 +760,7 @@ impl FeedKind {
         match self {
             FeedKind::Rss => "rss",
             FeedKind::Publication => "publication",
+            FeedKind::Unsupported => "unsupported",
         }
     }
 
@@ -756,16 +770,21 @@ impl FeedKind {
         match raw {
             "rss" => Some(FeedKind::Rss),
             "publication" => Some(FeedKind::Publication),
+            "unsupported" => Some(FeedKind::Unsupported),
             _ => None,
         }
     }
 
     /// What a URL will be stored as. The only place the question is asked.
     pub fn of(url: &str) -> Self {
-        if crate::atproto::strip_at_prefix(url).is_some() {
-            FeedKind::Publication
-        } else {
-            FeedKind::Rss
+        match crate::atproto::strip_at_prefix(url) {
+            // **Only a well-formed publication URI is a publication.** An
+            // at-URI naming another collection is not something this reader can
+            // fetch, and labelling it `Publication` would hand it to the
+            // standard.site reader every tick to fail the same way.
+            Some(rest) if is_storable_publication_uri(rest) => FeedKind::Publication,
+            Some(_) => FeedKind::Unsupported,
+            None => FeedKind::Rss,
         }
     }
 }
@@ -2075,6 +2094,40 @@ mod tests {
         assert!(is_storable_feed_url(uri, true));
         assert!(is_storable_feed_url("https://example.com/feed.xml", false));
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
+    }
+
+    /// **Only a well-formed publication URI is a `Publication`.**
+    ///
+    /// An at-URI naming another collection is `Unsupported`: never pollable,
+    /// counted by `unpollable_feeds`. Rows like this exist — they predate the
+    /// storability guard. Calling them `Publication` hands each one to the
+    /// standard.site reader every tick once the flag is on, to fail its
+    /// collection check every time and be published as an unreachable
+    /// publisher, which is the conflation the whole design prevents.
+    #[test]
+    fn only_a_publication_uri_is_the_publication_kind() {
+        let pubn = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        assert_eq!(FeedKind::of(pubn), FeedKind::Publication);
+        for other in [
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.generator/whats-hot",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication",
+            "at://not-a-did/site.standard.publication/3lab",
+        ] {
+            assert_eq!(
+                FeedKind::of(other),
+                FeedKind::Unsupported,
+                "{other} was called a publication"
+            );
+        }
+        assert_eq!(FeedKind::of("https://example.com/feed.xml"), FeedKind::Rss);
+        // And it is pollable under NO flag setting.
+        for flag in [false, true] {
+            assert!(
+                !FeedKind::pollable(flag).contains(&FeedKind::Unsupported),
+                "an unsupported row was pollable with the flag {flag}"
+            );
+        }
     }
 
     /// **A non-canonical scheme spelling is recognised and refused.** URL
