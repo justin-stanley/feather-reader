@@ -1057,10 +1057,12 @@ fn fetching_state(rh: &crate::runtime_health::RuntimeHealth, now_unix: i64) -> &
 /// `GET /stats` — public poll health.
 async fn stats(State(state): State<AppState>) -> Response {
     let now = chrono::Utc::now();
+    let pollable = crate::feed::FeedKind::pollable(state.config.standard_site);
     let health = match store::poll_health(
         &state.db,
         &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        pollable,
     )
     .await
     {
@@ -4419,7 +4421,13 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
     // cannot separate "the publishers are gone" from "we are broken". #159 was
     // the latter and took a production investigation to establish. Named feeds
     // and their error text belong here, behind ALLOWED_DIDS.
-    let failing = match crate::store::failing_feeds(&state.db, ADMIN_FAILING_FEED_LIMIT).await {
+    let failing = match crate::store::failing_feeds(
+        &state.db,
+        ADMIN_FAILING_FEED_LIMIT,
+        crate::feed::FeedKind::pollable(state.config.standard_site),
+    )
+    .await
+    {
         Ok(f) => f,
         Err(err) => {
             warn!(%err, "could not list failing feeds");
@@ -4444,7 +4452,12 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
     // row (`store::count_feeds`), but `/stats` measures the poller and excludes
     // unpollable ones — so an instance can be at its cap with every public
     // number saying otherwise. A review found exactly that gap.
-    let unpollable = match crate::store::unpollable_feeds(&state.db).await {
+    let unpollable = match crate::store::unpollable_feeds(
+        &state.db,
+        crate::feed::FeedKind::pollable(state.config.standard_site),
+    )
+    .await
+    {
         Ok(n) => n,
         Err(err) => {
             warn!(%err, "could not count unpollable feeds");
@@ -10720,6 +10733,7 @@ mod tests {
             &state.db,
             &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            crate::feed::FeedKind::pollable(false),
         )
         .await
         .unwrap();
@@ -10775,6 +10789,7 @@ mod tests {
             &state.db,
             &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            crate::feed::FeedKind::pollable(false),
         )
         .await
         .unwrap();

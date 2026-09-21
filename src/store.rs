@@ -60,6 +60,11 @@ pub type Pool = SqlitePool;
 pub struct Feed {
     pub id: i64,
     pub url: String,
+    /// What the poller does with this row — see [`crate::feed::FeedKind`].
+    /// Read as a string so a value written by a newer build cannot fail the
+    /// whole query; the scheduler parses it and skips what it does not know.
+    #[sqlx(default)]
+    pub kind: String,
     pub title: Option<String>,
     pub site_url: Option<String>,
     /// HTTP `ETag` from the last successful fetch, for conditional GET.
@@ -422,7 +427,7 @@ CREATE TABLE IF NOT EXISTS repo_timing_total (
 /// RFC3339 timestamp for "now" (UTC, seconds precision), used as the default for
 /// `*_at` columns. Uses `chrono` to match the shape written by [`crate::feed`]
 /// and [`crate::web`] (one timestamp format across the whole crate).
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -615,9 +620,14 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // case a permanent hole (re-accumulated errors hidden by the filters,
     // never cleared). Trade-off accepted: a publication that has never once
     // succeeded restarts its backoff at the floor on every boot.
+    // Migrations run before any config is consulted, so "unpollable" here means
+    // "not an RSS feed" — the kinds no flag setting makes fetchable by the
+    // existing poller. A publication the wired reader later polls successfully
+    // gets `last_polled` set and is spared by the clause below from then on.
+    let rss = kinds_sql(&[crate::feed::FeedKind::Rss]);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
-         WHERE kind NOT IN ({POLLABLE_KINDS_SQL}) AND last_polled IS NULL \
+         WHERE kind NOT IN ({rss}) AND last_polled IS NULL \
          AND consecutive_errors > 0"
     )))
     .execute(pool)
@@ -800,14 +810,21 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// spelling is separately refused, because `feeds.url` is UNIQUE.
 pub(crate) const UNPOLLABLE_URL_SQL: &str = "lower(substr(url, 1, 5)) = 'at://'";
 
-/// The `kind` values the scheduler may select, as a SQL list.
+/// Render a set of [`crate::feed::FeedKind`]s as a SQL list.
 ///
-/// Pinned against [`crate::feed::FeedKind::POLLABLE`] by
-/// `the_sql_kind_list_matches_the_rust_one` — a literal here and a slice there
-/// is exactly the drift the column was introduced to end, so the two are
-/// asserted equal rather than trusted. Wiring the standard.site reader means
-/// changing both, and that test is what makes forgetting one a failure.
-pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss'";
+/// **Built from the Rust values, never written out.** A literal here and a
+/// slice there is exactly the drift the `kind` column was introduced to end;
+/// this is the one place the two representations meet, and it derives one from
+/// the other so they cannot disagree. Which kinds are pollable is the caller's
+/// question — see [`crate::feed::FeedKind::pollable`] — because it depends on a
+/// runtime flag.
+fn kinds_sql(kinds: &[crate::feed::FeedKind]) -> String {
+    kinds
+        .iter()
+        .map(|k| format!("'{}'", k.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// How many rows the poller will never select — the capacity consumed by feeds
 /// that cannot be fetched.
@@ -815,9 +832,13 @@ pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss'";
 /// Rendered on `/admin/metrics` because the global ceiling counts these rows
 /// (see [`count_feeds`]) while `/stats` does not, so without this the cap could
 /// be reached with every public number saying otherwise.
-pub async fn unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
+pub async fn unpollable_feeds(
+    pool: &SqlitePool,
+    pollable: &[crate::feed::FeedKind],
+) -> Result<i64> {
+    let pollable_kinds_sql = kinds_sql(pollable);
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({POLLABLE_KINDS_SQL})"
+        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({pollable_kinds_sql})"
     )))
     .fetch_one(pool)
     .await
@@ -828,8 +849,9 @@ pub async fn unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
 /// at:// tests make, spelled once, against the predicate the code uses.
 #[cfg(test)]
 pub(crate) async fn count_unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
+    let pollable_kinds_sql = kinds_sql(crate::feed::FeedKind::pollable(false));
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({POLLABLE_KINDS_SQL})"
+        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({pollable_kinds_sql})"
     )))
     .fetch_one(pool)
     .await
@@ -838,14 +860,20 @@ pub(crate) async fn count_unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
 
 /// The scheduler's hot query: feeds whose `next_poll` is due (`<= as_of`, or
 /// never polled), oldest-due first. `as_of` is an RFC3339 timestamp.
-pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec<Feed>> {
+pub async fn due_feeds(
+    pool: &SqlitePool,
+    as_of: &str,
+    limit: i64,
+    pollable: &[crate::feed::FeedKind],
+) -> Result<Vec<Feed>> {
+    let pollable_kinds_sql = kinds_sql(pollable);
     let sql = format!(
         r#"
         SELECT * FROM feeds
         WHERE (next_poll IS NULL OR next_poll <= ?1)
           -- `at://` is not pollable, so it is not due: skipped, not failed.
           -- The why lives on `UNPOLLABLE_URL_SQL`.
-          AND kind IN ({POLLABLE_KINDS_SQL})
+          AND kind IN ({pollable_kinds_sql})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
         "#
@@ -880,7 +908,12 @@ pub struct FailingFeed {
 ///
 /// **Admin-gated callers only.** Bounded because this renders into one response
 /// and a large instance should not be able to make that response unbounded.
-pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingFeed>> {
+pub async fn failing_feeds(
+    pool: &SqlitePool,
+    limit: i64,
+    pollable: &[crate::feed::FeedKind],
+) -> Result<Vec<FailingFeed>> {
+    let pollable_kinds_sql = kinds_sql(pollable);
     // The same exclusion as `poll_health`: a row the poller never selects
     // can never have its errors cleared, so listing it here would pin it to
     // the top of the operator's page for good.
@@ -888,7 +921,7 @@ pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingF
         r#"
         SELECT url, consecutive_errors, last_error_kind, last_error
         FROM feeds
-        WHERE consecutive_errors > 0 AND kind IN ({POLLABLE_KINDS_SQL})
+        WHERE consecutive_errors > 0 AND kind IN ({pollable_kinds_sql})
         ORDER BY consecutive_errors DESC, url ASC
         LIMIT ?1
         "#
@@ -4007,7 +4040,13 @@ const BADLY_BROKEN_ERRORS: i64 = 6;
 
 /// Compute [`PollHealth`] as of `now` (RFC3339, seconds precision — the same
 /// format the scheduler writes, so the comparisons are lexicographic).
-pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result<PollHealth> {
+pub async fn poll_health(
+    pool: &SqlitePool,
+    now: &str,
+    hour_ago: &str,
+    pollable: &[crate::feed::FeedKind],
+) -> Result<PollHealth> {
+    let pollable_kinds_sql = kinds_sql(pollable);
     // **Only what the poller sees.** `due_feeds` skips `at://` rows, so nothing
     // ever advances their `next_poll` or sets `last_polled`; counted here they
     // read as overdue and never-polled forever and force "oldest poll" to
@@ -4031,7 +4070,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
             COALESCE(SUM(CASE WHEN consecutive_errors > 0 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN consecutive_errors >= ?3 THEN 1 ELSE 0 END), 0)
         FROM feeds
-        WHERE kind IN ({POLLABLE_KINDS_SQL})
+        WHERE kind IN ({pollable_kinds_sql})
         "#
     );
     #[allow(clippy::type_complexity)]
@@ -4070,7 +4109,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
         -- `an_unrecognised_failure_kind_folds_into_unknown`.
         SELECT COALESCE(last_error_kind, 'unknown') AS failure_kind, COUNT(*) AS n
         FROM feeds
-        WHERE consecutive_errors > 0 AND kind IN ({POLLABLE_KINDS_SQL})
+        WHERE consecutive_errors > 0 AND kind IN ({pollable_kinds_sql})
         GROUP BY failure_kind
         ORDER BY n DESC, failure_kind ASC
         "#
@@ -6349,7 +6388,13 @@ mod tests {
         }
         // All three have a NULL next_poll, which sorts FIRST — so if at:// were
         // selectable at all it would be selected before the http feed.
-        let due = due_feeds(&pool, "2026-09-20T00:00:00Z", 50).await?;
+        let due = due_feeds(
+            &pool,
+            "2026-09-20T00:00:00Z",
+            50,
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         let urls: Vec<&str> = due.iter().map(|f| f.url.as_str()).collect();
         assert_eq!(
             urls,
@@ -6512,6 +6557,7 @@ mod tests {
             &pool,
             &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            crate::feed::FeedKind::pollable(false),
         )
         .await?;
         let mut kinds = health.failure_kinds.clone();
@@ -9081,7 +9127,7 @@ mod tests {
         // corrupt the "oldest poll" figure with a NULL.
         feed_polled(&pool, "https://c.example/f", None, None).await;
 
-        let h = poll_health(&pool, now, hour_ago).await?;
+        let h = poll_health(&pool, now, hour_ago, crate::feed::FeedKind::pollable(false)).await?;
         assert_eq!(h.feeds_tracked, 3);
         assert_eq!(
             h.polled_last_hour, 1,
@@ -9111,7 +9157,7 @@ mod tests {
             .bind("2026-01-01T09:00:00Z")
             .execute(&pool)
             .await?;
-        let h = poll_health(&pool, now, hour_ago).await?;
+        let h = poll_health(&pool, now, hour_ago, crate::feed::FeedKind::pollable(false)).await?;
         assert_eq!(h.never_polled, 0);
         assert_eq!(h.oldest_poll_secs_ago, Some(10_800));
         Ok(())
@@ -9146,7 +9192,7 @@ mod tests {
         )
         .await;
 
-        let h = poll_health(&pool, now, hour_ago).await?;
+        let h = poll_health(&pool, now, hour_ago, crate::feed::FeedKind::pollable(false)).await?;
         assert_eq!(
             h.feeds_tracked, 1,
             "an unpollable row was counted as tracked"
@@ -9188,7 +9234,7 @@ mod tests {
             .await?;
             bump_feed_errors(&pool, url, crate::feed::FailureKind::Fetch, "down").await?;
         }
-        let failing = failing_feeds(&pool, 10).await?;
+        let failing = failing_feeds(&pool, 10, crate::feed::FeedKind::pollable(false)).await?;
         let urls: Vec<&str> = failing.iter().map(|f| f.url.as_str()).collect();
         assert_eq!(
             urls,
@@ -9255,13 +9301,102 @@ mod tests {
     /// the standard.site reader changes both, and this is what makes
     /// forgetting one a failure rather than a silently dormant feature.
     #[test]
-    fn the_sql_kind_list_matches_the_rust_one() {
-        let expected = crate::feed::FeedKind::POLLABLE
-            .iter()
-            .map(|k| format!("'{}'", k.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert_eq!(POLLABLE_KINDS_SQL, expected);
+    fn the_sql_kind_list_is_rendered_from_the_rust_one() {
+        use crate::feed::FeedKind;
+        assert_eq!(kinds_sql(FeedKind::pollable(false)), "'rss'");
+        assert_eq!(
+            kinds_sql(FeedKind::pollable(true)),
+            "'rss', 'publication'",
+            "wiring the reader must widen the SQL list too"
+        );
+        // Every kind round-trips: a value rendered here is one `parse` knows.
+        for k in [FeedKind::Rss, FeedKind::Publication] {
+            assert_eq!(FeedKind::parse(k.as_str()), Some(k));
+        }
+    }
+
+    /// **A publication is due only when the reader is wired.**
+    ///
+    /// The flag gates SELECTION, not dispatch. Gating dispatch instead would
+    /// hand the scheduler a row it then had to refuse, which is a manufactured
+    /// failure per publication per tick — the thing the exclusion existed to
+    /// prevent. Off, the row is simply not due.
+    #[tokio::test]
+    async fn a_publication_is_due_only_when_the_reader_is_wired() -> anyhow::Result<()> {
+        use crate::feed::FeedKind;
+        let pool = init_url("sqlite::memory:").await?;
+        for url in [
+            "https://rss.example/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        let unwired =
+            due_feeds(&pool, "2026-01-01T12:00:00Z", 10, FeedKind::pollable(false)).await?;
+        assert_eq!(
+            unwired.iter().map(|f| f.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://rss.example/feed.xml"],
+            "a publication was due with the reader unwired"
+        );
+
+        let wired = due_feeds(&pool, "2026-01-01T12:00:00Z", 10, FeedKind::pollable(true)).await?;
+        assert_eq!(
+            wired.len(),
+            2,
+            "a publication was NOT due with the reader wired"
+        );
+        assert!(
+            wired
+                .iter()
+                .any(|f| f.kind == FeedKind::Publication.as_str()),
+            "the row came back without its kind, so the scheduler cannot dispatch on it"
+        );
+        Ok(())
+    }
+
+    /// The public page counts what the poller actually handles: with the
+    /// reader wired, a publication is a tracked feed like any other.
+    #[tokio::test]
+    async fn the_stats_page_counts_publications_once_they_are_pollable() -> anyhow::Result<()> {
+        use crate::feed::FeedKind;
+        let pool = init_url("sqlite::memory:").await?;
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
+                    .to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let off = poll_health(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:00:00Z",
+            FeedKind::pollable(false),
+        )
+        .await?;
+        assert_eq!(off.feeds_tracked, 0);
+        let on = poll_health(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:00:00Z",
+            FeedKind::pollable(true),
+        )
+        .await?;
+        assert_eq!(
+            on.feeds_tracked, 1,
+            "a pollable publication is a tracked feed"
+        );
+        Ok(())
     }
 
     /// **A feed's kind is recorded at insert, not re-derived from its URL.**
@@ -9368,15 +9503,27 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        let due = due_feeds(&pool, "2026-01-01T12:00:00Z", 10).await?;
+        let due = due_feeds(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            10,
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         assert!(due.is_empty(), "due_feeds read the URL, not the kind");
         assert_eq!(
-            unpollable_feeds(&pool).await?,
+            unpollable_feeds(&pool, crate::feed::FeedKind::pollable(false)).await?,
             1,
             "unpollable_feeds read the URL"
         );
 
-        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        let h = poll_health(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:00:00Z",
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         assert_eq!(h.feeds_tracked, 0, "poll_health read the URL, not the kind");
         Ok(())
     }
@@ -9412,7 +9559,13 @@ mod tests {
             },
         )
         .await?;
-        let due = due_feeds(&pool, "2026-01-01T12:00:00Z", 10).await?;
+        let due = due_feeds(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            10,
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         assert!(
             due.is_empty(),
             "a row nothing can fetch was handed to the poller: {:?}",
@@ -9464,7 +9617,7 @@ mod tests {
             "the ceiling must bound storage, so every row counts"
         );
         assert_eq!(
-            unpollable_feeds(&pool).await?,
+            unpollable_feeds(&pool, crate::feed::FeedKind::pollable(false)).await?,
             2,
             "both at-URI spellings are unpollable and must be countable"
         );
@@ -9476,7 +9629,13 @@ mod tests {
     #[tokio::test]
     async fn poll_health_on_an_empty_instance_reports_no_polls() -> anyhow::Result<()> {
         let pool = init_url("sqlite::memory:").await?;
-        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        let h = poll_health(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:00:00Z",
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         assert_eq!(h.feeds_tracked, 0);
         assert_eq!(h.last_poll_secs_ago, None);
         assert_eq!(h.oldest_poll_secs_ago, None);
@@ -9495,7 +9654,13 @@ mod tests {
             None,
         )
         .await;
-        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        let h = poll_health(
+            &pool,
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:00:00Z",
+            crate::feed::FeedKind::pollable(false),
+        )
+        .await?;
         assert_eq!(h.last_poll_secs_ago, Some(0));
         Ok(())
     }

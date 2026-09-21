@@ -315,6 +315,121 @@ fn classify_document(
     }
 }
 
+/// What one read of a publication produced.
+///
+/// **`complete` is carried out, not just logged.** `RecordWalk` tracks whether
+/// the document walk finished; dropping that here would leave the caller unable
+/// to tell "this publication has nine articles" from "this reader gave up after
+/// nine", which is the distinction the flag exists for.
+#[derive(Debug)]
+pub struct PublicationRead {
+    pub publication: Publication,
+    pub entries: Vec<Entry>,
+    pub complete: bool,
+}
+
+/// Turn a read publication into stored entries, and report it as a
+/// [`crate::feed::PollOutcome`] the scheduler already knows how to settle.
+///
+/// **The adapter, kept separate from the fetch**, for the reason the rest of
+/// this module is: everything here is decidable without a network, so it is
+/// testable without one. `poll_publication` is the thin half.
+///
+/// The store path is the RSS path — `upsert_feed` then `insert_entries` — so
+/// dedup, the per-feed cap and the retention sweep treat a publication exactly
+/// like a feed. Nothing here is standard.site-specific except where the values
+/// came from.
+pub async fn store_publication(
+    pool: &sqlx::SqlitePool,
+    url: &str,
+    publication: &Publication,
+    entries: Vec<Entry>,
+    complete: bool,
+    max_entries_per_feed: i64,
+) -> anyhow::Result<crate::feed::PollOutcome> {
+    use anyhow::Context;
+
+    let rows: Vec<crate::store::NewEntry> = entries.into_iter().map(Into::into).collect();
+    let new_feed = crate::store::NewFeed {
+        url: url.to_string(),
+        title: publication.name.clone(),
+        site_url: Some(publication.url.clone()),
+        // A publication read has no validators: there is no ETag on a
+        // `listRecords` walk, so every poll is a full read. Left as-is rather
+        // than invented.
+        etag: None,
+        last_modified: None,
+        last_polled: Some(crate::store::now_rfc3339()),
+        // The scheduler owns cadence.
+        next_poll: None,
+    };
+    let feed_id = crate::store::upsert_feed(pool, &new_feed)
+        .await
+        .with_context(|| format!("upsert_feed for {url}"))?;
+    let n = crate::store::insert_entries(pool, feed_id, &rows, max_entries_per_feed)
+        .await
+        .with_context(|| format!("insert_entries for {url}"))?;
+
+    // **A partial read is not a clean poll.** `RecordWalk.complete` exists to
+    // carry "I did not read all of it" out of the walk; reporting `Updated`
+    // here would throw that away and leave the feed looking healthy while
+    // silently missing articles. The entries it DID read are already stored —
+    // a partial read is not a discarded one — but the outcome says so, which
+    // puts the feed on a backoff and names the cause on `/stats`.
+    if !complete {
+        return Ok(crate::feed::PollOutcome::Failed {
+            backoff: std::time::Duration::from_secs(0),
+            kind: crate::feed::FailureKind::Body,
+            detail: crate::feed::failure_detail(format!(
+                "incomplete read: stored {n} entries but the document walk stopped early"
+            )),
+        });
+    }
+    Ok(crate::feed::PollOutcome::Updated { new_entries: n })
+}
+
+/// Poll one publication: read it, then store it. The scheduler's entry point.
+///
+/// Returns a [`crate::feed::PollOutcome`] for every path including failure, so
+/// `feed::settle_poll` handles a publication exactly as it handles a feed —
+/// error counting, backoff and the cause histogram all come for free. A read
+/// error is a `fetch` failure with the anyhow chain as its detail, the same
+/// shape `poll_feed` produces.
+pub async fn poll_publication(
+    pool: &sqlx::SqlitePool,
+    http: &reqwest::Client,
+    plc_directory: &str,
+    url: &str,
+    max_entries_per_feed: i64,
+) -> anyhow::Result<crate::feed::PollOutcome> {
+    let Some(uri) = AtUri::parse(url) else {
+        return Ok(crate::feed::PollOutcome::Failed {
+            backoff: std::time::Duration::from_secs(0),
+            kind: crate::feed::FailureKind::Fetch,
+            detail: crate::feed::failure_detail(format!("not a readable at:// URI: {url}")),
+        });
+    };
+    let read = match fetch(http, plc_directory, &uri).await {
+        Ok(read) => read,
+        Err(e) => {
+            return Ok(crate::feed::PollOutcome::Failed {
+                backoff: std::time::Duration::from_secs(0),
+                kind: crate::feed::FailureKind::Fetch,
+                detail: crate::feed::failure_detail(format!("{e:#}")),
+            })
+        }
+    };
+    store_publication(
+        pool,
+        url,
+        &read.publication,
+        read.entries,
+        read.complete,
+        max_entries_per_feed,
+    )
+    .await
+}
+
 /// Read a publication and its documents through the hardened anonymous client.
 ///
 /// **Deliberately thin.** Everything that makes this fetch safe already exists
@@ -339,7 +454,7 @@ pub async fn fetch(
     http: &reqwest::Client,
     plc_directory: &str,
     uri: &AtUri,
-) -> anyhow::Result<(Publication, Vec<Entry>)> {
+) -> anyhow::Result<PublicationRead> {
     use anyhow::Context;
 
     // The collection is part of the identity of what was subscribed to, and
@@ -421,7 +536,11 @@ pub async fn fetch(
             "documents in this repo reference no publication in it — a `site` spelling nothing matches"
         );
     }
-    Ok((publication, entries))
+    Ok(PublicationRead {
+        publication,
+        entries,
+        complete: documents.complete,
+    })
 }
 
 #[cfg(test)]
@@ -782,6 +901,97 @@ mod tests {
             format!("{err:#}").contains(nsid::STANDARD_PUBLICATION),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// **A read becomes entries through the same store path RSS uses.**
+    /// `store_publication` is the adapter: what `fetch` returns, mapped onto
+    /// `upsert_feed` + `insert_entries` and reported as a `PollOutcome` the
+    /// scheduler already knows how to settle.
+    #[tokio::test]
+    async fn a_publication_read_stores_its_documents_as_entries() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        let uri = format!("at://{DID}/{}/p", nsid::STANDARD_PUBLICATION);
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: uri.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![
+            document("d1", &site, "First", "/one"),
+            document("d2", &site, "Second", "/two"),
+        ];
+        let entries = entries_from_records(&site, &pubn, &docs);
+
+        let outcome = store_publication(&pool, &uri, &pubn, entries, true, 100).await?;
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 2 }
+            ),
+            "expected two new entries, got {outcome:?}"
+        );
+        // The feed row carries the publication's title, and the guids are the
+        // record URIs — not the mutable paths.
+        let feed = crate::store::get_feed_by_url(&pool, &uri)
+            .await?
+            .expect("feed row");
+        assert_eq!(feed.title.as_deref(), Some("Scan's Lab"));
+        let guids: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            guids,
+            vec![
+                format!("at://{DID}/{}/d1", nsid::STANDARD_DOCUMENT),
+                format!("at://{DID}/{}/d2", nsid::STANDARD_DOCUMENT),
+            ]
+        );
+        Ok(())
+    }
+
+    /// **An incomplete read is not a complete poll.** `RecordWalk.complete`
+    /// exists to carry "I did not read all of it" out to the caller; settling
+    /// it as a clean `Updated` throws that away, and the feed looks healthy
+    /// while silently missing articles.
+    #[tokio::test]
+    async fn an_incomplete_read_is_not_reported_as_a_clean_poll() -> anyhow::Result<()> {
+        let pool = crate::store::init_url("sqlite::memory:").await?;
+        let uri = format!("at://{DID}/{}/p", nsid::STANDARD_PUBLICATION);
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: uri.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let entries = entries_from_records(&site, &pubn, &[document("d1", &site, "One", "/one")]);
+
+        let outcome = store_publication(&pool, &uri, &pubn, entries, false, 100).await?;
+        match outcome {
+            crate::feed::PollOutcome::Failed {
+                kind, ref detail, ..
+            } => {
+                assert_eq!(kind, crate::feed::FailureKind::Body);
+                assert!(detail.contains("incomplete"), "detail: {detail}");
+            }
+            other => panic!("an incomplete read was settled as {other:?}"),
+        }
+        // The entries it DID read are still stored — a partial read is not a
+        // discarded one.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(n, 1, "a partial read discarded the articles it had");
+        Ok(())
     }
 
     /// **A publication on a subpath keeps it.** `Url::join` is RFC-3986, so a

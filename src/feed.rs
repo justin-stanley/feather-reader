@@ -725,9 +725,21 @@ pub enum FeedKind {
 }
 
 impl FeedKind {
-    /// The kinds the scheduler may select. The single place that changes when
-    /// the standard.site reader is wired to the poller.
-    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
+    /// The kinds the scheduler may select, given whether the standard.site
+    /// reader is wired (`FEATHERREADER_STANDARD_SITE`).
+    ///
+    /// **The flag gates SELECTION, not dispatch.** Gating dispatch instead
+    /// would hand the scheduler a row it then had to refuse — a manufactured
+    /// failure per publication per tick, published as an unreachable
+    /// publisher, which is the conflation the exclusion existed to prevent.
+    /// Off, the row is simply not due.
+    pub fn pollable(standard_site: bool) -> &'static [FeedKind] {
+        if standard_site {
+            &[FeedKind::Rss, FeedKind::Publication]
+        } else {
+            &[FeedKind::Rss]
+        }
+    }
 
     /// The column value. Stable — it is persisted.
     pub fn as_str(self) -> &'static str {

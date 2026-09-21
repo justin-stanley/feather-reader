@@ -545,7 +545,13 @@ async fn poll_due_once(
     }
 
     let now = now_rfc3339();
-    let due = store::due_feeds(&state.db, &now, batch).await?;
+    let due = store::due_feeds(
+        &state.db,
+        &now,
+        batch,
+        feed::FeedKind::pollable(state.config.standard_site),
+    )
+    .await?;
     if due.is_empty() {
         debug!("poll scheduler: no feeds due");
         return Ok(());
@@ -583,6 +589,7 @@ async fn poll_due_once(
         let client = client.clone();
         let default_interval = state.config.poll_interval;
         let max_entries_per_feed = state.config.max_entries_per_feed;
+        let plc_directory = state.config.oauth.plc_directory.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit; // held for the duration of this poll
             poll_and_reschedule(
@@ -591,6 +598,7 @@ async fn poll_due_once(
                 &feed,
                 default_interval,
                 max_entries_per_feed,
+                &plc_directory,
             )
             .await;
         }));
@@ -630,9 +638,37 @@ async fn poll_and_reschedule(
     feed: &Feed,
     default_interval: Duration,
     max_entries_per_feed: i64,
+    plc_directory: &str,
 ) {
-    poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| {
-        feed::poll_feed(pool, client, feed, max_entries_per_feed)
+    poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| async move {
+        // **Dispatch on the recorded kind, not on the URL.** `due_feeds` only
+        // hands over kinds the config says are pollable, so an unknown kind
+        // here means a row written by a newer build: refused as a failure
+        // rather than guessed at, which is what keeps a future kind from being
+        // silently read as an RSS feed.
+        match feed::FeedKind::parse(&feed.kind) {
+            Some(feed::FeedKind::Rss) => {
+                feed::poll_feed(pool, client, feed, max_entries_per_feed).await
+            }
+            Some(feed::FeedKind::Publication) => {
+                feather_reader::standard_site::poll_publication(
+                    pool,
+                    client,
+                    plc_directory,
+                    &feed.url,
+                    max_entries_per_feed,
+                )
+                .await
+            }
+            None => Ok(feed::PollOutcome::Failed {
+                backoff: std::time::Duration::from_secs(0),
+                kind: feed::FailureKind::Parse,
+                detail: feed::failure_detail(format!(
+                    "unknown feed kind {:?} — written by a newer build?",
+                    feed.kind
+                )),
+            }),
+        }
     })
     .await;
 }
@@ -1297,6 +1333,57 @@ mod tests {
         assert!(
             at_fetch > now_rfc3339(),
             "next_poll was leased to {at_fetch}, which is not in the future"
+        );
+    }
+
+    /// **A kind this build does not know is refused, not guessed at.**
+    ///
+    /// `due_feeds` only hands over kinds the config calls pollable, so an
+    /// unrecognised one here means a row written by a NEWER build — a future
+    /// feed type this binary cannot fetch. Falling through to `poll_feed`
+    /// would hand it to the RSS fetcher and report somebody else's format as
+    /// a broken publisher. It fails as `parse`, which is what the cause
+    /// histogram exists to distinguish, and the row backs off like any other.
+    ///
+    /// Reached without a network: the arm returns before any fetch.
+    #[tokio::test]
+    async fn an_unknown_feed_kind_is_refused_rather_than_fetched() {
+        let url = "https://from-the-future.example/feed.xml";
+        let (pool, mut feed) = due_feed(url).await;
+        feed.kind = "atom-over-carrier-pigeon".to_string();
+
+        poll_and_reschedule(
+            &pool,
+            &reqwest::Client::new(),
+            &feed,
+            Duration::from_secs(3600),
+            100,
+            "https://plc.invalid",
+        )
+        .await;
+
+        let row = store::get_feed_by_url(&pool, url).await.unwrap().unwrap();
+        assert_eq!(
+            row.consecutive_errors, 1,
+            "an unknown kind was not recorded as a failure"
+        );
+        // `Feed` carries no error columns, so read them directly.
+        let (kind, detail): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_kind, last_error FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kind.as_deref(),
+            Some("parse"),
+            "an unknown kind should read as `parse`, not as a fetch problem"
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("unknown feed kind")),
+            "the detail should name the kind: {detail:?}"
         );
     }
 
