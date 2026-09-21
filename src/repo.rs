@@ -226,15 +226,24 @@ macro_rules! dispatch {
     //
     // The three on `oauth::xrpc::Repo` remain `pub` because
     // `examples/oauth_spike.rs` is a separate crate target and drives them
-    // against a scratch collection. So a handler in this crate can still write
-    // an unvetted record through `state.oauth`'s repo — narrower than before,
-    // not absent.
+    // against a scratch collection.
     //
-    // Ending the class means removing `Serialize` from `lexicon::Subscription`
-    // so a raw record cannot be serialised into a write at all. Blocked today:
-    // `VettedSubscription` is `#[serde(transparent)]` over it, so that needs a
-    // hand-written impl plus a wire-format test, and a record-shape slip there
-    // would silently migrate every reader's repo.
+    // They are no longer generic over every `Serialize`, though: `create_record`
+    // and `put_record` take `vetted::WritableRecord`, a sealed trait whose
+    // implementors are the vetted wrappers plus the two lexicon records with
+    // nothing to vet. `create_record(nsid::SUBSCRIPTION, &raw_subscription)`
+    // does not compile, and a `compile_fail` doctest on the trait says so.
+    //
+    // This comment used to name removing `Serialize` from
+    // `lexicon::Subscription` as the way to end the class, and call it blocked:
+    // `VettedSubscription` is `#[serde(transparent)]` over it, so removing the
+    // derive forces a hand-written impl, and a record-shape slip there would
+    // silently migrate every reader's repo. The trait gets the same guarantee
+    // with the wire format still coming from one derive.
+    //
+    // What remains reachable is `apply_writes`, whose `WriteOp::Create.value`
+    // is a `serde_json::Value` — a hand-built record, not an accidental
+    // one-liner. Narrowed, and the remainder named rather than implied.
     (
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,

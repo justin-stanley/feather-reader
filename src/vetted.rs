@@ -15,7 +15,88 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use crate::lexicon::{Saved, Subscription};
+use crate::lexicon::{Folder, ReadState, Saved, Subscription};
+
+/// What a record-write primitive will accept.
+///
+/// **The bound that makes vetting unskippable.** The write primitives were
+/// generic over `T: Serialize`, and `lexicon::Subscription` derives
+/// `Serialize` — so `create_record(nsid::SUBSCRIPTION, &raw_subscription)`
+/// compiled and wrote an unvetted record. On `oauth::xrpc::Repo` those
+/// primitives are `pub` (an example drives them), so that was reachable from
+/// any handler in this crate.
+///
+/// The obvious fix — dropping `Serialize` from `Subscription` — is the one
+/// `repo.rs` recorded as blocked: [`VettedSubscription`] is
+/// `#[serde(transparent)]` over it, so removing the derive forces a
+/// hand-written impl, and a record-shape slip there would silently migrate
+/// every reader's repo. A marker trait gets the same guarantee and cannot
+/// drift, because the wire format keeps coming from one derive.
+///
+/// **Sealed**: implementing it requires `sealed::Sealed`, which is private to
+/// this module, so the list below is the whole list — nothing elsewhere in the
+/// crate can add itself. `Subscription` and [`Saved`] are deliberately absent;
+/// their vetted wrappers are here instead.
+///
+/// A vetted record is accepted:
+///
+/// ```
+/// use feather_reader::lexicon::Subscription;
+/// use feather_reader::vetted::{VettedSubscription, WritableRecord};
+/// fn writes<T: WritableRecord>(_record: &T) {}
+///
+/// let sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
+/// writes(&VettedSubscription::new(&sub));
+/// ```
+///
+/// A raw one does not compile:
+///
+/// ```compile_fail
+/// use feather_reader::lexicon::Subscription;
+/// use feather_reader::vetted::WritableRecord;
+/// fn writes<T: WritableRecord>(_record: &T) {}
+///
+/// let sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
+/// writes(&sub);
+/// ```
+pub trait WritableRecord: Serialize + sealed::Sealed {}
+
+mod sealed {
+    /// Private to this module, so [`super::WritableRecord`] can only be
+    /// implemented here.
+    pub trait Sealed {}
+}
+
+macro_rules! writable {
+    ($($t:ty),+ $(,)?) => {$(
+        impl sealed::Sealed for $t {}
+        impl WritableRecord for $t {}
+    )+};
+}
+
+// The vetted wrappers, plus the two lexicon records that carry nothing to vet:
+// `Folder` is a name and a sort position, `ReadState` a feed URL the reader
+// already holds and two id lists. Neither has a field rendered as an href,
+// which is what `vet` exists to check.
+writable!(
+    VettedSubscription,
+    VettedSaved,
+    Folder,
+    ReadState,
+    SpikeRecord
+);
+
+/// Arbitrary JSON for `examples/oauth_spike.rs`, which round-trips a record
+/// through a scratch collection to prove the OAuth write path works.
+///
+/// **Not for the reader itself.** It exists because that example is a separate
+/// crate target driving the `pub` primitives, and the alternative was leaving
+/// them generic over every `Serialize` — which is the hole this trait closes.
+/// Anything the reader actually stores has a lexicon type and a vetted wrapper.
+#[doc(hidden)]
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct SpikeRecord(pub serde_json::Value);
 
 /// A [`Subscription`] whose `siteUrl` has been scheme-checked.
 ///
