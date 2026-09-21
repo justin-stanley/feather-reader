@@ -262,9 +262,13 @@ CREATE TABLE IF NOT EXISTS feeds (
     next_poll          TEXT,
     consecutive_errors INTEGER NOT NULL DEFAULT 0,
     last_error_kind    TEXT,
-    last_error         TEXT
+    last_error         TEXT,
+    -- What the poller does with this row; see `feed::FeedKind`. Written by the
+    -- Rust side at insert so SQL never re-derives it from the URL.
+    kind               TEXT NOT NULL DEFAULT 'rss'
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
+CREATE INDEX IF NOT EXISTS idx_feeds_kind ON feeds (kind);
 
 CREATE TABLE IF NOT EXISTS entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -566,6 +570,30 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .await?;
 
+    // feeds.kind — what the poller does with a row. Older DBs predate it and
+    // get `'rss'` from the DEFAULT, which is wrong for the at:// rows, so it is
+    // back-filled below.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(feeds)",
+        "kind",
+        "ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'",
+    )
+    .await?;
+
+    // **The last use of the string predicate.** Every reader keys on `kind`
+    // from here; this is the one-time translation from the old representation
+    // to the new one. Idempotent by its own WHERE: a row already marked is not
+    // re-marked, and a row the Rust side would call `rss` is never touched.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE feeds SET kind = '{}' WHERE kind = '{}' AND {UNPOLLABLE_URL_SQL}",
+        crate::feed::FeedKind::Publication.as_str(),
+        crate::feed::FeedKind::Rss.as_str(),
+    )))
+    .execute(pool)
+    .await
+    .context("back-filling feeds.kind")?;
+
     // **Clear failure counts on rows we never actually polled.**
     //
     // `due_feeds` excludes `at://` (see `UNPOLLABLE_URL_SQL`) — but rows
@@ -589,7 +617,8 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // succeeded restarts its backoff at the floor on every boot.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, last_error = NULL \
-         WHERE {UNPOLLABLE_URL_SQL} AND last_polled IS NULL AND consecutive_errors > 0"
+         WHERE kind NOT IN ({POLLABLE_KINDS_SQL}) AND last_polled IS NULL \
+         AND consecutive_errors > 0"
     )))
     .execute(pool)
     .await
@@ -691,8 +720,8 @@ async fn ensure_column(
 pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     let row = sqlx::query(
         r#"
-        INSERT INTO feeds (url, title, site_url, etag, last_modified, last_polled, next_poll)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO feeds (url, title, site_url, etag, last_modified, last_polled, next_poll, kind)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ON CONFLICT (url) DO UPDATE SET
             title         = COALESCE(excluded.title, feeds.title),
             site_url      = COALESCE(excluded.site_url, feeds.site_url),
@@ -710,6 +739,8 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     .bind(&feed.last_modified)
     .bind(&feed.last_polled)
     .bind(&feed.next_poll)
+    // Decided once, in Rust, and never re-derived from the URL by SQL.
+    .bind(crate::feed::FeedKind::of(&feed.url).as_str())
     .fetch_one(pool)
     .await
     .with_context(|| format!("upsert_feed failed for {}", feed.url))?;
@@ -739,12 +770,11 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// reason a failure cause is recorded. (Rows like this exist: subscriptions
 /// written by other clients before this reader refused the scheme.)
 ///
-/// **One predicate, five readers** — the scheduler's `due_feeds`, the public
-/// `/stats` aggregates in `poll_health`, the admin's `failing_feeds`, the
-/// boot-time clearing of the errors our own refusal produced, and
-/// [`unpollable_feeds`] — so they cannot drift: a row the scheduler skips must
-/// not be a row a health page counts as overdue or failing. When the reader is
-/// wired, every site that uses this constant is the list of what must change.
+/// **One job left: the back-fill.** This was the shared predicate for five
+/// readers, which is how a sixth (`count_feeds`) came to drift from it
+/// unnoticed. Those readers key on `feeds.kind` now — a value the Rust side
+/// writes at insert, so SQL cannot disagree with the fetcher about what a row
+/// is. All this does today is translate rows that predate the column, once.
 ///
 /// **[`count_feeds`] is deliberately NOT one of them.** The global ceiling
 /// bounds storage on a small box, and an unpollable row occupies a row, so it
@@ -770,6 +800,15 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// spelling is separately refused, because `feeds.url` is UNIQUE.
 pub(crate) const UNPOLLABLE_URL_SQL: &str = "lower(substr(url, 1, 5)) = 'at://'";
 
+/// The `kind` values the scheduler may select, as a SQL list.
+///
+/// Pinned against [`crate::feed::FeedKind::POLLABLE`] by
+/// `the_sql_kind_list_matches_the_rust_one` — a literal here and a slice there
+/// is exactly the drift the column was introduced to end, so the two are
+/// asserted equal rather than trusted. Wiring the standard.site reader means
+/// changing both, and that test is what makes forgetting one a failure.
+pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss'";
+
 /// How many rows the poller will never select — the capacity consumed by feeds
 /// that cannot be fetched.
 ///
@@ -778,7 +817,7 @@ pub(crate) const UNPOLLABLE_URL_SQL: &str = "lower(substr(url, 1, 5)) = 'at://'"
 /// be reached with every public number saying otherwise.
 pub async fn unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM feeds WHERE {UNPOLLABLE_URL_SQL}"
+        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({POLLABLE_KINDS_SQL})"
     )))
     .fetch_one(pool)
     .await
@@ -790,7 +829,7 @@ pub async fn unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
 #[cfg(test)]
 pub(crate) async fn count_unpollable_feeds(pool: &SqlitePool) -> Result<i64> {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM feeds WHERE {UNPOLLABLE_URL_SQL}"
+        "SELECT COUNT(*) FROM feeds WHERE kind NOT IN ({POLLABLE_KINDS_SQL})"
     )))
     .fetch_one(pool)
     .await
@@ -806,7 +845,7 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
         WHERE (next_poll IS NULL OR next_poll <= ?1)
           -- `at://` is not pollable, so it is not due: skipped, not failed.
           -- The why lives on `UNPOLLABLE_URL_SQL`.
-          AND NOT ({UNPOLLABLE_URL_SQL})
+          AND kind IN ({POLLABLE_KINDS_SQL})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
         "#
@@ -849,7 +888,7 @@ pub async fn failing_feeds(pool: &SqlitePool, limit: i64) -> Result<Vec<FailingF
         r#"
         SELECT url, consecutive_errors, last_error_kind, last_error
         FROM feeds
-        WHERE consecutive_errors > 0 AND NOT ({UNPOLLABLE_URL_SQL})
+        WHERE consecutive_errors > 0 AND kind IN ({POLLABLE_KINDS_SQL})
         ORDER BY consecutive_errors DESC, url ASC
         LIMIT ?1
         "#
@@ -3992,7 +4031,7 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
             COALESCE(SUM(CASE WHEN consecutive_errors > 0 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN consecutive_errors >= ?3 THEN 1 ELSE 0 END), 0)
         FROM feeds
-        WHERE NOT ({UNPOLLABLE_URL_SQL})
+        WHERE kind IN ({POLLABLE_KINDS_SQL})
         "#
     );
     #[allow(clippy::type_complexity)]
@@ -4023,11 +4062,17 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
     // `FailureKind::parse("unknown")` is `None`.
     let histogram = format!(
         r#"
-        SELECT COALESCE(last_error_kind, 'unknown') AS kind, COUNT(*) AS n
+        -- **`failure_kind`, not `kind`.** Aliasing this `kind` collided with
+        -- the `feeds.kind` column added for the poller: SQLite resolved
+        -- `GROUP BY kind` to the table column, so every failing feed collapsed
+        -- into ONE bucket labelled from an arbitrary row — a public page
+        -- reporting "10 fetch" for ten unrelated causes. Caught by
+        -- `an_unrecognised_failure_kind_folds_into_unknown`.
+        SELECT COALESCE(last_error_kind, 'unknown') AS failure_kind, COUNT(*) AS n
         FROM feeds
-        WHERE consecutive_errors > 0 AND NOT ({UNPOLLABLE_URL_SQL})
-        GROUP BY kind
-        ORDER BY n DESC, kind ASC
+        WHERE consecutive_errors > 0 AND kind IN ({POLLABLE_KINDS_SQL})
+        GROUP BY failure_kind
+        ORDER BY n DESC, failure_kind ASC
         "#
     );
     let kinds: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(histogram))
@@ -8983,19 +9028,30 @@ mod tests {
 
     // ── poll health (the public stats page) ─────────────────────────────────
 
+    /// Seed a feed row **through the real writer**, so its `kind` is whatever
+    /// production would store.
+    ///
+    /// This used to be a raw `INSERT`, which took the `kind` column's
+    /// `DEFAULT 'rss'`. That is correct for an http(s) URL and silently wrong
+    /// for an `at://` one — the helper claimed to seed a row the poller skips
+    /// while seeding one it selects.
     async fn feed_polled(
         pool: &SqlitePool,
         url: &str,
         last_polled: Option<&str>,
         next_poll: Option<&str>,
     ) {
-        sqlx::query("INSERT INTO feeds (url, last_polled, next_poll) VALUES (?1, ?2, ?3)")
-            .bind(url)
-            .bind(last_polled)
-            .bind(next_poll)
-            .execute(pool)
-            .await
-            .unwrap();
+        upsert_feed(
+            pool,
+            &NewFeed {
+                url: url.to_string(),
+                last_polled: last_polled.map(str::to_string),
+                next_poll: next_poll.map(str::to_string),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// The numbers on the public page must describe the poller's actual state.
@@ -9191,6 +9247,137 @@ mod tests {
                 "boot {boot} left a never-polled row failing"
             );
         }
+        Ok(())
+    }
+
+    /// **The SQL kind list and the Rust one are the same list.** A literal in
+    /// SQL and a slice in Rust is the drift the column exists to end; wiring
+    /// the standard.site reader changes both, and this is what makes
+    /// forgetting one a failure rather than a silently dormant feature.
+    #[test]
+    fn the_sql_kind_list_matches_the_rust_one() {
+        let expected = crate::feed::FeedKind::POLLABLE
+            .iter()
+            .map(|k| format!("'{}'", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(POLLABLE_KINDS_SQL, expected);
+    }
+
+    /// **A feed's kind is recorded at insert, not re-derived from its URL.**
+    ///
+    /// "Can the poller fetch this?" was a substring predicate spliced into
+    /// four statements, and a review found a fifth reader that had drifted
+    /// from it. A column the writers set cannot drift: the Rust side decides
+    /// once, SQL reads a value.
+    #[tokio::test]
+    async fn a_feed_row_records_its_kind_at_insert() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for (url, want) in [
+            ("https://real.example/feed.xml", crate::feed::FeedKind::Rss),
+            ("http://real.example/feed.xml", crate::feed::FeedKind::Rss),
+            (
+                "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+                crate::feed::FeedKind::Publication,
+            ),
+        ] {
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let got: String = sqlx::query_scalar("SELECT kind FROM feeds WHERE url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(got, want.as_str(), "wrong kind recorded for {url}");
+        }
+        Ok(())
+    }
+
+    /// **A row written before the column existed is back-filled from its URL.**
+    /// That back-fill is the LAST use of the string predicate; every reader
+    /// keys on `kind` afterwards.
+    #[tokio::test]
+    async fn the_migration_backfills_kind_from_the_url() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // A table that predates the column, with both shapes in it.
+        sqlx::query("DROP TABLE feeds").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE feeds (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 url TEXT NOT NULL UNIQUE,
+                 title TEXT, site_url TEXT, etag TEXT, last_modified TEXT,
+                 last_polled TEXT, next_poll TEXT,
+                 consecutive_errors INTEGER NOT NULL DEFAULT 0,
+                 last_error_kind TEXT, last_error TEXT
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        for url in [
+            "https://real.example/feed.xml",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac",
+        ] {
+            sqlx::query("INSERT INTO feeds (url) VALUES (?1)")
+                .bind(url)
+                .execute(&pool)
+                .await?;
+        }
+
+        apply_migrations(&pool).await?;
+
+        let kinds: Vec<(String, String)> =
+            sqlx::query_as("SELECT url, kind FROM feeds ORDER BY url")
+                .fetch_all(&pool)
+                .await?;
+        let by_url: std::collections::HashMap<_, _> = kinds.into_iter().collect();
+        assert_eq!(by_url["https://real.example/feed.xml"], "rss");
+        assert_eq!(
+            by_url["at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"],
+            "publication"
+        );
+        assert_eq!(
+            by_url["At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac"],
+            "publication",
+            "the back-fill must recognise a non-canonical spelling, like every other guard"
+        );
+        Ok(())
+    }
+
+    /// **The readers key on `kind`, not on the URL.** A row whose kind says
+    /// publication is unpollable even if its URL looks ordinary — which is
+    /// what makes the column, rather than the string, the source of truth.
+    #[tokio::test]
+    async fn the_poller_and_the_pages_key_on_kind() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://looks-ordinary.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // Force the kind independently of the URL: only the column should matter.
+        sqlx::query("UPDATE feeds SET kind = 'publication' WHERE url LIKE 'https://looks%'")
+            .execute(&pool)
+            .await?;
+
+        let due = due_feeds(&pool, "2026-01-01T12:00:00Z", 10).await?;
+        assert!(due.is_empty(), "due_feeds read the URL, not the kind");
+        assert_eq!(
+            unpollable_feeds(&pool).await?,
+            1,
+            "unpollable_feeds read the URL"
+        );
+
+        let h = poll_health(&pool, "2026-01-01T12:00:00Z", "2026-01-01T11:00:00Z").await?;
+        assert_eq!(h.feeds_tracked, 0, "poll_health read the URL, not the kind");
         Ok(())
     }
 

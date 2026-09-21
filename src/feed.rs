@@ -705,6 +705,58 @@ pub enum FailureKind {
     Parse,
 }
 
+/// What the poller does with a feed row.
+///
+/// **A column, not a predicate.** "Can this be fetched?" used to be
+/// `substr(url, 1, 5) = 'at://'` spliced into four statements, with a fifth
+/// reader that had already drifted from them. Deciding it once, in Rust, at
+/// insert — and storing the answer — means SQL cannot disagree with the
+/// fetcher, and wiring the standard.site reader becomes a change to this
+/// function plus a dispatch, rather than an edit to every statement that
+/// mentions a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedKind {
+    /// An RSS/Atom/JSON feed document fetched over http(s).
+    Rss,
+    /// An `at://…/site.standard.publication/…` record pair in somebody's PDS.
+    /// Storable behind `FEATHERREADER_STANDARD_SITE`; **not yet pollable**, so
+    /// [`FeedKind::POLLABLE`] excludes it. Wiring the reader is what moves it.
+    Publication,
+}
+
+impl FeedKind {
+    /// The kinds the scheduler may select. The single place that changes when
+    /// the standard.site reader is wired to the poller.
+    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
+
+    /// The column value. Stable — it is persisted.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedKind::Rss => "rss",
+            FeedKind::Publication => "publication",
+        }
+    }
+
+    /// A closed vocabulary on the way back in: a kind written by a newer build
+    /// is not silently read as one this build knows.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "rss" => Some(FeedKind::Rss),
+            "publication" => Some(FeedKind::Publication),
+            _ => None,
+        }
+    }
+
+    /// What a URL will be stored as. The only place the question is asked.
+    pub fn of(url: &str) -> Self {
+        if crate::atproto::strip_at_prefix(url).is_some() {
+            FeedKind::Publication
+        } else {
+            FeedKind::Rss
+        }
+    }
+}
+
 /// Apply a [`PollOutcome`] to the feed's row: settle the error columns AND
 /// reschedule it. **Both halves, always, from one place.**
 ///
