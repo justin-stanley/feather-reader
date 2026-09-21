@@ -14,6 +14,48 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Publication entries are dated, so they stop resurrecting.** `site.standard.document`
+  makes `publishedAt` optional, and an entry stored without a date takes
+  `fetched_at` at insertion instead. Retention and the per-feed cap both order on
+  `COALESCE(published, fetched_at)`, so an undated entry is swept once it is
+  `retention_days` old, re-inserted by the next poll with a fresh `fetched_at`
+  and a new `entries.id`, loses its read state to the cascade, and comes back
+  unread — on that cycle, indefinitely. The same reset also sorts it newest in
+  the per-feed cap, where it evicts entries that are genuinely newer. A document
+  with no usable `publishedAt` is now dated from the TID in its record key,
+  which is the microsecond the record was written.
+- **A date in the future is clamped to now.** Retention deletes rows older than
+  the cutoff and the cap keeps the newest, so a document claiming the year 2999
+  was never swept and evicted every real entry in the feed ahead of itself. One
+  optional field in one record was enough to empty a feed.
+
+### Added
+
+- `atproto::decode_s32_tid`, the inverse of the existing encoder, and
+  `tid_timestamp`, which refuses a TID decoding to the future or to before
+  atproto existed. That bound is what stops a 13-character slug — an ordinary
+  filename shape that happens to be valid `s32` — from being read as a date.
+
+### Tests
+
+- Nine tests, each mutation-checked: fourteen mutations of the decoder, the
+  bounds, the fallback order and the clamp, all killed by a named test. The
+  fallback deliberately leaves a document with neither a date nor a TID rkey
+  undated; an invented date is worse than none, and what the store does with an
+  undated row is a separate decision.
+
+### Corrected
+
+- A comment claimed the leading character of a TID is always the `s32`
+  alphabet's first symbol. It is the second one for every timestamp between 2004
+  and 2038, which is why real TIDs begin with `3`.
+
+---
+
 ## 0.3.8 — 2026-09-20
 
 Fourteen PRs. Two additive nullable columns, no `fly.toml` change, one new

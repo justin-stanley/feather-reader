@@ -209,6 +209,9 @@ pub fn entries_from_records(
         }
         u
     });
+    // One "now" for the whole batch: the clamp below must not order two
+    // documents of the same poll by which microsecond they were mapped.
+    let now = chrono::Utc::now();
     records
         .iter()
         .filter_map(|record| {
@@ -221,11 +224,26 @@ pub fn entries_from_records(
             Some(Entry {
                 guid: record.uri.clone(),
                 title: doc.title,
+                // **Three rules, in order: what the publisher said, then when
+                // the record was written, then nothing.**
+                //
+                // Clamped to now because retention and the per-feed cap both
+                // order on this column: a document dated in the future is never
+                // swept and evicts every entry that is genuinely newer, so one
+                // `publishedAt` field can empty a feed. A TID-derived date
+                // needs no clamp — `tid_timestamp` already refuses a future or
+                // pre-atproto instant — and an rkey that is not a TID leaves
+                // the entry undated rather than inventing a date from a slug.
                 published: doc
                     .published_at
                     .as_deref()
                     .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-                    .map(|d| crate::feed::fmt_time(d.with_timezone(&chrono::Utc))),
+                    .map(|d| d.with_timezone(&chrono::Utc).min(now))
+                    .or_else(|| {
+                        AtUri::parse(&record.uri)
+                            .and_then(|uri| crate::atproto::tid_timestamp(&uri.rkey))
+                    })
+                    .map(crate::feed::fmt_time),
                 // `non_blank` for the same reason the summary uses it: a blank
                 // path joins to the publication's own base, so a handful of
                 // documents with an empty `path` became a handful of entries
@@ -643,6 +661,9 @@ mod tests {
                 json!({ "title": "T", "publishedAt": published_at, "path": "/x", "site": site }),
             )
         };
+        // Single-character rkeys on purpose: they are not TIDs, so the
+        // rkey-derived fallback below does not apply and "unparseable" really
+        // does mean undated here.
         let docs = vec![
             with("a", json!("2026-07-11T09:30:00.123+02:00")),
             with("b", json!("yesterday-ish")),
@@ -660,6 +681,138 @@ mod tests {
                 Some("2026-07-11T00:00:00Z".to_string()),
             ],
             "publishedAt was not normalised to the store's spelling"
+        );
+    }
+
+    /// A document with no usable `publishedAt` is dated from its rkey.
+    ///
+    /// **An undated entry is not merely untidy, it is immortal-and-mortal at
+    /// once.** The store's retention sweep and its per-feed cap both order on
+    /// `COALESCE(published, fetched_at)`, and an entry inserted with no
+    /// `published` gets `fetched_at` stamped at insertion. So the sweep deletes
+    /// it once it is `retention_days` old, the next poll re-inserts it with a
+    /// fresh `fetched_at` and a new `entries.id`, its read state is gone with
+    /// the cascade, and it arrives unread — again, on the same cycle, forever.
+    /// The same reset also sorts it newest in the per-feed cap, where it evicts
+    /// entries that really are newer.
+    #[test]
+    fn an_undated_document_is_dated_from_its_tid_rkey() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let tid = crate::atproto::TidGenerator::new().next();
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            &tid,
+            json!({ "title": "T", "path": "/x", "site": site }),
+        )];
+        let published = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .next()
+            .expect("the document is an entry")
+            .published
+            .expect("a TID rkey carries the moment the record was written");
+        let now = chrono::Utc::now();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&published)
+            .expect("the date is in the store's spelling")
+            .with_timezone(&chrono::Utc);
+        assert!(
+            (now - chrono::Duration::minutes(1)..=now).contains(&parsed),
+            "TID {tid} dated the entry to {published}, not to about now ({now})"
+        );
+        assert_eq!(
+            published,
+            crate::feed::fmt_time(parsed),
+            "the fallback date must be spelled the way the store spells dates"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_published_at_falls_back_to_the_tid_rkey() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let tid = crate::atproto::TidGenerator::new().next();
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            &tid,
+            json!({ "title": "T", "publishedAt": "yesterday-ish", "path": "/x", "site": site }),
+        )];
+        let published = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .next()
+            .expect("the document is an entry")
+            .published;
+        assert!(
+            published.is_some(),
+            "a date the parser cannot read is no date at all, so the rkey stands in"
+        );
+    }
+
+    #[test]
+    fn a_stated_date_outranks_the_rkey() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let tid = crate::atproto::TidGenerator::new().next();
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            &tid,
+            json!({ "title": "T", "publishedAt": "2026-07-11T00:00:00Z", "path": "/x", "site": site }),
+        )];
+        assert_eq!(
+            entries_from_records(&site, &pubn, &docs)
+                .into_iter()
+                .next()
+                .expect("the document is an entry")
+                .published,
+            Some("2026-07-11T00:00:00Z".to_string()),
+            "the rkey records when the file was written, which is not when the post was published"
+        );
+    }
+
+    /// **A stated date in the future is clamped, not kept.**
+    ///
+    /// Retention deletes rows whose date is older than the cutoff, so a
+    /// document claiming the year 2999 is never swept, and the per-feed cap
+    /// keeps the newest rows, so it also evicts every real entry ahead of
+    /// itself. One field in one record, and the feed holds nothing else.
+    #[test]
+    fn a_future_dated_document_is_dated_no_later_than_now() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            "self",
+            json!({ "title": "T", "publishedAt": "2999-01-01T00:00:00Z", "path": "/x", "site": site }),
+        )];
+        let published = entries_from_records(&site, &pubn, &docs)
+            .into_iter()
+            .next()
+            .expect("the document is an entry")
+            .published
+            .expect("the entry keeps a date");
+        let now = crate::feed::fmt_time(chrono::Utc::now());
+        assert!(
+            published.as_str() <= now.as_str(),
+            "a document dated {published} outlives every real entry (now is {now})"
+        );
+    }
+
+    #[test]
+    fn a_document_with_neither_a_date_nor_a_tid_rkey_stays_undated() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            "my-first-post",
+            json!({ "title": "T", "path": "/x", "site": site }),
+        )];
+        assert_eq!(
+            entries_from_records(&site, &pubn, &docs)
+                .into_iter()
+                .next()
+                .expect("the document is an entry")
+                .published,
+            None,
+            "an invented date is worse than no date; the store decides what to do with undated rows"
         );
     }
 
