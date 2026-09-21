@@ -39,6 +39,7 @@ pub mod readstate;
 pub mod repo;
 pub mod runtime_health;
 pub mod safe_link;
+pub mod standard_site;
 pub mod store;
 pub mod vetted;
 pub mod web;

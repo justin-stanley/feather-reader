@@ -131,17 +131,15 @@ impl Repo<'_> {
                 "com.atproto.repo.listRecords",
             )
             .await?;
-        let records: Vec<RecordEntry> = serde_json::from_value(
-            value
-                .get("records")
-                .cloned()
-                .unwrap_or(Value::Array(vec![])),
-        )
-        .context("listRecords returned records this client cannot parse")?;
-        let cursor = value
-            .get("cursor")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        // A 2xx carrying an error envelope is NOT an empty page: `records`
+        // defaulting to `[]` turned a PDS failure into `Ok(vec![])`, which
+        // `resolve_subscriptions` reads as "this DID follows nothing" and
+        // `sync_sub_refs` then writes through, revoking every `sub_ref`.
+        // Both invariants, through the one function every listRecords caller
+        // shares — this check was added here first and had to be fitted to the
+        // other two clients a round later.
+        let page = crate::atproto::list_records_from_value(value)?;
+        let (records, cursor) = (page.records, page.cursor);
         Ok((records, cursor))
     }
 
@@ -220,7 +218,8 @@ impl Repo<'_> {
             DpopBody::Json(serde_json::to_vec(&body)?),
             "com.atproto.repo.deleteRecord",
         )
-        .await?;
+        .await
+        .and_then(|v| crate::atproto::reject_error_envelope(&v))?;
         Ok(())
     }
 
@@ -236,7 +235,8 @@ impl Repo<'_> {
             DpopBody::Json(serde_json::to_vec(&body)?),
             "com.atproto.repo.applyWrites",
         )
-        .await?;
+        .await
+        .and_then(|v| crate::atproto::reject_error_envelope(&v))?;
         Ok(())
     }
 
@@ -646,6 +646,132 @@ mod tests {
             format!("{err:#}").contains("forbidden (internal) address"),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// **A 200 carrying an error envelope must not read as an empty repo.**
+    ///
+    /// `records` was taken off the JSON with `unwrap_or(Array([]))`, so a PDS
+    /// answering `200 {"error": …}` produced `Ok(vec![])`. That is not the
+    /// fail-closed branch in `web::resolve_subscriptions`: `sync_sub_refs`
+    /// writes the empty set through and `replace_sub_refs` DELETEs the DID's
+    /// entire `sub_ref` projection — one bad response revokes the reader's
+    /// access to every feed they have. Driven through the real client against
+    /// a real server, because the bug was the missing CALL, not the check.
+    #[tokio::test]
+    async fn a_200_error_envelope_is_not_an_empty_repo() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"bad cursor"}"#.to_vec(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "envelope-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://envelope-pds.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_records("app.feather.subscription", None, None)
+            .await
+            .expect_err("an error envelope was read as an empty page");
+        assert!(
+            format!("{err:#}").contains("InvalidRequest"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **An empty 2xx body is not an empty repo either.** `send` maps a
+    /// zero-length 2xx to `Value::Null` — deliberately, for `deleteRecord` and
+    /// `applyWrites` — so on `listRecords` it slipped past the envelope guard
+    /// and `records.unwrap_or(Array([]))` produced `Ok(vec![])`: the same
+    /// `sub_ref` wipe the guard was added to prevent, through the sibling door.
+    #[tokio::test]
+    async fn an_empty_200_body_is_not_an_empty_repo() {
+        let base = crate::net::tests::serve_body(Vec::new()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "empty-body.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://empty-body.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_records("app.feather.subscription", None, None)
+            .await
+            .expect_err("an empty body was read as an empty repo");
+        assert!(
+            format!("{err:#}").contains("no records"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// The write paths discarded the body too: `delete_record` and
+    /// `apply_writes` are `send(..).await?; Ok(())`, so a 200 carrying an
+    /// error envelope reported success for a delete that did not happen.
+    #[tokio::test]
+    async fn a_200_error_envelope_is_not_a_successful_write() {
+        let base = crate::net::tests::serve_body(
+            br#"{"error":"InvalidRequest","message":"nope"}"#.to_vec(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "envelope-write.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://envelope-write.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .delete_record("app.feather.subscription", "rk1")
+            .await
+            .expect_err("a failed delete was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+
+        let err = repo
+            .apply_writes(&[crate::atproto::WriteOp::Delete {
+                collection: "app.feather.subscription".to_string(),
+                rkey: "rk1".to_string(),
+            }])
+            .await
+            .expect_err("a failed batch was reported as success");
+        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
     }
 
     /// An empty batch must not produce a request at all — an `applyWrites` with
