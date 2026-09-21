@@ -4132,6 +4132,54 @@ mod tests {
     /// unconditionally, that call wrote both back to NULL, so `If-None-Match`
     /// was never sent, `304` was unreachable, and every feed was re-downloaded
     /// and re-parsed in full on every cycle. Nothing failed; it was invisible.
+    /// **A re-poll refreshes `published`; it never refreshes `fetched_at`.**
+    ///
+    /// The asymmetry is the whole reason a date must be stable. `published`
+    /// comes back from the publisher on every poll, so a value the mapper
+    /// recomputes — "now", say — is rewritten every hour and the row can never
+    /// age. `fetched_at` is written once, at first insert, so an entry stored
+    /// with no date is effectively dated when we first saw it, and that date
+    /// does hold still. Both the per-feed cap and the retention sweep order on
+    /// `COALESCE(published, fetched_at)`, so which of the two a row lands in
+    /// decides whether it can ever be evicted or swept.
+    #[tokio::test]
+    async fn a_repoll_refreshes_published_but_never_fetched_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://example.com/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let seen = |at: &str| {
+            vec![NewEntry {
+                guid: "g".to_string(),
+                published: Some(at.to_string()),
+                fetched_at: Some(at.to_string()),
+                ..Default::default()
+            }]
+        };
+        insert_entries(&pool, feed_id, &seen("2026-01-01T00:00:00Z"), 0).await?;
+        insert_entries(&pool, feed_id, &seen("2026-09-20T00:00:00Z"), 0).await?;
+
+        let (published, fetched_at): (Option<String>, String) =
+            sqlx::query_as("SELECT published, fetched_at FROM entries WHERE guid = 'g'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            published.as_deref(),
+            Some("2026-09-20T00:00:00Z"),
+            "the second poll's date did not replace the first"
+        );
+        assert_eq!(
+            fetched_at, "2026-01-01T00:00:00Z",
+            "fetched_at moved, so an undated entry would never age either"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn validators_survive_a_partial_upsert() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;

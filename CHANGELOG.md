@@ -24,14 +24,12 @@ deploying is separate.
   `COALESCE(published, fetched_at)`, so an undated entry is swept once it is
   `retention_days` old, re-inserted by the next poll with a fresh `fetched_at`
   and a new `entries.id`, loses its read state to the cascade, and comes back
-  unread — on that cycle, indefinitely. The same reset also sorts it newest in
-  the per-feed cap, where it evicts entries that are genuinely newer. A document
-  with no usable `publishedAt` is now dated from the TID in its record key,
-  which is the microsecond the record was written.
-- **A date in the future is clamped to now.** Retention deletes rows older than
-  the cutoff and the cap keeps the newest, so a document claiming the year 2999
-  was never swept and evicted every real entry in the feed ahead of itself. One
-  optional field in one record was enough to empty a feed.
+  unread — on that cycle, indefinitely. A document with no usable `publishedAt`
+  is now dated from the TID in its record key, which is the microsecond the
+  record was written.
+- **A stated date in the future is discarded, not used.** Retention deletes rows
+  older than the cutoff and the cap keeps the newest, so a document claiming the
+  year 2999 was never swept and permanently held the top of the reading list.
 
 ### Added
 
@@ -42,17 +40,50 @@ deploying is separate.
 
 ### Tests
 
-- Nine tests, each mutation-checked: fourteen mutations of the decoder, the
-  bounds, the fallback order and the clamp, all killed by a named test. The
-  fallback deliberately leaves a document with neither a date nor a TID rkey
-  undated; an invented date is worse than none, and what the store does with an
-  undated row is a separate decision.
+- Eleven, each mutation-checked; 857 to 868 in the library suite.
+- One of them pins a store invariant this change rests on: an upsert refreshes
+  `published` from every poll but never refreshes `fetched_at`. It was not
+  pinned before, and it is the reason the fix below is what it is.
 
-### Corrected
+### Corrected in review
 
-- A comment claimed the leading character of a TID is always the `s32`
-  alphabet's first symbol. It is the second one for every timestamp between 2004
-  and 2038, which is why real TIDs begin with `3`.
+Four defects in the first version of this change, all found by review before it
+merged and all recorded here rather than quietly rewritten.
+
+- **The first fix clamped a future date to "now". That was wrong**, and the
+  reason is the invariant above: `published` is rewritten on every poll, so a
+  clamped row is re-dated to the current hour forever. It can never age past the
+  retention cutoff, can never be outranked in the per-feed cap, and sits at the
+  top of the reading list showing today's date. Clamping moved the defect and
+  made it harder to see — the literal `2999` was at least a visible symptom.
+  A non-credible date is now discarded like an unparseable one, falling through
+  to the record key and then to undated; every one of those values holds still.
+- **Two tests named for the rkey fallback passed with the fallback deleted.**
+  Both minted a fresh TID and asserted the result was "about now", which any
+  source of the current time satisfies — including a fallback replaced outright
+  by `Utc::now()`. Both now use a fixed record key from a real repo and assert
+  the exact instant it decodes to. Three further mutations that survived the
+  original tests die against the new ones.
+- **A round-trip test cannot catch a consistently wrong alphabet.** Swapping two
+  `s32` symbols round-trips perfectly and misreads every real record key. The
+  decoder is now pinned to a known answer computed outside this code.
+- **`the_decoder_rejects_rkeys_that_are_not_tids` claimed more than it proved.**
+  The decoder accepts any 13-character `s32` string, slugs included; refusing an
+  implausible instant is `tid_timestamp`'s job. Renamed, and the function's own
+  doc comment corrected to match. The end-to-end test now covers a slug-shaped
+  key as well as a punctuated one, so the bound is exercised through the mapper
+  and not only as a unit.
+
+Two wrong numbers in the first draft of this entry, both since computed rather
+than estimated: the slug `abcdefghijklm` decodes to 2192, not 2183, and a TID's
+leading character is `3` between 2005-09-05 and 2041-05-10, not 2004 and 2038.
+
+### Known, not fixed here
+
+- An undated entry is the newest row in the feed to the per-feed cap and the
+  oldest to the reading list, which orders on bare `published DESC` where SQLite
+  sorts NULL last. It is therefore safe from eviction and invisible to the
+  reader at the same time. Pre-existing, affects RSS equally, filed as #187.
 
 ---
 

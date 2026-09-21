@@ -1976,8 +1976,8 @@ fn encode_s32_tid(mut v: u64) -> String {
     // 13 * 5 = 65 bits cover the 64-bit value; the leading char carries bits
     // 64..60, and bit 64 does not exist in a `u64` while bit 63 is always 0 in
     // a real TID, so the leading char is always one of the alphabet's first
-    // eight symbols. For every microsecond timestamp between 2004 and 2038 it
-    // is the second one, which is why real TIDs all begin with `3`.
+    // eight symbols. Between 2005-09-05 and 2041-05-10 it is the second one,
+    // which is why real TIDs all begin with `3`.
     String::from_utf8(buf.to_vec()).unwrap_or_default()
 }
 
@@ -1992,11 +1992,19 @@ const TID_FLOOR_MICROS: i64 = 1_577_836_800_000_000;
 
 /// Decode a 13-char `s32` TID rkey back to its raw 64-bit value.
 ///
-/// The exact inverse of [`encode_s32_tid`] over the values a TID can hold, and
-/// `None` for anything that is not a TID: wrong length, a character outside the
-/// `s32` alphabet, or a value whose top bit is set (the TID spec reserves it,
-/// so a string decoding with bit 63 high is not a TID even though it is
-/// 13 valid characters).
+/// The exact inverse of [`encode_s32_tid`] over the values a TID can hold.
+///
+/// `None` for anything that is not a 13-character `s32` value: wrong length, a
+/// character outside the alphabet, or a value whose top bit is set. That last
+/// rejection is stricter than the TID syntax regex, which admits leading `c`
+/// through `j`; the spec's separate rule that the high bit is always 0 is the
+/// one enforced here, and it keeps every decoded value inside the range
+/// [`tid_timestamp`] can shift without loss.
+///
+/// **This does not decide whether the string is a TID**, only whether it is a
+/// number. Thirteen lowercase alphanumerics is also an ordinary slug, and a
+/// slug decodes as readily as a record key does. Refusing an implausible
+/// instant is [`tid_timestamp`]'s job, and it is where that case is caught.
 pub(crate) fn decode_s32_tid(rkey: &str) -> Option<u64> {
     if rkey.len() != 13 {
         return None;
@@ -3230,16 +3238,37 @@ mod tests {
                 "{v} encoded to {encoded}, which did not decode back"
             );
         }
+
+        // **A round trip alone proves too little.** Encoder and decoder share
+        // the alphabet, so swapping two of its symbols round-trips perfectly
+        // and still reads every real record key wrong. These two are the
+        // known answer: a record key from a real atproto repo, and the value
+        // it holds, computed independently of this code.
+        assert_eq!(
+            decode_s32_tid("3jzfcijpj2z2a"),
+            Some(1_728_652_679_052_295_174)
+        );
+        assert_eq!(encode_s32_tid(1_728_652_679_052_295_174), "3jzfcijpj2z2a");
+        assert_eq!(
+            decode_s32_tid("3jzfcijpj2z2a").map(|raw| raw >> 10),
+            Some(1_688_137_381_887_007),
+            "that key was written at 2023-06-30T15:03:01.887007Z"
+        );
     }
 
     #[test]
-    fn a_generated_tid_decodes_to_the_moment_it_was_minted() {
+    fn the_first_tid_of_a_generator_decodes_to_the_microsecond_it_was_minted() {
         let micros = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0)
         };
+        // The FIRST `next()` only. `TidGenerator` bumps a TID to `last + 1`
+        // to stay strictly increasing, and on a generator whose clock id is
+        // already at its maximum that carry lands in the timestamp bits — so a
+        // later TID can decode a microsecond or two past when it was really
+        // minted. A fresh generator has `last: 0`, where the bump cannot fire.
         let before = micros();
         let tid = TidGenerator::new().next();
         let after = micros();
@@ -3252,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn the_decoder_rejects_rkeys_that_are_not_tids() {
+    fn the_decoder_rejects_strings_that_are_not_13_char_s32_values() {
         for rkey in [
             "",               // empty
             "self",           // the common non-TID rkey
@@ -3265,7 +3294,11 @@ mod tests {
             "k222222222222",  // decodes past 64 bits entirely
             "zzzzzzzzzzzzz",  // the largest 13-char s32 string
         ] {
-            assert_eq!(decode_s32_tid(rkey), None, "{rkey:?} is not a TID");
+            assert_eq!(
+                decode_s32_tid(rkey),
+                None,
+                "{rkey:?} is not a 13-character s32 value"
+            );
         }
     }
 
@@ -3305,7 +3338,7 @@ mod tests {
         assert_eq!(
             tid_timestamp("abcdefghijklm"),
             None,
-            "a 13-character slug decodes to the year 2183; it is not a date"
+            "a 13-character slug decodes to the year 2192; it is not a date"
         );
     }
 
