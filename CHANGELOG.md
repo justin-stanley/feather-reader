@@ -18,8 +18,8 @@ deploying is separate.
 
 ### Security
 
-- **The sidecar's response body is capped like every other body this codebase
-  reads.** `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
+- **Every response body in the atproto layer is now capped. Five were not.**
+  `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
   which reads whatever arrives. That endpoint proxies the account's PDS, so the
   length is chosen by a host the reader picked and we did not, and the sidecar
   is the default backend — so the one path with no byte bound of any kind was
@@ -28,6 +28,21 @@ deploying is separate.
   Found by review of a change that set out to bound the *record walks* and
   missed the transport underneath one of them.
 
+  Review of **that** fix then found four more of the same shape, two of them on
+  hosts an attacker picks rather than merely influences: the DID document, whose
+  host for a `did:web:` comes straight out of the DID, so whoever supplies the
+  DID chooses the server; `resolveHandle`, against a resolver base this code's
+  own comment calls user-influenced; and the sidecar's two session reads. The
+  SSRF guard covers where those requests go, not how much comes back.
+
+  The original entry claimed the sidecar body was capped "like every other body
+  this codebase reads" and the pull request said the same of that client's
+  siblings. Neither was true when written; both are now.
+- **A sidecar error whose body cannot be read keeps its HTTP status.** Reading
+  the body before branching on the status was the obvious shape and it swallowed
+  the status on an over-cap or truncated error body, turning a `404` into a bare
+  "body exceeded the cap". `xrpc_error_from` already makes the opposite choice
+  deliberately, for this reason.
 
 ### Fixed
 
