@@ -1348,15 +1348,20 @@ impl SidecarClient {
             .send()
             .await?;
         let status = resp.status();
+        // **Capped, like every other body this codebase reads.** `resp.json()`
+        // buffers whatever arrives; `/internal/repo` proxies the account's PDS,
+        // so that length is chosen by a host the reader picked and we did not.
+        // The 8 MB ceiling that bounds the direct client did not exist here,
+        // and the sidecar is the default backend — so the one path with no byte
+        // bound at all was the one most deployments run.
+        let raw = crate::net::read_capped(resp).await?;
         if status.is_success() {
-            let ok: RepoOk = resp
-                .json()
-                .await
-                .context("parsing /internal/repo ok body")?;
+            let ok: RepoOk =
+                serde_json::from_slice(&raw).context("parsing /internal/repo ok body")?;
             return Ok(ok.data);
         }
         // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
-        let err: RepoErr = resp.json().await.unwrap_or(RepoErr {
+        let err: RepoErr = serde_json::from_slice(&raw).unwrap_or(RepoErr {
             error: None,
             message: None,
             status: None,
@@ -2477,6 +2482,38 @@ mod tests {
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
         let page = list_records_from_value(serde_json::json!({"records": []})).unwrap();
         assert!(page.records.is_empty());
+    }
+
+    /// **The sidecar's body is capped like every other body we read.**
+    ///
+    /// `/internal/repo` proxies whatever the account's PDS returned, so its
+    /// size is remote-controlled by a host the reader chose and we did not.
+    /// Every other response in this codebase goes through
+    /// [`crate::net::read_capped`]; this one buffered the whole thing with
+    /// `resp.json()`, so the 8 MB ceiling that bounds the direct PDS client
+    /// simply did not exist on the sidecar backend — which is the default.
+    #[tokio::test]
+    async fn the_sidecar_client_caps_the_body_it_will_buffer() {
+        // Well-formed, and past the cap. The guard has to fire on size, not
+        // on the shape being wrong.
+        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
+        let body = format!(r#"{{"ok":true,"data":{{"records":[],"pad":"{filler}"}}}}"#);
+        assert!(body.len() > crate::net::MAX_BODY_BYTES);
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an oversized sidecar body was buffered whole");
+        assert!(
+            format!("{err:#}").contains("cap"),
+            "failed for the wrong reason: {err:#}"
+        );
     }
 
     /// The sidecar path needs the records guard too, not only the envelope

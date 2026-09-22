@@ -16,6 +16,19 @@ deploying is separate.
 
 ## Unreleased
 
+### Security
+
+- **The sidecar's response body is capped like every other body this codebase
+  reads.** `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
+  which reads whatever arrives. That endpoint proxies the account's PDS, so the
+  length is chosen by a host the reader picked and we did not, and the sidecar
+  is the default backend — so the one path with no byte bound of any kind was
+  the one most deployments run. Both the success and error paths now go through
+  `net::read_capped`, the same 8 MB ceiling the direct client has always had.
+  Found by review of a change that set out to bound the *record walks* and
+  missed the transport underneath one of them.
+
+
 ### Fixed
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
