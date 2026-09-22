@@ -149,7 +149,19 @@ impl Repo<'_> {
     /// unbounded walk is a denial-of-service against ourselves. A cursor that
     /// does not advance also terminates the walk rather than spinning.
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_within(collection, crate::atproto::MAX_LIST_BYTES)
+            .await
+    }
+
+    /// [`list_all_records`](Self::list_all_records) with the byte budget named,
+    /// so a test can reach the bound without allocating it.
+    pub(crate) async fn list_all_records_within(
+        &self,
+        collection: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
+        let mut budget = crate::atproto::ByteBudget::new(max_bytes);
         let mut cursor: Option<String> = None;
 
         for _ in 0..MAX_LIST_PAGES {
@@ -161,6 +173,16 @@ impl Repo<'_> {
             // bounds requests, not memory, unless the server honours our limit.
             // This is the LIVE walk on `backend=rust` — its result reaches
             // `replace_sub_refs`, so a truncation here is revoked access.
+            // Same refusal, same reason: this walk's result reaches
+            // `replace_sub_refs`, so stopping short is revoked access.
+            if !budget.admit(&page) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+                     ({} held, {} bytes charged) — refusing to accumulate further",
+                    out.len(),
+                    budget.used(),
+                );
+            }
             crate::atproto::extend_bounded(&mut out, page, MAX_LIST_RECORDS, collection)?;
             match next {
                 // `got > 0` is not defensive tidiness -- it is a whole round
@@ -690,6 +712,49 @@ mod tests {
         assert!(
             format!("{err:#}").contains("InvalidRequest"),
             "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **The byte budget refuses here too, and refusing is the point.**
+    ///
+    /// This is the live walk on `backend=rust`: its result reaches
+    /// `replace_sub_refs`, so a walk that quietly stopped short on memory would
+    /// revoke the reader's access to every feed past the cut. One page of one
+    /// record against a one-byte budget reaches the bound without allocating.
+    #[tokio::test]
+    async fn the_live_walk_refuses_when_the_byte_budget_is_spent() {
+        let body = serde_json::json!({
+            "records": [{"uri": "at://did:plc:x/c/1", "value": {"t": "x".repeat(4096)}}]
+        })
+        .to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "budget-pds.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://budget-pds.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_all_records_within("app.feather.subscription", 1)
+            .await
+            .expect_err("a 4 kB record cannot fit in a 1-byte budget");
+        assert!(
+            format!("{err:#}").contains("byte cap"),
+            "the refusal did not say what bound was hit: {err:#}"
         );
     }
 

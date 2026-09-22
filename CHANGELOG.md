@@ -16,6 +16,26 @@ deploying is separate.
 
 ## Unreleased
 
+### Security
+
+- **A record walk is now bounded in bytes, not only in records.** Every walk
+  capped how many records it would accumulate, against a measured average size,
+  and `MAX_LIST_PAGES` bounds requests rather than memory — a point one of the
+  walks already made in a comment. A PDS returning records an order of magnitude
+  above that average satisfies every count and still drives hundreds of
+  megabytes of allocation on a 512 MB box, which is an out-of-memory kill
+  reachable by any server the reader talks to. All three walks now carry a
+  128 MiB budget that does not depend on the average holding.
+
+  The two verdicts differ, and have to. The walk feeding `replace_sub_refs`
+  refuses, because a short list there is revoked access to every feed past the
+  cut. The publication read truncates and reports `complete: false`, which it
+  already models, because it only ever adds entries.
+
+  This deliberately lowers the reading walk's effective ceiling: at the measured
+  average, its record cap allowed about 340 MB, which was never survivable on
+  this box. A publication larger than the budget now truncates instead.
+
 ### Fixed
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
@@ -99,7 +119,12 @@ deploying is separate.
   killed by one of them. Four more for the operational findings: leaving
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
-- The suite stands at 877 tests, 875 passing and two ignored.
+- **Walk budget**: six more, three of them red first, each pinning one of the
+  three walks or the accounting itself. Seven mutations — an estimate that
+  ignores the record's contents, a budget that admits everything, one that
+  charges a page it refused, and removing the check from each of the three
+  walks — all killed by a named test.
+- The suite stands at 883 tests, 881 passing and two ignored.
 
 ### Corrected in review
 

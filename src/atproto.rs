@@ -240,6 +240,84 @@ impl RecordWalk {
 /// fail-closed branch and serve the last-known projection instead.
 ///
 /// `out` is left untouched on refusal, so a partial page cannot survive.
+/// The memory a single walk may retain, whatever the PDS's records turn out to
+/// weigh.
+///
+/// **A record cap bounds memory only if you know the record size.** The caps
+/// above are counts, chosen against a measured average, and `MAX_LIST_PAGES`
+/// bounds requests rather than bytes — a point one of the walks already makes
+/// in a comment. A PDS that returns records an order of magnitude larger than
+/// the average satisfies every count and still costs hundreds of megabytes on a
+/// 512 MB box. This bound does not depend on the average holding.
+///
+/// Deliberately lower than the reading walk's previous effective ceiling
+/// ([`MAX_LARGE_RECORDS`] at the measured average is about 340 MB, which is not
+/// survivable here). A publication larger than this truncates, which the walk
+/// already models as `complete: false`, rather than ending the process.
+pub(crate) const MAX_LIST_BYTES: usize = 128 * 1024 * 1024;
+
+/// A cheap over-estimate of what one record retains once parsed.
+///
+/// Serialized length stands in for retained size: it is within a small factor
+/// for the shapes atproto records take, and it costs a walk of the value rather
+/// than a second serialization. Over-estimating is the safe direction.
+pub(crate) fn approx_bytes(entry: &RecordEntry) -> usize {
+    entry.uri.len() + entry.cid.as_ref().map_or(0, String::len) + json_bytes(&entry.value)
+}
+
+/// Serialized size of a parsed JSON value, without serializing it.
+///
+/// Recursion is safe here because the value came from `serde_json`, whose
+/// parser enforces its own nesting limit — a value this deep could not have
+/// been built from a response body in the first place.
+fn json_bytes(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        // Not measured digit by digit: a number is small and bounded, and the
+        // budget is an over-estimate by design.
+        serde_json::Value::Number(_) => 20,
+        serde_json::Value::String(s) => s.len() + 2,
+        serde_json::Value::Array(a) => 2 + a.len() + a.iter().map(json_bytes).sum::<usize>(),
+        serde_json::Value::Object(o) => {
+            2 + o
+                .iter()
+                .map(|(k, v)| k.len() + 4 + json_bytes(v))
+                .sum::<usize>()
+        }
+    }
+}
+
+/// Running byte accounting for one walk.
+pub(crate) struct ByteBudget {
+    used: usize,
+    max: usize,
+}
+
+impl ByteBudget {
+    pub(crate) fn new(max: usize) -> Self {
+        Self { used: 0, max }
+    }
+
+    /// Charge a page against the budget. `false` when the walk must stop —
+    /// the page is NOT charged in that case, so `used` always describes what
+    /// the caller actually kept.
+    pub(crate) fn admit(&mut self, page: &[RecordEntry]) -> bool {
+        let cost: usize = page.iter().map(approx_bytes).sum();
+        match self.used.checked_add(cost) {
+            Some(total) if total <= self.max => {
+                self.used = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+}
+
 pub(crate) fn extend_bounded(
     out: &mut Vec<RecordEntry>,
     page: Vec<RecordEntry>,
@@ -850,13 +928,36 @@ impl PdsClient {
     /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_within(collection, MAX_LIST_BYTES)
+            .await
+    }
+
+    /// [`list_all_records`](Self::list_all_records) with the byte budget named,
+    /// so a test can reach the bound without allocating it.
+    pub(crate) async fn list_all_records_within(
+        &self,
+        collection: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
+        let mut budget = ByteBudget::new(max_bytes);
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
+            // **Refused, not truncated**, for the same reason the record cap
+            // refuses here: this walk feeds `replace_sub_refs`, where a short
+            // list is revoked access.
+            if !budget.admit(&page.records) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+                     ({} held, {} bytes charged) — refusing to accumulate further",
+                    out.len(),
+                    budget.used(),
+                );
+            }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
                 // Guard against a PDS that echoes a cursor with an empty page,
@@ -900,9 +1001,24 @@ impl PdsClient {
         collection: &str,
         max_records: usize,
         page_size: u32,
+        keep: impl FnMut(&RecordEntry) -> bool,
+    ) -> Result<RecordWalk> {
+        self.list_recent_matching_within(collection, max_records, MAX_LIST_BYTES, page_size, keep)
+            .await
+    }
+
+    /// [`list_recent_matching`](Self::list_recent_matching) with the byte
+    /// budget named, so a test can reach the bound without allocating it.
+    pub(crate) async fn list_recent_matching_within(
+        &self,
+        collection: &str,
+        max_records: usize,
+        max_bytes: usize,
+        page_size: u32,
         mut keep: impl FnMut(&RecordEntry) -> bool,
     ) -> Result<RecordWalk> {
         let mut out = Vec::new();
+        let mut budget = ByteBudget::new(max_bytes);
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
@@ -914,6 +1030,13 @@ impl PdsClient {
             let more =
                 matches!(&page.cursor, Some(next) if got > 0 && Some(next) != cursor.as_ref());
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
+            // Charged on what is KEPT, which is what the walk retains; the
+            // page itself is already bounded by `net::read_capped`. A filter
+            // that matches nothing therefore costs no budget, only the fixed
+            // number of round trips `MAX_LIST_PAGES` allows.
+            if !budget.admit(&kept) {
+                return Ok(RecordWalk::partial(out));
+            }
             if extend_truncating(&mut out, kept, max_records) {
                 return Ok(RecordWalk::partial(out));
             }
@@ -3231,6 +3354,136 @@ mod tests {
         // Page 1: cursor None → "same". Page 2: "same" again → stop, after
         // taking that page. Two pages, not two hundred.
         assert_eq!(records.len(), 2, "a repeated cursor was followed");
+    }
+
+    // -- walk byte budget ---------------------------------------------------
+
+    fn sized_record(bytes: usize) -> RecordEntry {
+        RecordEntry {
+            uri: "at://did:plc:x/c/1".to_string(),
+            cid: None,
+            value: serde_json::json!({ "t": "x".repeat(bytes) }),
+        }
+    }
+
+    #[test]
+    fn a_records_size_is_estimated_from_what_it_holds() {
+        let small = approx_bytes(&sized_record(10));
+        let large = approx_bytes(&sized_record(10_000));
+        assert!(
+            small > 0,
+            "every record costs something; a zero estimate makes the budget inert"
+        );
+        assert!(
+            large >= 10_000,
+            "a record holding 10 kB of text was estimated at {large} bytes"
+        );
+        assert!(
+            large > small * 10,
+            "the estimate must track what the record actually holds"
+        );
+    }
+
+    #[test]
+    fn a_budget_refuses_the_page_that_would_exceed_it() {
+        let mut budget = ByteBudget::new(50_000);
+        let page = vec![sized_record(10_000)];
+        assert!(budget.admit(&page), "the first page fits");
+        let after_one = budget.used();
+        assert!(after_one >= 10_000, "the page was not charged");
+
+        // Four more pages of the same size overrun 50 kB.
+        let mut admitted = 1;
+        for _ in 0..8 {
+            if budget.admit(&page) {
+                admitted += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            admitted < 9,
+            "the budget admitted every page; it is not bounding anything"
+        );
+        assert!(
+            budget.used() <= 50_000,
+            "the budget was overrun to {} bytes",
+            budget.used()
+        );
+    }
+
+    #[test]
+    fn a_refused_page_is_not_charged() {
+        let mut budget = ByteBudget::new(1);
+        let before = budget.used();
+        assert!(
+            !budget.admit(&[sized_record(1_000)]),
+            "1 kB cannot fit in 1 byte"
+        );
+        assert_eq!(
+            budget.used(),
+            before,
+            "a page the walk never kept was charged against the budget anyway"
+        );
+    }
+
+    /// **The byte budget stops a walk the record cap would have allowed.**
+    ///
+    /// Both of these serve one page of one record and set the budget to a
+    /// single byte, so the bound is reached on the first page without
+    /// allocating anything. What differs is the verdict, and it has to: the
+    /// refusing walk feeds `replace_sub_refs`, where a short list is revoked
+    /// access, and the truncating walk only ever adds entries.
+    async fn serve_one_record(host: &str) -> PdsClient {
+        let body = serde_json::json!({
+            "records": [{"uri": "at://did:plc:x/c/1", "value": {"t": "x".repeat(4096)}}]
+        })
+        .to_string();
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        PdsClient::anonymous(
+            ssrf_test_client(),
+            format!("http://{host}:{port}"),
+            "did:plc:x",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_walk_that_must_not_truncate_refuses_when_the_byte_budget_is_spent() {
+        let client = serve_one_record("byte-budget-refuse.test").await;
+        let err = client
+            .list_all_records_within("c", 1)
+            .await
+            .expect_err("a 4 kB record cannot fit in a 1-byte budget");
+        assert!(
+            err.to_string().contains("byte cap"),
+            "the refusal did not say what bound was hit: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_walk_that_may_truncate_reports_incomplete_when_the_byte_budget_is_spent() {
+        let client = serve_one_record("byte-budget-truncate.test").await;
+        let walk = client
+            .list_recent_matching_within("c", 100, 1, 100, |_| true)
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert!(
+            !walk.complete,
+            "the walk stopped on the budget but called itself complete, \
+             which is the one fact the caller cannot recover"
+        );
+        assert!(
+            walk.records.is_empty(),
+            "a page the budget refused was kept anyway"
+        );
     }
 
     // -- TID rkeys ----------------------------------------------------------
