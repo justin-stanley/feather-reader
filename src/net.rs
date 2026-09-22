@@ -1515,6 +1515,47 @@ pub(crate) mod tests {
         (format!("http://{addr}/"), hits)
     }
 
+    /// Serve a different body per request, in order, repeating the last.
+    ///
+    /// **The fixed-body servers cannot test a walk.** `serve_body` answers every
+    /// request identically, so a paging walk sees the same cursor twice and its
+    /// repeat-detection guard stops it at two pages. Anything that only happens
+    /// across pages — a budget accumulating, a cursor advancing — is therefore
+    /// unreachable with them, which is how a cap that was per-page rather than
+    /// per-walk once passed an entire suite.
+    ///
+    /// Each request is a fresh connection (`Connection: close`), so accept order
+    /// is request order for the sequential walks that use this.
+    pub(crate) async fn serve_bodies_in_sequence(bodies: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert!(!bodies.is_empty(), "serve_bodies_in_sequence needs a body");
+        let bodies = std::sync::Arc::new(bodies);
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = bodies[i.min(bodies.len() - 1)].clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
     pub(crate) async fn serve_body(body: Vec<u8>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

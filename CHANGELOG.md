@@ -43,6 +43,41 @@ deploying is separate.
   the status on an over-cap or truncated error body, turning a `404` into a bare
   "body exceeded the cap". `xrpc_error_from` already makes the opposite choice
   deliberately, for this reason.
+- **A record walk is bounded in retained bytes, across all four walks.** Every
+  walk capped how many records it would accumulate, against a measured ~17 KB
+  document, and `MAX_LIST_PAGES` bounds requests rather than memory. A PDS whose
+  records are not that shape satisfies every count and still exhausts the box.
+
+  The bound charges what a parsed value **retains**, not what it takes on the
+  wire. A first attempt charged serialized length and was wrong by up to 42x: a
+  parsed value is a tree of 32-byte nodes in vectors that over-allocate, so
+  `[[],[],…]` costs three bytes of JSON and well over a hundred in memory.
+  Measured against that estimate, a budget reporting 119 MiB held a process at
+  5.6 GiB. Every arm now charges at least the node itself, which over-estimates
+  on adversarial shapes and costs honest traffic a couple of percent.
+
+  64 MiB, not more: at the measured average the record caps already bind first
+  (2 000 documents is ~34 MB), so on honest traffic this never fires and nothing
+  truncates that did not truncate before. It exists for the traffic the counts
+  do not describe.
+
+  The two verdicts differ. The three walks feeding `replace_sub_refs` refuse,
+  since a short list there is revoked access. The publication read truncates and
+  reports `complete: false`, which it already models.
+
+### Tests
+
+- **A mock that serves a different body per request**, which this suite did not
+  have. The fixed-body servers answer every request identically, so a paging
+  walk sees the same cursor twice and its repeat-detection guard stops it at two
+  pages — which makes anything that only happens *across* pages unreachable.
+  That is how a cap that was per-page rather than per-walk, and therefore 200x
+  weaker, once passed an entire suite unnoticed.
+- Eight for the walk budget, each mutation-checked. Eleven mutations, all killed
+  by a named test: the per-page budget in each of the four walks, dropping the
+  recursion into arrays and into objects, charging scalars nothing, the
+  exact-fit fence-post, a refusal resetting the running total, an uncharged uri
+  and cid, and removing the check from the live walk entirely.
 
 ### Fixed
 
