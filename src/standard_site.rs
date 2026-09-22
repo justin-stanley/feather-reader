@@ -100,10 +100,14 @@ pub struct Entry {
     /// dedup is `UNIQUE (feed_id, guid)`.
     pub guid: String,
     pub title: String,
-    /// `publishedAt` parsed and re-spelled by [`crate::feed::fmt_time`], the
-    /// store's one RFC3339 shape — or `None` when it does not parse. The
-    /// reading order sorts on this column as a string, so a publisher's
-    /// spelling cannot go in verbatim.
+    /// When the document was published, re-spelled by [`crate::feed::fmt_time`]
+    /// into the store's one RFC3339 shape. The reading order sorts on this
+    /// column as a string, so a publisher's spelling cannot go in verbatim.
+    ///
+    /// Taken from `publishedAt` when it parses AND is not in the future,
+    /// otherwise from the TID in the record key, otherwise `None`. See
+    /// `entries_from_records` for why a future date is discarded rather than
+    /// clamped, and why an undated entry is left undated.
     pub published: Option<String>,
     /// The joined, **scheme-vetted** permalink — `None` when the document's
     /// `path` does not resolve to a safe href on the publication's origin.

@@ -18,7 +18,7 @@ deploying is separate.
 
 ### Fixed
 
-- **Publication entries are dated, so they stop resurrecting.** `site.standard.document`
+- **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
   `fetched_at` at insertion instead. Retention and the per-feed cap both order on
   `COALESCE(published, fetched_at)`, so an undated entry is swept once it is
@@ -27,6 +27,15 @@ deploying is separate.
   unread — on that cycle, indefinitely. A document with no usable `publishedAt`
   is now dated from the TID in its record key, which is the microsecond the
   record was written.
+
+  **This narrows the cycle; it does not end it.** A date that no longer resets
+  itself is a precondition for ending it, not a cure: for a document whose write
+  time is already older than the retention window, a fixed date is permanently
+  past the cutoff, so it is swept on every sweep and re-listed on every poll —
+  faster than before, not slower. What ends it is refusing to insert what is
+  already past the floor, which belongs with the retention floor still to come.
+  Nothing stores publication entries yet, so the order of the two changes is a
+  sequencing requirement rather than a live defect.
 - **A stated date in the future is discarded, not used.** Retention deletes rows
   older than the cutoff and the cap keeps the newest, so a document claiming the
   year 2999 was never swept and permanently held the top of the reading list.
@@ -34,13 +43,22 @@ deploying is separate.
 ### Added
 
 - `atproto::decode_s32_tid`, the inverse of the existing encoder, and
-  `tid_timestamp`, which refuses a TID decoding to the future or to before
-  atproto existed. That bound is what stops a 13-character slug — an ordinary
-  filename shape that happens to be valid `s32` — from being read as a date.
+  `tid_timestamp`, which refuses a TID decoding far into the future or to before
+  atproto existed, with five minutes of grace for a PDS whose clock runs ahead
+  of ours.
+- Those bounds are **not** a slug detector, and a test now says so by name.
+  Thirteen lowercase alphanumerics is an ordinary filename shape and also a
+  valid `s32` value, so `3hoursinparis` reads as 2020-11-24 and `3ideasforjune`
+  as 2021-08-12, indistinguishable from record keys written then. Telling them
+  apart would mean asking the PDS when the record was written, which the listing
+  does not report. What the bounds do guarantee is that a mis-read date is an
+  ordinary past instant: it ages, it sweeps, and the cap outranks it normally,
+  so a wrong date costs ordering and nothing worse.
 
 ### Tests
 
-- Eleven, each mutation-checked; 857 to 868 in the library suite.
+- Thirteen, each mutation-checked. The library suite goes from 859 tests to 872;
+  857 to 870 of them pass and two are ignored, before and after.
 - One of them pins a store invariant this change rests on: an upsert refreshes
   `published` from every poll but never refreshes `fetched_at`. It was not
   pinned before, and it is the reason the fix below is what it is.
@@ -78,12 +96,27 @@ Two wrong numbers in the first draft of this entry, both since computed rather
 than estimated: the slug `abcdefghijklm` decodes to 2192, not 2183, and a TID's
 leading character is `3` between 2005-09-05 and 2041-05-10, not 2004 and 2038.
 
+### Corrected in a second review round
+
+A cold pass over the corrections above — the one commit nobody had read — found
+four more. The first version of this entry claimed the slug bound stopped slugs
+from being read as dates; it stops only those landing outside 2020-to-now, which
+is a minority of them. It claimed publication entries "stop resurrecting"; for a
+document older than the retention window the cycle gets faster, not slower. A
+doc comment for an unrelated store test was captured by the test inserted above
+it, leaving that test undocumented and this one described by a paragraph about
+`If-None-Match`. And `Entry.published`'s own field comment still described the
+old rule, in a change whose review discipline is precisely that.
+
 ### Known, not fixed here
 
 - An undated entry is the newest row in the feed to the per-feed cap and the
   oldest to the reading list, which orders on bare `published DESC` where SQLite
   sorts NULL last. It is therefore safe from eviction and invisible to the
   reader at the same time. Pre-existing, affects RSS equally, filed as #187.
+- The same future-date hole is still open for RSS, where `feed::entry_time` has
+  no upper bound at all. The guard landed in the atproto mapper rather than in
+  the shared layer that would cover both paths. Filed as #188.
 
 ---
 

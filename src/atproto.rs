@@ -1984,11 +1984,30 @@ fn encode_s32_tid(mut v: u64) -> String {
 /// The earliest instant a real TID can encode: 2020-01-01T00:00:00Z, in
 /// microseconds.
 ///
-/// atproto did not exist before this, so a "TID" that decodes to earlier is a
-/// record key that merely *looks* like one. 13 lowercase-alphanumeric
-/// characters is also an ordinary slug shape, and a publisher naming documents
-/// that way must not be handed a date invented out of their filenames.
+/// atproto did not exist before this, so a "TID" decoding to earlier is a record
+/// key that merely *looks* like one.
+///
+/// **This bound catches only the slugs that fall outside the window, and that
+/// is a minority of them.** 13 lowercase alphanumerics is an ordinary slug
+/// shape and also a valid `s32` value, and one beginning `3` decodes into the
+/// last few years as readily as a real record key does: `3hoursinparis` reads
+/// as 2020-11-24, `3ideasforjune` as 2021-08-12. Nothing in the string
+/// distinguishes them — telling a slug from a TID would mean asking the PDS
+/// when the record was written, which the listing does not report.
+///
+/// What the window does buy is that a mis-read date is always an ordinary past
+/// instant. It ages, it sweeps, and the per-feed cap outranks it like any other
+/// row, so a wrong date costs a reader ordering and nothing worse. The dates it
+/// rejects are the ones that would be unsweepable.
 const TID_FLOOR_MICROS: i64 = 1_577_836_800_000_000;
+
+/// How far ahead of our own clock a TID may be minted and still be believed.
+///
+/// A PDS a second or two fast would otherwise leave a brand-new undated
+/// document undated until the following poll, and an undated row is the least
+/// visible one in the reading list. Well under any interval that matters to
+/// retention or the per-feed cap.
+const TID_SKEW_GRACE_SECS: i64 = 300;
 
 /// Decode a 13-char `s32` TID rkey back to its raw 64-bit value.
 ///
@@ -2024,10 +2043,13 @@ pub(crate) fn decode_s32_tid(rkey: &str) -> Option<u64> {
 /// TID.
 ///
 /// **Bounded at both ends on purpose.** A TID's timestamp is minted from the
-/// writer's clock, so one that decodes into the future is either a bad clock or
-/// a slug that happens to be 13 `s32` characters; one that decodes to before
+/// writer's clock, so one decoding far into the future is either a broken clock
+/// or a slug that happens to be 13 `s32` characters; one decoding to before
 /// [`TID_FLOOR_MICROS`] predates atproto. Neither is a date worth trusting, and
-/// the caller's fallback for "no date" is safer than a wrong date.
+/// the caller's fallback for "no date" is safer than a wrong one.
+///
+/// The bounds are not a slug detector — see [`TID_FLOOR_MICROS`] for why they
+/// cannot be, and for what they do guarantee instead.
 pub(crate) fn tid_timestamp(rkey: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     // The low 10 bits are the clock id; the rest is microseconds since the
     // epoch, and clearing bit 63 above bounds it well inside `i64`.
@@ -2036,7 +2058,8 @@ pub(crate) fn tid_timestamp(rkey: &str) -> Option<chrono::DateTime<chrono::Utc>>
         return None;
     }
     let at = chrono::DateTime::from_timestamp_micros(micros)?;
-    (at <= chrono::Utc::now()).then_some(at)
+    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(TID_SKEW_GRACE_SECS);
+    (at <= ceiling).then_some(at)
 }
 
 // ---------------------------------------------------------------------------
@@ -3300,6 +3323,45 @@ mod tests {
                 "{rkey:?} is not a 13-character s32 value"
             );
         }
+    }
+
+    /// **The window is not a slug detector, and this is what that costs.**
+    ///
+    /// A 13-character slug beginning `3` decodes into the last few years just
+    /// as a record key does, and nothing in the string tells them apart. These
+    /// are read as dates, and pinning that here is the honest alternative to a
+    /// doc comment claiming otherwise. The damage is bounded: a wrong date is
+    /// an ordinary past instant that ages, sweeps and is outranked normally.
+    #[test]
+    fn a_slug_that_decodes_inside_the_window_is_read_as_a_date() {
+        for (slug, reads_as) in [
+            ("3hoursinparis", "2020-11-24T08:17:26Z"),
+            ("3ideasforjune", "2021-08-12T00:19:38Z"),
+            ("3jokesaweekly", "2023-02-12T15:50:26Z"),
+        ] {
+            assert_eq!(
+                tid_timestamp(slug).map(crate::feed::fmt_time),
+                Some(reads_as.to_string()),
+                "{slug} is indistinguishable from a record key written then"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tid_minted_slightly_ahead_of_our_clock_is_still_believed() {
+        let now = chrono::Utc::now();
+        let of = |at: chrono::DateTime<chrono::Utc>| {
+            encode_s32_tid((at.timestamp_micros() as u64) << 10)
+        };
+        assert!(
+            tid_timestamp(&of(now + chrono::Duration::seconds(2))).is_some(),
+            "a PDS two seconds fast must not leave a fresh document undated"
+        );
+        assert_eq!(
+            tid_timestamp(&of(now + chrono::Duration::hours(1))),
+            None,
+            "an hour ahead is a broken clock or a slug, not skew"
+        );
     }
 
     #[test]

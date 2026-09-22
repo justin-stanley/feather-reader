@@ -4125,13 +4125,6 @@ fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// A partial upsert must not erase the conditional-GET validators.
-    ///
-    /// `set_next_poll` supplies only `url` + `next_poll` and runs after EVERY
-    /// poll of EVERY feed. While `upsert_feed` assigned etag/last_modified
-    /// unconditionally, that call wrote both back to NULL, so `If-None-Match`
-    /// was never sent, `304` was unreachable, and every feed was re-downloaded
-    /// and re-parsed in full on every cycle. Nothing failed; it was invisible.
     /// **A re-poll refreshes `published`; it never refreshes `fetched_at`.**
     ///
     /// The asymmetry is the whole reason a date must be stable. `published`
@@ -4180,6 +4173,13 @@ mod tests {
         Ok(())
     }
 
+    /// A partial upsert must not erase the conditional-GET validators.
+    ///
+    /// `set_next_poll` supplies only `url` + `next_poll` and runs after EVERY
+    /// poll of EVERY feed. While `upsert_feed` assigned etag/last_modified
+    /// unconditionally, that call wrote both back to NULL, so `If-None-Match`
+    /// was never sent, `304` was unreachable, and every feed was re-downloaded
+    /// and re-parsed in full on every cycle. Nothing failed; it was invisible.
     #[tokio::test]
     async fn validators_survive_a_partial_upsert() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
