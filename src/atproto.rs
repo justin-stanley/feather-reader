@@ -462,10 +462,11 @@ pub async fn resolve_handle(client: &Client, resolver_base: &str, handle: &str) 
         return Err(err.into());
     }
 
-    let out: ResolveHandleOut = resp
-        .json()
-        .await
-        .context("parsing resolveHandle response")?;
+    // Capped: `resolver_base` can be a user-influenced PDS host, as the comment
+    // above this function's guard already says.
+    let raw = crate::net::read_capped(resp).await?;
+    let out: ResolveHandleOut =
+        serde_json::from_slice(&raw).context("parsing resolveHandle response")?;
     Ok(out.did)
 }
 
@@ -508,7 +509,12 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         .into());
     }
 
-    let doc: DidDocument = resp.json().await.context("parsing DID document")?;
+    // **Capped, and this is the most remote-controlled body of the lot.** For a
+    // `did:web:` the host is taken straight out of the DID, so whoever supplies
+    // the DID chooses the server — and the SSRF guard only proves the address is
+    // public, not that the body is finite.
+    let raw = crate::net::read_capped(resp).await?;
+    let doc: DidDocument = serde_json::from_slice(&raw).context("parsing DID document")?;
     let endpoint = doc
         .pds_endpoint()
         .ok_or_else(|| AtProtoError::DidResolution {
@@ -1299,10 +1305,9 @@ impl SidecarClient {
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
-        let session: SidecarSession = resp
-            .json()
-            .await
-            .context("parsing /internal/session response")?;
+        let raw = crate::net::read_capped(resp).await?;
+        let session: SidecarSession =
+            serde_json::from_slice(&raw).context("parsing /internal/session response")?;
         Ok(Some(session))
     }
 
@@ -1325,10 +1330,9 @@ impl SidecarClient {
         if !resp.status().is_success() {
             return Err(xrpc_error_from(resp).await.into());
         }
-        let result: RevokeResult = resp
-            .json()
-            .await
-            .context("parsing /internal/revoke response")?;
+        let raw = crate::net::read_capped(resp).await?;
+        let result: RevokeResult =
+            serde_json::from_slice(&raw).context("parsing /internal/revoke response")?;
         Ok(result)
     }
 
@@ -1348,19 +1352,33 @@ impl SidecarClient {
             .send()
             .await?;
         let status = resp.status();
+        // **Capped, like every other body this codebase reads.** `resp.json()`
+        // buffers whatever arrives; `/internal/repo` proxies the account's PDS,
+        // so that length is chosen by a host the reader picked and we did not.
+        // The 8 MB ceiling that bounds the direct client did not exist here,
+        // and the sidecar is the default backend — so the one path with no byte
+        // bound at all was the one most deployments run.
+        let raw = crate::net::read_capped(resp).await;
         if status.is_success() {
-            let ok: RepoOk = resp
-                .json()
-                .await
-                .context("parsing /internal/repo ok body")?;
+            let ok: RepoOk =
+                serde_json::from_slice(&raw?).context("parsing /internal/repo ok body")?;
             return Ok(ok.data);
         }
         // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
-        let err: RepoErr = resp.json().await.unwrap_or(RepoErr {
-            error: None,
-            message: None,
-            status: None,
-        });
+        //
+        // **A body we could not read must not cost us the status.** Reading
+        // before the branch was the obvious shape and it swallowed the HTTP
+        // status on an over-cap or truncated error body, turning a `404
+        // SessionNotFound` into a bare "body exceeded the cap". `xrpc_error_from`
+        // already makes the opposite choice deliberately, for the same reason.
+        let err: RepoErr = raw
+            .ok()
+            .and_then(|body| serde_json::from_slice(&body).ok())
+            .unwrap_or(RepoErr {
+                error: None,
+                message: None,
+                status: None,
+            });
         let mapped = err
             .status
             .and_then(|s| StatusCode::from_u16(s).ok())
@@ -2477,6 +2495,98 @@ mod tests {
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
         let page = list_records_from_value(serde_json::json!({"records": []})).unwrap();
         assert!(page.records.is_empty());
+    }
+
+    /// Serve one oversized-but-well-formed body and point `host` at it.
+    async fn serve_oversized(host: &str, shape: &str) -> String {
+        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
+        let body = shape.replace("PAD", &filler);
+        assert!(body.len() > crate::net::MAX_BODY_BYTES);
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        format!("http://{host}:{port}")
+    }
+
+    /// **The DID document is the most remote-controlled body of the lot.**
+    ///
+    /// For a `did:web:` the host comes straight out of the DID, so whoever
+    /// supplies the DID chooses the server. The SSRF guard proves the address
+    /// is public; it says nothing about the body being finite.
+    #[tokio::test]
+    async fn the_did_document_read_is_capped() {
+        let base = serve_oversized(
+            "did-doc-cap.test",
+            r##"{"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example"}],"pad":"PAD"}"##,
+        )
+        .await;
+        let err = resolve_did_to_pds(
+            &ssrf_test_client(),
+            &base,
+            "did:plc:ohutz6x5acjmpuulp3x7wxxc",
+        )
+        .await
+        .expect_err("an oversized DID document was buffered whole");
+        assert!(
+            format!("{err:#}").contains("cap"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// `resolver_base` is a user-influenced PDS host, as this function's own
+    /// guard comment says.
+    #[tokio::test]
+    async fn the_resolve_handle_read_is_capped() {
+        let base = serve_oversized(
+            "resolve-handle-cap.test",
+            r#"{"did":"did:plc:ohutz6x5acjmpuulp3x7wxxc","pad":"PAD"}"#,
+        )
+        .await;
+        let err = resolve_handle(&ssrf_test_client(), &base, "alice.example.com")
+            .await
+            .expect_err("an oversized resolveHandle body was buffered whole");
+        assert!(
+            format!("{err:#}").contains("cap"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **The sidecar's body is capped like every other body we read.**
+    ///
+    /// `/internal/repo` proxies whatever the account's PDS returned, so its
+    /// size is remote-controlled by a host the reader chose and we did not.
+    /// Every other response in this codebase goes through
+    /// [`crate::net::read_capped`]; this one buffered the whole thing with
+    /// `resp.json()`, so the 8 MB ceiling that bounds the direct PDS client
+    /// simply did not exist on the sidecar backend — which is the default.
+    #[tokio::test]
+    async fn the_sidecar_client_caps_the_body_it_will_buffer() {
+        // Well-formed, and past the cap. The guard has to fire on size, not
+        // on the shape being wrong.
+        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
+        let body = format!(r#"{{"ok":true,"data":{{"records":[],"pad":"{filler}"}}}}"#);
+        assert!(body.len() > crate::net::MAX_BODY_BYTES);
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an oversized sidecar body was buffered whole");
+        assert!(
+            format!("{err:#}").contains("cap"),
+            "failed for the wrong reason: {err:#}"
+        );
     }
 
     /// The sidecar path needs the records guard too, not only the envelope
