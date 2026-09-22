@@ -216,8 +216,15 @@ pub fn entries_from_records(
     // One "now" for the whole batch, so two documents of the same poll are
     // judged against the same instant rather than one being called credible and
     // an identical one not. (`tid_timestamp` reads the clock again for its own
-    // upper bound; that only ever rejects, so it needs no such agreement.)
+    // ceiling; that only ever tightens a bound five minutes away, so it needs
+    // no such agreement.)
     let now = chrono::Utc::now();
+    // The SAME allowance the record-key branch gets. A publisher's clock runs
+    // ahead of ours as readily as a PDS's does, and judging a stated date
+    // against a bare `now` while the rkey below gets five minutes discarded a
+    // perfectly good date and left the newest post undated — which, ordered on
+    // a bare `published DESC`, puts it at the bottom of the list.
+    let ceiling = now + chrono::Duration::seconds(crate::atproto::CLOCK_SKEW_GRACE_SECS);
     records
         .iter()
         .filter_map(|record| {
@@ -250,7 +257,7 @@ pub fn entries_from_records(
                     .as_deref()
                     .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                     .map(|d| d.with_timezone(&chrono::Utc))
-                    .filter(|d| *d <= now)
+                    .filter(|d| *d <= ceiling)
                     .or_else(|| {
                         AtUri::parse(&record.uri)
                             .and_then(|uri| crate::atproto::tid_timestamp(&uri.rkey))
@@ -824,6 +831,35 @@ mod tests {
                 .published,
             None,
             "with nothing credible to date it by, the row falls to fetched_at, which holds still"
+        );
+    }
+
+    /// **A little ahead of our clock is skew, not a lie.**
+    ///
+    /// The rkey here is deliberately not a TID, so nothing masks a wrongly
+    /// discarded date: if the stated one is thrown away the entry is undated,
+    /// and an undated entry sorts to the bottom of a list ordered on a bare
+    /// `published DESC`. A publisher a few seconds fast would have had their
+    /// newest post buried.
+    #[test]
+    fn a_stated_date_a_little_ahead_of_our_clock_is_still_believed() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let slightly_ahead =
+            crate::feed::fmt_time(chrono::Utc::now() + chrono::Duration::seconds(10));
+        let docs = vec![rec(
+            nsid::STANDARD_DOCUMENT,
+            "self",
+            json!({ "title": "T", "publishedAt": slightly_ahead, "path": "/x", "site": site }),
+        )];
+        assert_eq!(
+            entries_from_records(&site, &pubn, &docs)
+                .into_iter()
+                .next()
+                .expect("the document is an entry")
+                .published,
+            Some(slightly_ahead),
+            "a few seconds of clock skew must not cost the entry its date"
         );
     }
 

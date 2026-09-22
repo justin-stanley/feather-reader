@@ -1996,18 +1996,28 @@ fn encode_s32_tid(mut v: u64) -> String {
 /// when the record was written, which the listing does not report.
 ///
 /// What the window does buy is that a mis-read date is always an ordinary past
-/// instant. It ages, it sweeps, and the per-feed cap outranks it like any other
-/// row, so a wrong date costs a reader ordering and nothing worse. The dates it
-/// rejects are the ones that would be unsweepable.
+/// instant rather than an unsweepable future one. That is worth having and it
+/// is *not* harmless: a slug reading as 2020 is older than any realistic
+/// retention window, so the row is swept, re-listed on the next poll, and
+/// arrives unread again — the cycle this dating work narrows but does not
+/// close. Refusing to insert what is already past the floor is what closes it,
+/// for a mis-read slug and a genuine archive alike, and that belongs with the
+/// retention floor rather than here.
 const TID_FLOOR_MICROS: i64 = 1_577_836_800_000_000;
 
-/// How far ahead of our own clock a TID may be minted and still be believed.
+/// How far ahead of our own clock a timestamp someone else authored may be and
+/// still be believed.
 ///
-/// A PDS a second or two fast would otherwise leave a brand-new undated
-/// document undated until the following poll, and an undated row is the least
-/// visible one in the reading list. Well under any interval that matters to
-/// retention or the per-feed cap.
-const TID_SKEW_GRACE_SECS: i64 = 300;
+/// A PDS a second or two fast would otherwise leave a brand-new document
+/// undated until the following poll, and an undated row is the least visible
+/// one in the reading list. Well under any interval that matters to retention
+/// or the per-feed cap.
+///
+/// **Both date sources use it.** It began as a TID-only allowance, which left a
+/// stated `publishedAt` judged against a bare `now` while the record key two
+/// lines below got five minutes — the same clock, two different answers, for no
+/// reason either comment could give.
+pub(crate) const CLOCK_SKEW_GRACE_SECS: i64 = 300;
 
 /// Decode a 13-char `s32` TID rkey back to its raw 64-bit value.
 ///
@@ -2058,7 +2068,7 @@ pub(crate) fn tid_timestamp(rkey: &str) -> Option<chrono::DateTime<chrono::Utc>>
         return None;
     }
     let at = chrono::DateTime::from_timestamp_micros(micros)?;
-    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(TID_SKEW_GRACE_SECS);
+    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(CLOCK_SKEW_GRACE_SECS);
     (at <= ceiling).then_some(at)
 }
 

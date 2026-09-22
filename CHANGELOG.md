@@ -57,8 +57,8 @@ deploying is separate.
 
 ### Tests
 
-- Thirteen, each mutation-checked. The library suite goes from 859 tests to 872;
-  857 to 870 of them pass and two are ignored, before and after.
+- Fourteen, each mutation-checked. The library suite goes from 859 tests to 873;
+  857 to 871 of them pass and two are ignored, before and after.
 - One of them pins a store invariant this change rests on: an upsert refreshes
   `published` from every poll but never refreshes `fetched_at`. It was not
   pinned before, and it is the reason the fix below is what it is.
@@ -107,6 +107,34 @@ doc comment for an unrelated store test was captured by the test inserted above
 it, leaving that test undocumented and this one described by a paragraph about
 `If-None-Match`. And `Entry.published`'s own field comment still described the
 old rule, in a change whose review discipline is precisely that.
+
+### Corrected in a third review round
+
+- **One clock, two answers.** The five-minute skew allowance was written for the
+  record key only, so a stated `publishedAt` was judged against a bare `now`. A
+  publisher whose clock runs a few seconds ahead had a perfectly good date
+  discarded, and with a slug-shaped record key the entry was then stored
+  undated — which, ordered on a bare `published DESC`, buries the newest post at
+  the bottom of the list. Both sources now share one ceiling, and the constant
+  is no longer named after TIDs.
+- **A comment contradicted the entry above it.** `TID_FLOOR_MICROS` claimed a
+  mis-read date "costs a reader ordering and nothing worse", which is false for
+  exactly the slugs the same comment says will be misread: one reading as 2020
+  is past any realistic retention window, so it costs repeated loss of read
+  state. The changelog said as much two paragraphs away. The in-code comment is
+  the one a future reader consults when deciding whether the floor is still
+  needed, so it was the more damaging of the two.
+
+### Considered and declined
+
+A third finding asked for a lower bound on stated dates, since `1970-01-01` is a
+routine "missing date" default from static-site generators and lands permanently
+past the retention cutoff. Declined: the cycle it describes is driven by the date
+being older than the retention window, not by it being wrong, so a floor would
+have to reject genuine archive content to catch the garbage — trading a known
+limitation for real data loss, and making the rejected entries undated and
+therefore invisible. The ingest floor closes both cases at once and is the right
+place for it.
 
 ### Known, not fixed here
 
