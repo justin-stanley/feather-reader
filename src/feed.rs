@@ -751,6 +751,15 @@ impl FeedKind {
     /// capacity that appeared on no surface, since `/stats` measures the poller
     /// and excludes these rows. `/admin/metrics` renders
     /// `store::unpollable_feeds` for exactly that reason.
+    /// **Adding a kind here makes a population of rows due all at once.**
+    /// `store::due_feeds` orders `next_poll IS NOT NULL, next_poll ASC`, so a
+    /// row with no scheduled poll sorts ahead of every dated one. Rows that
+    /// were never pollable have no schedule, so the boot that reclassifies
+    /// them hands the poller a block of N rows that outrank every regular
+    /// feed until they drain — `ceil(N / batch)` ticks, measured, during which
+    /// `/stats` shows a climbing backlog and nothing logs why. Bounded and
+    /// harmless at ninety feeds; not at ten thousand. Whoever wires the next
+    /// kind should seed or stagger `next_poll` for the rows it admits.
     pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
 
     /// The column value. Stable — it is persisted.

@@ -596,27 +596,86 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // Cheap by shape, not by assumption: it writes only rows that are actually
     // wrong, so the steady state is a single scan of a table that holds one row
     // per subscribed feed.
-    let rows: Vec<(i64, String, String)> = sqlx::query_as("SELECT id, url, kind FROM feeds")
+    let rows = sqlx::query("SELECT id, url, kind FROM feeds")
         .fetch_all(pool)
         .await
         .context("reading feeds to re-derive kind")?;
     let mut tx = pool.begin().await.context("begin kind re-derivation")?;
-    let mut corrected = 0u64;
-    for (id, url, kind) in rows {
-        let want = crate::feed::FeedKind::of(&url).as_str();
-        if kind != want {
-            sqlx::query("UPDATE feeds SET kind = ?1 WHERE id = ?2")
-                .bind(want)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| format!("re-deriving kind for feed {id}"))?;
-            corrected += 1;
+    let (mut to_pollable, mut to_unpollable, mut unreadable) = (0u64, 0u64, 0u64);
+    for row in rows {
+        // **A row we cannot read is skipped, not fatal.** This runs on the boot
+        // path, so anything that returns `Err` here is the difference between a
+        // wedged poller and a site that will not start. A `url` or `kind` that
+        // is not decodable as text takes no opinion from us and keeps whatever
+        // it has; every reader downstream already treats an unknown kind as
+        // unpollable. Nothing sqlx writes produces such a row — it binds `&str`
+        // as TEXT everywhere — so reaching this means the file was edited by
+        // hand, which is exactly when refusing to boot is the least helpful
+        // thing to do.
+        let (Ok(id), Ok(url), Ok(kind)) = (
+            row.try_get::<i64, _>("id"),
+            row.try_get::<String, _>("url"),
+            row.try_get::<String, _>("kind"),
+        ) else {
+            unreadable += 1;
+            continue;
+        };
+        let want = crate::feed::FeedKind::of(&url);
+        if kind == want.as_str() {
+            continue;
+        }
+        sqlx::query("UPDATE feeds SET kind = ?1 WHERE id = ?2")
+            .bind(want.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("re-deriving kind for feed {id}"))?;
+        if crate::feed::FeedKind::POLLABLE.contains(&want) {
+            to_pollable += 1;
+        } else {
+            // **Declaring a row unpollable orphans its poll state, so clear
+            // it.** A backoff horizon and an error count belong to a feed the
+            // scheduler selects; on a row it will never select again they are
+            // dead, and not inert. They are hidden from `/stats` and the cause
+            // histogram, which filter on kind, so they rot unseen — and if a
+            // later rule change makes the row pollable again it resumes at
+            // `backoff_for(n)` on an `n` earned under a classification that no
+            // longer applies, which for seven prior errors is a first retry ten
+            // hours out instead of five minutes.
+            //
+            // Narrower than the step below, deliberately: that one clears only
+            // rows we never polled, on the grounds that a real feed's history
+            // still means something. This clears rows whose history can no
+            // longer mean anything, because nothing will add to it or act on
+            // it.
+            sqlx::query(
+                "UPDATE feeds SET consecutive_errors = 0, last_error_kind = NULL, \
+                 last_error = NULL, next_poll = NULL WHERE id = ?1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("clearing orphaned poll state for feed {id}"))?;
+            to_unpollable += 1;
         }
     }
     tx.commit().await.context("commit kind re-derivation")?;
-    if corrected > 0 {
-        tracing::info!(corrected, "feeds.kind re-derived from the URL");
+    // Quiet in the steady state, which is every boot where nothing changed.
+    // Split by direction because the two mean opposite things to an operator:
+    // one puts feeds back in the poller's queue, the other takes them out of
+    // every figure `/stats` reports.
+    if to_pollable > 0 || to_unpollable > 0 {
+        tracing::info!(
+            to_pollable,
+            to_unpollable,
+            "feeds.kind re-derived from the URL"
+        );
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            unreadable,
+            "feeds rows are not readable as text; their kind was left alone"
+        );
     }
 
     // **Clear failure counts on rows we never actually polled.**
@@ -9420,6 +9479,92 @@ mod tests {
             "an http feed marked as a publication stayed one, and nothing polls it"
         );
         assert_eq!(by_url[at], "publication", "the at:// direction regressed");
+        Ok(())
+    }
+
+    /// **Taking a row out of the poller orphans its poll state, so clear it.**
+    ///
+    /// `last_polled` is set here on purpose: the migration's other cleanup step
+    /// only clears rows we never polled, so a row that HAS been polled proves
+    /// this reset is the one doing the work. An error count left on a row the
+    /// scheduler will never select again is hidden from `/stats`, which filters
+    /// on kind — and if a later rule change readmits the row, it resumes at a
+    /// backoff earned under a classification that no longer applies.
+    #[tokio::test]
+    async fn a_row_taken_out_of_the_poller_loses_the_poll_state_it_cannot_use() -> anyhow::Result<()>
+    {
+        let pool = init_url("sqlite::memory:").await?;
+        let at = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        sqlx::query(
+            "INSERT INTO feeds (url, kind, consecutive_errors, last_error_kind, last_error, \
+             next_poll, last_polled) \
+             VALUES (?1, 'rss', 7, 'fetch', 'connection refused', ?2, ?3)",
+        )
+        .bind(at)
+        .bind("2026-09-10T00:00:00Z")
+        .bind("2026-09-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
+
+        apply_migrations(&pool).await?;
+
+        let (kind, errors, error_kind, error, next_poll): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT kind, consecutive_errors, last_error_kind, last_error, next_poll \
+             FROM feeds WHERE url = ?1",
+        )
+        .bind(at)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(kind, "publication", "the row was not reclassified at all");
+        assert_eq!(
+            (errors, error_kind, error, next_poll),
+            (0, None, None, None),
+            "a row the scheduler will never select again kept its backoff and failure history"
+        );
+        Ok(())
+    }
+
+    /// **A row we cannot read must not stop the process from starting.**
+    ///
+    /// This runs on the boot path. Refusing to start is a strictly worse
+    /// outcome than declining to have an opinion about one row, and it is a
+    /// failure mode the SQL predicate this replaced did not have: it evaluated
+    /// a non-text `url` happily and returned false.
+    #[tokio::test]
+    async fn an_unreadable_feeds_row_does_not_stop_the_boot() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        sqlx::query("INSERT INTO feeds (url, kind) VALUES (X'ff41', 'rss')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO feeds (url, kind) VALUES (?1, 'publication')")
+            .bind("https://real.example/feed.xml")
+            .execute(&pool)
+            .await?;
+
+        apply_migrations(&pool).await?;
+
+        let corrected: String = sqlx::query_scalar("SELECT kind FROM feeds WHERE url = ?1")
+            .bind("https://real.example/feed.xml")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            corrected, "rss",
+            "one unreadable row aborted the pass before the readable ones were corrected"
+        );
+        let untouched: String =
+            sqlx::query_scalar("SELECT kind FROM feeds WHERE typeof(url) = 'blob'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            untouched, "rss",
+            "a row we declined to classify was classified anyway"
+        );
         Ok(())
     }
 
