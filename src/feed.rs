@@ -259,9 +259,9 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
         if !url.starts_with(crate::atproto::AT_URI_PREFIX) {
             return false;
         }
-        // **This gates STORING only — polling is handled by exclusion**, on
-        // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
-        // place the why is written down.
+        // **This gates STORING only — polling is handled by exclusion**, by
+        // kind rather than by any re-description of the URL, and
+        // `FeedKind::POLLABLE` is the one place the why is written down.
         return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
@@ -727,6 +727,39 @@ pub enum FeedKind {
 impl FeedKind {
     /// The kinds the scheduler may select. The single place that changes when
     /// the standard.site reader is wired to the poller.
+    ///
+    /// **This is the canonical home of the at:// exclusion; the other sites
+    /// point here.** It used to be a SQL string predicate in `store`, carrying
+    /// its own copy of the rule — which is how one reader (`count_feeds`) came
+    /// to drift from it unnoticed.
+    ///
+    /// Why an unpollable kind is skipped rather than failed: `poll_feed`
+    /// reaches `net::guarded_get`, whose `check_scheme` refuses any non-http(s)
+    /// scheme, and the standard.site reader is not yet wired to the scheduler.
+    /// Handing such a row to the poller does not leave the feature dormant — it
+    /// manufactures one permanent failure per row, which the public cause
+    /// histogram then reports as an unreachable publisher. Unsupported is not
+    /// broken, and telling those apart is the entire reason a failure cause is
+    /// recorded. (Rows like this exist: subscriptions written by other clients
+    /// before this reader refused the scheme.)
+    ///
+    /// **`store::count_feeds` is deliberately NOT filtered by this.** The
+    /// global ceiling bounds storage on a small box, and an unpollable row
+    /// occupies a row, so it counts against the cap. An earlier version of this
+    /// note listed the readers without naming the exception, which read as
+    /// completeness it did not have: a review found the ceiling consuming
+    /// capacity that appeared on no surface, since `/stats` measures the poller
+    /// and excludes these rows. `/admin/metrics` renders
+    /// `store::unpollable_feeds` for exactly that reason.
+    /// **Adding a kind here makes a population of rows due all at once.**
+    /// `store::due_feeds` orders `next_poll IS NOT NULL, next_poll ASC`, so a
+    /// row with no scheduled poll sorts ahead of every dated one. Rows that
+    /// were never pollable have no schedule, so the boot that reclassifies
+    /// them hands the poller a block of N rows that outrank every regular
+    /// feed until they drain — `ceil(N / batch)` ticks, measured, during which
+    /// `/stats` shows a climbing backlog and nothing logs why. Bounded and
+    /// harmless at ninety feeds; not at ten thousand. Whoever wires the next
+    /// kind should seed or stagger `next_poll` for the rows it admits.
     pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
 
     /// The column value. Stable — it is persisted.
@@ -748,6 +781,20 @@ impl FeedKind {
     }
 
     /// What a URL will be stored as. The only place the question is asked.
+    ///
+    /// `store::feeds.kind` is a cache of this function, re-derived from the URL
+    /// on every start and on every upsert, so a change here needs no migration
+    /// and SQL cannot hold an opinion of its own about what a row is.
+    ///
+    /// **Case-insensitive on purpose.** An earlier version was case-sensitive,
+    /// with a test pinning that a mixed-case `At://` row IS handed to the
+    /// poller — reasoning that if Rust does not call it an at-URI, neither
+    /// should anything else. That was wrong in the direction that matters: URL
+    /// schemes are case-insensitive, so `Url::parse` folds `At://` to scheme
+    /// `at` and `net::check_scheme` refuses it (the DID form does not parse at
+    /// all). The row could only fail, every tick, forever, and be published in
+    /// the `fetch` bucket as an unreachable publisher. Storing a non-canonical
+    /// spelling is separately refused, because `feeds.url` is UNIQUE.
     pub fn of(url: &str) -> Self {
         if crate::atproto::strip_at_prefix(url).is_some() {
             FeedKind::Publication

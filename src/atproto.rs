@@ -140,8 +140,14 @@ const MAX_LIST_RECORDS: usize = 20_000;
 pub(crate) const MAX_LARGE_RECORDS: usize = 2_000;
 
 /// The at-URI scheme prefix, **the one Rust spelling**. Every Rust guard that
-/// asks "is this an at-URI" strips or compares this; the SQL side is
-/// [`crate::store::UNPOLLABLE_URL_SQL`], and a test pins that the two agree.
+/// asks "is this an at-URI" strips or compares this.
+///
+/// **SQL no longer holds a second opinion.** There used to be a matching string
+/// predicate in `store`, and this comment claimed a test pinned the two in
+/// agreement. Both are gone: the predicate was deleted when `feeds.kind` became
+/// a cache of [`crate::feed::FeedKind::of`], re-derived from the URL rather than
+/// re-described in SQL, and no such test survived it. Nothing outside Rust
+/// decides what an at-URI is, so there is nothing left to keep in step.
 pub(crate) const AT_URI_PREFIX: &str = "at://";
 
 /// Strip the at-URI scheme **case-insensitively**, returning the body.
