@@ -581,22 +581,47 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .await?;
 
-    // **The last use of the string predicate.** Every reader keys on `kind`
-    // from here; this is the one-time translation from the old representation
-    // to the new one. Idempotent by its own WHERE: a row already marked is not
-    // re-marked, and a row the Rust side would call `rss` is never touched.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE feeds SET kind = '{}' WHERE kind = '{}' AND {UNPOLLABLE_URL_SQL}",
-        crate::feed::FeedKind::Publication.as_str(),
-        crate::feed::FeedKind::Rss.as_str(),
-    )))
-    .execute(pool)
-    .await
-    .context("back-filling feeds.kind")?;
+    // **Re-derived in Rust, every row, every start — not translated once.**
+    //
+    // `kind` is a pure function of `url`, so it is a cache, and a cache that is
+    // only ever written forward goes stale the moment the function changes.
+    // The first version of this was a one-directional SQL `UPDATE` carrying its
+    // own copy of the rule as a string predicate: it agreed with
+    // `FeedKind::of` on the day it was written, translated `rss` to
+    // `publication` and never the reverse, and had no way to notice either
+    // fact. Asking the Rust classifier about every row instead means the column
+    // cannot disagree with the one function that defines it, and a future kind
+    // — or a corrected rule — needs no migration of its own.
+    //
+    // Cheap by shape, not by assumption: it writes only rows that are actually
+    // wrong, so the steady state is a single scan of a table that holds one row
+    // per subscribed feed.
+    let rows: Vec<(i64, String, String)> = sqlx::query_as("SELECT id, url, kind FROM feeds")
+        .fetch_all(pool)
+        .await
+        .context("reading feeds to re-derive kind")?;
+    let mut tx = pool.begin().await.context("begin kind re-derivation")?;
+    let mut corrected = 0u64;
+    for (id, url, kind) in rows {
+        let want = crate::feed::FeedKind::of(&url).as_str();
+        if kind != want {
+            sqlx::query("UPDATE feeds SET kind = ?1 WHERE id = ?2")
+                .bind(want)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("re-deriving kind for feed {id}"))?;
+            corrected += 1;
+        }
+    }
+    tx.commit().await.context("commit kind re-derivation")?;
+    if corrected > 0 {
+        tracing::info!(corrected, "feeds.kind re-derived from the URL");
+    }
 
     // **Clear failure counts on rows we never actually polled.**
     //
-    // `due_feeds` excludes `at://` (see `UNPOLLABLE_URL_SQL`) — but rows
+    // `due_feeds` excludes them by kind (see `feed::FeedKind`) — but rows
     // subscribed before the scheme check already carry the errors OUR refusal
     // produced. Left alone they would count as failing forever, since no poll
     // that could clear them will ever be scheduled.
@@ -728,7 +753,12 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
             etag          = COALESCE(excluded.etag, feeds.etag),
             last_modified = COALESCE(excluded.last_modified, feeds.last_modified),
             last_polled   = COALESCE(excluded.last_polled, feeds.last_polled),
-            next_poll     = COALESCE(excluded.next_poll, feeds.next_poll)
+            next_poll     = COALESCE(excluded.next_poll, feeds.next_poll),
+            -- Not COALESCE: `kind` is derived from the URL, and `excluded`
+            -- always carries the current answer. Preserving the stored value
+            -- would make a row's classification a function of when it was
+            -- first subscribed rather than of what it is.
+            kind          = excluded.kind
         RETURNING id
         "#,
     )
@@ -757,48 +787,6 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
         .with_context(|| format!("get_feed_by_url failed for {url}"))?;
     Ok(feed)
 }
-
-/// SQL for "this row is an `at://` publication, which nothing can poll".
-///
-/// **This is the canonical home of the at:// exclusion; the other sites point
-/// here.** Why skip rather than fail: `poll_feed` reaches `net::guarded_get`,
-/// whose `check_scheme` refuses any non-http(s) scheme, and the standard.site
-/// reader is not yet wired to the scheduler. Handing such a row to the poller
-/// does not leave the feature dormant — it manufactures one permanent failure
-/// per row, which the public cause histogram then reports as an unreachable
-/// publisher. Unsupported is not broken, and telling those apart is the entire
-/// reason a failure cause is recorded. (Rows like this exist: subscriptions
-/// written by other clients before this reader refused the scheme.)
-///
-/// **One job left: the back-fill.** This was the shared predicate for five
-/// readers, which is how a sixth (`count_feeds`) came to drift from it
-/// unnoticed. Those readers key on `feeds.kind` now — a value the Rust side
-/// writes at insert, so SQL cannot disagree with the fetcher about what a row
-/// is. All this does today is translate rows that predate the column, once.
-///
-/// **[`count_feeds`] is deliberately NOT one of them.** The global ceiling
-/// bounds storage on a small box, and an unpollable row occupies a row, so it
-/// counts against the cap. An earlier version of this doc said "four readers"
-/// without naming the exception, which read as completeness it did not have:
-/// a review found the ceiling consuming capacity that appeared on no surface,
-/// since `/stats` measures the poller and excludes these rows. `/admin/metrics`
-/// renders [`unpollable_feeds`] for exactly that reason.
-///
-/// `lower(substr(...)) = 'at://'` rather than `LIKE 'at://%'`: `LIKE` is
-/// case-insensitive for ASCII but its semantics are a SQLite setting
-/// (`PRAGMA case_sensitive_like`), and this must not depend on one.
-///
-/// **Case-insensitive on purpose, and the Rust guards match.** An earlier
-/// version was case-sensitive on both sides, with a test pinning that a
-/// mixed-case `At://` row IS handed to the poller — reasoning that if Rust does
-/// not call it an at-URI, SQL should not either. That was wrong in the
-/// direction that matters: URL schemes are case-insensitive, so `Url::parse`
-/// folds `At://` to scheme `at` and `net::check_scheme` refuses it (the DID
-/// form does not parse at all). The row could only fail, every tick, forever,
-/// and be published in the `fetch` bucket as an unreachable publisher.
-/// Recognition is now case-insensitive everywhere; storing a non-canonical
-/// spelling is separately refused, because `feeds.url` is UNIQUE.
-pub(crate) const UNPOLLABLE_URL_SQL: &str = "lower(substr(url, 1, 5)) = 'at://'";
 
 /// The `kind` values the scheduler may select, as a SQL list.
 ///
@@ -844,7 +832,7 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
         SELECT * FROM feeds
         WHERE (next_poll IS NULL OR next_poll <= ?1)
           -- `at://` is not pollable, so it is not due: skipped, not failed.
-          -- The why lives on `UNPOLLABLE_URL_SQL`.
+          -- The why lives on `feed::FeedKind::POLLABLE`.
           AND kind IN ({POLLABLE_KINDS_SQL})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
@@ -6346,7 +6334,8 @@ mod tests {
         let (at_errors, at_kind, at_detail): (i64, Option<String>, Option<String>) =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT consecutive_errors, last_error_kind, last_error FROM feeds \
-                 WHERE {UNPOLLABLE_URL_SQL}"
+                 WHERE kind = '{}'",
+                crate::feed::FeedKind::Publication.as_str()
             )))
             .fetch_one(&pool)
             .await?;
@@ -9397,6 +9386,76 @@ mod tests {
         Ok(())
     }
 
+    /// **`feeds.kind` is derived from the URL, so it has to be re-derivable.**
+    ///
+    /// The back-fill translated one direction only — a row the Rust side would
+    /// call `rss` was never touched — which is correct for a one-time migration
+    /// and wrong for a column that has to survive the rule changing. A kind that
+    /// disagrees with its own URL is currently permanent: nothing re-reads it.
+    #[tokio::test]
+    async fn the_back_fill_corrects_a_kind_that_disagrees_with_the_url() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let at = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        for (url, wrong) in [
+            ("https://real.example/feed.xml", "publication"),
+            (at, "rss"),
+        ] {
+            sqlx::query("INSERT INTO feeds (url, kind) VALUES (?1, ?2)")
+                .bind(url)
+                .bind(wrong)
+                .execute(&pool)
+                .await?;
+        }
+
+        apply_migrations(&pool).await?;
+
+        let by_url: std::collections::HashMap<String, String> =
+            sqlx::query_as("SELECT url, kind FROM feeds")
+                .fetch_all(&pool)
+                .await?
+                .into_iter()
+                .collect();
+        assert_eq!(
+            by_url["https://real.example/feed.xml"], "rss",
+            "an http feed marked as a publication stayed one, and nothing polls it"
+        );
+        assert_eq!(by_url[at], "publication", "the at:// direction regressed");
+        Ok(())
+    }
+
+    /// Re-subscribing must re-derive the kind, not preserve whatever is there.
+    ///
+    /// `upsert_feed` binds `FeedKind::of` on the way in, but its conflict clause
+    /// never carried `kind`, so the value a row was first written with is the
+    /// value it keeps. Harmless while the rule is fixed; the rule is about to
+    /// change.
+    #[tokio::test]
+    async fn a_re_upsert_re_derives_the_kind() -> anyhow::Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let url = "https://real.example/feed.xml";
+        let feed = NewFeed {
+            url: url.to_string(),
+            ..Default::default()
+        };
+        upsert_feed(&pool, &feed).await?;
+        sqlx::query("UPDATE feeds SET kind = 'publication' WHERE url = ?1")
+            .bind(url)
+            .execute(&pool)
+            .await?;
+
+        upsert_feed(&pool, &feed).await?;
+
+        let kind: String = sqlx::query_scalar("SELECT kind FROM feeds WHERE url = ?1")
+            .bind(url)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            kind, "rss",
+            "a second subscription to the same URL kept the stale classification"
+        );
+        Ok(())
+    }
+
     /// **The readers key on `kind`, not on the URL.** A row whose kind says
     /// publication is unpollable even if its URL looks ordinary — which is
     /// what makes the column, rather than the string, the source of truth.
@@ -9483,7 +9542,7 @@ mod tests {
     /// — deliberately, and visibly.**
     ///
     /// `count_feeds` is a fifth reader of "is this an at-URI" that does NOT use
-    /// `UNPOLLABLE_URL_SQL`, and that is the right call: the ceiling bounds
+    /// the unpollable kinds, and that is the right call: the ceiling bounds
     /// STORAGE on a small box, and an unpollable row occupies a row. What was
     /// wrong is that the capacity it consumed appeared on no surface — `/stats`
     /// measures the poller and excludes them, so an operator could be at the

@@ -18,6 +18,32 @@ deploying is separate.
 
 ### Fixed
 
+- **`feeds.kind` is re-derived from the URL rather than translated once.** The
+  column is a cache of `FeedKind::of`, and it was populated by a one-time SQL
+  `UPDATE` carrying its own copy of the rule as a string predicate. That
+  translated `rss` to `publication` and never the reverse, so a row whose stored
+  kind disagreed with its URL in the other direction stayed wrong permanently:
+  an http feed marked as a publication is excluded from every poll, forever,
+  and nothing re-reads it. The classification is now asked of the Rust function
+  on every start, in both directions, and `upsert_feed`'s conflict clause
+  carries `kind` so re-subscribing re-derives it too.
+- The string predicate is gone. It agreed with `FeedKind::of` on the day it was
+  written and had no way to notice if it stopped — which is how one reader came
+  to drift from it unnoticed, recorded in this file at the time. Its reasoning
+  moved onto `FeedKind`, which is where the question is now asked.
+
+### Tests
+
+- Two, both mutation-checked, both red first: a kind that disagrees with its URL
+  is corrected in either direction, and a second subscription to the same URL
+  re-derives rather than preserving. Four mutations — reverting to a
+  one-directional back-fill, disabling the write, dropping `kind` from the
+  conflict clause, and preserving the stored value there — each killed by one of
+  them.
+
+
+### Fixed
+
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
   `fetched_at` at insertion instead. Retention and the per-feed cap both order on
