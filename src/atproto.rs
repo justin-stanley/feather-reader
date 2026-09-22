@@ -230,16 +230,6 @@ impl RecordWalk {
     }
 }
 
-/// Append a page, refusing to exceed `max`.
-///
-/// **An error, never a truncation.** The caller of the live walk is
-/// `web::resolve_subscriptions`, whose result reaches `store::replace_sub_refs`
-/// — a `DELETE` followed by reinserting exactly what it was handed. A short
-/// list there is not a short list, it is revoked access to whatever fell off
-/// the end. Returning `Err` lets `resolve_subscriptions` take its documented
-/// fail-closed branch and serve the last-known projection instead.
-///
-/// `out` is left untouched on refusal, so a partial page cannot survive.
 /// The memory one walk may retain.
 ///
 /// **A record cap bounds memory only if you know what a record costs.** The
@@ -247,10 +237,22 @@ impl RecordWalk {
 /// `MAX_LIST_PAGES` bounds requests rather than bytes. A PDS whose records are
 /// not that shape satisfies every count and still exhausts the box.
 ///
-/// 64 MiB rather than something larger: at the measured average the count caps
-/// already bind first (2 000 documents is ~34 MB), so on honest traffic this
-/// never fires and nothing truncates that did not truncate before. It exists
-/// for the traffic the counts do not describe.
+/// 64 MiB, and what that means for each walk, since the record caps differ:
+///
+/// - The subscription walks cap at 20 000 (5 000 on the live one). A real
+///   subscription record charges on the order of 1.5 KB here, so a full repo is
+///   around 30 MB and this never fires. Their verdict is a refusal, so a bound
+///   that bit honest traffic would push a reader into the fail-closed branch —
+///   which is why the headroom matters more there than anywhere else.
+/// - The publication walk caps at [`MAX_LARGE_RECORDS`] (2 000). At the
+///   measured ~17 KB document that is about 37 MB, also under. Above roughly
+///   33 KB per article the budget binds first and the walk truncates early,
+///   reporting `complete: false` as it already does for the record cap.
+///
+/// So on the traffic that has been measured this never fires; for a publication
+/// of unusually long articles it truncates sooner than the count would. It is
+/// not true that nothing truncates that did not truncate before, and an earlier
+/// version of this comment said so.
 pub(crate) const MAX_LIST_BYTES: usize = 64 * 1024 * 1024;
 
 /// What one record retains once parsed.
@@ -283,13 +285,23 @@ fn json_bytes(v: &serde_json::Value) -> usize {
     /// A map entry is a tree node of its own, with links and a key beside the
     /// value. Rounded up rather than derived, since the layout is not ours.
     const MAP_ENTRY: usize = 104;
+    /// A map's backing node, allocated whole.
+    ///
+    /// `serde_json::Map` is a `BTreeMap` here — no `preserve_order` in the
+    /// lock — and its leaf carries room for eleven pairs whether or not they
+    /// are used, measured at ~632 bytes. So a one-key object costs what an
+    /// eleven-key one does, and a chain of them costs that per level. Charging
+    /// a container's minimum the way an array does under-reports this by about
+    /// half, which is the same failure as the version this replaces, two orders
+    /// of magnitude smaller.
+    const MAP_NODE: usize = 512;
     match v {
         // The `4 * NODE` is the container's own minimum allocation; each child
         // then charges for itself, recursively. Dropping that recursion is what
         // made an array of empty arrays look free.
         serde_json::Value::Array(a) => 4 * NODE + a.iter().map(json_bytes).sum::<usize>(),
         serde_json::Value::Object(o) => {
-            4 * NODE
+            MAP_NODE
                 + o.iter()
                     .map(|(k, v)| MAP_ENTRY + k.len().max(NODE / 2) + SLOT + json_bytes(v))
                     .sum::<usize>()
@@ -329,6 +341,16 @@ impl ByteBudget {
     }
 }
 
+/// Append a page, refusing to exceed `max`.
+///
+/// **An error, never a truncation.** The caller of the live walk is
+/// `web::resolve_subscriptions`, whose result reaches `store::replace_sub_refs`
+/// — a `DELETE` followed by reinserting exactly what it was handed. A short
+/// list there is not a short list, it is revoked access to whatever fell off
+/// the end. Returning `Err` lets `resolve_subscriptions` take its documented
+/// fail-closed branch and serve the last-known projection instead.
+///
+/// `out` is left untouched on refusal, so a partial page cannot survive.
 pub(crate) fn extend_bounded(
     out: &mut Vec<RecordEntry>,
     page: Vec<RecordEntry>,
@@ -3574,6 +3596,34 @@ pub(crate) mod tests {
             assert!(
                 charged >= wire,
                 "{label}: charged {charged}, under the {wire} bytes it takes on the wire alone"
+            );
+        }
+    }
+
+    /// **Known answers from a real allocator, not a model of one.**
+    ///
+    /// The property above models `Value` nodes and nothing else, which is how
+    /// an object-shaped under-charge of about half slipped past it: a
+    /// `serde_json::Map` is a `BTreeMap` whose leaf is allocated whole, so the
+    /// entries' own nodes are not the cost. These two figures were measured
+    /// with a counting global allocator against the `serde_json` in this
+    /// lockfile, and are here precisely because the test above could not see
+    /// them.
+    #[test]
+    fn the_estimate_covers_shapes_measured_against_a_real_allocator() {
+        let many_small = serde_json::json!(vec![serde_json::json!({"a": 0}); 5000]);
+        let mut deep = serde_json::json!({"a": 0});
+        for _ in 0..99 {
+            deep = serde_json::json!({ "a": deep });
+        }
+        for (label, value, measured) in [
+            ("5000 one-key objects", many_small, 3_430_000usize),
+            ("a 100-deep chain of one-key objects", deep, 63_350),
+        ] {
+            let charged = approx_bytes(&record_of(value));
+            assert!(
+                charged >= measured,
+                "{label}: charged {charged} against {measured} bytes actually held"
             );
         }
     }

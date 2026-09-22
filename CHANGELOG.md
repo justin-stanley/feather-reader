@@ -53,13 +53,22 @@ deploying is separate.
   parsed value is a tree of 32-byte nodes in vectors that over-allocate, so
   `[[],[],…]` costs three bytes of JSON and well over a hundred in memory.
   Measured against that estimate, a budget reporting 119 MiB held a process at
-  5.6 GiB. Every arm now charges at least the node itself, which over-estimates
-  on adversarial shapes and costs honest traffic a couple of percent.
+  5.6 GiB. Every arm now charges at least the node itself, and an object charges
+  for its backing node — `serde_json::Map` is a `BTreeMap` whose leaf carries
+  room for eleven pairs and is allocated whole, so a one-key object costs what
+  an eleven-key one does. Charging it as an ordinary container under-reported
+  object-shaped records by about half: the same failure two orders of magnitude
+  smaller, caught by a later review round.
 
-  64 MiB, not more: at the measured average the record caps already bind first
-  (2 000 documents is ~34 MB), so on honest traffic this never fires and nothing
-  truncates that did not truncate before. It exists for the traffic the counts
-  do not describe.
+  64 MiB, and what that means differs per walk because the record caps do. The
+  subscription walks cap at 20 000 records, about 30 MB of real subscriptions,
+  so the budget never fires there — which matters most because their verdict is
+  a refusal, and a bound that bit honest traffic would push a reader into the
+  fail-closed branch. The publication walk caps at 2 000 documents, about 37 MB
+  at the measured ~17 KB article; above roughly 33 KB per article the budget
+  binds first and the walk truncates early. So it is not true that nothing
+  truncates that did not truncate before, and an earlier draft of this entry
+  said so.
 
   The two verdicts differ. The three walks feeding `replace_sub_refs` refuse,
   since a short list there is revoked access. The publication read truncates and
@@ -73,11 +82,14 @@ deploying is separate.
   pages — which makes anything that only happens *across* pages unreachable.
   That is how a cap that was per-page rather than per-walk, and therefore 200x
   weaker, once passed an entire suite unnoticed.
-- Eight for the walk budget, each mutation-checked. Eleven mutations, all killed
-  by a named test: the per-page budget in each of the four walks, dropping the
+- Nine for the walk budget, each mutation-checked. One of them asserts against
+  heap figures measured with a counting allocator rather than against a model,
+  which is what catches an under-charge the node-count property cannot see.
+  Thirteen mutations, all killed by a named test: the per-page budget in each of the four walks, dropping the
   recursion into arrays and into objects, charging scalars nothing, the
   exact-fit fence-post, a refusal resetting the running total, an uncharged uri
-  and cid, and removing the check from the live walk entirely.
+  and cid, removing the check from the live walk entirely, charging a map as an
+  ordinary container, and halving its backing node.
 
 ### Fixed
 

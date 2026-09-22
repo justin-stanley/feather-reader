@@ -1541,8 +1541,28 @@ pub(crate) mod tests {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let body = bodies[i.min(bodies.len() - 1)].clone();
                 tokio::spawn(async move {
+                    // **Drain the whole request head, not one fixed read.** A
+                    // DPoP-signed XRPC request head measures ~880 bytes, so a
+                    // single 1024-byte read is within a longer NSID or cursor
+                    // of leaving bytes unread — and closing with data still in
+                    // the receive queue makes the kernel send RST instead of
+                    // FIN, which can discard a response the client has not
+                    // drained. That surfaces as an intermittent connection
+                    // reset in a test whose failure would read as a budget bug.
+                    let mut head = Vec::new();
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                head.extend_from_slice(&buf[..n]);
+                                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
