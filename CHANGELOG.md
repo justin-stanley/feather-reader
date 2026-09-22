@@ -74,23 +74,6 @@ deploying is separate.
   since a short list there is revoked access. The publication read truncates and
   reports `complete: false`, which it already models.
 
-### Tests
-
-- **A mock that serves a different body per request**, which this suite did not
-  have. The fixed-body servers answer every request identically, so a paging
-  walk sees the same cursor twice and its repeat-detection guard stops it at two
-  pages — which makes anything that only happens *across* pages unreachable.
-  That is how a cap that was per-page rather than per-walk, and therefore 200x
-  weaker, once passed an entire suite unnoticed.
-- Nine for the walk budget, each mutation-checked. One of them asserts against
-  heap figures measured with a counting allocator rather than against a model,
-  which is what catches an under-charge the node-count property cannot see.
-  Thirteen mutations, all killed by a named test: the per-page budget in each of the four walks, dropping the
-  recursion into arrays and into objects, charging scalars nothing, the
-  exact-fit fence-post, a refusal resetting the running total, an uncharged uri
-  and cid, removing the check from the live walk entirely, charging a map as an
-  ordinary container, and halving its backing node.
-
 ### Fixed
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
@@ -175,6 +158,21 @@ deploying is separate.
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
 - The suite stands at 877 tests, 875 passing and two ignored.
+
+- **A mock that serves a different body per request**, which this suite did not
+  have. The fixed-body servers answer every request identically, so a paging
+  walk sees the same cursor twice and its repeat-detection guard stops it at two
+  pages — which makes anything that only happens *across* pages unreachable.
+  That is how a cap that was per-page rather than per-walk, and therefore 200x
+  weaker, once passed an entire suite unnoticed.
+- Nine for the walk budget, each mutation-checked. One of them asserts against
+  heap figures measured with a counting allocator rather than against a model,
+  which is what catches an under-charge the node-count property cannot see.
+  Thirteen mutations, all killed by a named test: the per-page budget in each of the four walks, dropping the
+  recursion into arrays and into objects, charging scalars nothing, the
+  exact-fit fence-post, a refusal resetting the running total, an uncharged uri
+  and cid, removing the check from the live walk entirely, charging a map as an
+  ordinary container, and halving its backing node.
 
 ### Corrected in review
 
