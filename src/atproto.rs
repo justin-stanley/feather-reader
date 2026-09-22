@@ -1973,9 +1973,103 @@ fn encode_s32_tid(mut v: u64) -> String {
         *slot = S32_ALPHABET[(v & 0x1f) as usize];
         v >>= 5;
     }
-    // 13 * 5 = 65 bits cover the 64-bit value; the leading char holds the top
-    // (always-0) bit, so it is always the alphabet's first symbol.
+    // 13 * 5 = 65 bits cover the 64-bit value; the leading char carries bits
+    // 64..60, and bit 64 does not exist in a `u64` while bit 63 is always 0 in
+    // a real TID, so the leading char is always one of the alphabet's first
+    // eight symbols. Between 2005-09-05 and 2041-05-10 it is the second one,
+    // which is why real TIDs all begin with `3`.
     String::from_utf8(buf.to_vec()).unwrap_or_default()
+}
+
+/// The earliest instant a real TID can encode: 2020-01-01T00:00:00Z, in
+/// microseconds.
+///
+/// atproto did not exist before this, so a "TID" decoding to earlier is a record
+/// key that merely *looks* like one.
+///
+/// **This bound catches only the slugs that fall outside the window, and that
+/// is a minority of them.** 13 lowercase alphanumerics is an ordinary slug
+/// shape and also a valid `s32` value, and one beginning `3` decodes into the
+/// last few years as readily as a real record key does: `3hoursinparis` reads
+/// as 2020-11-24, `3ideasforjune` as 2021-08-12. Nothing in the string
+/// distinguishes them — telling a slug from a TID would mean asking the PDS
+/// when the record was written, which the listing does not report.
+///
+/// What the window does buy is that a mis-read date is always an ordinary past
+/// instant rather than an unsweepable future one. That is worth having and it
+/// is *not* harmless: a slug reading as 2020 is older than any realistic
+/// retention window, so the row is swept, re-listed on the next poll, and
+/// arrives unread again — the cycle this dating work narrows but does not
+/// close. Refusing to insert what is already past the floor is what closes it,
+/// for a mis-read slug and a genuine archive alike, and that belongs with the
+/// retention floor rather than here.
+const TID_FLOOR_MICROS: i64 = 1_577_836_800_000_000;
+
+/// How far ahead of our own clock a timestamp someone else authored may be and
+/// still be believed.
+///
+/// A PDS a second or two fast would otherwise leave a brand-new document
+/// undated until the following poll, and an undated row is the least visible
+/// one in the reading list. Well under any interval that matters to retention
+/// or the per-feed cap.
+///
+/// **Both date sources use it.** It began as a TID-only allowance, which left a
+/// stated `publishedAt` judged against a bare `now` while the record key two
+/// lines below got five minutes — the same clock, two different answers, for no
+/// reason either comment could give.
+pub(crate) const CLOCK_SKEW_GRACE_SECS: i64 = 300;
+
+/// Decode a 13-char `s32` TID rkey back to its raw 64-bit value.
+///
+/// The exact inverse of [`encode_s32_tid`] over the values a TID can hold.
+///
+/// `None` for anything that is not a 13-character `s32` value: wrong length, a
+/// character outside the alphabet, or a value whose top bit is set. That last
+/// rejection is stricter than the TID syntax regex, which admits leading `c`
+/// through `j`; the spec's separate rule that the high bit is always 0 is the
+/// one enforced here, and it keeps every decoded value inside the range
+/// [`tid_timestamp`] can shift without loss.
+///
+/// **This does not decide whether the string is a TID**, only whether it is a
+/// number. Thirteen lowercase alphanumerics is also an ordinary slug, and a
+/// slug decodes as readily as a record key does. Refusing an implausible
+/// instant is [`tid_timestamp`]'s job, and it is where that case is caught.
+pub(crate) fn decode_s32_tid(rkey: &str) -> Option<u64> {
+    if rkey.len() != 13 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in rkey.bytes() {
+        let digit = S32_ALPHABET.iter().position(|c| *c == b)? as u64;
+        // `checked_*` rather than shifting: 13 chars carry 65 bits, so the
+        // largest 13-char string overflows a `u64` and must read as "not a
+        // TID" instead of wrapping to a plausible-looking value.
+        v = v.checked_mul(32)?.checked_add(digit)?;
+    }
+    (v >> 63 == 0).then_some(v)
+}
+
+/// The instant a TID rkey encodes, or `None` if the rkey is not a plausible
+/// TID.
+///
+/// **Bounded at both ends on purpose.** A TID's timestamp is minted from the
+/// writer's clock, so one decoding far into the future is either a broken clock
+/// or a slug that happens to be 13 `s32` characters; one decoding to before
+/// [`TID_FLOOR_MICROS`] predates atproto. Neither is a date worth trusting, and
+/// the caller's fallback for "no date" is safer than a wrong one.
+///
+/// The bounds are not a slug detector — see [`TID_FLOOR_MICROS`] for why they
+/// cannot be, and for what they do guarantee instead.
+pub(crate) fn tid_timestamp(rkey: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // The low 10 bits are the clock id; the rest is microseconds since the
+    // epoch, and clearing bit 63 above bounds it well inside `i64`.
+    let micros = i64::try_from(decode_s32_tid(rkey)? >> 10).ok()?;
+    if micros < TID_FLOOR_MICROS {
+        return None;
+    }
+    let at = chrono::DateTime::from_timestamp_micros(micros)?;
+    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(CLOCK_SKEW_GRACE_SECS);
+    (at <= ceiling).then_some(at)
 }
 
 // ---------------------------------------------------------------------------
@@ -3162,6 +3256,162 @@ mod tests {
         assert!(tid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b':' | b'-')));
+    }
+
+    #[test]
+    fn tid_values_round_trip_through_the_decoder() {
+        // The decoder is the inverse of the encoder across the whole range a
+        // TID can hold, boundaries included.
+        let max_tid = (0x001f_ffff_ffff_ffffu64 << 10) | 0x3ff;
+        for v in [0u64, 1, 31, 32, 1023, 1024, 1_000_000, max_tid] {
+            let encoded = encode_s32_tid(v);
+            assert_eq!(
+                decode_s32_tid(&encoded),
+                Some(v),
+                "{v} encoded to {encoded}, which did not decode back"
+            );
+        }
+
+        // **A round trip alone proves too little.** Encoder and decoder share
+        // the alphabet, so swapping two of its symbols round-trips perfectly
+        // and still reads every real record key wrong. These two are the
+        // known answer: a record key from a real atproto repo, and the value
+        // it holds, computed independently of this code.
+        assert_eq!(
+            decode_s32_tid("3jzfcijpj2z2a"),
+            Some(1_728_652_679_052_295_174)
+        );
+        assert_eq!(encode_s32_tid(1_728_652_679_052_295_174), "3jzfcijpj2z2a");
+        assert_eq!(
+            decode_s32_tid("3jzfcijpj2z2a").map(|raw| raw >> 10),
+            Some(1_688_137_381_887_007),
+            "that key was written at 2023-06-30T15:03:01.887007Z"
+        );
+    }
+
+    #[test]
+    fn the_first_tid_of_a_generator_decodes_to_the_microsecond_it_was_minted() {
+        let micros = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0)
+        };
+        // The FIRST `next()` only. `TidGenerator` bumps a TID to `last + 1`
+        // to stay strictly increasing, and on a generator whose clock id is
+        // already at its maximum that carry lands in the timestamp bits — so a
+        // later TID can decode a microsecond or two past when it was really
+        // minted. A fresh generator has `last: 0`, where the bump cannot fire.
+        let before = micros();
+        let tid = TidGenerator::new().next();
+        let after = micros();
+        let raw = decode_s32_tid(&tid).expect("a generated TID must decode");
+        let minted = raw >> 10;
+        assert!(
+            (before..=after).contains(&minted),
+            "TID {tid} decoded to {minted}, outside the {before}..={after} window it was minted in"
+        );
+    }
+
+    #[test]
+    fn the_decoder_rejects_strings_that_are_not_13_char_s32_values() {
+        for rkey in [
+            "",               // empty
+            "self",           // the common non-TID rkey
+            "3jzfcijpj2z2",   // 12 chars: one short
+            "3jzfcijpj2z2aa", // 14 chars: one long
+            "3jzfcijpj2z2A",  // uppercase is outside the s32 alphabet
+            "3jzfcijpj2z-a",  // a legal rkey character, but not an s32 one
+            "3jzfcijpj2z2!",  // not a legal rkey character at all
+            "c222222222222",  // decodes with bit 63 set: the reserved top bit
+            "k222222222222",  // decodes past 64 bits entirely
+            "zzzzzzzzzzzzz",  // the largest 13-char s32 string
+        ] {
+            assert_eq!(
+                decode_s32_tid(rkey),
+                None,
+                "{rkey:?} is not a 13-character s32 value"
+            );
+        }
+    }
+
+    /// **The window is not a slug detector, and this is what that costs.**
+    ///
+    /// A 13-character slug beginning `3` decodes into the last few years just
+    /// as a record key does, and nothing in the string tells them apart. These
+    /// are read as dates, and pinning that here is the honest alternative to a
+    /// doc comment claiming otherwise. The damage is bounded: a wrong date is
+    /// an ordinary past instant that ages, sweeps and is outranked normally.
+    #[test]
+    fn a_slug_that_decodes_inside_the_window_is_read_as_a_date() {
+        for (slug, reads_as) in [
+            ("3hoursinparis", "2020-11-24T08:17:26Z"),
+            ("3ideasforjune", "2021-08-12T00:19:38Z"),
+            ("3jokesaweekly", "2023-02-12T15:50:26Z"),
+        ] {
+            assert_eq!(
+                tid_timestamp(slug).map(crate::feed::fmt_time),
+                Some(reads_as.to_string()),
+                "{slug} is indistinguishable from a record key written then"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tid_minted_slightly_ahead_of_our_clock_is_still_believed() {
+        let now = chrono::Utc::now();
+        let of = |at: chrono::DateTime<chrono::Utc>| {
+            encode_s32_tid((at.timestamp_micros() as u64) << 10)
+        };
+        assert!(
+            tid_timestamp(&of(now + chrono::Duration::seconds(2))).is_some(),
+            "a PDS two seconds fast must not leave a fresh document undated"
+        );
+        assert_eq!(
+            tid_timestamp(&of(now + chrono::Duration::hours(1))),
+            None,
+            "an hour ahead is a broken clock or a slug, not skew"
+        );
+    }
+
+    #[test]
+    fn a_tid_timestamp_is_bounded_at_both_ends() {
+        let now = chrono::Utc::now();
+        let of = |micros: i64| encode_s32_tid((micros as u64) << 10);
+
+        // A TID minted now dates to now.
+        let fresh = TidGenerator::new().next();
+        let dated = tid_timestamp(&fresh).expect("a freshly minted TID has a timestamp");
+        assert!(
+            (now - chrono::Duration::minutes(1)..=now + chrono::Duration::minutes(1))
+                .contains(&dated),
+            "{fresh} dated to {dated}, not to now ({now})"
+        );
+
+        // Before atproto existed: not a date.
+        assert_eq!(
+            tid_timestamp(&of(TID_FLOOR_MICROS - 1)),
+            None,
+            "a TID predating atproto must not date an entry"
+        );
+        assert!(
+            tid_timestamp(&of(TID_FLOOR_MICROS)).is_some(),
+            "the floor itself is a real instant"
+        );
+
+        // In the future: not a date. A slug of 13 s32 characters lands here,
+        // which is the case this bound exists for.
+        let far_future = (now + chrono::Duration::days(365)).timestamp_micros();
+        assert_eq!(
+            tid_timestamp(&of(far_future)),
+            None,
+            "a TID from the future must not date an entry"
+        );
+        assert_eq!(
+            tid_timestamp("abcdefghijklm"),
+            None,
+            "a 13-character slug decodes to the year 2192; it is not a date"
+        );
     }
 
     #[test]
