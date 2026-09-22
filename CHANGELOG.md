@@ -18,32 +18,6 @@ deploying is separate.
 
 ### Fixed
 
-- **`feeds.kind` is re-derived from the URL rather than translated once.** The
-  column is a cache of `FeedKind::of`, and it was populated by a one-time SQL
-  `UPDATE` carrying its own copy of the rule as a string predicate. That
-  translated `rss` to `publication` and never the reverse, so a row whose stored
-  kind disagreed with its URL in the other direction stayed wrong permanently:
-  an http feed marked as a publication is excluded from every poll, forever,
-  and nothing re-reads it. The classification is now asked of the Rust function
-  on every start, in both directions, and `upsert_feed`'s conflict clause
-  carries `kind` so re-subscribing re-derives it too.
-- The string predicate is gone. It agreed with `FeedKind::of` on the day it was
-  written and had no way to notice if it stopped — which is how one reader came
-  to drift from it unnoticed, recorded in this file at the time. Its reasoning
-  moved onto `FeedKind`, which is where the question is now asked.
-
-### Tests
-
-- Two, both mutation-checked, both red first: a kind that disagrees with its URL
-  is corrected in either direction, and a second subscription to the same URL
-  re-derives rather than preserving. Four mutations — reverting to a
-  one-directional back-fill, disabling the write, dropping `kind` from the
-  conflict clause, and preserving the stored value there — each killed by one of
-  them.
-
-
-### Fixed
-
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
   `fetched_at` at insertion instead. Retention and the per-feed cap both order on
@@ -65,6 +39,19 @@ deploying is separate.
 - **A stated date in the future is discarded, not used.** Retention deletes rows
   older than the cutoff and the cap keeps the newest, so a document claiming the
   year 2999 was never swept and permanently held the top of the reading list.
+- **`feeds.kind` is re-derived from the URL rather than translated once.** The
+  column is a cache of `FeedKind::of`, and it was populated by a one-time SQL
+  `UPDATE` carrying its own copy of the rule as a string predicate. That
+  translated `rss` to `publication` and never the reverse, so a row whose stored
+  kind disagreed with its URL in the other direction stayed wrong permanently:
+  an http feed marked as a publication is excluded from every poll, forever,
+  and nothing re-reads it. The classification is now asked of the Rust function
+  on every start, in both directions, and `upsert_feed`'s conflict clause
+  carries `kind` so re-subscribing re-derives it too.
+- The string predicate is gone. It agreed with `FeedKind::of` on the day it was
+  written and had no way to notice if it stopped — which is how one reader came
+  to drift from it unnoticed, recorded in this file at the time. Its reasoning
+  moved onto `FeedKind`, which is where the question is now asked.
 
 ### Added
 
@@ -78,16 +65,25 @@ deploying is separate.
   as 2021-08-12, indistinguishable from record keys written then. Telling them
   apart would mean asking the PDS when the record was written, which the listing
   does not report. What the bounds do guarantee is that a mis-read date is an
-  ordinary past instant: it ages, it sweeps, and the cap outranks it normally,
-  so a wrong date costs ordering and nothing worse.
+  ordinary past instant rather than an unsweepable future one — worth having,
+  and not harmless: a slug reading as 2020 is older than any realistic retention
+  window, so the row is swept, re-listed on the next poll, and arrives unread
+  again. That is the cycle the retention floor closes, for a mis-read slug and a
+  genuine archive alike.
 
 ### Tests
 
-- Fourteen, each mutation-checked. The library suite goes from 859 tests to 873;
-  857 to 871 of them pass and two are ignored, before and after.
-- One of them pins a store invariant this change rests on: an upsert refreshes
-  `published` from every poll but never refreshes `fetched_at`. It was not
-  pinned before, and it is the reason the fix below is what it is.
+- **Dating**: fourteen, each mutation-checked, taking the library suite from 859
+  tests to 873. One of them pins a store invariant the change rests on: an
+  upsert refreshes `published` from every poll but never refreshes `fetched_at`.
+  It was not pinned before, and it is the reason the fix is what it is.
+- **Classifier**: two more, both mutation-checked, both red first — a kind that
+  disagrees with its URL is corrected in either direction, and a second
+  subscription to the same URL re-derives rather than preserving. Four mutations
+  (reverting to a one-directional back-fill, disabling the write, dropping
+  `kind` from the conflict clause, and preserving the stored value there), each
+  killed by one of them.
+- The suite stands at 875 tests, 873 passing and two ignored.
 
 ### Corrected in review
 

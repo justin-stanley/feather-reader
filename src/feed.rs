@@ -259,9 +259,9 @@ pub fn is_storable_feed_url(url: &str, allow_at_uri: bool) -> bool {
         if !url.starts_with(crate::atproto::AT_URI_PREFIX) {
             return false;
         }
-        // **This gates STORING only — polling is handled by exclusion**, on
-        // the SQL side by `store::UNPOLLABLE_URL_SQL`, whose doc is the one
-        // place the why is written down.
+        // **This gates STORING only — polling is handled by exclusion**, by
+        // kind rather than by any re-description of the URL, and
+        // `FeedKind::POLLABLE` is the one place the why is written down.
         return allow_at_uri && is_storable_publication_uri(rest);
     }
     match Url::parse(url) {
