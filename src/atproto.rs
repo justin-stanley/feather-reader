@@ -237,23 +237,34 @@ impl RecordWalk {
 /// `MAX_LIST_PAGES` bounds requests rather than bytes. A PDS whose records are
 /// not that shape satisfies every count and still exhausts the box.
 ///
-/// 64 MiB, and what that means for each walk, since the record caps differ:
+/// **128 MiB, and the number is only safe because the charge is an
+/// over-estimate.** An earlier version of this constant was also 128 MiB while
+/// [`approx_bytes`] charged serialized length — 42x optimistic on hostile
+/// shapes, so the bound was nearly fiction. It was then cut to 64 MiB to
+/// compensate. Charging nodes removed the reason for the cut: the charge is now
+/// at or above what the page really retains, so 128 MiB of budget is at most
+/// 128 MiB of memory, which a 512 MB box carries.
 ///
-/// - The subscription walks cap at 20 000 (5 000 on the live one). A real
-///   subscription record charges on the order of 1.5 KB here, so a full repo is
-///   around 30 MB and this never fires. Their verdict is a refusal, so a bound
-///   that bit honest traffic would push a reader into the fail-closed branch —
-///   which is why the headroom matters more there than anywhere else.
-/// - The publication walk caps at [`MAX_LARGE_RECORDS`] (2 000). At the
-///   measured ~17 KB document that is about 37 MB, also under. Above roughly
-///   33 KB per article the budget binds first and the walk truncates early,
-///   reporting `complete: false` as it already does for the record cap.
+/// The cut had a cost, measured rather than assumed. Per walk:
 ///
-/// So on the traffic that has been measured this never fires; for a publication
-/// of unusually long articles it truncates sooner than the count would. It is
-/// not true that nothing truncates that did not truncate before, and an earlier
-/// version of this comment said so.
-pub(crate) const MAX_LIST_BYTES: usize = 64 * 1024 * 1024;
+/// - The subscription walks cap at 20 000 records (5 000 on the live one). A
+///   real five-field subscription charges **2 188 bytes** here, and one carrying
+///   a folder and a fetch hint charges **2 764** — so a full repo is 42 to 53 MB,
+///   which was 65 to 82 % of a 64 MiB budget. Their verdict is a hard refusal
+///   that drops the reader into the fail-closed branch, so an account near the
+///   record cap with slightly longer titles would have served a stale projection
+///   on every poll, permanently. At 128 MiB that is 41 % and the count still
+///   binds first. An earlier version of this comment claimed 1.5 KB and 30 MB;
+///   that is a three-field record, not a real one.
+/// - The publication walk caps at [`MAX_LARGE_RECORDS`] (2 000). At the measured
+///   ~17 KB document that is about 37 MB either way. Above roughly 66 KB per
+///   article the budget binds first and the walk truncates early, reporting
+///   `complete: false` as it already does for the record cap.
+///
+/// So the counts bind first on everything measured, and a publication of
+/// extremely long articles truncates sooner than the count would. It remains
+/// untrue that nothing truncates that did not truncate before.
+pub(crate) const MAX_LIST_BYTES: usize = 128 * 1024 * 1024;
 
 /// What one record retains once parsed.
 ///
@@ -286,6 +297,14 @@ fn json_bytes(v: &serde_json::Value) -> usize {
     /// value. Rounded up rather than derived, since the layout is not ours.
     const MAP_ENTRY: usize = 104;
     /// A map's backing node, allocated whole.
+    ///
+    /// **Empirical, and not derived from anything the compiler checks.** Unlike
+    /// [`NODE`], which is a `size_of`, this and `MAP_ENTRY` come from measuring
+    /// `std`'s `BTreeMap` layout — B = 6, so eleven pairs to a leaf — under the
+    /// `serde_json` in this lockfile. A toolchain that changes that layout, or a
+    /// `serde_json` that swaps the map type, moves the real cost without moving
+    /// these. The known-answer test below is the tripwire, and it is only as
+    /// good as the day its figures were taken.
     ///
     /// `serde_json::Map` is a `BTreeMap` here — no `preserve_order` in the
     /// lock — and its leaf carries room for eleven pairs whether or not they
@@ -1068,10 +1087,20 @@ impl PdsClient {
             // cursor with an empty page, or hand back the same one forever.)
             let more =
                 matches!(&page.cursor, Some(next) if got > 0 && Some(next) != cursor.as_ref());
+            // **The transient page needs its own bound.** The running total
+            // charges what is KEPT, because that is what the walk retains and a
+            // page is dropped after the filter. But transient is not free, and
+            // `net::read_capped`'s 8 MB bounds the WIRE — the whole point of
+            // this budget is that wire size and retained size are not the same
+            // number. A page of records the filter rejects entirely charges
+            // nothing against the total and can still hold hundreds of
+            // megabytes, so no single page may exceed the walk's budget alone.
+            let page_cost: usize = page.records.iter().map(approx_bytes).sum();
+            if page_cost > max_bytes {
+                return Ok(RecordWalk::partial(out));
+            }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
-            // Charged on what is KEPT, which is what this walk retains. The
-            // page itself is transient, and bounded separately by
-            // `net::read_capped`.
+            // Charged on what is KEPT, which is what this walk retains.
             if !budget.admit(&kept) {
                 return Ok(RecordWalk::partial(out));
             }
@@ -3600,15 +3629,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// **Known answers from a real allocator, not a model of one.**
+    /// **Known answers, taken from a real allocator elsewhere.**
     ///
-    /// The property above models `Value` nodes and nothing else, which is how
-    /// an object-shaped under-charge of about half slipped past it: a
+    /// The property above models `Value` nodes and nothing else, which is how an
+    /// object-shaped under-charge of about half slipped past it: a
     /// `serde_json::Map` is a `BTreeMap` whose leaf is allocated whole, so the
-    /// entries' own nodes are not the cost. These two figures were measured
+    /// entries' own nodes are not the cost.
+    ///
+    /// **This test does not measure anything.** The two figures were obtained
     /// with a counting global allocator against the `serde_json` in this
-    /// lockfile, and are here precisely because the test above could not see
-    /// them.
+    /// lockfile and are hardcoded here, because a global allocator is not
+    /// something to install in the suite for one assertion. That makes this a
+    /// tripwire for the *estimate* changing, not for the *real cost* changing: a
+    /// dependency or toolchain bump that grows a map's true footprint leaves this
+    /// green and the estimate quietly short again. Re-taking these numbers is the
+    /// price of trusting them.
     #[test]
     fn the_estimate_covers_shapes_measured_against_a_real_allocator() {
         let many_small = serde_json::json!(vec![serde_json::json!({"a": 0}); 5000]);
@@ -3769,6 +3804,64 @@ pub(crate) mod tests {
             !walk.complete,
             "a walk stopped by the budget called itself complete"
         );
+    }
+
+    /// **The budget must not bind before the record cap does, with room spare.**
+    ///
+    /// The walks that carry `MAX_LIST_RECORDS` REFUSE when a bound is hit, and a
+    /// refusal drops the reader into `resolve_subscriptions`' fail-closed branch
+    /// — so an account near the record cap would serve a stale projection on
+    /// every poll, forever. The figure quoted in `MAX_LIST_BYTES`'s own comment
+    /// is this calculation, and a review caught that figure being wrong by a
+    /// factor of two because nothing computed it. This does.
+    ///
+    /// Double, not merely under: the margin is what stops a slightly longer
+    /// title or one more optional field from turning a working account into a
+    /// permanently failing one.
+    #[test]
+    fn a_full_subscription_repo_fits_the_budget_twice_over() {
+        let record = record_of(serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/blog/feed.xml",
+            "title": "Some Blog With A Longish Name",
+            "siteUrl": "https://example.com/blog",
+            "createdAt": "2026-07-11T09:30:00Z",
+            "folder": "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.folder/3lab999",
+            "fetchHint": "hourly",
+        }));
+        let per_record = approx_bytes(&record);
+        let full_repo = per_record * MAX_LIST_RECORDS;
+        assert!(
+            full_repo * 2 <= MAX_LIST_BYTES,
+            "a full repo charges {per_record} B x {MAX_LIST_RECORDS} = {} MB against a {} MB \
+             budget — too close for a walk whose verdict is a refusal",
+            full_repo / (1024 * 1024),
+            MAX_LIST_BYTES / (1024 * 1024)
+        );
+    }
+
+    /// **A filter that keeps nothing must not let the walk run unbounded.**
+    ///
+    /// The running total charges what is kept, so a filter matching nothing
+    /// charges zero and the total can never stop the walk. What it holds is
+    /// another matter: each page is fully parsed before the filter sees it, and
+    /// `read_capped`'s 8 MB bounds the wire, not the tree. Only the per-page
+    /// bound stands between that and the box.
+    #[tokio::test]
+    async fn a_filter_that_keeps_nothing_still_cannot_outrun_the_budget() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-filtered.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        let walk = client
+            .list_recent_matching_within("c", 100, per_page / 2, 100, |_| false)
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert!(
+            !walk.complete,
+            "a page too large to hold was walked past because the filter dropped it"
+        );
+        assert!(walk.records.is_empty(), "the filter kept nothing");
     }
 
     #[tokio::test]

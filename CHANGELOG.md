@@ -157,7 +157,10 @@ deploying is separate.
   killed by one of them. Four more for the operational findings: leaving
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
-- The suite stands at 877 tests, 875 passing and two ignored.
+- The suite stands at **891 tests**: 888 pass, two are ignored, and one —
+  `the_test_ca_is_trusted_and_still_validates_hostnames` — fails whenever the
+  machine is loaded, which is filed as #195 and is unrelated to any of this work.
+  Earlier drafts of this entry said 877, 884 and 885; none was measured.
 
 - **A mock that serves a different body per request**, which this suite did not
   have. The fixed-body servers answer every request identically, so a paging
@@ -165,9 +168,13 @@ deploying is separate.
   pages — which makes anything that only happens *across* pages unreachable.
   That is how a cap that was per-page rather than per-walk, and therefore 200x
   weaker, once passed an entire suite unnoticed.
-- Nine for the walk budget, each mutation-checked. One of them asserts against
-  heap figures measured with a counting allocator rather than against a model,
-  which is what catches an under-charge the node-count property cannot see.
+- Eleven for the walk budget, each mutation-checked. One asserts against heap
+  figures that were taken with a counting allocator, which is what catches an
+  under-charge the node-count property cannot see — but it hardcodes them rather
+  than measuring, so it is a tripwire for the estimate changing and not for the
+  real cost changing. Another computes that a full subscription repo fits the
+  budget twice over, which is the calculation a reviewer found stated wrongly in
+  a comment because nothing computed it.
   Thirteen mutations, all killed by a named test: the per-page budget in each of the four walks, dropping the
   recursion into arrays and into objects, charging scalars nothing, the
   exact-fit fence-post, a refusal resetting the running total, an uncharged uri
@@ -248,6 +255,19 @@ therefore invisible. The ingest floor closes both cases at once and is the right
 place for it.
 
 ### Known, not fixed here
+
+- **The walk budget is per-walk, and walks nest.** `standard_site::fetch` holds
+  the publication walk's records alive while the document walk runs, and the
+  login path runs four list walks and retains all four results, so the real
+  process ceiling is a multiple of one walk's budget. The constant's own doc
+  calls it "the memory one walk may retain", which is accurate and easy to
+  over-trust.
+- **A page is charged only after it has been materialised.** The refusing walks
+  charge the whole page and the truncating walk now refuses any single page
+  larger than the budget, so the transient is bounded — but it is bounded after
+  the allocation, not before it. Bounding it earlier means not parsing the page
+  until its size is known, which is a change to the transport rather than to the
+  walk.
 
 - Admitting a new kind to `FeedKind::POLLABLE` makes a whole population of rows
   due at once: `due_feeds` sorts unscheduled rows ahead of every scheduled one,

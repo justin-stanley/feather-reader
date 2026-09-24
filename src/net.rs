@@ -1549,14 +1549,38 @@ pub(crate) mod tests {
                     // FIN, which can discard a response the client has not
                     // drained. That surfaces as an intermittent connection
                     // reset in a test whose failure would read as a budget bug.
-                    let mut head = Vec::new();
+                    let mut req = Vec::new();
                     let mut buf = [0u8; 1024];
+                    // Drain the head, then the body it declares. Stopping at
+                    // the head is not enough: the sidecar's list call is a POST,
+                    // so on any platform that does not coalesce head and body
+                    // into one segment the body stays in the receive queue, and
+                    // closing on unread bytes is the RST-instead-of-FIN case
+                    // this loop exists to avoid.
+                    let mut want: Option<usize> = None;
                     loop {
                         match sock.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => {
-                                head.extend_from_slice(&buf[..n]);
-                                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                req.extend_from_slice(&buf[..n]);
+                                let Some(head_end) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                                else {
+                                    continue;
+                                };
+                                let head_len = head_end + 4;
+                                if want.is_none() {
+                                    let head = String::from_utf8_lossy(&req[..head_len]);
+                                    want = Some(
+                                        head.lines()
+                                            .find_map(|l| {
+                                                let (k, v) = l.split_once(':')?;
+                                                k.eq_ignore_ascii_case("content-length")
+                                                    .then(|| v.trim().parse::<usize>().ok())?
+                                            })
+                                            .unwrap_or(0),
+                                    );
+                                }
+                                if req.len() >= head_len + want.unwrap_or(0) {
                                     break;
                                 }
                             }
