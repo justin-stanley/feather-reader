@@ -18,6 +18,52 @@ deploying is separate.
 
 ### Security
 
+- **A `listRecords` page is parsed once, not twice.** The body went through
+  `serde_json::Value` and then into the typed struct, and `from_value` rebuilds
+  rather than moves — so both copies are live at the same time.
+
+  Measured on this branch with a counting allocator, before and after, on two
+  8 MB pages. A page of 480 prose articles: peak 8.5 MB before, 8.2 MB after —
+  a 4% saving, because long strings dominate and the wire size and the tree size
+  are nearly the same. A page whose bulk is structure rather than text: peak
+  256.0 MB before, 128.0 MB after — **exactly halved**, and the retained figure
+  is 128 MB either way.
+
+  So this buys almost nothing on honest traffic and halves the transient peak on
+  the shapes an attacker picks, which is the only place it was ever needed.
+
+  This is the one allocation a byte budget cannot cover, because the budget is
+  charged on records that exist only once the body has already been parsed. The
+  all three clients deserialise straight from the bytes, the sidecar included:
+  its page arrives nested inside an envelope, so the envelope is typed too rather
+  than read as a `Value`.
+
+  The two invariants move with it rather than being dropped: an `error` present
+  on a 2xx is a failure and not an empty page, and `records` **absent** is not
+  `records` empty. They live in one function over one wire struct, which all
+  three clients now deserialise into — the sidecar included, which means it is
+  no longer the odd one out. That also makes them stricter: a duplicated
+  `records` key, which a `Value` resolves last-wins and could therefore use to
+  smuggle an empty page past a proxy, is a hard refusal everywhere.
+
+  An empty body is refused with one reason across all three callers. An earlier
+  draft of this entry said "the same reason it always carried", which was true
+  only of the OAuth client; the direct client used to say "EOF while parsing".
+  It is a unification, not a preservation.
+
+- **The envelope guard fired only on a string `error`.** So a PDS answering
+  `{"error":404,"records":[]}` walked past it and read as a healthy empty page —
+  the exact shape that makes `replace_sub_refs` delete every `sub_ref` a reader
+  has. Any type is an envelope now, and the field is typed as a `Value` so the
+  refusal reports as an envelope rather than as "invalid type", which is the
+  right reason for the one shape this guard exists for.
+
+  Absent, `null`, `false` and `0` are the four spellings of "no error". The last
+  two are a proxy convention, and treating them as envelopes would fail a good
+  page of a thousand records outright. The name is also truncated before it
+  reaches a log, because the PDS chooses it and the log already carries the DID.
+
+
 - **Every response body in the atproto layer is now capped. Five were not.**
   `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
   which reads whatever arrives. That endpoint proxies the account's PDS, so the
@@ -173,9 +219,11 @@ deploying is separate.
   killed by one of them. Four more for the operational findings: leaving
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
-- The suite stands at **893 tests**: 890 pass, two are ignored, and one is the
-  load-sensitive TLS failure filed as #195.
-  Earlier drafts of this entry said 877, 884 and 885; none was measured.
+- The suite stands at **906 tests**: 903 pass, two are ignored, and one is the
+  load-sensitive TLS failure filed as #195. Measured on the merged branch, not
+  carried forward — drafts of this line have said 877, 884, 885, 888, 889, 891
+  and 893, none of them measured when written.
+
 
 - **A mock that serves a different body per request**, which this suite did not
   have. The fixed-body servers answer every request identically, so a paging
