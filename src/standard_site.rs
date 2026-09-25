@@ -394,8 +394,15 @@ pub async fn fetch(
         .with_context(|| format!("resolving the PDS for {}", uri.authority))?;
     let client = crate::atproto::PdsClient::anonymous(http.clone(), pds, uri.authority.clone());
 
+    // **One budget for both walks, because they nest.** The publications are
+    // still held when the documents walk runs — `known` borrows them, and the
+    // `keep` closure captures that — so two independent ceilings let this one
+    // read hold twice the bound the box was sized for. Threading a single budget
+    // makes the limit a property of the read rather than of each walk, and the
+    // borrow checker keeps it that way where a comment would not.
+    let mut budget = crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES);
     let publications = client
-        .list_all_records(nsid::STANDARD_PUBLICATION)
+        .list_all_records_within(nsid::STANDARD_PUBLICATION, &mut budget)
         .await
         .with_context(|| format!("listing publications for {}", uri.authority))?;
     let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
@@ -414,9 +421,10 @@ pub async fn fetch(
         publications.iter().map(|p| p.uri.as_str()).collect();
     let mut orphaned = 0usize;
     let documents = client
-        .list_recent_matching(
+        .list_recent_matching_within(
             nsid::STANDARD_DOCUMENT,
             crate::atproto::MAX_LARGE_RECORDS,
+            &mut budget,
             DOCUMENT_PAGE_SIZE,
             // Orphans are counted while WALKING, not over the kept window: a
             // truncated slice would both miss orphans and stay silent in

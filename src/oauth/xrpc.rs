@@ -149,19 +149,21 @@ impl Repo<'_> {
     /// unbounded walk is a denial-of-service against ourselves. A cursor that
     /// does not advance also terminates the walk rather than spinning.
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
-        self.list_all_records_within(collection, crate::atproto::MAX_LIST_BYTES)
-            .await
+        self.list_all_records_within(
+            collection,
+            &mut crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES),
+        )
+        .await
     }
 
-    /// [`list_all_records`](Self::list_all_records) with the budget named, so a
-    /// test can reach the bound without allocating it.
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
     pub(crate) async fn list_all_records_within(
         &self,
         collection: &str,
-        max_bytes: usize,
+        budget: &mut crate::atproto::ByteBudget,
     ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
-        let mut budget = crate::atproto::ByteBudget::new(max_bytes);
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
 
         for _ in 0..MAX_LIST_PAGES {
@@ -744,7 +746,10 @@ mod tests {
         let repo = repo(&http, &pool, &s, &key);
 
         let err = repo
-            .list_all_records_within("app.feather.subscription", per_page * 2)
+            .list_all_records_within(
+                "app.feather.subscription",
+                &mut crate::atproto::ByteBudget::new(per_page * 2),
+            )
             .await
             .expect_err("three pages cannot fit in a two-page budget");
         let msg = format!("{err:#}");

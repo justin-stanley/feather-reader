@@ -60,15 +60,22 @@ deploying is separate.
   object-shaped records by about half: the same failure two orders of magnitude
   smaller, caught by a later review round.
 
-  64 MiB, and what that means differs per walk because the record caps do. The
-  subscription walks cap at 20 000 records, about 30 MB of real subscriptions,
-  so the budget never fires there — which matters most because their verdict is
-  a refusal, and a bound that bit honest traffic would push a reader into the
-  fail-closed branch. The publication walk caps at 2 000 documents, about 37 MB
-  at the measured ~17 KB article; above roughly 33 KB per article the budget
-  binds first and the walk truncates early. So it is not true that nothing
-  truncates that did not truncate before, and an earlier draft of this entry
-  said so.
+  **128 MiB per read, not per walk.** A caller passes one budget into every walk
+  it makes, so a publication read — which runs a second walk while still holding
+  the first's records — is bounded once. Two independent ceilings put about
+  384 MB in flight on a 512 MB box, counting a transient page that was compared
+  against the ceiling rather than the remainder; all three are one budget now.
+
+  The figure differs in effect per walk, because the record caps do. The
+  subscription walks cap at 20 000 records and a real subscription charges
+  2 188 bytes here — 2 764 with a folder and a fetch hint — so a full repo is 42
+  to 53 MB and the count binds first. That matters most on those walks because
+  their verdict is a refusal, which drops the reader into the fail-closed branch.
+  The publication walk caps at 2 000 documents, about 37 MB at the measured ~17 KB
+  article; above roughly 66 KB per article the budget binds first and the walk
+  truncates early. So it is not true that nothing truncates that did not truncate
+  before, and an earlier draft of this entry said so — as it also said 64 MiB,
+  30 MB and 33 KB, all of which this work has since corrected.
 
   The two verdicts differ. The three walks feeding `replace_sub_refs` refuse,
   since a short list there is revoked access. The publication read truncates and
@@ -175,7 +182,11 @@ deploying is separate.
   real cost changing. Another computes that a full subscription repo fits the
   budget twice over, which is the calculation a reviewer found stated wrongly in
   a comment because nothing computed it.
-  Thirteen mutations, all killed by a named test: the per-page budget in each of the four walks, dropping the
+  Twenty mutations, all killed by a named test — including the five from the
+  second review round and the two from the third. One is not: `standard_site::fetch`
+  passing a single budget to both its walks is unpinned, because reaching it needs
+  a mock serving the PLC directory and two collections. The sharing mechanism is
+  pinned; that one call site is not. The rest: the per-page budget in each of the four walks, dropping the
   recursion into arrays and into objects, charging scalars nothing, the
   exact-fit fence-post, a refusal resetting the running total, an uncharged uri
   and cid, removing the check from the live walk entirely, charging a map as an

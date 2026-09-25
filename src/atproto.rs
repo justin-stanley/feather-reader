@@ -237,8 +237,17 @@ impl RecordWalk {
 /// `MAX_LIST_PAGES` bounds requests rather than bytes. A PDS whose records are
 /// not that shape satisfies every count and still exhausts the box.
 ///
-/// **128 MiB, and the number is only safe because the charge is an
-/// over-estimate.** An earlier version of this constant was also 128 MiB while
+/// **128 MiB per READ, not per walk, and only safe because the charge is an
+/// over-estimate.**
+///
+/// A caller passes one [`ByteBudget`] into every walk it makes, so a publication
+/// read — which runs a second walk while still holding the first's records —
+/// is bounded once rather than twice. Two independent ceilings put roughly
+/// 384 MB in flight on a 512 MB box: 128 for the publications, 128 for the
+/// documents, and a further 128 of transient page because the per-page check
+/// compared against the ceiling instead of what was left. All three are now one
+/// budget, and the transient fits in its remainder.
+/// An earlier version of this constant was also 128 MiB while
 /// [`approx_bytes`] charged serialized length — 42x optimistic on hostile
 /// shapes, so the bound was nearly fiction. It was then cut to 64 MiB to
 /// compensate. Charging nodes removed the reason for the cut: the charge is now
@@ -357,6 +366,18 @@ impl ByteBudget {
 
     pub(crate) fn used(&self) -> usize {
         self.used
+    }
+
+    /// The ceiling this budget was built with.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    /// What is left. A transient page has to fit in this, not in the ceiling —
+    /// otherwise a walk that has already retained most of its budget can still
+    /// hold a full budget's worth of page on top of it.
+    pub(crate) fn remaining(&self) -> usize {
+        self.max.saturating_sub(self.used)
     }
 }
 
@@ -986,19 +1007,24 @@ impl PdsClient {
     /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
-        self.list_all_records_within(collection, MAX_LIST_BYTES)
+        self.list_all_records_within(collection, &mut ByteBudget::new(MAX_LIST_BYTES))
             .await
     }
 
-    /// [`list_all_records`](Self::list_all_records) with the budget named, so a
-    /// test can reach the bound without allocating it.
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
+    ///
+    /// **Shared, not per-walk.** Two walks that nest — a publication read runs a
+    /// second walk while still holding the first's records — each had their own
+    /// ceiling, so the process could hold twice it. Passing one budget in makes
+    /// the bound a property of the caller's whole read, which is the thing that
+    /// has to fit in the box, and the type enforces it where a comment would not.
     pub(crate) async fn list_all_records_within(
         &self,
         collection: &str,
-        max_bytes: usize,
+        budget: &mut ByteBudget,
     ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
-        let mut budget = ByteBudget::new(max_bytes);
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
@@ -1061,22 +1087,28 @@ impl PdsClient {
         page_size: u32,
         keep: impl FnMut(&RecordEntry) -> bool,
     ) -> Result<RecordWalk> {
-        self.list_recent_matching_within(collection, max_records, MAX_LIST_BYTES, page_size, keep)
-            .await
+        self.list_recent_matching_within(
+            collection,
+            max_records,
+            &mut ByteBudget::new(MAX_LIST_BYTES),
+            page_size,
+            keep,
+        )
+        .await
     }
 
-    /// [`list_recent_matching`](Self::list_recent_matching) with the budget
-    /// named, so a test can reach the bound without allocating it.
+    /// [`list_recent_matching`](Self::list_recent_matching) against a caller's
+    /// budget. See [`list_all_records_within`](Self::list_all_records_within) for
+    /// why it is the caller's and not the walk's.
     pub(crate) async fn list_recent_matching_within(
         &self,
         collection: &str,
         max_records: usize,
-        max_bytes: usize,
+        budget: &mut ByteBudget,
         page_size: u32,
         mut keep: impl FnMut(&RecordEntry) -> bool,
     ) -> Result<RecordWalk> {
         let mut out = Vec::new();
-        let mut budget = ByteBudget::new(max_bytes);
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
@@ -1096,7 +1128,7 @@ impl PdsClient {
             // nothing against the total and can still hold hundreds of
             // megabytes, so no single page may exceed the walk's budget alone.
             let page_cost: usize = page.records.iter().map(approx_bytes).sum();
-            if page_cost > max_bytes {
+            if page_cost > budget.remaining() {
                 return Ok(RecordWalk::partial(out));
             }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
@@ -1608,20 +1640,19 @@ impl SidecarClient {
     /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
     /// PDS, so the page count is ultimately remote-controlled here too.
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
-        self.list_all_records_within(did, collection, MAX_LIST_BYTES)
+        self.list_all_records_within(did, collection, &mut ByteBudget::new(MAX_LIST_BYTES))
             .await
     }
 
-    /// [`list_all_records`](Self::list_all_records) with the budget named, so a
-    /// test can reach the bound without allocating it.
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
     pub(crate) async fn list_all_records_within(
         &self,
         did: &str,
         collection: &str,
-        max_bytes: usize,
+        budget: &mut ByteBudget,
     ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
-        let mut budget = ByteBudget::new(max_bytes);
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
@@ -3774,7 +3805,7 @@ pub(crate) mod tests {
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
         let err = client
-            .list_all_records_within("c", per_page * 2)
+            .list_all_records_within("c", &mut ByteBudget::new(per_page * 2))
             .await
             .expect_err("three pages cannot fit in a two-page budget");
         let msg = format!("{err:#}");
@@ -3792,7 +3823,9 @@ pub(crate) mod tests {
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
         let walk = client
-            .list_recent_matching_within("c", 100, per_page * 2, 100, |_| true)
+            .list_recent_matching_within("c", 100, &mut ByteBudget::new(per_page * 2), 100, |_| {
+                true
+            })
             .await
             .expect("an additive walk truncates rather than failing");
         assert_eq!(
@@ -3840,6 +3873,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// **A budget passed to two walks is spent by both of them.**
+    ///
+    /// The reason it is passed rather than constructed: a publication read runs
+    /// a second walk while still holding the first's records, so two independent
+    /// ceilings let one read hold twice the bound. Here the first walk spends
+    /// the budget and the second finds it spent.
+    #[tokio::test]
+    async fn two_walks_sharing_a_budget_do_not_each_get_the_whole_of_it() {
+        let (bodies, per_page) = paged_bodies(4, 4096, false);
+        let (base, _) = host_for(bodies, "budget-shared.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let mut budget = ByteBudget::new(per_page * 3);
+
+        let err = client
+            .list_all_records_within("c", &mut budget)
+            .await
+            .expect_err("four pages cannot fit a three-page budget");
+        assert!(format!("{err:#}").contains("3 held"), "{err:#}");
+
+        // Same budget, nothing left in it.
+        let err = client
+            .list_all_records_within("c", &mut budget)
+            .await
+            .expect_err("the second walk was handed a fresh ceiling");
+        assert!(
+            format!("{err:#}").contains("0 held"),
+            "the second walk kept something out of an exhausted budget: {err:#}"
+        );
+    }
+
+    /// **A transient page has to fit what is LEFT of the budget.**
+    ///
+    /// Measuring it against the ceiling lets a walk that has already retained
+    /// most of its budget hold a further ceiling's worth of page on top. The
+    /// filter keeps nothing here, so the running total cannot stop the walk and
+    /// only the remaining-budget comparison can.
+    #[tokio::test]
+    async fn a_transient_page_must_fit_what_is_left_not_the_ceiling() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-remaining.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        // Ceiling of two and a half pages, two of them already spent.
+        let mut budget = ByteBudget::new(per_page * 5 / 2);
+        let spent = vec![
+            record_of(serde_json::json!({ "t": "x".repeat(4096) })),
+            record_of(serde_json::json!({ "t": "x".repeat(4096) })),
+        ];
+        assert!(budget.admit(&spent), "the pre-spend has to fit");
+        assert!(
+            budget.remaining() < per_page,
+            "and has to leave less than a page"
+        );
+
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut budget, 100, |_| false)
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert!(
+            !walk.complete,
+            "a page larger than the remaining budget was walked past"
+        );
+    }
+
     /// **A filter that keeps nothing must not let the walk run unbounded.**
     ///
     /// The running total charges what is kept, so a filter matching nothing
@@ -3854,7 +3951,9 @@ pub(crate) mod tests {
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
         let walk = client
-            .list_recent_matching_within("c", 100, per_page / 2, 100, |_| false)
+            .list_recent_matching_within("c", 100, &mut ByteBudget::new(per_page / 2), 100, |_| {
+                false
+            })
             .await
             .expect("an additive walk truncates rather than failing");
         assert!(
@@ -3874,7 +3973,7 @@ pub(crate) mod tests {
             .list_all_records_within(
                 "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
                 "app.feather.subscription",
-                per_page * 2,
+                &mut ByteBudget::new(per_page * 2),
             )
             .await
             .expect_err("the sidecar walk was the one with no budget at all");
