@@ -237,16 +237,33 @@ impl RecordWalk {
 /// `MAX_LIST_PAGES` bounds requests rather than bytes. A PDS whose records are
 /// not that shape satisfies every count and still exhausts the box.
 ///
-/// **128 MiB per READ, not per walk, and only safe because the charge is an
-/// over-estimate.**
+/// **128 MiB of ACCUMULATION per read — which is not the same as 128 MiB of
+/// memory, and an earlier version of this comment said it was.**
+///
+/// Every charge here is taken after `serde_json` has already built the page, so
+/// the true peak is this ceiling plus one page's tree, and a page's tree is not
+/// small: measured, an 8 MB response of `{"":0}` objects retains 824 MB, a
+/// wire-to-heap amplification of 98x. A bound consulted after the allocation
+/// cannot prevent that allocation. What it does prevent is the accumulation
+/// across pages and across the walks of one read, which is the part that scales
+/// with how long a walk runs rather than with one response.
+///
+/// Closing the single-page case needs a smaller wire cap for `listRecords` or a
+/// parser that counts as it goes. Neither belongs to this bound; both are filed
+/// as #197 rather than implied here.
 ///
 /// A caller passes one [`ByteBudget`] into every walk it makes, so a publication
-/// read — which runs a second walk while still holding the first's records —
-/// is bounded once rather than twice. Two independent ceilings put roughly
-/// 384 MB in flight on a 512 MB box: 128 for the publications, 128 for the
-/// documents, and a further 128 of transient page because the per-page check
-/// compared against the ceiling instead of what was left. All three are now one
-/// budget, and the transient fits in its remainder.
+/// read — which runs a second walk while still holding the first's records — is
+/// bounded once rather than twice. Two independent ceilings put roughly 384 MB of
+/// accumulation in flight: 128 for the publications, 128 for the documents, and a
+/// further 128 of transient page because the per-page check compared against the
+/// ceiling instead of what was left.
+///
+/// **Only one caller threads it today**, and that caller has no production entry
+/// point yet: the publication reader is not wired to the poller. Every live read
+/// builds its own ceiling per walk, so the per-request total is still a multiple
+/// of this number — two walks on an OPML export, four on a login — and nothing
+/// bounds concurrent requests at all.
 /// An earlier version of this constant was also 128 MiB while
 /// [`approx_bytes`] charged serialized length — 42x optimistic on hostile
 /// shapes, so the bound was nearly fiction. It was then cut to 64 MiB to
@@ -1132,10 +1149,14 @@ impl PdsClient {
                 return Ok(RecordWalk::partial(out));
             }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
-            // Charged on what is KEPT, which is what this walk retains.
-            if !budget.admit(&kept) {
-                return Ok(RecordWalk::partial(out));
-            }
+            // Charged on what is KEPT, which is what this walk retains. **This
+            // cannot refuse**, and saying so matters: the page check above
+            // already proved the whole page fits in the remainder, and `kept` is
+            // a subset of it. Written as `if !admit(…) { return }` it reads as a
+            // second stopping rule, and a reader would look for the case that
+            // trips it. There isn't one — the call is the bookkeeping.
+            let charged = budget.admit(&kept);
+            debug_assert!(charged, "the page charge already proved this fits");
             if extend_truncating(&mut out, kept, max_records) {
                 return Ok(RecordWalk::partial(out));
             }

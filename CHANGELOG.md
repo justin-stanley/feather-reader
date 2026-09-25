@@ -60,11 +60,20 @@ deploying is separate.
   object-shaped records by about half: the same failure two orders of magnitude
   smaller, caught by a later review round.
 
-  **128 MiB per read, not per walk.** A caller passes one budget into every walk
-  it makes, so a publication read — which runs a second walk while still holding
-  the first's records — is bounded once. Two independent ceilings put about
-  384 MB in flight on a 512 MB box, counting a transient page that was compared
-  against the ceiling rather than the remainder; all three are one budget now.
+  **128 MiB of accumulation per read, which is not 128 MiB of memory.** Every
+  charge is taken after the page is already built, so the true peak is the ceiling
+  plus one page's tree — and a page's tree is not small: an 8 MB response of
+  one-key objects retains 824 MB, 98x its wire size. A bound consulted after the
+  allocation cannot prevent it. What it does prevent is accumulation across pages
+  and across the walks of one read. The single-page case needs a smaller wire cap
+  or a counting parser, and is filed as #197 rather than implied here.
+
+  A caller passes one budget into every walk it makes, so a publication read —
+  which runs a second walk while still holding the first's records — is bounded
+  once rather than twice; two independent ceilings put about 384 MB of
+  accumulation in flight. Only that one caller threads it today and it has no
+  production entry point yet, so every live read still builds a ceiling per walk
+  and nothing bounds concurrent requests.
 
   The figure differs in effect per walk, because the record caps do. The
   subscription walks cap at 20 000 records and a real subscription charges
@@ -164,9 +173,8 @@ deploying is separate.
   killed by one of them. Four more for the operational findings: leaving
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
-- The suite stands at **891 tests**: 888 pass, two are ignored, and one —
-  `the_test_ca_is_trusted_and_still_validates_hostnames` — fails whenever the
-  machine is loaded, which is filed as #195 and is unrelated to any of this work.
+- The suite stands at **893 tests**: 890 pass, two are ignored, and one is the
+  load-sensitive TLS failure filed as #195.
   Earlier drafts of this entry said 877, 884 and 885; none was measured.
 
 - **A mock that serves a different body per request**, which this suite did not
