@@ -53,7 +53,12 @@ impl Repo<'_> {
     }
 
     /// Send, and fail loudly on a non-2xx with the XRPC error if there is one.
-    async fn send(&self, url: &str, body: DpopBody<'_>, nsid: &str) -> Result<Value> {
+    async fn send_raw(
+        &self,
+        url: &str,
+        body: DpopBody<'_>,
+        nsid: &str,
+    ) -> Result<request::PostOutcome> {
         let outcome = request::send_with_dpop(
             self.http,
             self.pool,
@@ -82,6 +87,16 @@ impl Repo<'_> {
                 xrpc_error(&outcome.body, outcome.status)
             );
         }
+        Ok(outcome)
+    }
+
+    /// [`send_raw`](Self::send_raw), then the body as JSON.
+    ///
+    /// Every call that wants a `Value` goes through here; `listRecords` does
+    /// not, because turning its body into a `Value` and then into a page
+    /// materialises the records twice.
+    async fn send(&self, url: &str, body: DpopBody<'_>, nsid: &str) -> Result<Value> {
+        let outcome = self.send_raw(url, body, nsid).await?;
         // A 200 with an empty body is legitimate for deleteRecord/applyWrites.
         if outcome.body.is_empty() {
             return Ok(Value::Null);
@@ -124,8 +139,11 @@ impl Repo<'_> {
             }
         }
 
-        let value = self
-            .send(
+        // **Raw bytes, parsed once.** This is the live backend's list walk, the
+        // largest body this client reads, and routing it through `Value` first
+        // held two copies of every page at the same time.
+        let outcome = self
+            .send_raw(
                 url.as_str(),
                 DpopBody::Query,
                 "com.atproto.repo.listRecords",
@@ -137,8 +155,9 @@ impl Repo<'_> {
         // `sync_sub_refs` then writes through, revoking every `sub_ref`.
         // Both invariants, through the one function every listRecords caller
         // shares — this check was added here first and had to be fitted to the
-        // other two clients a round later.
-        let page = crate::atproto::list_records_from_value(value)?;
+        // other two clients a round later. It reads bytes now rather than a
+        // `Value`; the invariants are the same ones, expressed as fields.
+        let page = crate::atproto::parse_list_records(&outcome.body)?;
         let (records, cursor) = (page.records, page.cursor);
         Ok((records, cursor))
     }
@@ -760,9 +779,54 @@ mod tests {
         );
     }
 
+    /// **A duplicated `records` key must not be able to empty a page.**
+    ///
+    /// This is the live `backend=rust` walk, so an empty page here reaches
+    /// `replace_sub_refs` and deletes the reader's subscriptions. serde refuses
+    /// a repeated field outright; a `serde_json::Value` takes the last one
+    /// silently, so routing this body through a `Value` first turns a smuggled
+    /// second key into a successful, empty listing. The test exists to pin
+    /// which of the two this client uses.
+    #[tokio::test]
+    async fn the_live_walk_refuses_a_duplicated_records_key() {
+        let base = crate::net::tests::serve_body(
+            br#"{"records":[{"uri":"at://d/c/r","value":{}}],"records":[]}"#.to_vec(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "dup-records.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://dup-records.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_records("app.feather.subscription", None, None)
+            .await
+            .expect_err("a duplicated records key was read as an empty page");
+        assert!(
+            format!("{err:#}").contains("duplicate"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
     /// **An empty 2xx body is not an empty repo either.** `send` maps a
     /// zero-length 2xx to `Value::Null` — deliberately, for `deleteRecord` and
-    /// `applyWrites` — so on `listRecords` it slipped past the envelope guard
+    /// `applyWrites` — and while `listRecords` still went through it, that
+    /// slipped past the envelope guard
     /// and `records.unwrap_or(Array([]))` produced `Ok(vec![])`: the same
     /// `sub_ref` wipe the guard was added to prevent, through the sibling door.
     #[tokio::test]

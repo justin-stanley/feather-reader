@@ -1480,6 +1480,22 @@ struct RepoOk {
     data: Value,
 }
 
+/// `/internal/repo`'s ok envelope for a **listing**, typed all the way down.
+///
+/// `data` absent is not `data` empty, the same distinction `records` carries: it
+/// is what a proxy makes of an unexpected upstream body.
+#[derive(Debug, Deserialize)]
+struct RepoOkList {
+    /// The sidecar's own `ok`, which it can set false on a 200.
+    #[serde(default)]
+    ok: Option<bool>,
+    /// And its own `error` — a different envelope from the PDS's, one layer out.
+    #[serde(default)]
+    error: Option<Value>,
+    #[serde(default)]
+    data: Option<ListRecordsBody>,
+}
+
 /// The `/internal/repo` error envelope: `{ ok:false, error, message, status? }`.
 #[derive(Debug, Deserialize)]
 struct RepoErr {
@@ -1580,6 +1596,19 @@ impl SidecarClient {
     /// to [`AtProtoError`]: `404 SessionNotFound` → `Xrpc{error:"SessionNotFound"}`
     /// so callers can treat it as "re-login required".
     async fn repo(&self, body: Value) -> Result<Value> {
+        let raw = self.repo_bytes(body).await?;
+        let ok: RepoOk = serde_json::from_slice(&raw).context("parsing /internal/repo ok body")?;
+        Ok(ok.data)
+    }
+
+    /// [`repo`](Self::repo) without the `Value`.
+    ///
+    /// The listing path needs the bytes: a `serde_json::Map` resolves a repeated
+    /// key last-wins, so a body carrying a second, empty `records` array read as
+    /// a successful empty page — and an empty page here is `replace_sub_refs`
+    /// deleting every `sub_ref` the reader has. serde refuses a duplicated field
+    /// outright, but only if it sees the bytes.
+    async fn repo_bytes(&self, body: Value) -> Result<Vec<u8>> {
         let url = format!("{}/internal/repo", self.internal_url);
         let resp = self
             .http
@@ -1597,9 +1626,7 @@ impl SidecarClient {
         // bound at all was the one most deployments run.
         let raw = crate::net::read_capped(resp).await;
         if status.is_success() {
-            let ok: RepoOk =
-                serde_json::from_slice(&raw?).context("parsing /internal/repo ok body")?;
-            return Ok(ok.data);
+            return raw;
         }
         // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
         //
@@ -1649,10 +1676,31 @@ impl SidecarClient {
         if let Some(cursor) = cursor {
             body["cursor"] = json!(cursor);
         }
-        let data = self.repo(body).await?;
-        // The sidecar proxies the PDS's body, so the 2xx-envelope case arrives
-        // here too — and `RepoOk.data` is a defaulted `Value`.
-        list_records_from_value(data).context("parsing sidecar listRecords data")
+        // Straight into the shared wire struct, one parse, no `Value` between —
+        // so this client gets the same guards as the other two, including the
+        // duplicated-key refusal that only serde can make.
+        let raw = self.repo_bytes(body).await?;
+        let envelope: RepoOkList =
+            serde_json::from_slice(&raw).context("parsing sidecar listRecords data")?;
+        // **Two envelope layers here, not one.** `page_from_body` guards the
+        // PDS's, which arrives inside `data`; this is the sidecar's own, and it
+        // can say `{"ok":false,"error":"ExpiredToken"}` on a 200 while still
+        // carrying a `data` that reads as a perfectly good empty page.
+        if envelope.ok == Some(false) {
+            let name = envelope
+                .error
+                .as_ref()
+                .and_then(envelope_error_name)
+                .unwrap_or_else(|| "unspecified".to_string());
+            anyhow::bail!("the sidecar answered 2xx with ok:false ({name})");
+        }
+        if let Some(name) = envelope.error.as_ref().and_then(envelope_error_name) {
+            anyhow::bail!("the sidecar answered 2xx with an error envelope: {name}");
+        }
+        let Some(data) = envelope.data else {
+            anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
+        };
+        page_from_body(data).context("parsing sidecar listRecords data")
     }
 
     /// Page through **all** records in a collection for `did`.
@@ -2381,60 +2429,232 @@ pub(crate) fn urlencode(s: &str) -> String {
     out
 }
 
-/// Parse a `listRecords` body, refusing an error envelope that arrived on a
-/// 2xx. `ListRecordsResponse.records` is `#[serde(default)]`, so
-/// `{"error","message"}` would otherwise deserialise as an EMPTY page — and a
-/// walk over a stranger's collection would return a healthy, empty result in
-/// place of an error. Some PDS implementations answer 200 for application
-/// failures; the status check in the caller cannot see those.
+/// Parse a `listRecords` body, refusing an error envelope that arrived on a 2xx.
+///
+/// Some PDS implementations answer 200 for application failures, and the status
+/// check in the caller cannot see those. Without the guard, `{"error","message"}`
+/// deserialises as a page with no records — so a walk over a stranger's
+/// collection returns a healthy, empty result in place of an error, and for the
+/// walk that feeds `replace_sub_refs` that is revoked access rather than an empty
+/// repo. The guard itself lives in [`page_from_body`], which every client shares.
 pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
-    let value: Value = serde_json::from_slice(body).context("parsing listRecords response")?;
-    list_records_from_value(value)
+    // **An empty body is the "unexpected body" case, not a parse error.** Reading
+    // bytes reaches it as "EOF while parsing", where the OAuth client used to
+    // reach it as "no records field" (its `send` mapped an empty 2xx to
+    // `Value::Null`) and the direct client reached it as "EOF" too. Refused
+    // either way, so this is a unification rather than a preservation — nothing
+    // outside the tests matches on the text, and `resolve_subscriptions` fails
+    // closed on any `Err`. It is for whoever reads the log.
+    if body.is_empty() {
+        anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
+    }
+    let parsed: ListRecordsBody =
+        serde_json::from_slice(body).context("parsing listRecords response")?;
+    page_from_body(parsed)
 }
 
-/// Turn an already-parsed `listRecords` body into a page, enforcing **both**
-/// invariants every caller needs.
+/// Apply both invariants to an already-deserialised body.
 ///
-/// **One function, because the guards kept being added to one caller at a
-/// time.** The error-envelope check landed on the anonymous client first and
-/// had to be added to the OAuth and sidecar clients a round later; the
-/// records-presence check landed on the OAuth client and had to be added to
-/// the other two a round after that. Both failures are the same: a body that
-/// is not a listing deserialises to an empty page, `resolve_subscriptions`
-/// reads that as "this DID follows nothing" instead of taking its fail-closed
-/// branch, and `replace_sub_refs` DELETEs the reader's whole `sub_ref`
-/// projection. Anything that reads a listRecords body goes through here.
-pub(crate) fn list_records_from_value(value: Value) -> Result<ListRecordsResponse> {
-    reject_error_envelope(&value)?;
-    // `records` is `#[serde(default)]`, so `{}` — what a proxy produces from an
-    // empty or unexpected upstream body — is otherwise a page of zero records.
-    anyhow::ensure!(
-        value.get("records").is_some(),
-        "listRecords returned no records field (empty or unexpected body)"
-    );
-    serde_json::from_value(value).context("parsing listRecords response")
+/// **The one place the guards live, for all three clients.** They were added a
+/// client at a time twice over, which is the whole reason a shared function
+/// exists; splitting the sidecar onto a different route would have started that
+/// again, so it deserialises into this same struct.
+fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
+    if let Some(error) = parsed.error.as_ref().and_then(envelope_error_name) {
+        let message = parsed
+            .message
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(|m| format!(" — {}", truncate_for_message(m)))
+            .unwrap_or_default();
+        anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}");
+    }
+    let records = parsed.records.ok_or_else(|| {
+        anyhow::anyhow!("listRecords returned no records field (empty or unexpected body)")
+    })?;
+    Ok(ListRecordsResponse {
+        records,
+        cursor: parsed.cursor,
+    })
+}
+
+/// The wire shape of a `listRecords` body, read in **one** pass.
+///
+/// **Parsing to `Value` and then into the struct materialises the page twice.**
+/// `serde_json::from_value` rebuilds rather than moves, so an 8 MB response was
+/// measured holding both copies at once — a peak of roughly double the retained
+/// size, reached before any accounting the caller does, which is why no budget
+/// charged after the parse can cover it.
+///
+/// The two invariants that used to live on a `Value` are
+/// expressed here as fields instead of lookups, and mean exactly what they did:
+/// an `error` present on a 2xx is a failure, not an empty page, and `records`
+/// ABSENT is not `records` empty.
+#[derive(Debug, Default)]
+struct ListRecordsBody {
+    /// A `Value`, not a `String`. Typing it as a string made
+    /// `{"error":404,"records":[]}` fail as "invalid type: integer" rather than
+    /// as an envelope — the wrong reason for the exact shape the guard exists
+    /// for, and the guard's whole point is that this distinction is load-bearing.
+    error: Option<Value>,
+    /// Likewise, and for a duller reason: `message` carries no security role,
+    /// and typing it as a string made a PDS that stamps a non-string one onto an
+    /// otherwise good page of a thousand records fail the entire listing.
+    message: Option<Value>,
+    /// `None` means the field was absent — what a proxy makes of an empty or
+    /// unexpected upstream body. `Some(vec![])` is a genuine empty page.
+    records: Option<Vec<RecordEntry>>,
+    cursor: Option<String>,
+}
+
+/// **Hand-written, because the derive accepts a listing that is not an object.**
+///
+/// serde's derived `Deserialize` takes a struct in POSITIONAL form as well as
+/// map form, so with every field defaulted the fourteen bytes `[null,null,[]]`
+/// bound `records` to an empty vector and read as a healthy page — on all three
+/// clients, and the `Value` route this replaced refused it, because
+/// `Value::Array::get("records")` is always `None`. Neither the envelope guard
+/// nor the duplicated-key refusal can fire on a body with no keys at all, so one
+/// short array defeated every protection here at once and reached
+/// `replace_sub_refs`, which deletes the reader's whole subscription projection.
+///
+/// **Unknown fields are read, not skipped.** `IgnoredAny` does not validate what
+/// it skips, so `{"records":[],"x":"<invalid utf-8>"}` — not valid JSON at all —
+/// also read as a healthy empty page where the `Value` route refused it. Reading
+/// the value into a `Value` and dropping it costs an allocation on a field nobody
+/// wants, and buys back the validation.
+impl<'de> Deserialize<'de> for ListRecordsBody {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct AsMap;
+        impl<'de> serde::de::Visitor<'de> for AsMap {
+            type Value = ListRecordsBody;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a listRecords object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<ListRecordsBody, M::Error> {
+                use serde::de::Error;
+                let mut out = ListRecordsBody::default();
+                let (mut error, mut message, mut records, mut cursor) =
+                    (false, false, false, false);
+                while let Some(key) = map.next_key::<String>()? {
+                    let seen = match key.as_str() {
+                        "error" => std::mem::replace(&mut error, true),
+                        "message" => std::mem::replace(&mut message, true),
+                        "records" => std::mem::replace(&mut records, true),
+                        "cursor" => std::mem::replace(&mut cursor, true),
+                        _ => false,
+                    };
+                    if seen {
+                        // A repeated key is last-wins in a `Value`, which is how
+                        // a smuggled second, empty `records` array read as a
+                        // successful page. Refused here.
+                        return Err(M::Error::duplicate_field(match key.as_str() {
+                            "error" => "error",
+                            "message" => "message",
+                            "records" => "records",
+                            _ => "cursor",
+                        }));
+                    }
+                    match key.as_str() {
+                        "error" => out.error = Some(map.next_value()?),
+                        "message" => out.message = Some(map.next_value()?),
+                        "records" => out.records = Some(map.next_value()?),
+                        "cursor" => out.cursor = map.next_value()?,
+                        _ => {
+                            let _validated: Value = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(AsMap)
+    }
 }
 
 /// Refuse an atproto error envelope that arrived on a 2xx.
 ///
-/// **Every shape that reads a listRecords body goes through this**, not only
-/// the anonymous client: `oauth::xrpc::Repo` takes `records` off the JSON with
-/// `unwrap_or(Array([]))`, and the sidecar's `RepoOk.data` is a defaulted
-/// `Value`. Both turned `200 {"error": …}` into `Ok(empty)`, which is not the
-/// fail-closed branch in `web::resolve_subscriptions` — so `sync_sub_refs`
-/// wrote an empty set and `replace_sub_refs` DELETEd the DID's entire
-/// `sub_ref` projection. One bad response revoked a reader's access to every
-/// feed they have.
+/// **No listing reaches this any more — [`page_from_body`] is the one every
+/// client shares.** It survives for the WRITE paths, where the response is still
+/// a `Value`: `deleteRecord` and `applyWrites` on both live clients.
+///
+/// The history is worth keeping, because it is why a shared function exists at
+/// all. Each client used to take `records` off the JSON its own way — the live
+/// one with `unwrap_or(Array([]))`, the sidecar through a defaulted `Value` — and
+/// each turned `200 {"error": …}` into `Ok(empty)`. That is not the fail-closed
+/// branch in `web::resolve_subscriptions`: `sync_sub_refs` wrote the empty set
+/// and `replace_sub_refs` DELETEd the DID's entire `sub_ref` projection. One bad
+/// response revoked a reader's access to every feed they had. The guard was added
+/// to one client at a time, twice, which is the drift a single function prevents
+/// — and why the listing guard now lives in exactly one place rather than here.
 pub(crate) fn reject_error_envelope(value: &Value) -> Result<()> {
-    let Some(error) = value.get("error").and_then(Value::as_str) else {
+    let Some(error) = value.get("error").and_then(envelope_error_name) else {
         return Ok(());
     };
     let message = value
         .get("message")
         .and_then(Value::as_str)
-        .map(|m| format!(" — {m}"))
+        .map(|m| format!(" — {}", truncate_for_message(m)))
         .unwrap_or_default();
     anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}")
+}
+
+/// The name in an `error` field, or `None` when the field does not denote one.
+///
+/// **Whatever its type.** Keying on `as_str` meant a PDS answering
+/// `{"error":404,"records":[]}` — or `{}`, or `[]` — passed the guard and read as
+/// a healthy empty page, the shape that makes `replace_sub_refs` delete every
+/// `sub_ref` a reader has. A non-string `error` is not a well-formed envelope,
+/// but it is certainly not a successful listing either.
+///
+/// **Except the four spellings of "no error".** Absent and `null` are what an
+/// ordinary listing carries; `false` and `0` are a convention proxies use, and
+/// treating those as envelopes turns a good page of a thousand records into a
+/// hard refusal, which on these walks means the reader's sidebar degrades to a
+/// stale projection on every request.
+///
+/// **Bounded.** The name reaches a `warn!` that also logs the DID, and the value
+/// is attacker-chosen: a PDS answering with hundreds of kilobytes under `error`
+/// would otherwise put all of it in the log and allocate another copy, in code
+/// whose purpose is cutting peak allocation.
+fn envelope_error_name(error: &Value) -> Option<String> {
+    match error {
+        Value::Null | Value::Bool(false) => None,
+        // Integer zero only. `as_f64() == Some(0.0)` also matched `-0`, `0.0`
+        // and anything that underflows, so `1e-400` was "no error".
+        Value::Number(n) if n.as_i64() == Some(0) || n.as_u64() == Some(0) => None,
+
+        Value::String(s) => Some(truncate_for_message(s)),
+        // **The type, not the value.** `to_string()` would serialise the whole
+        // attacker-chosen subtree before truncating it, allocating a full extra
+        // copy of up to the body cap — in code whose purpose is cutting peak
+        // allocation. A non-string `error` is malformed, so its contents tell a
+        // reader nothing its shape does not.
+        Value::Bool(_) => Some("<non-string error: bool>".to_string()),
+        Value::Number(_) => Some("<non-string error: number>".to_string()),
+        Value::Array(_) => Some("<non-string error: array>".to_string()),
+        Value::Object(_) => Some("<non-string error: object>".to_string()),
+    }
+}
+
+/// Cap a string destined for an error message at a readable length.
+fn truncate_for_message(s: &str) -> String {
+    /// **Bytes, not characters.** A log line is bytes, and counting characters
+    /// let astral-plane code points render four times the intended bound.
+    const MAX_BYTES: usize = 120;
+    if s.len() <= MAX_BYTES {
+        return s.to_string();
+    }
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX_BYTES)
+        .last()
+        .unwrap_or(0);
+    format!("{}… ({} bytes)", &s[..cut], s.len())
 }
 
 /// The atproto XRPC error envelope body: `{"error": "...", "message": "..."}`.
@@ -2747,13 +2967,13 @@ pub(crate) mod tests {
     /// look healthy.
     #[test]
     fn a_body_without_a_records_field_is_not_an_empty_page() {
-        let err = list_records_from_value(serde_json::json!({}))
-            .expect_err("`{}` was read as a page of zero records");
+        let err =
+            parse_list_records(br#"{}"#).expect_err("`{}` was read as a page of zero records");
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
-        let err = list_records_from_value(serde_json::json!({"cursor": "c"}))
+        let err = parse_list_records(br#"{"cursor":"c"}"#)
             .expect_err("a cursor-only body was read as a page");
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
-        let page = list_records_from_value(serde_json::json!({"records": []})).unwrap();
+        let page = parse_list_records(br#"{"records":[]}"#).unwrap();
         assert!(page.records.is_empty());
     }
 
@@ -3032,6 +3252,51 @@ pub(crate) mod tests {
         assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
         let page = parse_list_records(br#"{"records":[]}"#).expect("an empty page is a page");
         assert!(page.records.is_empty() && page.cursor.is_none());
+    }
+
+    /// **Both invariants, now read out of the bytes rather than out of a
+    /// `Value`.** Parsing once is the point of the change; parsing once while
+    /// quietly dropping a guard would be a much worse trade, and these are the
+    /// shapes those guards exist for.
+    #[test]
+    fn parsing_a_page_from_bytes_keeps_both_invariants() {
+        // Each shape names the reason it must fail for. Accepting either
+        // message would let the envelope guard be deleted without a test
+        // noticing, because an error envelope also has no `records` field — so
+        // it keeps failing, for a reason that stops applying the day a PDS
+        // returns an envelope alongside a records array.
+        for (label, body, because) in [
+            (
+                "an error envelope on a 2xx",
+                &br#"{"error":"InvalidRequest","message":"bad cursor"}"#[..],
+                "error envelope",
+            ),
+            (
+                "an envelope that also carries records",
+                &br#"{"error":"InvalidRequest","records":[]}"#[..],
+                "error envelope",
+            ),
+            (
+                "a body with no records field",
+                &br#"{"cursor":"c"}"#[..],
+                "no records",
+            ),
+            ("a proxy's empty object", &br#"{}"#[..], "no records"),
+            ("an empty body", &b""[..], "no records"),
+        ] {
+            let err = parse_list_records(body)
+                .map(|p| panic!("{label} was read as a page of {} records", p.records.len()))
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(because),
+                "{label} should have failed on {because:?}, got: {msg}"
+            );
+        }
+        let page = parse_list_records(br#"{"records":[],"cursor":"c"}"#)
+            .expect("a genuinely empty page is still a page");
+        assert!(page.records.is_empty());
+        assert_eq!(page.cursor.as_deref(), Some("c"));
     }
 
     #[test]
@@ -4003,6 +4268,320 @@ pub(crate) mod tests {
         assert!(
             msg.contains("2 held"),
             "did not accumulate across pages: {msg}"
+        );
+    }
+
+    /// **Shapes that used to read as a healthy empty page.**
+    ///
+    /// Each of these was accepted by the `Value` route as `records: []`, and an
+    /// empty page is not inert: `resolve_subscriptions` passes it to
+    /// `replace_sub_refs`, which DELETEs the reader's projection and rewrites
+    /// what it was handed. A page that is wrong in this direction costs them
+    /// every feed.
+    #[test]
+    fn a_page_that_is_not_a_listing_is_never_read_as_an_empty_one() {
+        for (label, body) in [
+            (
+                "a non-string error alongside records",
+                &br#"{"error":404,"records":[]}"#[..],
+            ),
+            (
+                "an object error alongside records",
+                &br#"{"error":{"code":"x"},"records":[]}"#[..],
+            ),
+            (
+                "a duplicated records key, the second one empty",
+                &br#"{"records":[{"uri":"at://d/c/r","value":{}}],"records":[]}"#[..],
+            ),
+            ("an explicit null records", &br#"{"records":null}"#[..]),
+        ] {
+            assert!(
+                parse_list_records(body).is_err(),
+                "{label} was read as a page"
+            );
+        }
+    }
+
+    /// **A non-string `error` is an envelope, and is reported as one.**
+    ///
+    /// Typing the field as a `String` made these fail as "invalid type" — the
+    /// wrong reason for the exact shape the guard exists for, which is the same
+    /// looseness that once let the guard be deleted unnoticed. So the reason is
+    /// asserted, not just the refusal.
+    #[test]
+    fn a_non_string_error_is_reported_as_an_envelope() {
+        for body in [
+            &br#"{"error":404,"records":[]}"#[..],
+            &br#"{"error":{"code":"x"},"records":[]}"#[..],
+            &br#"{"error":[],"records":[]}"#[..],
+            &br#"{"error":true,"records":[]}"#[..],
+        ] {
+            let err = parse_list_records(body)
+                .expect_err("a non-string error envelope was read as an empty page");
+            assert!(
+                format!("{err:#}").contains("error envelope"),
+                "{} failed for the wrong reason: {err:#}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // An empty name IS an envelope, as it was before this work: the route
+        // this replaced keyed on `as_str`, so `Some("")` bailed. Exempting it
+        // was a loosening made on speculation about proxy conventions, and a
+        // loosening in this direction is a page accepted that used to be
+        // refused.
+        for body in [
+            &br#"{"error":"","records":[]}"#[..],
+            // Not zero on the wire, but zero once read: an exemption keyed on
+            // `as_f64` swallowed anything that underflows.
+            &br#"{"error":1e-400,"records":[]}"#[..],
+        ] {
+            let err = parse_list_records(body).expect_err("this is an envelope");
+            assert!(
+                format!("{err:#}").contains("error envelope"),
+                "{} failed for the wrong reason: {err:#}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // The four spellings of "no error". `null` is what an ordinary listing
+        // carries; `false` and integer `0` are a proxy convention, and refusing
+        // those would fail a good page outright.
+        for body in [
+            &br#"{"error":null,"records":[]}"#[..],
+            &br#"{"error":false,"records":[]}"#[..],
+            &br#"{"error":0,"records":[]}"#[..],
+            &br#"{"records":[]}"#[..],
+        ] {
+            assert!(
+                parse_list_records(body).is_ok(),
+                "{} is not an error envelope",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// **A non-string `error` is named by its type, never by its contents.**
+    ///
+    /// Rendering the value would serialise the whole attacker-chosen subtree
+    /// before truncating it, allocating a full extra copy of up to the body cap
+    /// — in a change whose purpose is cutting peak allocation. The earlier
+    /// version of this did exactly that and the comment claimed otherwise.
+    #[test]
+    fn a_structured_error_is_named_by_its_type_not_serialised() {
+        let payload = "s".repeat(20_000);
+        let body = format!(r#"{{"error":{{"deep":"{payload}"}},"records":[]}}"#);
+        let err = parse_list_records(body.as_bytes()).expect_err("an envelope is a refusal");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("ssss"),
+            "the error's contents reached the message: {} chars",
+            msg.len()
+        );
+        assert!(
+            msg.contains("non-string error: object"),
+            "it should name the shape instead: {msg}"
+        );
+    }
+
+    /// `data` absent is not `data` empty, on the sidecar envelope too.
+    ///
+    /// `{"ok":true}` is what a proxy makes of an unexpected upstream body, and
+    /// reading it as a page of zero records is the wipe this whole family of
+    /// guards exists to prevent.
+    #[tokio::test]
+    async fn the_sidecar_refuses_an_envelope_with_no_data() {
+        for body in [&br#"{"ok":true}"#[..], &br#"{"ok":true,"data":{}}"#[..]] {
+            let base = crate::net::tests::serve_body(body.to_vec()).await;
+            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+            let err = client
+                .list_records(
+                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                    "app.feather.subscription",
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("an envelope without a listing was read as an empty page");
+            assert!(
+                format!("{err:#}").contains("no records"),
+                "{} failed for the wrong reason: {err:#}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// **The sidecar gets the duplicated-key refusal too.**
+    ///
+    /// It was the one client still reading a listing through a `Value`, where a
+    /// repeated key resolves last-wins — so a body carrying a second, empty
+    /// `records` array read as a successful empty page, and an empty page on this
+    /// path is `replace_sub_refs` deleting every `sub_ref` the reader has. It is
+    /// also the default backend, so it was the one that mattered most.
+    #[tokio::test]
+    async fn the_sidecar_refuses_a_duplicated_records_key() {
+        let base = crate::net::tests::serve_body(
+            br#"{"ok":true,"data":{"records":[{"uri":"at://d/c/r","value":{}}],"records":[]}}"#
+                .to_vec(),
+        )
+        .await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                None,
+                None,
+            )
+            .await
+            .expect_err("a duplicated records key was read as an empty page");
+        assert!(
+            format!("{err:#}").contains("duplicate"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// A non-string `message` must not fail an otherwise good page.
+    /// **A listing has to be an object.**
+    ///
+    /// serde's derived `Deserialize` takes a struct positionally too, so with
+    /// every field defaulted `[null,null,[]]` bound `records` to an empty vector
+    /// and read as a healthy page — and a body with no keys defeats the envelope
+    /// guard and the duplicated-key refusal at the same time, because neither has
+    /// anything to look at. Fourteen bytes, and `replace_sub_refs` deletes every
+    /// feed the reader has.
+    #[test]
+    fn a_listing_that_is_not_an_object_is_not_a_page() {
+        for body in [
+            &b"[null,null,[]]"[..],
+            &b"[null,null,[],null]"[..],
+            &br#"[null,null,[{"uri":"at://d/c/r","value":{}}],"c"]"#[..],
+            &b"[]"[..],
+            &br#""a string""#[..],
+            &b"0"[..],
+            &b"true"[..],
+        ] {
+            assert!(
+                parse_list_records(body).is_err(),
+                "{} was read as a page",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// **The rendering is bounded in bytes, whatever the input is made of.**
+    ///
+    /// Counting characters bounds nothing a log cares about: 120 astral-plane
+    /// code points are 480 bytes. The invariant is on the output's byte length.
+    #[test]
+    fn a_truncated_message_is_bounded_in_bytes() {
+        for (label, input) in [
+            ("ascii", "e".repeat(50_000)),
+            ("astral", "\u{1f600}".repeat(20_000)),
+            (
+                "mixed",
+                format!("{}{}", "e".repeat(200), "\u{1f600}".repeat(200)),
+            ),
+            (
+                "just over in bytes, just under in chars",
+                "\u{1f600}".repeat(40),
+            ),
+        ] {
+            let out = truncate_for_message(&input);
+            assert!(
+                out.len() <= 200,
+                "{label}: rendered {} bytes from {} bytes of input",
+                out.len(),
+                input.len()
+            );
+        }
+        // Short inputs pass through untouched.
+        assert_eq!(truncate_for_message("Boom"), "Boom");
+    }
+
+    /// **The sidecar has two envelope layers, and both are guards.**
+    ///
+    /// `page_from_body` covers the PDS's, which arrives inside `data`. The
+    /// sidecar's own can say `ok:false` or carry its own `error` on a 200 while
+    /// `data` still holds something that reads as a perfectly good empty page —
+    /// and an empty page here is `replace_sub_refs` deleting every feed.
+    #[tokio::test]
+    async fn the_sidecar_refuses_its_own_error_envelope_on_a_2xx() {
+        for body in [
+            &br#"{"ok":false,"error":"ExpiredToken","data":{"records":[]}}"#[..],
+            &br#"{"ok":true,"error":"ExpiredToken","data":{"records":[]}}"#[..],
+            &br#"{"ok":false,"data":{"records":[]}}"#[..],
+        ] {
+            let base = crate::net::tests::serve_body(body.to_vec()).await;
+            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+            let err = client
+                .list_records(
+                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                    "app.feather.subscription",
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("the sidecar's own envelope was read as a page");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("sidecar answered 2xx"),
+                "{} failed for the wrong reason: {msg}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// **An unknown field's contents are still validated.**
+    ///
+    /// `IgnoredAny` skips without validating, so a body that is not valid JSON at
+    /// all read as a healthy empty page where the route this replaced refused it.
+    #[test]
+    fn an_unknown_field_holding_invalid_json_is_not_a_page() {
+        for body in [
+            &b"{\"records\":[],\"x\":\"\xff\xfe\"}"[..],
+            &br#"{"records":[],"x":"\ud800"}"#[..],
+        ] {
+            assert!(
+                parse_list_records(body).is_err(),
+                "{} was read as a page",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_string_message_does_not_cost_the_page() {
+        let page = parse_list_records(br#"{"records":[],"message":5,"cursor":"c"}"#)
+            .expect("message carries no guard; typing it strictly failed whole listings");
+        assert_eq!(page.cursor.as_deref(), Some("c"));
+    }
+
+    /// The name that reaches the log is bounded, because the PDS chooses it.
+    #[test]
+    fn an_enormous_error_name_is_truncated_before_it_reaches_a_log() {
+        let huge = "e".repeat(50_000);
+        let body = format!(r#"{{"error":"{huge}","records":[]}}"#);
+        let err = parse_list_records(body.as_bytes()).expect_err("an envelope is a refusal");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.len() < 400,
+            "the error message carried {} bytes of attacker-chosen text",
+            msg.len()
+        );
+        assert!(
+            msg.contains("50000 bytes"),
+            "it should say what it dropped: {msg}"
+        );
+
+        // Astral-plane code points: the bound must hold in BYTES, because a log
+        // line is bytes. Counting characters made this four times the stated cap.
+        let wide = "\u{1f600}".repeat(20_000);
+        let body = format!(r#"{{"error":"{wide}","message":"{wide}","records":[]}}"#);
+        let err = parse_list_records(body.as_bytes()).expect_err("an envelope is a refusal");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.len() < 400,
+            "a wide-character error rendered {} bytes",
+            msg.len()
         );
     }
 
