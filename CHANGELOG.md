@@ -43,6 +43,52 @@ deploying is separate.
   the status on an over-cap or truncated error body, turning a `404` into a bare
   "body exceeded the cap". `xrpc_error_from` already makes the opposite choice
   deliberately, for this reason.
+- **A record walk is bounded in retained bytes, across all four walks.** Every
+  walk capped how many records it would accumulate, against a measured ~17 KB
+  document, and `MAX_LIST_PAGES` bounds requests rather than memory. A PDS whose
+  records are not that shape satisfies every count and still exhausts the box.
+
+  The bound charges what a parsed value **retains**, not what it takes on the
+  wire. A first attempt charged serialized length and was wrong by up to 42x: a
+  parsed value is a tree of 32-byte nodes in vectors that over-allocate, so
+  `[[],[],…]` costs three bytes of JSON and well over a hundred in memory.
+  Measured against that estimate, a budget reporting 119 MiB held a process at
+  5.6 GiB. Every arm now charges at least the node itself, and an object charges
+  for its backing node — `serde_json::Map` is a `BTreeMap` whose leaf carries
+  room for eleven pairs and is allocated whole, so a one-key object costs what
+  an eleven-key one does. Charging it as an ordinary container under-reported
+  object-shaped records by about half: the same failure two orders of magnitude
+  smaller, caught by a later review round.
+
+  **128 MiB of accumulation per read, which is not 128 MiB of memory.** Every
+  charge is taken after the page is already built, so the true peak is the ceiling
+  plus one page's tree — and a page's tree is not small: an 8 MB response of
+  one-key objects retains 824 MB, 98x its wire size. A bound consulted after the
+  allocation cannot prevent it. What it does prevent is accumulation across pages
+  and across the walks of one read. The single-page case needs a smaller wire cap
+  or a counting parser, and is filed as #197 rather than implied here.
+
+  A caller passes one budget into every walk it makes, so a publication read —
+  which runs a second walk while still holding the first's records — is bounded
+  once rather than twice; two independent ceilings put about 384 MB of
+  accumulation in flight. Only that one caller threads it today and it has no
+  production entry point yet, so every live read still builds a ceiling per walk
+  and nothing bounds concurrent requests.
+
+  The figure differs in effect per walk, because the record caps do. The
+  subscription walks cap at 20 000 records and a real subscription charges
+  2 188 bytes here — 2 764 with a folder and a fetch hint — so a full repo is 42
+  to 53 MB and the count binds first. That matters most on those walks because
+  their verdict is a refusal, which drops the reader into the fail-closed branch.
+  The publication walk caps at 2 000 documents, about 37 MB at the measured ~17 KB
+  article; above roughly 66 KB per article the budget binds first and the walk
+  truncates early. So it is not true that nothing truncates that did not truncate
+  before, and an earlier draft of this entry said so — as it also said 64 MiB,
+  30 MB and 33 KB, all of which this work has since corrected.
+
+  The two verdicts differ. The three walks feeding `replace_sub_refs` refuse,
+  since a short list there is revoked access. The publication read truncates and
+  reports `complete: false`, which it already models.
 
 ### Fixed
 
@@ -127,7 +173,32 @@ deploying is separate.
   killed by one of them. Four more for the operational findings: leaving
   orphaned poll state, keeping `next_poll` on an unpollable row, aborting the
   boot on an unreadable row, and abandoning the pass at one.
-- The suite stands at 877 tests, 875 passing and two ignored.
+- The suite stands at **893 tests**: 890 pass, two are ignored, and one is the
+  load-sensitive TLS failure filed as #195.
+  Earlier drafts of this entry said 877, 884 and 885; none was measured.
+
+- **A mock that serves a different body per request**, which this suite did not
+  have. The fixed-body servers answer every request identically, so a paging
+  walk sees the same cursor twice and its repeat-detection guard stops it at two
+  pages — which makes anything that only happens *across* pages unreachable.
+  That is how a cap that was per-page rather than per-walk, and therefore 200x
+  weaker, once passed an entire suite unnoticed.
+- Eleven for the walk budget, each mutation-checked. One asserts against heap
+  figures that were taken with a counting allocator, which is what catches an
+  under-charge the node-count property cannot see — but it hardcodes them rather
+  than measuring, so it is a tripwire for the estimate changing and not for the
+  real cost changing. Another computes that a full subscription repo fits the
+  budget twice over, which is the calculation a reviewer found stated wrongly in
+  a comment because nothing computed it.
+  Twenty mutations, all killed by a named test — including the five from the
+  second review round and the two from the third. One is not: `standard_site::fetch`
+  passing a single budget to both its walks is unpinned, because reaching it needs
+  a mock serving the PLC directory and two collections. The sharing mechanism is
+  pinned; that one call site is not. The rest: the per-page budget in each of the four walks, dropping the
+  recursion into arrays and into objects, charging scalars nothing, the
+  exact-fit fence-post, a refusal resetting the running total, an uncharged uri
+  and cid, removing the check from the live walk entirely, charging a map as an
+  ordinary container, and halving its backing node.
 
 ### Corrected in review
 
@@ -203,6 +274,19 @@ therefore invisible. The ingest floor closes both cases at once and is the right
 place for it.
 
 ### Known, not fixed here
+
+- **The walk budget is per-walk, and walks nest.** `standard_site::fetch` holds
+  the publication walk's records alive while the document walk runs, and the
+  login path runs four list walks and retains all four results, so the real
+  process ceiling is a multiple of one walk's budget. The constant's own doc
+  calls it "the memory one walk may retain", which is accurate and easy to
+  over-trust.
+- **A page is charged only after it has been materialised.** The refusing walks
+  charge the whole page and the truncating walk now refuses any single page
+  larger than the budget, so the transient is bounded — but it is bounded after
+  the allocation, not before it. Bounding it earlier means not parsing the page
+  until its size is known, which is a change to the transport rather than to the
+  walk.
 
 - Admitting a new kind to `FeedKind::POLLABLE` makes a whole population of rows
   due at once: `due_feeds` sorts unscheduled rows ahead of every scheduled one,

@@ -149,7 +149,21 @@ impl Repo<'_> {
     /// unbounded walk is a denial-of-service against ourselves. A cursor that
     /// does not advance also terminates the walk rather than spinning.
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_within(
+            collection,
+            &mut crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES),
+        )
+        .await
+    }
+
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
+    pub(crate) async fn list_all_records_within(
+        &self,
+        collection: &str,
+        budget: &mut crate::atproto::ByteBudget,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
 
         for _ in 0..MAX_LIST_PAGES {
@@ -161,6 +175,14 @@ impl Repo<'_> {
             // bounds requests, not memory, unless the server honours our limit.
             // This is the LIVE walk on `backend=rust` — its result reaches
             // `replace_sub_refs`, so a truncation here is revoked access.
+            if !budget.admit(&page) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+                     ({} held, {} bytes charged) — refusing to accumulate further",
+                    out.len(),
+                    budget.used(),
+                );
+            }
             crate::atproto::extend_bounded(&mut out, page, MAX_LIST_RECORDS, collection)?;
             match next {
                 // `got > 0` is not defensive tidiness -- it is a whole round
@@ -690,6 +712,51 @@ mod tests {
         assert!(
             format!("{err:#}").contains("InvalidRequest"),
             "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **The live walk spends its budget across pages too.**
+    ///
+    /// This is the `backend=rust` walk whose result reaches `replace_sub_refs`,
+    /// so a bound that silently failed to accumulate here would revoke a
+    /// reader's access to every feed past the cut. Three pages, a two-page
+    /// budget: the walk must refuse, and must say it kept two.
+    #[tokio::test]
+    async fn the_live_walk_spends_its_budget_across_pages() {
+        let (bodies, per_page) = crate::atproto::tests::paged_bodies(3, 4096, false);
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "live-budget-pages.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://live-budget-pages.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_all_records_within(
+                "app.feather.subscription",
+                &mut crate::atproto::ByteBudget::new(per_page * 2),
+            )
+            .await
+            .expect_err("three pages cannot fit in a two-page budget");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("byte cap"), "wrong bound reported: {msg}");
+        assert!(
+            msg.contains("2 held"),
+            "the live walk did not accumulate across pages: {msg}"
         );
     }
 

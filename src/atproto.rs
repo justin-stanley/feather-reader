@@ -230,6 +230,174 @@ impl RecordWalk {
     }
 }
 
+/// The memory one walk may retain.
+///
+/// **A record cap bounds memory only if you know what a record costs.** The
+/// caps above are counts, chosen against a measured ~17 KB document, and
+/// `MAX_LIST_PAGES` bounds requests rather than bytes. A PDS whose records are
+/// not that shape satisfies every count and still exhausts the box.
+///
+/// **128 MiB of ACCUMULATION per read — which is not the same as 128 MiB of
+/// memory, and an earlier version of this comment said it was.**
+///
+/// Every charge here is taken after `serde_json` has already built the page, so
+/// the true peak is this ceiling plus one page's tree, and a page's tree is not
+/// small: measured, an 8 MB response of `{"":0}` objects retains 824 MB, a
+/// wire-to-heap amplification of 98x. A bound consulted after the allocation
+/// cannot prevent that allocation. What it does prevent is the accumulation
+/// across pages and across the walks of one read, which is the part that scales
+/// with how long a walk runs rather than with one response.
+///
+/// Closing the single-page case needs a smaller wire cap for `listRecords` or a
+/// parser that counts as it goes. Neither belongs to this bound; both are filed
+/// as #197 rather than implied here.
+///
+/// A caller passes one [`ByteBudget`] into every walk it makes, so a publication
+/// read — which runs a second walk while still holding the first's records — is
+/// bounded once rather than twice. Two independent ceilings put roughly 384 MB of
+/// accumulation in flight: 128 for the publications, 128 for the documents, and a
+/// further 128 of transient page because the per-page check compared against the
+/// ceiling instead of what was left.
+///
+/// **Only one caller threads it today**, and that caller has no production entry
+/// point yet: the publication reader is not wired to the poller. Every live read
+/// builds its own ceiling per walk, so the per-request total is still a multiple
+/// of this number — two walks on an OPML export, four on a login — and nothing
+/// bounds concurrent requests at all.
+/// An earlier version of this constant was also 128 MiB while
+/// [`approx_bytes`] charged serialized length — 42x optimistic on hostile
+/// shapes, so the bound was nearly fiction. It was then cut to 64 MiB to
+/// compensate. Charging nodes removed the reason for the cut: the charge is now
+/// at or above what the page really retains, so 128 MiB of budget is at most
+/// 128 MiB of memory, which a 512 MB box carries.
+///
+/// The cut had a cost, measured rather than assumed. Per walk:
+///
+/// - The subscription walks cap at 20 000 records (5 000 on the live one). A
+///   real five-field subscription charges **2 188 bytes** here, and one carrying
+///   a folder and a fetch hint charges **2 764** — so a full repo is 42 to 53 MB,
+///   which was 65 to 82 % of a 64 MiB budget. Their verdict is a hard refusal
+///   that drops the reader into the fail-closed branch, so an account near the
+///   record cap with slightly longer titles would have served a stale projection
+///   on every poll, permanently. At 128 MiB that is 41 % and the count still
+///   binds first. An earlier version of this comment claimed 1.5 KB and 30 MB;
+///   that is a three-field record, not a real one.
+/// - The publication walk caps at [`MAX_LARGE_RECORDS`] (2 000). At the measured
+///   ~17 KB document that is about 37 MB either way. Above roughly 66 KB per
+///   article the budget binds first and the walk truncates early, reporting
+///   `complete: false` as it already does for the record cap.
+///
+/// So the counts bind first on everything measured, and a publication of
+/// extremely long articles truncates sooner than the count would. It remains
+/// untrue that nothing truncates that did not truncate before.
+pub(crate) const MAX_LIST_BYTES: usize = 128 * 1024 * 1024;
+
+/// What one record retains once parsed.
+///
+/// **Nodes, not serialized text.** An earlier version of this charged the
+/// length of the JSON, which is the wrong quantity by up to 42x: a parsed value
+/// is a tree of 32-byte nodes held in vectors that over-allocate, so `[[],[]…]`
+/// costs three bytes on the wire and well over a hundred in memory. Measured
+/// against that estimate, a budget reporting 119 MiB held a process at 5.6 GiB.
+///
+/// Every arm therefore charges at least the node itself, and a container
+/// charges for the slack its backing allocation carries. The result
+/// over-estimates on every adversarial shape and costs honest traffic a couple
+/// of percent, which is the direction a bound has to err in.
+pub(crate) fn approx_bytes(entry: &RecordEntry) -> usize {
+    2 * std::mem::size_of::<RecordEntry>()
+        + entry.uri.len()
+        + entry.cid.as_ref().map_or(0, String::len)
+        + json_bytes(&entry.value)
+}
+
+/// What a parsed JSON value retains, without measuring the heap.
+fn json_bytes(v: &serde_json::Value) -> usize {
+    /// Every value, of every kind, occupies one of these wherever it sits.
+    const NODE: usize = std::mem::size_of::<serde_json::Value>();
+    /// Two nodes per value: the slot it occupies, and the slack the container
+    /// holding it carries — a `Vec` grows by doubling, so up to one spare slot
+    /// per live one.
+    const SLOT: usize = 2 * NODE;
+    /// A map entry is a tree node of its own, with links and a key beside the
+    /// value. Rounded up rather than derived, since the layout is not ours.
+    const MAP_ENTRY: usize = 104;
+    /// A map's backing node, allocated whole.
+    ///
+    /// **Empirical, and not derived from anything the compiler checks.** Unlike
+    /// [`NODE`], which is a `size_of`, this and `MAP_ENTRY` come from measuring
+    /// `std`'s `BTreeMap` layout — B = 6, so eleven pairs to a leaf — under the
+    /// `serde_json` in this lockfile. A toolchain that changes that layout, or a
+    /// `serde_json` that swaps the map type, moves the real cost without moving
+    /// these. The known-answer test below is the tripwire, and it is only as
+    /// good as the day its figures were taken.
+    ///
+    /// `serde_json::Map` is a `BTreeMap` here — no `preserve_order` in the
+    /// lock — and its leaf carries room for eleven pairs whether or not they
+    /// are used, measured at ~632 bytes. So a one-key object costs what an
+    /// eleven-key one does, and a chain of them costs that per level. Charging
+    /// a container's minimum the way an array does under-reports this by about
+    /// half, which is the same failure as the version this replaces, two orders
+    /// of magnitude smaller.
+    const MAP_NODE: usize = 512;
+    match v {
+        // The `4 * NODE` is the container's own minimum allocation; each child
+        // then charges for itself, recursively. Dropping that recursion is what
+        // made an array of empty arrays look free.
+        serde_json::Value::Array(a) => 4 * NODE + a.iter().map(json_bytes).sum::<usize>(),
+        serde_json::Value::Object(o) => {
+            MAP_NODE
+                + o.iter()
+                    .map(|(k, v)| MAP_ENTRY + k.len().max(NODE / 2) + SLOT + json_bytes(v))
+                    .sum::<usize>()
+        }
+        serde_json::Value::String(s) => SLOT + s.len(),
+        // Null, bool and number are all the node and nothing else.
+        _ => SLOT,
+    }
+}
+
+/// Running byte accounting for one walk.
+pub(crate) struct ByteBudget {
+    used: usize,
+    max: usize,
+}
+
+impl ByteBudget {
+    pub(crate) fn new(max: usize) -> Self {
+        Self { used: 0, max }
+    }
+
+    /// Charge a page. `false` when the walk must stop; a refused page is NOT
+    /// charged, so `used` always describes what the caller actually kept.
+    pub(crate) fn admit(&mut self, page: &[RecordEntry]) -> bool {
+        let cost: usize = page.iter().map(approx_bytes).sum();
+        match self.used.checked_add(cost) {
+            Some(total) if total <= self.max => {
+                self.used = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+
+    /// The ceiling this budget was built with.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    /// What is left. A transient page has to fit in this, not in the ceiling —
+    /// otherwise a walk that has already retained most of its budget can still
+    /// hold a full budget's worth of page on top of it.
+    pub(crate) fn remaining(&self) -> usize {
+        self.max.saturating_sub(self.used)
+    }
+}
+
 /// Append a page, refusing to exceed `max`.
 ///
 /// **An error, never a truncation.** The caller of the live walk is
@@ -856,13 +1024,41 @@ impl PdsClient {
     /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_within(collection, &mut ByteBudget::new(MAX_LIST_BYTES))
+            .await
+    }
+
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
+    ///
+    /// **Shared, not per-walk.** Two walks that nest — a publication read runs a
+    /// second walk while still holding the first's records — each had their own
+    /// ceiling, so the process could hold twice it. Passing one budget in makes
+    /// the bound a property of the caller's whole read, which is the thing that
+    /// has to fit in the box, and the type enforces it where a comment would not.
+    pub(crate) async fn list_all_records_within(
+        &self,
+        collection: &str,
+        budget: &mut ByteBudget,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
+            // **Refused, not truncated**, for the reason `extend_bounded`
+            // gives: this walk feeds `replace_sub_refs`, where a short list is
+            // revoked access.
+            if !budget.admit(&page.records) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+                     ({} held, {} bytes charged) — refusing to accumulate further",
+                    out.len(),
+                    budget.used(),
+                );
+            }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
                 // Guard against a PDS that echoes a cursor with an empty page,
@@ -906,6 +1102,27 @@ impl PdsClient {
         collection: &str,
         max_records: usize,
         page_size: u32,
+        keep: impl FnMut(&RecordEntry) -> bool,
+    ) -> Result<RecordWalk> {
+        self.list_recent_matching_within(
+            collection,
+            max_records,
+            &mut ByteBudget::new(MAX_LIST_BYTES),
+            page_size,
+            keep,
+        )
+        .await
+    }
+
+    /// [`list_recent_matching`](Self::list_recent_matching) against a caller's
+    /// budget. See [`list_all_records_within`](Self::list_all_records_within) for
+    /// why it is the caller's and not the walk's.
+    pub(crate) async fn list_recent_matching_within(
+        &self,
+        collection: &str,
+        max_records: usize,
+        budget: &mut ByteBudget,
+        page_size: u32,
         mut keep: impl FnMut(&RecordEntry) -> bool,
     ) -> Result<RecordWalk> {
         let mut out = Vec::new();
@@ -919,7 +1136,27 @@ impl PdsClient {
             // cursor with an empty page, or hand back the same one forever.)
             let more =
                 matches!(&page.cursor, Some(next) if got > 0 && Some(next) != cursor.as_ref());
+            // **The transient page needs its own bound.** The running total
+            // charges what is KEPT, because that is what the walk retains and a
+            // page is dropped after the filter. But transient is not free, and
+            // `net::read_capped`'s 8 MB bounds the WIRE — the whole point of
+            // this budget is that wire size and retained size are not the same
+            // number. A page of records the filter rejects entirely charges
+            // nothing against the total and can still hold hundreds of
+            // megabytes, so no single page may exceed the walk's budget alone.
+            let page_cost: usize = page.records.iter().map(approx_bytes).sum();
+            if page_cost > budget.remaining() {
+                return Ok(RecordWalk::partial(out));
+            }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
+            // Charged on what is KEPT, which is what this walk retains. **This
+            // cannot refuse**, and saying so matters: the page check above
+            // already proved the whole page fits in the remainder, and `kept` is
+            // a subset of it. Written as `if !admit(…) { return }` it reads as a
+            // second stopping rule, and a reader would look for the case that
+            // trips it. There isn't one — the call is the bookkeeping.
+            let charged = budget.admit(&kept);
+            debug_assert!(charged, "the page charge already proved this fits");
             if extend_truncating(&mut out, kept, max_records) {
                 return Ok(RecordWalk::partial(out));
             }
@@ -1424,13 +1661,36 @@ impl SidecarClient {
     /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
     /// PDS, so the page count is ultimately remote-controlled here too.
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
+        self.list_all_records_within(did, collection, &mut ByteBudget::new(MAX_LIST_BYTES))
+            .await
+    }
+
+    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
+    pub(crate) async fn list_all_records_within(
+        &self,
+        did: &str,
+        collection: &str,
+        budget: &mut ByteBudget,
+    ) -> Result<Vec<RecordEntry>> {
         let mut out = Vec::new();
+        let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(did, collection, Some(100), cursor.as_deref())
                 .await?;
             let got = page.records.len();
+            // The sidecar proxies the account's PDS, so this walk's size is as
+            // remote-controlled as the direct client's. It carried no budget at
+            // all until a review noticed it was the default backend.
+            if !budget.admit(&page.records) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+                     ({} held, {} bytes charged) — refusing to accumulate further",
+                    out.len(),
+                    budget.used(),
+                );
+            }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
                 Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
@@ -2221,7 +2481,7 @@ async fn xrpc_error_from(resp: reqwest::Response) -> AtProtoError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// **Regression (v0.2.8 review).** Every guarded call caps its *success*
@@ -3341,6 +3601,409 @@ mod tests {
         // Page 1: cursor None → "same". Page 2: "same" again → stop, after
         // taking that page. Two pages, not two hundred.
         assert_eq!(records.len(), 2, "a repeated cursor was followed");
+    }
+
+    // -- walk byte budget ---------------------------------------------------
+
+    /// What a parsed value really costs, counted independently of the code
+    /// under test: every node occupies a `Value`, wherever it sits.
+    fn node_count(v: &serde_json::Value) -> usize {
+        1 + match v {
+            serde_json::Value::Array(a) => a.iter().map(node_count).sum::<usize>(),
+            serde_json::Value::Object(o) => o.values().map(node_count).sum::<usize>(),
+            _ => 0,
+        }
+    }
+
+    fn record_of(value: serde_json::Value) -> RecordEntry {
+        RecordEntry {
+            uri: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/c/3lab".to_string(),
+            cid: Some("bafyreiabc123def456ghi789jkl012mno345pqr678stu901".to_string()),
+            value,
+        }
+    }
+
+    /// **The estimate must never under-report, on any shape.**
+    ///
+    /// The version this replaces charged serialized length, which is accurate
+    /// on prose-shaped records and 42x optimistic on the shapes an attacker
+    /// picks. A bound that is only correct on benign input is not a bound.
+    #[test]
+    fn the_estimate_charges_every_node_at_least_what_a_parsed_value_costs() {
+        let deep: serde_json::Value =
+            serde_json::from_str(&format!("{}{}", "[".repeat(100), "]".repeat(100))).unwrap();
+        let shapes: Vec<(&str, serde_json::Value)> = vec![
+            ("100 nested empty arrays", deep),
+            (
+                "4096 empty arrays",
+                serde_json::json!(vec![serde_json::json!([]); 4096]),
+            ),
+            ("4096 empty strings", serde_json::json!(vec![""; 4096])),
+            (
+                "4096 nulls",
+                serde_json::json!(vec![serde_json::Value::Null; 4096]),
+            ),
+            ("4096 bools", serde_json::json!(vec![true; 4096])),
+            ("4096 small numbers", serde_json::json!(vec![0; 4096])),
+            (
+                "object with short keys",
+                serde_json::Value::Object(
+                    (0..4096)
+                        .map(|i| (format!("k{i}"), serde_json::json!([])))
+                        .collect(),
+                ),
+            ),
+            (
+                "a realistic document",
+                serde_json::json!({
+                    "$type": "site.standard.document",
+                    "title": "A post with a reasonably typical title",
+                    "path": "/posts/one",
+                    "publishedAt": "2026-07-11T09:30:00Z",
+                    "textContent": "x".repeat(17_000),
+                }),
+            ),
+        ];
+        for (label, value) in shapes {
+            let entry = record_of(value);
+            let charged = approx_bytes(&entry);
+            let floor = node_count(&entry.value) * std::mem::size_of::<serde_json::Value>();
+            assert!(
+                charged >= floor,
+                "{label}: charged {charged} for {} nodes, which cannot cost less than {floor}",
+                node_count(&entry.value)
+            );
+            let wire = serde_json::to_vec(&entry.value).unwrap().len();
+            assert!(
+                charged >= wire,
+                "{label}: charged {charged}, under the {wire} bytes it takes on the wire alone"
+            );
+        }
+    }
+
+    /// **Known answers, taken from a real allocator elsewhere.**
+    ///
+    /// The property above models `Value` nodes and nothing else, which is how an
+    /// object-shaped under-charge of about half slipped past it: a
+    /// `serde_json::Map` is a `BTreeMap` whose leaf is allocated whole, so the
+    /// entries' own nodes are not the cost.
+    ///
+    /// **This test does not measure anything.** The two figures were obtained
+    /// with a counting global allocator against the `serde_json` in this
+    /// lockfile and are hardcoded here, because a global allocator is not
+    /// something to install in the suite for one assertion. That makes this a
+    /// tripwire for the *estimate* changing, not for the *real cost* changing: a
+    /// dependency or toolchain bump that grows a map's true footprint leaves this
+    /// green and the estimate quietly short again. Re-taking these numbers is the
+    /// price of trusting them.
+    #[test]
+    fn the_estimate_covers_shapes_measured_against_a_real_allocator() {
+        let many_small = serde_json::json!(vec![serde_json::json!({"a": 0}); 5000]);
+        let mut deep = serde_json::json!({"a": 0});
+        for _ in 0..99 {
+            deep = serde_json::json!({ "a": deep });
+        }
+        for (label, value, measured) in [
+            ("5000 one-key objects", many_small, 3_430_000usize),
+            ("a 100-deep chain of one-key objects", deep, 63_350),
+        ] {
+            let charged = approx_bytes(&record_of(value));
+            assert!(
+                charged >= measured,
+                "{label}: charged {charged} against {measured} bytes actually held"
+            );
+        }
+    }
+
+    #[test]
+    fn the_estimate_counts_the_uri_and_cid_too() {
+        let bare = RecordEntry {
+            uri: String::new(),
+            cid: None,
+            value: serde_json::json!(null),
+        };
+        let addressed = record_of(serde_json::json!(null));
+        assert!(
+            approx_bytes(&addressed) > approx_bytes(&bare),
+            "a record's own identifiers are retained alongside its value"
+        );
+    }
+
+    #[test]
+    fn the_budget_admits_a_page_that_exactly_fills_it() {
+        let page = vec![record_of(serde_json::json!({"t": "x".repeat(1000)}))];
+        let exact: usize = page.iter().map(approx_bytes).sum();
+        assert!(
+            ByteBudget::new(exact).admit(&page),
+            "a page that exactly fits was refused; the fence-post is one byte out"
+        );
+        assert!(
+            !ByteBudget::new(exact - 1).admit(&page),
+            "a page one byte over the budget was admitted"
+        );
+    }
+
+    #[test]
+    fn a_refused_page_leaves_the_running_total_alone() {
+        let small = vec![record_of(serde_json::json!({"t": "x".repeat(100)}))];
+        let huge = vec![record_of(serde_json::json!({"t": "x".repeat(100_000)}))];
+        let cost: usize = small.iter().map(approx_bytes).sum();
+        let mut budget = ByteBudget::new(cost * 3);
+
+        assert!(budget.admit(&small), "the first page fits");
+        let after_one = budget.used();
+        assert!(after_one > 0, "an admitted page must be charged");
+
+        assert!(!budget.admit(&huge), "the oversized page must be refused");
+        assert_eq!(
+            budget.used(),
+            after_one,
+            "a refused page moved the total — either charged, or reset"
+        );
+        assert!(
+            budget.admit(&small),
+            "the walk could not continue against the total it had before the refusal"
+        );
+    }
+
+    /// Build `pages` responses, each holding one record of about `bytes`, each
+    /// pointing at the next. Returns the base URL and what one page costs.
+    ///
+    /// **Pages that differ is the whole point.** A walk served the same body
+    /// twice stops on its repeated-cursor guard, so every test built on the
+    /// fixed-body server refuses on page one and never exercises accumulation
+    /// at all — which is how a per-page budget once passed a whole suite.
+    pub(crate) fn paged_bodies(
+        pages: usize,
+        bytes: usize,
+        envelope: bool,
+    ) -> (Vec<Vec<u8>>, usize) {
+        let record = |i: usize| {
+            serde_json::json!({
+                "uri": format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/c/3lab{i}"),
+                "cid": "bafyreiabc123def456ghi789jkl012mno345pqr678stu901",
+                "value": { "t": "x".repeat(bytes) }
+            })
+        };
+        let bodies = (0..pages)
+            .map(|i| {
+                let mut page = serde_json::json!({ "records": [record(i)] });
+                if i + 1 < pages {
+                    page["cursor"] = serde_json::json!(format!("p{}", i + 1));
+                }
+                if envelope {
+                    page = serde_json::json!({ "ok": true, "data": page });
+                }
+                page.to_string().into_bytes()
+            })
+            .collect();
+        let entry: RecordEntry = serde_json::from_value(record(0)).unwrap();
+        (bodies, approx_bytes(&entry))
+    }
+
+    async fn host_for(bodies: Vec<Vec<u8>>, host: &str) -> (String, u16) {
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        (format!("http://{host}:{port}"), port)
+    }
+
+    /// **The budget is spent across pages, not reset by each one.**
+    ///
+    /// The single test this project most needed and did not have. Without it,
+    /// moving the budget's construction inside the page loop — making the cap
+    /// 200x weaker and effectively inert — passed every test in the suite.
+    #[tokio::test]
+    async fn a_refusing_walk_spends_its_budget_across_pages() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-accumulate.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        let err = client
+            .list_all_records_within("c", &mut ByteBudget::new(per_page * 2))
+            .await
+            .expect_err("three pages cannot fit in a two-page budget");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("byte cap"), "wrong bound reported: {msg}");
+        assert!(
+            msg.contains("2 held"),
+            "the walk did not keep exactly the two pages that fit: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncating_walk_keeps_the_pages_that_fit() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-accumulate-trunc.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut ByteBudget::new(per_page * 2), 100, |_| {
+                true
+            })
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert_eq!(
+            walk.records.len(),
+            2,
+            "the pages that fit were not kept, or the refused one was"
+        );
+        assert!(
+            !walk.complete,
+            "a walk stopped by the budget called itself complete"
+        );
+    }
+
+    /// **The budget must not bind before the record cap does, with room spare.**
+    ///
+    /// The walks that carry `MAX_LIST_RECORDS` REFUSE when a bound is hit, and a
+    /// refusal drops the reader into `resolve_subscriptions`' fail-closed branch
+    /// — so an account near the record cap would serve a stale projection on
+    /// every poll, forever. The figure quoted in `MAX_LIST_BYTES`'s own comment
+    /// is this calculation, and a review caught that figure being wrong by a
+    /// factor of two because nothing computed it. This does.
+    ///
+    /// Double, not merely under: the margin is what stops a slightly longer
+    /// title or one more optional field from turning a working account into a
+    /// permanently failing one.
+    #[test]
+    fn a_full_subscription_repo_fits_the_budget_twice_over() {
+        let record = record_of(serde_json::json!({
+            "$type": "community.lexicon.rss.subscription",
+            "url": "https://example.com/blog/feed.xml",
+            "title": "Some Blog With A Longish Name",
+            "siteUrl": "https://example.com/blog",
+            "createdAt": "2026-07-11T09:30:00Z",
+            "folder": "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.folder/3lab999",
+            "fetchHint": "hourly",
+        }));
+        let per_record = approx_bytes(&record);
+        let full_repo = per_record * MAX_LIST_RECORDS;
+        assert!(
+            full_repo * 2 <= MAX_LIST_BYTES,
+            "a full repo charges {per_record} B x {MAX_LIST_RECORDS} = {} MB against a {} MB \
+             budget — too close for a walk whose verdict is a refusal",
+            full_repo / (1024 * 1024),
+            MAX_LIST_BYTES / (1024 * 1024)
+        );
+    }
+
+    /// **A budget passed to two walks is spent by both of them.**
+    ///
+    /// The reason it is passed rather than constructed: a publication read runs
+    /// a second walk while still holding the first's records, so two independent
+    /// ceilings let one read hold twice the bound. Here the first walk spends
+    /// the budget and the second finds it spent.
+    #[tokio::test]
+    async fn two_walks_sharing_a_budget_do_not_each_get_the_whole_of_it() {
+        let (bodies, per_page) = paged_bodies(4, 4096, false);
+        let (base, _) = host_for(bodies, "budget-shared.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let mut budget = ByteBudget::new(per_page * 3);
+
+        let err = client
+            .list_all_records_within("c", &mut budget)
+            .await
+            .expect_err("four pages cannot fit a three-page budget");
+        assert!(format!("{err:#}").contains("3 held"), "{err:#}");
+
+        // Same budget, nothing left in it.
+        let err = client
+            .list_all_records_within("c", &mut budget)
+            .await
+            .expect_err("the second walk was handed a fresh ceiling");
+        assert!(
+            format!("{err:#}").contains("0 held"),
+            "the second walk kept something out of an exhausted budget: {err:#}"
+        );
+    }
+
+    /// **A transient page has to fit what is LEFT of the budget.**
+    ///
+    /// Measuring it against the ceiling lets a walk that has already retained
+    /// most of its budget hold a further ceiling's worth of page on top. The
+    /// filter keeps nothing here, so the running total cannot stop the walk and
+    /// only the remaining-budget comparison can.
+    #[tokio::test]
+    async fn a_transient_page_must_fit_what_is_left_not_the_ceiling() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-remaining.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        // Ceiling of two and a half pages, two of them already spent.
+        let mut budget = ByteBudget::new(per_page * 5 / 2);
+        let spent = vec![
+            record_of(serde_json::json!({ "t": "x".repeat(4096) })),
+            record_of(serde_json::json!({ "t": "x".repeat(4096) })),
+        ];
+        assert!(budget.admit(&spent), "the pre-spend has to fit");
+        assert!(
+            budget.remaining() < per_page,
+            "and has to leave less than a page"
+        );
+
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut budget, 100, |_| false)
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert!(
+            !walk.complete,
+            "a page larger than the remaining budget was walked past"
+        );
+    }
+
+    /// **A filter that keeps nothing must not let the walk run unbounded.**
+    ///
+    /// The running total charges what is kept, so a filter matching nothing
+    /// charges zero and the total can never stop the walk. What it holds is
+    /// another matter: each page is fully parsed before the filter sees it, and
+    /// `read_capped`'s 8 MB bounds the wire, not the tree. Only the per-page
+    /// bound stands between that and the box.
+    #[tokio::test]
+    async fn a_filter_that_keeps_nothing_still_cannot_outrun_the_budget() {
+        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (base, _) = host_for(bodies, "budget-filtered.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut ByteBudget::new(per_page / 2), 100, |_| {
+                false
+            })
+            .await
+            .expect("an additive walk truncates rather than failing");
+        assert!(
+            !walk.complete,
+            "a page too large to hold was walked past because the filter dropped it"
+        );
+        assert!(walk.records.is_empty(), "the filter kept nothing");
+    }
+
+    #[tokio::test]
+    async fn the_sidecar_walk_spends_its_budget_across_pages() {
+        let (bodies, per_page) = paged_bodies(3, 4096, true);
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+
+        let err = client
+            .list_all_records_within(
+                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "app.feather.subscription",
+                &mut ByteBudget::new(per_page * 2),
+            )
+            .await
+            .expect_err("the sidecar walk was the one with no budget at all");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("byte cap"), "wrong bound reported: {msg}");
+        assert!(
+            msg.contains("2 held"),
+            "did not accumulate across pages: {msg}"
+        );
     }
 
     // -- TID rkeys ----------------------------------------------------------

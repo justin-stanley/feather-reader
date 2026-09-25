@@ -1515,6 +1515,91 @@ pub(crate) mod tests {
         (format!("http://{addr}/"), hits)
     }
 
+    /// Serve a different body per request, in order, repeating the last.
+    ///
+    /// **The fixed-body servers cannot test a walk.** `serve_body` answers every
+    /// request identically, so a paging walk sees the same cursor twice and its
+    /// repeat-detection guard stops it at two pages. Anything that only happens
+    /// across pages — a budget accumulating, a cursor advancing — is therefore
+    /// unreachable with them, which is how a cap that was per-page rather than
+    /// per-walk once passed an entire suite.
+    ///
+    /// Each request is a fresh connection (`Connection: close`), so accept order
+    /// is request order for the sequential walks that use this.
+    pub(crate) async fn serve_bodies_in_sequence(bodies: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert!(!bodies.is_empty(), "serve_bodies_in_sequence needs a body");
+        let bodies = std::sync::Arc::new(bodies);
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = bodies[i.min(bodies.len() - 1)].clone();
+                tokio::spawn(async move {
+                    // **Drain the whole request head, not one fixed read.** A
+                    // DPoP-signed XRPC request head measures ~880 bytes, so a
+                    // single 1024-byte read is within a longer NSID or cursor
+                    // of leaving bytes unread — and closing with data still in
+                    // the receive queue makes the kernel send RST instead of
+                    // FIN, which can discard a response the client has not
+                    // drained. That surfaces as an intermittent connection
+                    // reset in a test whose failure would read as a budget bug.
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    // Drain the head, then the body it declares. Stopping at
+                    // the head is not enough: the sidecar's list call is a POST,
+                    // so on any platform that does not coalesce head and body
+                    // into one segment the body stays in the receive queue, and
+                    // closing on unread bytes is the RST-instead-of-FIN case
+                    // this loop exists to avoid.
+                    let mut want: Option<usize> = None;
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                let Some(head_end) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                                else {
+                                    continue;
+                                };
+                                let head_len = head_end + 4;
+                                if want.is_none() {
+                                    let head = String::from_utf8_lossy(&req[..head_len]);
+                                    want = Some(
+                                        head.lines()
+                                            .find_map(|l| {
+                                                let (k, v) = l.split_once(':')?;
+                                                k.eq_ignore_ascii_case("content-length")
+                                                    .then(|| v.trim().parse::<usize>().ok())?
+                                            })
+                                            .unwrap_or(0),
+                                    );
+                                }
+                                if req.len() >= head_len + want.unwrap_or(0) {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
     pub(crate) async fn serve_body(body: Vec<u8>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
