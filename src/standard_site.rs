@@ -82,6 +82,20 @@ impl std::fmt::Display for AtUri {
     }
 }
 
+/// What one read of a publication produced.
+///
+/// **`complete` is the fact the store cannot recover afterwards.** A truncated
+/// walk and a short publication return the same entries; the difference decides
+/// whether an empty result is a quiet blog or a read that gave up, and the
+/// caller has no other way to tell. `fetch` used to drop it on the floor after
+/// logging a warning.
+#[derive(Debug)]
+pub struct PublicationRead {
+    pub publication: Publication,
+    pub entries: Vec<Entry>,
+    pub complete: bool,
+}
+
 /// The publication record — a pointer, not a feed. Supplies the title and the
 /// base URL that document `path`s are joined onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +295,117 @@ pub fn entries_from_records(
         .collect()
 }
 
+/// Persist one publication read, and say what the poll amounted to.
+///
+/// `retention_days` is the ingest floor: an entry whose stated date is already
+/// older than the window is not stored, because storing it means the next sweep
+/// deletes it and the next poll re-inserts it with a new row id — which loses its
+/// read state and arrives unread, on that cycle, forever.
+///
+/// **An entry with no date is stored anyway.** That is a decision, not an
+/// oversight: it is dated by `fetched_at` instead, which does not move, and the
+/// alternative is discarding an article the reader can never see. It does mean
+/// such an entry resurrects once per retention window, which is accepted.
+pub async fn store_publication(
+    pool: &sqlx::SqlitePool,
+    url: &str,
+    read: PublicationRead,
+    max_entries_per_feed: i64,
+    retention_days: u32,
+    retention_hard_days: u32,
+) -> anyhow::Result<crate::feed::PollOutcome> {
+    let offered = read.entries.len();
+
+    // **The failure check runs before anything is written.** Stamping the feed
+    // and then returning `Failed` is the shape that makes a broken publication
+    // read as freshly polled on `/stats`, and it is easy to write by accident
+    // because the upsert is the natural first step.
+    //
+    // **Keyed on what was OFFERED, not on what survives the floor.** A truncated
+    // read that produced nothing means the walk gave up before its first record.
+    // A truncated read whose entries are merely older than the window is a
+    // healthy poll of an old publication, and calling that a failure puts it into
+    // backoff that widens forever.
+    if !read.complete && offered == 0 {
+        return Ok(crate::feed::PollOutcome::Failed {
+            backoff: crate::feed::backoff_for(1),
+            kind: crate::feed::FailureKind::Body,
+            detail: crate::feed::failure_detail(
+                "the publication read stopped before its first document",
+            ),
+        });
+    }
+
+    // **The floor is whichever window will actually delete the row, not the
+    // rolling one.** Keying on `retention_days` alone left a hole in a
+    // configuration the config module explicitly blesses: `retention_days = 0`
+    // means "no rolling window" and `prune_old_entries` keeps the hard ceiling
+    // alive independently, because "I don't want a rolling window" and "I don't
+    // want any ceiling" are different statements. With 0 and 180, nothing was
+    // floored at ingest and the ceiling deleted at 180 days — reinstating the
+    // exact cycle this guard exists to prevent, and a worse one: the ceiling
+    // spares nothing, so a starred entry came back unstarred rather than merely
+    // unread.
+    let effective_days = [retention_days, retention_hard_days]
+        .into_iter()
+        .filter(|d| *d > 0)
+        .min();
+    let floor = effective_days.map(|days| {
+        // Saturating, because `FEATHERREADER_RETENTION_DAYS` parses into a `u32`
+        // with no upper bound and `Utc::now() - Duration::days(u32::MAX)` panics.
+        let window = chrono::Duration::try_days(days.into()).unwrap_or(chrono::Duration::MAX);
+        crate::feed::fmt_time(
+            chrono::Utc::now()
+                .checked_sub_signed(window)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        )
+    });
+    let rows: Vec<crate::store::NewEntry> = read
+        .entries
+        .into_iter()
+        .filter(|e| match (&floor, &e.published) {
+            // Lexicographic on the store's one RFC3339 spelling, which sorts
+            // chronologically by construction.
+            (Some(floor), Some(published)) => published.as_str() >= floor.as_str(),
+            // No floor, or no date. The undated case is the decision the doc
+            // above records: kept, dated by `fetched_at`, and it resurrects once
+            // per window.
+            _ => true,
+        })
+        .map(Into::into)
+        .collect();
+
+    // **Say when the floor emptied the read.** A complete read of three
+    // year-old posts and a complete read of an empty publication both return
+    // `Updated { new_entries: 0 }`, stamp the feed, and look green — so a
+    // subscriber to an archived blog gets a blank feed and nothing anywhere says
+    // why. `offered` is already in hand.
+    if offered > rows.len() {
+        tracing::info!(
+            feed = %url,
+            offered,
+            stored = rows.len(),
+            "the retention floor dropped documents older than the window"
+        );
+    }
+
+    let feed_id = crate::store::upsert_feed(
+        pool,
+        &crate::store::NewFeed {
+            url: url.to_string(),
+            title: read.publication.name.clone(),
+            site_url: Some(read.publication.url.clone()),
+            last_polled: Some(crate::feed::fmt_time(chrono::Utc::now())),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let new_entries =
+        crate::store::insert_entries(pool, feed_id, &rows, max_entries_per_feed).await?;
+    Ok(crate::feed::PollOutcome::Updated { new_entries })
+}
+
 fn non_blank(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
@@ -376,7 +501,7 @@ pub async fn fetch(
     http: &reqwest::Client,
     plc_directory: &str,
     uri: &AtUri,
-) -> anyhow::Result<(Publication, Vec<Entry>)> {
+) -> anyhow::Result<PublicationRead> {
     use anyhow::Context;
 
     // The collection is part of the identity of what was subscribed to, and
@@ -440,13 +565,32 @@ pub async fn fetch(
         )
         .await
         .with_context(|| format!("listing documents for {canonical_site}"))?;
-    let entries = entries_from_records(&canonical_site, &publication, &documents.records);
+    Ok(read_from(publication, &canonical_site, documents, orphaned))
+}
+
+/// Assemble a [`PublicationRead`] from a finished walk.
+///
+/// **Extracted so `complete` is testable.** It is the one fact the store cannot
+/// recover afterwards, and reaching the `false` case through `fetch` needs a PLC
+/// directory, a PDS, and a walk that truncates — three mocked hosts for one
+/// boolean. Reaching it here needs a struct.
+fn read_from(
+    publication: Publication,
+    canonical_site: &str,
+    documents: crate::atproto::RecordWalk,
+    orphaned: usize,
+) -> PublicationRead {
+    let entries = entries_from_records(canonical_site, &publication, &documents.records);
 
     // **A walk that stopped early is not a short archive.** Reading part of a
     // publication is acceptable; reporting it as the whole of one is not, and
     // when the part is empty — a quiet publication whose busy sibling fills
     // every page this reader will fetch — the feed looks healthy and stays
     // empty forever.
+    // Logged AND returned. Logging it alone is how the fact that the walk gave
+    // up reached nobody who could act on it: a truncated read and a short
+    // publication produce the same entries, and only the caller can tell the
+    // difference between "quiet blog" and "we stopped early".
     if !documents.complete {
         tracing::warn!(
             site = %canonical_site,
@@ -466,7 +610,11 @@ pub async fn fetch(
             "documents in this repo reference no publication in it — a `site` spelling nothing matches"
         );
     }
-    Ok((publication, entries))
+    PublicationRead {
+        publication,
+        entries,
+        complete: documents.complete,
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +624,299 @@ mod tests {
     use serde_json::json;
 
     const DID: &str = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
+
+    /// **A walk that gave up must not report itself as a whole publication.**
+    ///
+    /// `fetch` used to log that and return only the entries, so the fact reached
+    /// nobody who could act on it — and a truncated read and a quiet blog produce
+    /// exactly the same entries.
+    #[test]
+    fn a_read_carries_whether_the_walk_finished() {
+        let publication = Publication {
+            name: Some("Scan's Lab".to_string()),
+            url: "https://example.com/blog/".to_string(),
+        };
+        for complete in [true, false] {
+            let walk = crate::atproto::RecordWalk {
+                records: Vec::new(),
+                complete,
+            };
+            let read = read_from(publication.clone(), "at://d/c/r", walk, 0);
+            assert_eq!(
+                read.complete, complete,
+                "the walk said complete={complete} and the read said {}",
+                read.complete
+            );
+        }
+    }
+
+    // -- storing a publication read -----------------------------------------
+
+    fn read_of(entries: Vec<Entry>, complete: bool) -> PublicationRead {
+        PublicationRead {
+            publication: Publication {
+                name: Some("Scan's Lab".to_string()),
+                url: "https://example.com/blog/".to_string(),
+            },
+            entries,
+            complete,
+        }
+    }
+
+    fn entry_dated(guid: &str, published: Option<&str>) -> Entry {
+        Entry {
+            guid: guid.to_string(),
+            title: "T".to_string(),
+            published: published.map(str::to_string),
+            url: Some("https://example.com/blog/a".to_string()),
+            summary: None,
+        }
+    }
+
+    fn days_ago(n: i64) -> String {
+        crate::feed::fmt_time(chrono::Utc::now() - chrono::Duration::days(n))
+    }
+
+    const PUB_URL: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+
+    async fn pool() -> sqlx::SqlitePool {
+        crate::store::init_url("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_complete_read_stores_its_entries_and_reports_them() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![
+                entry_dated("at://d/c/1", Some(&days_ago(1))),
+                entry_dated("at://d/c/2", Some(&days_ago(2))),
+            ],
+            true,
+        );
+        let outcome = store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 2 }
+            ),
+            "expected two new entries, got {outcome:?}"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "the entries were not stored");
+    }
+
+    /// **Starvation is keyed on what was OFFERED, not on what was stored.**
+    ///
+    /// A truncated read that produced nothing is a failure: the walk gave up
+    /// before the first record. But a truncated read whose entries the retention
+    /// floor dropped is not — the read worked, the entries are simply older than
+    /// the window, and calling that a failure puts a healthy publication into
+    /// backoff forever.
+    #[tokio::test]
+    async fn an_incomplete_read_that_offered_nothing_is_a_failure() {
+        let pool = pool().await;
+        let outcome = store_publication(&pool, PUB_URL, read_of(vec![], false), 0, 14, 180)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::feed::PollOutcome::Failed { .. }),
+            "a truncated read that produced nothing is not a healthy poll: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_read_whose_entries_the_floor_dropped_is_not_a_failure() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![entry_dated("at://d/c/old", Some(&days_ago(900)))],
+            false,
+        );
+        let outcome = store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(outcome, crate::feed::PollOutcome::Failed { .. }),
+            "the read offered an entry; the floor dropping it is not a failed poll: {outcome:?}"
+        );
+    }
+
+    /// A failed poll must not look like a successful one on `/stats`.
+    #[tokio::test]
+    async fn a_failed_read_does_not_stamp_last_polled() {
+        let pool = pool().await;
+        let outcome = store_publication(&pool, PUB_URL, read_of(vec![], false), 0, 14, 180)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, crate::feed::PollOutcome::Failed { .. }));
+        let stamped: Option<String> =
+            sqlx::query_scalar("SELECT last_polled FROM feeds WHERE url = ?1")
+                .bind(PUB_URL)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
+        assert_eq!(
+            stamped, None,
+            "a failed poll stamped last_polled, so the feed reads as freshly polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_already_older_than_the_window_is_not_stored() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![
+                entry_dated("at://d/c/fresh", Some(&days_ago(1))),
+                entry_dated("at://d/c/ancient", Some(&days_ago(900))),
+            ],
+            true,
+        );
+        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        let guids: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            guids,
+            vec!["at://d/c/fresh".to_string()],
+            "an entry the next sweep would delete was stored anyway"
+        );
+    }
+
+    /// **The floor follows whichever window actually deletes, not the rolling one.**
+    ///
+    /// `retention_days = 0` is a supported configuration meaning "no rolling
+    /// window", and the hard ceiling stays alive independently. Keying the ingest
+    /// floor on the rolling window alone let a 900-day-old entry in, which the
+    /// ceiling then deleted and the next poll re-inserted — and the ceiling spares
+    /// nothing, so a starred entry came back unstarred.
+    #[tokio::test]
+    async fn the_floor_follows_the_hard_ceiling_when_the_window_is_disabled() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![entry_dated("at://d/c/ancient", Some(&days_ago(900)))],
+            true,
+        );
+        store_publication(&pool, PUB_URL, read, 0, 0, 180)
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "an entry the hard ceiling will delete was stored, so it will resurrect"
+        );
+    }
+
+    /// **The SHORTER window is the floor, because it is the one that deletes first.**
+    ///
+    /// With a 14-day rolling window and a 180-day ceiling, an entry 100 days old
+    /// is inside the ceiling and outside the window — so the sweep takes it and
+    /// the next poll puts it back. Taking the longer of the two would store it.
+    #[tokio::test]
+    async fn the_floor_is_the_shorter_of_the_two_windows() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![entry_dated("at://d/c/hundred", Some(&days_ago(100)))],
+            true,
+        );
+        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "an entry inside the ceiling but outside the window was stored, so it will cycle"
+        );
+    }
+
+    /// With both windows off there is no floor, because nothing will delete it.
+    #[tokio::test]
+    async fn no_retention_at_all_means_no_ingest_floor() {
+        let pool = pool().await;
+        let read = read_of(
+            vec![entry_dated("at://d/c/ancient", Some(&days_ago(900)))],
+            true,
+        );
+        store_publication(&pool, PUB_URL, read, 0, 0, 0)
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "with nothing deleting it, an old entry is worth keeping"
+        );
+    }
+
+    /// A retention window near `u32::MAX` must not panic the poller.
+    #[tokio::test]
+    async fn an_absurd_retention_window_does_not_panic() {
+        let pool = pool().await;
+        let read = read_of(vec![entry_dated("at://d/c/x", Some(&days_ago(1)))], true);
+        store_publication(&pool, PUB_URL, read, 0, u32::MAX, u32::MAX)
+            .await
+            .expect("a huge window is a wide floor, not a crash");
+    }
+
+    /// The feed row learns the publication's name and homepage — the only reason
+    /// beyond the timestamp that the upsert is there at all. `upsert_feed`
+    /// COALESCEs both, so dropping either is silent.
+    #[tokio::test]
+    async fn the_feed_row_learns_the_publications_name_and_site() {
+        let pool = pool().await;
+        let read = read_of(vec![entry_dated("at://d/c/1", Some(&days_ago(1)))], true);
+        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        let (title, site): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT title, site_url FROM feeds WHERE url = ?1")
+                .bind(PUB_URL)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            title.as_deref(),
+            Some("Scan's Lab"),
+            "the name never reached the row"
+        );
+        assert_eq!(
+            site.as_deref(),
+            Some("https://example.com/blog/"),
+            "the homepage never reached the row"
+        );
+    }
+
+    /// **The undated entry is kept, deliberately.** It is dated by `fetched_at`,
+    /// which holds still, and the alternative is discarding an article the reader
+    /// can never see. It resurrects once per retention window; that is accepted.
+    #[tokio::test]
+    async fn an_undated_entry_is_stored_rather_than_dropped() {
+        let pool = pool().await;
+        let read = read_of(vec![entry_dated("at://d/c/undated", None)], true);
+        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "an entry with no date was discarded");
+    }
 
     /// A record key from a real atproto repo, and the instant it decodes to.
     ///
