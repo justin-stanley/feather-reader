@@ -18,6 +18,30 @@ deploying is separate.
 
 ### Security
 
+- **A record walk that runs out of pages now refuses instead of returning a
+  truncated list as a success.** All three refusing walks fell out of
+  `for _ in 0..MAX_LIST_PAGES` into a bare `Ok(out)`, so a repository larger than
+  the page budget produced a short list indistinguishable from a complete one.
+  `web::resolve_subscriptions` needs an `Err` to take its fail-closed branch;
+  given `Ok` it hands the short list to `store::replace_sub_refs`, which DELETEs
+  the reader's entire `sub_ref` projection and reinserts only what it was given.
+  Everything past the cap was gone from their account, on an ordinary poll, with
+  no attacker involved.
+
+  `extend_bounded`'s refusal could not catch it: `MAX_LIST_PAGES` multiplied by
+  the 100 records each request asks for is *exactly* `MAX_LIST_RECORDS` on both
+  clients, so against any server that honours `limit` the page budget always runs
+  out first and that refusal was unreachable. Found by a cold adversarial review
+  of the walk budget, filed as #196.
+
+  The new failure mode is a reader whose repository exceeds the budget being
+  served their cached projection on every request rather than losing feeds. That
+  is the correct direction and it is still a degraded state; raising the caps, or
+  paging past them, is separate work.
+
+
+### Security
+
 - **A `listRecords` page is parsed once, not twice.** The body went through
   `serde_json::Value` and then into the typed struct, and `from_value` rebuilds
   rather than moves — so both copies are live at the same time.
