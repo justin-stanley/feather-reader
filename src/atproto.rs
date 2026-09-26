@@ -1680,6 +1680,7 @@ impl SidecarClient {
         // so this client gets the same guards as the other two, including the
         // duplicated-key refusal that only serde can make.
         let raw = self.repo_bytes(body).await?;
+        refuse_a_node_explosion(&raw, "the sidecar listRecords body")?;
         let envelope: RepoOkList =
             serde_json::from_slice(&raw).context("parsing sidecar listRecords data")?;
         // **Two envelope layers here, not one.** `page_from_body` guards the
@@ -2437,6 +2438,70 @@ pub(crate) fn urlencode(s: &str) -> String {
 /// collection returns a healthy, empty result in place of an error, and for the
 /// walk that feeds `replace_sub_refs` that is revoked access rather than an empty
 /// repo. The guard itself lives in [`page_from_body`], which every client shares.
+/// The most nodes a `listRecords` body may ask us to build.
+///
+/// **A bound on the parse, checked before the parse.** Every other limit here is
+/// consulted after `serde_json` has already materialised the page, which cannot
+/// prevent the allocation it exists to prevent: one 8 MB response of `{"":0}`
+/// objects was measured retaining 824 MB, a 98x wire-to-heap amplification, on a
+/// 512 MB box. A record cap does not see it — the page holds one record. A page
+/// cap does not see it — there is one request. A byte budget does not see it
+/// until the memory is already spent.
+///
+/// A `serde_json::Value` node costs 32 bytes and lives in a container that
+/// over-allocates, so two million nodes is on the order of 128 MB — the same
+/// figure the walk budget uses, now enforced per response and in advance.
+pub(crate) const MAX_LIST_NODES: usize = 2_000_000;
+
+/// An upper bound on how many nodes `body` would parse into, without parsing it.
+///
+/// Counts the structural characters that introduce a value — `{`, `[`, `,`, `:`
+/// — **outside strings**, which is what makes this sound: a node cannot appear
+/// without one, and a string's contents cannot invent one. Skipping strings is
+/// the whole difficulty; counting naively would refuse a legitimate article that
+/// happens to contain a million commas.
+pub(crate) fn node_upper_bound(body: &[u8]) -> usize {
+    let mut nodes = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in body {
+        if in_string {
+            // `\"` stays inside the string; `\\` does not escape the quote that
+            // follows it. Getting this pair wrong makes the scan count a whole
+            // document as structure, or none of it.
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            // A string is a node, and everything inside it is not.
+            b'"' => {
+                in_string = true;
+                nodes += 1;
+            }
+            b'{' | b'[' | b',' | b':' => nodes += 1,
+            _ => {}
+        }
+    }
+    nodes
+}
+
+/// Refuse a body that would build more nodes than [`MAX_LIST_NODES`].
+fn refuse_a_node_explosion(body: &[u8], what: &str) -> Result<()> {
+    let nodes = node_upper_bound(body);
+    anyhow::ensure!(
+        nodes <= MAX_LIST_NODES,
+        "{what} would build at least {nodes} nodes, over the {MAX_LIST_NODES} cap \
+         — refusing before parsing it"
+    );
+    Ok(())
+}
+
 pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     // **An empty body is the "unexpected body" case, not a parse error.** Reading
     // bytes reaches it as "EOF while parsing", where the OAuth client used to
@@ -2448,6 +2513,7 @@ pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     if body.is_empty() {
         anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
     }
+    refuse_a_node_explosion(body, "the listRecords body")?;
     let parsed: ListRecordsBody =
         serde_json::from_slice(body).context("parsing listRecords response")?;
     page_from_body(parsed)
@@ -3866,6 +3932,117 @@ pub(crate) mod tests {
         // Page 1: cursor None → "same". Page 2: "same" again → stop, after
         // taking that page. Two pages, not two hundred.
         assert_eq!(records.len(), 2, "a repeated cursor was followed");
+    }
+
+    // -- bounding the parse before it allocates -----------------------------
+
+    /// **Strings cannot invent structure.** The subtle half of the bound: an
+    /// article containing a million commas is one node, and counting naively
+    /// would refuse it.
+    #[test]
+    fn structure_inside_a_string_is_not_structure() {
+        let prose = format!(
+            r#"{{"records":[{{"uri":"at://d/c/r","value":{{"t":"{}"}}}}]}}"#,
+            "a,b,[c],{d}:e,".repeat(50_000)
+        );
+        let bound = node_upper_bound(prose.as_bytes());
+        assert!(
+            bound < 100,
+            "a page of prose full of punctuation was counted as {bound} nodes"
+        );
+        assert!(
+            parse_list_records(prose.as_bytes()).is_ok(),
+            "a legitimate page of prose was refused"
+        );
+    }
+
+    #[test]
+    fn a_node_explosion_is_refused_before_it_is_parsed() {
+        // ~8 MB of the cheapest node there is, which is the measured attack.
+        let mut body = String::from(r#"{"records":[{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            body.push_str("{},");
+        }
+        body.push_str(r#"{}]}]}"#);
+        assert!(
+            body.len() > 3_000_000,
+            "the probe body is {} bytes",
+            body.len()
+        );
+
+        let bound = node_upper_bound(body.as_bytes());
+        assert!(
+            bound > MAX_LIST_NODES,
+            "the attack shape was counted as only {bound} nodes"
+        );
+        let err = parse_list_records(body.as_bytes())
+            .expect_err("a node explosion was parsed rather than refused");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_page_is_nowhere_near_the_node_bound() {
+        let (bodies, _) = paged_bodies(1, 17_000, false);
+        let bound = node_upper_bound(&bodies[0]);
+        assert!(
+            bound < 1_000,
+            "a real page of documents counted {bound} nodes, too close to the bound"
+        );
+    }
+
+    /// **An escaped quote does not end the string**, asserted without a magic
+    /// number: the same document with the escape replaced by a plain letter has
+    /// the same structure, so it must count the same. Get the escape wrong and the
+    /// scanner leaves the string early and counts the rest as structure.
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string() {
+        let escaped = br#"{"records":[{"uri":"a\"b","value":{}}],"cursor":"x"}"#;
+        let plain = br#"{"records":[{"uri":"axb","value":{}}],"cursor":"x"}"#;
+        assert_eq!(
+            node_upper_bound(escaped),
+            node_upper_bound(plain),
+            "an escaped quote changed the structure count"
+        );
+        let backslash = br#"{"records":[],"cursor":"x\\"}"#;
+        let letter = br#"{"records":[],"cursor":"xy"}"#;
+        assert_eq!(
+            node_upper_bound(backslash),
+            node_upper_bound(letter),
+            "an escaped backslash changed the structure count"
+        );
+    }
+
+    /// A string is itself a node, so a page of strings costs more than a page of
+    /// numbers. Without that, an array of a million short strings reads as cheap.
+    #[test]
+    fn a_string_counts_as_a_node() {
+        assert!(
+            node_upper_bound(br#"["a","b","c"]"#) > node_upper_bound(br#"[1,1,1]"#),
+            "strings were not counted, so an array of them looks free"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sidecar_refuses_a_node_explosion_too() {
+        let mut data =
+            String::from(r#"{"ok":true,"data":{"records":[{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            data.push_str("{},");
+        }
+        data.push_str(r#"{}]}]}}"#);
+        let base = crate::net::tests::serve_body(data.into_bytes()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c", None, None)
+            .await
+            .expect_err("a node explosion reached the parser");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
     }
 
     // -- walk byte budget ---------------------------------------------------
