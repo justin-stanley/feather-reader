@@ -1983,7 +1983,9 @@ async fn index(
         // see the slice below. Collected BEFORE the page is chosen because the
         // page count depends on how many there are.
         // Bounded like everything else on this page. These come from the PDS
-        // (up to the 20,000-record list ceiling) and are appended whole to the
+        // (up to the list ceiling — 20,000 on the sidecar backend, 5,000 on
+        // `backend=rust`, whose caps are a quarter of the other's) and are
+        // appended whole to the
         // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
         // cap is generous — a reader with more saved-elsewhere records than this
         // is not the case being designed for — but a response has to have a size

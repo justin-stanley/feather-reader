@@ -29,18 +29,28 @@ deploying is separate.
   no attacker involved.
 
   `extend_bounded`'s refusal could not catch it: `MAX_LIST_PAGES` multiplied by
-  the 100 records each request asks for is *exactly* `MAX_LIST_RECORDS` on both
-  clients, so against any server that honours `limit` the page budget always runs
-  out first and that refusal was unreachable. Found by a cold adversarial review
+  the 100 records each request asks for is `MAX_LIST_RECORDS` on both clients, so
+  the page budget runs out first and that refusal was unreachable. It runs out
+  **100 records early**, because terminating costs one extra request when a short
+  page still carries a cursor — this project's own PDS does that — so a repository
+  of 19 901 to 20 000 records now refuses although nothing was truncated. A false
+  refusal, in the safe direction, and not the clean boundary an earlier draft of
+  this entry called "exactly". Found by a cold adversarial review
   of the walk budget, filed as #196.
 
   The new failure mode is a reader whose repository exceeds the budget being
-  served their cached projection on every request rather than losing feeds. That
-  is the correct direction and it is still a degraded state; raising the caps, or
-  paging past them, is separate work.
+  served their cached projection on every request rather than losing feeds. The
+  correct direction, and worse than "stale" makes it sound: the fallback branch
+  has no record keys, and the manage page gates its rename and unsubscribe forms
+  on having one — so that reader loses the only in-app way to shrink the
+  repository back under the cap. Recovery needs an operator or another atproto
+  client. Raising the caps, or paging past them, is separate work.
 
-
-### Security
+  The two backends also disagree about where this bites. `backend=rust` caps at
+  50 pages and 5 000 records, a quarter of the direct client's, so the same
+  reader refuses at about 4 900 records there and works to about 19 900 on the
+  sidecar. `Saved` walks the same path with one record per starred article, where
+  4 900 is a plausible number for a real reader rather than a pathological one.
 
 - **A `listRecords` page is parsed once, not twice.** The body went through
   `serde_json::Value` and then into the typed struct, and `from_value` rebuilds

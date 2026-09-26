@@ -1082,8 +1082,17 @@ impl PdsClient {
         // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
         // which DELETEs the reader's whole `sub_ref` projection and reinserts
         // only what it was given. `extend_bounded` cannot catch this either:
-        // `MAX_LIST_PAGES` x the 100 we request is exactly `MAX_LIST_RECORDS`,
-        // so the page budget always runs out first.
+        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
+        // page budget runs out first.
+        //
+        // **It runs out 100 records early, and that window is a false refusal.**
+        // Terminating costs one extra request, because a short page can still
+        // carry a cursor — this project's own PDS does exactly that — so a
+        // complete walk of N records needs `ceil(N/100) + 1` of them. A repo
+        // holding 19 901 to 20 000 records therefore refuses although nothing was
+        // truncated. The direction is safe and the alternative is deleting feeds,
+        // but it is a false refusal and not the clean boundary an earlier version
+        // of this comment claimed.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -1782,8 +1791,17 @@ impl SidecarClient {
         // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
         // which DELETEs the reader's whole `sub_ref` projection and reinserts
         // only what it was given. `extend_bounded` cannot catch this either:
-        // `MAX_LIST_PAGES` x the 100 we request is exactly `MAX_LIST_RECORDS`,
-        // so the page budget always runs out first.
+        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
+        // page budget runs out first.
+        //
+        // **It runs out 100 records early, and that window is a false refusal.**
+        // Terminating costs one extra request, because a short page can still
+        // carry a cursor — this project's own PDS does exactly that — so a
+        // complete walk of N records needs `ceil(N/100) + 1` of them. A repo
+        // holding 19 901 to 20 000 records therefore refuses although nothing was
+        // truncated. The direction is safe and the alternative is deleting feeds,
+        // but it is a false refusal and not the clean boundary an earlier version
+        // of this comment claimed.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -4242,6 +4260,47 @@ pub(crate) mod tests {
         assert!(
             msg.contains("did not finish"),
             "failed for the wrong reason: {msg}"
+        );
+    }
+
+    /// **A walk that finishes cleanly across several pages still returns `Ok`.**
+    ///
+    /// The refusal's dangerous direction. Removing the flag's reset makes *every*
+    /// multi-page walk refuse, which puts a reader with more than one page of
+    /// records permanently into the fail-closed branch — and a review found that
+    /// mutation surviving on the sidecar walk, which is the default backend,
+    /// because nothing walked it to a clean finish and asserted success.
+    #[tokio::test]
+    async fn the_sidecar_walk_that_finishes_cleanly_returns_the_records() {
+        let mut bodies: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                        "cursor": format!("p{}", i + 1),
+                    }
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        // The honest terminator: a page with no cursor.
+        bodies.push(
+            serde_json::json!({ "ok": true, "data": { "records": [] } })
+                .to_string()
+                .into_bytes(),
+        );
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let records = client
+            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
+            .await
+            .expect("a walk that ran out of records is not a short list");
+        assert_eq!(
+            records.len(),
+            3,
+            "the pages that were served were not all kept"
         );
     }
 
