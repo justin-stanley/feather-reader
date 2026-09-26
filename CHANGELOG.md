@@ -18,31 +18,38 @@ deploying is separate.
 
 ### Fixed
 
-- **A certificate test stopped failing when the machine was busy, and the cause
-  was not the machine being busy.** `the_test_ca_is_trusted_and_still_validates_hostnames`
-  asserts the test CA is trusted and that a host outside the leaf's SAN list is
-  still refused. It failed on the first run after a full recompile, three times
-  out of three, and not under CPU load alone — which is what made it look random.
+- **A certificate test no longer turns latency into a verdict about a
+  certificate.** `the_test_ca_is_trusted_and_still_validates_hostnames` asserts
+  that the test CA is trusted and that a host outside the leaf's SAN list is
+  still refused. It was observed failing on the first HTTPS request in a freshly
+  linked test binary — 11.7 s and 20.3 s measured on one macOS machine, against
+  the 15 s per-read bound `build_pinned_client` sets.
 
-  Measured by timing the phases: building the client takes microseconds, building
-  the per-hop client takes 600 microseconds, and **the first request takes 11.7
-  seconds while the second takes 3 milliseconds**. The cost is
-  `rustls_platform_verifier`'s first verification loading the macOS system trust
-  store, which reqwest switches to as soon as an extra root is present — and the
-  test CA is added under `cfg(test)`, so this is a test-only path that production
-  never takes.
+  **The cause is not pinned, and this entry no longer claims it is.** Nine later
+  attempts on the same machine, three of them under a load average of ~120,
+  measured that first request at 8–17 ms. The leading candidate is CPU starvation
+  with ~900 tests in flight.
 
-  The fix pays that cost once, in the helper every TLS test goes through, using a
-  client with its own generous deadline. Production bounds are untouched.
+  So the test asks again when the only answer is a timeout, up to three times. A
+  timeout is not a verdict about a chain; a verdict is returned on the first ask,
+  so a genuine validation failure is never retried or masked. No production bound
+  changes.
 
-  **An earlier attempt raised the per-read timeout under `cfg(test)` instead, and
-  it was wrong three ways**, each found by review: the production constant became
+  **Two earlier attempts were wrong, and both are worth naming.** The first
+  raised the per-read timeout under `cfg(test)`: the production constant became
   invisible to every test, so the assertion said to protect it protected nothing
   and setting it to an hour left the suite green; the effective relaxation was 30
-  seconds rather than the 120 claimed, because the total request timeout caps it;
-  and it accommodated an 11.7-second warm-up rather than accounting for it.
-  Filed as #195.
-
+  seconds rather than the 120 claimed, because the total request timeout caps it.
+  Filed as #195. The second warmed the platform verifier once per process, on the
+  claim that reqwest switches to `rustls_platform_verifier` only when an extra
+  root is present — **that claim is false.** reqwest builds the platform verifier
+  on both arms of `if config.root_certs.is_empty()`
+  (`reqwest-0.13.5/src/async_impl/client.rs:758`), so there was no test-only path
+  to warm and production takes the same one. That attempt also failed silently
+  (its builder and its request both discarded their outcome, and the `OnceCell`
+  recorded success either way), omitted the `.no_proxy()` this module documents
+  at length, and issued a real request into whichever caller's captured request
+  log libtest happened to schedule first.
 
 ### Security
 
