@@ -288,6 +288,32 @@ pub(crate) fn test_pki() -> &'static TestPki {
     })
 }
 
+/// Perform one throwaway TLS handshake so the platform verifier's first-use cost
+/// is not charged to a test's first assertion. Process-wide, once.
+#[cfg(test)]
+async fn warm_the_platform_verifier(addr: SocketAddr) {
+    static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    WARM.get_or_init(|| async {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .resolve("feed-tls.test", addr)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(test_pki().ca_pem.as_bytes())
+                    .expect("parsing the test CA"),
+            )
+            .build()
+        else {
+            return;
+        };
+        // The outcome does not matter — only that a verification happened.
+        let _ = client
+            .get(format!("https://feed-tls.test:{}/ok", addr.port()))
+            .send()
+            .await;
+    })
+    .await;
+}
+
 #[cfg(test)]
 /// A loopback HTTPS server presenting the test CA's leaf, routing by path.
 ///
@@ -454,6 +480,26 @@ where
             });
         }
     });
+    // **Pay the platform verifier's one-time cost here, not inside a test's
+    // first assertion.**
+    //
+    // `build_pinned_client` adds the test CA under `cfg(test)`, and reqwest
+    // switches to `rustls_platform_verifier` as soon as an extra root is
+    // present. Its first verification loads the macOS system trust store
+    // through Security.framework, and on a freshly linked test binary that
+    // measured **11.7 seconds**, three runs out of three — while the second
+    // request through the same path took 3 ms. With the per-read timeout at 15 s
+    // that intermittently blew the budget, and the test it broke
+    // (`the_test_ca_is_trusted_and_still_validates_hostnames`) is about
+    // certificate validation rather than latency.
+    //
+    // A longer timeout was the first fix and it was the wrong one: it changed a
+    // production constant to accommodate a test-only cost, and hid an 11.7 s
+    // warm-up rather than accounting for it. Paying it once here, through a
+    // client with its own generous deadline, leaves every production bound
+    // untouched and makes the cost visible in one place.
+    warm_the_platform_verifier(addr).await;
+
     (addr, log)
 }
 

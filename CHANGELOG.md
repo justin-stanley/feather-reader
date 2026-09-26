@@ -16,6 +16,34 @@ deploying is separate.
 
 ## Unreleased
 
+### Fixed
+
+- **A certificate test stopped failing when the machine was busy, and the cause
+  was not the machine being busy.** `the_test_ca_is_trusted_and_still_validates_hostnames`
+  asserts the test CA is trusted and that a host outside the leaf's SAN list is
+  still refused. It failed on the first run after a full recompile, three times
+  out of three, and not under CPU load alone — which is what made it look random.
+
+  Measured by timing the phases: building the client takes microseconds, building
+  the per-hop client takes 600 microseconds, and **the first request takes 11.7
+  seconds while the second takes 3 milliseconds**. The cost is
+  `rustls_platform_verifier`'s first verification loading the macOS system trust
+  store, which reqwest switches to as soon as an extra root is present — and the
+  test CA is added under `cfg(test)`, so this is a test-only path that production
+  never takes.
+
+  The fix pays that cost once, in the helper every TLS test goes through, using a
+  client with its own generous deadline. Production bounds are untouched.
+
+  **An earlier attempt raised the per-read timeout under `cfg(test)` instead, and
+  it was wrong three ways**, each found by review: the production constant became
+  invisible to every test, so the assertion said to protect it protected nothing
+  and setting it to an hour left the suite green; the effective relaxation was 30
+  seconds rather than the 120 claimed, because the total request timeout caps it;
+  and it accommodated an 11.7-second warm-up rather than accounting for it.
+  Filed as #195.
+
+
 ### Security
 
 - **A `listRecords` page is parsed once, not twice.** The body went through
