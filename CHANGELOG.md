@@ -16,6 +16,33 @@ deploying is separate.
 
 ## Unreleased
 
+### Added
+
+- **`standard_site::store_publication`** — the half of 0.4.0 that was missing.
+  The reader could fetch a publication and turn its documents into entries;
+  nothing wrote them anywhere. Three poll semantics, each of which a reviewer of
+  the abandoned first attempt had to find:
+  - **Starvation is keyed on what the read OFFERED, not on what survived the
+    retention floor.** A truncated read that produced nothing means the walk gave
+    up before its first record, and that is a failure. A truncated read whose
+    entries are merely older than the window is a healthy poll of an old
+    publication; calling it a failure puts it into a backoff that widens forever.
+  - **A failed poll does not stamp `last_polled`.** The natural way to write this
+    upserts the feed first and returns the failure after, which makes a broken
+    publication read as freshly polled on `/stats`.
+  - **An entry already older than the window is not stored.** Storing it means the
+    next sweep deletes it, the next poll re-inserts it with a new row id, and it
+    arrives unread — on that cycle, forever.
+- **An entry with no date is stored anyway**, which is a decision rather than an
+  oversight. It is dated by `fetched_at`, which does not move, and the alternative
+  is discarding an article the reader can never see. It does resurrect once per
+  retention window; that is accepted, and a test says so by name.
+- `fetch` now returns whether the walk finished instead of logging it and dropping
+  it. A truncated read and a quiet blog produce identical entries, so only the
+  caller can tell "this publication has nine articles" from "this reader gave up
+  after nine" — and the caller was never told.
+
+
 ### Security
 
 - **A `listRecords` page is parsed once, not twice.** The body went through
