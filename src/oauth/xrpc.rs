@@ -184,6 +184,7 @@ impl Repo<'_> {
         let mut out = Vec::new();
         let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
+        let mut more_offered = false;
 
         for _ in 0..MAX_LIST_PAGES {
             let (page, next) = self
@@ -213,9 +214,41 @@ impl Repo<'_> {
                 //
                 // The cursor-repeat check is the separate concern: a server that
                 // hands back the same cursor forever would otherwise loop.
-                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => cursor = Some(next),
-                _ => return Ok(out),
+                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => {
+                    cursor = Some(next);
+                    more_offered = true;
+                }
+                _ => {
+                    // `break` with the flag cleared, rather than an early
+                    // `return`: an early return makes the post-loop check
+                    // unreachable, so the flag reads as dead state and a
+                    // reviewer hunts for the case that clears it. It also left
+                    // the "every walk refuses" mutation alive here.
+                    more_offered = false;
+                    break;
+                }
             }
+        }
+        // **Running out of pages is a refusal, not a short answer.** Falling out
+        // of the loop used to return `Ok(out)`, so a repo bigger than the page
+        // budget produced a truncated list indistinguishable from a complete
+        // one — and `resolve_subscriptions` needs an `Err` for its fail-closed
+        // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
+        // which DELETEs the reader's whole `sub_ref` projection and reinserts
+        // only what it was given. `extend_bounded` cannot catch this either:
+        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
+        // page budget runs out first — 100 records early, because terminating
+        // costs one extra request when a short page still carries a cursor. This
+        // client's caps are a QUARTER of the direct client's (50 pages, 5 000
+        // records), so the same reader refuses here at ~4 900 records and works
+        // to ~19 900 on the sidecar. `Saved` walks this too, one record per
+        // starred article, where 4 900 is a plausible number for a real reader.
+        if more_offered {
+            anyhow::bail!(
+                "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
+                 ({} held, and the PDS still offered more) — refusing a short list",
+                out.len(),
+            );
         }
         Ok(out)
     }
@@ -777,6 +810,97 @@ mod tests {
             msg.contains("2 held"),
             "the live walk did not accumulate across pages: {msg}"
         );
+    }
+
+    /// **The live walk refuses a short list.** Its result reaches
+    /// `replace_sub_refs`, so returning a truncated list as a complete one
+    /// deletes every subscription past the page budget.
+    #[tokio::test]
+    async fn the_live_walk_that_runs_out_of_pages_refuses() {
+        let bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES + 1)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "pages-exhausted-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://pages-exhausted-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect_err("a truncated list was returned as a complete one");
+        assert!(
+            format!("{err:#}").contains("did not finish"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// The live walk's clean finish must still be a success — see the sidecar's
+    /// twin for why this direction is the dangerous one.
+    #[tokio::test]
+    async fn the_live_walk_that_finishes_cleanly_returns_the_records() {
+        let mut bodies: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        bodies.push(
+            serde_json::json!({ "records": [] })
+                .to_string()
+                .into_bytes(),
+        );
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "clean-finish-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://clean-finish-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let records = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect("a walk that ran out of records is not a short list");
+        assert_eq!(records.len(), 3);
     }
 
     /// **A duplicated `records` key must not be able to empty a page.**
