@@ -1597,6 +1597,12 @@ impl SidecarClient {
     /// so callers can treat it as "re-login required".
     async fn repo(&self, body: Value) -> Result<Value> {
         let raw = self.repo_bytes(body).await?;
+        // **The same guard as the listing path, twelve lines below.** This is
+        // the response path for every write — create, put, delete, applyWrites —
+        // and `RepoOk.data` is an unbounded `Value`. Measured without it: the
+        // identical 8 MB attack retains 786 MB. The listing had the guard and
+        // this did not, which is the drift a shared helper exists to prevent.
+        refuse_a_node_explosion(&raw, "the /internal/repo body")?;
         let ok: RepoOk = serde_json::from_slice(&raw).context("parsing /internal/repo ok body")?;
         Ok(ok.data)
     }
@@ -1680,6 +1686,7 @@ impl SidecarClient {
         // so this client gets the same guards as the other two, including the
         // duplicated-key refusal that only serde can make.
         let raw = self.repo_bytes(body).await?;
+        refuse_a_node_explosion(&raw, "the sidecar listRecords body")?;
         let envelope: RepoOkList =
             serde_json::from_slice(&raw).context("parsing sidecar listRecords data")?;
         // **Two envelope layers here, not one.** `page_from_body` guards the
@@ -2437,6 +2444,92 @@ pub(crate) fn urlencode(s: &str) -> String {
 /// collection returns a healthy, empty result in place of an error, and for the
 /// walk that feeds `replace_sub_refs` that is revoked access rather than an empty
 /// repo. The guard itself lives in [`page_from_body`], which every client shares.
+/// The most nodes a `listRecords` body may ask us to build.
+///
+/// **A bound on the parse, checked before the parse.** Every other limit here is
+/// consulted after `serde_json` has already materialised the page, which cannot
+/// prevent the allocation it exists to prevent: one 8 MB response of `{"":0}`
+/// objects was measured retaining 824 MB, a 98x wire-to-heap amplification, on a
+/// 512 MB box. A record cap does not see it — the page holds one record. A page
+/// cap does not see it — there is one request. A byte budget does not see it
+/// until the memory is already spent.
+///
+/// **640 000, measured — not two million, which this file's own arithmetic
+/// already contradicted.** An earlier version reasoned "32 bytes a node plus
+/// slack, so two million is about 128 MB". That is the model `json_bytes` two
+/// hundred lines above explicitly rejects: it charges `MAP_NODE` + `MAP_ENTRY` +
+/// `SLOT` = 680 bytes for a single-entry object, which costs three counted
+/// characters. Measured against a counting allocator, the worst shape reaches
+/// **210 bytes per counted character**, so two million admitted **400 MB** — a
+/// bound that let through more than the attack it was written to stop, and that
+/// the walk's own byte budget then refused a step later.
+///
+/// 640 000 x 210 B is about 128 MiB, which is the figure the walk budget uses
+/// and the one this claims.
+///
+/// **The floor is real traffic, not comfort.** The densest legitimate page is a
+/// full `readState` listing — 100 records each carrying two arrays of
+/// [`crate::lexicon::ReadState::MAX_IDS`] ids — which measures about 403 000 nodes.
+/// A page of 100 documents measures 40 000. So the cap sits above the densest
+/// page the lexicons permit, and a test holds it there.
+pub(crate) const MAX_LIST_NODES: usize = 640_000;
+
+/// How many nodes `body` would parse into, to within one, without parsing it.
+///
+/// **A lower bound, despite what an earlier name said.** `[1,2,3]` counts three
+/// — one `[` and two commas — and builds four values. The deficit is never more
+/// than one (verified exhaustively over every body of length 1-5 from a JSON
+/// alphabet), because every node but the outermost is introduced by one of the
+/// characters counted here. That is the direction a guard needs: it can
+/// under-count by one and still refuse everything it must.
+///
+/// Counts the structural characters that introduce a value — `{`, `[`, `,`, `:`
+/// — **outside strings**, which is what makes this sound: a node cannot appear
+/// without one, and a string's contents cannot invent one. Skipping strings is
+/// the whole difficulty; counting naively would refuse a legitimate article that
+/// happens to contain a million commas.
+pub(crate) fn node_lower_bound(body: &[u8]) -> usize {
+    let mut nodes = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in body {
+        if in_string {
+            // `\"` stays inside the string; `\\` does not escape the quote that
+            // follows it. Getting this pair wrong makes the scan count a whole
+            // document as structure, or none of it.
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            // A string is a node, and everything inside it is not.
+            b'"' => {
+                in_string = true;
+                nodes += 1;
+            }
+            b'{' | b'[' | b',' | b':' => nodes += 1,
+            _ => {}
+        }
+    }
+    nodes
+}
+
+/// Refuse a body that would build more nodes than [`MAX_LIST_NODES`].
+fn refuse_a_node_explosion(body: &[u8], what: &str) -> Result<()> {
+    let nodes = node_lower_bound(body);
+    anyhow::ensure!(
+        nodes <= MAX_LIST_NODES,
+        "{what} would build at least {nodes} nodes, over the {MAX_LIST_NODES} cap \
+         — refusing before parsing it"
+    );
+    Ok(())
+}
+
 pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     // **An empty body is the "unexpected body" case, not a parse error.** Reading
     // bytes reaches it as "EOF while parsing", where the OAuth client used to
@@ -2448,6 +2541,7 @@ pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     if body.is_empty() {
         anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
     }
+    refuse_a_node_explosion(body, "the listRecords body")?;
     let parsed: ListRecordsBody =
         serde_json::from_slice(body).context("parsing listRecords response")?;
     page_from_body(parsed)
@@ -3866,6 +3960,177 @@ pub(crate) mod tests {
         // Page 1: cursor None → "same". Page 2: "same" again → stop, after
         // taking that page. Two pages, not two hundred.
         assert_eq!(records.len(), 2, "a repeated cursor was followed");
+    }
+
+    // -- bounding the parse before it allocates -----------------------------
+
+    /// **Strings cannot invent structure.** The subtle half of the bound: an
+    /// article containing a million commas is one node, and counting naively
+    /// would refuse it.
+    #[test]
+    fn structure_inside_a_string_is_not_structure() {
+        let prose = format!(
+            r#"{{"records":[{{"uri":"at://d/c/r","value":{{"t":"{}"}}}}]}}"#,
+            "a,b,[c],{d}:e,".repeat(50_000)
+        );
+        let bound = node_lower_bound(prose.as_bytes());
+        assert!(
+            bound < 100,
+            "a page of prose full of punctuation was counted as {bound} nodes"
+        );
+        assert!(
+            parse_list_records(prose.as_bytes()).is_ok(),
+            "a legitimate page of prose was refused"
+        );
+    }
+
+    #[test]
+    fn a_node_explosion_is_refused_before_it_is_parsed() {
+        // ~8 MB of the cheapest node there is, which is the measured attack.
+        let mut body = String::from(r#"{"records":[{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            body.push_str("{},");
+        }
+        body.push_str(r#"{}]}]}"#);
+        assert!(
+            body.len() > 3_000_000,
+            "the probe body is {} bytes",
+            body.len()
+        );
+
+        let bound = node_lower_bound(body.as_bytes());
+        assert!(
+            bound > MAX_LIST_NODES,
+            "the attack shape was counted as only {bound} nodes"
+        );
+        let err = parse_list_records(body.as_bytes())
+            .expect_err("a node explosion was parsed rather than refused");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **The densest page the lexicons permit must fit, with room.**
+    ///
+    /// This is the floor under [`MAX_LIST_NODES`], and it is the reason the cap
+    /// is 640 000 rather than the ~150 000 that would otherwise hold the memory
+    /// claim comfortably. A `readState` record carries up to
+    /// [`crate::lexicon::ReadState::MAX_IDS`] read ids, and a page carries 100 of
+    /// them — far denser in nodes than a page of articles, which is mostly
+    /// prose. Tighten the cap below this and a reader with a lot of history
+    /// stops being able to sync at all.
+    #[test]
+    fn a_full_read_state_page_fits_under_the_cap() {
+        let ids: Vec<String> = (0..crate::lexicon::ReadState::MAX_IDS)
+            .map(|i| format!("https://example.com/blog/post-{i}"))
+            .collect();
+        let records: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "uri": format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.readState/3lab{i}"),
+                    "cid": "bafyreiabc123def456ghi789jkl012mno345pqr678stu901",
+                    "value": {
+                        "$type": "community.lexicon.rss.readState",
+                        "feedUrl": "https://example.com/feed.xml",
+                        "readThrough": "2026-07-11T09:30:00Z",
+                        "readIds": ids,
+                    }
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "records": records }).to_string();
+        let bound = node_lower_bound(body.as_bytes());
+        assert!(
+            bound < MAX_LIST_NODES,
+            "the densest legitimate page counts {bound} nodes against a cap of {MAX_LIST_NODES}"
+        );
+        assert!(
+            parse_list_records(body.as_bytes()).is_ok(),
+            "a full read-state page was refused"
+        );
+    }
+
+    /// The write path takes the same guard as the listing path.
+    #[tokio::test]
+    async fn the_write_path_refuses_a_node_explosion() {
+        let mut data = String::from(r#"{"ok":true,"data":{"records":["#);
+        for _ in 0..700_000 {
+            data.push_str("{},");
+        }
+        data.push_str(r#"{}]}}"#);
+        let base = crate::net::tests::serve_body(data.into_bytes()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .delete_record("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c", "r")
+            .await
+            .expect_err("a node explosion reached the parser on the write path");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_page_is_nowhere_near_the_node_bound() {
+        let (bodies, _) = paged_bodies(1, 17_000, false);
+        let bound = node_lower_bound(&bodies[0]);
+        assert!(
+            bound < 1_000,
+            "a real page of documents counted {bound} nodes, too close to the bound"
+        );
+    }
+
+    /// **An escaped quote does not end the string**, asserted without a magic
+    /// number: the same document with the escape replaced by a plain letter has
+    /// the same structure, so it must count the same. Get the escape wrong and the
+    /// scanner leaves the string early and counts the rest as structure.
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string() {
+        let escaped = br#"{"records":[{"uri":"a\"b","value":{}}],"cursor":"x"}"#;
+        let plain = br#"{"records":[{"uri":"axb","value":{}}],"cursor":"x"}"#;
+        assert_eq!(
+            node_lower_bound(escaped),
+            node_lower_bound(plain),
+            "an escaped quote changed the structure count"
+        );
+        let backslash = br#"{"records":[],"cursor":"x\\"}"#;
+        let letter = br#"{"records":[],"cursor":"xy"}"#;
+        assert_eq!(
+            node_lower_bound(backslash),
+            node_lower_bound(letter),
+            "an escaped backslash changed the structure count"
+        );
+    }
+
+    /// A string is itself a node, so a page of strings costs more than a page of
+    /// numbers. Without that, an array of a million short strings reads as cheap.
+    #[test]
+    fn a_string_counts_as_a_node() {
+        assert!(
+            node_lower_bound(br#"["a","b","c"]"#) > node_lower_bound(br#"[1,1,1]"#),
+            "strings were not counted, so an array of them looks free"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sidecar_refuses_a_node_explosion_too() {
+        let mut data =
+            String::from(r#"{"ok":true,"data":{"records":[{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            data.push_str("{},");
+        }
+        data.push_str(r#"{}]}]}}"#);
+        let base = crate::net::tests::serve_body(data.into_bytes()).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c", None, None)
+            .await
+            .expect_err("a node explosion reached the parser");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
     }
 
     // -- walk byte budget ---------------------------------------------------
