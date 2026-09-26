@@ -218,7 +218,15 @@ impl Repo<'_> {
                     cursor = Some(next);
                     more_offered = true;
                 }
-                _ => return Ok(out),
+                _ => {
+                    // `break` with the flag cleared, rather than an early
+                    // `return`: an early return makes the post-loop check
+                    // unreachable, so the flag reads as dead state and a
+                    // reviewer hunts for the case that clears it. It also left
+                    // the "every walk refuses" mutation alive here.
+                    more_offered = false;
+                    break;
+                }
             }
         }
         // **Running out of pages is a refusal, not a short answer.** Falling out
@@ -228,8 +236,13 @@ impl Repo<'_> {
         // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
         // which DELETEs the reader's whole `sub_ref` projection and reinserts
         // only what it was given. `extend_bounded` cannot catch this either:
-        // `MAX_LIST_PAGES` x the 100 we request is exactly `MAX_LIST_RECORDS`,
-        // so the page budget always runs out first.
+        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
+        // page budget runs out first — 100 records early, because terminating
+        // costs one extra request when a short page still carries a cursor. This
+        // client's caps are a QUARTER of the direct client's (50 pages, 5 000
+        // records), so the same reader refuses here at ~4 900 records and works
+        // to ~19 900 on the sidecar. `Saved` walks this too, one record per
+        // starred article, where 4 900 is a plausible number for a real reader.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -842,6 +855,52 @@ mod tests {
             format!("{err:#}").contains("did not finish"),
             "failed for the wrong reason: {err:#}"
         );
+    }
+
+    /// The live walk's clean finish must still be a success — see the sidecar's
+    /// twin for why this direction is the dangerous one.
+    #[tokio::test]
+    async fn the_live_walk_that_finishes_cleanly_returns_the_records() {
+        let mut bodies: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        bodies.push(
+            serde_json::json!({ "records": [] })
+                .to_string()
+                .into_bytes(),
+        );
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "clean-finish-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://clean-finish-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let records = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect("a walk that ran out of records is not a short list");
+        assert_eq!(records.len(), 3);
     }
 
     /// **A duplicated `records` key must not be able to empty a page.**
