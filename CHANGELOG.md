@@ -16,6 +16,28 @@ deploying is separate.
 
 ## Unreleased
 
+### Fixed
+
+- **A certificate test no longer turns on how fast loopback is.**
+  `the_test_ca_is_trusted_and_still_validates_hostnames` asserts that the test CA
+  is trusted and that a host outside the leaf's SAN list is still refused. It
+  failed whenever the machine was busy — reproduced three times out of three by
+  forcing a full recompile so the suite ran on saturated CPU. Measured: the
+  request took 20.3 s over loopback and the 15-second per-read idle timeout
+  fired. `guarded_get` builds its own client, so the test could not pass in a
+  looser one; the constant is now longer under `cfg(test)`, and production's
+  value is asserted so the relaxation cannot drift it.
+
+  **This was not just a red run.** Mutation testing decides whether a mutant was
+  killed by reading the suite's result, so a test that fails for unrelated
+  reasons records kills it has not earned. One did, and it reached a pull
+  request as evidence before a reviewer caught it. Filed as #195.
+- The two per-read timeouts — one in the guarded fetch, one in the feed fetch —
+  are now checked to be the same number. `net`'s doc claimed it "matches
+  `feed::build_client`'s READ_TIMEOUT" and nothing enforced it. Two copies of a
+  constant in two modules is the shape that drifts.
+
+
 ### Security
 
 - **A `listRecords` page is parsed once, not twice.** The body went through

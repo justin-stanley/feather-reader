@@ -60,8 +60,28 @@ pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
 /// that trickles bytes forever (slowloris) can't tie up a fetch under the total
-/// timeout. Matches [`crate::feed::build_client`]'s `READ_TIMEOUT`.
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// timeout. Matches [`crate::feed::build_client`]'s `READ_TIMEOUT` — and that is
+/// now a test rather than a sentence, below.
+pub(crate) const READ_TIMEOUT_SECS: u64 = 15;
+
+#[cfg(not(test))]
+const READ_TIMEOUT: Duration = Duration::from_secs(READ_TIMEOUT_SECS);
+
+/// **Deliberately longer under test, and the production value is asserted.**
+///
+/// `guarded_get` builds its own client, so a test cannot pass one in with a
+/// looser timeout. That made the *certificate* test — whose subject is whether
+/// the CA is trusted and hostnames are validated, not how fast loopback is —
+/// depend on this constant: on a machine compiling while it runs 900 tests, a
+/// real TLS handshake and reply over loopback took 20 s of wall time and this
+/// fired at 15.
+///
+/// That was not merely a red run. A suite that fails for reasons unrelated to
+/// the change under test corrupts mutation testing, which reads the suite's
+/// result to decide whether a mutant was killed; one kill recorded that way was
+/// wrong, and it reached a pull request as evidence.
+#[cfg(test)]
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum number of redirect hops we will follow (each re-validated).
 ///
@@ -2782,6 +2802,30 @@ pub(crate) mod tests {
              Authorization header across origins — can pass for the wrong \
              reason. captured {} bytes",
             seen.len()
+        );
+    }
+
+    /// **The two per-read timeouts are one number, enforced rather than stated.**
+    ///
+    /// `net`'s doc said it "matches `feed::build_client`'s READ_TIMEOUT" and
+    /// nothing checked it. Two copies of a constant in two modules is exactly
+    /// the shape that drifts, and this repo has watched a comment drift from its
+    /// code four separate times in one week.
+    ///
+    /// It also pins the production value against the longer one used under test:
+    /// the relaxation exists so a certificate test does not turn on loopback
+    /// latency, and it must not become a way for production to quietly slacken.
+    #[test]
+    fn the_read_timeout_is_the_same_number_in_both_clients() {
+        assert_eq!(
+            READ_TIMEOUT_SECS,
+            crate::feed::READ_TIMEOUT_SECS,
+            "the guarded fetch and the feed fetch disagree about the idle timeout"
+        );
+        assert_eq!(READ_TIMEOUT_SECS, 15, "production idle timeout changed");
+        assert!(
+            READ_TIMEOUT > Duration::from_secs(READ_TIMEOUT_SECS),
+            "the test build should be the relaxed one; production is {READ_TIMEOUT_SECS}s"
         );
     }
 
