@@ -32,11 +32,21 @@ deploying is separate.
     publication read as freshly polled on `/stats`.
   - **An entry already older than the window is not stored.** Storing it means the
     next sweep deletes it, the next poll re-inserts it with a new row id, and it
-    arrives unread — on that cycle, forever.
+    arrives unread — on that cycle, forever. "The window" is the **shorter** of
+    the rolling window and the hard ceiling, because that is the one that deletes
+    first: keying on the rolling one alone left a hole in a supported
+    configuration, since `retention_days = 0` disables the rolling window while
+    the ceiling stays alive. With 0 and 180 nothing was floored and the ceiling
+    reinstated the cycle — a worse one, because the ceiling spares nothing, so a
+    starred entry came back unstarred rather than merely unread.
 - **An entry with no date is stored anyway**, which is a decision rather than an
   oversight. It is dated by `fetched_at`, which does not move, and the alternative
   is discarding an article the reader can never see. It does resurrect once per
   retention window; that is accepted, and a test says so by name.
+- The floor also logs what it dropped. A complete read of three year-old posts and
+  a complete read of an empty publication both return zero new entries, stamp the
+  feed and look green, so a subscriber to an archived blog got a blank feed and
+  nothing said why.
 - `fetch` now returns whether the walk finished instead of logging it and dropping
   it. A truncated read and a quiet blog produce identical entries, so only the
   caller can tell "this publication has nine articles" from "this reader gave up
