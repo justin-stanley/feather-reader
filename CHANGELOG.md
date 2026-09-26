@@ -18,24 +18,30 @@ deploying is separate.
 
 ### Fixed
 
-- **A certificate test no longer turns on how fast loopback is.**
-  `the_test_ca_is_trusted_and_still_validates_hostnames` asserts that the test CA
-  is trusted and that a host outside the leaf's SAN list is still refused. It
-  failed whenever the machine was busy — reproduced three times out of three by
-  forcing a full recompile so the suite ran on saturated CPU. Measured: the
-  request took 20.3 s over loopback and the 15-second per-read idle timeout
-  fired. `guarded_get` builds its own client, so the test could not pass in a
-  looser one; the constant is now longer under `cfg(test)`, and production's
-  value is asserted so the relaxation cannot drift it.
+- **A certificate test stopped failing when the machine was busy, and the cause
+  was not the machine being busy.** `the_test_ca_is_trusted_and_still_validates_hostnames`
+  asserts the test CA is trusted and that a host outside the leaf's SAN list is
+  still refused. It failed on the first run after a full recompile, three times
+  out of three, and not under CPU load alone — which is what made it look random.
 
-  **This was not just a red run.** Mutation testing decides whether a mutant was
-  killed by reading the suite's result, so a test that fails for unrelated
-  reasons records kills it has not earned. One did, and it reached a pull
-  request as evidence before a reviewer caught it. Filed as #195.
-- The two per-read timeouts — one in the guarded fetch, one in the feed fetch —
-  are now checked to be the same number. `net`'s doc claimed it "matches
-  `feed::build_client`'s READ_TIMEOUT" and nothing enforced it. Two copies of a
-  constant in two modules is the shape that drifts.
+  Measured by timing the phases: building the client takes microseconds, building
+  the per-hop client takes 600 microseconds, and **the first request takes 11.7
+  seconds while the second takes 3 milliseconds**. The cost is
+  `rustls_platform_verifier`'s first verification loading the macOS system trust
+  store, which reqwest switches to as soon as an extra root is present — and the
+  test CA is added under `cfg(test)`, so this is a test-only path that production
+  never takes.
+
+  The fix pays that cost once, in the helper every TLS test goes through, using a
+  client with its own generous deadline. Production bounds are untouched.
+
+  **An earlier attempt raised the per-read timeout under `cfg(test)` instead, and
+  it was wrong three ways**, each found by review: the production constant became
+  invisible to every test, so the assertion said to protect it protected nothing
+  and setting it to an hour left the suite green; the effective relaxation was 30
+  seconds rather than the 120 claimed, because the total request timeout caps it;
+  and it accommodated an 11.7-second warm-up rather than accounting for it.
+  Filed as #195.
 
 
 ### Security

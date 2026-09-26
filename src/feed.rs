@@ -653,10 +653,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
 /// that trickles bytes forever can't tie up a fetch under the total timeout.
-///
-/// Must equal [`crate::net::READ_TIMEOUT_SECS`]; a test enforces it.
-pub(crate) const READ_TIMEOUT_SECS: u64 = 15;
-const READ_TIMEOUT: Duration = Duration::from_secs(READ_TIMEOUT_SECS);
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Base backoff applied after a failed poll; the caller multiplies this by the
 /// feed's consecutive-error count (with a ceiling) to space out retries.
