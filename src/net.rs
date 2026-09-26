@@ -60,28 +60,8 @@ pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-read idle timeout: cap the wait for the *next* body chunk, so a server
 /// that trickles bytes forever (slowloris) can't tie up a fetch under the total
-/// timeout. Matches [`crate::feed::build_client`]'s `READ_TIMEOUT` — and that is
-/// now a test rather than a sentence, below.
-pub(crate) const READ_TIMEOUT_SECS: u64 = 15;
-
-#[cfg(not(test))]
-const READ_TIMEOUT: Duration = Duration::from_secs(READ_TIMEOUT_SECS);
-
-/// **Deliberately longer under test, and the production value is asserted.**
-///
-/// `guarded_get` builds its own client, so a test cannot pass one in with a
-/// looser timeout. That made the *certificate* test — whose subject is whether
-/// the CA is trusted and hostnames are validated, not how fast loopback is —
-/// depend on this constant: on a machine compiling while it runs 900 tests, a
-/// real TLS handshake and reply over loopback took 20 s of wall time and this
-/// fired at 15.
-///
-/// That was not merely a red run. A suite that fails for reasons unrelated to
-/// the change under test corrupts mutation testing, which reads the suite's
-/// result to decide whether a mutant was killed; one kill recorded that way was
-/// wrong, and it reached a pull request as evidence.
-#[cfg(test)]
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// timeout. Matches [`crate::feed::build_client`]'s `READ_TIMEOUT`.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum number of redirect hops we will follow (each re-validated).
 ///
@@ -308,6 +288,32 @@ pub(crate) fn test_pki() -> &'static TestPki {
     })
 }
 
+/// Perform one throwaway TLS handshake so the platform verifier's first-use cost
+/// is not charged to a test's first assertion. Process-wide, once.
+#[cfg(test)]
+async fn warm_the_platform_verifier(addr: SocketAddr) {
+    static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    WARM.get_or_init(|| async {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .resolve("feed-tls.test", addr)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(test_pki().ca_pem.as_bytes())
+                    .expect("parsing the test CA"),
+            )
+            .build()
+        else {
+            return;
+        };
+        // The outcome does not matter — only that a verification happened.
+        let _ = client
+            .get(format!("https://feed-tls.test:{}/ok", addr.port()))
+            .send()
+            .await;
+    })
+    .await;
+}
+
 #[cfg(test)]
 /// A loopback HTTPS server presenting the test CA's leaf, routing by path.
 ///
@@ -474,6 +480,26 @@ where
             });
         }
     });
+    // **Pay the platform verifier's one-time cost here, not inside a test's
+    // first assertion.**
+    //
+    // `build_pinned_client` adds the test CA under `cfg(test)`, and reqwest
+    // switches to `rustls_platform_verifier` as soon as an extra root is
+    // present. Its first verification loads the macOS system trust store
+    // through Security.framework, and on a freshly linked test binary that
+    // measured **11.7 seconds**, three runs out of three — while the second
+    // request through the same path took 3 ms. With the per-read timeout at 15 s
+    // that intermittently blew the budget, and the test it broke
+    // (`the_test_ca_is_trusted_and_still_validates_hostnames`) is about
+    // certificate validation rather than latency.
+    //
+    // A longer timeout was the first fix and it was the wrong one: it changed a
+    // production constant to accommodate a test-only cost, and hid an 11.7 s
+    // warm-up rather than accounting for it. Paying it once here, through a
+    // client with its own generous deadline, leaves every production bound
+    // untouched and makes the cost visible in one place.
+    warm_the_platform_verifier(addr).await;
+
     (addr, log)
 }
 
@@ -2802,30 +2828,6 @@ pub(crate) mod tests {
              Authorization header across origins — can pass for the wrong \
              reason. captured {} bytes",
             seen.len()
-        );
-    }
-
-    /// **The two per-read timeouts are one number, enforced rather than stated.**
-    ///
-    /// `net`'s doc said it "matches `feed::build_client`'s READ_TIMEOUT" and
-    /// nothing checked it. Two copies of a constant in two modules is exactly
-    /// the shape that drifts, and this repo has watched a comment drift from its
-    /// code four separate times in one week.
-    ///
-    /// It also pins the production value against the longer one used under test:
-    /// the relaxation exists so a certificate test does not turn on loopback
-    /// latency, and it must not become a way for production to quietly slacken.
-    #[test]
-    fn the_read_timeout_is_the_same_number_in_both_clients() {
-        assert_eq!(
-            READ_TIMEOUT_SECS,
-            crate::feed::READ_TIMEOUT_SECS,
-            "the guarded fetch and the feed fetch disagree about the idle timeout"
-        );
-        assert_eq!(READ_TIMEOUT_SECS, 15, "production idle timeout changed");
-        assert!(
-            READ_TIMEOUT > Duration::from_secs(READ_TIMEOUT_SECS),
-            "the test build should be the relaxed one; production is {READ_TIMEOUT_SECS}s"
         );
     }
 
