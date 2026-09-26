@@ -28,10 +28,20 @@ deploying is separate.
 
   A cheap linear scan of the raw bytes now bounds how many nodes the body can
   ask for, counting the structural characters that introduce a value **outside
-  strings**. Skipping strings is the whole difficulty: counting naively would
+  strings**. The cap is **640 000**, from measurement: the worst shape reaches
+  210 bytes per counted character, so 640 000 is about the 128 MiB this claims.
+  An earlier draft said two million on a 32-bytes-a-node model — which this same
+  file already rejects two hundred lines above, where a single-entry object is
+  charged 680 bytes — and two million admitted **400 MB**, more than the attack it
+  was written to stop. Tests now bracket the cap from both sides: a full
+  `readState` page must fit, and the attack must not. Skipping strings is the whole difficulty: counting naively would
   refuse a legitimate article containing a million commas. Measured again with
   the guard in place: **peak 0 MB, refused**. An ordinary page of documents
   counts a few hundred nodes against a cap of two million.
+
+  The same guard now covers the write path — `SidecarClient::repo`, twelve lines
+  from the listing path, is the response for every create, put, delete and batch,
+  and without it the identical 8 MB attack retained 786 MB.
 
   Filed as #197 from a cold adversarial review, which also established that the
   wire cap alone cannot close this — at a hundredfold amplification no single
