@@ -16,6 +16,44 @@ deploying is separate.
 
 ## Unreleased
 
+### Changed
+
+- **A standard.site publication is retained by COUNT, not by age — because
+  measurement says the age window stores nothing at all.** Read three real
+  publications through `standard_site::fetch` on 2026-09-27: the newest document
+  Standard.site offered was **131 days** old, Annotated's **109** (its oldest
+  373), minus listens' **241**. Against the instance default `retention_days = 14`
+  every one of them stored **zero rows** — a successful poll, an empty feed, and
+  an info log as the only trace that anything was dropped. Long-form publishing is
+  not news-paced, and an ingest floor that mirrors an age-based sweep faithfully
+  reproduces that.
+
+  So `FeedKind::AGED` now names the kinds the rolling window and the hard ceiling
+  apply to (RSS), both sweep passes are scoped to it, and a publication is bounded
+  by `max_entries_per_feed` in `insert_entries` instead — the newest N plus up to
+  N starred, which is a real bound and the one that suits a source whose value is
+  its archive.
+
+  A third, generous ceiling (`FEATHERREADER_PUBLICATION_RETENTION_DAYS`, default
+  **3650**) keeps "not aged out" from meaning "immortal": the per-feed trim only
+  runs when a poll stores something, so entries of a feed nobody polls any more
+  have nothing else to reap them. Ten years is longer than the protocol itself, so
+  it cannot truncate an archive that exists today. It is scoped the other way
+  (`kind NOT IN` the aged kinds) so that a kind added later inherits a bound
+  rather than immortality — and that scoping is pinned, because dropping it left
+  all 909 tests passing while quietly re-enabling age eviction for RSS on an
+  instance whose operator had set both RSS knobs to zero.
+
+  `Config::retention_for(kind)` is the single home for which window applies to
+  which kind. The sweep decides what to delete and `standard_site::ingest_floor`
+  decides what is worth storing; written independently they drift, and a drift
+  here is the resurrection cycle — a row the store keeps, the sweep deletes, and
+  the next poll re-inserts unread. Both read the same function.
+
+  Nothing polls a publication yet, so no behaviour changes for any existing
+  reader; this is the retention half of that wiring, landed first because without
+  it the feature demonstrably delivers empty feeds.
+
 ### Fixed
 
 - **A certificate test no longer turns latency into a verdict about a
@@ -50,6 +88,7 @@ deploying is separate.
   recorded success either way), omitted the `.no_proxy()` this module documents
   at length, and issued a real request into whichever caller's captured request
   log libtest happened to schedule first.
+
 
 ### Security
 

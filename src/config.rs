@@ -15,6 +15,7 @@
 //! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
+//! | `FEATHERREADER_PUBLICATION_RETENTION_DAYS` | `3650` | Absolute ceiling for entries of a kind the rolling window does not apply to — a standard.site publication. Publications are bounded by COUNT (`max_entries_per_feed`) instead of by age, because measurement says a 14-day window stores NOTHING from a real publication: the newest documents on three of them were 109 to 241 days old. This is the "not immortal" backstop, not the space bound. `0` disables it. |
 //! | `FEATHERREADER_PROXY_IMAGES` | `false`                  | Proxy feed images so reader IPs aren't leaked to feed hosts. |
 //! | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)*           | Trusted reverse-proxy header for the real client IP (e.g. `Fly-Client-IP`, `CF-Connecting-IP`). Unset trusts the socket peer only. |
 //! | `FEATHERREADER_MAX_SUBS_PER_DID` | `500`                | Per-DID subscription cap. |
@@ -99,6 +100,28 @@ pub struct Config {
     /// Losing a starred entry here is survivable: the saved record stays in the
     /// reader's PDS and renders as a link.
     pub retention_hard_days: u32,
+    /// Absolute ceiling, in days, for entries of a kind the rolling window does
+    /// **not** apply to — a standard.site publication today. `0` disables it.
+    ///
+    /// **Ten years, and the reason is that age is the wrong policy here at all.**
+    /// Measured on 2026-09-27, reading three real publications through
+    /// `standard_site::fetch`: the newest document Standard.site offered was 131
+    /// days old, Annotated's 109 (oldest 373), minus listens' 241. Under the
+    /// 14-day window every one of them stored **zero** rows — a successful poll
+    /// and an empty feed. Long-form publishing is not news-paced, so a
+    /// publication is bounded by COUNT (`max_entries_per_feed`, the newest N plus
+    /// up to N starred) rather than by age.
+    ///
+    /// This number is therefore not a space bound; the per-feed trim is. It is
+    /// the guarantee that "not aged out" does not become "immortal": the trim
+    /// only runs when a poll stores something, so entries of a feed nobody polls
+    /// any more would otherwise never be reaped. Ten years is longer than the
+    /// protocol itself, so it cannot truncate an archive that exists today, while
+    /// still being a real bound rather than none.
+    ///
+    /// Per-publication retention on the reader's own PDS will choose inside this
+    /// ceiling; the instance's number stays the upper bound.
+    pub publication_retention_days: u32,
     /// Whether to proxy feed images through the server (privacy vs. bandwidth).
     pub proxy_images: bool,
     /// Closed-beta seat cap: the maximum number of DIDs that may hold beta
@@ -337,6 +360,7 @@ impl Default for Config {
             poll_interval: Duration::from_secs(3600),
             retention_days: 14,
             retention_hard_days: 180,
+            publication_retention_days: 3_650,
             proxy_images: false,
             beta_cap: 100,
             trusted_ip_header: None,
@@ -369,6 +393,32 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The retention window that applies to entries of `kind`, as
+    /// `(days, hard_days)` for [`crate::store::prune_old_entries`].
+    ///
+    /// **One home for the policy, because it has two halves that must agree.**
+    /// The sweep decides what to DELETE; `standard_site::ingest_floor` decides
+    /// what is even worth STORING, and it is written to mirror the sweep. If the
+    /// two disagree, the store gains rows the sweep deletes and the next poll
+    /// re-inserts — the resurrection cycle, which costs a reader their read state
+    /// once per window, forever. Both sides read this.
+    ///
+    /// An RSS feed gets the rolling window and the hard ceiling. A publication
+    /// gets **no rolling window** and the archive ceiling instead: measured, a
+    /// 14-day window stored zero rows from every real publication tried, because
+    /// their newest documents were 109 to 241 days old. See
+    /// [`Config::publication_retention_days`] and `feed::FeedKind::AGED`.
+    ///
+    /// Returning `0` for a publication's window is load-bearing rather than
+    /// incidental: `prune_old_entries` honours a ceiling when `days <= 0`, and
+    /// `ingest_floor` falls through to the ceiling on the same condition.
+    pub fn retention_for(&self, kind: crate::feed::FeedKind) -> (u32, u32) {
+        match kind {
+            crate::feed::FeedKind::Rss => (self.retention_days, self.retention_hard_days),
+            crate::feed::FeedKind::Publication => (0, self.publication_retention_days),
+        }
+    }
+
     /// Build a [`Config`] from the process environment, falling back to the
     /// defaults above for anything unset. Returns an error only when a *present*
     /// variable fails to parse — an unset variable is never an error.
@@ -424,6 +474,15 @@ impl Config {
                 format!("FEATHERREADER_RETENTION_DAYS: expected an integer, got {raw:?}")
             })?,
             None => defaults.retention_days,
+        };
+
+        let publication_retention_days = match env_opt("FEATHERREADER_PUBLICATION_RETENTION_DAYS") {
+            Some(raw) => raw.parse().with_context(|| {
+                format!(
+                    "FEATHERREADER_PUBLICATION_RETENTION_DAYS: expected an integer, got {raw:?}"
+                )
+            })?,
+            None => defaults.publication_retention_days,
         };
 
         let proxy_images = match env_opt("FEATHERREADER_PROXY_IMAGES") {
@@ -577,6 +636,7 @@ impl Config {
             poll_interval,
             retention_days,
             retention_hard_days,
+            publication_retention_days,
             proxy_images,
             beta_cap,
             trusted_ip_header,
@@ -1177,6 +1237,41 @@ mod tests {
         };
         assert!(c.did_allowed("did:plc:me"));
         assert!(!c.did_allowed("did:plc:stranger"));
+    }
+
+    /// **The two halves of the retention policy read the same function.**
+    ///
+    /// The sweep deletes and the ingest floor refuses to store; written
+    /// independently they drift, and a drift in this direction is the
+    /// resurrection cycle — a row the store keeps, the sweep deletes, and the next
+    /// poll re-inserts unread.
+    #[test]
+    fn retention_for_gives_a_publication_the_archive_ceiling_and_no_window() {
+        let config = Config::default();
+        assert_eq!(
+            config.retention_for(crate::feed::FeedKind::Rss),
+            (14, 180),
+            "an RSS feed must keep the rolling window and the hard ceiling",
+        );
+        assert_eq!(
+            config.retention_for(crate::feed::FeedKind::Publication),
+            (0, 3_650),
+            "a publication gets NO rolling window and the archive ceiling — a \
+             14-day window stored zero rows from every real publication measured",
+        );
+        // The zero is load-bearing, not cosmetic: `prune_old_entries` honours a
+        // ceiling only when the window is off (or strictly tighter), and
+        // `ingest_floor` falls through to the ceiling on the same condition.
+        let (days, hard) = config.retention_for(crate::feed::FeedKind::Publication);
+        assert_eq!(days, 0);
+        assert!(hard > 0);
+    }
+
+    #[test]
+    fn publication_retention_defaults_to_ten_years() {
+        // Ten years is longer than the protocol, so it cannot truncate an archive
+        // that exists today; the per-feed count cap is the space bound.
+        assert_eq!(Config::default().publication_retention_days, 3_650);
     }
 
     /// **`FEATHERREADER_STANDARD_SITE` is off unless it is set on.**

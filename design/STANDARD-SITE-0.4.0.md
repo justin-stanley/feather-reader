@@ -147,6 +147,47 @@ Size skew is the only thing worth watching: one publisher is 1.7 MB for 97
 documents (~17 KB each) while another is 11 KB for 21. Per-entry retention
 matters more than request count.
 
+### Re-measured 2026-09-27, through the real code path
+
+Three publications, read through `standard_site::fetch` + `store_publication`
+with a counting allocator (`$SCRATCHPAD/publication_probe.rs`):
+
+| | docs | fetch cold | warm | retained | peak | stored @ 14/180 | @ no floor |
+|---|---|---|---|---|---|---|---|
+| Standard.site (own repo) | 11 | 0.58 s | 0.32 s | 133 kB | 231 kB | **0** | 11 |
+| Annotated (18 of 38, 9-publication repo) | 18 | 2.13 s | 1.17 s | 63 kB | 4.8 MB | **0** | 18 |
+| minus listens (1 of 38, same repo) | 1 | 1.23 s | 1.21 s | 0 kB | 4.6 MB | **0** | 1 |
+
+Four things this settles, and the first is the one that decided a release step:
+
+**Retention by age stores NOTHING.** The newest documents were 131, 109 and 241
+days old; the default window is 14. "Per-entry retention matters more than request
+count" was right, and the answer is that publications are bounded by count
+(`max_entries_per_feed`) with a generous absolute ceiling, not by the rolling
+window. Implemented; see `FeedKind::AGED` and `Config::retention_for`.
+
+**Peak is bounded by page size, not by archive size.** 4.8 MB peak against 63 kB
+retained is `DOCUMENT_PAGE_SIZE = 25` at a ~15 kB median with ~7x wire-to-`Value`
+amplification. At poll concurrency 4 that is ~19 MB — safe on a 512 MB box.
+
+**Cost scales with the REPO, not the publication.** "minus listens" retains 0 kB
+and peaks 4.6 MB to deliver one article, because the walk reads all 38 documents in
+the repo to find its one. Nine publications in one repo cost nine such walks an
+hour. Per-repo de-duplication within a tick is therefore the cheapest cadence win
+available, ahead of any rev/high-water-mark scheme.
+
+**Open question 1 is answered: yes.** An unauthenticated XRPC GET is reachable —
+`atproto::PdsClient::anonymous` is exactly that path, it is what `fetch` uses, and
+it succeeded against three real PDSes (`bsky.network`, `eurosky.social`) with no
+session. The `User-Agent` trap above is also already handled: `net`'s client sets
+one, and these reads go through it.
+
+One more real-world shape worth recording: of nine publications in that repo, one
+carries a **slug** rkey (`blento.self`) rather than a TID, and one document names
+its `site` as a bare DID rather than a publication at-URI. Both are handled —
+`tid_timestamp` returns `None` for a non-TID rkey, and the canonical-URI filter
+drops the malformed document — but neither case is hypothetical.
+
 ---
 
 ## Traps found while measuring
