@@ -236,13 +236,22 @@ impl Repo<'_> {
         // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
         // which DELETEs the reader's whole `sub_ref` projection and reinserts
         // only what it was given. `extend_bounded` cannot catch this either:
-        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
-        // page budget runs out first — 100 records early, because terminating
-        // costs one extra request when a short page still carries a cursor. This
-        // client's caps are a QUARTER of the direct client's (50 pages, 5 000
-        // records), so the same reader refuses here at ~4 900 records and works
-        // to ~19 900 on the sidecar. `Saved` walks this too, one record per
-        // starred article, where 4 900 is a plausible number for a real reader.
+        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so against
+        // a server that honours our limit the page budget runs out first.
+        //
+        // **The cap is on REQUESTS, though, so the record count it bites at is
+        // the server's page size x the budget — not a number our constants fix.**
+        // A PDS answering 50 a page reaches half as far; one answering more than
+        // asked trips `extend_bounded` instead. And the last allowed page is a
+        // FALSE refusal: terminating costs one extra request when a short page
+        // still carries a cursor, so a walk holding every record it will ever
+        // hold still refuses on a cursor it never followed.
+        //
+        // This client's caps are a QUARTER of the direct client's (50 pages,
+        // 5 000 records), so with `limit=100` honoured the same reader refuses
+        // here at ~4 900 records and works to ~19 900 on the sidecar. `Saved`
+        // walks this too, one record per starred article, where 4 900 is a
+        // plausible number for a real reader.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -871,10 +880,16 @@ mod tests {
                 .into_bytes()
             })
             .collect();
+        // **The terminator CARRIES a record**, because a real PDS ends on a
+        // partial page and those are the records an off-by-one loses. Ending on
+        // an empty page kept "drop the last page's records" alive: the count
+        // below was right either way.
         bodies.push(
-            serde_json::json!({ "records": [] })
-                .to_string()
-                .into_bytes(),
+            serde_json::json!({
+                "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }]
+            })
+            .to_string()
+            .into_bytes(),
         );
         let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
         let port: u16 = base
@@ -900,7 +915,70 @@ mod tests {
             .list_all_records("app.feather.subscription")
             .await
             .expect("a walk that ran out of records is not a short list");
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 4);
+        assert!(
+            records.iter().any(|r| r.uri.ends_with("3labLAST")),
+            "the LAST page's records were dropped: {:?}",
+            records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// **The page cap is pinned exactly, not to within one.**
+    ///
+    /// `the_live_walk_that_runs_out_of_pages_refuses` serves `MAX_LIST_PAGES + 1`
+    /// pages, so a budget one page SHORT refuses too and that mutation survives
+    /// it. A walk whose last allowed request is the terminating one must come
+    /// back `Ok` — and on this backend an `Err` is `replace_sub_refs` never
+    /// running, which is the direction that costs a reader their subscriptions.
+    #[tokio::test]
+    async fn a_live_walk_that_terminates_on_its_last_allowed_page_succeeds() {
+        let mut bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        bodies.push(
+            serde_json::json!({
+                "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }]
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        assert_eq!(bodies.len(), MAX_LIST_PAGES);
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "last-allowed-page-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://last-allowed-page-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let records = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect("a walk that terminated inside its budget is not a short list");
+        assert_eq!(
+            records.len(),
+            MAX_LIST_PAGES,
+            "a walk that used its whole page budget and finished lost records",
+        );
     }
 
     /// **A duplicated `records` key must not be able to empty a page.**

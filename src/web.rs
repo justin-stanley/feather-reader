@@ -1985,8 +1985,8 @@ async fn index(
         // Bounded like everything else on this page. These come from the PDS
         // (up to the list ceiling — 20,000 on the sidecar backend, 5,000 on
         // `backend=rust`, whose caps are a quarter of the other's) and are
-        // appended whole to the
-        // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
+        // appended whole to the last page, so `ENTRIES_PER_PAGE` does not
+        // constrain them at all. The
         // cap is generous — a reader with more saved-elsewhere records than this
         // is not the case being designed for — but a response has to have a size
         // an operator can reason about.
@@ -2947,6 +2947,9 @@ async fn mark_all_read(
 /// `FEATHERREADER_STANDARD_SITE` off, an unsupported scheme). Distinct from
 /// [`PRIVATE_FEED_REFUSAL`], whose "not saved or sent anywhere" would be a
 /// false promise for a record that may already exist in the user's PDS.
+const UNSUPPORTED_FEED_URL_REFUSAL: &str =
+    "That isn't a kind of feed this instance can subscribe to. Nothing was saved.";
+
 /// Shown when an OPML export is refused because the subscription list could not
 /// be read in full.
 ///
@@ -2957,9 +2960,6 @@ const EXPORT_INCOMPLETE_REFUSAL: &str =
     "Could not read your subscriptions in full, so nothing was exported. Your \
      feeds are unchanged — try again, and if it keeps failing the list may be \
      larger than this reader can page through.";
-
-const UNSUPPORTED_FEED_URL_REFUSAL: &str =
-    "That isn't a kind of feed this instance can subscribe to. Nothing was saved.";
 
 /// Refusal message shown when a private/paid feed is submitted. FeatherReader
 /// stores subscriptions in the user's PUBLIC PDS, so it supports public feeds
@@ -11793,6 +11793,7 @@ mod tests {
             "/health still called the database ok: {body}",
         );
     }
+
     /// A sidecar mock for the OPML export: serves one subscription and one
     /// folder, except for the collection named in `fail_on`, which answers
     /// `500` — the shape a refused (short or unreadable) walk takes at this

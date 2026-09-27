@@ -1085,14 +1085,23 @@ impl PdsClient {
         // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
         // page budget runs out first.
         //
-        // **It runs out 100 records early, and that window is a false refusal.**
-        // Terminating costs one extra request, because a short page can still
-        // carry a cursor — this project's own PDS does exactly that — so a
-        // complete walk of N records needs `ceil(N/100) + 1` of them. A repo
-        // holding 19 901 to 20 000 records therefore refuses although nothing was
-        // truncated. The direction is safe and the alternative is deleting feeds,
-        // but it is a false refusal and not the clean boundary an earlier version
-        // of this comment claimed.
+        // **The cap is on REQUESTS, so where it bites in RECORDS is the server's
+        // choice and not ours.** We ask for 100 a page; a PDS MAY answer with
+        // fewer, and only one that honours the limit puts the boundary anywhere
+        // near `MAX_LIST_PAGES` x 100. Halve the page size and the same budget
+        // reaches half as many records; a server that returns MORE than asked
+        // trips `extend_bounded` first, which is the case the sentence above does
+        // not cover. Said this way because an earlier version of this comment
+        // named a fixed record window as though our own constants decided it.
+        //
+        // **And at the boundary the refusal is a FALSE one.** Terminating costs
+        // one extra request, because a short page can still carry a cursor — this
+        // project's own PDS does exactly that — so a walk that fills its last
+        // allowed page is holding every record it was ever going to hold and
+        // refuses anyway, on the strength of a cursor it never followed. With
+        // `limit=100` honoured that window is a repo of roughly 19 901 to 20 000
+        // records. The direction is safe and the alternative is deleting feeds,
+        // but it is a false refusal and not a clean boundary.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -1794,14 +1803,23 @@ impl SidecarClient {
         // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
         // page budget runs out first.
         //
-        // **It runs out 100 records early, and that window is a false refusal.**
-        // Terminating costs one extra request, because a short page can still
-        // carry a cursor — this project's own PDS does exactly that — so a
-        // complete walk of N records needs `ceil(N/100) + 1` of them. A repo
-        // holding 19 901 to 20 000 records therefore refuses although nothing was
-        // truncated. The direction is safe and the alternative is deleting feeds,
-        // but it is a false refusal and not the clean boundary an earlier version
-        // of this comment claimed.
+        // **The cap is on REQUESTS, so where it bites in RECORDS is the server's
+        // choice and not ours.** We ask for 100 a page; a PDS MAY answer with
+        // fewer, and only one that honours the limit puts the boundary anywhere
+        // near `MAX_LIST_PAGES` x 100. Halve the page size and the same budget
+        // reaches half as many records; a server that returns MORE than asked
+        // trips `extend_bounded` first, which is the case the sentence above does
+        // not cover. Said this way because an earlier version of this comment
+        // named a fixed record window as though our own constants decided it.
+        //
+        // **And at the boundary the refusal is a FALSE one.** Terminating costs
+        // one extra request, because a short page can still carry a cursor — this
+        // project's own PDS does exactly that — so a walk that fills its last
+        // allowed page is holding every record it was ever going to hold and
+        // refuses anyway, on the strength of a cursor it never followed. With
+        // `limit=100` honoured that window is a repo of roughly 19 901 to 20 000
+        // records. The direction is safe and the alternative is deleting feeds,
+        // but it is a false refusal and not a clean boundary.
         if more_offered {
             anyhow::bail!(
                 "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
@@ -4285,11 +4303,18 @@ pub(crate) mod tests {
                 .into_bytes()
             })
             .collect();
-        // The honest terminator: a page with no cursor.
+        // **The terminator CARRIES a record.** Ending on an empty page left a
+        // second mutation alive: drop the last page's records and the assertion
+        // below still counts three, because the last page had none to drop. A
+        // real PDS ends on a partial page, and that page's records are the ones
+        // an off-by-one loses.
         bodies.push(
-            serde_json::json!({ "ok": true, "data": { "records": [] } })
-                .to_string()
-                .into_bytes(),
+            serde_json::json!({
+                "ok": true,
+                "data": { "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }] }
+            })
+            .to_string()
+            .into_bytes(),
         );
         let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
         let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
@@ -4299,8 +4324,154 @@ pub(crate) mod tests {
             .expect("a walk that ran out of records is not a short list");
         assert_eq!(
             records.len(),
-            3,
+            4,
             "the pages that were served were not all kept"
+        );
+        assert!(
+            records.iter().any(|r| r.uri.ends_with("3labLAST")),
+            "the LAST page's records were dropped — the walk kept the right \
+             count only because every page held one: {:?}",
+            records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// **The page cap is pinned exactly, not to within one.**
+    ///
+    /// `the_sidecar_walk_that_runs_out_of_pages_refuses` serves
+    /// `MAX_LIST_PAGES + 1` pages, so a budget one page SHORT refuses too and
+    /// that mutation survives it. A walk whose last allowed request is the
+    /// terminating one must come back `Ok` — which fails the moment the loop
+    /// allows one page fewer, and is the direction that costs a reader their
+    /// subscriptions.
+    #[tokio::test]
+    async fn a_sidecar_walk_that_terminates_on_its_last_allowed_page_succeeds() {
+        let mut bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                        "cursor": format!("p{}", i + 1),
+                    }
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        // Request number `MAX_LIST_PAGES` — the last the loop allows — is the one
+        // that terminates, and it carries a record of its own.
+        bodies.push(
+            serde_json::json!({
+                "ok": true,
+                "data": { "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }] }
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        assert_eq!(bodies.len(), MAX_LIST_PAGES);
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+
+        let records = client
+            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
+            .await
+            .expect("a walk that terminated inside its budget is not a short list");
+        assert_eq!(
+            records.len(),
+            MAX_LIST_PAGES,
+            "a walk that used its whole page budget and finished lost records",
+        );
+    }
+
+    /// **The direct walk's page cap, pinned exactly.**
+    ///
+    /// Twin of `a_sidecar_walk_that_terminates_on_its_last_allowed_page_succeeds`
+    /// for the anonymous client. Verified needed: with only the `+ 1` refusal test
+    /// above, `for _ in 0..MAX_LIST_PAGES - 1` left all 914 tests passing.
+    #[tokio::test]
+    async fn a_direct_walk_that_terminates_on_its_last_allowed_page_succeeds() {
+        let mut bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        bodies.push(
+            serde_json::json!({
+                "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }]
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        assert_eq!(bodies.len(), MAX_LIST_PAGES);
+        let (base, _) = host_for(bodies, "last-allowed-page.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        let records = client
+            .list_all_records("c")
+            .await
+            .expect("a walk that terminated inside its budget is not a short list");
+        assert_eq!(
+            records.len(),
+            MAX_LIST_PAGES,
+            "a walk that used its whole page budget and finished lost records",
+        );
+        assert!(
+            records.iter().any(|r| r.uri.ends_with("3labLAST")),
+            "the LAST page's records were dropped",
+        );
+    }
+
+    /// **The TRUNCATING walk's page cap, pinned exactly — it reports completeness
+    /// rather than refusing, so an off-by-one here is a silent short read.**
+    ///
+    /// A publication whose archive needs exactly the page budget to exhaust is
+    /// `complete`; one page fewer makes it `complete = false`, which
+    /// `store_publication` treats as a partial read. Verified needed:
+    /// `for _ in 0..MAX_LIST_PAGES - 1` on this walk left all 914 tests passing.
+    #[tokio::test]
+    async fn a_truncating_walk_that_exhausts_on_its_last_allowed_page_is_complete() {
+        let mut bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect();
+        bodies.push(
+            serde_json::json!({
+                "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }]
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        assert_eq!(bodies.len(), MAX_LIST_PAGES);
+        let (base, _) = host_for(bodies, "last-allowed-page-truncating.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+
+        // `max_records` well above what is served, so the cap under test is the
+        // PAGE budget and not the record one.
+        let walk = client
+            .list_recent_matching("c", MAX_LIST_PAGES * 10, 1, |_| true)
+            .await
+            .expect("walk failed");
+        assert_eq!(
+            walk.records.len(),
+            MAX_LIST_PAGES,
+            "a walk that used its whole page budget and exhausted the collection \
+             lost records",
+        );
+        assert!(
+            walk.complete,
+            "a collection that ran out on the last allowed page was reported as a \
+             partial read, which is a starvation warning for a complete archive",
         );
     }
 
