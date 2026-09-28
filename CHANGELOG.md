@@ -50,9 +50,14 @@ deploying is separate.
   here is the resurrection cycle — a row the store keeps, the sweep deletes, and
   the next poll re-inserts unread. Both read the same function.
 
-  Nothing polls a publication yet, so no behaviour changes for any existing
-  reader; this is the retention half of that wiring, landed first because without
-  it the feature demonstrably delivers empty feeds.
+  Nothing polls a publication yet, so no reader sees a difference; this is the
+  retention half of that wiring, landed first because without it the feature
+  demonstrably delivers empty feeds. One operator-visible change: the sweeper's
+  "retention disabled entirely" early return now requires all THREE knobs to be
+  zero, so an instance running `RETENTION_DAYS=0 RETENTION_HARD_DAYS=0` starts a
+  daily sweeper where it previously logged and returned. On an all-RSS instance
+  that sweep deletes nothing — the one pass it runs is scoped to kinds that
+  instance has no rows for.
 
 ### Fixed
 
@@ -211,6 +216,27 @@ deploying is separate.
   reports `complete: false`, which it already models.
 
 ### Fixed
+
+- **A retention window too large to be a date stopped the sweeper instead of
+  being ignored.** Every retention knob parses from a `u32` with no upper bound,
+  and both `chrono::Duration::days` and `DateTime - TimeDelta` panic out of range
+  — measured, anything past roughly 96 million days, and `u32::MAX` is. A unit
+  slip is enough to reach it: seconds or milliseconds typed into a field that
+  means days.
+
+  The failure was quiet, which is what makes it worth a line. The sweep runs in a
+  spawned task, so tokio caught the panic and the retention sweeper simply stopped
+  for the life of the process — silently, permanently, and taking with it the
+  release valve for `db_size_watermark_bytes`, which is the one thing that stops
+  polling for every reader on the instance.
+
+  An unrepresentable window now disables the pass it belongs to and says so in a
+  warning naming the knob. That is also what `standard_site::ingest_floor` already
+  answered for the same input, and `Config::retention_for` exists to keep the two
+  agreeing — so this ends a disagreement where unrepresentable meant "store
+  everything" on one side and "panic" on the other. Found reviewing #206, which
+  added the third knob and therefore a third way in.
+
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes

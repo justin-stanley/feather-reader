@@ -1758,11 +1758,38 @@ pub async fn prune_old_entries(
     publication_days: i64,
 ) -> Result<u64> {
     let now = chrono::Utc::now();
-    let at = |d: i64| {
-        (now - chrono::Duration::days(d)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // **A window too large to be a date disables that pass; it must not panic.**
+    //
+    // `chrono::Duration::days` and `DateTime - TimeDelta` both panic out of
+    // range, and every knob here parses from a `u32` with no upper bound — so
+    // `FEATHERREADER_RETENTION_DAYS=1000000000` (a plausible unit slip: seconds or
+    // milliseconds typed into a days field) panicked this function. Measured:
+    // anything past roughly 96 million days overflows, and `u32::MAX` does.
+    //
+    // The consequence was not a crash an operator would notice. This runs in a
+    // spawned task, so tokio catches the panic and the retention sweeper simply
+    // stops for the life of the process — silently, permanently, and taking the
+    // release valve for `db_size_watermark_bytes` with it, which is the one thing
+    // that stops polling for every reader.
+    //
+    // Disabled-not-panicking is also the answer `standard_site::ingest_floor`
+    // already gives for the same input, and the two are supposed to mirror each
+    // other — `Config::retention_for` exists to keep them agreeing. An
+    // unrepresentable window meant "store everything" there and "panic" here.
+    let at = |d: i64, knob: &str| -> Option<String> {
+        let cutoff = chrono::Duration::try_days(d).and_then(|w| now.checked_sub_signed(w));
+        if cutoff.is_none() {
+            tracing::warn!(
+                days = d,
+                knob,
+                "retention window is too large to express as a date; treating it as \
+                 disabled for this sweep rather than failing the sweeper"
+            );
+        }
+        cutoff.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     };
 
-    let cutoff = (days > 0).then(|| at(days));
+    let cutoff = (days > 0).then(|| at(days, "retention_days")).flatten();
     // **The third window, for the kinds age does not bound.** See
     // [`AGED_KINDS_SQL`] and `FeedKind::AGED`: a publication's entries are
     // bounded by COUNT (the per-feed trim), because a 14-day window stored zero
@@ -1770,7 +1797,9 @@ pub async fn prune_old_entries(
     // "not aged out" from meaning "immortal" — the per-feed trim only runs when a
     // poll stores something, so rows belonging to a feed nobody polls any more
     // have nothing else to reap them.
-    let publication_cutoff = (publication_days > 0).then(|| at(publication_days));
+    let publication_cutoff = (publication_days > 0)
+        .then(|| at(publication_days, "publication_retention_days"))
+        .flatten();
     // The ceiling only means anything if it is STRICTLY OLDER than the window.
     // At `0 < hard_days <= days` the two cutoffs coincide, and since the hard
     // delete spares nothing, it would delete exactly the rows the soft delete
@@ -1797,7 +1826,7 @@ pub async fn prune_old_entries(
     // rolling window" and "I don't want any ceiling at all" are different
     // statements, and are now configured separately.
     let hard_cutoff = if hard_days > 0 && (days <= 0 || hard_days > days) {
-        Some(at(hard_days))
+        at(hard_days, "retention_hard_days")
     } else {
         if hard_days > 0 {
             tracing::warn!(
@@ -7544,9 +7573,12 @@ mod tests {
         }
         assert_eq!(count_entries(&pool).await?, 2);
 
-        // The instance defaults, with the archive ceiling disabled so that only
-        // the two aged windows are under test here.
-        let deleted = prune_old_entries(&pool, 14, 180, 0).await?;
+        // **The shipped configuration, all three knobs at their defaults.** An
+        // earlier version of this test passed `0` for the archive ceiling, so the
+        // combination under test was not the one any instance runs; at 3650 the
+        // publication's year-old document is inside the ceiling and must still
+        // survive.
+        let deleted = prune_old_entries(&pool, 14, 180, 3_650).await?;
         assert_eq!(deleted, 1, "exactly one of the two should have gone");
         let surviving: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM entries")
             .fetch_all(&pool)
@@ -7666,6 +7698,82 @@ mod tests {
             prune_old_entries(&pool, 0, 0, 0).await?,
             0,
             "publication_retention_days = 0 still deleted something",
+        );
+        Ok(())
+    }
+
+    /// **A retention window too large to be a date must disable that pass, not
+    /// kill the sweeper.**
+    ///
+    /// Every knob parses from a `u32` with no upper bound, and `Duration::days` /
+    /// `DateTime - TimeDelta` both panic out of range — measured, anything past
+    /// roughly 96 million days, and `u32::MAX` is. A unit slip (seconds or
+    /// milliseconds typed into a days field) reaches it.
+    ///
+    /// The old failure was quiet: this runs in a spawned task, so tokio catches
+    /// the panic and the sweeper stops for the life of the process, taking the
+    /// release valve for `db_size_watermark_bytes` with it — the one thing that
+    /// stops polling for every reader on the instance.
+    ///
+    /// `standard_site::ingest_floor` already answers the same input with "no
+    /// floor", and `Config::retention_for` exists to keep the two agreeing, so
+    /// this is also the end of a disagreement: unrepresentable meant "store
+    /// everything" on one side and "panic" on the other.
+    #[tokio::test]
+    async fn an_unrepresentable_retention_window_disables_the_pass_it_belongs_to() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://absurd.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(1_000))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "ancient".into(),
+                published: Some(ancient.clone()),
+                fetched_at: Some(ancient),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        // Each knob in turn, since each computes its own cutoff.
+        let absurd = u32::MAX as i64;
+        assert_eq!(
+            prune_old_entries(&pool, absurd, 0, 0).await?,
+            0,
+            "an absurd rolling window deleted something",
+        );
+        assert_eq!(
+            prune_old_entries(&pool, 0, absurd, 0).await?,
+            0,
+            "an absurd hard ceiling deleted something",
+        );
+        assert_eq!(
+            prune_old_entries(&pool, 0, 0, absurd).await?,
+            0,
+            "an absurd archive ceiling deleted something",
+        );
+        assert_eq!(
+            count_entries(&pool).await?,
+            1,
+            "the entry went away under a window that cannot even be expressed",
+        );
+
+        // And the sweep still works for the same knobs at a sane value — a
+        // function that returned early on every input would satisfy the above.
+        assert_eq!(
+            prune_old_entries(&pool, 30, 0, 0).await?,
+            1,
+            "a 30-day window did not delete a 1000-day-old entry",
         );
         Ok(())
     }
