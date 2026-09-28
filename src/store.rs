@@ -856,6 +856,17 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// changing both, and that test is what makes forgetting one a failure.
 pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss'";
 
+/// The `kind` values the retention **window** applies to, as a SQL list.
+///
+/// Pinned against [`crate::feed::FeedKind::AGED`] by
+/// `the_sql_aged_kind_list_matches_the_rust_one`, for the same reason
+/// [`POLLABLE_KINDS_SQL`] is pinned against `POLLABLE`.
+///
+/// Why a publication is not in it: see `FeedKind::AGED`. Measured — a 14-day
+/// window stored zero rows from every real publication tried, because their
+/// newest documents were 109 to 241 days old.
+pub(crate) const AGED_KINDS_SQL: &str = "'rss'";
+
 /// How many rows the poller will never select — the capacity consumed by feeds
 /// that cannot be fetched.
 ///
@@ -1740,13 +1751,55 @@ pub async fn mark_feed_due(
 /// The two knobs are **independent**. `days == 0` disables the rolling window and
 /// nothing else; `hard_days == 0` disables the ceiling and nothing else. Only
 /// when both are off is this a no-op. Returns the number of entry rows deleted.
-pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> Result<u64> {
+pub async fn prune_old_entries(
+    pool: &SqlitePool,
+    days: i64,
+    hard_days: i64,
+    publication_days: i64,
+) -> Result<u64> {
     let now = chrono::Utc::now();
-    let at = |d: i64| {
-        (now - chrono::Duration::days(d)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // **A window too large to be a date disables that pass; it must not panic.**
+    //
+    // `chrono::Duration::days` and `DateTime - TimeDelta` both panic out of
+    // range, and every knob here parses from a `u32` with no upper bound — so
+    // `FEATHERREADER_RETENTION_DAYS=1000000000` (a plausible unit slip: seconds or
+    // milliseconds typed into a days field) panicked this function. Measured:
+    // anything past roughly 96 million days overflows, and `u32::MAX` does.
+    //
+    // The consequence was not a crash an operator would notice. This runs in a
+    // spawned task, so tokio catches the panic and the retention sweeper simply
+    // stops for the life of the process — silently, permanently, and taking the
+    // release valve for `db_size_watermark_bytes` with it, which is the one thing
+    // that stops polling for every reader.
+    //
+    // Disabled-not-panicking is also the answer `standard_site::ingest_floor`
+    // already gives for the same input, and the two are supposed to mirror each
+    // other — `Config::retention_for` exists to keep them agreeing. An
+    // unrepresentable window meant "store everything" there and "panic" here.
+    let at = |d: i64, knob: &str| -> Option<String> {
+        let cutoff = chrono::Duration::try_days(d).and_then(|w| now.checked_sub_signed(w));
+        if cutoff.is_none() {
+            tracing::warn!(
+                days = d,
+                knob,
+                "retention window is too large to express as a date; treating it as \
+                 disabled for this sweep rather than failing the sweeper"
+            );
+        }
+        cutoff.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     };
 
-    let cutoff = (days > 0).then(|| at(days));
+    let cutoff = (days > 0).then(|| at(days, "retention_days")).flatten();
+    // **The third window, for the kinds age does not bound.** See
+    // [`AGED_KINDS_SQL`] and `FeedKind::AGED`: a publication's entries are
+    // bounded by COUNT (the per-feed trim), because a 14-day window stored zero
+    // rows from every real publication measured. This is the backstop that keeps
+    // "not aged out" from meaning "immortal" — the per-feed trim only runs when a
+    // poll stores something, so rows belonging to a feed nobody polls any more
+    // have nothing else to reap them.
+    let publication_cutoff = (publication_days > 0)
+        .then(|| at(publication_days, "publication_retention_days"))
+        .flatten();
     // The ceiling only means anything if it is STRICTLY OLDER than the window.
     // At `0 < hard_days <= days` the two cutoffs coincide, and since the hard
     // delete spares nothing, it would delete exactly the rows the soft delete
@@ -1773,7 +1826,7 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
     // rolling window" and "I don't want any ceiling at all" are different
     // statements, and are now configured separately.
     let hard_cutoff = if hard_days > 0 && (days <= 0 || hard_days > days) {
-        Some(at(hard_days))
+        at(hard_days, "retention_hard_days")
     } else {
         if hard_days > 0 {
             tracing::warn!(
@@ -1786,7 +1839,7 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         None
     };
 
-    if cutoff.is_none() && hard_cutoff.is_none() {
+    if cutoff.is_none() && hard_cutoff.is_none() && publication_cutoff.is_none() {
         return Ok(0);
     }
 
@@ -1813,7 +1866,14 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         Some(cutoff) => {
             delete_in_batches(
                 pool,
-                "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
+                // Scoped to the kinds the window applies to. A publication's
+                // entries answer to `publication_cutoff` below instead, which is
+                // generous where this is tight — an archive read is not a cache
+                // of the last few days.
+                &format!(
+                    "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1 \
+                     AND feed_id IN (SELECT id FROM feeds WHERE kind IN ({AGED_KINDS_SQL}))"
+                ),
                 cutoff,
                 "hard ceiling",
             )
@@ -1896,13 +1956,17 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
                 // column constraint somewhere else, and `NOT EXISTS` does not.
                 // `sparing_honours_every_did_not_just_one` pins the multi-DID
                 // case, which is the only one where the forms could diverge.
-                "SELECT e.id FROM entries e \
-                 WHERE COALESCE(e.published, e.fetched_at) < ?1 \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM entry_state s \
-                       WHERE s.entry_id = e.id \
-                         AND (s.starred = 1 OR s.read = 0) \
-                   )",
+                &format!(
+                    "SELECT e.id FROM entries e \
+                     WHERE COALESCE(e.published, e.fetched_at) < ?1 \
+                       AND e.feed_id IN \
+                           (SELECT id FROM feeds WHERE kind IN ({AGED_KINDS_SQL})) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM entry_state s \
+                           WHERE s.entry_id = e.id \
+                             AND (s.starred = 1 OR s.read = 0) \
+                       )"
+                ),
                 cutoff,
                 "window",
             )
@@ -1910,7 +1974,29 @@ pub async fn prune_old_entries(pool: &SqlitePool, days: i64, hard_days: i64) -> 
         }
         None => 0,
     };
-    let deleted = soft_deleted + hard_deleted;
+    // **The archive ceiling, for every kind the window does not cover.**
+    //
+    // `kind NOT IN` rather than `kind = 'publication'` deliberately: a kind added
+    // later and left out of `FeedKind::AGED` inherits a bound here rather than
+    // inheriting immortality. Spares nothing, for the reason the hard ceiling
+    // spares nothing — a saved record whose entry is gone still renders from the
+    // PDS record as a link card, so the reader keeps the article's identity.
+    let publication_deleted = match &publication_cutoff {
+        Some(cutoff) => {
+            delete_in_batches(
+                pool,
+                &format!(
+                    "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1 \
+                     AND feed_id IN (SELECT id FROM feeds WHERE kind NOT IN ({AGED_KINDS_SQL}))"
+                ),
+                cutoff,
+                "archive ceiling",
+            )
+            .await?
+        }
+        None => 0,
+    };
+    let deleted = soft_deleted + hard_deleted + publication_deleted;
 
     // Only touch cursors when rows actually went away — and OUTSIDE the deletes.
     //
@@ -4325,7 +4411,7 @@ mod tests {
             .execute(&pool)
             .await?;
 
-            prune_old_entries(&pool, 14, hard).await?;
+            prune_old_entries(&pool, 14, hard, 0).await?;
 
             let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
                 .fetch_one(&pool)
@@ -4389,7 +4475,7 @@ mod tests {
         .await?;
 
         // No rolling window; a 180-day ceiling.
-        let deleted = prune_old_entries(&pool, 0, 180).await?;
+        let deleted = prune_old_entries(&pool, 0, 180, 0).await?;
 
         assert_eq!(
             deleted, 1,
@@ -4435,7 +4521,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(prune_old_entries(&pool, 0, 0).await?, 0);
+        assert_eq!(prune_old_entries(&pool, 0, 0, 0).await?, 0);
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
             .fetch_one(&pool)
             .await?;
@@ -7064,7 +7150,7 @@ mod tests {
                 // and the cursor scrub. The bias therefore runs AGAINST the
                 // shipped form, so a win measured here is a lower bound — but the
                 // two numbers are not a like-for-like microbenchmark.
-                prune_old_entries(&pool, 30, 3650).await?
+                prune_old_entries(&pool, 30, 3650, 0).await?
             };
             let elapsed = t.elapsed();
 
@@ -7421,6 +7507,290 @@ mod tests {
             .await?)
     }
 
+    /// **The rolling window and the hard ceiling do not touch a publication, and
+    /// this is the test that says the feature works at all.**
+    ///
+    /// Measured on 2026-09-27 against three real publications: the newest
+    /// document Standard.site offered was 131 days old, Annotated's 109, minus
+    /// listens' 241. Under the 14-day window every one of them stored **zero**
+    /// rows — a successful poll and an empty feed. So age is not the policy here;
+    /// COUNT is (`max_entries_per_feed`), and the ceiling below is only the
+    /// not-immortal backstop.
+    ///
+    /// Both directions in one test on purpose: the RSS twin must still be
+    /// deleted, or "nothing is ever swept" would pass.
+    #[tokio::test]
+    async fn the_window_and_the_ceiling_spare_a_publication_but_not_an_rss_entry() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let rss = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://aged.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let publication = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
+                    .to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // The kind column is what the sweep filters on, so assert the fixture
+        // really produced two different kinds rather than trusting `FeedKind::of`.
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feeds ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(kinds, vec!["rss".to_string(), "publication".to_string()]);
+
+        // A year old, and READ by somebody — so the window's own sparing rule
+        // ("starred or unread survives") cannot be what keeps either row.
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        for feed_id in [rss, publication] {
+            insert_entries(
+                &pool,
+                feed_id,
+                &[NewEntry {
+                    guid: format!("ancient-{feed_id}"),
+                    published: Some(ancient.clone()),
+                    fetched_at: Some(ancient.clone()),
+                    ..Default::default()
+                }],
+                0,
+            )
+            .await?;
+        }
+        replace_sub_refs(&pool, "did:plc:reader", &[rss, publication]).await?;
+        for id in sqlx::query_scalar::<_, i64>("SELECT id FROM entries ORDER BY id")
+            .fetch_all(&pool)
+            .await?
+        {
+            mark_read(&pool, "did:plc:reader", id, true).await?;
+        }
+        assert_eq!(count_entries(&pool).await?, 2);
+
+        // **The shipped configuration, all three knobs at their defaults.** An
+        // earlier version of this test passed `0` for the archive ceiling, so the
+        // combination under test was not the one any instance runs; at 3650 the
+        // publication's year-old document is inside the ceiling and must still
+        // survive.
+        let deleted = prune_old_entries(&pool, 14, 180, 3_650).await?;
+        assert_eq!(deleted, 1, "exactly one of the two should have gone");
+        let surviving: Vec<i64> = sqlx::query_scalar("SELECT feed_id FROM entries")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            surviving,
+            vec![publication],
+            "the publication's year-old document was swept — under the 14-day \
+             window that is every document a real publication has, so the feed a \
+             reader subscribed to would be permanently empty",
+        );
+        Ok(())
+    }
+
+    /// **"Not aged out" must not mean "immortal".**
+    ///
+    /// The per-feed trim is what bounds a publication, and it only runs when a
+    /// poll stores something — so entries of a feed nobody polls any more have
+    /// nothing else to reap them. This ceiling is that backstop, and it spares
+    /// nothing, for the same reason the hard ceiling spares nothing: a saved
+    /// record whose entry is gone still renders from the PDS record as a link.
+    #[tokio::test]
+    async fn the_archive_ceiling_reaps_a_publication_entry_past_it() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        // An RSS twin, to pin that this pass is SCOPED. Verified needed: dropping
+        // the `kind NOT IN` clause from it left all 909 tests passing, and that
+        // mutation quietly re-enables age-based eviction for RSS on an instance
+        // whose operator set both RSS knobs to zero.
+        let rss = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://not-swept.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let publication = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
+                    .to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let recent = now_rfc3339();
+        insert_entries(
+            &pool,
+            publication,
+            &[
+                NewEntry {
+                    guid: "past-the-ceiling".into(),
+                    published: Some(ancient.clone()),
+                    fetched_at: Some(ancient),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "inside-the-ceiling".into(),
+                    published: Some(recent.clone()),
+                    fetched_at: Some(recent),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(400))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_entries(
+            &pool,
+            rss,
+            &[NewEntry {
+                guid: "rss-past-the-archive-ceiling".into(),
+                published: Some(long_ago.clone()),
+                fetched_at: Some(long_ago),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        // STARRED, so this also pins that the ceiling spares nothing.
+        replace_sub_refs(&pool, "did:plc:reader", &[rss, publication]).await?;
+        for id in sqlx::query_scalar::<_, i64>("SELECT id FROM entries ORDER BY id")
+            .fetch_all(&pool)
+            .await?
+        {
+            mark_starred(&pool, "did:plc:reader", id, true).await?;
+        }
+
+        // Rolling window and hard ceiling off: the archive ceiling is the only
+        // thing that can delete here.
+        let deleted = prune_old_entries(&pool, 0, 0, 365).await?;
+        assert_eq!(
+            deleted, 1,
+            "the entry past the archive ceiling was not reaped"
+        );
+        let mut guids: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries")
+            .fetch_all(&pool)
+            .await?;
+        guids.sort();
+        assert_eq!(
+            guids,
+            vec![
+                "inside-the-ceiling".to_string(),
+                "rss-past-the-archive-ceiling".to_string(),
+            ],
+            "the archive ceiling must reap the publication's over-age entry and \
+             ONLY that — an RSS entry on an instance with both RSS knobs at zero \
+             is one the operator chose to keep",
+        );
+
+        // And zero disables it, consistently with the other two knobs.
+        assert_eq!(
+            prune_old_entries(&pool, 0, 0, 0).await?,
+            0,
+            "publication_retention_days = 0 still deleted something",
+        );
+        Ok(())
+    }
+
+    /// **A retention window too large to be a date must disable that pass, not
+    /// kill the sweeper.**
+    ///
+    /// Every knob parses from a `u32` with no upper bound, and `Duration::days` /
+    /// `DateTime - TimeDelta` both panic out of range — measured, anything past
+    /// roughly 96 million days, and `u32::MAX` is. A unit slip (seconds or
+    /// milliseconds typed into a days field) reaches it.
+    ///
+    /// The old failure was quiet: this runs in a spawned task, so tokio catches
+    /// the panic and the sweeper stops for the life of the process, taking the
+    /// release valve for `db_size_watermark_bytes` with it — the one thing that
+    /// stops polling for every reader on the instance.
+    ///
+    /// `standard_site::ingest_floor` already answers the same input with "no
+    /// floor", and `Config::retention_for` exists to keep the two agreeing, so
+    /// this is also the end of a disagreement: unrepresentable meant "store
+    /// everything" on one side and "panic" on the other.
+    #[tokio::test]
+    async fn an_unrepresentable_retention_window_disables_the_pass_it_belongs_to() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://absurd.example/feed.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(1_000))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "ancient".into(),
+                published: Some(ancient.clone()),
+                fetched_at: Some(ancient),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+
+        // Each knob in turn, since each computes its own cutoff.
+        let absurd = u32::MAX as i64;
+        assert_eq!(
+            prune_old_entries(&pool, absurd, 0, 0).await?,
+            0,
+            "an absurd rolling window deleted something",
+        );
+        assert_eq!(
+            prune_old_entries(&pool, 0, absurd, 0).await?,
+            0,
+            "an absurd hard ceiling deleted something",
+        );
+        assert_eq!(
+            prune_old_entries(&pool, 0, 0, absurd).await?,
+            0,
+            "an absurd archive ceiling deleted something",
+        );
+        assert_eq!(
+            count_entries(&pool).await?,
+            1,
+            "the entry went away under a window that cannot even be expressed",
+        );
+
+        // And the sweep still works for the same knobs at a sane value — a
+        // function that returned early on every input would satisfy the above.
+        assert_eq!(
+            prune_old_entries(&pool, 30, 0, 0).await?,
+            1,
+            "a 30-day window did not delete a 1000-day-old entry",
+        );
+        Ok(())
+    }
+
+    /// The SQL list and the Rust slice are asserted equal, for the same reason
+    /// [`POLLABLE_KINDS_SQL`] is: a literal here and a slice there is the drift
+    /// the `kind` column was introduced to end.
+    #[test]
+    fn the_sql_aged_kind_list_matches_the_rust_one() {
+        let expected = crate::feed::FeedKind::AGED
+            .iter()
+            .map(|k| format!("'{}'", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(AGED_KINDS_SQL, expected);
+    }
+
     #[tokio::test]
     async fn prune_old_entries_deletes_only_old_and_cascades_entry_state() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
@@ -7484,7 +7854,7 @@ mod tests {
         assert_eq!(state_before, 1);
 
         // Prune at a 90-day window: only the ancient entry is old.
-        let deleted = prune_old_entries(&pool, 90, 3650).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650, 0).await?;
         assert_eq!(deleted, 1, "only the year-old entry should be pruned");
         assert_eq!(
             count_entries(&pool).await?,
@@ -7509,7 +7879,7 @@ mod tests {
         // days == 0 disables the rolling WINDOW. The 3650-day ceiling still runs
         // (see `a_disabled_window_does_not_disable_the_ceiling`); it deletes
         // nothing here because both survivors are fresh.
-        assert_eq!(prune_old_entries(&pool, 0, 3650).await?, 0);
+        assert_eq!(prune_old_entries(&pool, 0, 3650, 0).await?, 0);
         assert_eq!(count_entries(&pool).await?, 2);
         Ok(())
     }
@@ -7569,7 +7939,7 @@ mod tests {
         assert!(ids_before.contains(&new_id.to_string()));
 
         // Prune the old entry — its id must be scrubbed from the cursor's id-set.
-        let deleted = prune_old_entries(&pool, 90, 3650).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650, 0).await?;
         assert_eq!(deleted, 1);
         let after = get_cursor(&pool, did, feed_url).await?.unwrap();
         let ids_after: Vec<String> = serde_json::from_str(&after.read_ids)?;
@@ -7686,7 +8056,7 @@ mod tests {
         insert_entries(&pool, feed_id, &entries, 0).await?;
         assert_eq!(count_entries(&pool).await? as usize, count);
 
-        let deleted = prune_old_entries(&pool, 30, 180).await?;
+        let deleted = prune_old_entries(&pool, 30, 180, 0).await?;
         assert_eq!(deleted as usize, count, "the sweep left rows behind");
         assert_eq!(count_entries(&pool).await?, 0);
         Ok(())
@@ -8482,7 +8852,7 @@ mod tests {
         }
 
         // Window only — no ceiling, so nothing is swept for age alone.
-        let deleted = prune_old_entries(&pool, 30, 0).await?;
+        let deleted = prune_old_entries(&pool, 30, 0, 0).await?;
         assert_eq!(
             deleted, 2,
             "expected the untouched and the all-read entries to go"
@@ -8657,7 +9027,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(prune_old_entries(&pool, 30, 180).await?, 1);
+        assert_eq!(prune_old_entries(&pool, 30, 180, 0).await?, 1);
 
         let cursor = get_cursor(&pool, did, feed_url).await?.expect("cursor");
         let ids: Vec<String> = serde_json::from_str(&cursor.read_ids)?;
@@ -8701,7 +9071,7 @@ mod tests {
         assert!(full > 0);
 
         // A retention sweep prunes every (year-old) entry, then reclaim shrinks.
-        let deleted = prune_old_entries(&pool, 90, 3650).await?;
+        let deleted = prune_old_entries(&pool, 90, 3650, 0).await?;
         assert_eq!(deleted, 2000);
         reclaim(&pool).await?;
         let after = db_size_bytes(&pool).await?;
@@ -9802,7 +10172,7 @@ mod tests {
         mark(&pool, old_unread, 0, 0).await;
         mark(&pool, recent_read, 1, 0).await;
 
-        let deleted = prune_old_entries(&pool, 14, 3650).await?;
+        let deleted = prune_old_entries(&pool, 14, 3650, 0).await?;
         assert_eq!(deleted, 1, "only the old, read, unstarred entry should go");
 
         let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
@@ -9820,7 +10190,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         aged_entry(&pool, "untouched-old", 30).await;
         aged_entry(&pool, "untouched-new", 1).await;
-        assert_eq!(prune_old_entries(&pool, 14, 3650).await?, 1);
+        assert_eq!(prune_old_entries(&pool, 14, 3650, 0).await?, 1);
         Ok(())
     }
 
@@ -9909,7 +10279,7 @@ mod tests {
         mark(&pool, recent_starred, 1, 1).await;
 
         // 14-day soft window, 180-day hard ceiling.
-        prune_old_entries(&pool, 14, 180).await?;
+        prune_old_entries(&pool, 14, 180, 0).await?;
 
         let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
             .fetch_all(&pool)

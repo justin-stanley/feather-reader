@@ -16,40 +16,48 @@ deploying is separate.
 
 ## Unreleased
 
-### Fixed
+### Changed
 
-- **A certificate test no longer turns latency into a verdict about a
-  certificate.** `the_test_ca_is_trusted_and_still_validates_hostnames` asserts
-  that the test CA is trusted and that a host outside the leaf's SAN list is
-  still refused. It was observed failing on the first HTTPS request in a freshly
-  linked test binary — 11.7 s and 20.3 s measured on one macOS machine, against
-  the 15 s per-read bound `build_pinned_client` sets.
+- **A standard.site publication is retained by COUNT, not by age — because
+  measurement says the age window stores nothing at all.** Read three real
+  publications through `standard_site::fetch` on 2026-09-27: the newest document
+  Standard.site offered was **131 days** old, Annotated's **109** (its oldest
+  373), minus listens' **241**. Against the instance default `retention_days = 14`
+  every one of them stored **zero rows** — a successful poll, an empty feed, and
+  an info log as the only trace that anything was dropped. Long-form publishing is
+  not news-paced, and an ingest floor that mirrors an age-based sweep faithfully
+  reproduces that.
 
-  **The cause is not pinned, and this entry no longer claims it is.** Nine later
-  attempts on the same machine, three of them under a load average of ~120,
-  measured that first request at 8–17 ms. The leading candidate is CPU starvation
-  with ~900 tests in flight.
+  So `FeedKind::AGED` now names the kinds the rolling window and the hard ceiling
+  apply to (RSS), both sweep passes are scoped to it, and a publication is bounded
+  by `max_entries_per_feed` in `insert_entries` instead — the newest N plus up to
+  N starred, which is a real bound and the one that suits a source whose value is
+  its archive.
 
-  So the test asks again when the only answer is a timeout, up to three times. A
-  timeout is not a verdict about a chain; a verdict is returned on the first ask,
-  so a genuine validation failure is never retried or masked. No production bound
-  changes.
+  A third, generous ceiling (`FEATHERREADER_PUBLICATION_RETENTION_DAYS`, default
+  **3650**) keeps "not aged out" from meaning "immortal": the per-feed trim only
+  runs when a poll stores something, so entries of a feed nobody polls any more
+  have nothing else to reap them. Ten years is longer than the protocol itself, so
+  it cannot truncate an archive that exists today. It is scoped the other way
+  (`kind NOT IN` the aged kinds) so that a kind added later inherits a bound
+  rather than immortality — and that scoping is pinned, because dropping it left
+  all 909 tests passing while quietly re-enabling age eviction for RSS on an
+  instance whose operator had set both RSS knobs to zero.
 
-  **Two earlier attempts were wrong, and both are worth naming.** The first
-  raised the per-read timeout under `cfg(test)`: the production constant became
-  invisible to every test, so the assertion said to protect it protected nothing
-  and setting it to an hour left the suite green; the effective relaxation was 30
-  seconds rather than the 120 claimed, because the total request timeout caps it.
-  Filed as #195. The second warmed the platform verifier once per process, on the
-  claim that reqwest switches to `rustls_platform_verifier` only when an extra
-  root is present — **that claim is false.** reqwest builds the platform verifier
-  on both arms of `if config.root_certs.is_empty()`
-  (`reqwest-0.13.5/src/async_impl/client.rs:758`), so there was no test-only path
-  to warm and production takes the same one. That attempt also failed silently
-  (its builder and its request both discarded their outcome, and the `OnceCell`
-  recorded success either way), omitted the `.no_proxy()` this module documents
-  at length, and issued a real request into whichever caller's captured request
-  log libtest happened to schedule first.
+  `Config::retention_for(kind)` is the single home for which window applies to
+  which kind. The sweep decides what to delete and `standard_site::ingest_floor`
+  decides what is worth storing; written independently they drift, and a drift
+  here is the resurrection cycle — a row the store keeps, the sweep deletes, and
+  the next poll re-inserts unread. Both read the same function.
+
+  Nothing polls a publication yet, so no reader sees a difference; this is the
+  retention half of that wiring, landed first because without it the feature
+  demonstrably delivers empty feeds. One operator-visible change: the sweeper's
+  "retention disabled entirely" early return now requires all THREE knobs to be
+  zero, so an instance running `RETENTION_DAYS=0 RETENTION_HARD_DAYS=0` starts a
+  daily sweeper where it previously logged and returned. On an all-RSS instance
+  that sweep deletes nothing — the one pass it runs is scoped to kinds that
+  instance has no rows for.
 
 ### Security
 
@@ -172,6 +180,60 @@ deploying is separate.
   reports `complete: false`, which it already models.
 
 ### Fixed
+
+- **A certificate test no longer turns latency into a verdict about a
+  certificate.** `the_test_ca_is_trusted_and_still_validates_hostnames` asserts
+  that the test CA is trusted and that a host outside the leaf's SAN list is
+  still refused. It was observed failing on the first HTTPS request in a freshly
+  linked test binary — 11.7 s and 20.3 s measured on one macOS machine, against
+  the 15 s per-read bound `build_pinned_client` sets.
+
+  **The cause is not pinned, and this entry no longer claims it is.** Nine later
+  attempts on the same machine, three of them under a load average of ~120,
+  measured that first request at 8–17 ms. The leading candidate is CPU starvation
+  with ~900 tests in flight.
+
+  So the test asks again when the only answer is a timeout, up to three times. A
+  timeout is not a verdict about a chain; a verdict is returned on the first ask,
+  so a genuine validation failure is never retried or masked. No production bound
+  changes.
+
+  **Two earlier attempts were wrong, and both are worth naming.** The first
+  raised the per-read timeout under `cfg(test)`: the production constant became
+  invisible to every test, so the assertion said to protect it protected nothing
+  and setting it to an hour left the suite green; the effective relaxation was 30
+  seconds rather than the 120 claimed, because the total request timeout caps it.
+  Filed as #195. The second warmed the platform verifier once per process, on the
+  claim that reqwest switches to `rustls_platform_verifier` only when an extra
+  root is present — **that claim is false.** reqwest builds the platform verifier
+  on both arms of `if config.root_certs.is_empty()`
+  (`reqwest-0.13.5/src/async_impl/client.rs:758`), so there was no test-only path
+  to warm and production takes the same one. That attempt also failed silently
+  (its builder and its request both discarded their outcome, and the `OnceCell`
+  recorded success either way), omitted the `.no_proxy()` this module documents
+  at length, and issued a real request into whichever caller's captured request
+  log libtest happened to schedule first.
+
+- **A retention window too large to be a date stopped the sweeper instead of
+  being ignored.** Every retention knob parses from a `u32` with no upper bound,
+  and both `chrono::Duration::days` and `DateTime - TimeDelta` panic out of range
+  — measured, anything past roughly 96 million days, and `u32::MAX` is. A unit
+  slip is enough to reach it: seconds or milliseconds typed into a field that
+  means days.
+
+  The failure was quiet, which is what makes it worth a line. The sweep runs in a
+  spawned task, so tokio caught the panic and the retention sweeper simply stopped
+  for the life of the process — silently, permanently, and taking with it the
+  release valve for `db_size_watermark_bytes`, which is the one thing that stops
+  polling for every reader on the instance.
+
+  An unrepresentable window now disables the pass it belongs to and says so in a
+  warning naming the knob. That is also what `standard_site::ingest_floor` already
+  answered for the same input, and `Config::retention_for` exists to keep the two
+  agreeing — so this ends a disagreement where unrepresentable meant "store
+  everything" on one side and "panic" on the other. Found reviewing #206, which
+  added the third knob and therefore a third way in.
+
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes

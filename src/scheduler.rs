@@ -809,11 +809,18 @@ pub async fn run_retention_sweeper(
 ) {
     let days = state.config.retention_days as i64;
     let hard_days = state.config.retention_hard_days as i64;
-    if days <= 0 && hard_days <= 0 {
+    // The third window: the ceiling for kinds the rolling window does not apply
+    // to (a publication). It is on by default and independent of the other two,
+    // so the "disabled entirely" branch below has to consider it or a
+    // `RETENTION_DAYS=0 RETENTION_HARD_DAYS=0` instance would silently stop
+    // reaping publications as well.
+    let publication_days = state.config.publication_retention_days as i64;
+    if days <= 0 && hard_days <= 0 && publication_days <= 0 {
         info!(
-            "retention sweeper: retention_days=0 and retention_hard_days=0, \
-             retention disabled entirely (no rolling window, NO ceiling — the \
-             shared cache is unbounded in this configuration)"
+            "retention sweeper: retention_days=0, retention_hard_days=0 and \
+             publication_retention_days=0, retention disabled entirely (no rolling \
+             window, NO ceiling — the shared cache is unbounded in this \
+             configuration)"
         );
         return;
     }
@@ -824,6 +831,7 @@ pub async fn run_retention_sweeper(
     info!(
         retention_days = days,
         retention_hard_days = hard_days,
+        publication_retention_days = publication_days,
         ?period,
         "retention sweeper started"
     );
@@ -840,13 +848,14 @@ pub async fn run_retention_sweeper(
                 break;
             }
             _ = ticker.tick() => {
-                match store::prune_old_entries(&state.db, days, hard_days).await {
+                match store::prune_old_entries(&state.db, days, hard_days, publication_days).await {
                     Ok(0) => debug!("retention sweeper: nothing past the retention window"),
                     Ok(n) => {
                         info!(
                             pruned = n,
                             retention_days = days,
                             retention_hard_days = hard_days,
+                            publication_retention_days = publication_days,
                             "retention sweeper: pruned old entries"
                         );
                         // Return the freed pages to the OS so the file actually

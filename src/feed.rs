@@ -762,6 +762,27 @@ impl FeedKind {
     /// kind should seed or stagger `next_poll` for the rows it admits.
     pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
 
+    /// The kinds whose entries the retention **window** applies to.
+    ///
+    /// **Age is the wrong retention policy for an archive, and that is a
+    /// measurement, not a preference.** Three real publications, read through
+    /// `standard_site::fetch` on 2026-09-27: Standard.site's newest document was
+    /// **131 days** old, Annotated's **109** (with its oldest at 373), and minus
+    /// listens' **241**. Against the instance default window of 14 days, every
+    /// one of them stored **zero** rows — a green poll, an empty feed, and an
+    /// info log as the only trace. Long-form publishing is not news-paced.
+    ///
+    /// So a publication is bounded by COUNT instead: `max_entries_per_feed` in
+    /// `insert_entries`, which caps a feed at the newest N plus up to N starred.
+    /// That is a real bound — it is what keeps this from being "retention off" —
+    /// and it is the one that suits a source whose value is its archive.
+    ///
+    /// A generous absolute ceiling still applies (`publication_retention_days`),
+    /// because "not aged out" must not mean "immortal": rows belonging to a feed
+    /// nobody polls any more would otherwise never be reaped at all, and the
+    /// per-feed trim only runs when a poll stores something.
+    pub const AGED: &'static [FeedKind] = &[FeedKind::Rss];
+
     /// The column value. Stable — it is persisted.
     pub fn as_str(self) -> &'static str {
         match self {
