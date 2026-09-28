@@ -2787,6 +2787,116 @@ pub(crate) mod tests {
 
     // ── TLS test server ──────────────────────────────────────────────────────
 
+    /// How many times [`guarded_get_for_a_verdict`] asks, while the answer keeps
+    /// being a timeout rather than a verdict about the certificate.
+    ///
+    /// **Nothing pins this number, and that is disclosed rather than implied.**
+    /// Any value above one behaves identically on a healthy run, so pinning it
+    /// would need a server that stalls past the 15 s per-read bound — a 15 s
+    /// test. What IS pinned, in both directions, is the classifier the loop turns
+    /// on: `a_timeout_is_recognised_as_a_timeout_and_not_a_certificate_verdict`
+    /// for one, the assertion inside
+    /// `the_test_ca_is_trusted_and_still_validates_hostnames` for the other.
+    const VERDICT_ATTEMPTS: usize = 3;
+
+    /// Whether an error out of [`guarded_get`] is a TIMEOUT rather than a verdict
+    /// about the certificate.
+    ///
+    /// Classified from `reqwest::Error::is_timeout` through the `with_context`
+    /// layer `guarded_get_inner` adds, not from the message text — the message
+    /// is not a contract, and matching on it is how this file's other
+    /// error-shape assertion passed for the wrong reason once already.
+    fn is_timeout(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    }
+
+    /// [`guarded_get`], asked again while the only answer is a timeout.
+    ///
+    /// **The certificate test is about whether the chain validates, and a
+    /// timeout is not a verdict on that.** It was observed failing on the first
+    /// HTTPS request in a freshly linked test binary — 11.7 s and 20.3 s
+    /// measured on one macOS machine, against the 15 s per-read bound
+    /// `build_pinned_client` sets. Nine later attempts on the same machine
+    /// measured 8–17 ms, so the cause is NOT pinned; the leading candidate is
+    /// CPU starvation with ~900 tests in flight, which no amount of warming
+    /// would fix.
+    ///
+    /// Two earlier attempts at this are worth naming, because both were wrong in
+    /// ways this one avoids. Widening `READ_TIMEOUT` changed a production
+    /// constant to accommodate a test. Warming the platform verifier once per
+    /// process rested on a claim that is simply false — reqwest builds
+    /// `rustls_platform_verifier` whether or not an extra root is present
+    /// (`reqwest-0.13/src/async_impl/client.rs`: both arms of
+    /// `if config.root_certs.is_empty()`), so there was no test-only path to
+    /// warm; it also failed silently, and issued a request into the caller's
+    /// captured log.
+    ///
+    /// Retrying the timeout is insensitive to *which* cause it was, changes no
+    /// production bound, and cannot mask a validation failure: a certificate
+    /// verdict is returned on the first ask.
+    async fn guarded_get_for_a_verdict(client: &Client, url: &str) -> Result<Response> {
+        for _ in 1..VERDICT_ATTEMPTS {
+            match guarded_get(client, url, &[]).await {
+                Err(err) if is_timeout(&err) => {
+                    eprintln!("asking {url} again after a timeout, not a verdict: {err:#}");
+                }
+                verdict => return verdict,
+            }
+        }
+        guarded_get(client, url, &[]).await
+    }
+
+    /// **The retry turns entirely on this classifier, so pin it.**
+    ///
+    /// A classifier that stops recognising timeouts leaves the certificate test
+    /// exactly as latency-sensitive as it was, with nothing to say so. The
+    /// opposite direction — a certificate error must NOT read as a timeout, or a
+    /// genuine validation failure would be retried and then reported as one — is
+    /// asserted where such an error already exists, in
+    /// `the_test_ca_is_trusted_and_still_validates_hostnames`.
+    ///
+    /// Uses a real timeout against a socket that is accepted and never answered,
+    /// through the same `with_context` wrapping `guarded_get_inner` applies, so
+    /// the downcast is exercised through a context layer rather than on a bare
+    /// error.
+    #[tokio::test]
+    async fn a_timeout_is_recognised_as_a_timeout_and_not_a_certificate_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold: answering nothing is the point, and dropping the
+            // socket would end the request as a connection close instead.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let raw = client
+            .get(format!("http://{addr}/never"))
+            .send()
+            .await
+            .expect_err("a server that never answers must not produce a response");
+        assert!(
+            raw.is_timeout(),
+            "the silent server ended the request some other way, so this test is \
+             not exercising a timeout at all: {raw}",
+        );
+        let err = anyhow::Error::from(raw).context(format!("fetching http://{addr}/never"));
+
+        assert!(
+            is_timeout(&err),
+            "a real read timeout was not recognised as one, so the retry would \
+             never retry and the certificate test stays latency-sensitive: {err:#}",
+        );
+    }
+
     /// **The chain really validates — no invalid-cert acceptance anywhere.**
     ///
     /// The foundation every test below rests on. If this passed because
@@ -2806,22 +2916,31 @@ pub(crate) mod tests {
         test_host_override("not-in-san.test", addr);
 
         let client = reqwest::Client::builder().build().unwrap();
-        let ok = guarded_get(
+        // Asked again on a timeout — see `guarded_get_for_a_verdict`. A timeout
+        // is not a verdict about this chain, and this test is only about the
+        // verdict.
+        let ok = guarded_get_for_a_verdict(
             &client,
             &format!("https://feed-tls.test:{}/ok", addr.port()),
-            &[],
         )
         .await
         .expect("a SAN-matching https host should be accepted");
         assert!(ok.status().is_success());
 
-        let err = guarded_get(
+        let err = guarded_get_for_a_verdict(
             &client,
             &format!("https://not-in-san.test:{}/ok", addr.port()),
-            &[],
         )
         .await
         .expect_err("a host with no SAN must still fail: validation is NOT disabled");
+        // **The other half of the classifier, pinned where such an error exists.**
+        // If a certificate verdict read as a timeout, this failure would be
+        // retried `VERDICT_ATTEMPTS` times and then reported anyway — and the
+        // retry would be masking exactly the failure it must never mask.
+        assert!(
+            !is_timeout(&err),
+            "a certificate verdict was classified as a timeout, so the retry              would retry a genuine validation failure: {err:#}",
+        );
         // **Assert the CERTIFICATE reason, not merely that it failed.**
         //
         // An earlier version accepted `msg.contains("name")`, which the DNS error
