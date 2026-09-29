@@ -116,6 +116,52 @@ deploying is separate.
   for one, down the route this entry points them at. Both arms now refuse the
   export and say so, rather than exporting nothing and calling it a success.
 
+- **A `listRecords` body is bounded before it is parsed, not after.** Every other
+  limit is consulted once `serde_json` has already built the page, which cannot
+  prevent the allocation it exists to prevent. Measured: one 8 MB response whose
+  single record holds 1.2 million `{"":0}` objects retained **787 MB**, a 98x
+  wire-to-heap amplification, on a 512 MB box. The record cap does not see it —
+  the page holds one record. The page cap does not see it — there is one request.
+  The byte budget does not see it until the memory is spent.
+
+  A cheap linear scan of the raw bytes now bounds how many nodes the body can ask
+  for, counting the structural characters that introduce a value **outside
+  strings**. Skipping strings is the whole difficulty: counting naively would
+  refuse a legitimate article containing a million commas.
+
+  The cap is **640 000**, from measurement: the worst shape reaches 210 bytes per
+  counted character, so 640 000 is about the 128 MiB this claims. An earlier draft
+  said two million on a 32-bytes-a-node model — which this same file already
+  rejects two hundred lines above, where a single-entry object is charged 680
+  bytes — and two million admitted **400 MB**, more than the attack it was written
+  to stop. Re-measured when a review put the worst shape at 221 B instead: it does
+  not reproduce. Sweeping nesting depths 10, 50, 100 and 120 against a counting
+  allocator, the worst is 210.6 B per counted character and peak equals retained;
+  depth cannot be pushed further to raise it, because `serde_json`'s own recursion
+  limit of 128 refuses a deeper body before this guard would matter.
+
+  Tests bracket the cap from **both** sides: the densest page the lexicons permit
+  must fit, and the attack must not. The dense page is a full `readState` listing
+  — 100 records each carrying `readIds` **and** `unreadIds` at
+  `ReadState::MAX_IDS`, which counts about 403 000 nodes. Filling only `readIds`
+  counted 203 503, so a cap as low as 300 000 passed every test while refusing the
+  page the floor exists to protect; verified both ways, 300 000 and 2 000 000 now
+  each fail that test.
+
+  **Every path that turns an outside body into a `Value` is covered, not just the
+  listing.** `SidecarClient::repo`, twelve lines from the listing path, is the
+  response for every create, put, delete and batch, and without the guard the
+  identical 8 MB attack retained 786 MB. On the `backend=rust` client the funnel
+  is `PostOutcome::json` — the repo writers' responses, the PAR response, the
+  token response and the session refresh all parse through it, and none of them
+  had a bound before the parse. The guard sits in that one method rather than at
+  its four call sites, because the listing guard had to be fitted to three clients
+  one round at a time, twice.
+
+  Filed as #197 from a cold adversarial review, which also established that the
+  wire cap alone cannot close this — at a hundredfold amplification no single byte
+  limit both permits long-form prose and bounds the attack.
+
 - **A `listRecords` page is parsed once, not twice.** The body went through
   `serde_json::Value` and then into the typed struct, and `from_value` rebuilds
   rather than moves — so both copies are live at the same time.

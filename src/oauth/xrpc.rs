@@ -981,6 +981,90 @@ mod tests {
         );
     }
 
+    /// **The write path parses a PDS body too, and it had no bound before the
+    /// parse.**
+    ///
+    /// `listRecords` is guarded by `parse_list_records`; every OTHER body this
+    /// client turns into a `Value` goes through `PostOutcome::json` — the repo
+    /// writers' responses, the PAR response, the token response, the session
+    /// refresh. `read_capped` bounds the WIRE at 8 MB, which is the *input* to the
+    /// amplification rather than a limit on it: 8 MB of the cheapest node shape
+    /// measured 824 MB retained on a 512 MB box.
+    ///
+    /// Drives `delete_record`, which is the shortest route from a handler to
+    /// `send` → `json`.
+    #[tokio::test]
+    async fn the_live_write_path_refuses_a_node_explosion() {
+        let mut body = String::from(r#"{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            body.push_str("{},");
+        }
+        body.push_str("{}]}");
+        assert!(
+            crate::atproto::node_lower_bound(body.as_bytes()) > crate::atproto::MAX_LIST_NODES,
+            "the probe body is not over the cap, so this test proves nothing",
+        );
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "write-explosion.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://write-explosion.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .delete_record("c", "r")
+            .await
+            .expect_err("a node explosion on the write path was parsed rather than refused");
+        assert!(
+            format!("{err:#}").contains("nodes"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// The other direction: an ordinary write response still parses. Without this
+    /// a guard that refused every body would pass the test above.
+    #[tokio::test]
+    async fn the_live_write_path_accepts_an_ordinary_response() {
+        let base =
+            crate::net::tests::serve_body(br#"{"commit":{"cid":"bafy","rev":"3lab"}}"#.to_vec())
+                .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "write-ordinary.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://write-ordinary.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        repo.delete_record("c", "r")
+            .await
+            .expect("an ordinary write response was refused");
+    }
+
     /// **A duplicated `records` key must not be able to empty a page.**
     ///
     /// This is the live `backend=rust` walk, so an empty page here reaches

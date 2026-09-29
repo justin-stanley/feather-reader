@@ -58,6 +58,26 @@ impl PostOutcome {
     /// otherwise put the access and refresh tokens into whatever logs the error.
     /// Status and length carry the same diagnostic value.
     pub fn json(&self) -> Result<serde_json::Value> {
+        // **The one funnel where a body from outside becomes a `Value`, so the
+        // node guard belongs here.** `listRecords` is bounded by
+        // `parse_list_records`, but every OTHER body this client turns into a
+        // `Value` arrives through this method: the repo writers' responses
+        // (`createRecord`, `putRecord`, `applyWrites`), the PAR response, the
+        // token response and the session refresh. None of them had a bound
+        // before the parse — `read_capped` bounds the WIRE at 8 MB, which is the
+        // input to the amplification, not a limit on it, and 8 MB of the cheapest
+        // node shape measured 824 MB retained on a 512 MB box.
+        //
+        // Guarding here rather than at the four call sites is deliberate: the
+        // listing guard had to be fitted to three clients one round at a time,
+        // twice, which is the whole argument for a single choke point.
+        //
+        // The message carries node counts only — never the body, not even an
+        // excerpt, for the same reason the parse error below does not.
+        crate::atproto::refuse_a_node_explosion(
+            &self.body,
+            &format!("the response body (status {})", self.status),
+        )?;
         serde_json::from_slice(&self.body).with_context(|| {
             format!(
                 "response (status {}, {} bytes) is not valid JSON",
