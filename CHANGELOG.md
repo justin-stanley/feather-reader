@@ -118,9 +118,14 @@ deploying is separate.
 
 - **A `listRecords` body is bounded before it is parsed, not after.** Every other
   limit is consulted once `serde_json` has already built the page, which cannot
-  prevent the allocation it exists to prevent. Measured: one 8 MB response whose
-  single record holds 1.2 million `{"":0}` objects retained **787 MB**, a 98x
-  wire-to-heap amplification, on a 512 MB box. The record cap does not see it —
+  prevent the allocation it exists to prevent. Measured: one response of `{"":0}`
+  objects at `net::MAX_BODY_BYTES` — 8 MiB, the most `read_capped` admits —
+  retained **824 MB**, a 98x wire-to-heap amplification, on a 512 MB box.
+
+  (An earlier draft of this entry said 787 MB. Both numbers are real and they
+  describe the same shape at different sizes: 789 MB at 8 MB decimal, 824 MB at
+  8 MiB. The figure quoted everywhere is now the second one, because 8 MiB is what
+  the code actually permits.) The record cap does not see it —
   the page holds one record. The page cap does not see it — there is one request.
   The byte budget does not see it until the memory is spent.
 
@@ -148,19 +153,58 @@ deploying is separate.
   page the floor exists to protect; verified both ways, 300 000 and 2 000 000 now
   each fail that test.
 
-  **Every path that turns an outside body into a `Value` is covered, not just the
-  listing.** `SidecarClient::repo`, twelve lines from the listing path, is the
-  response for every create, put, delete and batch, and without the guard the
-  identical 8 MB attack retained 786 MB. On the `backend=rust` client the funnel
-  is `PostOutcome::json` — the repo writers' responses, the PAR response, the
-  token response and the session refresh all parse through it, and none of them
-  had a bound before the parse. The guard sits in that one method rather than at
-  its four call sites, because the listing guard had to be fitted to three clients
-  one round at a time, twice.
+  **Every path that turns an outside body into a `Value` is covered, and it took
+  three rounds to make that sentence true.** The first round guarded the shared
+  listing parse. The second added `SidecarClient::repo` — twelve lines from the
+  listing path, the response for every create, put, delete and batch, where the
+  identical attack retained 786 MB — and `PostOutcome::json`, the `backend=rust`
+  funnel carrying the repo writers' responses, the PAR response, the token
+  response and the session refresh. A third review round found **three more**, and
+  they were the ones that mattered most:
+
+  - `oauth::fetch::get_json`, which returns a `Value` from a host chosen by
+    whoever typed the handle — a `did:web` document, or an authorization server's
+    metadata — **before anyone is authenticated.** A stranger could spend most of
+    a 512 MB box by submitting a handle. Bounded by structure, because these
+    bodies are legitimately structural.
+  - `xrpc::Repo::error_fields`, the ERROR twin of the `send` whose success branch
+    had just been guarded: a hostile PDS answering **500** instead of 200 with the
+    same explosion got the whole amplification, on every write and every listing
+    failure. The guard was bypassed by a status code.
+  - `token::classify_refresh_failure`, which parses a `400` body looking for
+    `invalid_grant` — unattended, on every failed refresh.
+
+  The last two are error peeks, so they take a LENGTH bound rather than a
+  structural one: an error document is a few dozen bytes, and refusing to read a
+  large one is fail-safe (the session stays, the request fails). `dpop` already had
+  exactly that guard and exactly that reasoning for the nonce challenge; its 10 KiB
+  constant now lives in `oauth` with one predicate and three callers, instead of
+  being the only copy.
+
+  **And the cap on the response funnel is now the endpoint's own.** 640 000 was
+  sized by the densest page the lexicons permit, which is not what a token response
+  is: at 210 B per counted character it admitted about 134 MB on a path whose
+  largest legitimate body is 120 kB. Measured the real traffic — a 500-op
+  `applyWrites` result counts 8 514 — and set 64 000, which is 7.5x headroom and
+  ten times tighter.
 
   Filed as #197 from a cold adversarial review, which also established that the
   wire cap alone cannot close this — at a hundredfold amplification no single byte
   limit both permits long-form prose and bounds the attack.
+
+  **The scanner is no longer called a node count**, because it is not one.
+  `{"a":1}` counts three characters and builds two `Value`s, since a map key is a
+  `String` in the map rather than a value — so the count can over-report by one per
+  entry, as well as under-report by one on an array. Neither bound holds, and the
+  old name (`node_lower_bound`) and error message ("would build at least N nodes")
+  both claimed one did. The arithmetic is untouched: the cap is calibrated in these
+  same units, 210 B per counted character, measured with this function doing the
+  counting. Over-counting is also the safe direction for a guard.
+
+  Two figures were wrong in the first draft of this entry, both found by review:
+  the ordinary-traffic floor ("a page of 100 documents measures 40 000" — it counts
+  **4 003**, and the test that was meant to hold it served a single record and would
+  have passed with the cap at 1 000), and the 787-vs-824 MB discrepancy above.
 
 - **A `listRecords` page is parsed once, not twice.** The body went through
   `serde_json::Value` and then into the typed struct, and `from_value` rebuilds

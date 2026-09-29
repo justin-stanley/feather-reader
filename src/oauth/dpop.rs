@@ -319,16 +319,12 @@ pub enum Endpoint {
     ResourceServer,
 }
 
-/// Largest error body we will parse looking for a nonce challenge.
-///
-/// A `use_dpop_nonce` error is a few dozen bytes. Matching the reference
-/// client's 10 KiB peek bounds what a server can make us deserialize on a path
-/// that runs for every failed request.
-const MAX_ERROR_BODY: usize = 10 * 1024;
-
 /// Whether an authorization-server error body is a nonce challenge.
+///
+/// The size guard is [`super::error_body_worth_parsing`] — this file had the only
+/// copy of it until a review found two more error peeks with none.
 fn body_asks_for_nonce(body: &[u8]) -> bool {
-    if body.is_empty() || body.len() > MAX_ERROR_BODY {
+    if !super::error_body_worth_parsing(body) {
         return false;
     }
     serde_json::from_slice::<Value>(body)

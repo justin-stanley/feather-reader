@@ -49,6 +49,45 @@ impl std::fmt::Debug for PostOutcome {
     }
 }
 
+/// The most nodes a response on THIS funnel may build.
+///
+/// **`MAX_LIST_STRUCTURAL_CHARS` is the wrong number here, and a review was right about
+/// that.** 640 000 was sized by the densest page the lexicons permit — a full
+/// `readState` listing, 403 003 counted characters — and at the measured 210 B
+/// per counted character it admits about 134 MB. Nothing on this funnel is a
+/// listing: it carries the token response, the PAR response, the session refresh,
+/// and the repo writers' results.
+///
+/// Measured, so the headroom is a number rather than a feeling. The largest
+/// legitimate body here is an `applyWrites` result set, and the batch is bounded
+/// by `max_subs_per_did` (default 500) or by the reader's subscribed feeds:
+///
+/// | body | wire | counted |
+/// |---|---|---|
+/// | token response | 1.2 kB | 23 |
+/// | `applyWrites`, 1 result | 348 B | 31 |
+/// | `applyWrites`, 500 results | 120 kB | 8 514 |
+/// | `applyWrites`, 2 000 results | 480 kB | 34 014 |
+///
+/// 64 000 leaves 7.5x over a 500-op batch, still covers a 2 000-op one, and is
+/// ten times tighter than the listing cap — about 13 MB instead of 134.
+const MAX_RESPONSE_NODES: usize = 64_000;
+
+/// Refuse a response body that would build more than [`MAX_RESPONSE_NODES`].
+///
+/// Message carries the status and the counts only — never the body, not even an
+/// excerpt, because a token response passes through here.
+fn refuse_a_response_explosion(body: &[u8], status: u16) -> Result<()> {
+    let nodes = crate::atproto::count_structural_chars(body);
+    anyhow::ensure!(
+        nodes <= MAX_RESPONSE_NODES,
+        "the response body (status {status}) counts at least {nodes} structural \
+         characters, over the {MAX_RESPONSE_NODES} cap for this endpoint — refusing \
+         before parsing it"
+    );
+    Ok(())
+}
+
 impl PostOutcome {
     /// Parse the body as JSON.
     ///
@@ -74,10 +113,7 @@ impl PostOutcome {
         //
         // The message carries node counts only — never the body, not even an
         // excerpt, for the same reason the parse error below does not.
-        crate::atproto::refuse_a_node_explosion(
-            &self.body,
-            &format!("the response body (status {})", self.status),
-        )?;
+        refuse_a_response_explosion(&self.body, self.status)?;
         serde_json::from_slice(&self.body).with_context(|| {
             format!(
                 "response (status {}, {} bytes) is not valid JSON",
@@ -319,6 +355,77 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("forbidden (internal) address"),
+            "failed for the wrong reason: {rendered}"
+        );
+    }
+
+    /// **The cap on this funnel is the endpoint's, not the listing's.**
+    ///
+    /// `MAX_LIST_STRUCTURAL_CHARS` (640 000) was sized by the densest page the
+    /// lexicons permit. Nothing here is a listing — token, PAR, refresh, and the
+    /// repo writers' results — so at 210 B per counted character that cap admitted
+    /// about 134 MB per call on paths whose largest legitimate body is 120 kB. A
+    /// review called that out; the constant was borrowed from an unrelated floor.
+    ///
+    /// Both directions, because a cap too tight breaks a real OPML import: the
+    /// largest legitimate body is an `applyWrites` result set, measured at 8 514
+    /// counted characters for 500 results (`max_subs_per_did`'s default).
+    #[test]
+    fn the_response_funnel_has_its_own_cap_sized_for_its_own_traffic() {
+        // A 500-op applyWrites result: the largest thing a real deployment sends
+        // through here, and it must pass.
+        let results: Vec<serde_json::Value> = (0..500)
+            .map(|i| {
+                serde_json::json!({
+                    "$type": "com.atproto.repo.applyWrites#createResult",
+                    "uri": format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/community.lexicon.rss.subscription/3lab{i:08}"),
+                    "cid": "bafyreibaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "validationStatus": "valid",
+                })
+            })
+            .collect();
+        let big_but_legitimate = serde_json::json!({
+            "commit": { "cid": "bafyreibaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "rev": "3labcdefghijk" },
+            "results": results,
+        })
+        .to_string();
+        let counted = crate::atproto::count_structural_chars(big_but_legitimate.as_bytes());
+        assert!(
+            counted > 8_000,
+            "the probe body counts only {counted}, so it is not the large legitimate \
+             case it is meant to be",
+        );
+        let outcome = PostOutcome {
+            status: 200,
+            body: big_but_legitimate.into_bytes(),
+        };
+        outcome
+            .json()
+            .expect("a 500-op applyWrites result is legitimate traffic on this path");
+
+        // And an explosion is refused — one that the LISTING cap would have
+        // admitted, which is the whole point of a separate constant.
+        let mut body = String::from(r#"{"results":["#);
+        for _ in 0..70_000 {
+            body.push_str("{},");
+        }
+        body.push_str("{}]}");
+        let counted = crate::atproto::count_structural_chars(body.as_bytes());
+        assert!(
+            counted > MAX_RESPONSE_NODES && counted < crate::atproto::MAX_LIST_STRUCTURAL_CHARS,
+            "this probe must sit BETWEEN the two caps to prove they differ: counted \
+             {counted}, endpoint cap {MAX_RESPONSE_NODES}, listing cap {}",
+            crate::atproto::MAX_LIST_STRUCTURAL_CHARS,
+        );
+        let err = PostOutcome {
+            status: 200,
+            body: body.into_bytes(),
+        }
+        .json()
+        .expect_err("a body the listing cap would admit was accepted here");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("structural characters"),
             "failed for the wrong reason: {rendered}"
         );
     }

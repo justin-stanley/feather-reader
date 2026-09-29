@@ -242,7 +242,7 @@ impl RecordWalk {
 ///
 /// Every charge here is taken after `serde_json` has already built the page, so
 /// the true peak is this ceiling plus one page's tree, and a page's tree is not
-/// small: measured, an 8 MB response of `{"":0}` objects retains 824 MB, a
+/// small: measured, an 8 MiB response of `{"":0}` objects retains 824 MB, a
 /// wire-to-heap amplification of 98x. A bound consulted after the allocation
 /// cannot prevent that allocation. What it does prevent is the accumulation
 /// across pages and across the walks of one read, which is the part that scales
@@ -1643,7 +1643,7 @@ impl SidecarClient {
         // and `RepoOk.data` is an unbounded `Value`. Measured without it: the
         // identical 8 MB attack retains 786 MB. The listing had the guard and
         // this did not, which is the drift a shared helper exists to prevent.
-        refuse_a_node_explosion(&raw, "the /internal/repo body")?;
+        refuse_a_structure_explosion(&raw, "the /internal/repo body")?;
         let ok: RepoOk = serde_json::from_slice(&raw).context("parsing /internal/repo ok body")?;
         Ok(ok.data)
     }
@@ -1727,7 +1727,7 @@ impl SidecarClient {
         // so this client gets the same guards as the other two, including the
         // duplicated-key refusal that only serde can make.
         let raw = self.repo_bytes(body).await?;
-        refuse_a_node_explosion(&raw, "the sidecar listRecords body")?;
+        refuse_a_structure_explosion(&raw, "the sidecar listRecords body")?;
         let envelope: RepoOkList =
             serde_json::from_slice(&raw).context("parsing sidecar listRecords data")?;
         // **Two envelope layers here, not one.** `page_from_body` guards the
@@ -2551,10 +2551,16 @@ pub(crate) fn urlencode(s: &str) -> String {
 ///
 /// **The floor is real traffic, not comfort.** The densest legitimate page is a
 /// full `readState` listing — 100 records each carrying two arrays of
-/// [`crate::lexicon::ReadState::MAX_IDS`] ids — which measures about 403 000 nodes.
-/// A page of 100 documents measures 40 000. So the cap sits above the densest
-/// page the lexicons permit, and a test holds it there.
-pub(crate) const MAX_LIST_NODES: usize = 640_000;
+/// [`crate::lexicon::ReadState::MAX_IDS`] ids — which counts 403 003. So the cap
+/// sits above the densest page the lexicons permit, and a test holds it there.
+///
+/// Ordinary traffic is nowhere near either number: a page of 100 real-sized
+/// standard.site documents (seven fields, a 15 kB `textContent`, 1.5 MB on the
+/// wire) counts **4 003**. An earlier version of this line said 40 000, which was
+/// wrong by an order of magnitude in the direction that makes the cap look tighter
+/// than it is; the test that was supposed to hold it served a single record and
+/// would have passed with the cap set to 1 000.
+pub(crate) const MAX_LIST_STRUCTURAL_CHARS: usize = 640_000;
 
 /// How many nodes `body` would parse into, to within one, without parsing it.
 ///
@@ -2570,7 +2576,7 @@ pub(crate) const MAX_LIST_NODES: usize = 640_000;
 /// without one, and a string's contents cannot invent one. Skipping strings is
 /// the whole difficulty; counting naively would refuse a legitimate article that
 /// happens to contain a million commas.
-pub(crate) fn node_lower_bound(body: &[u8]) -> usize {
+pub(crate) fn count_structural_chars(body: &[u8]) -> usize {
     let mut nodes = 0usize;
     let mut in_string = false;
     let mut escaped = false;
@@ -2601,13 +2607,14 @@ pub(crate) fn node_lower_bound(body: &[u8]) -> usize {
     nodes
 }
 
-/// Refuse a body that would build more nodes than [`MAX_LIST_NODES`].
-pub(crate) fn refuse_a_node_explosion(body: &[u8], what: &str) -> Result<()> {
-    let nodes = node_lower_bound(body);
+/// Refuse a body carrying more JSON structure than
+/// [`MAX_LIST_STRUCTURAL_CHARS`].
+pub(crate) fn refuse_a_structure_explosion(body: &[u8], what: &str) -> Result<()> {
+    let counted = count_structural_chars(body);
     anyhow::ensure!(
-        nodes <= MAX_LIST_NODES,
-        "{what} would build at least {nodes} nodes, over the {MAX_LIST_NODES} cap \
-         — refusing before parsing it"
+        counted <= MAX_LIST_STRUCTURAL_CHARS,
+        "{what} counts at least {counted} structural characters, over the \
+         {MAX_LIST_STRUCTURAL_CHARS} cap — refusing before parsing it"
     );
     Ok(())
 }
@@ -2631,7 +2638,7 @@ pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     if body.is_empty() {
         anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
     }
-    refuse_a_node_explosion(body, "the listRecords body")?;
+    refuse_a_structure_explosion(body, "the listRecords body")?;
     let parsed: ListRecordsBody =
         serde_json::from_slice(body).context("parsing listRecords response")?;
     page_from_body(parsed)
@@ -4063,7 +4070,7 @@ pub(crate) mod tests {
             r#"{{"records":[{{"uri":"at://d/c/r","value":{{"t":"{}"}}}}]}}"#,
             "a,b,[c],{d}:e,".repeat(50_000)
         );
-        let bound = node_lower_bound(prose.as_bytes());
+        let bound = count_structural_chars(prose.as_bytes());
         assert!(
             bound < 100,
             "a page of prose full of punctuation was counted as {bound} nodes"
@@ -4088,22 +4095,22 @@ pub(crate) mod tests {
             body.len()
         );
 
-        let bound = node_lower_bound(body.as_bytes());
+        let bound = count_structural_chars(body.as_bytes());
         assert!(
-            bound > MAX_LIST_NODES,
+            bound > MAX_LIST_STRUCTURAL_CHARS,
             "the attack shape was counted as only {bound} nodes"
         );
         let err = parse_list_records(body.as_bytes())
             .expect_err("a node explosion was parsed rather than refused");
         assert!(
-            format!("{err:#}").contains("nodes"),
+            format!("{err:#}").contains("structural characters"),
             "failed for the wrong reason: {err:#}"
         );
     }
 
     /// **The densest page the lexicons permit must fit, with room.**
     ///
-    /// This is the floor under [`MAX_LIST_NODES`], and it is the reason the cap
+    /// This is the floor under [`MAX_LIST_STRUCTURAL_CHARS`], and it is the reason the cap
     /// is 640 000 rather than the ~150 000 that would otherwise hold the memory
     /// claim comfortably. A `readState` record carries up to
     /// [`crate::lexicon::ReadState::MAX_IDS`] read ids, and a page carries 100 of
@@ -4135,18 +4142,18 @@ pub(crate) mod tests {
             })
             .collect();
         let body = serde_json::json!({ "records": records }).to_string();
-        let bound = node_lower_bound(body.as_bytes());
+        let bound = count_structural_chars(body.as_bytes());
         assert!(
-            bound < MAX_LIST_NODES,
-            "the densest legitimate page counts {bound} nodes against a cap of {MAX_LIST_NODES}"
+            bound < MAX_LIST_STRUCTURAL_CHARS,
+            "the densest legitimate page counts {bound} nodes against a cap of {MAX_LIST_STRUCTURAL_CHARS}"
         );
         // And it is dense enough to be the floor the cap was chosen for: a page
         // counting only a fifth of the cap would pass the assertion above while
         // leaving the cap free to drop far below real traffic.
         assert!(
-            bound > MAX_LIST_NODES / 2,
+            bound > MAX_LIST_STRUCTURAL_CHARS / 2,
             "this page counts only {bound} nodes, so it is no longer the floor \
-             `MAX_LIST_NODES` was measured against and a much tighter cap would \
+             `MAX_LIST_STRUCTURAL_CHARS` was measured against and a much tighter cap would \
              pass it"
         );
         assert!(
@@ -4170,18 +4177,54 @@ pub(crate) mod tests {
             .await
             .expect_err("a node explosion reached the parser on the write path");
         assert!(
-            format!("{err:#}").contains("nodes"),
+            format!("{err:#}").contains("structural characters"),
             "failed for the wrong reason: {err:#}"
         );
     }
 
     #[test]
-    fn an_ordinary_page_is_nowhere_near_the_node_bound() {
-        let (bodies, _) = paged_bodies(1, 17_000, false);
-        let bound = node_lower_bound(&bodies[0]);
+    fn an_ordinary_page_is_nowhere_near_the_structure_bound() {
+        // **A page, not a record.** This served `paged_bodies(1, 17_000, false)` —
+        // ONE page holding ONE record — which counts about eleven characters, so
+        // the old `< 1_000` assertion held by three orders of magnitude and would
+        // have passed with the cap at 1 000. It also made the doc comment's "a
+        // page of 100 documents measures 40 000" untested, and that figure was
+        // wrong by 10x.
+        let records: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "uri": format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.document/3lab{i}"),
+                    "cid": "bafyreiabc123def456ghi789jkl012mno345pqr678stu901",
+                    "value": {
+                        "$type": "site.standard.document",
+                        "title": "A reasonably typical post title",
+                        "path": format!("/posts/{i}"),
+                        "site": "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+                        "publishedAt": "2026-07-11T09:30:00Z",
+                        "description": "x".repeat(120),
+                        "textContent": "y".repeat(15_000),
+                    }
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "records": records }).to_string();
+        // A real page of documents is mostly prose: 1.5 MB on the wire for 4 003
+        // counted characters.
         assert!(
-            bound < 1_000,
-            "a real page of documents counted {bound} nodes, too close to the bound"
+            body.len() > 1_000_000,
+            "the probe page is only {} bytes, so it is not a full page",
+            body.len(),
+        );
+        let counted = count_structural_chars(body.as_bytes());
+        assert!(
+            (3_500..4_500).contains(&counted),
+            "a page of 100 documents counted {counted}, not the ~4 003 the cap's \
+             doc comment claims — the ordinary-traffic end of the bracket moved",
+        );
+        assert!(
+            counted * 100 < MAX_LIST_STRUCTURAL_CHARS,
+            "ordinary traffic is within 100x of the cap ({counted} against \
+             {MAX_LIST_STRUCTURAL_CHARS}), which is not the headroom the cap claims",
         );
     }
 
@@ -4194,15 +4237,15 @@ pub(crate) mod tests {
         let escaped = br#"{"records":[{"uri":"a\"b","value":{}}],"cursor":"x"}"#;
         let plain = br#"{"records":[{"uri":"axb","value":{}}],"cursor":"x"}"#;
         assert_eq!(
-            node_lower_bound(escaped),
-            node_lower_bound(plain),
+            count_structural_chars(escaped),
+            count_structural_chars(plain),
             "an escaped quote changed the structure count"
         );
         let backslash = br#"{"records":[],"cursor":"x\\"}"#;
         let letter = br#"{"records":[],"cursor":"xy"}"#;
         assert_eq!(
-            node_lower_bound(backslash),
-            node_lower_bound(letter),
+            count_structural_chars(backslash),
+            count_structural_chars(letter),
             "an escaped backslash changed the structure count"
         );
     }
@@ -4212,7 +4255,7 @@ pub(crate) mod tests {
     #[test]
     fn a_string_counts_as_a_node() {
         assert!(
-            node_lower_bound(br#"["a","b","c"]"#) > node_lower_bound(br#"[1,1,1]"#),
+            count_structural_chars(br#"["a","b","c"]"#) > count_structural_chars(br#"[1,1,1]"#),
             "strings were not counted, so an array of them looks free"
         );
     }
@@ -4232,7 +4275,7 @@ pub(crate) mod tests {
             .await
             .expect_err("a node explosion reached the parser");
         assert!(
-            format!("{err:#}").contains("nodes"),
+            format!("{err:#}").contains("structural characters"),
             "failed for the wrong reason: {err:#}"
         );
     }
