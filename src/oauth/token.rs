@@ -208,6 +208,15 @@ pub fn classify_refresh_failure(status: u16, body: &[u8]) -> RefreshFailure {
     if status != 400 {
         return RefreshFailure::Transient;
     }
+    // **Bounded by length before it is parsed**, like every other error peek
+    // here — see `super::MAX_ERROR_BODY`. This one runs unattended on the session
+    // refresh path, so an authorization server answering 400 with 8 MB of cheap
+    // structure otherwise bought itself hundreds of megabytes per refresh. A body
+    // too large to look at is `Transient`, which is what an unrecognised body
+    // already meant.
+    if !super::error_body_worth_parsing(body) {
+        return RefreshFailure::Transient;
+    }
     let is_invalid_grant = serde_json::from_slice::<Value>(body)
         .ok()
         .as_ref()
@@ -223,6 +232,39 @@ pub fn classify_refresh_failure(status: u16, body: &[u8]) -> RefreshFailure {
 
 #[cfg(test)]
 mod tests {
+
+    /// **An error body too large to read must not invalidate a session, and must
+    /// not be parsed either.**
+    ///
+    /// This runs unattended on every failed refresh, so an authorization server
+    /// answering `400` with 8 MiB of cheap structure otherwise bought itself the
+    /// full amplification — measured at 824 MB for that body — once per refresh.
+    /// Refusing to look is fail-safe in the direction that matters: the session
+    /// stays, the request fails, and a real `invalid_grant` body is a few dozen
+    /// bytes.
+    #[test]
+    fn an_oversized_400_body_is_transient_rather_than_invalidating() {
+        let small = br#"{"error":"invalid_grant"}"#;
+        assert_eq!(
+            classify_refresh_failure(400, small),
+            RefreshFailure::SessionInvalid,
+            "a real invalid_grant must still invalidate, or nobody is ever asked \
+             to log in again",
+        );
+
+        // The same field, in a body nobody should deserialise.
+        let mut huge = String::from(r#"{"error":"invalid_grant","pad":["#);
+        while huge.len() < super::super::MAX_ERROR_BODY + 1_024 {
+            huge.push_str("{},");
+        }
+        huge.push_str("{}]}");
+        assert!(huge.len() > super::super::MAX_ERROR_BODY);
+        assert_eq!(
+            classify_refresh_failure(400, huge.as_bytes()),
+            RefreshFailure::Transient,
+            "an oversized 400 body was parsed and acted on",
+        );
+    }
     use super::*;
     use serde_json::json;
 

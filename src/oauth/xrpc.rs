@@ -109,7 +109,17 @@ impl Repo<'_> {
     /// Only ever called on a NON-success, where the body is an error document
     /// rather than a token or a record — and even then only the `error` and
     /// `message` fields, never the raw bytes.
+    ///
+    /// **Bounded by length before it is parsed.** This is the error twin of
+    /// `send`, whose success branch goes through `PostOutcome::json` and its node
+    /// guard — so without this a hostile PDS answering **500** instead of 200 got
+    /// the whole amplification the guard exists to stop, on every write and on
+    /// every listing failure. An error document is a few dozen bytes; see
+    /// [`super::MAX_ERROR_BODY`].
     fn error_fields(body: &[u8]) -> Option<String> {
+        if !super::error_body_worth_parsing(body) {
+            return None;
+        }
         let value: Value = serde_json::from_slice(body).ok()?;
         let kind = value.get("error").and_then(Value::as_str)?;
         match value.get("message").and_then(Value::as_str) {
@@ -979,6 +989,124 @@ mod tests {
             MAX_LIST_PAGES,
             "a walk that used its whole page budget and finished lost records",
         );
+    }
+
+    /// **The ERROR twin of `send`, which a review found unguarded.**
+    ///
+    /// `send`'s success branch goes through `PostOutcome::json` and its cap; its
+    /// failure branch goes to `xrpc_error` → `error_fields`, which deserialised the
+    /// whole body. So a hostile PDS answering **500** instead of 200 with the same
+    /// explosion got the full amplification on every write and on every listing
+    /// failure — the guard bypassed by a status code.
+    ///
+    /// Both directions: a small error body still yields its reason, because that
+    /// string is what a reader's log needs to tell "your PDS said no" from "we
+    /// broke".
+    #[test]
+    fn an_oversized_error_body_is_not_parsed_for_its_reason() {
+        let small = br#"{"error":"InvalidSwap","message":"record changed"}"#;
+        assert_eq!(
+            Repo::error_fields(small).as_deref(),
+            Some("InvalidSwap: record changed"),
+            "a real error body must still render its reason",
+        );
+
+        let mut huge = String::from(r#"{"error":"InvalidSwap","pad":["#);
+        while huge.len() < crate::oauth::MAX_ERROR_BODY + 1_024 {
+            huge.push_str("{},");
+        }
+        huge.push_str("{}]}");
+        assert!(huge.len() > crate::oauth::MAX_ERROR_BODY);
+        assert_eq!(
+            Repo::error_fields(huge.as_bytes()),
+            None,
+            "an oversized error body was deserialised to fish out one string",
+        );
+    }
+
+    /// **The write path parses a PDS body too, and it had no bound before the
+    /// parse.**
+    ///
+    /// `listRecords` is guarded by `parse_list_records`; every OTHER body this
+    /// client turns into a `Value` goes through `PostOutcome::json` — the repo
+    /// writers' responses, the PAR response, the token response, the session
+    /// refresh. `read_capped` bounds the WIRE at 8 MB, which is the *input* to the
+    /// amplification rather than a limit on it: 8 MB of the cheapest node shape
+    /// measured 824 MB retained on a 512 MB box.
+    ///
+    /// Drives `delete_record`, which is the shortest route from a handler to
+    /// `send` → `json`.
+    #[tokio::test]
+    async fn the_live_write_path_refuses_a_node_explosion() {
+        let mut body = String::from(r#"{"uri":"at://d/c/r","value":["#);
+        for _ in 0..1_200_000 {
+            body.push_str("{},");
+        }
+        body.push_str("{}]}");
+        assert!(
+            crate::atproto::count_structural_chars(body.as_bytes())
+                > crate::atproto::MAX_LIST_STRUCTURAL_CHARS,
+            "the probe body is not over the cap, so this test proves nothing",
+        );
+        let base = crate::net::tests::serve_body(body.into_bytes()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "write-explosion.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://write-explosion.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .delete_record("c", "r")
+            .await
+            .expect_err("a node explosion on the write path was parsed rather than refused");
+        assert!(
+            format!("{err:#}").contains("structural characters"),
+            "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// The other direction: an ordinary write response still parses. Without this
+    /// a guard that refused every body would pass the test above.
+    #[tokio::test]
+    async fn the_live_write_path_accepts_an_ordinary_response() {
+        let base =
+            crate::net::tests::serve_body(br#"{"commit":{"cid":"bafy","rev":"3lab"}}"#.to_vec())
+                .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "write-ordinary.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://write-ordinary.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        repo.delete_record("c", "r")
+            .await
+            .expect("an ordinary write response was refused");
     }
 
     /// **A duplicated `records` key must not be able to empty a page.**

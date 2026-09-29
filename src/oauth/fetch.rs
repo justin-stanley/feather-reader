@@ -91,6 +91,19 @@ pub async fn get_json_optional(
     let body = net::read_capped(resp)
         .await
         .with_context(|| format!("reading {url}"))?;
+    // **The host here is chosen by whoever typed the handle, and this runs before
+    // anyone is authenticated.** `resolve::did_document` fetches a `did:web`
+    // document from the host named in the DID, and `discovery::discover` fetches
+    // `/.well-known/oauth-authorization-server` from the PDS URL that came with
+    // it. `read_capped` bounds the wire at 8 MB, which is the INPUT to the
+    // amplification, not a limit on it — 8 MB of `{"":0}` objects measured 789 MB
+    // of `Value`.
+    //
+    // The node bound rather than a length bound, because unlike an error peek
+    // these bodies are legitimately structural: a DID document carries services
+    // and verification methods, and authorization-server metadata is a few dozen
+    // arrays. Bounding structure permits any amount of text.
+    crate::atproto::refuse_a_structure_explosion(&body, &format!("the body of {url}"))?;
     let value =
         serde_json::from_slice(&body).with_context(|| format!("{url} is not valid JSON"))?;
     Ok(Some(value))
@@ -98,6 +111,63 @@ pub async fn get_json_optional(
 
 #[cfg(test)]
 mod tests {
+
+    /// **The pre-auth path, and the one a stranger can reach.**
+    ///
+    /// `get_json` returns a `Value` from a host chosen by whoever typed the
+    /// handle: `resolve::did_document` fetches a `did:web` document from the host
+    /// named in the DID, and `discovery::discover` fetches
+    /// `/.well-known/oauth-authorization-server` from the PDS URL that came with
+    /// it. Neither needs a session. `read_capped` bounds the wire at 8 MiB, which
+    /// is the INPUT to the amplification rather than a limit on it — measured, 824
+    /// MB of `Value` for that body — so before the guard a stranger could spend
+    /// most of a 512 MB box by submitting a handle.
+    ///
+    /// Asserts the guard through the real `guarded_get`+`read_capped` path rather
+    /// than on the helper, because the point is the wiring.
+    #[tokio::test]
+    async fn a_did_document_that_is_a_structure_explosion_is_refused() {
+        let mut body = String::from(r#"{"id":"did:web:probe.test","service":["#);
+        for _ in 0..700_000 {
+            body.push_str("{},");
+        }
+        body.push_str("{}]}");
+        assert!(
+            crate::atproto::count_structural_chars(body.as_bytes())
+                > crate::atproto::MAX_LIST_STRUCTURAL_CHARS,
+            "the probe body is not over the cap, so this test proves nothing",
+        );
+        // `serve_bodies_in_sequence` answers `application/json`, which `DID_JSON`
+        // accepts — so the refusal under test is the body's, not `check_meta`'s.
+        // The host override is how a loopback server gets past the SSRF guard:
+        // without it this fails on the address rather than on the body, which is
+        // exactly the "failed for the wrong reason" trap the assertion below
+        // exists to catch.
+        let base = crate::net::tests::serve_bodies_in_sequence(vec![body.into_bytes()]).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "did-explosion.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let err = get_json(
+            &Client::new(),
+            &format!("http://did-explosion.test:{port}/did.json"),
+            DID_JSON,
+        )
+        .await
+        .expect_err("a structure explosion was parsed rather than refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("structural characters"),
+            "failed for the wrong reason: {rendered}"
+        );
+    }
     use super::*;
 
     #[test]
