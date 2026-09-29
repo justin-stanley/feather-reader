@@ -59,6 +59,7 @@ deploying is separate.
   that sweep deletes nothing — the one pass it runs is scoped to kinds that
   instance has no rows for.
 
+
 ### Security
 
 - **A record walk that runs out of pages now refuses instead of returning a
@@ -430,6 +431,73 @@ deploying is separate.
   moved onto `FeedKind`, which is where the question is now asked.
 
 ### Added
+
+- **`standard_site::store_publication`** — the half of 0.4.0 that was missing.
+  The reader could fetch a publication and turn its documents into entries;
+  nothing wrote them anywhere. Three poll semantics, each of which a reviewer of
+  the abandoned first attempt had to find:
+  - **Starvation is keyed on what the read OFFERED, not on what survived the
+    retention floor.** A truncated read that produced nothing means the walk gave
+    up before its first record, and that is a failure. A truncated read whose
+    entries are merely older than the window is a healthy poll of an old
+    publication; calling it a failure puts it into a backoff that widens forever.
+  - **A failed poll does not stamp `last_polled`.** The natural way to write this
+    upserts the feed first and returns the failure after, which makes a broken
+    publication read as freshly polled on `/stats`.
+  - **An entry already older than the window is not stored.** Storing it means the
+    next sweep deletes it, the next poll re-inserts it with a new row id, and it
+    arrives unread — on that cycle, forever.
+
+    "The window" is the one the **sweep** would use, and getting that right took
+    three attempts. Keying on the rolling window alone left a hole in a supported
+    configuration, since `retention_days = 0` disables the rolling window while the
+    ceiling stays alive: with 0 and 180 nothing was floored and the ceiling
+    reinstated the cycle — a worse one, because the ceiling spares nothing, so a
+    starred entry came back unstarred rather than merely unread. Reaching for the
+    **shorter** of the two then over-corrected. `prune_old_entries` honours the
+    ceiling only when it is strictly older than the window (a ceiling inside the
+    window is logged and ignored there, since the hard delete would take exactly
+    the rows the soft delete spares), so at `days = 180, hard = 30` nothing is
+    deleted before 180 days while the floor discarded five months of a publisher's
+    archive that nothing would ever have deleted. The rule is now: the window when
+    there is one, the ceiling only when there is not.
+
+    **And for a publication the pair is not the RSS window at all.** #206 landed
+    `Config::retention_for(kind)`, which gives a publication `(0,
+    publication_retention_days)` — no rolling window, a generous archive ceiling —
+    because a 14-day window stored zero rows from every real publication measured.
+    Fed that pair, the rule above falls through to the ceiling, which is exactly
+    the sweep pass that can delete such a row.
+    `a_publications_floor_is_its_archive_ceiling_not_the_rss_window` asserts the
+    two halves agree, and fails if either is changed alone.
+
+    An **unrepresentable** window is no floor, said directly. `RETENTION_DAYS`
+    parses into a `u32` with no upper bound and `u32::MAX` days is an operator
+    saying "keep everything"; the previous shape fell back to a sentinel instant
+    and left the outcome resting on the row comparison being lexicographic —
+    `fmt_time` renders an out-of-range year with a sign, which sorts either side of
+    a 4-digit year by ASCII accident. Verified: swapping that fallback to
+    `MAX_UTC`, a floor of the year 262143 that should have discarded every entry in
+    existence, changed nothing at all.
+- **An entry with no date is stored anyway**, which is a decision rather than an
+  oversight. It is dated by `fetched_at`, which does not move, and the alternative
+  is discarding an article the reader can never see. Three consequences, all
+  documented on the function rather than the first one alone: it resurrects once
+  per retention window; under the hard ceiling it comes back **unstarred** as well,
+  because the ceiling spares nothing; and until then it **outranks** the
+  publication's real articles, since both the sweep and the per-feed cap order on
+  `COALESCE(published, fetched_at)` — so a publication of mostly undated documents
+  can push dated articles out of `max_entries_per_feed`. `new_entries` is likewise
+  an upper bound rather than a count of survivors: `insert_entries` reports what it
+  inserted and the per-feed cap trims within the same call.
+- The floor also logs what it dropped. A complete read of three year-old posts and
+  a complete read of an empty publication both return zero new entries, stamp the
+  feed and look green, so a subscriber to an archived blog got a blank feed and
+  nothing said why.
+- `fetch` now returns whether the walk finished instead of logging it and dropping
+  it. A truncated read and a quiet blog produce identical entries, so only the
+  caller can tell "this publication has nine articles" from "this reader gave up
+  after nine" — and the caller was never told.
 
 - `atproto::decode_s32_tid`, the inverse of the existing encoder, and
   `tid_timestamp`, which refuses a TID decoding far into the future or to before
