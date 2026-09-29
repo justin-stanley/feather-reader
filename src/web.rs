@@ -1983,8 +1983,10 @@ async fn index(
         // see the slice below. Collected BEFORE the page is chosen because the
         // page count depends on how many there are.
         // Bounded like everything else on this page. These come from the PDS
-        // (up to the 20,000-record list ceiling) and are appended whole to the
-        // last page, so `ENTRIES_PER_PAGE` does not constrain them at all. The
+        // (up to the list ceiling — 20,000 on the sidecar backend, 5,000 on
+        // `backend=rust`, whose caps are a quarter of the other's) and are
+        // appended whole to the last page, so `ENTRIES_PER_PAGE` does not
+        // constrain them at all. The
         // cap is generous — a reader with more saved-elsewhere records than this
         // is not the case being designed for — but a response has to have a size
         // an operator can reason about.
@@ -2947,6 +2949,17 @@ async fn mark_all_read(
 /// false promise for a record that may already exist in the user's PDS.
 const UNSUPPORTED_FEED_URL_REFUSAL: &str =
     "That isn't a kind of feed this instance can subscribe to. Nothing was saved.";
+
+/// Shown when an OPML export is refused because the subscription list could not
+/// be read in full.
+///
+/// **An empty export is worse than no export.** This path used to
+/// `unwrap_or_default()`, so a failed read produced a 200 carrying a zero-feed
+/// file — a blank backup, handed over at the moment the reader reached for one.
+const EXPORT_INCOMPLETE_REFUSAL: &str =
+    "Could not read your subscriptions in full, so nothing was exported. Your \
+     feeds are unchanged — try again, and if it keeps failing the list may be \
+     larger than this reader can page through.";
 
 /// Refusal message shown when a private/paid feed is submitted. FeatherReader
 /// stores subscriptions in the user's PUBLIC PDS, so it supports public feeds
@@ -5220,16 +5233,34 @@ async fn export_opml(
         None => return Ok(Redirect::to("/login").into_response()),
     };
 
-    let subs = state
-        .repo()
-        .list_subscriptions_sorted(&did)
-        .await
-        .unwrap_or_default();
-    let folders = state
-        .repo()
-        .list_folders_sorted(&did)
-        .await
-        .unwrap_or_default();
+    // **An export must never be silently empty.** `unwrap_or_default` here turned
+    // a failed read into a 200 carrying a zero-feed OPML file — the reader's
+    // backup, blank, at exactly the moment they reached for it. That was survivable
+    // while a truncated walk returned `Ok`; now that the walk refuses a short list,
+    // this is the one caller that converts a refusal into data loss, and it is also
+    // the recovery route the changelog points a locked-out reader at.
+    let subs = match state.repo().list_subscriptions_sorted(&did).await {
+        Ok(subs) => subs,
+        Err(err) => {
+            tracing::warn!(%err, did = %did, "refusing to export an OPML we could not read in full");
+            return Ok(Redirect::to(&format!(
+                "/manage?flash={}",
+                qenc(EXPORT_INCOMPLETE_REFUSAL)
+            ))
+            .into_response());
+        }
+    };
+    let folders = match state.repo().list_folders_sorted(&did).await {
+        Ok(folders) => folders,
+        Err(err) => {
+            tracing::warn!(%err, did = %did, "refusing to export an OPML without its folders");
+            return Ok(Redirect::to(&format!(
+                "/manage?flash={}",
+                qenc(EXPORT_INCOMPLETE_REFUSAL)
+            ))
+            .into_response());
+        }
+    };
     // The exporter matches a subscription's `folder` at-uri against the folder's
     // pair key; our folder pairs are keyed by rkey, so rebuild them as at-uris.
     let folder_pairs: Vec<(String, Folder)> = folders
@@ -11760,6 +11791,191 @@ mod tests {
         assert!(
             !body.contains("db: ok"),
             "/health still called the database ok: {body}",
+        );
+    }
+
+    /// A sidecar mock for the OPML export: serves one subscription and one
+    /// folder, except for the collection named in `fail_on`, which answers
+    /// `500` — the shape a refused (short or unreadable) walk takes at this
+    /// boundary.
+    async fn spawn_export_sidecar(fail_on: Option<&'static str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let wants = |c: &str| req.contains(c);
+                if fail_on.is_some_and(wants) {
+                    let body = r#"{"ok":false,"error":"ShortList"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    continue;
+                }
+                let records = if wants(crate::lexicon::nsid::SUBSCRIPTION) {
+                    serde_json::json!([{
+                        "uri": "at://did:plc:exporter/community.lexicon.rss.subscription/sub1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": crate::lexicon::nsid::SUBSCRIPTION,
+                            "url": "https://kept.example/feed.xml",
+                            "title": "Kept",
+                            // Inside the folder, so the healthy export has to
+                            // carry BOTH walks' results: an exporter that lost
+                            // the folder list would flatten this outline out of
+                            // its group with nothing else changing.
+                            "folder": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else if wants(crate::lexicon::nsid::FOLDER) {
+                    serde_json::json!([{
+                        "uri": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
+                        "cid": "bafy",
+                        "value": {
+                            "$type": crate::lexicon::nsid::FOLDER,
+                            "name": "Kept folder",
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let body =
+                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// `GET /opml/export` against the mock, returning `(status, headers, body)`.
+    async fn export_opml_response(
+        fail_on: Option<&'static str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let did = "did:plc:exporter";
+        let sidecar = spawn_export_sidecar(fail_on).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/opml/export")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = String::from_utf8_lossy(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .to_string();
+        (status, headers, body)
+    }
+
+    /// **An empty export is worse than no export, and this is the caller that
+    /// used to produce one.**
+    ///
+    /// `export_opml` read both walks through `unwrap_or_default()`. Now that a
+    /// truncated walk refuses instead of returning a short list, that turned the
+    /// refusal into `200 OK` carrying a zero-feed
+    /// `featherreader-subscriptions.opml` — a blank backup handed over at exactly
+    /// the moment a locked-out reader reached for one, and the changelog points
+    /// them at this route as the recovery path.
+    ///
+    /// Asserts the three things a reader can actually observe: no success status,
+    /// no download offered, and no OPML document in the body.
+    #[tokio::test]
+    async fn an_export_that_cannot_read_the_subscriptions_serves_no_opml() {
+        let (status, headers, body) =
+            export_opml_response(Some(crate::lexicon::nsid::SUBSCRIPTION)).await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed subscription walk answered 200: {body}",
+        );
+        assert!(
+            !headers.contains_key(header::CONTENT_DISPOSITION),
+            "a failed subscription walk still offered a download: {headers:?}",
+        );
+        assert!(
+            !body.contains("<opml"),
+            "a failed subscription walk still served an OPML document: {body}",
+        );
+    }
+
+    /// The folders half of the same hole. The two walks are separate calls, and
+    /// fixing only the first leaves an export that silently loses every folder —
+    /// a flat list that reimports as one, with no sign anything was lost.
+    #[tokio::test]
+    async fn an_export_that_cannot_read_the_folders_serves_no_opml() {
+        let (status, headers, body) =
+            export_opml_response(Some(crate::lexicon::nsid::FOLDER)).await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed folder walk answered 200: {body}",
+        );
+        assert!(
+            !headers.contains_key(header::CONTENT_DISPOSITION),
+            "a failed folder walk still offered a download: {headers:?}",
+        );
+        assert!(
+            !body.contains("<opml"),
+            "a failed folder walk still served an OPML document: {body}",
+        );
+    }
+
+    /// The other direction, without which "refuse everything" would pass both
+    /// tests above: a healthy read still serves the file, with the feed in it.
+    #[tokio::test]
+    async fn a_healthy_export_serves_the_subscriptions_as_a_download() {
+        let (status, headers, body) = export_opml_response(None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a healthy export did not answer 200"
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"featherreader-subscriptions.opml\""),
+            "a healthy export did not offer the download",
+        );
+        assert!(
+            body.contains("https://kept.example/feed.xml"),
+            "the exported OPML lost the subscription: {body}",
+        );
+        assert!(
+            body.contains("Kept folder"),
+            "the exported OPML lost the folder: {body}",
         );
     }
 }

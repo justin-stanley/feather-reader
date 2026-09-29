@@ -61,6 +61,61 @@ deploying is separate.
 
 ### Security
 
+- **A record walk that runs out of pages now refuses instead of returning a
+  truncated list as a success.** All three refusing walks fell out of
+  `for _ in 0..MAX_LIST_PAGES` into a bare `Ok(out)`, so a repository larger than
+  the page budget produced a short list indistinguishable from a complete one.
+  `web::resolve_subscriptions` needs an `Err` to take its fail-closed branch;
+  given `Ok` it hands the short list to `store::replace_sub_refs`, which DELETEs
+  the reader's entire `sub_ref` projection and reinserts only what it was given.
+  Everything past the cap was gone from their account, on an ordinary poll, with
+  no attacker involved.
+
+  `extend_bounded`'s refusal could not catch it: `MAX_LIST_PAGES` multiplied by
+  the 100 records each request asks for is `MAX_LIST_RECORDS` on both clients, so
+  against a server that honours the limit the page budget runs out first and that
+  refusal was unreachable.
+
+  **The cap is on requests, so the record count it bites at is the server's page
+  size times the budget — not a number our constants fix.** A PDS answering 50 a
+  page reaches half as far; one answering more than asked trips `extend_bounded`
+  instead. And the last allowed page is a *false* refusal: terminating costs one
+  extra request when a short page still carries a cursor — this project's own PDS
+  does that — so a walk holding every record it was ever going to hold refuses
+  anyway, on the strength of a cursor it never followed. With `limit=100` honoured
+  that window is a repository of roughly 19 901 to 20 000 records. Safe direction,
+  but a false refusal, and neither the clean boundary nor the fixed record window
+  earlier drafts of this entry claimed. Found by a cold adversarial review of the
+  walk budget, filed as #196.
+
+  The new failure mode is a reader whose repository exceeds the budget being
+  served their cached projection on every request rather than losing feeds. The
+  correct direction, and worse than "stale" makes it sound: the fallback branch
+  has no record keys, and the manage page gates its rename and unsubscribe forms
+  on having one — so that reader loses the only in-app way to shrink the
+  repository back under the cap. Recovery needs an operator or another atproto
+  client. Raising the caps, or paging past them, is separate work.
+
+  The two backends also disagree about where this bites. `backend=rust` caps at
+  50 pages and 5 000 records, a quarter of the direct client's, so the same
+  reader refuses at about 4 900 records there and works to about 19 900 on the
+  sidecar. `Saved` walks the same path with one record per starred article, where
+  4 900 is a plausible number for a real reader rather than a pathological one.
+
+  **`Saved` should not be on this path at all, and that is filed rather than
+  fixed here (#204).** Un-starring works by listing the collection to find the
+  record's key, so a reader over the budget cannot see their saved records *and*
+  cannot remove any — while un-starring is the only thing that lowers the count.
+  The refusal is right where a short list is written back as a deletion, as
+  `sub_ref` is, and wrong where it is not.
+
+  **One caller turned the refusal into data loss and is fixed here:**
+  `GET /opml/export` read both of its walks through `unwrap_or_default()`, so a
+  refusal became `200 OK` carrying a zero-feed `featherreader-subscriptions.opml`
+  — a blank backup, handed over at exactly the moment a locked-out reader reached
+  for one, down the route this entry points them at. Both arms now refuse the
+  export and say so, rather than exporting nothing and calling it a success.
+
 - **A `listRecords` page is parsed once, not twice.** The body went through
   `serde_json::Value` and then into the typed struct, and `from_value` rebuilds
   rather than moves — so both copies are live at the same time.
