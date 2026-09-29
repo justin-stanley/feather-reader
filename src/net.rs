@@ -112,12 +112,77 @@ fn is_forbidden_v6(ip: &Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4() {
         return is_forbidden_v4(&v4);
     }
+    // **And every OTHER way an IPv6 address carries an IPv4 one.** `to_ipv4()`
+    // stops at the mapped and compatible forms; four more families embed an
+    // address this function would refuse on sight, and all four were getting
+    // through. See [`embedded_v4`].
+    if embedded_v4(ip).iter().any(is_forbidden_v4) {
+        return true;
+    }
     let seg = ip.segments();
     // fe80::/10 link-local (incl. RFC-4291 metadata equivalents).
     let link_local = (seg[0] & 0xffc0) == 0xfe80;
     // fc00::/7 unique-local addresses.
     let ula = (seg[0] & 0xfe00) == 0xfc00;
     link_local || ula
+}
+
+/// Every IPv4 address `ip` embeds under a translation scheme, for re-checking
+/// against the v4 rules.
+///
+/// **`to_ipv4()` is not the whole story, and the gap was a live SSRF hole.** It
+/// handles `::ffff:a.b.c.d` and `::a.b.c.d`. These it does not:
+///
+/// * **NAT64** — `64:ff9b::/32`, covering both RFC 6052's well-known `/96` and
+///   RFC 8215's local-use `64:ff9b:1::/48`. The whole `/32` is reserved by IANA
+///   for translation and nothing legitimate to fetch lives in it, so rather than
+///   decode the six embedding lengths RFC 6052 §2.2 defines — each putting the
+///   octets in different places around the `u` byte — this returns the loopback
+///   address for any of them. Refusing the prefix outright is both simpler and
+///   stricter, and a host reachable *through* a translator has an ordinary
+///   address we resolve anyway.
+/// * **6to4** — `2002::/16` (RFC 3056), IPv4 in the next two groups.
+/// * **IPv4-translated** — `::ffff:0:0/96` (RFC 2765), one group away from the
+///   mapped form.
+/// * **Teredo** — `2001::/32` (RFC 4380): the relay's IPv4 in groups 2-3 and the
+///   client's in groups 6-7, the latter obfuscated by XOR with all-ones. Both are
+///   returned; either one reaching an internal address is enough to refuse.
+///
+/// Decoded rather than blanket-refused for 6to4, IPv4-translated and Teredo,
+/// because those prefixes carry public addresses too and a blocklist would take
+/// out ordinary traffic. `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+///
+/// Found while bumping a JavaScript dependency whose advisory was this class:
+/// "no classifier recognizes the NAT64 local-use range". Ours did not either.
+fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
+    let seg = ip.segments();
+    let v4 = |hi: u16, lo: u16| {
+        Ipv4Addr::new(
+            (hi >> 8) as u8,
+            (hi & 0xff) as u8,
+            (lo >> 8) as u8,
+            (lo & 0xff) as u8,
+        )
+    };
+    // NAT64, the whole IANA translation /32 — see above for why this does not
+    // decode. `LOCALHOST` is a stand-in for "forbidden", not a claim about where
+    // the address points.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return vec![Ipv4Addr::LOCALHOST];
+    }
+    // 6to4.
+    if seg[0] == 0x2002 {
+        return vec![v4(seg[1], seg[2])];
+    }
+    // IPv4-translated: `::ffff:0:a.b.c.d`.
+    if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        return vec![v4(seg[6], seg[7])];
+    }
+    // Teredo: relay, then the client with the RFC 4380 obfuscation undone.
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return vec![v4(seg[2], seg[3]), v4(seg[6] ^ 0xffff, seg[7] ^ 0xffff)];
+    }
+    Vec::new()
 }
 
 /// Validate a URL's scheme (http/https only). Returns the host as a string.
@@ -1226,6 +1291,82 @@ pub(crate) mod tests {
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} should be forbidden");
+        }
+    }
+
+    /// **An IPv6 address that EMBEDS a forbidden IPv4 one is a forbidden address,
+    /// and four families of them were getting through.**
+    ///
+    /// `is_forbidden_v6` unwrapped IPv4-mapped (`::ffff:a.b.c.d`) and
+    /// IPv4-compatible (`::a.b.c.d`) forms, which is where `to_ipv4()` stops. It
+    /// did not unwrap:
+    ///
+    /// * **NAT64**, `64:ff9b::/32` — the well-known prefix of RFC 6052 and the
+    ///   local-use prefix of RFC 8215. On a NAT64/DNS64 network,
+    ///   `64:ff9b::a9fe:a9fe` is the cloud metadata service.
+    /// * **6to4**, `2002::/16` (RFC 3056) — the IPv4 sits in the next two groups,
+    ///   so `2002:a9fe:a9fe::` is the same address again.
+    /// * **IPv4-translated**, `::ffff:0:0/96` (RFC 2765) — one group away from the
+    ///   mapped form `to_ipv4()` does handle.
+    /// * **Teredo**, `2001::/32` (RFC 4380) — carries the relay's IPv4 in groups
+    ///   2-3 and the client's, obfuscated by XOR with all-ones, in groups 6-7.
+    ///
+    /// Found while bumping a JavaScript dependency whose advisory was the same
+    /// class: "no classifier recognizes the NAT64 local-use range". Ours did not
+    /// either.
+    ///
+    /// Whether a given deployment can route these depends on a translator being on
+    /// the path — but the attacker does not need to know that, only to try it, and
+    /// an IPv6-only network with DNS64 is now the ordinary case rather than the
+    /// exotic one. This guard is defence in depth against exactly the address that
+    /// reaches the host's own network without looking like it.
+    #[test]
+    fn forbids_ipv6_that_embeds_a_forbidden_ipv4() {
+        for (ip, what) in [
+            ("64:ff9b::7f00:1", "NAT64 well-known -> 127.0.0.1"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 well-known -> 169.254.169.254"),
+            ("64:ff9b::c0a8:1", "NAT64 well-known -> 192.168.0.1"),
+            ("64:ff9b:1::7f00:1", "NAT64 local-use, RFC 8215"),
+            ("64:ff9b:1:ffff::1", "anywhere in the NAT64 /32"),
+            ("2002:7f00:1::", "6to4 -> 127.0.0.1"),
+            ("2002:a9fe:a9fe::", "6to4 -> 169.254.169.254"),
+            ("::ffff:0:7f00:1", "IPv4-translated -> 127.0.0.1"),
+            // Teredo, laid out the way the format actually is: server IPv4 in
+            // groups 2-3, client IPv4 in groups 6-7 XORed with all-ones. Each case
+            // keeps the OTHER field public, so it fails for the reason its label
+            // claims rather than because a zero field is forbidden anyway.
+            ("2001:0:7f00:1:0:0:f7f7:fbfb", "Teredo server -> 127.0.0.1"),
+            ("2001:0:808:808:0:0:80ff:fffe", "Teredo client -> 127.0.0.1"),
+            (
+                "2001:0:808:808:0:0:5601:5601",
+                "Teredo client -> 169.254.169.254",
+            ),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip(&parsed),
+                "{ip} reaches {what} and was allowed",
+            );
+        }
+    }
+
+    /// The other direction, and it is not decoration: refusing every address that
+    /// merely *looks* translated would take out ordinary public traffic. A 6to4
+    /// address wrapping a PUBLIC IPv4, and a Teredo address wrapping one, must both
+    /// still be allowed — that is what makes this a decode rather than a
+    /// prefix-blocklist.
+    #[test]
+    fn allows_ipv6_that_embeds_a_public_ipv4() {
+        for (ip, what) in [
+            ("2002:0808:0808::", "6to4 -> 8.8.8.8"),
+            (
+                "2001:0:808:808:0:0:f7f7:fbfb",
+                "Teredo, server 8.8.8.8 and client 8.8.4.4",
+            ),
+            ("::ffff:0:808:808", "IPv4-translated -> 8.8.8.8"),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_forbidden_ip(&parsed), "{ip} is {what} and was refused");
         }
     }
 

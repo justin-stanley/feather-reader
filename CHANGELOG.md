@@ -62,6 +62,35 @@ deploying is separate.
 
 ### Security
 
+- **Four families of IPv6 address that embed a forbidden IPv4 one were reaching
+  the fetcher.** `net::is_forbidden_v6` unwrapped the IPv4-mapped
+  (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) forms, because that is
+  where `std`'s `to_ipv4()` stops. It did not unwrap **NAT64** (`64:ff9b::/32`,
+  RFC 6052's well-known prefix and RFC 8215's local-use one), **6to4**
+  (`2002::/16`, RFC 3056), **IPv4-translated** (`::ffff:0:0/96`, RFC 2765) or
+  **Teredo** (`2001::/32`, RFC 4380, whose client address is obfuscated by XOR
+  with all-ones).
+
+  So `64:ff9b::a9fe:a9fe` and `2002:a9fe:a9fe::` both name the cloud metadata
+  service, and both passed the guard. Verified against the shipped code before
+  the fix: ten such addresses, every one allowed.
+
+  Whether a given deployment routes them depends on a translator being on the
+  path — but the attacker needs only to try, not to know, and an IPv6-only
+  network with DNS64 is now ordinary rather than exotic. A hostile DNS answer for
+  a subscribed feed's host is enough: `resolve_and_check` checks every answer, and
+  these passed.
+
+  Decoded rather than blanket-refused, except for NAT64: 6to4, IPv4-translated and
+  Teredo prefixes carry public addresses too, and refusing the prefixes would take
+  out ordinary traffic — `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+  The whole `64:ff9b::/32` is reserved by IANA for translation, so it is refused
+  outright rather than decoding the six embedding lengths RFC 6052 §2.2 defines.
+
+  **Found while bumping a JavaScript dependency**, whose advisory was this exact
+  class — "no classifier recognizes the NAT64 local-use range `64:ff9b:1::/48`".
+  Ours did not either, and ours is the guard this project leans on hardest.
+
 - **A record walk that runs out of pages now refuses instead of returning a
   truncated list as a success.** All three refusing walks fell out of
   `for _ in 0..MAX_LIST_PAGES` into a bare `Ok(out)`, so a repository larger than
