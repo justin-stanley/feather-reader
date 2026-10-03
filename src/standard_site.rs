@@ -1369,15 +1369,101 @@ mod tests {
         );
     }
 
+    /// A read that fails — here, a DID whose PLC directory cannot be reached —
+    /// is a poll FAILURE with backoff, never an `Err`: `Err` from the poll seam
+    /// means the local store is broken.
+    #[tokio::test]
+    async fn a_failed_publication_read_is_a_poll_failure() {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        // A VALID DID, so the row is a Publication and the failure is the
+        // network's — an invalid one is Unsupported and fails for another reason.
+        let url = format!(
+            "at://did:plc:unreachableaaaaaaaaaaaaa/{}/x",
+            nsid::STANDARD_PUBLICATION
+        );
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &url)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .expect("a source failure surfaced as a store error");
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Failed {
+                    kind: crate::feed::FailureKind::Fetch,
+                    ..
+                }
+            ),
+            "an unreachable publication was not a fetch failure: {outcome:?}"
+        );
+    }
+
+    /// Two of 17 measured publications had no documents. That is a healthy,
+    /// empty feed — not a failure, and not a reason to back off.
+    #[tokio::test]
+    async fn an_empty_publication_is_a_healthy_poll() {
+        const EMPTY: &str = "did:plc:emptypubaaaaaaaaaaaaaaaa";
+        let site = format!("at://{EMPTY}/{}/quiet", nsid::STANDARD_PUBLICATION);
+        let (plc, _) = serve_repo(
+            EMPTY,
+            vec![(
+                nsid::STANDARD_PUBLICATION,
+                "quiet",
+                json!({ "name": "Quiet", "url": "https://quiet.example" }),
+            )],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 0 }
+            ),
+            "an empty publication was not a healthy poll: {outcome:?}"
+        );
+    }
+
     /// **A0 — the 0.4.0 acceptance test.** A subscribed publication is due, is
     /// polled by the standard.site reader, and its documents land as entries.
     ///
     /// It starts from the stored row the subscribe form will create; step 3 of
     /// `design/STANDARD-SITE-0.4.0.md` extends it through the form itself.
     #[tokio::test]
-    #[ignore = "0.4.0 acceptance (A0): green when polling dispatches publications (plan step 2)"]
     async fn a_publication_subscription_delivers_entries_end_to_end() {
-        const A0: &str = "did:plc:a0publisher";
+        const A0: &str = "did:plc:acceptanceaaaaaaaaaaaaaa";
         let site = format!("at://{A0}/{}/a0pub", nsid::STANDARD_PUBLICATION);
         let document = |title: &str, path: &str| {
             json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",

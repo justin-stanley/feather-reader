@@ -863,7 +863,7 @@ pub async fn get_feed_by_url(pool: &SqlitePool, url: &str) -> Result<Option<Feed
 /// is exactly the drift the column was introduced to end, so the two are
 /// asserted equal rather than trusted. Wiring the standard.site reader means
 /// changing both, and that test is what makes forgetting one a failure.
-pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss'";
+pub(crate) const POLLABLE_KINDS_SQL: &str = "'rss', 'publication'";
 
 /// The `kind` values the retention **window** applies to, as a SQL list.
 ///
@@ -910,8 +910,8 @@ pub async fn due_feeds(pool: &SqlitePool, as_of: &str, limit: i64) -> Result<Vec
         r#"
         SELECT * FROM feeds
         WHERE (next_poll IS NULL OR next_poll <= ?1)
-          -- `at://` is not pollable, so it is not due: skipped, not failed.
-          -- The why lives on `feed::FeedKind::POLLABLE`.
+          -- Only POLLABLE kinds are due; an `unsupported` row is skipped, not
+          -- failed. The why lives on `feed::FeedKind::POLLABLE`.
           AND kind IN ({POLLABLE_KINDS_SQL})
         ORDER BY next_poll IS NOT NULL, next_poll ASC
         LIMIT ?2
@@ -1035,6 +1035,51 @@ pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Durat
         ..Default::default()
     };
     upsert_feed(pool, &nf).await.map(|_| ())
+}
+
+/// Spread the first polls of never-polled `kind` rows across `spread`.
+///
+/// **Admitting a kind to the poller makes every row of it due at once.**
+/// `due_feeds` sorts `next_poll IS NULL` ahead of every dated row, and rows that
+/// were never pollable have no schedule, so the boot that admits them hands the
+/// poller a block that outranks every regular feed — including an overdue one —
+/// until it drains (`feed::FeedKind::POLLABLE` documents the measurement). This
+/// gives each such row its own slot in `[now, now + spread)`, in id order, so
+/// the block arrives as a trickle. Rows that have been polled, or already carry
+/// a schedule, are untouched. Returns how many rows were scheduled.
+pub async fn stagger_unscheduled(
+    pool: &SqlitePool,
+    kind: crate::feed::FeedKind,
+    spread: std::time::Duration,
+) -> Result<u64> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM feeds WHERE kind = ?1 AND next_poll IS NULL AND last_polled IS NULL \
+         ORDER BY id",
+    )
+    .bind(kind.as_str())
+    .fetch_all(pool)
+    .await
+    .context("listing unscheduled feeds to stagger")?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now();
+    let spread = chrono::Duration::from_std(spread).unwrap_or_else(|_| chrono::Duration::hours(1));
+    let n = ids.len() as i32;
+    let mut tx = pool.begin().await.context("begin stagger")?;
+    for (i, id) in ids.iter().enumerate() {
+        // Evenly spaced, the first due now: slot i of n across the spread.
+        let at = now + spread * i as i32 / n;
+        let next_poll = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        sqlx::query("UPDATE feeds SET next_poll = ?1 WHERE id = ?2 AND next_poll IS NULL")
+            .bind(next_poll)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("staggering a feed's first poll")?;
+    }
+    tx.commit().await.context("commit stagger")?;
+    Ok(ids.len() as u64)
 }
 
 /// Reset a feed's `consecutive_errors` to 0 after a successful poll (or a 304).
@@ -4267,6 +4312,123 @@ fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    const PUB_A: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3laa";
+
+    /// Step 2 of the 0.4.0 plan: a stored publication is pollable.
+    #[tokio::test]
+    async fn a_due_publication_is_handed_to_the_poller() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: PUB_A.into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let due = due_feeds(&pool, "2999-01-01T00:00:00Z", 50).await?;
+        assert!(
+            due.iter().any(|f| f.url == PUB_A),
+            "a publication row is not handed to the poller"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admitting_publications_staggers_their_first_poll() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for i in 0..19 {
+            let url =
+                format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3l{i:02}");
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        // Already polled, and an RSS row: neither is touched.
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://rss.example/feed.xml".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let n = stagger_unscheduled(
+            &pool,
+            crate::feed::FeedKind::Publication,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(n, 19, "not every unscheduled publication was scheduled");
+        let slots: Vec<String> = sqlx::query_scalar(
+            "SELECT next_poll FROM feeds WHERE kind = 'publication' ORDER BY next_poll",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let distinct: std::collections::BTreeSet<_> = slots.iter().collect();
+        assert_eq!(distinct.len(), 19, "publications share slots: {slots:?}");
+        let rss: Option<String> = sqlx::query_scalar(
+            "SELECT next_poll FROM feeds WHERE url = 'https://rss.example/feed.xml'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(rss, None, "an RSS row was rescheduled");
+        let again = stagger_unscheduled(
+            &pool,
+            crate::feed::FeedKind::Publication,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(
+            again, 0,
+            "a second boot re-staggered rows that already had a slot"
+        );
+        Ok(())
+    }
+
+    /// The point of the stagger: an overdue RSS feed is not starved by a block
+    /// of newly admitted rows.
+    #[tokio::test]
+    async fn admitted_rows_do_not_outrank_an_overdue_rss_feed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        for i in 0..5 {
+            let url =
+                format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3l{i:02}");
+            upsert_feed(
+                &pool,
+                &NewFeed {
+                    url,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://overdue.example/feed.xml".into(),
+                next_poll: Some("2000-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        stagger_unscheduled(
+            &pool,
+            crate::feed::FeedKind::Publication,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let first = due_feeds(&pool, &now, 1).await?;
+        assert_eq!(first[0].url, "https://overdue.example/feed.xml");
+        Ok(())
+    }
+
     /// **A re-poll refreshes `published`; it never refreshes `fetched_at`.**
     ///
     /// The asymmetry is the whole reason a date must be stable. `published`
@@ -6464,7 +6626,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         for url in [
             "https://real.example/feed.xml",
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
         ] {
             upsert_feed(
                 &pool,
@@ -6489,7 +6651,7 @@ mod tests {
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT consecutive_errors, last_error_kind, last_error FROM feeds \
                  WHERE kind = '{}'",
-                crate::feed::FeedKind::Publication.as_str()
+                crate::feed::FeedKind::Unsupported.as_str()
             )))
             .fetch_one(&pool)
             .await?;
@@ -6526,7 +6688,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         for url in [
             "https://example.com/feed.xml",
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
             "at://alice.example.com/site.standard.publication/3lab",
         ] {
             upsert_feed(
@@ -9793,7 +9955,7 @@ mod tests {
         // Never polled, never due: the shape every at:// row has.
         feed_polled(
             &pool,
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
             None,
             None,
         )
@@ -9829,7 +9991,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         for url in [
             "https://broken.example/feed.xml",
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
         ] {
             upsert_feed(
                 &pool,
@@ -9861,8 +10023,8 @@ mod tests {
     #[tokio::test]
     async fn the_at_uri_error_clearing_spares_a_row_that_has_been_polled() -> anyhow::Result<()> {
         let pool = init_url("sqlite::memory:").await?;
-        let polled = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/polled";
-        let never = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/never";
+        let polled = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/polled";
+        let never = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/never";
         for url in [polled, never] {
             upsert_feed(
                 &pool,
@@ -9994,10 +10156,13 @@ mod tests {
             by_url["at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"],
             "publication"
         );
+        // Recognised as an at-URI (not `rss`), like every other guard does —
+        // and, since 0.4.0 polls publications, classed `unsupported`: storage
+        // refuses this spelling (#183), so polling it would fail every tick.
         assert_eq!(
             by_url["At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac"],
-            "publication",
-            "the back-fill must recognise a non-canonical spelling, like every other guard"
+            "unsupported",
+            "the back-fill must recognise a non-canonical spelling, and not poll it"
         );
         Ok(())
     }
@@ -10051,7 +10216,7 @@ mod tests {
     async fn a_row_taken_out_of_the_poller_loses_the_poll_state_it_cannot_use() -> anyhow::Result<()>
     {
         let pool = init_url("sqlite::memory:").await?;
-        let at = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        let at = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab";
         sqlx::query(
             "INSERT INTO feeds (url, kind, consecutive_errors, last_error_kind, last_error, \
              next_poll, last_polled) \
@@ -10078,7 +10243,7 @@ mod tests {
         .bind(at)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(kind, "publication", "the row was not reclassified at all");
+        assert_eq!(kind, "unsupported", "the row was not reclassified at all");
         assert_eq!(
             (errors, error_kind, error, next_poll),
             (0, None, None, None),
@@ -10173,7 +10338,9 @@ mod tests {
         )
         .await?;
         // Force the kind independently of the URL: only the column should matter.
-        sqlx::query("UPDATE feeds SET kind = 'publication' WHERE url LIKE 'https://looks%'")
+        // `unsupported` because it is the kind no poller reads (publications
+        // are pollable since 0.4.0).
+        sqlx::query("UPDATE feeds SET kind = 'unsupported' WHERE url LIKE 'https://looks%'")
             .execute(&pool)
             .await?;
 
@@ -10255,7 +10422,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         for url in [
             "https://real.example/feed.xml",
-            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.post/3lab",
             "At://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac",
         ] {
             upsert_feed(

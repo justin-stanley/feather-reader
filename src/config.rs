@@ -34,7 +34,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet, and nothing polls one: `at://` rows are skipped by kind, not failed (see `feed::FeedKind::POLLABLE`). Both land with the standard.site reader. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -179,11 +179,11 @@ pub struct Config {
     /// pasted and nothing fetches `at://`, so it refuses with its own message.
     /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
-    /// **This flag does not gate polling; nothing does, because nothing polls
-    /// an `at://` row.** An earlier version of this comment claimed one flag
-    /// gated both. It did not — nothing outside the storable guards read it.
-    /// Why `at://` rows are skipped rather than failed, and where that one
-    /// decision lives, is documented once on [`crate::feed::FeedKind::POLLABLE`].
+    /// **This flag does not gate polling.** Since 0.4.0 a stored publication
+    /// row is polled like any feed, flag on or off: the flag decides what may
+    /// be stored, and a row already stored is read. Which `at://` rows are
+    /// publications, and which are `Unsupported` and never polled, is decided
+    /// once by [`crate::feed::FeedKind::of`].
     pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
@@ -415,7 +415,11 @@ impl Config {
     pub fn retention_for(&self, kind: crate::feed::FeedKind) -> (u32, u32) {
         match kind {
             crate::feed::FeedKind::Rss => (self.retention_days, self.retention_hard_days),
-            crate::feed::FeedKind::Publication => (0, self.publication_retention_days),
+            // An Unsupported row never stores entries; it inherits the archive
+            // bound so no kind outside AGED is ever unbounded.
+            crate::feed::FeedKind::Publication | crate::feed::FeedKind::Unsupported => {
+                (0, self.publication_retention_days)
+            }
         }
     }
 

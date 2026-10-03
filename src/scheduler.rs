@@ -468,6 +468,26 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, star
     };
     let limiter = Arc::new(Semaphore::new(concurrency));
 
+    // Publications became pollable in 0.4.0, and every row of a newly admitted
+    // kind is due at once. Spread the never-polled ones across one interval so
+    // they arrive as a trickle instead of outranking every overdue feed.
+    match store::stagger_unscheduled(
+        &state.db,
+        feed::FeedKind::Publication,
+        state.config.poll_interval,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            scheduled = n,
+            "staggered the first poll of never-polled publications"
+        ),
+        Err(err) => {
+            warn!(%err, "could not stagger never-polled publications; they will all be due at once")
+        }
+    }
+
     // Not an immediate first tick: see `POLLER_STARTUP_DELAY`. Missed ticks are
     // skipped rather than burst through, so a slow poll round does not queue up.
     let mut ticker = delayed_interval(startup, tick);
@@ -582,17 +602,10 @@ async fn poll_due_once(
         let pool = state.db.clone();
         let client = client.clone();
         let default_interval = state.config.poll_interval;
-        let max_entries_per_feed = state.config.max_entries_per_feed;
+        let config = Arc::clone(&state.config);
         handles.push(tokio::spawn(async move {
             let _permit = permit; // held for the duration of this poll
-            poll_and_reschedule(
-                &pool,
-                &client,
-                &feed,
-                default_interval,
-                max_entries_per_feed,
-            )
-            .await;
+            poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
         }));
         // Stagger launches so a batch doesn't fire in one instant.
         if !stagger.is_zero() {
@@ -629,10 +642,13 @@ async fn poll_and_reschedule(
     client: &reqwest::Client,
     feed: &Feed,
     default_interval: Duration,
-    max_entries_per_feed: i64,
+    config: &feather_reader::config::Config,
 ) {
+    // By kind: an RSS feed is fetched over HTTP, a standard.site publication is
+    // read from its author's PDS. One entry point, so the choice lives with
+    // `FeedKind` and not here.
     poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| {
-        feed::poll_feed(pool, client, feed, max_entries_per_feed)
+        feed::poll_feed_by_kind(pool, client, config, feed)
     })
     .await;
 }

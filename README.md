@@ -230,22 +230,21 @@ FEATHERREADER_STANDARD_SITE=true
 ```
 
 A publication is not a feed document — it is a record in the author's atproto
-repo, and its articles are separate records in the same repo. The reader, when
-it lands, will read two collections rather than fetch one URL, and the plan is
-to render only `textContent` / `description`, never the `content` union: that
-is per-platform rather than standardised, and would mean a renderer per
-publisher. None of that exists in this tree yet.
+repo, and its articles are separate records in the same repo. The reader reads
+those two collections rather than fetching one URL, and renders only
+`textContent` / `description`, never the `content` union: that is per-platform
+rather than standardised, and would mean a renderer per publisher.
 
 Only the **DID form** of a publication URI is stored
 (`at://did:plc:…/site.standard.publication/…`). A handle is a mutable name for
 a DID, and the feed table is keyed on identity; resolving a handle belongs to
 the input path and lands with the reader.
 
-**Polling a publication is not implemented yet**, and the flag does not pretend
-otherwise. The scheduler excludes `at://` outright, so such a subscription is
-*skipped* rather than repeatedly failed — handing one to the poller would report
-a broken feature of this reader as somebody else's website being down, which is
-exactly the confusion the failure breakdown exists to prevent.
+**A stored publication is polled like any feed**, flag on or off: the flag
+decides what may be stored, not whether a stored row is read. An `at://` row
+that is not a well-formed publication — another collection, a handle, a
+non-canonical spelling — is classed `unsupported` and never polled, so it is not
+reported as somebody else's website being down.
 
 **Pasting an `at://` URI into the subscribe form does not work yet either**,
 with the flag on or off: the add path must fetch what you paste to find the
