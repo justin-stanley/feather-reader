@@ -268,7 +268,10 @@ CREATE TABLE IF NOT EXISTS feeds (
     kind               TEXT NOT NULL DEFAULT 'rss'
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
-CREATE INDEX IF NOT EXISTS idx_feeds_kind ON feeds (kind);
+-- NOTE: `idx_feeds_kind` is created in `apply_migrations`, AFTER `kind` is
+-- ensured, for the same reason as the `intended_did` indexes below. 0.3.9 put
+-- it here and crash-looped production on its first boot: on an existing volume
+-- the CREATE TABLE above is a no-op, so the column does not exist yet.
 
 CREATE TABLE IF NOT EXISTS entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -580,6 +583,12 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'",
     )
     .await?;
+    // Here, not in the base SCHEMA batch: it names a column that only exists
+    // after the line above. See the note beside `idx_feeds_next_poll`.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_feeds_kind ON feeds (kind)")
+        .execute(pool)
+        .await
+        .context("creating idx_feeds_kind")?;
 
     // **Re-derived in Rust, every row, every start — not translated once.**
     //
@@ -9193,6 +9202,99 @@ mod tests {
         // The legacy code still redeems (NULL intended_did → open, as before).
         let out = redeem_code(&pool, "FEATHER-LEGACY00", "did:plc:new", None, 100).await?;
         assert_eq!(out, Ok(()));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
+
+    // ---- 0.3.9: the schema a RELEASED binary left behind must upgrade. ------
+    //
+    // B1 above hand-built the old shape of ONE table, so it could only catch the
+    // mistake it was written for. 0.3.9 made the same mistake on `feeds` — an
+    // index in the base SCHEMA on `kind`, a column only `apply_migrations` adds
+    // — and crash-looped production on its first boot, while every test here
+    // passed, because every other test starts from an empty file. This one
+    // starts from the schema a v0.3.8 binary actually created (dumped, not
+    // transcribed), so it covers every table at once.
+
+    #[tokio::test]
+    async fn a_v0_3_8_database_upgrades_to_the_current_schema() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("fr-v038-{}.db", std::process::id()));
+        let url = format!("sqlite://{}", path.display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        sqlx::raw_sql(include_str!("../tests/fixtures/schema-v0.3.8.sql"))
+            .execute(&pool)
+            .await?;
+
+        let feed_cols = |pool: SqlitePool| async move {
+            Ok::<_, anyhow::Error>(
+                sqlx::query("PRAGMA table_info(feeds)")
+                    .fetch_all(&pool)
+                    .await?
+                    .iter()
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(
+            !feed_cols(pool.clone()).await?.iter().any(|c| c == "kind"),
+            "pre-condition: a v0.3.8 feeds table has no kind column"
+        );
+
+        // One row of each kind, inserted the way 0.3.8 did: without `kind`.
+        let publication = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        for u in ["https://example.com/feed.xml", publication] {
+            sqlx::query("INSERT INTO feeds (url) VALUES (?)")
+                .bind(u)
+                .execute(&pool)
+                .await?;
+        }
+
+        init_schema(&pool)
+            .await
+            .expect("init_schema must upgrade a v0.3.8 database, not refuse to boot");
+
+        assert!(feed_cols(pool.clone()).await?.iter().any(|c| c == "kind"));
+        let kinds: Vec<(String, String)> =
+            sqlx::query_as("SELECT url, kind FROM feeds ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "https://example.com/feed.xml".to_string(),
+                    "rss".to_string()
+                ),
+                (publication.to_string(), "publication".to_string()),
+            ],
+            "existing rows are back-filled from their URL"
+        );
+        let indexed: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_feeds_kind'",
+        )
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(
+            indexed.as_deref(),
+            Some("idx_feeds_kind"),
+            "the index is created after the column"
+        );
+
+        // And a second boot over the upgraded file is a no-op, not an error.
+        init_schema(&pool)
+            .await
+            .expect("re-running init_schema is idempotent");
 
         drop(pool);
         let _ = std::fs::remove_file(&path);
