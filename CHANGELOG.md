@@ -16,10 +16,44 @@ deploying is separate.
 
 ## 0.3.9 — 2026-10-03
 
+**Schema: one additive column and one index.** #184 adds `feeds.kind`
+(`ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'`) and
+`idx_feeds_kind`, and the app re-derives every row's `kind` from its URL on
+each start. No `fly.toml` change, no new config flag.
+
+The release commit described this release as migration-free — "no ALTER TABLE
+… no schema change anywhere in it". That was wrong: the claim was checked
+against the PRs listed in these notes, and #183 and #184 were missing from
+them. It is still the easy kind to roll back: 0.3.8 never reads `kind`, and the
+column's default keeps 0.3.8's inserts valid, so the old binary runs against
+the migrated database unchanged. A feed added while rolled back gets `'rss'`
+whatever it is, and 0.3.9's start-up backfill corrects it on the way forward
+again.
+
 ### Changed
 
+- **A feed records what it IS, instead of re-deriving it from its URL each time
+  it is read** (#184). "Can the poller fetch this?" was
+  `lower(substr(url, 1, 5)) = 'at://'` spliced into five statements, and a
+  review found a sixth reader, `count_feeds`, that had already drifted from
+  them. `feed::FeedKind` now decides it once, in Rust, at insert, and the new
+  `feeds.kind` column stores the answer. `due_feeds`, both `/stats` aggregates,
+  `failing_feeds` and `unpollable_feeds` read that value, so SQL cannot disagree
+  with the fetcher about what a row is. `FeedKind::POLLABLE` is the one list the
+  scheduler selects from, and `POLLABLE_KINDS_SQL` is pinned equal to it by a
+  test.
+
+  It behaves the same: no feed changes what the poller does with it. Rows from
+  before the column are backfilled from their URL. Two bugs were found while
+  making it, both caught by existing tests:
+  - The failure histogram's `AS kind` alias collided with the new column, so
+    `GROUP BY kind` folded every failing feed into one bucket. It is
+    `failure_kind` now.
+  - A test helper seeded `at://` rows with the column's `'rss'` default. It now
+    goes through `upsert_feed`.
+
 - **`cargo doc` is now a CI gate, and the 45 warnings behind it are fixed**
-  (#190). This codebase puts its reasoning in doc comments and routes a reader
+  (#214, closing #190). This codebase puts its reasoning in doc comments and routes a reader
   between them by intra-doc link, so a dangling link is not cosmetic: it renders
   as plain text and the reference silently stops being one. #189 deleted a
   constant that four doc comments pointed at and nothing noticed, because no job
@@ -29,10 +63,12 @@ deploying is separate.
   Three of those were `[vet]` in `repo.rs`, pointing at the free function #150
   retired; they now point at `crate::vetted::VettedSubscription`, which is
   genuinely public, so the navigation is restored rather than deleted. The rest
-  were fixed to their real targets (`offset_from`, `axum::Router`,
-  `SidecarConfig::internal_secret`, `Subscription::private`) or demoted to prose
-  where no item exists any more (`tid` is an atproto concept, not an item here;
-  `XrpcError` is now `XrpcErrorBody` and private).
+  were fixed to their real targets (`SidecarConfig::internal_secret`,
+  `Subscription::private`, and `XrpcError` re-pointed at
+  `AtProtoError::Xrpc`), or demoted to prose where no linkable item exists
+  (`offset_for` is historical; `tid` is an atproto concept, not an item here;
+  `axum::Router` is an external crate's item and is now backticked
+  instead of linked).
 
   The other ~33 were a **public item's docs linking to a private item**, which
   rustdoc renders as plain text. Those are unlinked, keeping the name in
@@ -460,6 +496,21 @@ deploying is separate.
   reports `complete: false`, which it already models.
 
 ### Fixed
+
+- **An at-URI is recognised whatever the case of its scheme** (#183). A
+  mixed-case `At://` row was handed to the poller, which could only fail on it,
+  every tick, forever. It then showed up in the `/stats` `fetch` bucket as an
+  unreachable publisher. URL schemes are case-insensitive, so recognition is
+  now too: `atproto::strip_at_prefix` in Rust and `lower(substr(...))` in SQL.
+  A non-canonical spelling is refused at storage time, because `feeds.url` is
+  UNIQUE and two spellings of one publication would be two rows. Only a legacy
+  row could have this shape; nothing can store one today.
+
+  **The feed ceiling's use now shows up somewhere.** `count_feeds`
+  deliberately counts unpollable rows, because the ceiling bounds storage. But
+  that usage appeared nowhere, so an instance could sit at its cap refusing
+  subscriptions while every public number said otherwise. `/admin/metrics` now
+  shows feeds cached, the ceiling, and how many feeds are unpollable.
 
 - **A certificate test no longer turns latency into a verdict about a
   certificate.** `the_test_ca_is_trusted_and_still_validates_hostnames` asserts
