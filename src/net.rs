@@ -204,7 +204,24 @@ fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
     // `2001:0000::/32` is IANA-assigned Teredo space and the Teredo reading of
     // it is the correct one; a real ISATAP host would not be using that prefix.
     // Pinned by `a_teredo_address_is_read_as_teredo_not_as_isatap`.
-    if seg[5] == 0x5efe && (seg[4] == 0x0000 || seg[4] == 0x0200) {
+    //
+    // **`seg[4]` is deliberately not constrained.** RFC 5214 spells the
+    // identifier as `000000ug 00000000 0x5E 0xFE` + the IPv4, so a spec-exact
+    // test would require all of `seg[4]` except the `u` and `g` bits to be
+    // zero. Two drafts of this arm tried to be that precise and the first was
+    // wrong: it enumerated `0x0000` and `0x0200`, missed the two values with
+    // `g` set, and so was bypassable by flipping one bit while reading as
+    // complete.
+    //
+    // The asymmetry decides it. Reading the marker loosely costs a false
+    // positive only when a non-ISATAP address happens to carry `0x5efe` in
+    // group 5 AND its low 32 bits decode to a forbidden IPv4 — and `00-00-5E`
+    // is IANA's own OUI, reserved for this, so a real interface identifier does
+    // not land there. Reading it strictly costs a total bypass if any tunnel
+    // driver is more lenient than the RFC about the reserved bits. A guard
+    // should be conservative about what it accepts as safe, which here means
+    // the simpler condition, not the more exact one.
+    if seg[5] == 0x5efe {
         return vec![v4(seg[6], seg[7])];
     }
     Vec::new()
@@ -1376,10 +1393,18 @@ pub(crate) mod tests {
             // ordinary-looking global address can carry one.
             ("2001:db8::5efe:7f00:1", "ISATAP -> 127.0.0.1"),
             ("2001:db8::5efe:a9fe:a9fe", "ISATAP -> 169.254.169.254"),
+            // All four values the IID's first byte can take, kept as named
+            // regressions. RFC 5214 spells it `000000ug`, so `u` and `g` are
+            // both free. The first draft of this guard enumerated only the two
+            // with `g` clear, leaving the other two allowed — a one-bit bypass
+            // of a guard that read as complete. Reverting the arm to that
+            // enumeration fails on the `g=1` rows below.
             (
                 "2001:db8::200:5efe:a9fe:a9fe",
-                "ISATAP with the u bit set -> 169.254.169.254",
+                "ISATAP u=1 g=0 -> 169.254.169.254",
             ),
+            ("2001:db8::100:5efe:7f00:1", "ISATAP u=0 g=1 -> 127.0.0.1"),
+            ("2001:db8::300:5efe:7f00:1", "ISATAP u=1 g=1 -> 127.0.0.1"),
             (
                 "2606:4700::5efe:c0a8:1",
                 "ISATAP under a REAL public prefix -> 192.168.0.1",
@@ -1429,6 +1454,35 @@ pub(crate) mod tests {
     /// host would not be using it, and refusing this would be a false positive
     /// on an address whose traffic goes to a Teredo relay rather than to
     /// loopback. Moving the ISATAP arm above Teredo fails this test.
+    /// **The ISATAP marker is read loosely ON PURPOSE, and this is the test that
+    /// says so.**
+    ///
+    /// RFC 5214 spells the interface identifier `000000ug 00000000 0x5E 0xFE` +
+    /// the IPv4, so a spec-exact test would also require the six reserved bits
+    /// of `seg[4]` to be zero and would ALLOW the address below. `embedded_v4`
+    /// tests only for `0x5efe` in group 5, so it refuses it.
+    ///
+    /// That is a deliberate over-refusal, and without this test it was a
+    /// comment and nothing else: restoring the spec-exact mask
+    /// (`seg[4] & !0x0300 == 0`) passed all 960 tests. The asymmetry is the
+    /// argument — reading the marker loosely costs a false positive only if a
+    /// non-ISATAP interface identifier carries IANA's own `00-00-5E` OUI *and*
+    /// its low 32 bits decode to an internal address, while reading it strictly
+    /// costs a total bypass if any tunnel driver is more lenient than the RFC.
+    ///
+    /// So if a future change tightens this arm toward the spec, that is a
+    /// decision to take deliberately, by deleting this test and saying why —
+    /// not something to discover from a bypass.
+    #[test]
+    fn a_reserved_bit_in_the_isatap_identifier_does_not_buy_a_bypass() {
+        let ip: IpAddr = "2001:db8::400:5efe:7f00:1".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "an identifier carrying 00-00-5E-FE and 127.0.0.1 was allowed \
+             because a reserved bit was set",
+        );
+    }
+
     #[test]
     fn a_teredo_address_is_read_as_teredo_not_as_isatap() {
         let ip: IpAddr = "2001:0:808:808:0:5efe:7f00:1".parse().unwrap();

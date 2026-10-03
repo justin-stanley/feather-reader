@@ -93,8 +93,14 @@ deploying is separate.
   is an entirely ordinary-looking global address that names 192.168.0.1. A
   link-local ISATAP address was already refused for being `fe80::/10`; one under
   a global prefix was not refused at all. Because it matches on the interface
-  identifier it can also match inside another family's prefix, so it is tested
-  **last** and the prefix wins — an address in IANA-assigned Teredo space is
+  identifier it is also read LOOSELY — only the OUI is tested, not RFC 5214's
+  reserved bits — because two earlier drafts tried to be spec-exact and the
+  first was bypassable by setting the identifier's `g` bit, and because reading
+  the marker strictly costs a total bypass against any tunnel driver more
+  lenient than the RFC while reading it loosely costs nothing a real interface
+  identifier would hit. And because it matches on the identifier rather than a
+  prefix it can match inside another family's prefix, so it is tested **last**
+  and the prefix wins — an address in IANA-assigned Teredo space is
   read as Teredo, which `a_teredo_address_is_read_as_teredo_not_as_isatap`
   pins, since the two readings disagree and refusing it would be a false
   positive.
