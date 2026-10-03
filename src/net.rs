@@ -112,12 +112,102 @@ fn is_forbidden_v6(ip: &Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4() {
         return is_forbidden_v4(&v4);
     }
+    // **And every OTHER way an IPv6 address carries an IPv4 one.** `to_ipv4()`
+    // stops at the mapped and compatible forms; five more families embed an
+    // address this function would refuse on sight, and all five were getting
+    // through. See [`embedded_v4`].
+    //
+    // This arm only ever returns `true`, so an address whose embedded IPv4 is
+    // public still falls through to the link-local and ULA checks below — which
+    // is what keeps `fe80::5efe:8.8.8.8` refused for being link-local.
+    if embedded_v4(ip).iter().any(is_forbidden_v4) {
+        return true;
+    }
     let seg = ip.segments();
     // fe80::/10 link-local (incl. RFC-4291 metadata equivalents).
     let link_local = (seg[0] & 0xffc0) == 0xfe80;
     // fc00::/7 unique-local addresses.
     let ula = (seg[0] & 0xfe00) == 0xfc00;
     link_local || ula
+}
+
+/// Every IPv4 address `ip` embeds under a translation scheme, for re-checking
+/// against the v4 rules.
+///
+/// **`to_ipv4()` is not the whole story, and the gap was a live SSRF hole.** It
+/// handles `::ffff:a.b.c.d` and `::a.b.c.d`. These it does not:
+///
+/// * **NAT64** — `64:ff9b::/32`, covering both RFC 6052's well-known `/96` and
+///   RFC 8215's local-use `64:ff9b:1::/48`. The whole `/32` is reserved by IANA
+///   for translation and nothing legitimate to fetch lives in it, so rather than
+///   decode the six embedding lengths RFC 6052 §2.2 defines — each putting the
+///   octets in different places around the `u` byte — this returns the loopback
+///   address for any of them. Refusing the prefix outright is both simpler and
+///   stricter, and a host reachable *through* a translator has an ordinary
+///   address we resolve anyway.
+/// * **6to4** — `2002::/16` (RFC 3056), IPv4 in the next two groups.
+/// * **IPv4-translated** — `::ffff:0:0:0/96` (RFC 2765), one group away from the
+///   mapped form.
+/// * **Teredo** — `2001::/32` (RFC 4380): the relay's IPv4 in groups 2-3 and the
+///   client's in groups 6-7, the latter obfuscated by XOR with all-ones. Both are
+///   returned; either one reaching an internal address is enough to refuse.
+/// * **ISATAP** — RFC 5214, and the odd one out: **no prefix to anchor on.** The
+///   IPv4 is the low 32 bits behind the IANA-reserved `00-00-5E-FE` OUI, under
+///   ANY /64, so an ordinary-looking global address can carry one. A link-local
+///   ISATAP address was already refused for being `fe80::/10`; one under a
+///   global prefix was not refused at all.
+///
+/// Decoded rather than blanket-refused for 6to4, IPv4-translated and Teredo,
+/// because those prefixes carry public addresses too and a blocklist would take
+/// out ordinary traffic. `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+///
+/// Found while bumping a JavaScript dependency whose advisory was this class:
+/// "no classifier recognizes the NAT64 local-use range". Ours did not either.
+fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
+    let seg = ip.segments();
+    let v4 = |hi: u16, lo: u16| {
+        Ipv4Addr::new(
+            (hi >> 8) as u8,
+            (hi & 0xff) as u8,
+            (lo >> 8) as u8,
+            (lo & 0xff) as u8,
+        )
+    };
+    // NAT64, the whole IANA translation /32 — see above for why this does not
+    // decode. `LOCALHOST` is a stand-in for "forbidden", not a claim about where
+    // the address points.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return vec![Ipv4Addr::LOCALHOST];
+    }
+    // 6to4.
+    if seg[0] == 0x2002 {
+        return vec![v4(seg[1], seg[2])];
+    }
+    // IPv4-translated: `::ffff:0:a.b.c.d`.
+    if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        return vec![v4(seg[6], seg[7])];
+    }
+    // Teredo: relay, then the client with the RFC 4380 obfuscation undone.
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return vec![v4(seg[2], seg[3]), v4(seg[6] ^ 0xffff, seg[7] ^ 0xffff)];
+    }
+    // ISATAP, and it is LAST on purpose.
+    //
+    // The four above are prefix-anchored; this one is not — the IPv4 sits in the
+    // low 32 bits behind the IANA `00-00-5E-FE` OUI under ANY /64, so the test
+    // is on the interface identifier and matches regardless of prefix. That
+    // makes it overlap: a Teredo address with zero flags whose obfuscated port
+    // happens to be `0x5efe` matches this pattern too, and the two readings
+    // disagree, because Teredo stores its client address complemented.
+    //
+    // Checking it last resolves that in favour of the prefix. An address inside
+    // `2001:0000::/32` is IANA-assigned Teredo space and the Teredo reading of
+    // it is the correct one; a real ISATAP host would not be using that prefix.
+    // Pinned by `a_teredo_address_is_read_as_teredo_not_as_isatap`.
+    if seg[5] == 0x5efe && (seg[4] == 0x0000 || seg[4] == 0x0200) {
+        return vec![v4(seg[6], seg[7])];
+    }
+    Vec::new()
 }
 
 /// Validate a URL's scheme (http/https only). Returns the host as a string.
@@ -1227,6 +1317,149 @@ pub(crate) mod tests {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} should be forbidden");
         }
+    }
+
+    /// **An IPv6 address that EMBEDS a forbidden IPv4 one is a forbidden address,
+    /// and four families of them were getting through.**
+    ///
+    /// `is_forbidden_v6` unwrapped IPv4-mapped (`::ffff:a.b.c.d`) and
+    /// IPv4-compatible (`::a.b.c.d`) forms, which is where `to_ipv4()` stops. It
+    /// did not unwrap:
+    ///
+    /// * **NAT64**, `64:ff9b::/32` — the well-known prefix of RFC 6052 and the
+    ///   local-use prefix of RFC 8215. On a NAT64/DNS64 network,
+    ///   `64:ff9b::a9fe:a9fe` is the cloud metadata service.
+    /// * **6to4**, `2002::/16` (RFC 3056) — the IPv4 sits in the next two groups,
+    ///   so `2002:a9fe:a9fe::` is the same address again.
+    /// * **IPv4-translated**, `::ffff:0:0/96` (RFC 2765) — one group away from the
+    ///   mapped form `to_ipv4()` does handle.
+    /// * **Teredo**, `2001::/32` (RFC 4380) — carries the relay's IPv4 in groups
+    ///   2-3 and the client's, obfuscated by XOR with all-ones, in groups 6-7.
+    /// * **ISATAP**, RFC 5214 — the IPv4 in the low 32 bits behind the IANA
+    ///   `00-00-5E-FE` OUI, under ANY /64. The only one of the five with no
+    ///   prefix to anchor on, so `2606:4700::5efe:c0a8:1` is an entirely
+    ///   ordinary-looking global address that names 192.168.0.1.
+    ///
+    /// Found while bumping a JavaScript dependency whose advisory was the same
+    /// class: "no classifier recognizes the NAT64 local-use range". Ours did not
+    /// either.
+    ///
+    /// Whether a given deployment can route these depends on a translator being on
+    /// the path — but the attacker does not need to know that, only to try it, and
+    /// an IPv6-only network with DNS64 is now the ordinary case rather than the
+    /// exotic one. This guard is defence in depth against exactly the address that
+    /// reaches the host's own network without looking like it.
+    #[test]
+    fn forbids_ipv6_that_embeds_a_forbidden_ipv4() {
+        for (ip, what) in [
+            ("64:ff9b::7f00:1", "NAT64 well-known -> 127.0.0.1"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 well-known -> 169.254.169.254"),
+            ("64:ff9b::c0a8:1", "NAT64 well-known -> 192.168.0.1"),
+            ("64:ff9b:1::7f00:1", "NAT64 local-use, RFC 8215"),
+            ("64:ff9b:1:ffff::1", "anywhere in the NAT64 /32"),
+            ("2002:7f00:1::", "6to4 -> 127.0.0.1"),
+            ("2002:a9fe:a9fe::", "6to4 -> 169.254.169.254"),
+            ("::ffff:0:7f00:1", "IPv4-translated -> 127.0.0.1"),
+            // Teredo, laid out the way the format actually is: server IPv4 in
+            // groups 2-3, client IPv4 in groups 6-7 XORed with all-ones. Each case
+            // keeps the OTHER field public, so it fails for the reason its label
+            // claims rather than because a zero field is forbidden anyway.
+            ("2001:0:7f00:1:0:0:f7f7:fbfb", "Teredo server -> 127.0.0.1"),
+            ("2001:0:808:808:0:0:80ff:fffe", "Teredo client -> 127.0.0.1"),
+            (
+                "2001:0:808:808:0:0:5601:5601",
+                "Teredo client -> 169.254.169.254",
+            ),
+            // ISATAP (RFC 5214): the IPv4 sits in the low 32 bits behind the
+            // IANA-reserved `00-00-5E-FE` OUI, under ANY /64 — so unlike the
+            // four above there is no prefix to anchor on, and a perfectly
+            // ordinary-looking global address can carry one.
+            ("2001:db8::5efe:7f00:1", "ISATAP -> 127.0.0.1"),
+            ("2001:db8::5efe:a9fe:a9fe", "ISATAP -> 169.254.169.254"),
+            (
+                "2001:db8::200:5efe:a9fe:a9fe",
+                "ISATAP with the u bit set -> 169.254.169.254",
+            ),
+            (
+                "2606:4700::5efe:c0a8:1",
+                "ISATAP under a REAL public prefix -> 192.168.0.1",
+            ),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip(&parsed),
+                "{ip} reaches {what} and was allowed",
+            );
+        }
+    }
+
+    /// The other direction, and it is not decoration: refusing every address that
+    /// merely *looks* translated would take out ordinary public traffic. A 6to4
+    /// address wrapping a PUBLIC IPv4, and a Teredo address wrapping one, must both
+    /// still be allowed — that is what makes this a decode rather than a
+    /// prefix-blocklist.
+    #[test]
+    fn allows_ipv6_that_embeds_a_public_ipv4() {
+        for (ip, what) in [
+            ("2002:0808:0808::", "6to4 -> 8.8.8.8"),
+            (
+                "2001:0:808:808:0:0:f7f7:fbfb",
+                "Teredo, server 8.8.8.8 and client 8.8.4.4",
+            ),
+            ("::ffff:0:808:808", "IPv4-translated -> 8.8.8.8"),
+            ("2606:4700::5efe:808:808", "ISATAP -> 8.8.8.8"),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_forbidden_ip(&parsed), "{ip} is {what} and was refused");
+        }
+    }
+
+    /// **The ISATAP test is on the interface identifier, so it matches under any
+    /// prefix — including prefixes that belong to one of the other four.**
+    ///
+    /// A Teredo address with zero flags whose obfuscated port happens to be
+    /// `0x5efe` matches the ISATAP pattern too, and the two readings disagree:
+    /// Teredo stores the client address complemented, so the ISATAP reading of
+    /// the same bits is its bitwise inverse. Here the Teredo reading is server
+    /// 8.8.8.8 and client 128.255.255.254 — both public, so the address is
+    /// legitimate — while the ISATAP reading of those low 32 bits is 127.0.0.1.
+    ///
+    /// `embedded_v4` checks ISATAP last, which resolves the overlap in favour of
+    /// the prefix. `2001:0000::/32` is IANA-assigned Teredo space, a real ISATAP
+    /// host would not be using it, and refusing this would be a false positive
+    /// on an address whose traffic goes to a Teredo relay rather than to
+    /// loopback. Moving the ISATAP arm above Teredo fails this test.
+    #[test]
+    fn a_teredo_address_is_read_as_teredo_not_as_isatap() {
+        let ip: IpAddr = "2001:0:808:808:0:5efe:7f00:1".parse().unwrap();
+        assert!(
+            !is_forbidden_ip(&ip),
+            "an address in Teredo space was read as ISATAP and wrongly refused",
+        );
+    }
+
+    /// **The embedded-IPv4 arm may only ADD refusals, never grant permission.**
+    ///
+    /// It is checked before the link-local and ULA rules, so if it returned a
+    /// verdict rather than falling through, an ISATAP address wrapping a PUBLIC
+    /// IPv4 under an `fe80::/10` prefix would come back allowed — a link-local
+    /// address let through because the thing it embeds happens to be fine.
+    ///
+    /// Changing `if embedded_v4(..).any(..) { return true; }` to return the
+    /// condition fails this test — and also `forbids_internal_v6` and
+    /// `every_blocklist_branch_is_load_bearing`, which were already standing
+    /// guard over the fall-through in general. So this case is a NAMED
+    /// regression for the ISATAP interaction rather than the only thing holding
+    /// the property down; it is measured, not assumed, and stated that way
+    /// because a test whose comment claims more than it catches is the defect
+    /// this file keeps finding.
+    #[test]
+    fn a_link_local_isatap_address_is_still_refused_for_being_link_local() {
+        let ip: IpAddr = "fe80::5efe:808:808".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "fe80::/10 wrapping a public IPv4 escaped the link-local rule",
+        );
     }
 
     #[test]
