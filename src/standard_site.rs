@@ -1285,7 +1285,8 @@ mod tests {
     }
 
     /// A PLC directory and the author's PDS, both on one loopback port, for a
-    /// repo holding `records` (`(collection, rkey, value)`). Each collection is
+    /// repo holding `records` (`(collection, rkey, value)`; an empty rkey serves
+    /// a malformed envelope with no `uri`). Each collection is
     /// served as one full page carrying a cursor, then an empty page, because a
     /// real PDS returns a cursor on its final page and the walk must stop on the
     /// empty one. Returns the PLC base URL and a count of `listRecords` calls.
@@ -1333,6 +1334,11 @@ mod tests {
                         .iter()
                         .filter(|(c, _, _)| *c == collection)
                         .map(|(c, rkey, value)| {
+                            // An empty rkey serves the #177 shape: an envelope
+                            // with no `uri`, which no record can be read from.
+                            if rkey.is_empty() {
+                                return json!({ "cid": "bafy", "value": value });
+                            }
                             json!({ "uri": format!("at://{did}/{c}/{rkey}"), "cid": "bafy", "value": value })
                         })
                         .collect();
@@ -1396,6 +1402,44 @@ mod tests {
             4,
             "two collections, each a full page then an empty one"
         );
+    }
+
+    /// **#177 through the real fetch path.** A stranger's repo with one
+    /// malformed publication record and one malformed document, each beside
+    /// good ones: both are skipped, and the publication still reads.
+    #[tokio::test]
+    async fn fetch_skips_malformed_records_beside_good_ones() {
+        const OWN: &str = "did:plc:malformedrepo";
+        let site = format!("at://{OWN}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let doc = |title: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": "/p", "site": site })
+        };
+        let (plc, _) = serve_repo(
+            OWN,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "",
+                    json!({ "name": "Broken", "url": "https://x.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "mine",
+                    json!({ "name": "Mine", "url": "https://mine.example" }),
+                ),
+                (nsid::STANDARD_DOCUMENT, "", doc("unreadable")),
+                (nsid::STANDARD_DOCUMENT, "3l2mfaaaaaa2a", doc("kept")),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let read = fetch(&client, &plc, &AtUri::parse(&site).unwrap())
+            .await
+            .expect("a malformed record stalled a stranger's publication");
+        assert!(read.complete);
+        let titles: Vec<&str> = read.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["kept"]);
     }
 
     /// **A0 — the 0.4.0 acceptance test.** A subscribed publication is due, is
