@@ -977,6 +977,24 @@ pub fn backoff_for(consecutive_errors: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Poll one feed by **what it is**: an RSS/Atom/JSON document over HTTP, or a
+/// standard.site publication read from its author's PDS.
+///
+/// The single entry point the scheduler calls, so the choice of reader lives
+/// with [`FeedKind`] and not in the poll loop. Same contract as [`poll_feed`]:
+/// `Err` is a broken local store, never a misbehaving source.
+pub async fn poll_feed_by_kind(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feed: &Feed,
+) -> Result<PollOutcome> {
+    match FeedKind::of(&feed.url) {
+        FeedKind::Rss => poll_feed(pool, client, feed, config.max_entries_per_feed).await,
+        FeedKind::Publication => todo!("0.4.0 step 2: poll a standard.site publication"),
+    }
+}
+
 /// Fetch, parse, sanitize, normalize, and store a single feed.
 ///
 /// Performs a conditional GET using the feed's stored `ETag` / `Last-Modified`.

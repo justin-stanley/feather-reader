@@ -1284,6 +1284,202 @@ mod tests {
         )
     }
 
+    /// A PLC directory and the author's PDS, both on one loopback port, for a
+    /// repo holding `records` (`(collection, rkey, value)`). Each collection is
+    /// served as one full page carrying a cursor, then an empty page, because a
+    /// real PDS returns a cursor on its final page and the walk must stop on the
+    /// empty one. Returns the PLC base URL and a count of `listRecords` calls.
+    pub(crate) async fn serve_repo(
+        did: &'static str,
+        records: Vec<(&'static str, &'static str, serde_json::Value)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::extract::{Query, Request};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        for host in ["plc.repo.test", "pds.repo.test"] {
+            crate::net::test_host_override(host, addr);
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let records = Arc::new(records);
+        let app = axum::Router::new().fallback(
+            move |Query(q): Query<HashMap<String, String>>, req: Request| {
+                let records = Arc::clone(&records);
+                let counter = Arc::clone(&counter);
+                async move {
+                    let path = req.uri().path().to_string();
+                    if path == format!("/{did}") {
+                        return axum::Json(json!({
+                            "id": did,
+                            "service": [{
+                                "id": "#atproto_pds",
+                                "type": "AtprotoPersonalDataServer",
+                                "serviceEndpoint": format!("http://pds.repo.test:{port}"),
+                            }],
+                        }));
+                    }
+                    assert_eq!(path, "/xrpc/com.atproto.repo.listRecords", "unexpected request");
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let collection = q.get("collection").cloned().unwrap_or_default();
+                    if q.contains_key("cursor") {
+                        return axum::Json(json!({ "records": [], "cursor": "end" }));
+                    }
+                    let page: Vec<_> = records
+                        .iter()
+                        .filter(|(c, _, _)| *c == collection)
+                        .map(|(c, rkey, value)| {
+                            json!({ "uri": format!("at://{did}/{c}/{rkey}"), "cid": "bafy", "value": value })
+                        })
+                        .collect();
+                    axum::Json(json!({ "records": page, "cursor": "end" }))
+                }
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://plc.repo.test:{port}"), hits)
+    }
+
+    /// **The mocked repo reads through the real fetch path.** Pins that
+    /// [`serve_repo`] is a faithful enough PDS for A0 and the polling tests to
+    /// mean something: PLC resolution, both walks, the `site` filter and the
+    /// empty-page stop all run for real.
+    #[tokio::test]
+    async fn fetch_reads_a_publication_from_a_mocked_repo() {
+        const OWN: &str = "did:plc:fetchmock";
+        let site = format!("at://{OWN}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let sibling = format!("at://{OWN}/{}/other", nsid::STANDARD_PUBLICATION);
+        let doc = |site: &str, title: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": "/p", "site": site })
+        };
+        let (plc, hits) = serve_repo(
+            OWN,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "mine",
+                    json!({ "name": "Mine", "url": "https://mine.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "other",
+                    json!({ "name": "Other", "url": "https://other.example" }),
+                ),
+                (nsid::STANDARD_DOCUMENT, "3l2fmaaaaaa2a", doc(&site, "kept")),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2fmaaaaaa2b",
+                    doc(&sibling, "sibling's"),
+                ),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let read = fetch(&client, &plc, &AtUri::parse(&site).unwrap())
+            .await
+            .unwrap();
+        assert!(read.complete, "the walk did not finish");
+        assert_eq!(read.publication.name.as_deref(), Some("Mine"));
+        let titles: Vec<&str> = read.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["kept"],
+            "the site filter let a sibling through"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two collections, each a full page then an empty one"
+        );
+    }
+
+    /// **A0 — the 0.4.0 acceptance test.** A subscribed publication is due, is
+    /// polled by the standard.site reader, and its documents land as entries.
+    ///
+    /// It starts from the stored row the subscribe form will create; step 3 of
+    /// `design/STANDARD-SITE-0.4.0.md` extends it through the form itself.
+    #[tokio::test]
+    #[ignore = "0.4.0 acceptance (A0): green when polling dispatches publications (plan step 2)"]
+    async fn a_publication_subscription_delivers_entries_end_to_end() {
+        const A0: &str = "did:plc:a0publisher";
+        let site = format!("at://{A0}/{}/a0pub", nsid::STANDARD_PUBLICATION);
+        let document = |title: &str, path: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": path, "site": site, "textContent": "body" })
+        };
+        let (plc, _hits) = serve_repo(
+            A0,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "a0pub",
+                    json!({ "name": "A0 Journal", "url": "https://a0.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2a0aaaaaa2a",
+                    document("First post", "/first"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2a0aaaaaa2b",
+                    document("Second post", "/second"),
+                ),
+            ],
+        )
+        .await;
+
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut config = crate::config::Config {
+            standard_site: true,
+            ..crate::config::Config::default()
+        };
+        config.oauth.plc_directory = plc;
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let feed = crate::store::due_feeds(&pool, &now, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.url == site)
+            .expect(
+                "the publication is not handed to the poller: FeedKind::POLLABLE must include it",
+            );
+
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 2 }
+            ),
+            "expected two new entries, got {outcome:?}"
+        );
+        let titles: Vec<String> =
+            sqlx::query_scalar("SELECT title FROM entries WHERE feed_id = ? ORDER BY title")
+                .bind(feed.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(titles, vec!["First post", "Second post"]);
+    }
+
     fn canonical(rkey: &str) -> String {
         format!("at://{DID}/{}/{rkey}", nsid::STANDARD_PUBLICATION)
     }
