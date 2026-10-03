@@ -14,21 +14,76 @@ deploying is separate.
 
 ---
 
-## 0.3.9 — 2026-10-03
+## 0.3.10 — 2026-10-03
 
-**Schema: one additive column and one index.** #184 adds `feeds.kind`
+**0.3.9 does not start against any existing database. 0.3.10 is 0.3.9 with
+that fixed.** Upgrade from 0.3.8 or earlier straight to 0.3.10; everything
+under 0.3.9 below ships here, including its schema change.
+
+**Schema: one additive column and one index**, both from #184 and both applied
+automatically at start: `feeds.kind`
 (`ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'`) and
-`idx_feeds_kind`, and the app re-derives every row's `kind` from its URL on
-each start. No `fly.toml` change, no new config flag.
+`idx_feeds_kind`. Every row's `kind` is re-derived from its URL on each start.
+No `fly.toml` change.
+
+Rolling back to 0.3.8 is safe. 0.3.8 never reads `kind`, and the column's
+default keeps 0.3.8's inserts valid, so it runs against the migrated database
+unchanged. A feed added while rolled back gets `'rss'` whatever it is, and the
+next 0.3.10 start corrects it.
+
+### Fixed
+
+- **0.3.9 crash-looped on its first boot in production: `no such column:
+  kind`** (#219). The base `SCHEMA` batch created `idx_feeds_kind ON feeds
+  (kind)`. On an existing database `CREATE TABLE IF NOT EXISTS feeds` is a
+  no-op, so the column is not there until `apply_migrations` adds it, and
+  `apply_migrations` runs after the batch. Startup failed before it got there.
+  The index is now created in `apply_migrations`, directly after the column.
+
+  It is the 0.2.2 `intended_did` bug (B1) again, on a different table, with the
+  warning about it a hundred lines further down the same string. On Fly the
+  machine exhausted its restart budget and stopped. The deploy has no automatic
+  rollback, so the site was down until v26 (0.3.8) was redeployed by digest.
+
+  **The crashed boot wrote nothing.** The three statements ahead of the failing
+  one are `PRAGMA foreign_keys = ON`, `CREATE TABLE IF NOT EXISTS feeds` and
+  `CREATE INDEX IF NOT EXISTS idx_feeds_next_poll`. On a 0.3.8 database the
+  table and index already exist, and the PRAGMA only sets the connection. The
+  0.3.8 binary booted against the same volume with `db: ok`.
+
+  A database 0.3.9 created from empty was never affected: there the column is in
+  the CREATE TABLE. It upgrades to 0.3.10 as a no-op.
+
+### Tests
+
+- **Every test started from an empty file, so none could see this.** In a fresh
+  database the column is in the CREATE TABLE, and the order of the index and the
+  migration cannot matter. B1's regression test hand-built one table's old
+  shape, so it guarded only that table.
+
+  `a_v0_3_8_database_upgrades_to_the_current_schema` starts from
+  `tests/fixtures/schema-v0.3.8.sql`, the schema a v0.3.8 binary created,
+  dumped with `sqlite3 .schema` rather than transcribed. It seeds an RSS row
+  and an `at://` row the way 0.3.8 inserted them, runs the current
+  `init_schema`, and asserts the column, the backfill, the index, and that a
+  second run is a no-op. It covers every table at once.
+
+  It fails on 0.3.9 with the production error and passes on 0.3.10. End to end,
+  on a database file the real v0.3.8 binary initialised, the 0.3.9 binary exits
+  1 with `no such column: kind` and the 0.3.10 one exits 0.
+
+---
+
+## 0.3.9 — 2026-10-03 — YANKED
+
+**Yanked: it does not start against an existing database.** See 0.3.10, which
+ships everything below with the fix. The schema note for this release has moved
+there.
 
 The release commit described this release as migration-free — "no ALTER TABLE
 … no schema change anywhere in it". That was wrong: the claim was checked
 against the PRs listed in these notes, and #183 and #184 were missing from
-them. It is still the easy kind to roll back: 0.3.8 never reads `kind`, and the
-column's default keeps 0.3.8's inserts valid, so the old binary runs against
-the migrated database unchanged. A feed added while rolled back gets `'rss'`
-whatever it is, and 0.3.9's start-up backfill corrects it on the way forward
-again.
+them.
 
 ### Changed
 
