@@ -76,16 +76,33 @@ next 0.3.10 start corrects it.
   migration cannot matter. B1's regression test hand-built one table's old
   shape, so it guarded only that table.
 
-  `a_v0_3_8_database_upgrades_to_the_current_schema` starts from
-  `tests/fixtures/schema-v0.3.8.sql`, the schema a v0.3.8 binary created,
-  dumped with `sqlite3 .schema` rather than transcribed. It seeds an RSS row
-  and an `at://` row the way 0.3.8 inserted them, runs the current
-  `init_schema`, and asserts the column, the backfill, the index, and that a
-  second run is a no-op. It covers every table at once.
+  Two upgrade tests now start from schemas that released binaries created,
+  dumped with `sqlite3 .schema` rather than transcribed:
+  - `tests/fixtures/schema-v0.3.8.sql`, the release before the bug;
+  - `tests/fixtures/schema-v0.2.0.sql`, the oldest released shape and the one
+    migrations do the most work on.
 
-  It fails on 0.3.9 with the production error and passes on 0.3.10. End to end,
-  on a database file the real v0.3.8 binary initialised, the 0.3.9 binary exits
-  1 with `no such column: kind` and the 0.3.10 one exits 0.
+  Each seeds an RSS row and an `at://` row the way the old binary inserted
+  them, runs the current `init_schema`, and asserts:
+  - the backfill;
+  - `idx_feeds_kind` exists and is on `kind`;
+  - a second run is a no-op;
+  - **the upgraded schema matches a fresh one.** That means every column with
+    its type, NOT NULL, default and pk, and every index with its columns. This
+    also catches the other half of the bug class: a column added to a CREATE
+    TABLE with no migration behind it.
+
+  Mutation-checked:
+  - 0.3.9's shape fails both tests with the production error.
+  - A column added to `SCHEMA` without a migration fails both, with the diff
+    naming it.
+  - Dropping the `last_error_kind` migration fails only the v0.2.0 test, which
+    is what the second fixture is for.
+
+  End to end, a review built all 19 tags from v0.2.0 to v0.3.9 and had each
+  create and seed a database. The 0.3.10 binary upgraded every one. As a
+  control, the 0.3.9 binary failed on the v0.2.0 and v0.3.8 databases with the
+  production error. A database 0.3.10 has upgraded still boots under 0.3.8.
 
 ---
 
