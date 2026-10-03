@@ -62,6 +62,75 @@ deploying is separate.
 
 ### Security
 
+- **Five families of IPv6 address that embed a forbidden IPv4 one were reaching
+  the fetcher.** `net::is_forbidden_v6` unwrapped the IPv4-mapped
+  (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) forms, because that is
+  where `std`'s `to_ipv4()` stops. It did not unwrap **NAT64** (`64:ff9b::/32`,
+  RFC 6052's well-known prefix and RFC 8215's local-use one), **6to4**
+  (`2002::/16`, RFC 3056), **IPv4-translated** (`::ffff:0:0:0/96`, RFC 2765),
+  **Teredo** (`2001::/32`, RFC 4380, whose client address is obfuscated by XOR
+  with all-ones) or **ISATAP** (RFC 5214).
+
+  So `64:ff9b::a9fe:a9fe` and `2002:a9fe:a9fe::` both name the cloud metadata
+  service, and both passed the guard. Verified against the shipped code before
+  the fix: ten such addresses, every one allowed.
+
+  Whether a given deployment routes them depends on a translator being on the
+  path — but the attacker needs only to try, not to know, and an IPv6-only
+  network with DNS64 is now ordinary rather than exotic. A hostile DNS answer for
+  a subscribed feed's host is enough: `resolve_and_check` checks every answer, and
+  these passed.
+
+  Decoded rather than blanket-refused: these prefixes carry public addresses too,
+  and refusing them wholesale would take out ordinary traffic —
+  `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+
+  That matters most for NAT64, where an earlier revision of this change refused
+  the whole `64:ff9b::/32` and so **broke feed fetching on the very network it
+  was written for.** A DNS64 resolver (RFC 6147) synthesises a
+  well-known-prefix AAAA for every IPv4-only host, that synthesised address is
+  the only answer there is, and `first_vetted` rejects a whole DNS answer set if
+  any member is forbidden — so every IPv4-only publisher became unfetchable on
+  an IPv6-only network. RFC 6052 §3.1 defines the well-known prefix as a `/96`,
+  so inside it the embedded IPv4 is unambiguous and is now decoded;
+  `64:ff9b::a9fe:a9fe` still refuses, because 169.254.169.254 refuses on its own
+  merits. The rest of the `/32`, including RFC 8215's local-use
+  `64:ff9b:1::/48`, stays refused outright: RFC 6052 §2.2 allows six embedding
+  lengths, and guessing which one a local deployment used could read the wrong
+  bits and render an internal target as a public-looking address.
+
+  **ISATAP is the odd one out and was found by review**, after the first four
+  landed: it has **no prefix to anchor on.** The IPv4 is the low 32 bits behind
+  the IANA-reserved `00-00-5E-FE` OUI under ANY /64, so `2606:4700::5efe:c0a8:1`
+  is an entirely ordinary-looking global address that names 192.168.0.1. A
+  link-local ISATAP address was already refused for being `fe80::/10`; one under
+  a global prefix was not refused at all. Because it matches on the interface
+  identifier it reaches INSIDE the other prefixes, which is why the decoders
+  accumulate candidates rather than returning the first match. An early return
+  on the 6to4 arm was a live bypass found by review: 6to4 delegates
+  `2002:<site-v4>::/48` to whoever owns that IPv4, so a site running ISATAP in
+  its own 6to4 space produces `2002:808:808:0:0:5efe:a9fe:a9fe` — site address
+  8.8.8.8 and tunnel endpoint 169.254.169.254, two readings of disjoint bits,
+  both true, and only the public one was being checked. Teredo is the single
+  exception and still returns, because its client address occupies the same
+  groups 6-7 the identifier does, complemented, so there the two readings
+  contradict rather than complement each other. Because it matches on the
+  identifier it is also read LOOSELY — only the OUI is tested, not RFC 5214's
+  reserved bits — because two earlier drafts tried to be spec-exact and the
+  first was bypassable by setting the identifier's `g` bit, and because reading
+  the marker strictly costs a total bypass against any tunnel driver more
+  lenient than the RFC while reading it loosely costs nothing a real interface
+  identifier would hit. And because it matches on the identifier rather than a
+  prefix it can match inside another family's prefix, so it is tested **last**
+  and the prefix wins — an address in IANA-assigned Teredo space is
+  read as Teredo, which `a_teredo_address_is_read_as_teredo_not_as_isatap`
+  pins, since the two readings disagree and refusing it would be a false
+  positive.
+
+  **Found while bumping a JavaScript dependency**, whose advisory was this exact
+  class — "no classifier recognizes the NAT64 local-use range `64:ff9b:1::/48`".
+  Ours did not either, and ours is the guard this project leans on hardest.
+
 - **A record walk that runs out of pages now refuses instead of returning a
   truncated list as a success.** All three refusing walks fell out of
   `for _ in 0..MAX_LIST_PAGES` into a bare `Ok(out)`, so a repository larger than

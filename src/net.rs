@@ -112,12 +112,163 @@ fn is_forbidden_v6(ip: &Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4() {
         return is_forbidden_v4(&v4);
     }
+    // **And every OTHER way an IPv6 address carries an IPv4 one.** `to_ipv4()`
+    // stops at the mapped and compatible forms; five more families embed an
+    // address this function would refuse on sight, and all five were getting
+    // through. See [`embedded_v4`].
+    //
+    // This arm only ever returns `true`, so an address whose embedded IPv4 is
+    // public still falls through to the link-local and ULA checks below — which
+    // is what keeps `fe80::5efe:8.8.8.8` refused for being link-local.
+    if embedded_v4(ip).iter().any(is_forbidden_v4) {
+        return true;
+    }
     let seg = ip.segments();
     // fe80::/10 link-local (incl. RFC-4291 metadata equivalents).
     let link_local = (seg[0] & 0xffc0) == 0xfe80;
     // fc00::/7 unique-local addresses.
     let ula = (seg[0] & 0xfe00) == 0xfc00;
     link_local || ula
+}
+
+/// Every IPv4 address `ip` embeds under a translation scheme, for re-checking
+/// against the v4 rules.
+///
+/// **`to_ipv4()` is not the whole story, and the gap was a live SSRF hole.** It
+/// handles `::ffff:a.b.c.d` and `::a.b.c.d`. These it does not:
+///
+/// * **NAT64** — `64:ff9b::/32`. RFC 6052's well-known prefix is defined as a
+///   `/96`, so inside it the IPv4 is the last 32 bits and is decoded. The rest
+///   of the `/32`, including RFC 8215's local-use `64:ff9b:1::/48`, is refused
+///   outright, because RFC 6052 §2.2 allows six embedding lengths and which one
+///   a local deployment used is not something this code can know.
+/// * **6to4** — `2002::/16` (RFC 3056), IPv4 in the next two groups.
+/// * **IPv4-translated** — `::ffff:0:0:0/96` (RFC 2765), one group away from the
+///   mapped form.
+/// * **Teredo** — `2001::/32` (RFC 4380): the relay's IPv4 in groups 2-3 and the
+///   client's in groups 6-7, the latter obfuscated by XOR with all-ones. Both are
+///   returned; either one reaching an internal address is enough to refuse.
+/// * **ISATAP** — RFC 5214, and the odd one out: **no prefix to anchor on.** The
+///   IPv4 is the low 32 bits behind the IANA-reserved `00-00-5E-FE` OUI, under
+///   ANY /64, so an ordinary-looking global address can carry one. A link-local
+///   ISATAP address was already refused for being `fe80::/10`; one under a
+///   global prefix was not refused at all.
+///
+/// Decoded rather than blanket-refused for 6to4, IPv4-translated and Teredo,
+/// because those prefixes carry public addresses too and a blocklist would take
+/// out ordinary traffic. `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+///
+/// Found while bumping a JavaScript dependency whose advisory was this class:
+/// "no classifier recognizes the NAT64 local-use range". Ours did not either.
+fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
+    let seg = ip.segments();
+    let v4 = |hi: u16, lo: u16| {
+        Ipv4Addr::new(
+            (hi >> 8) as u8,
+            (hi & 0xff) as u8,
+            (lo >> 8) as u8,
+            (lo & 0xff) as u8,
+        )
+    };
+    // NAT64, split by prefix length because only one of the two is unambiguous.
+    //
+    // RFC 6052's well-known prefix is DEFINED as `64:ff9b::/96`, so inside it
+    // the IPv4 is unambiguously the last 32 bits and decodes like the others.
+    // That matters for availability, not just tidiness: a DNS64 resolver
+    // (RFC 6147) synthesises a well-known-prefix AAAA for every IPv4-only host,
+    // and `first_vetted` rejects a whole DNS answer set if ANY address in it is
+    // forbidden — so refusing the prefix outright makes every IPv4-only feed
+    // publisher unfetchable on an IPv6-only network. Which is the network this
+    // guard was written for.
+    //
+    // Nothing is given up by decoding: `64:ff9b::a9fe:a9fe` still refuses,
+    // because 169.254.169.254 refuses on its own merits. RFC 6052 §3.1 also
+    // forbids the well-known prefix from carrying a non-global IPv4 at all, so
+    // such an address is malformed as well as hostile.
+    //
+    // The REST of `64:ff9b::/32` — notably RFC 8215's local-use
+    // `64:ff9b:1::/48` — stays refused outright, and that is deliberate rather
+    // than lazy. RFC 6052 §2.2 defines six embedding lengths, and which one a
+    // local-use deployment chose is a property of that deployment. Guessing
+    // wrong reads the wrong bits, which could turn an internal target into a
+    // public-looking one — so for anything but the /96 the conservative answer
+    // is the only safe one. `LOCALHOST` there is a stand-in for "forbidden",
+    // not a claim about where the address points.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        if seg[2..6] == [0, 0, 0, 0] {
+            return vec![v4(seg[6], seg[7])];
+        }
+        return vec![Ipv4Addr::LOCALHOST];
+    }
+    // **From here the arms ACCUMULATE instead of returning.** An early return
+    // was a bypass: 6to4 delegates `2002:<site-v4>::/48` to whoever owns that
+    // IPv4 and the site assigns identifiers inside it, so a site running ISATAP
+    // in its own 6to4 space produces `2002:<site-v4>:0:0:5efe:<internal-v4>` —
+    // two readings of DISJOINT bits, both true at once. Returning the 6to4 site
+    // address alone reported a public address and skipped the tunnel endpoint.
+    //
+    // This is the opposite of the Teredo case below, and the difference is
+    // which bits each family claims, not which is more important.
+    let mut out = Vec::new();
+    // 6to4: the site's IPv4 in groups 1-2, disjoint from the identifier.
+    if seg[0] == 0x2002 {
+        out.push(v4(seg[1], seg[2]));
+    }
+    // IPv4-translated: `::ffff:0:a.b.c.d`.
+    //
+    // This one accumulates for uniformity rather than necessity, and the
+    // distinction is worth recording: it requires `seg[5] == 0` where ISATAP
+    // requires `0x5efe`, and `seg[..4] == 0` excludes 6to4 and Teredo too, so
+    // it can only ever be the sole match. Returning here instead is an
+    // EQUIVALENT mutant — no test can tell the difference, and one written to
+    // try would be asserting on nothing. It pushes so that an arm added below
+    // it later is not silently skipped, which is the mistake the 6to4 arm
+    // above made.
+    if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        out.push(v4(seg[6], seg[7]));
+    }
+    // Teredo: relay, then the client with the RFC 4380 obfuscation undone.
+    //
+    // **The one arm that still returns, because it CLAIMS the identifier's
+    // bits.** Teredo's client address lives in groups 6-7 complemented — the
+    // same bits ISATAP reads uncomplemented — so the two readings are of one
+    // field and contradict each other. Accumulating both would refuse a
+    // legitimate Teredo address whenever the inverse of its client address
+    // happens to be internal. Returning here resolves that in favour of the
+    // prefix, which `a_teredo_address_is_read_as_teredo_not_as_isatap` pins.
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        out.push(v4(seg[2], seg[3]));
+        out.push(v4(seg[6] ^ 0xffff, seg[7] ^ 0xffff));
+        return out;
+    }
+    // ISATAP, and it is last so that Teredo above can suppress it.
+    //
+    // The others are prefix-anchored; this one is not — the IPv4 sits in the low
+    // 32 bits behind the IANA `00-00-5E-FE` OUI under ANY /64, so the test is on
+    // the interface identifier and matches whatever the prefix. Being reachable
+    // under another family's prefix is the point, not an edge case: it is why
+    // the arms above accumulate rather than return.
+    //
+    // **`seg[4]` is deliberately not constrained.** RFC 5214 spells the
+    // identifier as `000000ug 00000000 0x5E 0xFE` + the IPv4, so a spec-exact
+    // test would require all of `seg[4]` except the `u` and `g` bits to be
+    // zero. Two drafts of this arm tried to be that precise and the first was
+    // wrong: it enumerated `0x0000` and `0x0200`, missed the two values with
+    // `g` set, and so was bypassable by flipping one bit while reading as
+    // complete.
+    //
+    // The asymmetry decides it. Reading the marker loosely costs a false
+    // positive only when a non-ISATAP address happens to carry `0x5efe` in
+    // group 5 AND its low 32 bits decode to a forbidden IPv4 — and `00-00-5E`
+    // is IANA's own OUI, reserved for this, so a real interface identifier does
+    // not land there. Reading it strictly costs a total bypass if any tunnel
+    // driver is more lenient than the RFC about the reserved bits. A guard
+    // should be conservative about what it accepts as safe, which here means
+    // the simpler condition, not the more exact one.
+    if seg[5] == 0x5efe {
+        out.push(v4(seg[6], seg[7]));
+    }
+    out
 }
 
 /// Validate a URL's scheme (http/https only). Returns the host as a string.
@@ -1227,6 +1378,287 @@ pub(crate) mod tests {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} should be forbidden");
         }
+    }
+
+    /// **An IPv6 address that EMBEDS a forbidden IPv4 one is a forbidden address,
+    /// and four families of them were getting through.**
+    ///
+    /// `is_forbidden_v6` unwrapped IPv4-mapped (`::ffff:a.b.c.d`) and
+    /// IPv4-compatible (`::a.b.c.d`) forms, which is where `to_ipv4()` stops. It
+    /// did not unwrap:
+    ///
+    /// * **NAT64**, `64:ff9b::/32` — the well-known prefix of RFC 6052 and the
+    ///   local-use prefix of RFC 8215. On a NAT64/DNS64 network,
+    ///   `64:ff9b::a9fe:a9fe` is the cloud metadata service.
+    /// * **6to4**, `2002::/16` (RFC 3056) — the IPv4 sits in the next two groups,
+    ///   so `2002:a9fe:a9fe::` is the same address again.
+    /// * **IPv4-translated**, `::ffff:0:0/96` (RFC 2765) — one group away from the
+    ///   mapped form `to_ipv4()` does handle.
+    /// * **Teredo**, `2001::/32` (RFC 4380) — carries the relay's IPv4 in groups
+    ///   2-3 and the client's, obfuscated by XOR with all-ones, in groups 6-7.
+    /// * **ISATAP**, RFC 5214 — the IPv4 in the low 32 bits behind the IANA
+    ///   `00-00-5E-FE` OUI, under ANY /64. The only one of the five with no
+    ///   prefix to anchor on, so `2606:4700::5efe:c0a8:1` is an entirely
+    ///   ordinary-looking global address that names 192.168.0.1.
+    ///
+    /// Found while bumping a JavaScript dependency whose advisory was the same
+    /// class: "no classifier recognizes the NAT64 local-use range". Ours did not
+    /// either.
+    ///
+    /// Whether a given deployment can route these depends on a translator being on
+    /// the path — but the attacker does not need to know that, only to try it, and
+    /// an IPv6-only network with DNS64 is now the ordinary case rather than the
+    /// exotic one. This guard is defence in depth against exactly the address that
+    /// reaches the host's own network without looking like it.
+    #[test]
+    fn forbids_ipv6_that_embeds_a_forbidden_ipv4() {
+        for (ip, what) in [
+            ("64:ff9b::7f00:1", "NAT64 well-known -> 127.0.0.1"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 well-known -> 169.254.169.254"),
+            ("64:ff9b::c0a8:1", "NAT64 well-known -> 192.168.0.1"),
+            ("64:ff9b:1::7f00:1", "NAT64 local-use, RFC 8215"),
+            ("64:ff9b:1:ffff::1", "anywhere in the NAT64 /32"),
+            ("2002:7f00:1::", "6to4 -> 127.0.0.1"),
+            ("2002:a9fe:a9fe::", "6to4 -> 169.254.169.254"),
+            ("::ffff:0:7f00:1", "IPv4-translated -> 127.0.0.1"),
+            // Teredo, laid out the way the format actually is: server IPv4 in
+            // groups 2-3, client IPv4 in groups 6-7 XORed with all-ones. Each case
+            // keeps the OTHER field public, so it fails for the reason its label
+            // claims rather than because a zero field is forbidden anyway.
+            ("2001:0:7f00:1:0:0:f7f7:fbfb", "Teredo server -> 127.0.0.1"),
+            ("2001:0:808:808:0:0:80ff:fffe", "Teredo client -> 127.0.0.1"),
+            (
+                "2001:0:808:808:0:0:5601:5601",
+                "Teredo client -> 169.254.169.254",
+            ),
+            // ISATAP (RFC 5214): the IPv4 sits in the low 32 bits behind the
+            // IANA-reserved `00-00-5E-FE` OUI, under ANY /64 — so unlike the
+            // four above there is no prefix to anchor on, and a perfectly
+            // ordinary-looking global address can carry one.
+            ("2001:db8::5efe:7f00:1", "ISATAP -> 127.0.0.1"),
+            ("2001:db8::5efe:a9fe:a9fe", "ISATAP -> 169.254.169.254"),
+            // All four values the IID's first byte can take, kept as named
+            // regressions. RFC 5214 spells it `000000ug`, so `u` and `g` are
+            // both free. The first draft of this guard enumerated only the two
+            // with `g` clear, leaving the other two allowed — a one-bit bypass
+            // of a guard that read as complete. Reverting the arm to that
+            // enumeration fails on the `g=1` rows below.
+            (
+                "2001:db8::200:5efe:a9fe:a9fe",
+                "ISATAP u=1 g=0 -> 169.254.169.254",
+            ),
+            ("2001:db8::100:5efe:7f00:1", "ISATAP u=0 g=1 -> 127.0.0.1"),
+            ("2001:db8::300:5efe:7f00:1", "ISATAP u=1 g=1 -> 127.0.0.1"),
+            (
+                "2606:4700::5efe:c0a8:1",
+                "ISATAP under a REAL public prefix -> 192.168.0.1",
+            ),
+            // **An ISATAP identifier INSIDE another family's prefix.** 6to4
+            // delegates `2002:<site-v4>::/48` to whoever owns that IPv4, and
+            // the site assigns identifiers inside it — so a site running ISATAP
+            // in its own 6to4 space produces exactly this. The two families
+            // read DISJOINT bits (6to4 the site address in groups 1-2, ISATAP
+            // the tunnel endpoint in groups 6-7), so both readings are true at
+            // once and checking only the first is a bypass.
+            (
+                "2002:808:808:0:0:5efe:a9fe:a9fe",
+                "6to4 site 8.8.8.8 + ISATAP -> 169.254.169.254",
+            ),
+            (
+                "2002:808:808:0:0:5efe:7f00:1",
+                "6to4 site 8.8.8.8 + ISATAP -> 127.0.0.1",
+            ),
+            (
+                "2002:101:101:0:0:5efe:c0a8:1",
+                "6to4 site 1.1.1.1 + ISATAP -> 192.168.0.1",
+            ),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip(&parsed),
+                "{ip} reaches {what} and was allowed",
+            );
+        }
+    }
+
+    /// The other direction, and it is not decoration: refusing every address that
+    /// merely *looks* translated would take out ordinary public traffic. A 6to4
+    /// address wrapping a PUBLIC IPv4, and a Teredo address wrapping one, must both
+    /// still be allowed — that is what makes this a decode rather than a
+    /// prefix-blocklist.
+    #[test]
+    fn allows_ipv6_that_embeds_a_public_ipv4() {
+        for (ip, what) in [
+            ("2002:0808:0808::", "6to4 -> 8.8.8.8"),
+            (
+                "2001:0:808:808:0:0:f7f7:fbfb",
+                "Teredo, server 8.8.8.8 and client 8.8.4.4",
+            ),
+            ("::ffff:0:808:808", "IPv4-translated -> 8.8.8.8"),
+            ("2606:4700::5efe:808:808", "ISATAP -> 8.8.8.8"),
+            // The DNS64 case, and the reason NAT64 is decoded rather than
+            // prefix-refused: a resolver doing DNS64 synthesises exactly this
+            // for an IPv4-only host, so refusing the prefix outright makes
+            // every IPv4-only feed publisher unfetchable on an IPv6-only
+            // network — the very network that motivated the guard.
+            ("64:ff9b::808:808", "NAT64 well-known prefix -> 8.8.8.8"),
+            // Both readings of one address, both public. The arms accumulate,
+            // so this is the case that keeps that a decode rather than "any
+            // 6to4 address carrying a `5efe` identifier is refused".
+            (
+                "2002:808:808:0:0:5efe:808:404",
+                "6to4 site 8.8.8.8 + ISATAP 8.8.4.4",
+            ),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_forbidden_ip(&parsed), "{ip} is {what} and was refused");
+        }
+    }
+
+    /// **The well-known prefix decodes; the local-use one does not — and the
+    /// difference is deliberate, so it needs a test and not just a comment.**
+    ///
+    /// `64:ff9b::/96` is a fixed-length prefix by definition (RFC 6052 §3.1), so
+    /// the embedded IPv4 is unambiguously the last 32 bits. RFC 8215's local-use
+    /// `64:ff9b:1::/48` is not: RFC 6052 §2.2 allows six embedding lengths and
+    /// which one a deployment chose is a property of that deployment. Guessing
+    /// wrong reads the wrong bits and could render an internal target as a
+    /// public-looking address, so everything outside the /96 is refused whole.
+    ///
+    /// The cost is real and accepted: a site translating through its local-use
+    /// prefix cannot fetch through this reader. The alternative is a decode that
+    /// is wrong whenever the guess is wrong, in the one direction that matters.
+    ///
+    /// Extending the decode to the whole `/32` fails this test.
+    #[test]
+    fn a_local_use_nat64_prefix_is_refused_even_wrapping_a_public_address() {
+        let ip: IpAddr = "64:ff9b:1::808:808".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "the local-use NAT64 prefix was decoded as if its embedding length \
+             were known",
+        );
+    }
+
+    /// **The DNS64 path, end to end through the function that rejects answer
+    /// sets.** This is the interaction the unit cases cannot see.
+    ///
+    /// On an IPv6-only network a DNS64 resolver (RFC 6147) synthesises a
+    /// well-known-prefix AAAA for every IPv4-only host, and that synthesised
+    /// address is the ONLY answer — there is no "ordinary address we resolve
+    /// anyway". Since `first_vetted` rejects a whole set if any member is
+    /// forbidden, refusing `64:ff9b::/96` outright made every IPv4-only feed
+    /// publisher unfetchable on exactly the network this guard was written for.
+    ///
+    /// Both directions, because the fix must not cost the guard: a synthesised
+    /// answer for a PUBLIC host resolves, and a synthesised answer for the
+    /// metadata service still poisons the set.
+    #[test]
+    fn a_dns64_answer_set_for_an_ipv4_only_host_is_fetchable() {
+        let synthesised: SocketAddr = "[64:ff9b::808:808]:80".parse().unwrap();
+        let public_v4: SocketAddr = "1.2.3.4:80".parse().unwrap();
+
+        // IPv6-only: the synthesised address is the whole answer.
+        assert_eq!(
+            first_vetted("v4only.example", [synthesised].into_iter()).unwrap(),
+            synthesised,
+            "a DNS64-synthesised answer for a public host was refused, which \
+             makes every IPv4-only publisher unfetchable behind NAT64",
+        );
+        // Dual-stack with DNS64: the synthesised answer must not poison the set.
+        assert!(first_vetted("both.example", [public_v4, synthesised].into_iter()).is_ok());
+
+        // And the guard still bites: synthesising the metadata service is
+        // exactly the attack, and one such answer rejects the whole set.
+        let hostile: SocketAddr = "[64:ff9b::a9fe:a9fe]:80".parse().unwrap();
+        assert!(
+            first_vetted("evil.example", [public_v4, hostile].into_iter()).is_err(),
+            "a NAT64-synthesised metadata address was accepted",
+        );
+        assert!(first_vetted("evil.example", [hostile].into_iter()).is_err());
+    }
+
+    /// **The ISATAP marker is read loosely ON PURPOSE, and this is the test that
+    /// says so.**
+    ///
+    /// RFC 5214 spells the interface identifier `000000ug 00000000 0x5E 0xFE` +
+    /// the IPv4, so a spec-exact test would also require the six reserved bits
+    /// of `seg[4]` to be zero and would ALLOW the address below. `embedded_v4`
+    /// tests only for `0x5efe` in group 5, so it refuses it.
+    ///
+    /// That is a deliberate over-refusal, and without this test it was a
+    /// comment and nothing else: restoring the spec-exact mask
+    /// (`seg[4] & !0x0300 == 0`) passed all 960 tests. The asymmetry is the
+    /// argument — reading the marker loosely costs a false positive only if a
+    /// non-ISATAP interface identifier carries IANA's own `00-00-5E` OUI *and*
+    /// its low 32 bits decode to an internal address, while reading it strictly
+    /// costs a total bypass if any tunnel driver is more lenient than the RFC.
+    ///
+    /// So if a future change tightens this arm toward the spec, that is a
+    /// decision to take deliberately, by deleting this test and saying why —
+    /// not something to discover from a bypass.
+    #[test]
+    fn a_reserved_bit_in_the_isatap_identifier_does_not_buy_a_bypass() {
+        let ip: IpAddr = "2001:db8::400:5efe:7f00:1".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "an identifier carrying 00-00-5E-FE and 127.0.0.1 was allowed \
+             because a reserved bit was set",
+        );
+    }
+
+    /// **The ISATAP test is on the interface identifier, so it matches under any
+    /// prefix — including prefixes that belong to one of the other four.**
+    ///
+    /// A Teredo address with zero flags whose obfuscated port happens to be
+    /// `0x5efe` matches the ISATAP pattern too, and the two readings disagree:
+    /// Teredo stores the client address complemented, so the ISATAP reading of
+    /// the same bits is its bitwise inverse. Here the Teredo reading is server
+    /// 8.8.8.8 and client 128.255.255.254 — both public, so the address is
+    /// legitimate — while the ISATAP reading of those low 32 bits is 127.0.0.1.
+    ///
+    /// Teredo is the one arm that still RETURNS rather than accumulating, which
+    /// suppresses the ISATAP reading of bits Teredo has already claimed.
+    /// `2001:0000::/32` is IANA-assigned Teredo space, a real ISATAP host would
+    /// not be using it, and refusing this would be a false positive on an
+    /// address whose traffic goes to a Teredo relay rather than to loopback.
+    ///
+    /// Making the Teredo arm accumulate like the others — i.e. letting the
+    /// ISATAP arm also read groups 6-7 here — fails this test. That is the
+    /// whole difference between this case and the 6to4 one: there the two
+    /// families read disjoint bits and both readings hold, here they read the
+    /// same field and contradict each other.
+    #[test]
+    fn a_teredo_address_is_read_as_teredo_not_as_isatap() {
+        let ip: IpAddr = "2001:0:808:808:0:5efe:7f00:1".parse().unwrap();
+        assert!(
+            !is_forbidden_ip(&ip),
+            "an address in Teredo space was read as ISATAP and wrongly refused",
+        );
+    }
+
+    /// **The embedded-IPv4 arm may only ADD refusals, never grant permission.**
+    ///
+    /// It is checked before the link-local and ULA rules, so if it returned a
+    /// verdict rather than falling through, an ISATAP address wrapping a PUBLIC
+    /// IPv4 under an `fe80::/10` prefix would come back allowed — a link-local
+    /// address let through because the thing it embeds happens to be fine.
+    ///
+    /// Changing `if embedded_v4(..).any(..) { return true; }` to return the
+    /// condition fails this test — and also `forbids_internal_v6` and
+    /// `every_blocklist_branch_is_load_bearing`, which were already standing
+    /// guard over the fall-through in general. So this case is a NAMED
+    /// regression for the ISATAP interaction rather than the only thing holding
+    /// the property down; it is measured, not assumed, and stated that way
+    /// because a test whose comment claims more than it catches is the defect
+    /// this file keeps finding.
+    #[test]
+    fn a_link_local_isatap_address_is_still_refused_for_being_link_local() {
+        let ip: IpAddr = "fe80::5efe:808:808".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "fe80::/10 wrapping a public IPv4 escaped the link-local rule",
+        );
     }
 
     #[test]
