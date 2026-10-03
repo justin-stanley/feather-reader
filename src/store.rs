@@ -282,7 +282,15 @@ CREATE TABLE IF NOT EXISTS entries (
     fetched_at   TEXT NOT NULL,
     UNIQUE (feed_id, guid)
 );
-CREATE INDEX IF NOT EXISTS idx_entries_feed_published ON entries (feed_id, published);
+-- `fetched_at` is in the index so the queries that sort on
+-- `COALESCE(published, fetched_at)` stay COVERING. Without it the planner
+-- still uses the index to find a feed's rows but must then visit each one to
+-- read `fetched_at`, and the sort key is computed before `LIMIT` truncates
+-- anything — so the lookups scale with every row in every subscribed feed,
+-- not with the page. `(feed_id, published)` is a prefix of this, so it serves
+-- everything the old index did; `apply_migrations` drops that one.
+CREATE INDEX IF NOT EXISTS idx_entries_feed_effective
+    ON entries (feed_id, published, fetched_at);
 
 CREATE TABLE IF NOT EXISTS entry_state (
     did        TEXT NOT NULL,
@@ -756,6 +764,16 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await
     .context("creating idx_invite_codes_intended_active")?;
+
+    // Superseded by `idx_entries_feed_effective`, which carries `fetched_at` as a
+    // third column so the `COALESCE(published, fetched_at)` orderings stay
+    // covering. `(feed_id, published)` is a prefix of the new index, so nothing it
+    // served is lost — and keeping both would charge every entry insert for a
+    // second index answering no query the first does not.
+    sqlx::query("DROP INDEX IF EXISTS idx_entries_feed_published")
+        .execute(pool)
+        .await
+        .context("dropping the superseded idx_entries_feed_published")?;
     Ok(())
 }
 
@@ -4767,8 +4785,73 @@ mod tests {
         Ok(feed_id)
     }
 
-    /// **The cap and the reading list must agree about what an undated entry's
-    /// date IS.** They did not, and the disagreement had a direction.
+    /// **The index claim, pinned — because otherwise it is a comment.**
+    ///
+    /// `idx_entries_feed_effective` carries `fetched_at` as a third column so the
+    /// `COALESCE(published, fetched_at)` orderings stay covering. Drop that column
+    /// and every query still returns the right rows in the right order, so no
+    /// other test notices; what changes is that the planner must visit each
+    /// candidate row to read `fetched_at`, and the sort key is computed before
+    /// `LIMIT`, so on the prev/next path that is every entry in every subscribed
+    /// feed on every article open.
+    ///
+    /// This does assert a planner outcome, which is a little brittle by nature.
+    /// It earns that: the alternative is a performance property stated only in a
+    /// comment, and this file's history is mostly comments that stopped being
+    /// true. The superseded `(feed_id, published)` index must also be gone — it
+    /// is a prefix of the new one, so keeping it would charge every entry insert
+    /// for a second index answering no query the first does not.
+    #[tokio::test]
+    async fn the_entry_index_covers_the_ordering_the_queries_actually_use() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        seed_big_entries(&pool, "did:plc:idx", 20).await?;
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT e.id FROM entries e \
+             JOIN sub_ref s ON s.feed_id = e.feed_id AND s.did = 'did:plc:idx' \
+             ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT 5000",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let steps: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("COVERING INDEX idx_entries_feed_effective")),
+            "the ordering no longer reads from a covering index, so every \
+             candidate row is visited to compute the sort key: {steps:?}",
+        );
+
+        // **The drop has to be exercised on a database that HAS the old index.**
+        // A fresh one never creates it, so asserting its absence here would pass
+        // whether or not the migration runs — which is exactly what the first
+        // version of this test did. Recreate it, re-run the migrations (they are
+        // idempotent), and then look.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_entries_feed_published ON entries (feed_id, published)",
+        )
+        .execute(&pool)
+        .await?;
+        apply_migrations(&pool).await?;
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entries'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let names: Vec<&str> = indexes.iter().map(|i| i.0.as_str()).collect();
+        assert!(
+            !names.contains(&"idx_entries_feed_published"),
+            "the superseded index survived the migration: {names:?}",
+        );
+        assert!(
+            names.contains(&"idx_entries_feed_effective"),
+            "the migration dropped the old index without the new one existing: {names:?}",
+        );
+        Ok(())
+    }
+
+    /// **The cap, the reading list and prev/next must agree about what an undated
+    /// entry's date IS.** They did not, and the disagreement had a direction.
     ///
     /// The per-feed keep-set and both retention sweeps order on
     /// `COALESCE(published, fetched_at)` — correctly, because a feed of undated
@@ -4791,11 +4874,17 @@ mod tests {
     /// it is moot — both forms already end in `USE TEMP B-TREE FOR ORDER BY`,
     /// because the join fans out across every subscribed feed and several index
     /// ranges have to be merged, so the bare `published DESC` was not using the
-    /// index for ordering either. The one real difference is `COVERING INDEX` →
-    /// `INDEX` on `entries`, since `fetched_at` is not in the index and the rows
-    /// must now be visited: bounded by `LIMIT`, so tens of lookups per page.
-    /// Adding `fetched_at` to the index would restore covering, and that is an
-    /// optimisation with a migration attached, not part of this correctness fix.
+    /// index for ordering either. The one real difference was `COVERING INDEX` →
+    /// `INDEX` on `entries`, because `fetched_at` was not in the index and the
+    /// rows then had to be visited.
+    ///
+    /// **That cost is NOT "per page", and an earlier version of this comment said
+    /// it was.** The sort key is computed before `LIMIT` truncates anything, so
+    /// the lookups scale with every row matching the `WHERE` clause. For
+    /// `list_entries` the difference is small; for `list_entry_ids`, called with
+    /// `web::PREV_NEXT_MAX` on every article open, it is every entry in every
+    /// subscribed feed. So `fetched_at` is now the index's third column
+    /// (`idx_entries_feed_effective`) and both orderings are covering again.
     #[tokio::test]
     async fn an_undated_entry_leads_the_reading_list_as_it_leads_the_cap() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
@@ -4845,9 +4934,13 @@ mod tests {
             "the list disagrees with the cap about an undated entry's date",
         );
 
-        // The id projection used for marking a page read walks the same
-        // ordering, so it must agree too — otherwise "mark this page read"
-        // marks a different page than the one on screen.
+        // `list_entry_ids` is the sequence PREV/NEXT walks — its only non-test
+        // caller is `web::neighbors_in_scope`. Ordered differently from the
+        // list, "next entry" would take the reader somewhere that is not the
+        // next row on screen. (`mark_read` and `mark_all_read` are id-based and
+        // never use this ordering; an earlier version of this comment said they
+        // did, naming a failure that cannot happen and omitting the one that
+        // can.)
         let ids = list_entry_ids(&pool, did, ListView::All, None, 100).await?;
         let by_guid: std::collections::HashMap<i64, &str> =
             rows.iter().map(|r| (r.id, r.guid.as_str())).collect();

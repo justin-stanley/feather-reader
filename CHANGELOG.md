@@ -48,12 +48,29 @@ deploying is separate.
   reader would see it. `site.standard.document` makes `publishedAt` optional, so
   publication feeds reach this far more readily than RSS ever did.
 
-  The issue's index worry turned out to be moot, and this is measured rather
-  than assumed: `EXPLAIN QUERY PLAN` shows both forms already ending in `USE
-  TEMP B-TREE FOR ORDER BY`, because the join fans out across every subscribed
-  feed and several index ranges must be merged — so the bare ordering was not
-  using `idx_entries_feed_published` for sorting either. The only delta is
-  `COVERING INDEX` → `INDEX`, bounded by `LIMIT`. No expression index needed.
+  The issue's index worry was half right, and measuring said which half.
+  `EXPLAIN QUERY PLAN` shows both forms already ending in `USE TEMP B-TREE FOR
+  ORDER BY` — the join fans out across every subscribed feed and several index
+  ranges must be merged, so the bare ordering was not using the index for
+  sorting either, and no expression index is needed. But the loss of `COVERING
+  INDEX` is not "bounded by `LIMIT`" as first claimed: the sort key is computed
+  before `LIMIT` truncates anything, so the row lookups scale with every row
+  matching the `WHERE` clause. On the prev/next path, which runs on every
+  article open with a 5000 limit, that is every entry in every subscribed feed.
+  So `fetched_at` is now the index's third column
+  (`idx_entries_feed_effective`), both orderings are covering again, and
+  `apply_migrations` drops the superseded `(feed_id, published)` index, which was
+  a prefix of the new one.
+
+  The future-date bound is **two days**, not the publication path's five-minute
+  clock-skew grace, and the asymmetry is deliberate. There a refused
+  `publishedAt` falls back to the record key's TID — a real write time — so a
+  tight bound costs almost nothing. In a feed there is no such fallback, and the
+  ordinary cause of a future `pubDate` is a local time stamped `+0000` (up to 14
+  hours out) or a post scheduled slightly ahead; refusing those would leave real
+  articles with no date on screen. What the bound must prevent is a date that can
+  never become past, and two days clears the whole UTC offset range while still
+  refusing the year 2999 by a wide margin.
 
 ### Changed
 

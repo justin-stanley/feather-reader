@@ -1234,20 +1234,43 @@ fn entry_author(e: &RawEntry) -> Option<String> {
 /// `fetched_at` then dates the row and holds still. That is the rule the
 /// publication path already follows; see `standard_site::entries_from_records`.
 ///
-/// **Each candidate is judged separately.** Filtering `published.or(updated)`
-/// would throw away a perfectly good `updated` whenever `published` was bogus,
-/// which is the common shape of a broken-clock feed rather than a rare one.
+/// **Each candidate is judged separately**, so a bogus `<published>` beside a
+/// credible `<updated>` keeps the good date. That helps Atom and only Atom: for
+/// RSS 2 `feed-rs` copies `published` into `updated` when `updated` is absent
+/// (`parser/rss2/mod.rs`), so the second candidate holds the same value and the
+/// fall-through is a no-op. Worth keeping for the format where two independent
+/// dates exist; worth not overstating for the one where they do not.
 ///
-/// The ceiling carries the same [`crate::atproto::CLOCK_SKEW_GRACE_SECS`]
-/// allowance the publication path uses, so the two ingest paths agree about what
-/// "future" means instead of one being stricter by accident.
+/// **The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`], NOT the publication path's
+/// clock-skew grace, and the asymmetry is deliberate.** There, a refused
+/// `publishedAt` falls back to the record key's TID — the real write time, a
+/// credible date — so a five-minute bound costs almost nothing. Here there is no
+/// such fallback: refusing leaves the entry undated and the reader sees no date
+/// at all. Five minutes is sized for skew between two clocks, while the ordinary
+/// cause of a future `pubDate` is a local time stamped `+0000` (up to 14 hours
+/// out, the widest real UTC offset) or a post scheduled a little ahead. Those are
+/// dates worth keeping, and they stop being future on their own.
+///
+/// What the bound must prevent is a date that can never become past, because that
+/// is what makes a row permanently unsweepable, un-evictable and first in the
+/// list.
 fn entry_time(e: &RawEntry) -> Option<String> {
-    let ceiling = Utc::now() + chrono::Duration::seconds(crate::atproto::CLOCK_SKEW_GRACE_SECS);
+    let ceiling = Utc::now() + chrono::Duration::days(MAX_FUTURE_PUBLISHED_DAYS);
     e.published
         .filter(|d| *d <= ceiling)
         .or_else(|| e.updated.filter(|d| *d <= ceiling))
         .map(fmt_time)
 }
+
+/// How far ahead of now a feed may date an entry before [`entry_time`] refuses
+/// the date and lets `fetched_at` stand in.
+///
+/// Two days: the widest real UTC offset is +14:00, so a local time mislabelled as
+/// UTC lands inside this, as does a post scheduled slightly ahead. Both are dates
+/// worth keeping, and both stop being future without help. Anything further is
+/// refused, because a date that never becomes past is what makes a row
+/// permanently unsweepable and permanently first in the reading list.
+const MAX_FUTURE_PUBLISHED_DAYS: i64 = 2;
 
 /// Extract the plain string content of a feed [`Text`] node.
 fn text_plain(t: &Text) -> String {
@@ -1551,11 +1574,41 @@ mod tests {
             e.published,
         );
 
-        // **Each candidate is judged separately, not the winner of `or`.** A
-        // bogus `pubDate` beside a credible `atom:updated` is the ordinary shape
-        // of a broken-clock feed, and filtering `published.or(updated)` would
-        // throw the good date away with the bad one. Atom, because RSS has no
-        // second date field for feed-rs to read.
+        // **A merely MISLABELLED date must survive.** The ordinary cause of a
+        // future `pubDate` is a local time stamped `+0000` — up to 14 hours out,
+        // not a clock a few minutes fast. Refusing those would leave real
+        // articles undated and dateless on screen, which is why the bound is two
+        // days rather than the publication path's five-minute skew grace.
+        let soon = (Utc::now() + chrono::Duration::hours(14)).to_rfc2822();
+        let near = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &soon);
+        let parsed = feed_rs::parser::parse(near.as_bytes()).expect("should parse");
+        assert!(
+            parsed.entries[0].published.is_some(),
+            "the mislabelled-date fixture did not parse",
+        );
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published.is_some(),
+            "a date 14 hours ahead — the widest real UTC offset — was refused, \
+             so a timezone-mislabelled article loses its date entirely",
+        );
+
+        // And the bound still bounds: a month out is refused.
+        let far = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
+        let month = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &far);
+        let parsed = feed_rs::parser::parse(month.as_bytes()).expect("should parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(
+            e.published, None,
+            "a date a month ahead was kept, so the row leads the list for a month",
+        );
+
+        // **Each candidate is judged separately, not the winner of `or`.**
+        //
+        // Atom specifically: for RSS 2 `feed-rs` copies `published` into
+        // `updated` when `updated` is absent, so the second candidate holds the
+        // same bogus value and the fall-through cannot help. Only a format
+        // carrying two independent dates exercises this.
         let both = r#"<?xml version="1.0"?>
 <feed xmlns="http://www.w3.org/2005/Atom"><title>Clock</title>
 <entry><title>Mixed</title><id>https://clock.example/2</id>
