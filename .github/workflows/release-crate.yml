@@ -18,9 +18,21 @@ name: Release crate (crates.io)
 #   The tag must equal Cargo.toml's version (enforced below) so a mistagged push
 #   can't publish the wrong version.
 
+# ── ORDER ─────────────────────────────────────────────────────────────────────
+#   This runs AFTER release-image succeeds for the same tag, not alongside it.
+#   release-image holds the upgrade-boot gate; publishing a crate whose image
+#   cannot start against an existing database is how 0.3.9 shipped (and had to
+#   be yanked). A failed gate now publishes nothing anywhere.
+#
+#   `workflow_run` fires from the DEFAULT branch's copy of this file, so the
+#   tag comes from `workflow_run.head_branch` and the commit from `head_sha` —
+#   not from github.ref, which is main here. Trusted Publishing keys on this
+#   file's name, which is unchanged.
+
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_run:
+    workflows: [release-image]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -28,7 +40,7 @@ permissions:
   id-token: write   # REQUIRED: mint the OIDC token for crates.io Trusted Publishing
 
 concurrency:
-  group: release-crate-${{ github.ref }}
+  group: release-crate-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -43,10 +55,25 @@ jobs:
     # branch (e.g. main) would reach the "Verify tag matches Cargo.toml" step with
     # GITHUB_REF_NAME=main -> tag "vmain" -> a confusing hard failure. Gating here
     # makes a branch dispatch a clean no-op; dispatch against the tag still works.
-    if: ${{ github.event.repository.private == false && startsWith(github.ref, 'refs/tags/v') }}
+    #
+    # Under workflow_run: only a SUCCESSFUL release-image run that was itself
+    # triggered by a version tag. Under workflow_dispatch: only against a tag.
+    if: >-
+      ${{ github.event.repository.private == false && (
+        (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && startsWith(github.event.workflow_run.head_branch, 'v'))
+        || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))
+      ) }}
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_SHA }}
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -56,7 +83,7 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${RELEASE_TAG#v}"
           crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           echo "tag=v$tag  Cargo.toml=$crate"
           if [ "$tag" != "$crate" ]; then
