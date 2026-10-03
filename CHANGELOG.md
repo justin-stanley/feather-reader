@@ -16,6 +16,45 @@ deploying is separate.
 
 ## Unreleased
 
+### Fixed
+
+- **A future-dated RSS item was unsweepable and permanently first in the reading
+  list** (#188). `feed::entry_time` was `e.published.or(e.updated)` with no upper
+  bound, so an item dated in the year 2999 was stored verbatim and then became
+  permanent: both retention sweeps test `COALESCE(published, fetched_at) <
+  cutoff` and a future date is never less than either, the per-feed keep-set
+  orders on the same expression `DESC` where it is rank one forever, and every
+  list view puts it at the top. One item in one feed, there for good.
+
+  Discarded rather than clamped to now, which is the rule the publication path
+  already follows (#186) and the reasoning transfers: the entry upsert refreshes
+  `published` every poll but stamps `fetched_at` once, so a clock-derived value
+  is rewritten every cycle and the row can never age. Undated is the honest
+  answer, and `fetched_at` then dates it and holds still.
+
+  Each candidate is judged separately rather than the winner of `or`, so a feed
+  with a bogus `pubDate` beside a credible `atom:updated` keeps the good date —
+  that is the ordinary shape of a broken-clock feed, not a rare one. The ceiling
+  carries the same `CLOCK_SKEW_GRACE_SECS` allowance the publication path uses,
+  so the two ingest paths agree about what "future" means.
+
+- **An undated entry was the newest row to the cap and the oldest to the reading
+  list** (#187). The per-feed keep-set and both sweeps order on
+  `COALESCE(published, fetched_at)` — correctly, or a feed of undated items
+  would trim its own freshest rows. `list_entries` and the id projection behind
+  "mark this page read" ordered on bare `e.published DESC`, and in SQLite `NULL`
+  sorts LAST under `DESC`. So one undated entry was at once safe from eviction
+  and parked at the bottom of every list below years of read articles, where no
+  reader would see it. `site.standard.document` makes `publishedAt` optional, so
+  publication feeds reach this far more readily than RSS ever did.
+
+  The issue's index worry turned out to be moot, and this is measured rather
+  than assumed: `EXPLAIN QUERY PLAN` shows both forms already ending in `USE
+  TEMP B-TREE FOR ORDER BY`, because the join fans out across every subscribed
+  feed and several index ranges must be merged — so the bare ordering was not
+  using `idx_entries_feed_published` for sorting either. The only delta is
+  `COVERING INDEX` → `INDEX`, bounded by `LIMIT`. No expression index needed.
+
 ### Changed
 
 - **`cargo doc` is now a CI gate, and the 45 warnings behind it are fixed**

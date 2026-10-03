@@ -2574,7 +2574,7 @@ pub async fn list_entries(
     }
     let (mut sql, n) = list_entries_sql(view, feed_ids);
     sql.push_str(&format!(
-        " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
+        " ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
         n + 2,
         n + 3
     ));
@@ -2630,7 +2630,7 @@ pub async fn list_entry_ids(
     }
     let (mut sql, n) = list_query_sql(Projection::Ids, view, feed_ids);
     sql.push_str(&format!(
-        " ORDER BY e.published DESC, e.id DESC LIMIT ?{}",
+        " ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT ?{}",
         n + 2
     ));
     let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
@@ -4765,6 +4765,99 @@ mod tests {
         insert_entries(pool, feed_id, &entries, 0).await?;
         replace_sub_refs(pool, did, &[feed_id]).await?;
         Ok(feed_id)
+    }
+
+    /// **The cap and the reading list must agree about what an undated entry's
+    /// date IS.** They did not, and the disagreement had a direction.
+    ///
+    /// The per-feed keep-set and both retention sweeps order on
+    /// `COALESCE(published, fetched_at)` — correctly, because a feed of undated
+    /// items would otherwise trim its own freshest rows. The reading list
+    /// ordered on bare `e.published DESC`, and in SQLite `NULL` sorts LAST under
+    /// `DESC`. So one undated entry was simultaneously the NEWEST row in the
+    /// feed as far as eviction was concerned, and the OLDEST row in every list
+    /// view — parked below years of read articles where no reader would see it,
+    /// while the cap declined to drop it to make room for something they would.
+    ///
+    /// `site.standard.document` makes `publishedAt` optional, so publication
+    /// feeds reach this far more readily than RSS ever did.
+    ///
+    /// Both directions here: the undated row must come first, AND the two dated
+    /// rows must stay in their own order, or "order by nothing" would pass.
+    ///
+    /// **On the index worry, measured rather than assumed.** #187 flagged that a
+    /// `COALESCE` in `ORDER BY` cannot use `idx_entries_feed_published`, and
+    /// suggested an expression index might be needed. `EXPLAIN QUERY PLAN` says
+    /// it is moot — both forms already end in `USE TEMP B-TREE FOR ORDER BY`,
+    /// because the join fans out across every subscribed feed and several index
+    /// ranges have to be merged, so the bare `published DESC` was not using the
+    /// index for ordering either. The one real difference is `COVERING INDEX` →
+    /// `INDEX` on `entries`, since `fetched_at` is not in the index and the rows
+    /// must now be visited: bounded by `LIMIT`, so tens of lookups per page.
+    /// Adding `fetched_at` to the index would restore covering, and that is an
+    /// optimisation with a migration attached, not part of this correctness fix.
+    #[tokio::test]
+    async fn an_undated_entry_leads_the_reading_list_as_it_leads_the_cap() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:undated";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://undated.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "dated-old".to_string(),
+                    title: Some("Old".to_string()),
+                    published: Some("2024-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "dated-new".to_string(),
+                    title: Some("Newer".to_string()),
+                    published: Some("2025-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                // No `published` at all — dated by `fetched_at`, which is now,
+                // so it is the freshest row in the feed.
+                NewEntry {
+                    guid: "undated".to_string(),
+                    title: Some("Undated".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let rows = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        let order: Vec<&str> = rows.iter().map(|r| r.guid.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["undated", "dated-new", "dated-old"],
+            "the list disagrees with the cap about an undated entry's date",
+        );
+
+        // The id projection used for marking a page read walks the same
+        // ordering, so it must agree too — otherwise "mark this page read"
+        // marks a different page than the one on screen.
+        let ids = list_entry_ids(&pool, did, ListView::All, None, 100).await?;
+        let by_guid: std::collections::HashMap<i64, &str> =
+            rows.iter().map(|r| (r.id, r.guid.as_str())).collect();
+        let id_order: Vec<&str> = ids.iter().filter_map(|i| by_guid.get(i).copied()).collect();
+        assert_eq!(
+            id_order,
+            vec!["undated", "dated-new", "dated-old"],
+            "the id projection orders differently from the list it projects",
+        );
+        Ok(())
     }
 
     /// `limit` is honoured, and `offset` walks the same ordering without gaps or

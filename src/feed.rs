@@ -1215,9 +1215,38 @@ fn entry_author(e: &RawEntry) -> Option<String> {
     e.authors.first().map(|p| p.name.clone())
 }
 
-/// Best publication time (published, else updated) as an RFC3339 string.
+/// Best CREDIBLE publication time (published, else updated) as an RFC3339
+/// string, or `None` when neither is credible.
+///
+/// **A date in the future is discarded, not clamped, and not stored.** There was
+/// no upper bound here, so an item dated in the year 2999 was stored verbatim
+/// and became permanent: both retention sweeps test
+/// `COALESCE(published, fetched_at) < cutoff` and a future date is never less
+/// than either, the per-feed keep-set orders on the same expression `DESC` where
+/// it is rank one forever, and every list view puts it at the top. A publisher
+/// with a broken clock does that by accident; anyone wanting a permanent slot at
+/// the top of a reader's list does it on purpose.
+///
+/// Discarded rather than clamped to now because the entry upsert refreshes
+/// `published` on every poll while stamping `fetched_at` once — so a value
+/// derived from the current clock is rewritten every cycle and the row can never
+/// age at all. Clamping relocates the defect. Undated is the honest answer, and
+/// `fetched_at` then dates the row and holds still. That is the rule the
+/// publication path already follows; see `standard_site::entries_from_records`.
+///
+/// **Each candidate is judged separately.** Filtering `published.or(updated)`
+/// would throw away a perfectly good `updated` whenever `published` was bogus,
+/// which is the common shape of a broken-clock feed rather than a rare one.
+///
+/// The ceiling carries the same [`crate::atproto::CLOCK_SKEW_GRACE_SECS`]
+/// allowance the publication path uses, so the two ingest paths agree about what
+/// "future" means instead of one being stricter by accident.
 fn entry_time(e: &RawEntry) -> Option<String> {
-    e.published.or(e.updated).map(fmt_time)
+    let ceiling = Utc::now() + chrono::Duration::seconds(crate::atproto::CLOCK_SKEW_GRACE_SECS);
+    e.published
+        .filter(|d| *d <= ceiling)
+        .or_else(|| e.updated.filter(|d| *d <= ceiling))
+        .map(fmt_time)
 }
 
 /// Extract the plain string content of a feed [`Text`] node.
@@ -1466,6 +1495,89 @@ mod tests {
 
     /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
     /// (no network) and assert the entries come out sanitized and well-shaped.
+    /// **A stated date in the future is discarded, not stored and not clamped.**
+    ///
+    /// `entry_time` was `e.published.or(e.updated)` with no ceiling, so an item
+    /// dated in the year 2999 was stored verbatim and then became permanent:
+    /// both retention sweeps test `COALESCE(published, fetched_at) < cutoff` and
+    /// a future date is never less than either; the per-feed keep-set orders on
+    /// the same expression `DESC`, where it is rank one forever; and every list
+    /// view orders on `published DESC`, where it sits at the top. One item in one
+    /// feed, there for good. A publisher with a broken clock does this by
+    /// accident.
+    ///
+    /// Discarded rather than clamped to now, which is the rule `#186`
+    /// established on the atproto side and the reasoning transfers exactly: the
+    /// entry upsert refreshes `published` on every poll but stamps `fetched_at`
+    /// once, so a value derived from the current clock is rewritten every cycle
+    /// and the row can never age at all. Clamping moves the defect. Falling back
+    /// to undated lets `fetched_at` date it, and that holds still.
+    ///
+    /// The ceiling carries the SAME `CLOCK_SKEW_GRACE_SECS` allowance the
+    /// publication path uses, so the two ingest paths agree about what "future"
+    /// means rather than one being stricter by accident.
+    #[test]
+    fn a_future_dated_rss_item_is_stored_undated_rather_than_dated_in_2999() {
+        let future = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Clock</title><link>https://clock.example/</link>
+<item><title>From the future</title><link>https://clock.example/1</link>
+<guid>https://clock.example/1</guid>
+<pubDate>Sat, 01 Jan 2999 00:00:00 GMT</pubDate></item>
+</channel></rss>"#;
+        let parsed = feed_rs::parser::parse(future.as_bytes()).expect("should parse");
+        // The fixture is only meaningful if feed-rs actually read the date.
+        assert!(
+            parsed.entries[0].published.is_some(),
+            "the fixture's pubDate did not parse, so this test proves nothing",
+        );
+
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(
+            e.published, None,
+            "a year-2999 date was stored, which makes the row unsweepable, \
+             un-evictable and permanently first in the reading list",
+        );
+
+        // And the other direction: an ordinary past date must survive, or this
+        // would be satisfied by discarding every date.
+        let past = future.replace("01 Jan 2999", "01 Jan 2020");
+        let parsed = feed_rs::parser::parse(past.as_bytes()).expect("should parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published
+                .as_deref()
+                .is_some_and(|p| p.starts_with("2020")),
+            "an ordinary past date was discarded: {:?}",
+            e.published,
+        );
+
+        // **Each candidate is judged separately, not the winner of `or`.** A
+        // bogus `pubDate` beside a credible `atom:updated` is the ordinary shape
+        // of a broken-clock feed, and filtering `published.or(updated)` would
+        // throw the good date away with the bad one. Atom, because RSS has no
+        // second date field for feed-rs to read.
+        let both = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Clock</title>
+<entry><title>Mixed</title><id>https://clock.example/2</id>
+<link href="https://clock.example/2"/>
+<published>2999-01-01T00:00:00Z</published>
+<updated>2020-06-01T00:00:00Z</updated></entry></feed>"#;
+        let parsed = feed_rs::parser::parse(both.as_bytes()).expect("should parse");
+        assert!(
+            parsed.entries[0].published.is_some() && parsed.entries[0].updated.is_some(),
+            "the fixture needs BOTH dates parsed for this case to mean anything",
+        );
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published
+                .as_deref()
+                .is_some_and(|p| p.starts_with("2020")),
+            "a credible `updated` was discarded along with a bogus `published`, \
+             leaving the entry undated: {:?}",
+            e.published,
+        );
+    }
+
     #[test]
     fn rss_parses_and_sanitizes() {
         let parsed = feed_rs::parser::parse(RSS_SAMPLE.as_bytes()).expect("RSS should parse");
