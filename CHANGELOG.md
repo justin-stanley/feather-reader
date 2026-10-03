@@ -32,9 +32,11 @@ No `fly.toml` change.
 **This is the first deployable build of everything under 0.3.9.** That is 31
 files, much of it on the live Rust OAuth backend and the atproto layer, so
 expect these on the first boot:
-- one `feeds.kind re-derived` log line, with every `at://` row moving to
-  `publication`;
-- `/stats` counts changing, because unpollable rows leave them;
+- if any `at://` rows exist, one `feeds.kind re-derived` log line, with
+  `to_unpollable` counting them as they move to `publication`. Without such
+  rows the column is backfilled silently, and no line is NOT a failed
+  migration: `PRAGMA table_info(feeds)` showing `kind` is the check;
+- `/stats` counts changing for the same reason, and only on such instances;
 - a reader whose repository exceeds the record-walk page budget now gets an
   error instead of a silently truncated subscription list.
 
