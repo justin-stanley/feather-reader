@@ -1040,11 +1040,21 @@ async fn poll_publication(
     let read = match crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri).await {
         Ok(read) => read,
         Err(err) => {
+            // The repo answering with something that is not this publication
+            // is not a transport failure, and must not be counted as one.
+            let kind = if err
+                .downcast_ref::<crate::standard_site::NotAPublication>()
+                .is_some()
+            {
+                FailureKind::Parse
+            } else {
+                FailureKind::Fetch
+            };
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
-                kind: FailureKind::Fetch,
+                kind,
                 detail: failure_detail(format!("{err:#}")),
-            })
+            });
         }
     };
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);

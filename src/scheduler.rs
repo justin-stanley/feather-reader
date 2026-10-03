@@ -76,6 +76,16 @@ const DEFAULT_POLL_BATCH: i64 = 50;
 /// `FEATHERREADER_POLL_CONCURRENCY`.
 const DEFAULT_POLL_CONCURRENCY: usize = 4;
 
+/// Max standard.site publications read concurrently, WITHIN the overall limit
+/// above. Overridable via `FEATHERREADER_PUBLICATION_POLL_CONCURRENCY`.
+///
+/// **One, because a publication read is not an RSS fetch.** An RSS body is at
+/// most 8 MiB on the wire. A publication read walks up to `MAX_LARGE_RECORDS`
+/// documents and may retain up to `atproto::MAX_LIST_BYTES` (128 MiB) of parsed
+/// records. Four at once is a 512 MiB worst case on a 512 MB machine, whose
+/// entrypoint tears the container down when the process dies (found in review).
+const DEFAULT_PUBLICATION_POLL_CONCURRENCY: usize = 1;
+
 /// Small delay between *launching* each feed fetch, so a batch of due feeds is
 /// staggered rather than fired in one instant (polite to the network + to any
 /// single upstream). Overridable via `FEATHERREADER_POLL_STAGGER_MS`.
@@ -467,6 +477,13 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, star
         }
     };
     let limiter = Arc::new(Semaphore::new(concurrency));
+    let publication_limiter = Arc::new(Semaphore::new(
+        env_scalar::<usize>(
+            "FEATHERREADER_PUBLICATION_POLL_CONCURRENCY",
+            DEFAULT_PUBLICATION_POLL_CONCURRENCY,
+        )
+        .max(1),
+    ));
 
     // Publications became pollable in 0.4.0, and every row of a newly admitted
     // kind is due at once. Spread the never-polled ones across one interval so
@@ -500,7 +517,16 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, star
             }
             _ = ticker.tick() => {
                 if let Err(err) =
-                    poll_due_once(&state, &client, &limiter, batch, stagger, &shutdown).await
+                    poll_due_once(
+                        &state,
+                        &client,
+                        &limiter,
+                        &publication_limiter,
+                        batch,
+                        stagger,
+                        &shutdown,
+                    )
+                    .await
                 {
                     // A store-level error is worth logging, but must not kill the
                     // loop — the next tick retries.
@@ -524,6 +550,7 @@ async fn poll_due_once(
     state: &AppState,
     client: &reqwest::Client,
     limiter: &Arc<Semaphore>,
+    publication_limiter: &Arc<Semaphore>,
     batch: i64,
     stagger: Duration,
     shutdown: &watch::Receiver<()>,
@@ -593,20 +620,39 @@ async fn poll_due_once(
             abandoned += 1;
             continue;
         }
-        // Acquire a permit *before* launching so at most `concurrency` fetches
-        // are ever in flight; the permit is released when the task ends.
-        let permit = match Arc::clone(limiter).acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed — shutting down
-        };
         let pool = state.db.clone();
         let client = client.clone();
         let default_interval = state.config.poll_interval;
         let config = Arc::clone(&state.config);
-        handles.push(tokio::spawn(async move {
-            let _permit = permit; // held for the duration of this poll
-            poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
-        }));
+        if feed::FeedKind::of(&feed.url) == feed::FeedKind::Publication {
+            // **Its own, smaller limit, waited for INSIDE the task.** Waiting in
+            // this loop would hold every RSS feed behind it in the batch; the
+            // task holds nothing while it waits — the publication permit first,
+            // then an overall slot — so RSS launches are not delayed by it.
+            let publications = Arc::clone(publication_limiter);
+            let all = Arc::clone(limiter);
+            handles.push(tokio::spawn(async move {
+                let Ok(_one) = publications.acquire_owned().await else {
+                    return;
+                };
+                let Ok(_slot) = all.acquire_owned().await else {
+                    return;
+                };
+                poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
+            }));
+        } else {
+            // Acquire a permit *before* launching so at most `concurrency`
+            // fetches are ever in flight; the permit is released when the task
+            // ends.
+            let permit = match Arc::clone(limiter).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed — shutting down
+            };
+            handles.push(tokio::spawn(async move {
+                let _permit = permit; // held for the duration of this poll
+                poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
+            }));
+        }
         // Stagger launches so a batch doesn't fire in one instant.
         if !stagger.is_zero() {
             tokio::time::sleep(stagger).await;

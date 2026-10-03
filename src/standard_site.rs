@@ -572,11 +572,11 @@ pub async fn fetch(
     // this function is `pub`: without the check it lists publications and
     // matches on rkey alone, so `at://did/app.bsky.feed.post/<rkey>` would be
     // "read as a publication" whenever a publication shares that rkey.
-    anyhow::ensure!(
-        uri.collection == nsid::STANDARD_PUBLICATION,
-        "{uri} is not a {} URI",
-        nsid::STANDARD_PUBLICATION
-    );
+    if uri.collection != nsid::STANDARD_PUBLICATION {
+        return Err(
+            NotAPublication(format!("{uri} is not a {} URI", nsid::STANDARD_PUBLICATION)).into(),
+        );
+    }
 
     let pds = crate::atproto::resolve_did_to_pds(http, plc_directory, &uri.authority)
         .await
@@ -595,7 +595,9 @@ pub async fn fetch(
         .await
         .with_context(|| format!("listing publications for {}", uri.authority))?;
     let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
-        .with_context(|| format!("{uri} is not a readable site.standard.publication"))?;
+        .ok_or_else(|| {
+            NotAPublication(format!("{uri} is not a readable site.standard.publication"))
+        })?;
 
     // **Filtered inside the walk, so the cap counts THIS publication's
     // documents.** A repo-wide cap applied before the filter starves a quiet
@@ -631,6 +633,24 @@ pub async fn fetch(
         .with_context(|| format!("listing documents for {canonical_site}"))?;
     Ok(read_from(publication, &canonical_site, documents, orphaned))
 }
+
+/// **The repo answered, and what it holds is not this publication** — the
+/// record was deleted, never existed, or is unreadable, or the URI names
+/// another collection.
+///
+/// Typed so the poller can tell it from a network failure: filed as `Fetch`,
+/// an author deleting their publication read as their server being down, in
+/// the public cause histogram (found in review).
+#[derive(Debug)]
+pub struct NotAPublication(pub String);
+
+impl std::fmt::Display for NotAPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotAPublication {}
 
 /// Assemble a [`PublicationRead`] from a finished walk.
 ///
@@ -1409,6 +1429,55 @@ mod tests {
                 }
             ),
             "an unreachable publication was not a fetch failure: {outcome:?}"
+        );
+    }
+
+    /// Review of #225: an author who deletes their publication record is not
+    /// an unreachable publisher. Every fetch error used to be filed as
+    /// `Fetch`, putting it in the public histogram's network bucket.
+    #[tokio::test]
+    async fn a_deleted_publication_record_is_not_an_unreachable_publisher() {
+        const GONE: &str = "did:plc:goneaaaaaaaaaaaaaaaaaaaa";
+        let site = format!("at://{GONE}/{}/deleted", nsid::STANDARD_PUBLICATION);
+        // The repo answers, but holds no record with that rkey.
+        let (plc, _) = serve_repo(
+            GONE,
+            vec![(
+                nsid::STANDARD_PUBLICATION,
+                "another",
+                json!({ "name": "Other", "url": "https://o.example" }),
+            )],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Failed {
+                    kind: crate::feed::FailureKind::Parse,
+                    ..
+                }
+            ),
+            "a deleted publication was filed as a network failure: {outcome:?}"
         );
     }
 
