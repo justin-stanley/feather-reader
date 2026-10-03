@@ -14,7 +14,7 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.3.9 — 2026-10-03
 
 ### Changed
 
@@ -102,6 +102,30 @@ deploying is separate.
 
 
 ### Security
+
+- **Two advisories in the sidecar's dependency graph, four days apart, both
+  about deciding whether a target is what it looks like.**
+
+  `ip-address` 10.4.0 → 10.7.2 (#209). A moderate GHSA: before 10.5.1 the
+  classifier does not recognise the NAT64 local-use range `64:ff9b:1::/48`, so
+  it answers "public" for an address that reaches the host's own network. The
+  advisory's framing is SSRF and trust-boundary bypass. Transitive via
+  `@fastify/rate-limit`, so lockfile-only — done with
+  `npm update ip-address --package-lock-only` rather than `npm install`, which
+  would have added a direct dependency on a package the sidecar does not import.
+  `package.json` untouched; the diff is three lines.
+
+  `fast-uri` 3.1.7 → 3.1.8 and 4.1.4 → 4.2.1 (#212). GHSA-hrr3-gc8f-f4qj,
+  medium: inconsistent host case normalisation via percent-encoded octets.
+
+  Neither touches `net::is_forbidden_ip`, which is Rust and uses neither
+  package — the affected code is the sidecar rate limiter's view of which
+  addresses are local. But checking the *class* against our own guard is what
+  found the five IPv6 embedding families below, which is the half that mattered.
+
+  Worth recording that both landed in the Node sidecar, the component production
+  has not run since the 2026-09-13 cutover. It is not only dead weight; it is a
+  continuing source of advisories.
 
 - **Five families of IPv6 address that embed a forbidden IPv4 one were reaching
   the fetcher.** `net::is_forbidden_v6` unwrapped the IPv4-mapped
