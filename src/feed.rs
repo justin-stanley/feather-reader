@@ -1344,23 +1344,60 @@ pub(crate) fn bound_text(mut s: String, max: usize) -> String {
 /// renders whole first. A bigger input can only be plain text read from a
 /// record walk, which escaping never shrinks, so cutting it first loses nothing
 /// and spares escaping it all.
+///
+/// **The search is bounded, by rounds, not by convergence.** The first version
+/// shrank the cut in proportion to the overshoot. When the bytes beyond the
+/// cut are ones the sanitizer strips anyway, cutting them changes nothing, and
+/// it crept a few bytes a round — measured, hours of CPU for one entry, on
+/// the poller's async task. It also could jump into a stripped prefix and keep
+/// nothing (both found in review). So: try the whole input once, then
+/// binary-search the longest prefix whose output fits, at most
+/// [`MAX_RENDER_ROUNDS`] renders, keeping the best fit seen, and stopping once
+/// the cut is known to within 1/1024 of `max`.
 pub(crate) fn render_bounded(raw: &str, max: usize, render: impl Fn(&str) -> String) -> String {
-    let mut cut = if raw.len() <= crate::net::MAX_BODY_BYTES {
+    // The whole input, when it is small enough to have been one fetched body.
+    // Larger input is plain text, which escaping never shrinks, so no prefix
+    // longer than `max` can fit and that is the search's upper end.
+    let upper = if raw.len() <= crate::net::MAX_BODY_BYTES {
         raw.len()
     } else {
         floor_char_boundary(raw, max)
     };
-    loop {
-        let out = render(&raw[..cut]);
-        if out.len() <= max || cut == 0 {
-            return out;
-        }
-        // Shrink in proportion to the overshoot, and by at least one byte, so
-        // this converges in a few rounds rather than one byte at a time.
-        let scaled = (cut as u128 * max as u128 / out.len() as u128) as usize;
-        cut = floor_char_boundary(raw, scaled.min(cut - 1));
+    let first = render(&raw[..upper]);
+    if first.len() <= max {
+        return first;
     }
+    // `lo` always renders within `max` (the empty prefix trivially does);
+    // `hi` never does. The search stops once they are within `resolution`.
+    let (mut lo, mut hi) = (0usize, upper);
+    let mut best = String::new();
+    let resolution = (max / 1024).max(1);
+    // **The first probe is proportional**, which is where an input that mostly
+    // survives rendering lands — one probe, within resolution, done. The
+    // halving that follows bounds the cases where it is wrong.
+    let mut probe = (upper as u128 * max as u128 / first.len() as u128) as usize;
+    for _ in 0..MAX_RENDER_ROUNDS {
+        if hi - lo <= resolution {
+            break;
+        }
+        let mid = floor_char_boundary(raw, probe.clamp(lo + 1, hi - 1));
+        probe = lo + (hi - lo) / 2;
+        if mid <= lo {
+            break;
+        }
+        let out = render(&raw[..mid]);
+        if out.len() <= max {
+            lo = mid;
+            best = out;
+        } else {
+            hi = mid;
+        }
+    }
+    best
 }
+
+/// The most renders [`render_bounded`] spends on one value after the first.
+const MAX_RENDER_ROUNDS: usize = 12;
 
 /// An entry id, or a stable stand-in for one too long to index.
 ///
@@ -1670,17 +1707,71 @@ mod tests {
     /// article was stored as an empty body.
     #[test]
     fn content_the_sanitizer_strips_does_not_count_against_the_bound() {
+        const MAX: usize = 64 * 1024;
         let body = format!(
             r#"<p><img src="data:image/png;base64,{}"></p><p>the article</p>"#,
-            "A".repeat(MAX_CONTENT_HTML_BYTES + 512 * 1024)
+            "A".repeat(MAX + 16 * 1024)
         );
-        let html = render_bounded(&body, MAX_CONTENT_HTML_BYTES, sanitize_html);
+        let html = render_bounded(&body, MAX, sanitize_html);
         assert!(
             html.contains("the article"),
             "the article was cut away: {} bytes kept",
             html.len()
         );
-        assert!(html.len() <= MAX_CONTENT_HTML_BYTES);
+        assert!(html.len() <= MAX);
+    }
+
+    /// Review of #224 (second round): the re-cut loop shrank its input by a
+    /// few bytes a round when the bytes beyond the cut were ones the sanitizer
+    /// strips anyway — measured at ~32 bytes/round, hours for one entry, on the
+    /// poller's async task. The number of renders must be bounded.
+    #[test]
+    fn bounding_content_renders_a_bounded_number_of_times() {
+        // Scaled down: `max` is a parameter, and debug-build ammonia over the
+        // real 2 MiB bound took minutes per test. The shape is what matters.
+        const MAX: usize = 64 * 1024;
+        let article = "a".repeat(MAX + 8);
+        // An unterminated comment: ammonia drops all of it, so cutting into it
+        // removes input without shrinking output.
+        let body = format!("<p>{article}</p><!--{}", "x".repeat(16 * MAX));
+        let calls = std::cell::Cell::new(0u32);
+        let html = render_bounded(&body, MAX, |s| {
+            calls.set(calls.get() + 1);
+            // Fail fast rather than hang: the bug this pins ran for hours.
+            assert!(
+                calls.get() <= 16,
+                "{} renders for one entry and counting",
+                calls.get()
+            );
+            sanitize_html(s)
+        });
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX / 2,
+            "kept far less than fits: {}",
+            html.len()
+        );
+    }
+
+    /// Also from that review: a cut landing inside a stripped prefix stored an
+    /// empty body when an article that fits followed it.
+    #[test]
+    fn a_stripped_prefix_does_not_leave_an_empty_body() {
+        const MAX: usize = 64 * 1024;
+        // The reviewer's case, scaled: a stripped image three times the bound,
+        // then an article that escaping grows past it.
+        let body = format!(
+            r#"<p><img src="data:image/png;base64,{}"></p><p>{}</p>"#,
+            "A".repeat(3 * MAX),
+            "&".repeat(MAX)
+        );
+        let html = render_bounded(&body, MAX, sanitize_html);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.contains("&amp;&amp;"),
+            "nothing of the article was kept: {} bytes",
+            html.len()
+        );
     }
 
     #[test]

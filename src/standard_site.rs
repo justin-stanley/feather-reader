@@ -139,7 +139,9 @@ impl From<Entry> for crate::store::NewEntry {
     /// so wiring the reader to the scheduler has nothing left to decide.
     fn from(e: Entry) -> Self {
         crate::store::NewEntry {
-            guid: e.guid,
+            // The document's URI, which the publisher's PDS chose: bounded like
+            // any entry id before it reaches the UNIQUE index (found in review).
+            guid: crate::feed::bound_guid(e.guid),
             url: e.url,
             title: Some(e.title),
             author: None,
@@ -1683,6 +1685,31 @@ mod tests {
             summary.len() <= crate::feed::MAX_CONTENT_HTML_BYTES,
             "the ESCAPED summary is what is stored: {}",
             summary.len()
+        );
+    }
+
+    /// Review of #224: the document's URI is the entry id, chosen by the
+    /// publisher's PDS, and it went into the same UNIQUE-indexed column the
+    /// RSS path bounds.
+    #[test]
+    fn a_documents_uri_is_bounded_as_an_entry_id() {
+        let site = canonical("pub");
+        let records = vec![
+            publication("pub", "https://scanash.com"),
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                &"k".repeat(100_000),
+                json!({ "title": "t", "publishedAt": "2026-07-11T00:00:00Z",
+                        "path": "/p", "site": site }),
+            ),
+        ];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        let entries = entries_from_records(&site, &publication, &records);
+        let stored: crate::store::NewEntry = entries[0].clone().into();
+        assert!(
+            stored.guid.len() <= crate::feed::MAX_GUID_BYTES,
+            "guid: {}",
+            stored.guid.len()
         );
     }
 
