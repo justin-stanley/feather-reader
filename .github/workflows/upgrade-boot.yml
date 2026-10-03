@@ -1,0 +1,72 @@
+name: upgrade-boot
+
+# Does this tree's image start against a database the LAST GOOD RELEASE made,
+# and does that release still start after it? See scripts/upgrade-boot.sh.
+#
+# 0.3.9 passed every other check and crash-looped production on its first boot
+# ("no such column: kind"), because every test starts from an empty database.
+# This builds the candidate image and runs it against a volume the real
+# previous image created.
+#
+# The previous release is read from deploy/upgrade-from, NOT from `git describe`
+# or `:latest`: the newest tag can be a yanked release (0.3.9 was), and
+# upgrading FROM a broken release proves nothing about upgrading from what users
+# actually run. Bump the file as part of each release, once the new version is
+# deployed and healthy.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "deploy/**"
+      - "scripts/upgrade-boot.sh"
+      - ".github/workflows/upgrade-boot.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: upgrade-boot-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read   # pull the previous release from GHCR
+
+jobs:
+  upgrade-boot:
+    name: upgrade from the last good release, then roll back
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the candidate image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: feather-reader:candidate
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upgrade, boot, roll back
+        run: |
+          prev="ghcr.io/justin-stanley/feather-reader:$(tr -d '[:space:]' < deploy/upgrade-from)"
+          ./scripts/upgrade-boot.sh "$prev" feather-reader:candidate
