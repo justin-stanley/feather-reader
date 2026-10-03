@@ -10,7 +10,9 @@ name: release-image
 # resolves the tag to that digest, runs `gh attestation verify` (fail-closed),
 # then `fly deploy -i ghcr.io/...@<digest>`. Deploying a mutable tag defeats the
 # guarantee. `:latest` is published only for the newest semver (flavor latest=auto)
-# so a hotfix on an OLDER line can never repoint :latest backward.
+# -- NOT TRUE: metadata-action has no memory of earlier tags, and latest=auto
+# emits :latest for ANY non-prerelease semver tag. A 0.3.x hotfix pushed after
+# 0.4.0 WOULD move :latest backward. Deploy by digest regardless.
 
 on:
   push:
@@ -101,15 +103,41 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
-          # latest=auto: metadata-action only moves :latest to the HIGHEST semver
-          # it has seen, so cutting v0.1.6 AFTER v0.2.0 will NOT repoint :latest
-          # backward. (Deploys still resolve a DIGEST — :latest is a convenience.)
+          # latest=auto emits :latest for EVERY non-prerelease semver tag:
+          # metadata-action has no memory of earlier tags, so a hotfix on an older
+          # line pushed after a newer release moves :latest backward. (Deploys
+          # resolve a DIGEST — :latest is a convenience, never a deploy target.)
           flavor: |
             latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
+
+      # --- Upgrade-boot gate: nothing is pushed until this passes -------------
+      # Builds the image locally and runs it against a database the last good
+      # release created (scripts/upgrade-boot.sh). 0.3.9 was pushed, published
+      # and deployed with a schema bug that failed on every existing database;
+      # this is the check that would have stopped it. The push below reuses the
+      # build cache, so the image it publishes is this one.
+      - name: Build the candidate for the upgrade-boot gate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: feather-reader:candidate
+          build-args: |
+            ENABLE_SBOM=${{ steps.toggle.outputs.enabled }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upgrade-boot gate
+        run: |
+          prev="ghcr.io/justin-stanley/feather-reader:$(tr -d '[:space:]' < deploy/upgrade-from)"
+          ./scripts/upgrade-boot.sh "$prev" feather-reader:candidate
 
       - name: Build and push
         id: build

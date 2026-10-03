@@ -14,6 +14,35 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### CI
+
+- **An upgrade-boot gate, and nothing publishes until it passes.** 0.3.9
+  passed every check, was tagged, published to crates.io and ghcr.io, and
+  crash-looped production on its first boot. `scripts/upgrade-boot.sh` runs the
+  real previous release's image to create and seed a database, then the
+  candidate image against it (migrate, then a full boot that must answer
+  `/health`), then the previous image again to prove rollback.
+
+  - On pull requests touching the app, `upgrade-boot.yml` builds the candidate
+    and runs it.
+  - In `release-image.yml` it runs **before** the push, so a failure pushes no
+    image and moves no tag.
+  - `release-crate.yml` now runs after `release-image` succeeds for the same
+    tag, instead of in parallel, so a failed gate publishes no crate either.
+  - The previous release is read from `deploy/upgrade-from` (now `0.3.10`), not
+    from the newest tag, which can be a yanked release. Bump it once a new
+    version is deployed and healthy.
+
+  Verified locally: `0.3.8 → 0.3.9` fails at the migrate step with `no such
+  column: kind`, the production error; `0.3.8 → 0.3.10` passes all five steps.
+
+- **The `:latest` comment in `release-image.yml` was wrong.** It said a hotfix
+  on an older line could never move `:latest` backward. `latest=auto` emits
+  `:latest` for every non-prerelease version tag, so it can. Corrected; deploys
+  are by digest regardless.
+
 ## 0.3.10 — 2026-10-03
 
 **0.3.9 does not start against any existing database. 0.3.10 is 0.3.9 with
