@@ -44,9 +44,20 @@ deploying is separate.
 
   The gate is `cargo doc --no-deps --locked` with `RUSTDOCFLAGS="-D warnings"`,
   and it was verified to FAIL rather than merely pass: an injected dangling link
-  and a re-linked private item each exit non-zero, so both families are covered.
+  and a re-linked private item each exit non-zero.
 
-### Changed
+  **It does not catch everything, and review found where.** A reference into a
+  crate that sets no `html_root_url` resolves — so the gate stays green — but
+  renders with literal brackets, `[<code>reqwest::Client</code>]`, which is the
+  same defect by a different door. Measured: `axum`, `reqwest`, `sqlx`,
+  `ammonia` and `askama` produce zero `docs.rs` hrefs in the rendered output
+  while `anyhow` produces 237. Fourteen such references are demoted to prose
+  here, on the same reasoning as the private-item ones. `--extern-html-root-url`
+  would make them real links instead, at the cost of one flag per dependency
+  that nothing gates — worth considering separately, not silently. What remains
+  in the rendered docs (`[Span]`, `[WithDispatch]`, `[Action::Follow]`) comes
+  from dependencies' own doc comments via blanket trait impls, not from this
+  crate.
 
 - **A standard.site publication is retained by COUNT, not by age — because
   measurement says the age window stores nothing at all.** Read three real

@@ -17,10 +17,10 @@
 //! 2. **A lightweight [`PdsClient`]** — holds the resolved DID, the PDS base URL,
 //!    and an [`Auth`] token, and exposes typed calls over `com.atproto.repo.*`:
 //!    [`list_records`](PdsClient::list_records),
-//!    `create_record`(PdsClient::create_record),
-//!    `put_record`(PdsClient::put_record),
+//!    `create_record`,
+//!    `put_record`,
 //!    [`delete_record`](PdsClient::delete_record), and
-//!    `apply_writes`(PdsClient::apply_writes) (the **batch** call the
+//!    `apply_writes` (the **batch** call the
 //!    read-state flusher uses to coalesce many per-feed cursor writes into one
 //!    round-trip).
 //! 3. **Typed convenience wrappers** wired to the [`crate::lexicon`] record
@@ -74,7 +74,7 @@
 //! **reads**, and the record **writes** all route through [`crate::net`] —
 //! [`crate::net::guarded_get_no_privacy`] and
 //! [`crate::net::guarded_post_json`] — rather than the shared
-//! [`reqwest::Client`]. [`resolve_did_to_pds`] runs
+//! `reqwest::Client`. [`resolve_did_to_pds`] runs
 //! [`crate::net::assert_public_target`] on the `serviceEndpoint` it returns, but
 //! that check is a *separate DNS resolution* from the later request; only
 //! re-vetting and connect-pinning at request time closes the rebinding window.
@@ -525,7 +525,7 @@ pub enum Auth {
     /// A client holding it is **read-only**: [`Auth::bearer`] returns an error,
     /// so every write path (`create_record` / `put_record` / `delete_record` /
     /// `apply_writes`, all of which go through
-    /// `authed_headers`(PdsClient::authed_headers)) fails closed. Construct one
+    /// `authed_headers`) fails closed. Construct one
     /// via [`PdsClient::anonymous`].
     Anonymous,
 }
@@ -784,7 +784,7 @@ pub async fn login_with_app_password(
 /// A lightweight client for one user's PDS repo.
 ///
 /// Holds the user's DID (the repo to read/write), the PDS base URL (resolved
-/// from the DID doc), the shared [`reqwest::Client`], and the [`Auth`] token.
+/// from the DID doc), the shared `reqwest::Client`, and the [`Auth`] token.
 /// All the `com.atproto.repo.*` methods below act on `self.did`'s repo.
 ///
 /// The client may also be **anonymous** ([`PdsClient::anonymous`]), in which case
@@ -1549,7 +1549,7 @@ struct RepoErr {
 }
 
 impl SidecarClient {
-    /// Build a sidecar client from the shared [`reqwest::Client`] and the
+    /// Build a sidecar client from the shared `reqwest::Client` and the
     /// resolved public + internal base URLs + internal secret (from
     /// [`crate::config::SidecarConfig`]). `public_url` anchors the browser
     /// `/login` redirect; `internal_url` is the loopback base for the `/internal/*`

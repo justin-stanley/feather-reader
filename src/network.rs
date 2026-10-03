@@ -26,7 +26,7 @@
 //!
 //! **Why the SSRF guard, when the relay host is operator-configured?** Not
 //! because the operator is the threat — they can already edit the code. It earns
-//! its place for three other reasons. The shared [`reqwest::Client`] has *no*
+//! its place for three other reasons. The shared `reqwest::Client` has *no*
 //! timeouts, so a hung relay would pin a background task forever, while
 //! [`crate::net`]'s per-hop pinned client bounds both the total request and the
 //! idle read. The shared client also follows up to ten redirects with no
@@ -358,7 +358,7 @@ pub fn normalize_relay_host(raw: &str) -> Result<String, RelayError> {
 
 /// A thin, read-only client over the public relays.
 ///
-/// Holds the shared [`reqwest::Client`] (never builds its own — one connection
+/// Holds the shared `reqwest::Client` (never builds its own — one connection
 /// pool for the whole 512 MB box) and the normalized host list. Every request
 /// goes through [`crate::net::guarded_get_no_privacy`]; see the module doc for
 /// why.

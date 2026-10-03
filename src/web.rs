@@ -1,9 +1,9 @@
 //! The axum web layer — server-rendered HTML + a dash of htmx, **no SPA**.
 //!
-//! This module owns the HTTP surface: [`router`] builds an [`axum::Router`] over
+//! This module owns the HTTP surface: [`router`] builds an `axum::Router` over
 //! the shared [`AppState`], wiring the store, feed, atproto, and config seams into
 //! a small set of typography-first, dark-mode-ready views rendered with
-//! [`askama`] templates (under `templates/`). Progressive enhancement is a single
+//! `askama` templates (under `templates/`). Progressive enhancement is a single
 //! vendored `htmx` script plus a tiny keyboard handler (`static/keyboard.js`);
 //! every interaction also works as a plain HTML form POST, so the reader is fully
 //! usable with JavaScript disabled.
@@ -213,7 +213,7 @@ async fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
 ///
 /// Wires the reader routes, the health check, and the `/static` asset mount
 /// (the stylesheet, vendored htmx, and the keyboard handler, served from
-/// `static/` via [`ServeDir`]). A [`TraceLayer`] gives per-request tracing.
+/// `static/` via `ServeDir`). A `TraceLayer` gives per-request tracing.
 pub fn router(state: AppState) -> Router {
     // The shared per-IP rate limiter for the abuse-prone paths (login, redeem,
     // and the write endpoints). One instance is cloned into the state closure of

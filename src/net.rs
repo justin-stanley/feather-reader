@@ -929,7 +929,7 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
 /// headers (`Authorization`, `Cookie`, …), which are dropped the moment a
 /// redirect leaves the original origin, mirroring what reqwest's own redirect
 /// policy does for the shared client (see `hop_headers`). Returns the final
-/// [`Response`] (headers only; the body is read separately via [`read_capped`]).
+/// `Response` (headers only; the body is read separately via [`read_capped`]).
 /// `Err` on a blocked scheme/address, an exhausted redirect budget, or a
 /// transport error.
 pub async fn guarded_get(

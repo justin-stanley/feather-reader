@@ -245,7 +245,7 @@ fn startup_plan_from(raw: Option<String>) -> Vec<(Loop, Duration)> {
     plan
 }
 
-/// [`offset_from`] with the environment value passed in.
+/// The historical `offset_for`, with the environment value passed in.
 ///
 /// Split for the same reason `startup_delay_from` is: so the COMPOSITION —
 /// this loop's offset, then the ceiling — is testable without reading the

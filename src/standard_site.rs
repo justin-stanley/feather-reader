@@ -556,7 +556,7 @@ fn classify_document(
 /// - [`crate::atproto::PdsClient::list_all_records`] bounds the page count AND
 ///   detects a repeated or absent cursor — the trap this module's first draft
 ///   walked into, already solved there;
-/// - an XRPC error envelope surfaces as `XrpcErrorBody` rather
+/// - an XRPC error envelope surfaces as [`crate::atproto::AtProtoError::Xrpc`] rather
 ///   than deserialising into an empty page.
 ///
 /// The first draft of this module reimplemented all of that, worse. The only

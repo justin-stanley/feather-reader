@@ -9,7 +9,7 @@
 //!    identifiable [`crate::USER_AGENT`], a request timeout, and a simple
 //!    exponential backoff hint on error. A `304 Not Modified` is a no-op:
 //!    the feed is untouched apart from bumping its next-poll time.
-//! 2. **Safety** — every entry's HTML is run through [`ammonia`] before it is
+//! 2. **Safety** — every entry's HTML is run through `ammonia` before it is
 //!    ever stored (and therefore before it is ever rendered). Scripts, event
 //!    handlers, `javascript:` URLs, tracking pixels' dangerous attributes, and
 //!    other XSS vectors are stripped. Feeds carrying `<script>` is not

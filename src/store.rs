@@ -47,7 +47,7 @@ pub enum RedeemError {
 }
 
 /// The SQLite connection pool type the rest of the crate refers to as
-/// [`Pool`]. A thin alias over [`SqlitePool`] so [`crate::AppState`] and the web
+/// [`Pool`]. A thin alias over `SqlitePool` so [`crate::AppState`] and the web
 /// layer name one stable type; if the backend ever changes, this is the single
 /// place to swap it.
 pub type Pool = SqlitePool;
