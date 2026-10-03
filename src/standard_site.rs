@@ -203,8 +203,10 @@ pub fn publication_from_records(
     Some((
         entry.uri.clone(),
         Publication {
-            name: value.name,
-            url,
+            name: value
+                .name
+                .map(|n| crate::feed::bound_text(n, crate::feed::MAX_TITLE_BYTES)),
+            url: crate::feed::bound_text(url, crate::feed::MAX_URL_BYTES),
         },
     ))
 }
@@ -250,7 +252,7 @@ pub fn entries_from_records(
             }
             Some(Entry {
                 guid: record.uri.clone(),
-                title: doc.title,
+                title: crate::feed::bound_text(doc.title, crate::feed::MAX_TITLE_BYTES),
                 // **Three rules, in order: what the publisher credibly said,
                 // then when the record was written, then nothing.**
                 //
@@ -283,13 +285,20 @@ pub fn entries_from_records(
                 // all linking to the site root.
                 url: non_blank(doc.path)
                     .as_deref()
-                    .and_then(|path| join_path(base.as_ref(), path)),
+                    .and_then(|path| join_path(base.as_ref(), path))
+                    .map(|u| crate::feed::bound_text(u, crate::feed::MAX_URL_BYTES)),
                 // `description` first — the authored summary — but only when it
                 // actually says something: a blank one must not shadow the body.
                 // Then ESCAPED, not sanitised: both fields are plain text.
                 summary: non_blank(doc.description)
                     .or_else(|| non_blank(doc.text_content))
-                    .map(|raw| crate::feed::plain_text_to_html(&raw)),
+                    .map(|raw| {
+                        crate::feed::render_bounded(
+                            &raw,
+                            crate::feed::MAX_CONTENT_HTML_BYTES,
+                            crate::feed::plain_text_to_html,
+                        )
+                    }),
             })
         })
         .collect()
@@ -590,10 +599,19 @@ pub async fn fetch(
     // makes the limit a property of the read rather than of each walk, and the
     // borrow checker keeps it that way where a comment would not.
     let mut budget = crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES);
-    let publications = client
-        .list_all_records_within(nsid::STANDARD_PUBLICATION, &mut budget)
+    let (publications, skipped_publications) = client
+        .list_all_records_skipping_within(nsid::STANDARD_PUBLICATION, &mut budget)
         .await
         .with_context(|| format!("listing publications for {}", uri.authority))?;
+    // **Skipped, not refused** (#177): this is a stranger's repo, and one record
+    // whose envelope we cannot read must not stall the publication beside it.
+    if skipped_publications > 0 {
+        tracing::warn!(
+            repo = %uri.authority,
+            skipped = skipped_publications,
+            "skipped malformed publication records in this repo"
+        );
+    }
     let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
         .with_context(|| format!("{uri} is not a readable site.standard.publication"))?;
 
@@ -667,6 +685,16 @@ fn read_from(
     // would call this healthy forever; if the repo HAD documents and none
     // matched, say so, because that is the shape of a bug rather than of a
     // quiet blog.
+    // **Skipped records are said out loud** (#177), for the same reason as
+    // orphans below: a document we could not read looks exactly like one that
+    // was never written.
+    if documents.malformed > 0 {
+        tracing::warn!(
+            site = %canonical_site,
+            skipped = documents.malformed,
+            "skipped malformed document records for this publication"
+        );
+    }
     if orphaned > 0 {
         tracing::warn!(
             site = %canonical_site,
@@ -704,6 +732,7 @@ mod tests {
             let walk = crate::atproto::RecordWalk {
                 records: Vec::new(),
                 complete,
+                malformed: 0,
             };
             let read = read_from(publication.clone(), "at://d/c/r", walk, 0);
             assert_eq!(
@@ -1374,6 +1403,58 @@ mod tests {
             urls[1], None,
             "a document path that escapes its publication's origin must yield no URL"
         );
+    }
+
+    // ---- #205: a publisher's strings are bounded before they are stored ----
+
+    #[test]
+    fn a_documents_text_fields_are_bounded_before_they_are_stored() {
+        let site = canonical("pub");
+        let big = "x".repeat(8 * 1024 * 1024);
+        let records = vec![
+            publication("pub", "https://scanash.com"),
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                "3l2bigaaaaa2a",
+                json!({ "title": big, "publishedAt": "2026-07-11T00:00:00Z",
+                        "path": format!("/{}", "p".repeat(20_000)), "site": site,
+                        "textContent": "<".repeat(3 * 1024 * 1024) }),
+            ),
+        ];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        let entries = entries_from_records(&site, &publication, &records);
+        let e = &entries[0];
+        assert!(
+            e.title.len() <= crate::feed::MAX_TITLE_BYTES,
+            "title: {}",
+            e.title.len()
+        );
+        let url = e
+            .url
+            .as_ref()
+            .expect("an overlong path is truncated, not dropped");
+        assert!(
+            url.len() <= crate::feed::MAX_URL_BYTES,
+            "url: {}",
+            url.len()
+        );
+        let summary = e.summary.as_ref().unwrap();
+        assert!(
+            summary.len() <= crate::feed::MAX_CONTENT_HTML_BYTES,
+            "the ESCAPED summary is what is stored: {}",
+            summary.len()
+        );
+    }
+
+    #[test]
+    fn a_publications_own_name_is_bounded() {
+        let records = vec![rec(
+            nsid::STANDARD_PUBLICATION,
+            "pub",
+            json!({ "name": "n".repeat(100_000), "url": "https://scanash.com" }),
+        )];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        assert!(publication.name.unwrap().len() <= crate::feed::MAX_TITLE_BYTES);
     }
 
     /// 8% of measured documents (37 of 449) carry neither summary field.

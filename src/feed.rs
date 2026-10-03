@@ -1131,7 +1131,10 @@ async fn touch_polled(
 /// Extract `(title, site_url)` from a parsed feed. `site_url` prefers an
 /// `alternate`/no-rel HTML link over the feed's self link.
 fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
-    let title = parsed.title.as_ref().map(text_plain);
+    let title = parsed
+        .title
+        .as_ref()
+        .map(|t| bound_text(text_plain(t), MAX_TITLE_BYTES));
     let site_url = parsed
         .links
         .iter()
@@ -1149,7 +1152,7 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
                 .find(|l| l.rel.as_deref() != Some("self"))
         })
         .or_else(|| parsed.links.first())
-        .map(|l| l.href.clone());
+        .map(|l| bound_text(l.href.clone(), MAX_URL_BYTES));
     (title, site_url)
 }
 
@@ -1166,7 +1169,7 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
         .as_ref()
         .and_then(|c| c.body.as_deref())
         .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
-        .map(sanitize_html);
+        .map(|raw| render_bounded(raw, MAX_CONTENT_HTML_BYTES, sanitize_html));
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
@@ -1180,10 +1183,13 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
     };
 
     NewEntry {
-        guid,
-        url,
-        title: e.title.as_ref().map(text_plain),
-        author: entry_author(e),
+        guid: bound_guid(guid),
+        url: url.map(|u| bound_text(u, MAX_URL_BYTES)),
+        title: e
+            .title
+            .as_ref()
+            .map(|t| bound_text(text_plain(t), MAX_TITLE_BYTES)),
+        author: entry_author(e).map(|a| bound_text(a, MAX_AUTHOR_BYTES)),
         published: entry_time(e),
         content_html,
         fetched_at: None, // store defaults to "now".
@@ -1255,6 +1261,91 @@ pub(crate) fn plain_text_to_html(raw: &str) -> String {
     // Safe by order: every `<` from the input is already `&lt;` before this
     // adds a real tag.
     escaped.replace('\n', "<br>")
+}
+
+/// **What one entry, or one feed row, may store per field (#205).**
+///
+/// Every field below arrives from someone else's server — an RSS document or a
+/// publisher's `site.standard.document` record — and nothing between the wire
+/// and SQLite used to shorten it. A title could be megabytes, then indexed, read
+/// back and rendered into every list view of that feed.
+///
+/// Chosen from measurement, not guessed. Production's 4,389 entries on
+/// 2026-10-03: title max 253 bytes (p99 148), url max 235 (p99 178), author max
+/// 26, content_html max 86,969 (p99 17,535). Each bound is at least 8x the
+/// largest real value, so no ordinary article is touched; `MAX_TITLE_BYTES` is
+/// `site.standard.document`'s own `title.maxLength`.
+///
+/// **Truncated, never refused.** Dropping an article because one field is long
+/// is the failure mode the retention work was careful to avoid.
+pub(crate) const MAX_TITLE_BYTES: usize = 5_000;
+/// See [`MAX_TITLE_BYTES`].
+pub(crate) const MAX_AUTHOR_BYTES: usize = 1_000;
+/// See [`MAX_TITLE_BYTES`]. A truncated URL is a broken link, which was judged
+/// better than no link; at 35x the longest real one it should never happen.
+pub(crate) const MAX_URL_BYTES: usize = 8_192;
+/// See [`MAX_TITLE_BYTES`]. Applies to the STORED HTML, after sanitizing or
+/// escaping — see [`render_bounded`] for why that is the bound that matters.
+pub(crate) const MAX_CONTENT_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// An entry id longer than this is replaced by a stable hash of the whole id
+/// (see [`bound_guid`]): it is the dedup key, under a UNIQUE index.
+pub(crate) const MAX_GUID_BYTES: usize = 2_048;
+
+/// The largest index `<= at` that is a character boundary of `s`.
+fn floor_char_boundary(s: &str, at: usize) -> usize {
+    if at >= s.len() {
+        return s.len();
+    }
+    (0..=at).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary. Plain-text fields
+/// only: cutting markup or an escaped string here could split a tag or an
+/// entity, which is what [`render_bounded`] exists for.
+pub(crate) fn bound_text(mut s: String, max: usize) -> String {
+    let cut = floor_char_boundary(&s, max);
+    s.truncate(cut);
+    s
+}
+
+/// Render `raw` with `render` (sanitize or escape) so the **output** fits `max`.
+///
+/// **The bound is on what is stored, so it is checked after rendering.**
+/// Escaping grows text (`&` becomes five bytes) and sanitizing can grow it too,
+/// so a cap on the input bounds nothing. Cutting the output instead would split
+/// a tag or an entity. So the INPUT is cut — on a character boundary, before
+/// rendering, where `ammonia` closes whatever the cut left open and escaping
+/// has no entity to split — and re-cut, shorter, if the result still does not
+/// fit. Ordinary content renders once; the loop only runs for input that was
+/// already over the bound.
+pub(crate) fn render_bounded(raw: &str, max: usize, render: impl Fn(&str) -> String) -> String {
+    let mut cut = floor_char_boundary(raw, max);
+    loop {
+        let out = render(&raw[..cut]);
+        if out.len() <= max || cut == 0 {
+            return out;
+        }
+        // Shrink in proportion to the overshoot, and by at least one byte, so
+        // this converges in a few rounds rather than one byte at a time.
+        let scaled = (cut as u128 * max as u128 / out.len() as u128) as usize;
+        cut = floor_char_boundary(raw, scaled.min(cut - 1));
+    }
+}
+
+/// An entry id, or a stable stand-in for one too long to index.
+///
+/// The id is the dedup key under `UNIQUE (feed_id, guid)`, so truncating it
+/// would merge distinct entries that share a long prefix. A hash of the WHOLE
+/// id keeps them apart and keeps the same entry deduplicating across polls —
+/// the same construction as [`stable_guid`].
+pub(crate) fn bound_guid(guid: String) -> String {
+    if guid.len() <= MAX_GUID_BYTES {
+        return guid;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    guid.hash(&mut h);
+    format!("featherreader:long-guid:{:016x}", h.finish())
 }
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
@@ -1463,6 +1554,124 @@ mod tests {
     <content type="html"><![CDATA[<p>Safe <em>text</em>.</p><script>steal()</script><iframe src="evil"></iframe>]]></content>
   </entry>
 </feed>"#;
+
+    // ---- #205: what one entry may store, per field ----------------------
+
+    /// An RSS document carrying one item with exactly these fields.
+    fn rss_with_fields(title: &str, link: &str, author: &str, body: &str, guid: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
+<title>{title}</title><link>https://example.com/{link}</link>
+<item><title>{title}</title><link>https://example.com/{link}</link><guid>{guid}</guid>
+<dc:creator>{author}</dc:creator><description><![CDATA[{body}]]></description></item>
+</channel></rss>"#
+        )
+    }
+
+    #[test]
+    fn bound_text_cuts_on_a_character_boundary() {
+        // 'é' is two bytes, so an odd limit lands mid-character.
+        let cut = bound_text("é".repeat(100), 51);
+        assert!(cut.len() <= 51, "not bounded: {} bytes", cut.len());
+        assert_eq!(cut, "é".repeat(25), "cut too short or mid-character");
+        assert_eq!(
+            bound_text("short".into(), 51),
+            "short",
+            "a short value changed"
+        );
+    }
+
+    #[test]
+    fn rendered_content_fits_even_when_rendering_grows_it() {
+        // Escaping turns each `&` into `&amp;` — five bytes from one.
+        let out = render_bounded(&"&".repeat(1_000), 100, plain_text_to_html);
+        assert!(
+            out.len() <= 100,
+            "escaped output not bounded: {} bytes",
+            out.len()
+        );
+        assert!(!out.is_empty(), "bounded to nothing");
+        assert_eq!(
+            out.matches("&amp;").count() * 5,
+            out.len(),
+            "cut mid-entity: {out}"
+        );
+    }
+
+    #[test]
+    fn an_rss_items_text_fields_are_bounded() {
+        let big = "x".repeat(100_000);
+        let xml = rss_with_fields(&big, &big, &big, "body", "id-1");
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(e.title.as_ref().unwrap().len() <= MAX_TITLE_BYTES, "title");
+        assert!(e.url.as_ref().unwrap().len() <= MAX_URL_BYTES, "url");
+        assert!(
+            e.author.as_ref().unwrap().len() <= MAX_AUTHOR_BYTES,
+            "author"
+        );
+        let (title, site) = feed_metadata(&parsed);
+        assert!(title.unwrap().len() <= MAX_TITLE_BYTES, "feed title");
+        assert!(site.unwrap().len() <= MAX_URL_BYTES, "feed site url");
+    }
+
+    #[test]
+    fn an_rss_body_is_bounded_and_still_well_formed() {
+        // Long enough to need cutting, with markup straddling the cut.
+        let body = format!("<p>{}<b>tail</b></p>", "a".repeat(MAX_CONTENT_HTML_BYTES));
+        let xml = rss_with_fields("t", "l", "a", &body, "id-2");
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let html = normalize_entry(&parsed.entries[0]).content_html.unwrap();
+        assert!(
+            html.len() <= MAX_CONTENT_HTML_BYTES,
+            "body not bounded: {}",
+            html.len()
+        );
+        assert_eq!(
+            sanitize_html(&html),
+            html,
+            "the stored body is not well-formed sanitized HTML"
+        );
+    }
+
+    #[test]
+    fn an_overlong_rss_guid_becomes_a_stable_short_one() {
+        let long = "g".repeat(10_000);
+        let xml = rss_with_fields("t", "l", "a", "b", &long);
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let a = normalize_entry(&parsed.entries[0]).guid;
+        let b = normalize_entry(&parsed.entries[0]).guid;
+        assert!(a.len() <= MAX_GUID_BYTES, "guid not bounded: {}", a.len());
+        assert_eq!(
+            a, b,
+            "the stand-in is not stable, so the entry would duplicate"
+        );
+        let other = rss_with_fields("t", "l", "a", "b", &format!("{long}h"));
+        let other = feed_rs::parser::parse(other.as_bytes()).unwrap();
+        assert_ne!(
+            a,
+            normalize_entry(&other.entries[0]).guid,
+            "two ids collapsed into one"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_long_article_is_untouched() {
+        // The largest body production held on 2026-10-03 was 86,969 bytes.
+        let body = format!("<p>{}</p>", "word ".repeat(18_000));
+        let xml = rss_with_fields(
+            "A normal title",
+            "post",
+            "Author",
+            &body,
+            "https://example.com/post",
+        );
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(e.content_html.unwrap(), sanitize_html(&body));
+        assert_eq!(e.title.as_deref(), Some("A normal title"));
+        assert_eq!(e.guid, "https://example.com/post");
+    }
 
     /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
     /// (no network) and assert the entries come out sanitized and well-shaped.

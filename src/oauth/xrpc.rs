@@ -135,6 +135,18 @@ impl Repo<'_> {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<(Vec<RecordEntry>, Option<String>)> {
+        let page = self.list_records_page(collection, limit, cursor).await?;
+        Ok((page.records, page.cursor))
+    }
+
+    /// [`Self::list_records`] with the whole page, including how many records
+    /// were malformed and left out (#177) — which the tuple form cannot carry.
+    pub(crate) async fn list_records_page(
+        &self,
+        collection: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<crate::atproto::ListRecordsResponse> {
         let mut url = url::Url::parse(&self.url("com.atproto.repo.listRecords"))
             .context("building the listRecords URL")?;
         {
@@ -167,9 +179,7 @@ impl Repo<'_> {
         // shares — this check was added here first and had to be fitted to the
         // other two clients a round later. It reads bytes now rather than a
         // `Value`; the invariants are the same ones, expressed as fields.
-        let page = crate::atproto::parse_list_records(&outcome.body)?;
-        let (records, cursor) = (page.records, page.cursor);
-        Ok((records, cursor))
+        crate::atproto::parse_list_records(&outcome.body)
     }
 
     /// Every record in a collection, following the cursor.
@@ -197,9 +207,13 @@ impl Repo<'_> {
         let mut more_offered = false;
 
         for _ in 0..MAX_LIST_PAGES {
-            let (page, next) = self
-                .list_records(collection, Some(100), cursor.as_deref())
+            let listed = self
+                .list_records_page(collection, Some(100), cursor.as_deref())
                 .await?;
+            // This walk is the live backend's, and its result reaches
+            // `replace_sub_refs`: a skipped record is a dropped subscription.
+            crate::atproto::refuse_malformed(&listed, collection)?;
+            let (page, next) = (listed.records, listed.cursor);
             let got = page.len();
             // Same cap, same reason as `atproto::extend_bounded`: MAX_LIST_PAGES
             // bounds requests, not memory, unless the server honours our limit.
@@ -873,6 +887,46 @@ mod tests {
         assert!(
             format!("{err:#}").contains("did not finish"),
             "failed for the wrong reason: {err:#}"
+        );
+    }
+
+    /// #177 on the live backend: a malformed record in the reader's own repo
+    /// refuses the walk, by type, rather than dropping that subscription.
+    #[tokio::test]
+    async fn the_live_walk_refuses_a_page_with_a_malformed_record() {
+        let body = serde_json::json!({ "records": [
+            { "uri": "at://did:plc:x/c/3labGOOD", "value": {} },
+            { "cid": "bafy", "value": {} },
+        ]})
+        .to_string()
+        .into_bytes();
+        let base = crate::net::tests::serve_bodies_in_sequence(vec![body]).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "malformed-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://malformed-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+        let err = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect_err("a page with a malformed record was accepted");
+        assert!(
+            err.downcast_ref::<crate::atproto::MalformedRecords>()
+                .is_some(),
+            "refused for the wrong reason: {err:#}"
         );
     }
 

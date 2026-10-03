@@ -213,6 +213,10 @@ pub struct RecordWalk {
     pub records: Vec<RecordEntry>,
     /// True when the collection ran out before any bound did.
     pub complete: bool,
+    /// Records skipped because their envelope was malformed (#177). Only a
+    /// walk that SKIPS can report this; the walks that feed `replace_sub_refs`
+    /// refuse instead, with [`MalformedRecords`].
+    pub malformed: usize,
 }
 
 impl RecordWalk {
@@ -220,12 +224,14 @@ impl RecordWalk {
         Self {
             records,
             complete: true,
+            malformed: 0,
         }
     }
     fn partial(records: Vec<RecordEntry>) -> Self {
         Self {
             records,
             complete: false,
+            malformed: 0,
         }
     }
 }
@@ -841,7 +847,38 @@ pub struct ListRecordsResponse {
     /// The opaque pagination cursor for the next page, if any.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Records on this page whose envelope was malformed and were left out of
+    /// `records` (#177): one bad record no longer fails the page it is on.
+    #[serde(skip)]
+    pub malformed: usize,
 }
+
+/// **A reader's own repo holds records this server cannot read** (#177).
+///
+/// Returned by every walk whose result is written through
+/// `store::replace_sub_refs`. Skipping a record there would silently drop it
+/// from the reader's subscriptions, so the walk refuses instead, and the web
+/// layer recognises this error by type to tell the reader why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedRecords {
+    /// The collection being listed.
+    pub collection: String,
+    /// How many records on the refused page were malformed.
+    pub count: usize,
+}
+
+impl std::fmt::Display for MalformedRecords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} record(s) in {} have a malformed envelope; refusing the listing rather than \
+             dropping them",
+            self.count, self.collection
+        )
+    }
+}
+
+impl std::error::Error for MalformedRecords {}
 
 /// The `com.atproto.repo.createRecord` / `putRecord` response (a strong ref to
 /// the written record).
@@ -1040,15 +1077,46 @@ impl PdsClient {
         collection: &str,
         budget: &mut ByteBudget,
     ) -> Result<Vec<RecordEntry>> {
+        self.walk_all_within(collection, budget, OnMalformed::Refuse)
+            .await
+            .map(|(records, _)| records)
+    }
+
+    /// [`list_all_records_within`](Self::list_all_records_within) for a
+    /// **stranger's** repo: a malformed record is skipped and counted instead of
+    /// refusing the walk (#177). Never for a walk that reaches
+    /// `replace_sub_refs`, where a skipped record is a dropped subscription.
+    pub(crate) async fn list_all_records_skipping_within(
+        &self,
+        collection: &str,
+        budget: &mut ByteBudget,
+    ) -> Result<(Vec<RecordEntry>, usize)> {
+        self.walk_all_within(collection, budget, OnMalformed::Skip)
+            .await
+    }
+
+    async fn walk_all_within(
+        &self,
+        collection: &str,
+        budget: &mut ByteBudget,
+        on_malformed: OnMalformed,
+    ) -> Result<(Vec<RecordEntry>, usize)> {
         let mut out = Vec::new();
         let max_bytes = budget.max();
         let mut cursor: Option<String> = None;
         let mut more_offered = false;
+        let mut malformed = 0usize;
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(100), cursor.as_deref())
                 .await?;
-            let got = page.records.len();
+            if on_malformed == OnMalformed::Refuse {
+                refuse_malformed(&page, collection)?;
+            }
+            malformed += page.malformed;
+            // Skipped records count toward "the page had something", so a page
+            // of nothing BUT malformed records does not end the walk early.
+            let got = page.records.len() + page.malformed;
             // **Refused, not truncated**, for the reason `extend_bounded`
             // gives: this walk feeds `replace_sub_refs`, where a short list is
             // revoked access.
@@ -1109,7 +1177,7 @@ impl PdsClient {
                 out.len(),
             );
         }
-        Ok(out)
+        Ok((out, malformed))
     }
 
     /// See [`RecordWalk`].
@@ -1168,11 +1236,22 @@ impl PdsClient {
     ) -> Result<RecordWalk> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut malformed = 0usize;
+        // Every exit carries the skipped count, so none can forget it.
+        let walk = |mut w: RecordWalk, malformed: usize| {
+            w.malformed = malformed;
+            w
+        };
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list_records(collection, Some(page_size), cursor.as_deref())
                 .await?;
-            let got = page.records.len();
+            // **Skipped, not refused**: this reads a stranger's collection, and
+            // one bad record must not stall everything beside it (#177). Counted
+            // in `got` too, so a page whose only records were malformed is not
+            // mistaken for the end of the collection.
+            malformed += page.malformed;
+            let got = page.records.len() + page.malformed;
             // Is there a next page that is actually new? (A PDS may echo a
             // cursor with an empty page, or hand back the same one forever.)
             let more =
@@ -1187,7 +1266,7 @@ impl PdsClient {
             // megabytes, so no single page may exceed the walk's budget alone.
             let page_cost: usize = page.records.iter().map(approx_bytes).sum();
             if page_cost > budget.remaining() {
-                return Ok(RecordWalk::partial(out));
+                return Ok(walk(RecordWalk::partial(out), malformed));
             }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
             // Charged on what is KEPT, which is what this walk retains. **This
@@ -1199,7 +1278,7 @@ impl PdsClient {
             let charged = budget.admit(&kept);
             debug_assert!(charged, "the page charge already proved this fits");
             if extend_truncating(&mut out, kept, max_records) {
-                return Ok(RecordWalk::partial(out));
+                return Ok(walk(RecordWalk::partial(out), malformed));
             }
             if out.len() >= max_records {
                 // Landing exactly on the cap is only a truncation if the
@@ -1208,10 +1287,11 @@ impl PdsClient {
                 return Ok(RecordWalk {
                     complete: !more,
                     records: out,
+                    malformed,
                 });
             }
             if !more {
-                return Ok(RecordWalk::complete(out));
+                return Ok(walk(RecordWalk::complete(out), malformed));
             }
             cursor = page.cursor;
         }
@@ -1221,7 +1301,7 @@ impl PdsClient {
         // busy sibling has more records than MAX_LIST_PAGES × page_size can
         // reach returns nothing at all, forever, having spent every round trip
         // to find out. The caller is told so it can say which feed.
-        Ok(RecordWalk::partial(out))
+        Ok(walk(RecordWalk::partial(out), malformed))
     }
 
     /// `com.atproto.repo.createRecord` — create a new record (server assigns the
@@ -1776,6 +1856,7 @@ impl SidecarClient {
             let page = self
                 .list_records(did, collection, Some(100), cursor.as_deref())
                 .await?;
+            refuse_malformed(&page, collection)?;
             let got = page.records.len();
             // The sidecar proxies the account's PDS, so this walk's size is as
             // remote-controlled as the direct client's. It carried no budget at
@@ -2660,12 +2741,21 @@ fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
             .unwrap_or_default();
         anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}");
     }
-    let records = parsed.records.ok_or_else(|| {
+    let entries = parsed.records.ok_or_else(|| {
         anyhow::anyhow!("listRecords returned no records field (empty or unexpected body)")
     })?;
+    let mut records = Vec::with_capacity(entries.len());
+    let mut malformed = 0;
+    for entry in entries {
+        match entry {
+            MaybeRecord::Record(r) => records.push(r),
+            MaybeRecord::Malformed(_) => malformed += 1,
+        }
+    }
     Ok(ListRecordsResponse {
         records,
         cursor: parsed.cursor,
+        malformed,
     })
 }
 
@@ -2694,8 +2784,48 @@ struct ListRecordsBody {
     message: Option<Value>,
     /// `None` means the field was absent — what a proxy makes of an empty or
     /// unexpected upstream body. `Some(vec![])` is a genuine empty page.
-    records: Option<Vec<RecordEntry>>,
+    records: Option<Vec<MaybeRecord>>,
     cursor: Option<String>,
+}
+
+/// One element of a `listRecords` page: a record, or something that is not one.
+///
+/// **Parsed per record, so one malformed envelope costs that record and not
+/// the page** (#177). `RecordEntry.uri` is required, and the page used to be
+/// parsed in one `from_value`, so a single `{"cid":…,"value":{}}` failed every
+/// record beside it. Whoever reads the page decides what a skipped record
+/// means: a stranger's publication skips it, a reader's own repo refuses.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MaybeRecord {
+    Record(RecordEntry),
+    Malformed(serde::de::IgnoredAny),
+}
+
+/// Refuse a page that skipped records, for a walk that must not drop any.
+///
+/// Every walk whose result reaches `store::replace_sub_refs` calls this: a
+/// record left out there is a subscription silently removed.
+/// What a walk does with a record whose envelope is malformed (#177).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnMalformed {
+    /// Refuse the walk with [`MalformedRecords`]: the result reaches
+    /// `replace_sub_refs`, where a skipped record is a dropped subscription.
+    Refuse,
+    /// Skip and count it: a stranger's repo, where one bad record must not
+    /// stall everything beside it.
+    Skip,
+}
+
+pub(crate) fn refuse_malformed(page: &ListRecordsResponse, collection: &str) -> Result<()> {
+    if page.malformed > 0 {
+        return Err(MalformedRecords {
+            collection: collection.to_string(),
+            count: page.malformed,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// **Hand-written, because the derive accepts a listing that is not an object.**
@@ -4489,6 +4619,137 @@ pub(crate) mod tests {
             .unwrap();
         crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
         (format!("http://{host}:{port}"), port)
+    }
+
+    // ---- #177: one malformed envelope ---------------------------------------
+
+    /// A record with no `uri`, which is what #177 probed on `main`.
+    fn malformed_page(cursor: Option<&str>) -> Vec<u8> {
+        let mut page = serde_json::json!({
+            "records": [
+                { "uri": "at://did:plc:x/c/3labGOOD", "value": {} },
+                { "cid": "bafy", "value": {} },
+            ]
+        });
+        if let Some(c) = cursor {
+            page["cursor"] = serde_json::json!(c);
+        }
+        page.to_string().into_bytes()
+    }
+
+    #[test]
+    fn one_malformed_envelope_is_counted_not_fatal_to_the_page() {
+        let page = parse_list_records(&malformed_page(None))
+            .expect("one malformed envelope failed the whole page");
+        assert_eq!(page.records.len(), 1, "the good record was not kept");
+        assert_eq!(page.records[0].uri, "at://did:plc:x/c/3labGOOD");
+        assert_eq!(page.malformed, 1, "the malformed record was not counted");
+    }
+
+    /// The publications listing in `standard_site::fetch` reads a stranger's
+    /// repo through this walk: it skips, counts, and keeps paging.
+    #[tokio::test]
+    async fn the_skipping_walk_skips_malformed_records_and_keeps_paging() {
+        let only_bad = serde_json::json!({
+            "records": [{ "cid": "bafy", "value": {} }], "cursor": "p1"
+        })
+        .to_string()
+        .into_bytes();
+        let bodies = vec![
+            only_bad,
+            malformed_page(Some("p2")),
+            serde_json::json!({ "records": [] })
+                .to_string()
+                .into_bytes(),
+        ];
+        let (base, _) = host_for(bodies, "skipping-walk-malformed.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let (records, skipped) = client
+            .list_all_records_skipping_within("c", &mut ByteBudget::new(MAX_LIST_BYTES))
+            .await
+            .expect("a malformed record failed a stranger's walk");
+        assert_eq!(
+            records.len(),
+            1,
+            "the good record behind the bad page was lost"
+        );
+        assert_eq!(skipped, 2, "skipped records were not counted");
+    }
+
+    /// The reader's own repo: this walk feeds `replace_sub_refs`, so skipping
+    /// would drop a subscription silently. It refuses, by type.
+    #[tokio::test]
+    async fn the_own_repo_walk_refuses_a_page_with_a_malformed_record() {
+        let (base, _) = host_for(vec![malformed_page(None)], "own-repo-malformed.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let err = client
+            .list_all_records("c")
+            .await
+            .expect_err("a page with a malformed record was accepted");
+        let refused = err
+            .downcast_ref::<MalformedRecords>()
+            .unwrap_or_else(|| panic!("refused for the wrong reason: {err:#}"));
+        assert_eq!(refused.count, 1);
+        assert_eq!(refused.collection, "c");
+    }
+
+    #[tokio::test]
+    async fn the_sidecar_walk_refuses_a_page_with_a_malformed_record() {
+        let body = serde_json::json!({
+            "ok": true,
+            "data": { "records": [
+                { "uri": "at://did:plc:x/c/3labGOOD", "value": {} },
+                { "cid": "bafy", "value": {} },
+            ]}
+        })
+        .to_string()
+        .into_bytes();
+        let base = crate::net::tests::serve_bodies_in_sequence(vec![body]).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_all_records("did:plc:x", "c")
+            .await
+            .expect_err("a page with a malformed record was accepted");
+        assert!(
+            err.downcast_ref::<MalformedRecords>().is_some(),
+            "refused for the wrong reason: {err:#}"
+        );
+    }
+
+    /// A stranger's publication: skipping is right here, and the walk must keep
+    /// paging past a page whose ONLY records were malformed — that page is not
+    /// the end of the collection.
+    #[tokio::test]
+    async fn a_publication_walk_skips_malformed_records_and_keeps_paging() {
+        let only_bad = serde_json::json!({
+            "records": [{ "cid": "bafy", "value": {} }], "cursor": "p1"
+        })
+        .to_string()
+        .into_bytes();
+        let bodies = vec![
+            only_bad,
+            malformed_page(Some("p2")),
+            serde_json::json!({ "records": [] })
+                .to_string()
+                .into_bytes(),
+        ];
+        let (base, _) = host_for(bodies, "publication-malformed.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let mut budget = ByteBudget::new(MAX_LIST_BYTES);
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut budget, 25, |_| true)
+            .await
+            .expect("a malformed record failed a stranger's publication walk");
+        assert_eq!(
+            walk.records.len(),
+            1,
+            "the good record behind the bad page was lost"
+        );
+        assert_eq!(walk.malformed, 2, "skipped records were not counted");
+        assert!(
+            walk.complete,
+            "the walk stopped at a page of only malformed records"
+        );
     }
 
     /// **The budget is spent across pages, not reset by each one.**
