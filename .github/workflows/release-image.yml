@@ -118,8 +118,12 @@ jobs:
       # Builds the image locally and runs it against a database the last good
       # release created (scripts/upgrade-boot.sh). 0.3.9 was pushed, published
       # and deployed with a schema bug that failed on every existing database;
-      # this is the check that would have stopped it. The push below reuses the
-      # build cache, so the image it publishes is this one.
+      # this is the check that would have stopped it.
+      #
+      # **Built ONCE.** The step after the gate pushes this exact image, rather
+      # than building again: a second build only matches the tested one if every
+      # layer comes from the cache, and a cache eviction or a failed cache export
+      # would publish — and attest — layers nothing tested.
       - name: Build the candidate for the upgrade-boot gate
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -127,6 +131,8 @@ jobs:
           load: true
           push: false
           tags: feather-reader:candidate
+          labels: ${{ steps.meta.outputs.labels }}
+          # PART C: pass the cargo-auditable build-arg through to the Dockerfile.
           build-args: |
             ENABLE_SBOM=${{ steps.toggle.outputs.enabled }}
           provenance: false
@@ -139,21 +145,25 @@ jobs:
           prev="ghcr.io/justin-stanley/feather-reader:$(tr -d '[:space:]' < deploy/upgrade-from)"
           ./scripts/upgrade-boot.sh "$prev" feather-reader:candidate
 
-      - name: Build and push
+      - name: Push the image the gate tested
         id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # PART C: pass the cargo-auditable build-arg through to the Dockerfile.
-          build-args: |
-            ENABLE_SBOM=${{ steps.toggle.outputs.enabled }}
-          provenance: false   # we attest provenance ourselves (below), not via buildkit
-          sbom: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag feather-reader:candidate "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
+          # Every tag is the same local image, so the registry digest is shared;
+          # read it back rather than trusting push output formatting.
+          digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' feather-reader:candidate \
+            | grep "^${IMAGE}@" | head -n1 | cut -d@ -f2)"
+          case "$digest" in
+            sha256:*) echo "digest=$digest" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::could not read the pushed digest back"; exit 1 ;;
+          esac
 
       # --- SLSA build provenance for the pushed image DIGEST -----------------
       # Signs a provenance attestation bound to the exact digest, stored in the
