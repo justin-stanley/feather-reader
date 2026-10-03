@@ -161,7 +161,7 @@ pub struct AdoptionObservation {
     /// as "at least N".
     ///
     /// Set by EITHER bound — the [`MAX_PAGES`] cap (a pathological relay) or the
-    /// [`DEFAULT_HOST_BUDGET`] wall-clock budget (a merely slow one). They mean
+    /// `DEFAULT_HOST_BUDGET` wall-clock budget (a merely slow one). They mean
     /// the same thing to a consumer, which is why they share one flag.
     pub truncated: bool,
     /// When the observation was taken (RFC3339, UTC, seconds precision —
@@ -284,7 +284,7 @@ pub enum RelayError {
         host: String,
         /// `Retry-After` in seconds, when the delta-seconds form was sent.
         /// `None` covers both "absent" and "sent as an HTTP-date", which is
-        /// deliberately not parsed — see [`retry_after_secs`].
+        /// deliberately not parsed — see `retry_after_secs`.
         retry_after: Option<u64>,
     },
 

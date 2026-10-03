@@ -114,7 +114,7 @@ pub struct Entry {
     /// dedup is `UNIQUE (feed_id, guid)`.
     pub guid: String,
     pub title: String,
-    /// When the document was published, re-spelled by [`crate::feed::fmt_time`]
+    /// When the document was published, re-spelled by `crate::feed::fmt_time`
     /// into the store's one RFC3339 shape. The reading order sorts on this
     /// column as a string, so a publisher's spelling cannot go in verbatim.
     ///
@@ -129,7 +129,7 @@ pub struct Entry {
     /// store's column is optional too; a title-only entry is not a failure.
     pub url: Option<String>,
     /// `description`, else `textContent`, escaped by
-    /// [`crate::feed::plain_text_to_html`] — both are plain text in the
+    /// `crate::feed::plain_text_to_html` — both are plain text in the
     /// lexicon, and the column they land in is rendered as HTML.
     pub summary: Option<String>,
 }
@@ -368,7 +368,7 @@ fn ingest_floor(
 /// **For a publication the caller passes `Config::retention_for`'s pair, which is
 /// the archive ceiling rather than the 14-day window** — so in practice almost
 /// nothing is floored out here, which is the point: measured, a 14-day floor
-/// dropped every document of every real publication tried. See [`ingest_floor`].
+/// dropped every document of every real publication tried. See `ingest_floor`.
 ///
 /// **An entry with no date is stored anyway.** That is a decision, not an
 /// oversight: it is dated by `fetched_at` instead, which does not move, and the
@@ -556,7 +556,7 @@ fn classify_document(
 /// - [`crate::atproto::PdsClient::list_all_records`] bounds the page count AND
 ///   detects a repeated or absent cursor — the trap this module's first draft
 ///   walked into, already solved there;
-/// - an XRPC error envelope surfaces as [`crate::atproto::XrpcError`] rather
+/// - an XRPC error envelope surfaces as `XrpcErrorBody` rather
 ///   than deserialising into an empty page.
 ///
 /// The first draft of this module reimplemented all of that, worse. The only

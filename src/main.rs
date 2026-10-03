@@ -11,7 +11,7 @@
 //!    **read-state flusher** — as `tokio` tasks, behind a config flag so
 //!    tests/dev can disable them ([`scheduler::spawn`]). Both share the same
 //!    graceful-shutdown signal as the HTTP server.
-//! 6. Build the axum [`Router`] via [`web::router`] and serve until shutdown.
+//! 6. Build the axum [`axum::Router`] via [`web::router`] and serve until shutdown.
 //!
 //! Shutdown is broadcast to *both* the server and the background tasks via a
 //! `tokio::sync::watch` channel, so a single SIGINT/SIGTERM drains the HTTP

@@ -40,8 +40,8 @@
 //! ## Identity — a cookie-resolved atproto session
 //!
 //! Per-request identity comes from a **signed session cookie** (`fr_session`)
-//! keyed by the logged-in DID, set by [`oauth_callback`] and read by
-//! [`current_session`] / [`current_did`]. For local runs without the sidecar,
+//! keyed by the logged-in DID, set by `oauth_callback` and read by
+//! `current_session` / `current_did`. For local runs without the sidecar,
 //! [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a fallback identity.
 //! All PDS writes route through the [`crate::atproto::SidecarClient`]; a live-PDS
 //! write needs a real OAuth session, but the full write path is built and unit-

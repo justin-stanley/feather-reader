@@ -311,7 +311,7 @@ impl Repo<'_> {
 
     /// Subscribe. Returns the new record's rkey.
     ///
-    /// Vets the record first — see [`vet`].
+    /// Vets the record first — see [`crate::vetted::VettedSubscription`].
     pub async fn add_subscription(&self, did: &str, sub: &Subscription) -> Result<String> {
         self.add_subscription_unvetted(did, &VettedSubscription::new(sub))
             .await
@@ -335,7 +335,7 @@ impl Repo<'_> {
 
     /// Rename or re-folder a subscription.
     ///
-    /// Vets the record first — see [`vet`].
+    /// Vets the record first — see [`crate::vetted::VettedSubscription`].
     pub async fn update_subscription(
         &self,
         did: &str,
@@ -356,7 +356,7 @@ impl Repo<'_> {
 
     /// OPML import — one `applyWrites` for the whole batch.
     ///
-    /// Vets every record first — see [`vet`]. An import is the path where the
+    /// Vets every record first — see [`crate::vetted::VettedSubscription::all`]. An import is the path where the
     /// URLs are least trustworthy: the file is arbitrary, and 200 of them arrive
     /// at once with nobody reading each line.
     pub async fn add_subscriptions_bulk(
