@@ -268,7 +268,10 @@ CREATE TABLE IF NOT EXISTS feeds (
     kind               TEXT NOT NULL DEFAULT 'rss'
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
-CREATE INDEX IF NOT EXISTS idx_feeds_kind ON feeds (kind);
+-- NOTE: `idx_feeds_kind` is created in `apply_migrations`, AFTER `kind` is
+-- ensured, for the same reason as the `intended_did` indexes below. 0.3.9 put
+-- it here and crash-looped production on its first boot: on an existing volume
+-- the CREATE TABLE above is a no-op, so the column does not exist yet.
 
 CREATE TABLE IF NOT EXISTS entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -580,6 +583,12 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'",
     )
     .await?;
+    // Here, not in the base SCHEMA batch: it names a column that only exists
+    // after the line above. See the note beside `idx_feeds_next_poll`.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_feeds_kind ON feeds (kind)")
+        .execute(pool)
+        .await
+        .context("creating idx_feeds_kind")?;
 
     // **Re-derived in Rust, every row, every start — not translated once.**
     //
@@ -9199,6 +9208,184 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         Ok(())
+    }
+
+    // ---- 0.3.9: the schema a RELEASED binary left behind must upgrade. ------
+    //
+    // B1 above hand-built the old shape of ONE table, so it could only catch the
+    // mistake it was written for. 0.3.9 made the same mistake on `feeds` — an
+    // index in the base SCHEMA on `kind`, a column only `apply_migrations` adds
+    // — and crash-looped production on its first boot, while every test here
+    // passed, because every other test starts from an empty file. These start
+    // from the schema a released binary actually created (dumped, not
+    // transcribed), so they cover every table at once: v0.3.8, the release
+    // before the bug, and v0.2.0, the oldest and furthest-migrated shape.
+
+    /// A fresh in-memory pool on ONE connection that never expires. The bug
+    /// class is DDL order, which does not depend on a file, and a file named by
+    /// pid leaks on a failed run and then fails the next run whose pid matches,
+    /// at the fixture's first CREATE TABLE, before it tests anything.
+    async fn upgrade_test_pool() -> Result<SqlitePool> {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        Ok(SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(opts)
+            .await?)
+    }
+
+    /// Every table's columns (with type, NOT NULL, default and pk) and every
+    /// index (with uniqueness, partiality and its columns in order), as one
+    /// comparable set. Column ORDER is left out on purpose: `ALTER TABLE ADD
+    /// COLUMN` appends, so a migrated table legitimately orders differently
+    /// from a fresh one.
+    async fn schema_shape(pool: &SqlitePool) -> Result<std::collections::BTreeSet<String>> {
+        let mut shape = std::collections::BTreeSet::new();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(pool)
+        .await?;
+        for t in tables {
+            for r in sqlx::query(
+                r#"SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)"#,
+            )
+            .bind(&t)
+            .fetch_all(pool)
+            .await?
+            {
+                shape.insert(format!(
+                    "column {t}.{} {} notnull={} default={:?} pk={}",
+                    r.get::<String, _>("name"),
+                    r.get::<String, _>("type"),
+                    r.get::<i64, _>("notnull"),
+                    r.get::<Option<String>, _>("dflt_value"),
+                    r.get::<i64, _>("pk"),
+                ));
+            }
+            for r in sqlx::query(r#"SELECT name, "unique", partial FROM pragma_index_list(?)"#)
+                .bind(&t)
+                .fetch_all(pool)
+                .await?
+            {
+                let name: String = r.get("name");
+                let cols: Vec<String> =
+                    sqlx::query_scalar("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+                        .bind(&name)
+                        .fetch_all(pool)
+                        .await?;
+                shape.insert(format!(
+                    "index {t}.{name} unique={} partial={} ({})",
+                    r.get::<i64, _>("unique"),
+                    r.get::<i64, _>("partial"),
+                    cols.join(", "),
+                ));
+            }
+        }
+        Ok(shape)
+    }
+
+    /// Load `fixture`, seed rows the way an old binary inserted them, run the
+    /// current `init_schema`, and require the result to be indistinguishable
+    /// in shape from a fresh database, with `kind` back-filled correctly.
+    async fn assert_upgrades_from(version: &str, fixture: &'static str) -> Result<()> {
+        let pool = upgrade_test_pool().await?;
+        sqlx::raw_sql(fixture).execute(&pool).await?;
+
+        let has_kind = |pool: SqlitePool| async move {
+            Ok::<_, anyhow::Error>(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM pragma_table_info('feeds') WHERE name = 'kind'",
+                )
+                .fetch_one(&pool)
+                .await?
+                    == 1,
+            )
+        };
+        assert!(
+            !has_kind(pool.clone()).await?,
+            "pre-condition: a {version} feeds table has no kind column"
+        );
+
+        // One row of each kind, inserted the way the old binary did: without `kind`.
+        let publication = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        for u in ["https://example.com/feed.xml", publication] {
+            sqlx::query("INSERT INTO feeds (url) VALUES (?)")
+                .bind(u)
+                .execute(&pool)
+                .await?;
+        }
+
+        init_schema(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("init_schema must upgrade a {version} database: {e:#}"));
+
+        let kinds: Vec<(String, String)> =
+            sqlx::query_as("SELECT url, kind FROM feeds ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "https://example.com/feed.xml".to_string(),
+                    "rss".to_string()
+                ),
+                (publication.to_string(), "publication".to_string()),
+            ],
+            "{version}: existing rows are back-filled from their URL"
+        );
+        // What it indexes, not only its name: an `idx_feeds_kind` on the wrong
+        // column passed a name check. (The shape comparison below also covers
+        // this; this one names the bug that shipped.)
+        let indexed: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_index_info('idx_feeds_kind') ORDER BY seqno",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            indexed,
+            vec!["kind".to_string()],
+            "{version}: idx_feeds_kind exists, on feeds(kind), after the column"
+        );
+
+        // The general check: anything a fresh database has that the upgraded
+        // one lacks, or the reverse, is a migration gap.
+        let fresh = upgrade_test_pool().await?;
+        init_schema(&fresh).await?;
+        let (want, got) = (schema_shape(&fresh).await?, schema_shape(&pool).await?);
+        assert!(
+            want == got,
+            "{version}: upgraded schema differs from a fresh one\n  missing: {:#?}\n  extra: {:#?}",
+            want.difference(&got).collect::<Vec<_>>(),
+            got.difference(&want).collect::<Vec<_>>(),
+        );
+
+        // And a second boot over the upgraded database is a no-op, not an error.
+        init_schema(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{version}: re-running init_schema failed: {e:#}"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_v0_3_8_database_upgrades_to_the_current_schema() -> Result<()> {
+        assert_upgrades_from(
+            "v0.3.8",
+            include_str!("../tests/fixtures/schema-v0.3.8.sql"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_v0_2_0_database_upgrades_to_the_current_schema() -> Result<()> {
+        assert_upgrades_from(
+            "v0.2.0",
+            include_str!("../tests/fixtures/schema-v0.2.0.sql"),
+        )
+        .await
     }
 
     // ---- B2: a code minted FOR a specific DID is redeemable ONLY by that DID. --
