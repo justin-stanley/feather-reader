@@ -9222,14 +9222,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_v0_3_8_database_upgrades_to_the_current_schema() -> Result<()> {
-        let path = std::env::temp_dir().join(format!("fr-v038-{}.db", std::process::id()));
-        let url = format!("sqlite://{}", path.display());
-        let opts = SqliteConnectOptions::from_str(&url)?
-            .create_if_missing(true)
-            .foreign_keys(true);
+        // In memory, on ONE connection that never expires: the bug is DDL order,
+        // which does not depend on the file, and a file named by pid leaks on a
+        // failed run and then fails the next run whose pid matches, at the
+        // fixture's first CREATE TABLE, before it tests anything.
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .min_connections(1)
             .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connect_with(opts)
             .await?;
         sqlx::raw_sql(include_str!("../tests/fixtures/schema-v0.3.8.sql"))
@@ -9280,26 +9282,23 @@ mod tests {
             ],
             "existing rows are back-filled from their URL"
         );
-        let indexed: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_feeds_kind'",
+        // What it indexes, not only its name: an `idx_feeds_kind` on the wrong
+        // column passed the name check.
+        let indexed: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_index_info('idx_feeds_kind') ORDER BY seqno",
         )
-        .fetch_optional(&pool)
+        .fetch_all(&pool)
         .await?;
         assert_eq!(
-            indexed.as_deref(),
-            Some("idx_feeds_kind"),
-            "the index is created after the column"
+            indexed,
+            vec!["kind".to_string()],
+            "idx_feeds_kind exists, on feeds(kind), after the column"
         );
 
         // And a second boot over the upgraded file is a no-op, not an error.
         init_schema(&pool)
             .await
             .expect("re-running init_schema is idempotent");
-
-        drop(pool);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         Ok(())
     }
 
