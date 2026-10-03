@@ -43,6 +43,8 @@ deploying is separate.
   `:latest` for every non-prerelease version tag, so it can. Corrected; deploys
   are by digest regardless.
 
+---
+
 ## 0.3.10 — 2026-10-03
 
 **0.3.9 does not start against any existing database. 0.3.10 is 0.3.9 with
