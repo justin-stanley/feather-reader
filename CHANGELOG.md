@@ -14,12 +14,135 @@ deploying is separate.
 
 ---
 
-## 0.3.9 — 2026-10-03
+## 0.3.10 — 2026-10-03
+
+**0.3.9 does not start against any existing database. 0.3.10 is 0.3.9 with
+that fixed.** Upgrade from 0.3.8 or earlier straight to 0.3.10; everything
+under 0.3.9 below ships here, including its schema change.
+
+**Schema: one additive column and one index**, both from #184 and both applied
+automatically at start: `feeds.kind`
+(`ALTER TABLE feeds ADD COLUMN kind TEXT NOT NULL DEFAULT 'rss'`) and
+`idx_feeds_kind`. Every row's `kind` is re-derived from its URL on each start.
+No `fly.toml` change.
+
+**One new optional setting:** `FEATHERREADER_PUBLICATION_RETENTION_DAYS`
+(default 3650), from #206. It bounds standard.site publication entries only.
+
+**This is the first deployable build of everything under 0.3.9.** That is 31
+files, much of it on the live Rust OAuth backend and the atproto layer, so
+expect these on the first boot:
+- if any `at://` rows exist, one `feeds.kind re-derived` log line, with
+  `to_unpollable` counting them as they move to `publication`. Without such
+  rows the column is backfilled silently, and no line is NOT a failed
+  migration: `PRAGMA table_info(feeds)` showing `kind` is the check;
+- `/stats` counts changing for the same reason, and only on such instances;
+- a reader whose repository exceeds the record-walk page budget now gets an
+  error instead of a silently truncated subscription list.
+
+**Do not deploy the 0.3.9 image** (`sha256:6a3c3996…`). It stays on ghcr.io,
+because the registry has no yank and the failed Fly release references it.
+
+Rolling back to 0.3.8 is safe. 0.3.8 never reads `kind`, and the column's
+default keeps 0.3.8's inserts valid, so it runs against the migrated database
+unchanged. A feed added while rolled back gets `'rss'` whatever it is, and the
+next 0.3.10 start corrects it.
+
+### Fixed
+
+- **0.3.9 crash-looped on its first boot in production: `no such column:
+  kind`** (#219). The base `SCHEMA` batch created `idx_feeds_kind ON feeds
+  (kind)`. On an existing database `CREATE TABLE IF NOT EXISTS feeds` is a
+  no-op, so the column is not there until `apply_migrations` adds it, and
+  `apply_migrations` runs after the batch. Startup failed before it got there.
+  The index is now created in `apply_migrations`, directly after the column.
+
+  It is the 0.2.2 `intended_did` bug (B1) again, on a different table, with the
+  warning about it a hundred lines further down the same string. On Fly the
+  machine exhausted its restart budget and stopped. The deploy has no automatic
+  rollback, so the site was down until v26 (0.3.8) was redeployed by digest.
+
+  **The crashed boot wrote nothing.** The three statements ahead of the failing
+  one are `PRAGMA foreign_keys = ON`, `CREATE TABLE IF NOT EXISTS feeds` and
+  `CREATE INDEX IF NOT EXISTS idx_feeds_next_poll`. On a 0.3.8 database the
+  table and index already exist, and the PRAGMA only sets the connection. The
+  0.3.8 binary booted against the same volume with `db: ok`.
+
+  A database 0.3.9 created from empty was never affected: there the column is in
+  the CREATE TABLE. It upgrades to 0.3.10 as a no-op.
+
+### Tests
+
+- **Every test started from an empty file, so none could see this.** In a fresh
+  database the column is in the CREATE TABLE, and the order of the index and the
+  migration cannot matter. B1's regression test hand-built one table's old
+  shape, so it guarded only that table.
+
+  Two upgrade tests now start from schemas that released binaries created,
+  dumped with `sqlite3 .schema` rather than transcribed:
+  - `tests/fixtures/schema-v0.3.8.sql`, the release before the bug;
+  - `tests/fixtures/schema-v0.2.0.sql`, the oldest released shape and the one
+    migrations do the most work on.
+
+  Each seeds an RSS row and an `at://` row the way the old binary inserted
+  them, runs the current `init_schema`, and asserts:
+  - the backfill;
+  - `idx_feeds_kind` exists and is on `kind`;
+  - a second run is a no-op;
+  - **the upgraded schema matches a fresh one.** That means every column with
+    its type, NOT NULL, default and pk, and every index with its columns. This
+    also catches the other half of the bug class: a column added to a CREATE
+    TABLE with no migration behind it.
+
+  Mutation-checked:
+  - 0.3.9's shape fails both tests with the production error.
+  - A column added to `SCHEMA` without a migration fails both, with the diff
+    naming it.
+  - Dropping the `last_error_kind` migration fails only the v0.2.0 test, which
+    is what the second fixture is for.
+
+  End to end, a review built all 19 tags from v0.2.0 to v0.3.9 and had each
+  create and seed a database. The 0.3.10 binary upgraded every one. As a
+  control, the 0.3.9 binary failed on the v0.2.0 and v0.3.8 databases with the
+  production error. A database 0.3.10 has upgraded still boots under 0.3.8.
+
+---
+
+## 0.3.9 — 2026-10-03 — YANKED
+
+**Yanked: it does not start against an existing database.** See 0.3.10, which
+ships everything below with the fix. The schema note for this release has moved
+there.
+
+The release commit described this release as migration-free — "no ALTER TABLE
+… no schema change anywhere in it". That was wrong: the claim was checked
+against the PRs listed in these notes, and #183 and #184 were missing from
+them.
 
 ### Changed
 
+- **A feed records what it IS, instead of re-deriving it from its URL each time
+  it is read** (#184). "Can the poller fetch this?" was
+  `lower(substr(url, 1, 5)) = 'at://'` spliced into five statements, and a
+  review found a sixth reader, `count_feeds`, that had already drifted from
+  them. `feed::FeedKind` now decides it once, in Rust, at insert, and the new
+  `feeds.kind` column stores the answer. `due_feeds`, both `/stats` aggregates,
+  `failing_feeds` and `unpollable_feeds` read that value, so SQL cannot disagree
+  with the fetcher about what a row is. `FeedKind::POLLABLE` is the one list the
+  scheduler selects from, and `POLLABLE_KINDS_SQL` is pinned equal to it by a
+  test.
+
+  It behaves the same: no feed changes what the poller does with it. Rows from
+  before the column are backfilled from their URL. Two bugs were found while
+  making it, both caught by existing tests:
+  - The failure histogram's `AS kind` alias collided with the new column, so
+    `GROUP BY kind` folded every failing feed into one bucket. It is
+    `failure_kind` now.
+  - A test helper seeded `at://` rows with the column's `'rss'` default. It now
+    goes through `upsert_feed`.
+
 - **`cargo doc` is now a CI gate, and the 45 warnings behind it are fixed**
-  (#190). This codebase puts its reasoning in doc comments and routes a reader
+  (#214, closing #190). This codebase puts its reasoning in doc comments and routes a reader
   between them by intra-doc link, so a dangling link is not cosmetic: it renders
   as plain text and the reference silently stops being one. #189 deleted a
   constant that four doc comments pointed at and nothing noticed, because no job
@@ -29,10 +152,12 @@ deploying is separate.
   Three of those were `[vet]` in `repo.rs`, pointing at the free function #150
   retired; they now point at `crate::vetted::VettedSubscription`, which is
   genuinely public, so the navigation is restored rather than deleted. The rest
-  were fixed to their real targets (`offset_from`, `axum::Router`,
-  `SidecarConfig::internal_secret`, `Subscription::private`) or demoted to prose
-  where no item exists any more (`tid` is an atproto concept, not an item here;
-  `XrpcError` is now `XrpcErrorBody` and private).
+  were fixed to their real targets (`SidecarConfig::internal_secret`,
+  `Subscription::private`, and `XrpcError` re-pointed at
+  `AtProtoError::Xrpc`), or demoted to prose where no linkable item exists
+  (`offset_for` is historical; `tid` is an atproto concept, not an item here;
+  `axum::Router` is an external crate's item and is now backticked
+  instead of linked).
 
   The other ~33 were a **public item's docs linking to a private item**, which
   rustdoc renders as plain text. Those are unlinked, keeping the name in
@@ -460,6 +585,21 @@ deploying is separate.
   reports `complete: false`, which it already models.
 
 ### Fixed
+
+- **An at-URI is recognised whatever the case of its scheme** (#183). A
+  mixed-case `At://` row was handed to the poller, which could only fail on it,
+  every tick, forever. It then showed up in the `/stats` `fetch` bucket as an
+  unreachable publisher. URL schemes are case-insensitive, so recognition is
+  now too: `atproto::strip_at_prefix` in Rust and `lower(substr(...))` in SQL.
+  A non-canonical spelling is refused at storage time, because `feeds.url` is
+  UNIQUE and two spellings of one publication would be two rows. Only a legacy
+  row could have this shape; nothing can store one today.
+
+  **The feed ceiling's use now shows up somewhere.** `count_feeds`
+  deliberately counts unpollable rows, because the ceiling bounds storage. But
+  that usage appeared nowhere, so an instance could sit at its cap refusing
+  subscriptions while every public number said otherwise. `/admin/metrics` now
+  shows feeds cached, the ceiling, and how many feeds are unpollable.
 
 - **A certificate test no longer turns latency into a verdict about a
   certificate.** `the_test_ca_is_trusted_and_still_validates_hostnames` asserts
