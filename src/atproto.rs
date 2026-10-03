@@ -387,6 +387,18 @@ impl ByteBudget {
         }
     }
 
+    /// Charge `bytes` that no record accounts for. Same contract as
+    /// [`Self::admit`]: `false` means stop, and a refused charge is not taken.
+    pub(crate) fn charge(&mut self, bytes: usize) -> bool {
+        match self.used.checked_add(bytes) {
+            Some(total) if total <= self.max => {
+                self.used = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn used(&self) -> usize {
         self.used
     }
@@ -851,6 +863,11 @@ pub struct ListRecordsResponse {
     /// `records` (#177): one bad record no longer fails the page it is on.
     #[serde(skip)]
     pub malformed: usize,
+    /// The page's size on the wire, where the client knows it (0 otherwise).
+    /// A walk that SKIPS malformed records charges this to its budget, since
+    /// the skipped records are invisible to the per-record accounting.
+    #[serde(skip)]
+    pub wire_bytes: usize,
 }
 
 /// **A reader's own repo holds records this server cannot read** (#177).
@@ -1113,6 +1130,17 @@ impl PdsClient {
             if on_malformed == OnMalformed::Refuse {
                 refuse_malformed(&page, collection)?;
             }
+            // **Skipped records still cost what they cost.** The per-record
+            // accounting below never sees them, so without this a repo serving
+            // pages of junk walks every page MAX_LIST_PAGES allows — gigabytes —
+            // under a budget meant to stop it (found in review). The whole page
+            // is charged: conservative, and only on pages that skipped something.
+            if page.malformed > 0 && !budget.charge(page.wire_bytes) {
+                anyhow::bail!(
+                    "listRecords for {collection} exceeded the {max_bytes}-byte cap on pages \
+                     of malformed records — refusing to read further"
+                );
+            }
             malformed += page.malformed;
             // Skipped records count toward "the page had something", so a page
             // of nothing BUT malformed records does not end the walk early.
@@ -1250,6 +1278,11 @@ impl PdsClient {
             // one bad record must not stall everything beside it (#177). Counted
             // in `got` too, so a page whose only records were malformed is not
             // mistaken for the end of the collection.
+            // As in `walk_all_within`: skipped records are invisible to the
+            // per-record charge, so their page pays for them here.
+            if page.malformed > 0 && !budget.charge(page.wire_bytes) {
+                return Ok(walk(RecordWalk::partial(out), malformed + page.malformed));
+            }
             malformed += page.malformed;
             let got = page.records.len() + page.malformed;
             // Is there a next page that is actually new? (A PDS may echo a
@@ -2722,7 +2755,9 @@ pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     refuse_a_structure_explosion(body, "the listRecords body")?;
     let parsed: ListRecordsBody =
         serde_json::from_slice(body).context("parsing listRecords response")?;
-    page_from_body(parsed)
+    let mut page = page_from_body(parsed)?;
+    page.wire_bytes = body.len();
+    Ok(page)
 }
 
 /// Apply both invariants to an already-deserialised body.
@@ -2756,6 +2791,7 @@ fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
         records,
         cursor: parsed.cursor,
         malformed,
+        wire_bytes: 0,
     })
 }
 
@@ -4674,6 +4710,46 @@ pub(crate) mod tests {
             "the good record behind the bad page was lost"
         );
         assert_eq!(skipped, 2, "skipped records were not counted");
+    }
+
+    /// Pages of nothing but junk records, each ~`junk` bytes, with fresh
+    /// cursors, so only the budget can stop the walk.
+    fn junk_pages(n: usize, junk: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "records": [{ "cid": "bafy", "value": "x".repeat(junk) }],
+                    "cursor": format!("p{}", i + 1),
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .collect()
+    }
+
+    /// Review of #224: skipped records were never charged, so a stranger's
+    /// repo serving junk pages walked all MAX_LIST_PAGES of them — gigabytes
+    /// per poll — under a budget meant to stop at 128 MiB.
+    #[tokio::test]
+    async fn skipped_records_are_charged_against_the_budget() {
+        let (base, _) = host_for(junk_pages(40, 256 * 1024), "junk-recent.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let mut budget = ByteBudget::new(1024 * 1024);
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut budget, 25, |_| true)
+            .await
+            .unwrap();
+        assert!(
+            !walk.complete,
+            "40 pages of junk were walked to the end under a 1 MiB budget"
+        );
+
+        let (base, _) = host_for(junk_pages(40, 256 * 1024), "junk-skipping.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        client
+            .list_all_records_skipping_within("c", &mut ByteBudget::new(1024 * 1024))
+            .await
+            .expect_err("40 pages of junk were walked to the end under a 1 MiB budget");
     }
 
     /// The reader's own repo: this walk feeds `replace_sub_refs`, so skipping

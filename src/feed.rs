@@ -1316,10 +1316,22 @@ pub(crate) fn bound_text(mut s: String, max: usize) -> String {
 /// a tag or an entity. So the INPUT is cut — on a character boundary, before
 /// rendering, where `ammonia` closes whatever the cut left open and escaping
 /// has no entity to split — and re-cut, shorter, if the result still does not
-/// fit. Ordinary content renders once; the loop only runs for input that was
-/// already over the bound.
+/// fit.
+///
+/// **The whole input is rendered first, when it is no bigger than one fetched
+/// body.** Sanitizing can also SHRINK markup: a large inline `data:` image,
+/// `<svg>` or `<style>` is stripped entirely. Cutting first threw away the
+/// article behind such a block — the cut ended inside it, and nothing was kept
+/// (found in review). An RSS body is at most `net::MAX_BODY_BYTES`, so it always
+/// renders whole first. A bigger input can only be plain text read from a
+/// record walk, which escaping never shrinks, so cutting it first loses nothing
+/// and spares escaping it all.
 pub(crate) fn render_bounded(raw: &str, max: usize, render: impl Fn(&str) -> String) -> String {
-    let mut cut = floor_char_boundary(raw, max);
+    let mut cut = if raw.len() <= crate::net::MAX_BODY_BYTES {
+        raw.len()
+    } else {
+        floor_char_boundary(raw, max)
+    };
     loop {
         let out = render(&raw[..cut]);
         if out.len() <= max || cut == 0 {
@@ -1632,6 +1644,25 @@ mod tests {
             html,
             "the stored body is not well-formed sanitized HTML"
         );
+    }
+
+    /// Review of #224: cutting the INPUT first threw away content that would
+    /// have fit. A large inline `data:` image, which ammonia strips anyway,
+    /// ahead of the article left the cut ending inside the image tag, and the
+    /// article was stored as an empty body.
+    #[test]
+    fn content_the_sanitizer_strips_does_not_count_against_the_bound() {
+        let body = format!(
+            r#"<p><img src="data:image/png;base64,{}"></p><p>the article</p>"#,
+            "A".repeat(MAX_CONTENT_HTML_BYTES + 512 * 1024)
+        );
+        let html = render_bounded(&body, MAX_CONTENT_HTML_BYTES, sanitize_html);
+        assert!(
+            html.contains("the article"),
+            "the article was cut away: {} bytes kept",
+            html.len()
+        );
+        assert!(html.len() <= MAX_CONTENT_HTML_BYTES);
     }
 
     #[test]
