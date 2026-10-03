@@ -23,12 +23,13 @@ deploying is separate.
   crash-looped production on its first boot. `scripts/upgrade-boot.sh` runs the
   real previous release's image to create and seed a database, then the
   candidate image against it (migrate, then a full boot that must answer
-  `/health`), then the previous image again to prove rollback.
+  `/health`), then a full boot of the previous image again to prove rollback.
 
   - On pull requests touching the app, `upgrade-boot.yml` builds the candidate
     and runs it.
   - In `release-image.yml` it runs **before** the push, so a failure pushes no
-    image and moves no tag.
+    image and moves no tag. The image pushed and attested is the one the gate
+    tested, not a second build that matches it only on a warm cache.
   - `release-crate.yml` now runs after `release-image` succeeds for the same
     tag, instead of in parallel, so a failed gate publishes no crate either.
   - The previous release is read from `deploy/upgrade-from` (now `0.3.10`), not
