@@ -137,14 +137,11 @@ fn is_forbidden_v6(ip: &Ipv6Addr) -> bool {
 /// **`to_ipv4()` is not the whole story, and the gap was a live SSRF hole.** It
 /// handles `::ffff:a.b.c.d` and `::a.b.c.d`. These it does not:
 ///
-/// * **NAT64** — `64:ff9b::/32`, covering both RFC 6052's well-known `/96` and
-///   RFC 8215's local-use `64:ff9b:1::/48`. The whole `/32` is reserved by IANA
-///   for translation and nothing legitimate to fetch lives in it, so rather than
-///   decode the six embedding lengths RFC 6052 §2.2 defines — each putting the
-///   octets in different places around the `u` byte — this returns the loopback
-///   address for any of them. Refusing the prefix outright is both simpler and
-///   stricter, and a host reachable *through* a translator has an ordinary
-///   address we resolve anyway.
+/// * **NAT64** — `64:ff9b::/32`. RFC 6052's well-known prefix is defined as a
+///   `/96`, so inside it the IPv4 is the last 32 bits and is decoded. The rest
+///   of the `/32`, including RFC 8215's local-use `64:ff9b:1::/48`, is refused
+///   outright, because RFC 6052 §2.2 allows six embedding lengths and which one
+///   a local deployment used is not something this code can know.
 /// * **6to4** — `2002::/16` (RFC 3056), IPv4 in the next two groups.
 /// * **IPv4-translated** — `::ffff:0:0:0/96` (RFC 2765), one group away from the
 ///   mapped form.
@@ -173,10 +170,34 @@ fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
             (lo & 0xff) as u8,
         )
     };
-    // NAT64, the whole IANA translation /32 — see above for why this does not
-    // decode. `LOCALHOST` is a stand-in for "forbidden", not a claim about where
-    // the address points.
+    // NAT64, split by prefix length because only one of the two is unambiguous.
+    //
+    // RFC 6052's well-known prefix is DEFINED as `64:ff9b::/96`, so inside it
+    // the IPv4 is unambiguously the last 32 bits and decodes like the others.
+    // That matters for availability, not just tidiness: a DNS64 resolver
+    // (RFC 6147) synthesises a well-known-prefix AAAA for every IPv4-only host,
+    // and `first_vetted` rejects a whole DNS answer set if ANY address in it is
+    // forbidden — so refusing the prefix outright makes every IPv4-only feed
+    // publisher unfetchable on an IPv6-only network. Which is the network this
+    // guard was written for.
+    //
+    // Nothing is given up by decoding: `64:ff9b::a9fe:a9fe` still refuses,
+    // because 169.254.169.254 refuses on its own merits. RFC 6052 §3.1 also
+    // forbids the well-known prefix from carrying a non-global IPv4 at all, so
+    // such an address is malformed as well as hostile.
+    //
+    // The REST of `64:ff9b::/32` — notably RFC 8215's local-use
+    // `64:ff9b:1::/48` — stays refused outright, and that is deliberate rather
+    // than lazy. RFC 6052 §2.2 defines six embedding lengths, and which one a
+    // local-use deployment chose is a property of that deployment. Guessing
+    // wrong reads the wrong bits, which could turn an internal target into a
+    // public-looking one — so for anything but the /96 the conservative answer
+    // is the only safe one. `LOCALHOST` there is a stand-in for "forbidden",
+    // not a claim about where the address points.
     if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        if seg[2..6] == [0, 0, 0, 0] {
+            return vec![v4(seg[6], seg[7])];
+        }
         return vec![Ipv4Addr::LOCALHOST];
     }
     // 6to4.
@@ -1433,6 +1454,12 @@ pub(crate) mod tests {
             ),
             ("::ffff:0:808:808", "IPv4-translated -> 8.8.8.8"),
             ("2606:4700::5efe:808:808", "ISATAP -> 8.8.8.8"),
+            // The DNS64 case, and the reason NAT64 is decoded rather than
+            // prefix-refused: a resolver doing DNS64 synthesises exactly this
+            // for an IPv4-only host, so refusing the prefix outright makes
+            // every IPv4-only feed publisher unfetchable on an IPv6-only
+            // network — the very network that motivated the guard.
+            ("64:ff9b::808:808", "NAT64 well-known prefix -> 8.8.8.8"),
         ] {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(!is_forbidden_ip(&parsed), "{ip} is {what} and was refused");
@@ -1473,6 +1500,69 @@ pub(crate) mod tests {
     /// So if a future change tightens this arm toward the spec, that is a
     /// decision to take deliberately, by deleting this test and saying why —
     /// not something to discover from a bypass.
+    /// **The well-known prefix decodes; the local-use one does not — and the
+    /// difference is deliberate, so it needs a test and not just a comment.**
+    ///
+    /// `64:ff9b::/96` is a fixed-length prefix by definition (RFC 6052 §3.1), so
+    /// the embedded IPv4 is unambiguously the last 32 bits. RFC 8215's local-use
+    /// `64:ff9b:1::/48` is not: RFC 6052 §2.2 allows six embedding lengths and
+    /// which one a deployment chose is a property of that deployment. Guessing
+    /// wrong reads the wrong bits and could render an internal target as a
+    /// public-looking address, so everything outside the /96 is refused whole.
+    ///
+    /// The cost is real and accepted: a site translating through its local-use
+    /// prefix cannot fetch through this reader. The alternative is a decode that
+    /// is wrong whenever the guess is wrong, in the one direction that matters.
+    ///
+    /// Extending the decode to the whole `/32` fails this test.
+    #[test]
+    fn a_local_use_nat64_prefix_is_refused_even_wrapping_a_public_address() {
+        let ip: IpAddr = "64:ff9b:1::808:808".parse().unwrap();
+        assert!(
+            is_forbidden_ip(&ip),
+            "the local-use NAT64 prefix was decoded as if its embedding length \
+             were known",
+        );
+    }
+
+    /// **The DNS64 path, end to end through the function that rejects answer
+    /// sets.** This is the interaction the unit cases cannot see.
+    ///
+    /// On an IPv6-only network a DNS64 resolver (RFC 6147) synthesises a
+    /// well-known-prefix AAAA for every IPv4-only host, and that synthesised
+    /// address is the ONLY answer — there is no "ordinary address we resolve
+    /// anyway". Since `first_vetted` rejects a whole set if any member is
+    /// forbidden, refusing `64:ff9b::/96` outright made every IPv4-only feed
+    /// publisher unfetchable on exactly the network this guard was written for.
+    ///
+    /// Both directions, because the fix must not cost the guard: a synthesised
+    /// answer for a PUBLIC host resolves, and a synthesised answer for the
+    /// metadata service still poisons the set.
+    #[test]
+    fn a_dns64_answer_set_for_an_ipv4_only_host_is_fetchable() {
+        let synthesised: SocketAddr = "[64:ff9b::808:808]:80".parse().unwrap();
+        let public_v4: SocketAddr = "1.2.3.4:80".parse().unwrap();
+
+        // IPv6-only: the synthesised address is the whole answer.
+        assert_eq!(
+            first_vetted("v4only.example", [synthesised].into_iter()).unwrap(),
+            synthesised,
+            "a DNS64-synthesised answer for a public host was refused, which \
+             makes every IPv4-only publisher unfetchable behind NAT64",
+        );
+        // Dual-stack with DNS64: the synthesised answer must not poison the set.
+        assert!(first_vetted("both.example", [public_v4, synthesised].into_iter()).is_ok());
+
+        // And the guard still bites: synthesising the metadata service is
+        // exactly the attack, and one such answer rejects the whole set.
+        let hostile: SocketAddr = "[64:ff9b::a9fe:a9fe]:80".parse().unwrap();
+        assert!(
+            first_vetted("evil.example", [public_v4, hostile].into_iter()).is_err(),
+            "a NAT64-synthesised metadata address was accepted",
+        );
+        assert!(first_vetted("evil.example", [hostile].into_iter()).is_err());
+    }
+
     #[test]
     fn a_reserved_bit_in_the_isatap_identifier_does_not_buy_a_bypass() {
         let ip: IpAddr = "2001:db8::400:5efe:7f00:1".parse().unwrap();

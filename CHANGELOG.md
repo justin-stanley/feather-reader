@@ -81,11 +81,23 @@ deploying is separate.
   a subscribed feed's host is enough: `resolve_and_check` checks every answer, and
   these passed.
 
-  Decoded rather than blanket-refused, except for NAT64: 6to4, IPv4-translated and
-  Teredo prefixes carry public addresses too, and refusing the prefixes would take
-  out ordinary traffic — `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
-  The whole `64:ff9b::/32` is reserved by IANA for translation, so it is refused
-  outright rather than decoding the six embedding lengths RFC 6052 §2.2 defines.
+  Decoded rather than blanket-refused: these prefixes carry public addresses too,
+  and refusing them wholesale would take out ordinary traffic —
+  `allows_ipv6_that_embeds_a_public_ipv4` holds that line.
+
+  That matters most for NAT64, where an earlier revision of this change refused
+  the whole `64:ff9b::/32` and so **broke feed fetching on the very network it
+  was written for.** A DNS64 resolver (RFC 6147) synthesises a
+  well-known-prefix AAAA for every IPv4-only host, that synthesised address is
+  the only answer there is, and `first_vetted` rejects a whole DNS answer set if
+  any member is forbidden — so every IPv4-only publisher became unfetchable on
+  an IPv6-only network. RFC 6052 §3.1 defines the well-known prefix as a `/96`,
+  so inside it the embedded IPv4 is unambiguous and is now decoded;
+  `64:ff9b::a9fe:a9fe` still refuses, because 169.254.169.254 refuses on its own
+  merits. The rest of the `/32`, including RFC 8215's local-use
+  `64:ff9b:1::/48`, stays refused outright: RFC 6052 §2.2 allows six embedding
+  lengths, and guessing which one a local deployment used could read the wrong
+  bits and render an internal target as a public-looking address.
 
   **ISATAP is the odd one out and was found by review**, after the first four
   landed: it has **no prefix to anchor on.** The IPv4 is the low 32 bits behind
