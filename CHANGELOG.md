@@ -18,6 +18,47 @@ deploying is separate.
 
 ### Changed
 
+- **`cargo doc` is now a CI gate, and the 45 warnings behind it are fixed**
+  (#190). This codebase puts its reasoning in doc comments and routes a reader
+  between them by intra-doc link, so a dangling link is not cosmetic: it renders
+  as plain text and the reference silently stops being one. #189 deleted a
+  constant that four doc comments pointed at and nothing noticed, because no job
+  ran `cargo doc`.
+
+  Two families. Roughly ten were **unresolved** — items renamed or removed.
+  Three of those were `[vet]` in `repo.rs`, pointing at the free function #150
+  retired; they now point at `crate::vetted::VettedSubscription`, which is
+  genuinely public, so the navigation is restored rather than deleted. The rest
+  were fixed to their real targets (`offset_from`, `axum::Router`,
+  `SidecarConfig::internal_secret`, `Subscription::private`) or demoted to prose
+  where no item exists any more (`tid` is an atproto concept, not an item here;
+  `XrpcError` is now `XrpcErrorBody` and private).
+
+  The other ~33 were a **public item's docs linking to a private item**, which
+  rustdoc renders as plain text. Those are unlinked, keeping the name in
+  backticks — the honest shape, since that is already what the output showed.
+  Visibility was NOT widened to satisfy a docs lint: in this crate `pub` is a
+  guarantee (see `safe_link.rs`, `vetted.rs`), and `pub(crate)` would not
+  silence the lint anyway, so the only way to keep those links would have been
+  to publish internals like `resolve_and_check` and `pinned_client`.
+
+  The gate is `cargo doc --no-deps --locked` with `RUSTDOCFLAGS="-D warnings"`,
+  and it was verified to FAIL rather than merely pass: an injected dangling link
+  and a re-linked private item each exit non-zero.
+
+  **It does not catch everything, and review found where.** A reference into a
+  crate that sets no `html_root_url` resolves — so the gate stays green — but
+  renders with literal brackets, `[<code>reqwest::Client</code>]`, which is the
+  same defect by a different door. Measured: `axum`, `reqwest`, `sqlx`,
+  `ammonia` and `askama` produce zero `docs.rs` hrefs in the rendered output
+  while `anyhow` produces 237. Fourteen such references are demoted to prose
+  here, on the same reasoning as the private-item ones. `--extern-html-root-url`
+  would make them real links instead, at the cost of one flag per dependency
+  that nothing gates — worth considering separately, not silently. What remains
+  in the rendered docs (`[Span]`, `[WithDispatch]`, `[Action::Follow]`) comes
+  from dependencies' own doc comments via blanket trait impls, not from this
+  crate.
+
 - **A standard.site publication is retained by COUNT, not by age — because
   measurement says the age window stores nothing at all.** Read three real
   publications through `standard_site::fetch` on 2026-09-27: the newest document

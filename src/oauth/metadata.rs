@@ -1,7 +1,7 @@
 //! The OAuth client-identity documents: `client-metadata.json` and the
 //! `client_id` derived from it.
 //!
-//! Two client shapes, chosen by [`ClientConfig::dev`]:
+//! Two client shapes, chosen by `ClientConfig::dev`:
 //!
 //! * **dev / localhost** — atproto's special *localhost development client*.
 //!   The `client_id` is `http://localhost` with `redirect_uri` and `scope`

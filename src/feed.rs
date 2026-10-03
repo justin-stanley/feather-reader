@@ -9,7 +9,7 @@
 //!    identifiable [`crate::USER_AGENT`], a request timeout, and a simple
 //!    exponential backoff hint on error. A `304 Not Modified` is a no-op:
 //!    the feed is untouched apart from bumping its next-poll time.
-//! 2. **Safety** — every entry's HTML is run through [`ammonia`] before it is
+//! 2. **Safety** — every entry's HTML is run through `ammonia` before it is
 //!    ever stored (and therefore before it is ever rendered). Scripts, event
 //!    handlers, `javascript:` URLs, tracking pixels' dangerous attributes, and
 //!    other XSS vectors are stripped. Feeds carrying `<script>` is not
@@ -342,14 +342,14 @@ fn is_storable_at_authority(authority: &str) -> bool {
 ///
 /// Detection (any one is sufficient):
 /// 1. **Userinfo** — `https://user:pass@host/…` embeds credentials directly.
-/// 2. **Known private-feed path markers** — [`PRIVATE_PATH_MARKERS`]
+/// 2. **Known private-feed path markers** — `PRIVATE_PATH_MARKERS`
 ///    (`/feed/private/`, `/members/`, `/subscriber/`, …).
-/// 3. **Credential query parameters** — a query key in [`SECRET_QUERY_KEYS`] with
+/// 3. **Credential query parameters** — a query key in `SECRET_QUERY_KEYS` with
 ///    a long/opaque value (Patreon `?auth=`, Ghost `?uuid=`, `?token=`, …).
 /// 4. **High-entropy opaque token segments** — a long opaque blob (hex ≥ 16,
 ///    base64url ≥ 16, or a UUID) anywhere in the path or a query value, even
 ///    without a telltale name.
-/// 5. **Known providers** — [`KNOWN_PROVIDERS`] host (+ optional marker) match.
+/// 5. **Known providers** — `KNOWN_PROVIDERS` host (+ optional marker) match.
 ///
 /// An unparseable URL is treated as [`FeedPrivacy::Public`]: the add path rejects
 /// a malformed URL downstream anyway, and we don't want a parse quirk to
@@ -960,12 +960,12 @@ pub fn build_client() -> Result<Client> {
 }
 
 /// Compute the backoff for the `n`th consecutive failure (1-based), clamped to
-/// [`BACKOFF_MAX`]. Exponential in the error count so transient blips retry soon
+/// `BACKOFF_MAX`. Exponential in the error count so transient blips retry soon
 /// while a durably-broken feed backs off toward daily.
 ///
 /// The scheduler passes the feed's persisted `consecutive_errors` count (see
 /// [`crate::store::bump_feed_errors`]) so a feed that keeps failing actually
-/// climbs toward [`BACKOFF_MAX`] instead of retrying at the floor forever.
+/// climbs toward `BACKOFF_MAX` instead of retrying at the floor forever.
 pub fn backoff_for(consecutive_errors: u32) -> Duration {
     let n = consecutive_errors.max(1);
     // Saturating shift: base * 2^(n-1), capped. Avoids overflow for large n.

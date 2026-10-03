@@ -1,9 +1,9 @@
 //! The axum web layer — server-rendered HTML + a dash of htmx, **no SPA**.
 //!
-//! This module owns the HTTP surface: [`router`] builds an [`axum::Router`] over
+//! This module owns the HTTP surface: [`router`] builds an `axum::Router` over
 //! the shared [`AppState`], wiring the store, feed, atproto, and config seams into
 //! a small set of typography-first, dark-mode-ready views rendered with
-//! [`askama`] templates (under `templates/`). Progressive enhancement is a single
+//! `askama` templates (under `templates/`). Progressive enhancement is a single
 //! vendored `htmx` script plus a tiny keyboard handler (`static/keyboard.js`);
 //! every interaction also works as a plain HTML form POST, so the reader is fully
 //! usable with JavaScript disabled.
@@ -40,8 +40,8 @@
 //! ## Identity — a cookie-resolved atproto session
 //!
 //! Per-request identity comes from a **signed session cookie** (`fr_session`)
-//! keyed by the logged-in DID, set by [`oauth_callback`] and read by
-//! [`current_session`] / [`current_did`]. For local runs without the sidecar,
+//! keyed by the logged-in DID, set by `oauth_callback` and read by
+//! `current_session` / `current_did`. For local runs without the sidecar,
 //! [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a fallback identity.
 //! All PDS writes route through the [`crate::atproto::SidecarClient`]; a live-PDS
 //! write needs a real OAuth session, but the full write path is built and unit-
@@ -213,7 +213,7 @@ async fn current_did(state: &AppState, headers: &HeaderMap) -> Option<String> {
 ///
 /// Wires the reader routes, the health check, and the `/static` asset mount
 /// (the stylesheet, vendored htmx, and the keyboard handler, served from
-/// `static/` via [`ServeDir`]). A [`TraceLayer`] gives per-request tracing.
+/// `static/` via `ServeDir`). A `TraceLayer` gives per-request tracing.
 pub fn router(state: AppState) -> Router {
     // The shared per-IP rate limiter for the abuse-prone paths (login, redeem,
     // and the write endpoints). One instance is cloned into the state closure of

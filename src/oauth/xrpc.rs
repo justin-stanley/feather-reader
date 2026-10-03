@@ -174,7 +174,7 @@ impl Repo<'_> {
 
     /// Every record in a collection, following the cursor.
     ///
-    /// Bounded at [`MAX_LIST_PAGES`]: the repo is user-controlled, so an
+    /// Bounded at `MAX_LIST_PAGES`: the repo is user-controlled, so an
     /// unbounded walk is a denial-of-service against ourselves. A cursor that
     /// does not advance also terminates the walk rather than spinning.
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {

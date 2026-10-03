@@ -17,10 +17,10 @@
 //! 2. **A lightweight [`PdsClient`]** — holds the resolved DID, the PDS base URL,
 //!    and an [`Auth`] token, and exposes typed calls over `com.atproto.repo.*`:
 //!    [`list_records`](PdsClient::list_records),
-//!    [`create_record`](PdsClient::create_record),
-//!    [`put_record`](PdsClient::put_record),
+//!    `create_record`,
+//!    `put_record`,
 //!    [`delete_record`](PdsClient::delete_record), and
-//!    [`apply_writes`](PdsClient::apply_writes) (the **batch** call the
+//!    `apply_writes` (the **batch** call the
 //!    read-state flusher uses to coalesce many per-feed cursor writes into one
 //!    round-trip).
 //! 3. **Typed convenience wrappers** wired to the [`crate::lexicon`] record
@@ -74,7 +74,7 @@
 //! **reads**, and the record **writes** all route through [`crate::net`] —
 //! [`crate::net::guarded_get_no_privacy`] and
 //! [`crate::net::guarded_post_json`] — rather than the shared
-//! [`reqwest::Client`]. [`resolve_did_to_pds`] runs
+//! `reqwest::Client`. [`resolve_did_to_pds`] runs
 //! [`crate::net::assert_public_target`] on the `serviceEndpoint` it returns, but
 //! that check is a *separate DNS resolution* from the later request; only
 //! re-vetting and connect-pinning at request time closes the rebinding window.
@@ -525,7 +525,7 @@ pub enum Auth {
     /// A client holding it is **read-only**: [`Auth::bearer`] returns an error,
     /// so every write path (`create_record` / `put_record` / `delete_record` /
     /// `apply_writes`, all of which go through
-    /// [`authed_headers`](PdsClient::authed_headers)) fails closed. Construct one
+    /// `authed_headers`) fails closed. Construct one
     /// via [`PdsClient::anonymous`].
     Anonymous,
 }
@@ -784,7 +784,7 @@ pub async fn login_with_app_password(
 /// A lightweight client for one user's PDS repo.
 ///
 /// Holds the user's DID (the repo to read/write), the PDS base URL (resolved
-/// from the DID doc), the shared [`reqwest::Client`], and the [`Auth`] token.
+/// from the DID doc), the shared `reqwest::Client`, and the [`Auth`] token.
 /// All the `com.atproto.repo.*` methods below act on `self.did`'s repo.
 ///
 /// The client may also be **anonymous** ([`PdsClient::anonymous`]), in which case
@@ -1021,7 +1021,7 @@ impl PdsClient {
     /// exhausted. Convenience over [`list_records`](Self::list_records) for the
     /// login-time "load the whole follow-list" read.
     ///
-    /// Bounded by [`MAX_LIST_PAGES`] and by cursor-repetition detection, because
+    /// Bounded by `MAX_LIST_PAGES` and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
         self.list_all_records_within(collection, &mut ByteBudget::new(MAX_LIST_BYTES))
@@ -1124,7 +1124,7 @@ impl PdsClient {
     /// a filter that matches nothing costs a fixed number of round trips.
     ///
     /// Truncating, not refusing, because this is an additive read: see
-    /// [`extend_truncating`] for why the [`extend_bounded`] refusal would be
+    /// `extend_truncating` for why the `extend_bounded` refusal would be
     /// strictly worse here.
     ///
     /// `page_size` is the caller's, because the right page depends on how big
@@ -1549,7 +1549,7 @@ struct RepoErr {
 }
 
 impl SidecarClient {
-    /// Build a sidecar client from the shared [`reqwest::Client`] and the
+    /// Build a sidecar client from the shared `reqwest::Client` and the
     /// resolved public + internal base URLs + internal secret (from
     /// [`crate::config::SidecarConfig`]). `public_url` anchors the browser
     /// `/login` redirect; `internal_url` is the loopback base for the `/internal/*`
@@ -1753,7 +1753,7 @@ impl SidecarClient {
 
     /// Page through **all** records in a collection for `did`.
     ///
-    /// Bounded by [`MAX_LIST_PAGES`] and cursor-repetition detection, same as
+    /// Bounded by `MAX_LIST_PAGES` and cursor-repetition detection, same as
     /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
     /// PDS, so the page count is ultimately remote-controlled here too.
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
@@ -2063,7 +2063,7 @@ impl SidecarClient {
 
     /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
     ///
-    /// Each feed becomes one `create` op. Client-side monotonic [`tid`](tid)
+    /// Each feed becomes one `create` op. Client-side monotonic `tid`
     /// rkeys are assigned so the batch is deterministic and the imported feeds
     /// keep OPML order (server-assigned tids would also be monotonic, but pinning
     /// them here makes the whole import reproducible and testable offline).
@@ -2213,7 +2213,7 @@ pub(crate) fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Res
         .collect()
 }
 
-/// One operation in a [`PdsClient::apply_writes`] batch.
+/// One operation in a `PdsClient::apply_writes` batch.
 ///
 /// Maps to the `com.atproto.repo.applyWrites` union of
 /// `#create` / `#update` / `#delete`.

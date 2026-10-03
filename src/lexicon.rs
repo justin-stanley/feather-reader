@@ -104,9 +104,9 @@ where
 /// and no record (redacted or otherwise) is ever written. The server therefore
 /// holds NO private secret, which keeps "your data lives in your public PDS"
 /// 100% honest. Consequently every [`Subscription`] record actually written
-/// carries a real, public feed `url`, and [`private`] is **always omitted**.
+/// carries a real, public feed `url`, and [`Subscription::private`] is **always omitted**.
 ///
-/// The [`private`] field is retained ONLY as a documented, forward-compatible
+/// The [`Subscription::private`] field is retained ONLY as a documented, forward-compatible
 /// **reserved marker** for the eventual migration once atproto ships
 /// **permissioned data / permission-sets** (early-proposal as of mid-2026,
 /// bluesky-social/proposals#94). At that point a private feed's secret can live

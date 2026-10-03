@@ -232,7 +232,7 @@ pub struct Config {
 /// * the **public** `${public_url}/login` URL the browser is redirected to (and
 ///   which anchors the sidecar's OAuth `client_id`/`redirect_uri`), and
 /// * the **internal** `${internal_url}/internal/*` API (session lookup + the authed
-///   `com.atproto.repo.*` proxy), gated by the shared [`internal_secret`] sent as
+///   `com.atproto.repo.*` proxy), gated by the shared [`SidecarConfig::internal_secret`] sent as
 ///   the `X-Internal-Secret` header.
 ///
 /// The two URLs differ in a split deployment (public = the edge origin, internal =

@@ -919,8 +919,8 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
 /// the initial URL and on **every** redirect hop, following redirects manually.
 ///
 /// The passed `client` is used only as a policy reference; each hop is actually
-/// sent through a freshly-built [`pinned_client`] whose DNS for the target host
-/// is pinned to the exact IP that just passed [`resolve_and_check`] — so the
+/// sent through a freshly-built `pinned_client` whose DNS for the target host
+/// is pinned to the exact IP that just passed `resolve_and_check` — so the
 /// connect can't be rebound onto an internal address between the check and the
 /// TCP handshake.
 ///
@@ -928,8 +928,8 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<Client> {
 /// `If-None-Match` / `If-Modified-Since` validators) — **except** credential
 /// headers (`Authorization`, `Cookie`, …), which are dropped the moment a
 /// redirect leaves the original origin, mirroring what reqwest's own redirect
-/// policy does for the shared client (see [`hop_headers`]). Returns the final
-/// [`Response`] (headers only; the body is read separately via [`read_capped`]).
+/// policy does for the shared client (see `hop_headers`). Returns the final
+/// `Response` (headers only; the body is read separately via [`read_capped`]).
 /// `Err` on a blocked scheme/address, an exhausted redirect budget, or a
 /// transport error.
 pub async fn guarded_get(
@@ -1139,7 +1139,7 @@ async fn guarded_get_inner(
 /// The write-side counterpart to [`guarded_get_no_privacy`], and the only way
 /// [`crate::atproto::PdsClient`] is allowed to reach a PDS host it did not
 /// choose. It runs the same scheme allow-list, the same IP allow-list, and the
-/// same connect-pinning (via [`pinned_client`]), so the DNS-rebinding window
+/// same connect-pinning (via `pinned_client`), so the DNS-rebinding window
 /// between "`assert_public_target` said this host is public" and "the TCP
 /// handshake happens" is closed for writes exactly as it is for reads.
 ///

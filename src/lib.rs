@@ -140,7 +140,7 @@ fn new_session_id() -> String {
 
 /// Shared application state handed to every axum handler.
 ///
-/// Holds the resolved [`Config`], the SQLite pool, a shared [`reqwest::Client`]
+/// Holds the resolved [`Config`], the SQLite pool, a shared `reqwest::Client`
 /// (feed fetch + sidecar calls), the [`SidecarClient`] (the live atproto
 /// `com.atproto.repo.*` path), and the in-memory [`SessionRegistry`] (DID ↔
 /// handle, resolved via the sidecar's `/internal/session`). It is `Clone` (cheap

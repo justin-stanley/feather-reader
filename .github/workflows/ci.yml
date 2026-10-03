@@ -66,6 +66,15 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all --check
 
+      # This codebase routes a reader between doc comments by intra-doc link, so
+      # a dangling link is not cosmetic — it renders as plain text and the
+      # reference silently stops being one. #189 deleted a constant that four
+      # doc comments pointed at and nothing noticed, because nothing ran this.
+      - name: Rustdoc (intra-doc links)
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   cargo-deny:
     name: cargo deny (licenses + bans + sources)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)

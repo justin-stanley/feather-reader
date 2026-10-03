@@ -147,7 +147,7 @@ impl Aead {
     /// Encrypt into an unbound `enc.v1.gcm.…` token (AAD empty).
     ///
     /// **Panics if the OS CSPRNG is unavailable.** This is a deliberate
-    /// divergence from [`crate::new_session_id`], which falls back to a weak
+    /// divergence from `crate::new_session_id`, which falls back to a weak
     /// entropy mix: a guessable session id is bad, but a REPEATED GCM nonce is
     /// catastrophic — it leaks the XOR of two plaintexts and enables tag
     /// forgery. There is no safe degraded mode here, so this fails loudly.

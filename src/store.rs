@@ -47,7 +47,7 @@ pub enum RedeemError {
 }
 
 /// The SQLite connection pool type the rest of the crate refers to as
-/// [`Pool`]. A thin alias over [`SqlitePool`] so [`crate::AppState`] and the web
+/// [`Pool`]. A thin alias over `SqlitePool` so [`crate::AppState`] and the web
 /// layer name one stable type; if the backend ever changes, this is the single
 /// place to swap it.
 pub type Pool = SqlitePool;
@@ -2715,7 +2715,7 @@ pub async fn starred_identities(
 /// and stamping `updated_at`. Preserves any existing `starred` bit. Also
 /// projects the change into the per-`(did, feed_url)` [`ReadCursor`] and marks
 /// it `dirty` so the batched flusher pushes it to the PDS (see
-/// [`project_entry_into_cursor`]).
+/// `project_entry_into_cursor`).
 ///
 /// AUTHORIZED per-DID: the upsert only touches an entry the caller subscribes
 /// to (`sub_ref`). Returns `true` if a row was written, `false` if `did` does
@@ -3537,7 +3537,7 @@ const CODE_BODY_LEN: usize = 8;
 /// Generate a random, unguessable invite code of the form `FEATHER-XXXXXXXX`.
 ///
 /// Draws from the OS CSPRNG (`getrandom`) and maps each byte onto
-/// [`CODE_ALPHABET`] via rejection sampling so the alphabet distribution is
+/// `CODE_ALPHABET` via rejection sampling so the alphabet distribution is
 /// uniform (no modulo bias). Infallible in practice; a `getrandom` failure
 /// (no entropy source) propagates as an error rather than a weak code.
 pub fn generate_invite_code() -> Result<String> {
@@ -4097,12 +4097,12 @@ pub struct PollHealth {
     /// checked moved the wrong way: a feed failing every fetch made `overdue`
     /// look BETTER.
     pub in_backoff: i64,
-    /// Of those, how many have reached [`BADLY_BROKEN_ERRORS`] consecutive
+    /// Of those, how many have reached `BADLY_BROKEN_ERRORS` consecutive
     /// failures — retried 2h40m apart rather than every 5 minutes.
     ///
     /// Not "will not recover on their own": the backoff ceiling is 24h at ten
     /// errors, and any of these recovers on its next successful poll. See
-    /// [`BADLY_BROKEN_ERRORS`].
+    /// `BADLY_BROKEN_ERRORS`.
     pub badly_broken: i64,
     /// Failing feeds grouped by **cause**, descending, as
     /// `(kind, count)` — `fetch`, `status`, `body`, `parse`.
