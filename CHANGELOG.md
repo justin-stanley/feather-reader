@@ -105,6 +105,16 @@ deploying is separate.
   is an entirely ordinary-looking global address that names 192.168.0.1. A
   link-local ISATAP address was already refused for being `fe80::/10`; one under
   a global prefix was not refused at all. Because it matches on the interface
+  identifier it reaches INSIDE the other prefixes, which is why the decoders
+  accumulate candidates rather than returning the first match. An early return
+  on the 6to4 arm was a live bypass found by review: 6to4 delegates
+  `2002:<site-v4>::/48` to whoever owns that IPv4, so a site running ISATAP in
+  its own 6to4 space produces `2002:808:808:0:0:5efe:a9fe:a9fe` — site address
+  8.8.8.8 and tunnel endpoint 169.254.169.254, two readings of disjoint bits,
+  both true, and only the public one was being checked. Teredo is the single
+  exception and still returns, because its client address occupies the same
+  groups 6-7 the identifier does, complemented, so there the two readings
+  contradict rather than complement each other. Because it matches on the
   identifier it is also read LOOSELY — only the OUI is tested, not RFC 5214's
   reserved bits — because two earlier drafts tried to be spec-exact and the
   first was bypassable by setting the identifier's `g` bit, and because reading

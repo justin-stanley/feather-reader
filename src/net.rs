@@ -200,31 +200,54 @@ fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
         }
         return vec![Ipv4Addr::LOCALHOST];
     }
-    // 6to4.
+    // **From here the arms ACCUMULATE instead of returning.** An early return
+    // was a bypass: 6to4 delegates `2002:<site-v4>::/48` to whoever owns that
+    // IPv4 and the site assigns identifiers inside it, so a site running ISATAP
+    // in its own 6to4 space produces `2002:<site-v4>:0:0:5efe:<internal-v4>` —
+    // two readings of DISJOINT bits, both true at once. Returning the 6to4 site
+    // address alone reported a public address and skipped the tunnel endpoint.
+    //
+    // This is the opposite of the Teredo case below, and the difference is
+    // which bits each family claims, not which is more important.
+    let mut out = Vec::new();
+    // 6to4: the site's IPv4 in groups 1-2, disjoint from the identifier.
     if seg[0] == 0x2002 {
-        return vec![v4(seg[1], seg[2])];
+        out.push(v4(seg[1], seg[2]));
     }
     // IPv4-translated: `::ffff:0:a.b.c.d`.
+    //
+    // This one accumulates for uniformity rather than necessity, and the
+    // distinction is worth recording: it requires `seg[5] == 0` where ISATAP
+    // requires `0x5efe`, and `seg[..4] == 0` excludes 6to4 and Teredo too, so
+    // it can only ever be the sole match. Returning here instead is an
+    // EQUIVALENT mutant — no test can tell the difference, and one written to
+    // try would be asserting on nothing. It pushes so that an arm added below
+    // it later is not silently skipped, which is the mistake the 6to4 arm
+    // above made.
     if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
-        return vec![v4(seg[6], seg[7])];
+        out.push(v4(seg[6], seg[7]));
     }
     // Teredo: relay, then the client with the RFC 4380 obfuscation undone.
+    //
+    // **The one arm that still returns, because it CLAIMS the identifier's
+    // bits.** Teredo's client address lives in groups 6-7 complemented — the
+    // same bits ISATAP reads uncomplemented — so the two readings are of one
+    // field and contradict each other. Accumulating both would refuse a
+    // legitimate Teredo address whenever the inverse of its client address
+    // happens to be internal. Returning here resolves that in favour of the
+    // prefix, which `a_teredo_address_is_read_as_teredo_not_as_isatap` pins.
     if seg[0] == 0x2001 && seg[1] == 0 {
-        return vec![v4(seg[2], seg[3]), v4(seg[6] ^ 0xffff, seg[7] ^ 0xffff)];
+        out.push(v4(seg[2], seg[3]));
+        out.push(v4(seg[6] ^ 0xffff, seg[7] ^ 0xffff));
+        return out;
     }
-    // ISATAP, and it is LAST on purpose.
+    // ISATAP, and it is last so that Teredo above can suppress it.
     //
-    // The four above are prefix-anchored; this one is not — the IPv4 sits in the
-    // low 32 bits behind the IANA `00-00-5E-FE` OUI under ANY /64, so the test
-    // is on the interface identifier and matches regardless of prefix. That
-    // makes it overlap: a Teredo address with zero flags whose obfuscated port
-    // happens to be `0x5efe` matches this pattern too, and the two readings
-    // disagree, because Teredo stores its client address complemented.
-    //
-    // Checking it last resolves that in favour of the prefix. An address inside
-    // `2001:0000::/32` is IANA-assigned Teredo space and the Teredo reading of
-    // it is the correct one; a real ISATAP host would not be using that prefix.
-    // Pinned by `a_teredo_address_is_read_as_teredo_not_as_isatap`.
+    // The others are prefix-anchored; this one is not — the IPv4 sits in the low
+    // 32 bits behind the IANA `00-00-5E-FE` OUI under ANY /64, so the test is on
+    // the interface identifier and matches whatever the prefix. Being reachable
+    // under another family's prefix is the point, not an edge case: it is why
+    // the arms above accumulate rather than return.
     //
     // **`seg[4]` is deliberately not constrained.** RFC 5214 spells the
     // identifier as `000000ug 00000000 0x5E 0xFE` + the IPv4, so a spec-exact
@@ -243,9 +266,9 @@ fn embedded_v4(ip: &Ipv6Addr) -> Vec<Ipv4Addr> {
     // should be conservative about what it accepts as safe, which here means
     // the simpler condition, not the more exact one.
     if seg[5] == 0x5efe {
-        return vec![v4(seg[6], seg[7])];
+        out.push(v4(seg[6], seg[7]));
     }
-    Vec::new()
+    out
 }
 
 /// Validate a URL's scheme (http/https only). Returns the host as a string.
@@ -1430,6 +1453,25 @@ pub(crate) mod tests {
                 "2606:4700::5efe:c0a8:1",
                 "ISATAP under a REAL public prefix -> 192.168.0.1",
             ),
+            // **An ISATAP identifier INSIDE another family's prefix.** 6to4
+            // delegates `2002:<site-v4>::/48` to whoever owns that IPv4, and
+            // the site assigns identifiers inside it — so a site running ISATAP
+            // in its own 6to4 space produces exactly this. The two families
+            // read DISJOINT bits (6to4 the site address in groups 1-2, ISATAP
+            // the tunnel endpoint in groups 6-7), so both readings are true at
+            // once and checking only the first is a bypass.
+            (
+                "2002:808:808:0:0:5efe:a9fe:a9fe",
+                "6to4 site 8.8.8.8 + ISATAP -> 169.254.169.254",
+            ),
+            (
+                "2002:808:808:0:0:5efe:7f00:1",
+                "6to4 site 8.8.8.8 + ISATAP -> 127.0.0.1",
+            ),
+            (
+                "2002:101:101:0:0:5efe:c0a8:1",
+                "6to4 site 1.1.1.1 + ISATAP -> 192.168.0.1",
+            ),
         ] {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(
@@ -1460,46 +1502,19 @@ pub(crate) mod tests {
             // every IPv4-only feed publisher unfetchable on an IPv6-only
             // network — the very network that motivated the guard.
             ("64:ff9b::808:808", "NAT64 well-known prefix -> 8.8.8.8"),
+            // Both readings of one address, both public. The arms accumulate,
+            // so this is the case that keeps that a decode rather than "any
+            // 6to4 address carrying a `5efe` identifier is refused".
+            (
+                "2002:808:808:0:0:5efe:808:404",
+                "6to4 site 8.8.8.8 + ISATAP 8.8.4.4",
+            ),
         ] {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(!is_forbidden_ip(&parsed), "{ip} is {what} and was refused");
         }
     }
 
-    /// **The ISATAP test is on the interface identifier, so it matches under any
-    /// prefix — including prefixes that belong to one of the other four.**
-    ///
-    /// A Teredo address with zero flags whose obfuscated port happens to be
-    /// `0x5efe` matches the ISATAP pattern too, and the two readings disagree:
-    /// Teredo stores the client address complemented, so the ISATAP reading of
-    /// the same bits is its bitwise inverse. Here the Teredo reading is server
-    /// 8.8.8.8 and client 128.255.255.254 — both public, so the address is
-    /// legitimate — while the ISATAP reading of those low 32 bits is 127.0.0.1.
-    ///
-    /// `embedded_v4` checks ISATAP last, which resolves the overlap in favour of
-    /// the prefix. `2001:0000::/32` is IANA-assigned Teredo space, a real ISATAP
-    /// host would not be using it, and refusing this would be a false positive
-    /// on an address whose traffic goes to a Teredo relay rather than to
-    /// loopback. Moving the ISATAP arm above Teredo fails this test.
-    /// **The ISATAP marker is read loosely ON PURPOSE, and this is the test that
-    /// says so.**
-    ///
-    /// RFC 5214 spells the interface identifier `000000ug 00000000 0x5E 0xFE` +
-    /// the IPv4, so a spec-exact test would also require the six reserved bits
-    /// of `seg[4]` to be zero and would ALLOW the address below. `embedded_v4`
-    /// tests only for `0x5efe` in group 5, so it refuses it.
-    ///
-    /// That is a deliberate over-refusal, and without this test it was a
-    /// comment and nothing else: restoring the spec-exact mask
-    /// (`seg[4] & !0x0300 == 0`) passed all 960 tests. The asymmetry is the
-    /// argument — reading the marker loosely costs a false positive only if a
-    /// non-ISATAP interface identifier carries IANA's own `00-00-5E` OUI *and*
-    /// its low 32 bits decode to an internal address, while reading it strictly
-    /// costs a total bypass if any tunnel driver is more lenient than the RFC.
-    ///
-    /// So if a future change tightens this arm toward the spec, that is a
-    /// decision to take deliberately, by deleting this test and saying why —
-    /// not something to discover from a bypass.
     /// **The well-known prefix decodes; the local-use one does not — and the
     /// difference is deliberate, so it needs a test and not just a comment.**
     ///
@@ -1563,6 +1578,25 @@ pub(crate) mod tests {
         assert!(first_vetted("evil.example", [hostile].into_iter()).is_err());
     }
 
+    /// **The ISATAP marker is read loosely ON PURPOSE, and this is the test that
+    /// says so.**
+    ///
+    /// RFC 5214 spells the interface identifier `000000ug 00000000 0x5E 0xFE` +
+    /// the IPv4, so a spec-exact test would also require the six reserved bits
+    /// of `seg[4]` to be zero and would ALLOW the address below. `embedded_v4`
+    /// tests only for `0x5efe` in group 5, so it refuses it.
+    ///
+    /// That is a deliberate over-refusal, and without this test it was a
+    /// comment and nothing else: restoring the spec-exact mask
+    /// (`seg[4] & !0x0300 == 0`) passed all 960 tests. The asymmetry is the
+    /// argument — reading the marker loosely costs a false positive only if a
+    /// non-ISATAP interface identifier carries IANA's own `00-00-5E` OUI *and*
+    /// its low 32 bits decode to an internal address, while reading it strictly
+    /// costs a total bypass if any tunnel driver is more lenient than the RFC.
+    ///
+    /// So if a future change tightens this arm toward the spec, that is a
+    /// decision to take deliberately, by deleting this test and saying why —
+    /// not something to discover from a bypass.
     #[test]
     fn a_reserved_bit_in_the_isatap_identifier_does_not_buy_a_bypass() {
         let ip: IpAddr = "2001:db8::400:5efe:7f00:1".parse().unwrap();
@@ -1573,6 +1607,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The ISATAP test is on the interface identifier, so it matches under any
+    /// prefix — including prefixes that belong to one of the other four.**
+    ///
+    /// A Teredo address with zero flags whose obfuscated port happens to be
+    /// `0x5efe` matches the ISATAP pattern too, and the two readings disagree:
+    /// Teredo stores the client address complemented, so the ISATAP reading of
+    /// the same bits is its bitwise inverse. Here the Teredo reading is server
+    /// 8.8.8.8 and client 128.255.255.254 — both public, so the address is
+    /// legitimate — while the ISATAP reading of those low 32 bits is 127.0.0.1.
+    ///
+    /// Teredo is the one arm that still RETURNS rather than accumulating, which
+    /// suppresses the ISATAP reading of bits Teredo has already claimed.
+    /// `2001:0000::/32` is IANA-assigned Teredo space, a real ISATAP host would
+    /// not be using it, and refusing this would be a false positive on an
+    /// address whose traffic goes to a Teredo relay rather than to loopback.
+    ///
+    /// Making the Teredo arm accumulate like the others — i.e. letting the
+    /// ISATAP arm also read groups 6-7 here — fails this test. That is the
+    /// whole difference between this case and the 6to4 one: there the two
+    /// families read disjoint bits and both readings hold, here they read the
+    /// same field and contradict each other.
     #[test]
     fn a_teredo_address_is_read_as_teredo_not_as_isatap() {
         let ip: IpAddr = "2001:0:808:808:0:5efe:7f00:1".parse().unwrap();
