@@ -26,6 +26,21 @@ automatically at start: `feeds.kind`
 `idx_feeds_kind`. Every row's `kind` is re-derived from its URL on each start.
 No `fly.toml` change.
 
+**One new optional setting:** `FEATHERREADER_PUBLICATION_RETENTION_DAYS`
+(default 3650), from #206. It bounds standard.site publication entries only.
+
+**This is the first deployable build of everything under 0.3.9.** That is 31
+files, much of it on the live Rust OAuth backend and the atproto layer, so
+expect these on the first boot:
+- one `feeds.kind re-derived` log line, with every `at://` row moving to
+  `publication`;
+- `/stats` counts changing, because unpollable rows leave them;
+- a reader whose repository exceeds the record-walk page budget now gets an
+  error instead of a silently truncated subscription list.
+
+**Do not deploy the 0.3.9 image** (`sha256:6a3c3996…`). It stays on ghcr.io,
+because the registry has no yank and the failed Fly release references it.
+
 Rolling back to 0.3.8 is safe. 0.3.8 never reads `kind`, and the column's
 default keeps 0.3.8's inserts valid, so it runs against the migrated database
 unchanged. A feed added while rolled back gets `'rss'` whatever it is, and the
