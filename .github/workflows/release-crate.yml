@@ -24,15 +24,13 @@ name: Release crate (crates.io)
 #   cannot start against an existing database is how 0.3.9 shipped (and had to
 #   be yanked). A failed gate now publishes nothing anywhere.
 #
-#   `workflow_run` fires from the DEFAULT branch's copy of this file, so the
-#   tag comes from `workflow_run.head_branch` and the commit from `head_sha` —
-#   not from github.ref, which is main here. Trusted Publishing keys on this
-#   file's name, which is unchanged.
+#   release-image's last job DISPATCHES this workflow against the tag. It is not
+#   a `workflow_run` trigger, because crates.io Trusted Publishing refuses that
+#   event outright ("does not support the `workflow_run` event trigger"), which
+#   is how v0.4.0's first publish failed. A dispatch against the tag also makes
+#   github.ref the tag, so the steps below read it directly.
 
 on:
-  workflow_run:
-    workflows: [release-image]
-    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -40,7 +38,7 @@ permissions:
   id-token: write   # REQUIRED: mint the OIDC token for crates.io Trusted Publishing
 
 concurrency:
-  group: release-crate-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: release-crate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -55,21 +53,13 @@ jobs:
     # branch (e.g. main) would reach the "Verify tag matches Cargo.toml" step with
     # GITHUB_REF_NAME=main -> tag "vmain" -> a confusing hard failure. Gating here
     # makes a branch dispatch a clean no-op; dispatch against the tag still works.
-    #
-    # Under workflow_run: only a SUCCESSFUL release-image run that was itself
-    # triggered by a version tag. Under workflow_dispatch: only against a tag.
     if: >-
-      ${{ github.event.repository.private == false && (
-        (github.event_name == 'workflow_run'
-          && github.event.workflow_run.conclusion == 'success'
-          && github.event.workflow_run.event == 'push'
-          && startsWith(github.event.workflow_run.head_branch, 'v'))
-        || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))
-      ) }}
+      ${{ github.event.repository.private == false
+        && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-      RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

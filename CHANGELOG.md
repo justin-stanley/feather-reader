@@ -43,7 +43,23 @@ deploying is separate.
   the DID form on the server and refused it client-side, with no request
   sent. Established with Node's WHATWG `URL` (`ERR_INVALID_URL` for the DID
   form; the handle form parses). With the flag on the input is now
-  `type="text"` with `inputmode="url"`; with it off it is unchanged.
+  `type="text"` with `inputmode="url"`; with it off it is unchanged. A text
+  input loses the browser's scheme check, so it carries a `pattern`
+  (`web::FEED_URL_PATTERN`) that still asks for `http(s)://` or `at://`, in
+  any case and with surrounding whitespace allowed (a text input, unlike
+  `type="url"`, does not trim before checking); otherwise `example.com/blog`
+  reached the handler and came back as "Couldn't find a feed".
+
+### CI
+
+- **The crate publish is dispatched by `release-image`, not triggered by
+  `workflow_run`.** crates.io Trusted Publishing refuses the `workflow_run`
+  event ("does not support the `workflow_run` event trigger due to security
+  concerns"), so the ordering #223 added failed the first real release: v0.4.0's
+  automatic publish was rejected, and 0.4.0 was published by dispatching
+  `release-crate.yml` against the tag by hand. `release-image` now ends with a
+  job that dispatches it, after the gate passes and the image is pushed; the
+  order is unchanged.
 
 ## 0.4.0 — 2026-10-03
 
