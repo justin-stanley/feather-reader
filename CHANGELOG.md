@@ -24,7 +24,7 @@ DID form of a publication URI, which browsers refused in 0.4.0.
 - **No schema change, no new settings.** Upgrading from 0.4.0 is a deploy;
   rolling back to 0.4.0 is a redeploy.
 - **What changes depends on `FEATHERREADER_STANDARD_SITE`.** With it off, the
-  subscribe form is byte-for-byte as in 0.4.0, and the landing and about pages
+  subscribe input is the same as in 0.4.0 (`type="url"`, same attributes), and the landing and about pages
   describe publications and say this instance isn't accepting new publication
   subscriptions. With it on, the pages and the form say how to subscribe, and
   the subscribe input accepts `at://did:…`.
