@@ -14,7 +14,19 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.2 — 2026-10-04
+
+A public feature page for standard.site, a latest-releases call-out, and link
+cards, so a feather-reader.com link posted to Bluesky unfurls with a
+description and an image.
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.1 is a deploy;
+  rolling back to 0.4.1 is a redeploy.
+- **Link cards build absolute URLs from `FEATHERREADER_PUBLIC_URL`**, the
+  setting OAuth already uses. Left unset it is `http://localhost:8080`, and
+  link cards then point there; set it to the public origin.
 
 ### Added
 
