@@ -48,6 +48,8 @@
             <label class="visually-hidden" for="feed-url">Feed, site or publication URL</label>
             <input class="input" id="feed-url" name="url" type="text" inputmode="url"
                    autocapitalize="off" autocorrect="off" spellcheck="false"
+                   pattern="{{ crate::web::FEED_URL_PATTERN|safe }}"
+                   title="A URL starting https:// or at://"
                    placeholder="Paste a feed, site or at:// publication URL…" required />
           {% else %}
             <label class="visually-hidden" for="feed-url">Feed or site URL</label>

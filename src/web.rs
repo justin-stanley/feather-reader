@@ -1262,6 +1262,13 @@ struct Nav {
 }
 
 /// The reader index (`GET /`).
+/// The subscribe input's `pattern` when standard.site is on, and the input is
+/// `type="text"` (see `templates/manage.html`). It keeps the browser asking for
+/// a scheme, as `type="url"` did, while admitting `at://`. Matched in any case,
+/// because the handler canonicalises the scheme. Browsers compile `pattern`
+/// with the `v` flag and anchor it at both ends.
+pub(crate) const FEED_URL_PATTERN: &str = "(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Tt])://.+";
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
@@ -7171,6 +7178,22 @@ mod tests {
         assert!(
             input.contains("inputmode=\"url\""),
             "the URL keyboard is still wanted: {input}"
+        );
+    }
+
+    /// Flag on, `type="text"` drops the browser's scheme check, so a pasted
+    /// `example.com/blog` would reach the handler and come back as "Couldn't
+    /// find a feed" — wrong, the site likely has one. A `pattern` keeps the
+    /// browser asking for a scheme while still admitting `at://` (both cases:
+    /// the handler canonicalises the scheme).
+    #[tokio::test]
+    async fn manage_url_input_still_requires_a_scheme_when_the_flag_is_on() {
+        let did = "did:plc:reader";
+        let body = signed_in_body(standard_site_state(true, did).await, "/manage", did).await;
+        let input = feed_url_input(&body);
+        assert!(
+            input.contains(&format!("pattern=\"{FEED_URL_PATTERN}\"")),
+            "the text input must keep a scheme check: {input}"
         );
     }
 
