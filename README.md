@@ -6,22 +6,34 @@
 [![crates.io](https://img.shields.io/crates/v/feather-reader.svg)](https://crates.io/crates/feather-reader)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-**A minimalist, atproto-native RSS/Atom reader — written in Rust.**
+<p align="center">
+  <img src="static/social-card.png" width="600" alt="FeatherReader — read, quietly. A feather mark beside the wordmark.">
+</p>
 
-FeatherReader is a calm, typography-first feed reader for people who left
+**A minimalist, atproto-native reader for RSS feeds and standard.site
+publications — written in Rust.**
+
+FeatherReader is a calm, typography-first reader for people who left
 algorithmic feeds on purpose. Its defining idea: **your subscriptions, folders,
 stars, and read-state live as records in your own [atproto](https://atproto.com)
 PDS** — not in the app's database. You sign in with your atproto identity, and
-your reading list follows you across *any* reader that speaks the same open
-lexicon. You own your data; the app just holds a cache and a login session.
+your reading list follows you to *any* reader that speaks the same open
+lexicon. Since 0.4.0 the same list can hold a
+[standard.site](https://standard.site) publication beside an RSS feed: its
+articles are records in the author's atproto repo, and FeatherReader reads them
+the way it reads a feed. The app holds a cache and a login session; you own the
+rest.
 
-Hosted at **[feather-reader.com](https://feather-reader.com)**, and
-trivial to self-host.
+Hosted at **[feather-reader.com](https://feather-reader.com)**, and built to be
+self-hosted.
 
-> **Status: experimental / pre-1.0.** The core is built and usable, but the
-> project is early, the on-disk formats and the lexicon may still change, and a
-> closed invite-beta is planned before any wider launch. Treat it as something to
-> try, not something to depend on.
+> **Status: an invite-only, experimental beta, pre-1.0.** The hosted instance is
+> a free public experiment run by one person: no uptime guarantees, and it may
+> change, break, or pause at any time. Signing in there needs an invite code
+> (redeemed at `/beta/redeem`) and a seat under the instance's cap; there is no
+> open registration. Your data lives in your PDS, not here, so you can always
+> walk away with it. Treat the software as something to try, not something to
+> depend on.
 
 ---
 
@@ -37,9 +49,33 @@ trivial to self-host.
   algorithm, no "discover" tab. Every feature has to earn its place against
   "does this make the calm reading experience better, or just bigger?"
 - **Single binary, self-hostable.** Rust + an embedded SQLite cache (no Postgres
-  to run). Since 0.3.0 the atproto OAuth client is built in, so a self-host can
-  be **one process** — or keep the Node sidecar if you prefer. Easy to run
-  yourself either way.
+  to run). The atproto OAuth client is built in, so a self-host can be **one
+  process** — or keep the Node sidecar if you prefer. Easy to run yourself
+  either way.
+
+## Features
+
+- **A clean list + a distraction-free reader view** — the headline feature.
+- **RSS and Atom feeds, and standard.site publications**, in one list, in
+  order. See [standard.site publications](#standardsite-publications).
+- **Star / save-for-later** and **folders** for lightweight organisation.
+- **OPML import / export** — the migration on-ramp and off-ramp. Import creates a
+  subscription record per feed in your PDS; export reads them back out.
+- **Subscribe by URL** — paste a feed URL *or a site URL* and autodiscovery finds
+  the feed; or paste a publication's `at://` URI.
+- **Keyboard navigation** — `j`/`k` move, `o`/Enter open, `m` toggle read,
+  `s` star, `A` mark-all-read, `?` for the shortcuts overlay, `Esc` to close.
+- **Dark mode** — follows your system preference.
+- **No-JS friendly** — server-rendered HTML with a dash of htmx; every action also
+  works as a plain form POST.
+- **Polite fetching** — conditional GET (ETag / Last-Modified), backoff, and an
+  SSRF guard on every feed, identity and repo fetch.
+- **Link cards** — every page carries Open Graph and Twitter card metadata, so a
+  feather-reader.com link posted to Bluesky unfurls with a description and the
+  share image above. Private views carry only the site's generic card plus
+  `noindex`; no feed name or handle reaches `<head>`.
+- **Public pages** — `/about`, `/standard-site`, `/stats` (aggregate poller
+  health, no per-user or per-feed detail), `/privacy`, `/terms`.
 
 ## The `community.lexicon.rss.*` standard
 
@@ -50,73 +86,153 @@ lets any atproto calendar app read the same events. Log in anywhere with your
 handle and your feeds are already there. If you switch readers, there's nothing
 to export: the records are a shared standard.
 
-The record types:
+The record types ([`src/lexicon.rs`](src/lexicon.rs)):
 
-- `community.lexicon.rss.subscription` — a subscribed feed
+- `community.lexicon.rss.subscription` — a subscribed feed (or publication: the
+  same record, with the publication's `at://` URI where a feed URL would be)
 - `community.lexicon.rss.folder` — a lightweight grouping
 - `community.lexicon.rss.saved` — a starred / saved item
 - `community.lexicon.rss.readState` — a compact per-feed read cursor
 
-## Architecture
+## standard.site publications
 
-Two views — **where your data lives** and **how the running system is wired**.
-Both diagrams adapt to your light/dark theme.
+A [standard.site](https://standard.site) publication is not a feed document. It
+is a `site.standard.publication` record in the author's atproto repo, and its
+articles are `site.standard.document` records in the same repo. FeatherReader
+resolves the author's DID, reads both collections anonymously (no session, no
+credentials — the repo is public), and shows each document's title, date, link
+and a plain-text summary from `description` or `textContent`. It never renders
+the per-platform `content` union: across 449 real documents that field carried
+six different wrappers and twenty-two block types, and the set grows with every
+platform that adopts the lexicon. Plan and measurements:
+[`design/STANDARD-SITE-0.4.0.md`](design/STANDARD-SITE-0.4.0.md).
 
-**Data ownership — your PDS is the source of truth**
+What the flag does: `FEATHERREADER_STANDARD_SITE` (default `false`) decides
+whether a publication subscription may be **stored** — pasted into the
+subscribe form as `at://did:plc:…/site.standard.publication/…` or the handle
+form `at://alice.example.com/site.standard.publication/…` (resolved to its DID
+before storing), imported via OPML, or written to your repo by another client.
+**A stored publication is polled either way**: the flag gates storage, not
+reading. Any other `at://` row — another collection, a non-canonical spelling —
+is kept as `unsupported` and never polled. Limits: summaries only, public repos
+only, reading only (no `site.standard.graph.subscription` is written), and a
+30 s deadline per publication read. The hosted instance has the flag on; the
+public [`/standard-site`](https://feather-reader.com/standard-site) page says
+the same in user terms.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/ownership-dark.png">
-    <img alt="You read through FeatherReader, which fetches your feeds into a disposable local SQLite cache, while your subscriptions, folders, stars, and read-state live as community.lexicon.rss.* records in your own atproto PDS — portable to any other atproto reader." src="design/architecture/ownership-light.png" width="820">
-  </picture>
-</p>
+## How it works
 
-Your subscriptions and read-state are records in **your** PDS, so the local cache
-is throwaway and your reading list follows you to any reader that speaks the same
-lexicon.
+Four views, drawn from the code: how the running system is wired, where your
+data lives, what the background loops do, and how a release ships.
 
-**Runtime — one container, two or three processes**
+### Architecture
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/runtime-dark.png">
-    <img alt="Runtime: the browser reaches Cloudflare (proxy, cache, origin lock), which forwards to a single Fly.io container running Caddy on :8080 as the edge. Caddy sends everything to the Rust axum app on :8082, which holds a disposable SQLite cache on /data, makes SSRF-guarded conditional-GET fetches to feed origins, and makes com.atproto.repo.* calls to your atproto PDS. The OAuth handshake is handled either by the app itself (FEATHERREADER_REPO_BACKEND=rust, one process) or by a Node OAuth sidecar on :8081 that Caddy routes /oauth/* to (the sidecar backend, the default, two processes); exactly one of the two is live." src="design/architecture/runtime-light.png" width="620">
-  </picture>
-</p>
+One container on one Fly machine, fronted by Cloudflare. Caddy is the only
+listener reachable off loopback; the Rust app and the optional Node sidecar
+bind `127.0.0.1`. Ports and components are from [`fly.toml`](fly.toml), the
+[`Dockerfile`](Dockerfile) and [`deploy/Caddyfile`](deploy/Caddyfile).
 
-Caddy fronts everything on a single port — routing `/oauth/*` to whichever
-process owns the OAuth flow and the rest to the Rust server. The SQLite cache on
-the mounted volume is disposable; all durable state lives in your PDS. An
-[optional follow→invite bot](#invite-bot-optional) runs *outside* this container
-and reaches the app over `POST /bot/claims`; it isn't part of the core app.
+```mermaid
+flowchart LR
+    Browser["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>TLS · proxy · cache<br/>injects X-Origin-Auth"]
+    subgraph Fly["Fly.io — one machine, one container (tini + gosu)"]
+        Caddy["Caddy :8080<br/>origin lock · the only public listener"]
+        App["featherreader (Rust, axum, askama)<br/>127.0.0.1:8082"]
+        Side["Node OAuth sidecar<br/>127.0.0.1:8081<br/>started only on the sidecar backend"]
+        Vol[("/data volume<br/>SQLite cache · OAuth sessions · signing key")]
+        Caddy -->|"everything (and /oauth/* on the rust backend)"| App
+        Caddy -.->|"/oauth/* on the sidecar backend"| Side
+        App --- Vol
+        App -.->|"/internal/* over loopback"| Side
+        Side -.- Vol
+    end
+    CF -->|"X-Origin-Auth"| Caddy
+    App -->|"conditional GET · SSRF-guarded"| Feeds[("RSS / Atom hosts")]
+    App <-->|"OAuth · com.atproto.repo.*"| PDS[("Your PDS")]
+    App -->|"anonymous listRecords"| Pubs[("Publishers' PDSes")]
+    App -->|"did:plc resolution"| PLC[("plc.directory")]
+    Side -.->|"OAuth · repo calls"| PDS
+```
 
-The dashed links are the Node sidecar, used only on the default `sidecar`
-backend. On `FEATHERREADER_REPO_BACKEND=rust` the app owns the OAuth flow itself,
-those links do not exist, and the `:8081` process is not started — see
-[Choosing an OAuth backend](#choosing-an-oauth-backend).
+Dashed links exist only on `FEATHERREADER_REPO_BACKEND=sidecar`; on `rust` the
+app owns the OAuth flow and the sidecar process is not started (see
+[Choosing an OAuth backend](#choosing-an-oauth-backend)). The entrypoint
+installs the matching Caddy `/oauth/*` routing from the same variable, so the
+two cannot disagree. Caddy refuses any non-`/health` request that does not
+carry the `X-Origin-Auth` secret Cloudflare injects, which is what makes
+`cf-connecting-ip` trustworthy for rate limiting. An
+[optional follow→invite bot](#invite-bot-optional) runs *outside* this
+container and reaches the app over `POST /bot/claims`.
 
-So the container runs **three** processes on the `sidecar` backend and **two** on
-`rust`. That count includes Caddy, which runs either way; [Build &
-run](#build--run) counts only the application processes behind it, and so says
-one or two for the same two topologies.
+### Data ownership
 
-<sub>Diagram sources + rendered images live in [`design/architecture/`](design/architecture).</sub>
+Your PDS is the source of truth; SQLite is a cache that can be deleted and
+rebuilt. Tables are from [`src/store.rs`](src/store.rs); the flush path is
+[`src/readstate.rs`](src/readstate.rs).
 
-## Features
+```mermaid
+flowchart LR
+    subgraph PDS["Your atproto PDS — the source of truth"]
+        Sub["community.lexicon.rss.subscription<br/>one per feed or publication"]
+        Fol["community.lexicon.rss.folder"]
+        Sav["community.lexicon.rss.saved<br/>one per star"]
+        RS["community.lexicon.rss.readState<br/>one per feed, batched"]
+    end
+    subgraph Cache["FeatherReader's SQLite — a disposable cache"]
+        Feeds[("feeds + entries<br/>shared across readers, deduped by URL")]
+        Ref[("sub_ref<br/>per-DID subscription projection")]
+        State[("entry_state + read_cursor<br/>per-DID working copy, with a dirty bit")]
+    end
+    UI["You: subscribe · folder · star · mark read"] -->|"createRecord · putRecord · deleteRecord"| Sub
+    UI -->|"createRecord · putRecord · deleteRecord"| Fol
+    UI -->|"createRecord · deleteRecord"| Sav
+    UI -->|"local write, marks the cursor dirty"| State
+    Sub -->|"listRecords on each page load, mirrored into"| Ref
+    Ref -->|"scopes every entry read and mutation"| Feeds
+    State -->|"flusher: one applyWrites per DID<br/>~60 s debounce, once more at shutdown"| RS
+    Other["Any other reader that speaks the lexicon"] -.->|"reads the same records"| Sub
+```
 
-- **A clean list + a distraction-free reader view** — the headline feature.
-- **Star / save-for-later** and **folders** for lightweight organisation.
-- **OPML import / export** — the migration on-ramp and off-ramp. Import creates a
-  subscription record per feed in your PDS; export reads them back out.
-- **Subscribe by URL** — paste a feed URL *or a site URL* and autodiscovery finds
-  the feed.
-- **Keyboard navigation** — `j`/`k` move, `o`/Enter open, `m` toggle read,
-  `s` star, `A` mark-all-read, `?` for the shortcuts overlay, `Esc` to close.
-- **Dark mode** — system-preference-aware, with a manual toggle.
-- **No-JS friendly** — server-rendered HTML with a dash of htmx; every action also
-  works as a plain form POST.
-- **Polite fetching** — conditional GET (ETag / Last-Modified), backoff, and an
-  SSRF guard on every feed and identity fetch.
+Subscriptions, folders and stars are written to your PDS as you act. Read
+state is debounced: marking articles read sets a local dirty bit, and the
+flusher coalesces each DID's dirty per-feed cursors into **one**
+`com.atproto.repo.applyWrites` batch about once a minute — and once more on
+shutdown and on sign-out, so nothing is stranded. On every page load the app
+lists your subscription records and mirrors the result into `sub_ref`, which is
+the per-user isolation boundary: every cached-entry read and every read/star
+mutation is scoped through it. If your PDS cannot be reached, the page falls
+back to your own last-known projection and says so; it never widens.
+
+### Polling
+
+The background loops live in [`src/scheduler.rs`](src/scheduler.rs). Each has
+a distinct delay before its first tick, so a restarting machine never fires
+every sweep at once; `FEATHERREADER_STARTUP_DELAY_SECS` shortens them for dev
+runs. RSS feeds and publications have separate loops, so a slow publication
+read can never hold up RSS.
+
+```mermaid
+flowchart TB
+    Sched["scheduler::spawn<br/>distinct first-tick offsets per loop"]
+    Sched --> RSS["RSS poller<br/>first tick 30 s · wakes every 60 s"]
+    Sched --> Pub["Publication poller<br/>first tick 75 s · wakes every 60 s"]
+    Sched --> Flush["Read-state flusher<br/>every ~60 s, and at shutdown"]
+    Sched --> Sweeps["Sweepers<br/>pending logins: 45 s, then every 15 min<br/>invite codes: 60 s, then hourly<br/>retention: 90 s, then daily<br/>adoption probe: 5 min, then daily"]
+    RSS -->|"feeds whose next_poll is due: fetchHint or FEATHERREADER_POLL_INTERVAL (1 h)<br/>50 per tick · 4 concurrent · 250 ms stagger"| Get["Conditional GET<br/>ETag / Last-Modified · SSRF guard · backoff on failure"]
+    Get --> Store[("sanitise · size-bound every field · store<br/>newest 2000 per feed")]
+    Pub -->|"due publications, grouped by publisher DID<br/>one repo walk per publisher per pass"| Resolve["Resolve did:plc at plc.directory<br/>vet the PDS endpoint (SSRF guard)"]
+    Resolve --> List["Anonymous listRecords<br/>site.standard.publication, then site.standard.document filtered on site<br/>up to 16 publications per walk · malformed records skipped and counted · 30 s deadline"]
+    List --> Store
+```
+
+Retention is the cache's, not yours: read, unstarred entries leave after
+`FEATHERREADER_RETENTION_DAYS` (14), everything after
+`FEATHERREADER_RETENTION_HARD_DAYS` (180), and publication entries — which are
+bounded by count rather than age, because long-form publishing is not
+news-paced — after `FEATHERREADER_PUBLICATION_RETENTION_DAYS` (3650). Above
+`FEATHERREADER_DB_SIZE_WATERMARK_BYTES` the pollers stop fetching new content
+until the sweeps make room. A starred entry that ages out is still a `saved`
+record in your PDS and renders as a link.
 
 ## Known limitation: private / paid feeds
 
@@ -128,20 +244,19 @@ saved, fetched, or sent anywhere; it is refused at submission with a clear
 message. Private-feed support is deliberately deferred until atproto's
 permissioned ("private") records ship.
 
-## Build & run
+## Self-hosting
 
-FeatherReader runs as **one or two processes**, depending on which OAuth backend
-you choose (see [Choosing an OAuth backend](#choosing-an-oauth-backend)):
+FeatherReader is a single static Rust binary (optionally plus the Node OAuth
+sidecar), an embedded SQLite cache, and no external database. Everything is
+configured through environment variables; there is no config file, and every
+knob has a default, so a bare `./featherreader` boots on `127.0.0.1:8080`.
 
-- **`sidecar`** (the default) — the Rust server plus a small **Node OAuth
-  sidecar** that owns the atproto OAuth flow, so the Rust side never holds PDS
-  tokens.
-- **`rust`** — the Rust server alone, using its own built-in atproto OAuth
-  client. No Node.
+### Build & run
 
-**Prerequisites:** a recent stable Rust toolchain (see `rust-version` in
-`Cargo.toml`), plus Node.js **24 or newer only if** you run the sidecar backend
-(it uses the built-in `node:sqlite`, which is stable and flagless from 24).
+**Prerequisites:** a stable Rust toolchain at or above `rust-version` in
+[`Cargo.toml`](Cargo.toml) (1.94), plus Node.js **24 or newer only if** you run
+the sidecar backend (it uses the built-in `node:sqlite`, stable and flagless
+from 24).
 
 ```sh
 # 1. Build the server (always)
@@ -153,23 +268,32 @@ npm ci
 npm run build
 ```
 
-Both processes are configured entirely through environment variables — there is
-no config file. Every knob has a sensible default, so a bare run boots and works.
-
-- The **server** reads `FEATHERREADER_*` variables (bind address, database path,
-  poll interval, …), plus the `SIDECAR_*` URL and shared-secret pair it needs to
-  reach the sidecar. See the table at the top of
-  [`src/config.rs`](src/config.rs).
-- The **sidecar** reads `SIDECAR_*` variables (its public URL, storage path, the
-  at-rest token-encryption key, the shared internal secret, …). See
+- The **server** reads `FEATHERREADER_*` variables. **The table at the top of
+  [`src/config.rs`](src/config.rs) is the complete, authoritative list**, with
+  defaults and meanings; the ones you will set first are below.
+- The **sidecar** reads `SIDECAR_*` variables — see
   [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). Not used on the
   `rust` backend.
 
-In production the sidecar requires a real at-rest encryption key and a strong
-shared internal secret, and refuses to boot without them. **Never commit secret
-values** — the example files ship placeholders only.
+| Variable | Default | What it does |
+|---|---|---|
+| `FEATHERREADER_BIND` | `127.0.0.1:8080` | `host:port` the HTTP server binds. |
+| `FEATHERREADER_DB` | `featherreader.db` | Path to the SQLite cache. Put it on persistent storage. |
+| `FEATHERREADER_PUBLIC_URL` | `http://localhost:8080` | The public origin. Used for the OAuth callback and client metadata, and for the absolute URLs in link cards. |
+| `FEATHERREADER_COOKIE_SECRET` | *(dev fallback)* | HMAC key for the session cookie. Required, and at least 32 bytes, on a non-loopback instance. |
+| `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)* | Login allow-list of DIDs. Also the admin seed for the invite gate: these DIDs get a beta seat and can mint invite codes. |
+| `FEATHERREADER_REPO_BACKEND` | `sidecar` | `sidecar` or `rust`. Which implementation owns `/oauth/*` and `com.atproto.repo.*`. An unrecognised value fails startup. |
+| `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for OAuth sessions and the signing key on the `rust` backend. Generate it: `openssl rand -hex 32`. Required there on a production-like instance. |
+| `FEATHERREADER_OAUTH_KEY_PATH` | `oauth-signing-key.json` | The client's ES256 signing key. Relative by default; in a container put it on the volume, or every redeploy mints a new key and changes your published JWKS. |
+| `FEATHERREADER_STANDARD_SITE` | `false` | Whether a standard.site publication subscription may be stored. Stored ones are polled regardless. |
+| `FEATHERREADER_POLL_INTERVAL` | `3600` | Default per-feed poll interval in seconds. `0` is refused. |
+| `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)* | The reverse-proxy header to trust for the client IP (`CF-Connecting-IP`, `Fly-Client-IP`). Only safe when every request provably transits that proxy. |
+| `FEATHERREADER_DB_SIZE_WATERMARK_BYTES` | 2 GiB | Above this the pollers stop fetching. Set it below your volume size; startup warns if it cannot protect the disk. |
 
-## Choosing an OAuth backend
+On a non-loopback bind the server **refuses to start** with missing or weak
+production secrets rather than running with the published dev defaults.
+
+### Choosing an OAuth backend
 
 `FEATHERREADER_REPO_BACKEND` selects which implementation performs the atproto
 OAuth handshake and every `com.atproto.repo.*` call:
@@ -181,180 +305,163 @@ OAuth handshake and every `com.atproto.repo.*` call:
 | Runtime deps | Node.js | none |
 | Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` |
 
-**Upgrading to 0.3.0 changes nothing.** The default is `sidecar`, so an existing
-deployment keeps the topology it already has until you choose otherwise.
+The default stays `sidecar` so an existing deployment keeps its topology until
+you choose otherwise. **The hosted instance has run `rust` since the 2026-09-13
+cutover** ([`fly.toml`](fly.toml) sets it explicitly), and a measured latency
+comparison of the two is in the [CHANGELOG](CHANGELOG.md) (0.3.7). The intent
+is to remove the sidecar in a later release once the Rust path has enough
+production time; `sidecar` will be announced as deprecated before it is removed.
 
-### Measured in production
+What switching costs, in either direction:
 
-One deployment — a single 512 MB `shared-cpu-1x` machine in Fly's `ord`, talking
-to one PDS. Latencies are milliseconds from `/admin/metrics`; `n` is the number
-of successful calls each percentile is drawn from.
-
-| operation | `rust` p50 / p95 | n | `sidecar` p50 / p95 | n |
-|---|---|---|---|---|
-| `list_folders_sorted` | **61.3** / **78.0** | 48 | 253.3 / 274.3 | 6 |
-| `list_subscriptions_sorted` | **125.5** / **299.3** | 76 | 259.9 / 537.2 | 9 |
-| `flush_read_states` | 968.7 / **1569.3** | 15 | **849.1** / 3267.3 | 12 |
-
-**Read these as indicative, not as a benchmark.** The two backends were not
-measured concurrently: the `sidecar` figures accumulated before the 2026-09-13
-cutover and the `rust` ones after it, so they cover different weeks, a different
-cache size, and whatever the network was doing at the time. The samples are small
-and unequal, and a p50 over six calls is barely a median.
-
-What they are good for is ruling out the thing worth ruling out — the Rust client
-is not slower in a way that would argue against it. On the read paths it is
-comfortably faster; on `flush_read_states` it trades a slightly worse median for
-less than half the tail latency.
-
-The comparison is trustworthy in one narrow respect that is easy to lose:
-`FEATHERREADER_REPO_BACKEND` fails startup on an unrecognised value rather than
-falling back, so a row labelled `sidecar` was always really the sidecar, and the
-two columns are never the same implementation measured twice.
-
-`flush_read_states` on `rust` also carries 100 errors against those 15 successes.
-Nearly all are one signed-out account's read-state being retried every 60 s until
-#117 added parking in 0.3.4 — a scheduler bug, on shared code that runs
-identically under either backend, not a difference between them. Every other
-operation in the table has recorded zero errors on both.
-
-### standard.site publications
-
-`FEATHERREADER_STANDARD_SITE` (default `false`) allows this instance to
-**store** a subscription to a [standard.site](https://standard.site)
-publication — pasted into the subscribe form, imported via OPML, or written to
-your repo by another client:
-
-```sh
-FEATHERREADER_STANDARD_SITE=true
-```
-
-A publication is not a feed document — it is a record in the author's atproto
-repo, and its articles are separate records in the same repo. The reader reads
-those two collections rather than fetching one URL, and renders only
-`textContent` / `description`, never the `content` union: that is per-platform
-rather than standardised, and would mean a renderer per publisher.
-
-Only the **DID form** of a publication URI is stored
-(`at://did:plc:…/site.standard.publication/…`). A handle is a mutable name for
-a DID, and the feed table is keyed on identity; resolving a handle belongs to
-the input path and lands with the reader.
-
-**A stored publication is polled like any feed**, flag on or off: the flag
-decides what may be stored, not whether a stored row is read. An `at://` row
-that is not a well-formed publication — another collection, a handle, a
-non-canonical spelling — is classed `unsupported` and never polled, so it is not
-reported as somebody else's website being down.
-
-**With the flag on, you can also paste a publication into the subscribe form**:
-`at://did:plc:…/site.standard.publication/…`, or the handle form
-`at://alice.example.com/site.standard.publication/…`, which is resolved to its
-DID before it is stored. Anything else under `at://` is refused as "not a kind
-of feed this instance can subscribe to". With the flag off, every `at://` paste
-is refused that way.
-
-### Switching
-
-```sh
-FEATHERREADER_REPO_BACKEND=rust
-FEATHERREADER_OAUTH_ENCRYPTION_KEY=<random, >=32 bytes>   # required in production
-```
-
-The server **refuses to start** if you select `rust` on a production-like
-instance without an encryption key. That table holds every user's access token,
-refresh token and DPoP private key; without a key they would sit in plaintext in
-SQLite, on the same volume as the feed cache and in every backup of it. An
-unrecognised backend name is also a startup failure rather than a silent
-fallback.
-
-**Put the signing key somewhere persistent.** `FEATHERREADER_OAUTH_KEY_PATH`
-defaults to the *relative* `oauth-signing-key.json`, which is fine for a local
-run and a trap in a container: the key lands in the working directory, is lost on
-every redeploy, and a new one is generated in its place. Your published JWKS then
-changes on each deploy, which breaks `private_key_jwt` against any authorization
-server still holding the old one. The supplied image already points it at the
-persistent volume; a custom image or bare-binary deployment must do the same:
-
-```sh
-FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json
-```
-
-### What switching costs
-
-- **Everyone signs in again — in both directions.** The two backends keep
-  separate session stores, and separate is literal: nothing under `src/` reads
-  `SIDECAR_DB`, because the Rust backend keeps its own `oauth_session` table
-  inside `FEATHERREADER_DB`, apart from the sidecar's own database. No access
-  token, refresh token or DPoP key crosses the flip, so every signed-in reader is
-  logged out by it — and **rolling back logs them out a second time**, off a
-  sidecar store that has gone stale in the meantime. Browser sessions are
-  in-memory and already end on restart, so nothing is lost; it is one login per
-  flip, which is worth timing for low traffic and telling people about.
-- **Unverified, but worth knowing:** the two backends publish JWKS from different
-  signing keys, so if a PDS caches our JWKS across the flip, the first login
-  after it may fail for that reason rather than because of a bug in the new path.
-  This has not been observed or reproduced — it is a thing to rule out before
-  concluding the backend is broken.
+- **Everyone signs in again.** The two backends keep separate session stores
+  (the Rust backend's `oauth_session` table lives inside `FEATHERREADER_DB`;
+  nothing under `src/` reads `SIDECAR_DB`), so no token crosses the flip — and
+  rolling back logs people out a second time.
 - **`/oauth/*` routing must match the backend.** The two cannot share
-  `/oauth/callback`: your PDS redirects there with identical
-  `?code=&state=&iss=` in both cases, so nothing in the request distinguishes
-  them and one process has to own the path. The supplied container handles this
-  — the entrypoint installs the matching Caddy routing from the same environment
-  variable. **A bare-binary deployment must route `/oauth/*` itself:** to the app
-  on `rust`, to the sidecar on `sidecar`.
-- **Rolling back is unsetting the variable and restarting.** Nothing is migrated
-  or destroyed by the switch, and both Caddy routings ship in every image, so a
-  rollback needs no rebuild. Cheap operationally — but not free for your readers,
-  who log in again (see above).
+  `/oauth/callback`: the PDS redirects there with identical parameters in both
+  cases, so one process has to own the path. The supplied container installs
+  the matching Caddy routing from the same variable. A bare-binary deployment
+  must route `/oauth/*` itself: to the app on `rust`, to the sidecar on
+  `sidecar`.
+- **Rolling back is unsetting the variable and restarting.** Both Caddy
+  routings ship in every image; nothing is migrated or destroyed.
 
-### Which should you run?
+### The container image
 
-`sidecar` is the default and the option with production time behind it — it is
-what the hosted instance runs today. `rust` shipped in 0.3.0, but it has **no
-production time at all** yet: its login path is now covered by tests (the code
-exchange itself, and each of the security guards around it, are pinned by them),
-and that is a different claim from having been exercised against real PDSes under
-real traffic. `private_key_jwt` client authentication and RFC 7009 revocation in
-particular are implemented and unit-tested on the Rust path but have not run
-against a production PDS.
+`ghcr.io/justin-stanley/feather-reader` is the image the hosted instance runs:
+Caddy + the Rust app + the Node sidecar under tini, non-root, with the Rust app
+on `127.0.0.1:8082` and Caddy on `:8080` as the only public listener. Build it
+yourself with `docker build -t feather-reader .`. Two things to know before
+running it:
 
-So: if you want the smaller deployment — one process, no Node — and are content
-to be early, start fresh on `rust` and watch your logs through the first logins.
-Otherwise run the default. If you already have a working `sidecar` deployment,
-there is no urgency to move.
+- **Caddy enforces an origin lock.** The entrypoint refuses to start without
+  `FEATHERREADER_ORIGIN_SECRET`, and Caddy answers 403 to any non-`/health`
+  request whose `X-Origin-Auth` header does not match it. It does not require
+  Cloudflare specifically — any trusted proxy in front can inject the header —
+  but the image is not meant to be run with no proxy at all.
+- **`FEATHERREADER_ENV=prod` is baked in**, so the production secret checks
+  apply. [`fly.toml`](fly.toml) documents the required secrets, the one-volume
+  layout under `/data`, and the deliberate `/health` check design; its header
+  comments are the deployment notes.
 
-The choice is **transitional**. Maintaining two implementations of the same
-surface has a real cost, and the intent is to remove the sidecar in a later
-release once the Rust path has enough production time. `sidecar` will be
-announced as deprecated before it is removed.
+`GET /health` is the unauthenticated liveness endpoint and reports machine facts
+only — no user counts, no DIDs, no feed URLs. The first token of the body is
+the state: `ok`, `unknown` (no probe has completed yet; brief, at boot) or
+`FAIL` (a measured database failure, HTTP 503). The remaining lines (`db:`,
+`uptime:`, `poller:`, `polling-paused:`, `backend:`, `oauth-runtime:`) never
+change the status code, on the grounds that a stale poller can still serve
+pages while an unreadable database cannot. Alert on the body for those.
 
-## Self-hosting
+Teardown and data-ownership notes — how to revoke every session and wipe every
+scrap of state — live in [`deploy/teardown.md`](deploy/teardown.md).
 
-FeatherReader is designed to be run by anyone: a single static Rust binary
-(optionally plus the Node sidecar), an embedded SQLite cache, and no external
-database. Front it with your own reverse proxy / TLS. Teardown and
-data-ownership notes live in [`deploy/`](deploy/).
+## Development
 
-`GET /health` is the unauthenticated liveness endpoint, and it reports machine
-facts only — no user counts, no DIDs, no feed URLs. The first token of the body
-is the state: `ok`, `unknown` or `FAIL`. Only a *measured* database failure is a
-failure (`FAIL`, HTTP 503); `unknown` means no probe has completed yet, which
-happens briefly at boot and is not an outage — so match the state token, not just
-the status code. The remaining lines (`db:`, `uptime:`, `poller:`,
-`polling-paused:`, `backend:`, `oauth-runtime:`) never change the status code, on
-the grounds that a stale poller can still serve pages while an unreadable
-database cannot. Alert on the body if you want to hear about those.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs these gates in
+parallel on every push and pull request to `main`; all of them must pass.
+
+```sh
+# Rust (the app)
+cargo build --all-targets --locked
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked   # dangling intra-doc links fail
+
+# Supply chain
+cargo deny check bans licenses sources    # deny.toml: AGPL-compatible licences, crates.io only
+cargo audit -D warnings                   # RustSec, unmaintained advisories included
+
+# OAuth sidecar (Node 24)
+cd oauth-sidecar && npm ci && npm run build && npm run typecheck && npm test \
+  && npm run lint && npm run format:check && npm audit --omit=dev --audit-level=high
+
+# Invite bot (its own workspace): the same Rust and supply-chain gates, run in bot/
+```
+
+Two more jobs: **gitleaks** scans the tree and the full history with
+[`.gitleaks.toml`](.gitleaks.toml), and **Caddyfile** validates
+[`deploy/Caddyfile`](deploy/Caddyfile) with both OAuth routings, in Docker,
+against the exact Caddy digest the Dockerfile pins. A pull request that touches `src/`,
+`Cargo.*`, the `Dockerfile`, `deploy/` or the script also runs the
+**upgrade-boot** gate ([`.github/workflows/upgrade-boot.yml`](.github/workflows/upgrade-boot.yml));
+see [Releasing](#releasing) for what it proves.
+
+Locally, [`scripts/ci.sh`](scripts/ci.sh) runs the fmt, build, test and clippy
+steps plus the sidecar's `npm ci`, build and typecheck; the rustdoc, deny,
+audit, gitleaks and Caddy steps are not in it. Wire it up as a pre-push hook
+with `git config core.hooksPath .githooks`. Workflow notes and the local
+commands for the security scanners are in
+[`.github/workflows/README.md`](.github/workflows/README.md). How to contribute
+is in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Releasing
+
+A release is a git tag `vX.Y.Z` matching `version` in `Cargo.toml`. Pushing it
+runs [`release-image.yml`](.github/workflows/release-image.yml), and nothing is
+published until the candidate image has proven it can upgrade a database the
+last good release created — and that the last good release can still boot
+after it (rollback). 0.3.9 passed every other check and crash-looped
+production on its first boot; this is the gate that would have stopped it.
+Deployment is deliberately manual, and by digest.
+
+```mermaid
+flowchart TB
+    Tag["Push a tag vX.Y.Z"] --> Build
+    subgraph Img["release-image.yml"]
+        Build["Build the candidate image once<br/>(loaded locally, not pushed)"] --> Gate["Upgrade-boot gate — scripts/upgrade-boot.sh<br/>previous release (deploy/upgrade-from) creates and seeds a DB<br/>candidate migrates it and boots to a healthy /health<br/>previous release boots again on the migrated DB"]
+        Gate -->|"pass"| Push["Push that exact image to ghcr.io<br/>tags X.Y.Z, X.Y, sha, latest"]
+        Push --> Attest["Attest SLSA build provenance<br/>bound to the image digest (Sigstore, keyless)"]
+        Attest --> Dispatch["Dispatch release-crate.yml against the tag"]
+    end
+    Gate -->|"fail"| Stop["Nothing pushed, no tag moved, no crate"]
+    Dispatch --> Crate["release-crate.yml<br/>tag must equal the Cargo.toml version<br/>crates.io Trusted Publishing via OIDC, then cargo publish"]
+    Crate --> Crates[("crates.io")]
+    Attest --> Deploy["Manual deploy<br/>resolve the tag to its digest<br/>gh attestation verify, fail-closed<br/>fly deploy by digest<br/>then bump deploy/upgrade-from"]
+```
+
+The crate is dispatched rather than triggered by `workflow_run`, because
+crates.io Trusted Publishing refuses that event. `:latest` is published for
+every non-prerelease tag, so a hotfix on an older line can move it backward —
+one more reason deploys never use it. The deploy step the workflow prints:
+
+```sh
+gh attestation verify oci://ghcr.io/justin-stanley/feather-reader@sha256:<digest> \
+  --repo justin-stanley/feather-reader
+fly deploy -i ghcr.io/justin-stanley/feather-reader@sha256:<digest>
+```
+
+Once the new version is deployed and healthy,
+[`deploy/upgrade-from`](deploy/upgrade-from) is bumped to it, so the next
+release's gate upgrades from what users actually run — not from the newest tag,
+which can be a yanked one. The upgrade-boot script needs only Docker and runs
+locally too:
+
+```sh
+./scripts/upgrade-boot.sh ghcr.io/justin-stanley/feather-reader:"$(cat deploy/upgrade-from)" feather-reader:candidate
+```
+
+Every release is described in [CHANGELOG.md](CHANGELOG.md), with the mechanism
+and, where a defect is involved, how it was established rather than assumed.
 
 ## Invite bot (optional)
 
 The repo also ships a small, **optional** follow→invite bot in [`bot/`](bot/) — a
-tool for running a closed invite-beta, **not** needed to self-host the reader. It's
-a standalone Rust crate (its own workspace, deliberately **not** built by the app's
-`cargo build`) that watches an atproto account's followers and, for each new one,
-calls the app's `POST /bot/claims` to mint a single-use invite, then posts a public
-claim link. That endpoint stays disabled unless `FEATHERREADER_BOT_SECRET` is set,
-so the core app runs fine without the bot. Details + configuration in
-[`bot/README.md`](bot/README.md).
+tool for running the closed invite-beta, **not** needed to self-host the reader.
+It's a standalone Rust crate (its own workspace, deliberately **not** built by
+the app's `cargo build`) that watches an atproto account's followers and, for
+each new one, calls the app's `POST /bot/claims` to mint a single-use invite,
+then posts a public claim link. That endpoint stays disabled unless
+`FEATHERREADER_BOT_SECRET` is set, so the core app runs fine without the bot.
+Details + configuration in [`bot/README.md`](bot/README.md).
+
+## Security
+
+Please report vulnerabilities privately through GitHub's
+[private vulnerability reporting](https://github.com/justin-stanley/feather-reader/security/advisories/new),
+not in a public issue. Scope, response times and supported versions are in
+[SECURITY.md](SECURITY.md).
 
 ## Contributing
 
@@ -366,3 +473,19 @@ and design discussion via issues are equally welcome.
 
 [AGPL-3.0-only](./LICENSE). The AGPL is deliberate: it keeps hosted forks open, so
 improvements to a network-served reader flow back to everyone.
+
+## Links
+
+- The hosted reader: [feather-reader.com](https://feather-reader.com) ·
+  [about](https://feather-reader.com/about) ·
+  [standard.site publications](https://feather-reader.com/standard-site) ·
+  [stats](https://feather-reader.com/stats)
+- [CHANGELOG.md](CHANGELOG.md) ·
+  [GitHub releases](https://github.com/justin-stanley/feather-reader/releases) ·
+  [crates.io](https://crates.io/crates/feather-reader) ·
+  [ghcr.io image](https://github.com/justin-stanley/feather-reader/pkgs/container/feather-reader)
+- Design notes: [`design/`](design/) — the visual system
+  ([`DESIGN.md`](design/DESIGN.md)), the network spec
+  ([`NETWORK-SPEC.md`](design/NETWORK-SPEC.md)), and the standard.site plan
+  ([`STANDARD-SITE-0.4.0.md`](design/STANDARD-SITE-0.4.0.md))
+- [FeatherReader on Bluesky](https://bsky.app/profile/feather-reader.com)
