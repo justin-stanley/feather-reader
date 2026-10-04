@@ -763,12 +763,18 @@ where
             return Ok(());
         }
         let now = now_rfc3339();
-        let due: Vec<Feed> =
-            store::due_feeds_of_kind(&state.db, &now, feed::FeedKind::Publication, 1_000)
-                .await?
-                .into_iter()
-                .filter(|f| !read.contains(&f.id))
-                .collect();
+        let due: Vec<Feed> = store::due_feeds_of_kind(
+            &state.db,
+            &now,
+            feed::FeedKind::Publication,
+            // Past every row already read, so rows that stay due after
+            // their read cannot fill the window (found in review).
+            i64::try_from(read.len() + 1_000).unwrap_or(i64::MAX),
+        )
+        .await?
+        .into_iter()
+        .filter(|f| !read.contains(&f.id))
+        .collect();
         let Some(head) = due.first() else {
             return Ok(());
         };
@@ -2071,6 +2077,38 @@ mod tests {
         ];
         want.sort();
         assert_eq!(calls, want, "one read per repo");
+    }
+
+    /// Review of #228: the pass selected 1,000 due rows a round, so with more
+    /// than that still due after their reads (failing writes), every row past
+    /// the first 1,000 was skipped for the whole pass.
+    #[tokio::test]
+    async fn more_than_a_thousand_stuck_rows_are_all_read() {
+        // 1,005 publications, each in its own repo (a valid did:plc each).
+        let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz234567".chars().collect();
+        let did = |mut n: usize| {
+            let mut s = String::new();
+            for _ in 0..24 {
+                s.push(alphabet[n % 32]);
+                n /= 32;
+            }
+            format!("did:plc:{s}")
+        };
+        let urls: Vec<String> = (0..1005)
+            .map(|i| format!("at://{}/site.standard.publication/3lab", did(i)))
+            .collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let state = state_with_due(&refs).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut read = 0usize;
+        // Reads that leave every row due, as failing writes do.
+        poll_publications_with(&state, &shutdown, |feeds, _| {
+            read += feeds.len();
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(read, 1005, "rows past the selection window were skipped");
     }
 
     /// The RSS tick pauses at the watermark too. It always did; it had no test

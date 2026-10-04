@@ -89,7 +89,7 @@ impl std::fmt::Display for AtUri {
 /// whether an empty result is a quiet blog or a read that gave up, and the
 /// caller has no other way to tell. `fetch` used to drop it on the floor after
 /// logging a warning.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PublicationRead {
     pub publication: Publication,
     pub entries: Vec<Entry>,
@@ -627,6 +627,7 @@ pub async fn fetch_repo(
         did,
         rkeys,
         crate::atproto::MAX_LARGE_RECORDS,
+        crate::atproto::MAX_LIST_BYTES,
     )
     .await
 }
@@ -637,10 +638,26 @@ pub(crate) async fn fetch_repo_capped(
     http: &reqwest::Client,
     plc_directory: &str,
     did: &str,
-    rkeys: &[String],
+    requested: &[String],
     per_site_cap: usize,
+    budget_bytes: usize,
 ) -> anyhow::Result<Vec<anyhow::Result<PublicationRead>>> {
     use anyhow::Context;
+
+    // Nothing asked for, nothing fetched (found in review: an empty request
+    // still resolved the DID and listed the repo).
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Each rkey read once; a repeat gets a copy of its read. Indexing by the
+    // raw list made the first of two equal rkeys an empty, "complete" read.
+    let mut rkeys: Vec<String> = Vec::new();
+    for r in requested {
+        if !rkeys.contains(r) {
+            rkeys.push(r.clone());
+        }
+    }
+    let rkeys = rkeys.as_slice();
 
     let pds = crate::atproto::resolve_did_to_pds(http, plc_directory, did)
         .await
@@ -650,7 +667,7 @@ pub(crate) async fn fetch_repo_capped(
     // **One budget for both walks, because they nest.** The publications are
     // still held when the documents walk runs, so two ceilings would let this
     // read hold twice the bound the box was sized for.
-    let mut budget = crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES);
+    let mut budget = crate::atproto::ByteBudget::new(budget_bytes);
     let (publications, skipped_publications) = client
         .list_all_records_skipping_within(nsid::STANDARD_PUBLICATION, &mut budget)
         .await
@@ -691,6 +708,13 @@ pub(crate) async fn fetch_repo_capped(
     let known: std::collections::HashSet<&str> =
         publications.iter().map(|p| p.uri.as_str()).collect();
     let mut kept_per = vec![0usize; rkeys.len()];
+    // **A byte share per publication, too.** A fair COUNT is not enough: the
+    // walk's byte budget was shared, so big siblings spent it and the walk
+    // ended before a quiet publication's documents (found in review). Each
+    // gets an equal share of the budget, less an eighth held back for the
+    // transient page the walk checks against what remains.
+    let share = budget_bytes.saturating_sub(budget_bytes / 8) / index_of.len();
+    let mut kept_bytes = vec![0usize; rkeys.len()];
     let mut capped = vec![false; rkeys.len()];
     let mut orphaned = 0usize;
     let documents = client
@@ -700,8 +724,12 @@ pub(crate) async fn fetch_repo_capped(
             &mut budget,
             DOCUMENT_PAGE_SIZE,
             |record| match classify_document(record, &index_of, &known) {
-                DocumentFate::Keep(i) if kept_per[i] < per_site_cap => {
+                DocumentFate::Keep(i)
+                    if kept_per[i] < per_site_cap
+                        && kept_bytes[i] + crate::atproto::approx_bytes(record) <= share =>
+                {
                     kept_per[i] += 1;
+                    kept_bytes[i] += crate::atproto::approx_bytes(record);
                     true
                 }
                 DocumentFate::Keep(i) => {
@@ -729,7 +757,7 @@ pub(crate) async fn fetch_repo_capped(
             per_site[i].push(record);
         }
     }
-    Ok(wanted
+    let reads: Vec<anyhow::Result<PublicationRead>> = wanted
         .into_iter()
         .zip(per_site)
         .enumerate()
@@ -742,6 +770,19 @@ pub(crate) async fn fetch_repo_capped(
                     malformed: documents.malformed,
                 };
                 Ok(read_from(publication, &site, walk, orphaned))
+            }
+        })
+        .collect();
+    Ok(requested
+        .iter()
+        .map(|r| {
+            let u = rkeys
+                .iter()
+                .position(|k| k == r)
+                .expect("every requested rkey is in rkeys");
+            match &reads[u] {
+                Ok(read) => Ok(read.clone()),
+                Err(_) => Err(not_found(r)),
             }
         })
         .collect())
@@ -1430,12 +1471,15 @@ mod tests {
                     assert_eq!(path, "/xrpc/com.atproto.repo.listRecords", "unexpected request");
                     counter.fetch_add(1, Ordering::SeqCst);
                     let collection = q.get("collection").cloned().unwrap_or_default();
-                    if q.contains_key("cursor") {
-                        return axum::Json(json!({ "records": [], "cursor": "end" }));
-                    }
+                    // Pages honour `limit` and an offset cursor, and a cursor
+                    // comes back on the final page too, as a real PDS's does.
+                    let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+                    let offset: usize = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
                     let page: Vec<_> = records
                         .iter()
                         .filter(|(c, _, _)| *c == collection)
+                        .skip(offset)
+                        .take(limit)
                         .map(|(c, rkey, value)| {
                             // An empty rkey serves the #177 shape: an envelope
                             // with no `uri`, which no record can be read from.
@@ -1445,7 +1489,8 @@ mod tests {
                             json!({ "uri": format!("at://{did}/{c}/{rkey}"), "cid": "bafy", "value": value })
                         })
                         .collect();
-                    axum::Json(json!({ "records": page, "cursor": "end" }))
+                    let next = (offset + page.len()).to_string();
+                    axum::Json(json!({ "records": page, "cursor": next }))
                 }
             },
         );
@@ -1958,6 +2003,7 @@ mod tests {
             SHARED,
             &["busy".to_string(), "quiet".to_string()],
             2,
+            crate::atproto::MAX_LIST_BYTES,
         )
         .await
         .unwrap();
@@ -1971,6 +2017,178 @@ mod tests {
         assert!(!busy.complete, "a capped publication was reported complete");
         assert_eq!(quiet.entries.len(), 1, "the quiet sibling was starved");
         assert!(quiet.complete);
+    }
+
+    /// Review of #228: a fair COUNT per publication is not enough; the byte
+    /// budget was shared, so big siblings spent it and the walk stopped before
+    /// a quiet publication's one document. Each publication gets its own share.
+    #[tokio::test]
+    async fn big_siblings_do_not_spend_a_quiet_publications_share() {
+        let body = "w".repeat(20 * 1024);
+        let mut records = vec![
+            (
+                nsid::STANDARD_PUBLICATION,
+                "big1",
+                json!({ "name": "Big 1", "url": "https://b1.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "big2",
+                json!({ "name": "Big 2", "url": "https://b2.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "quiet",
+                json!({ "name": "Quiet", "url": "https://q.example" }),
+            ),
+        ];
+        for i in 0..200 {
+            let rkey: &'static str = Box::leak(format!("3l2big{i:06}").into_boxed_str());
+            let site = if i % 2 == 0 { "big1" } else { "big2" };
+            let mut doc = shared_doc(site, &format!("d{i}"), "2026-07-11T00:00:00Z");
+            doc["textContent"] = json!(body);
+            records.push((nsid::STANDARD_DOCUMENT, rkey, doc));
+        }
+        records.push((
+            nsid::STANDARD_DOCUMENT,
+            "3l2zzzzzzzzzz",
+            shared_doc("quiet", "q1", "2026-01-01T00:00:00Z"),
+        ));
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let rkeys: Vec<String> = ["big1", "big2", "quiet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let reads = fetch_repo_capped(&client, &plc, SHARED, &rkeys, 2_000, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let quiet = reads[2].as_ref().unwrap();
+        assert_eq!(
+            quiet.entries.len(),
+            1,
+            "the quiet publication was starved of bytes by its siblings"
+        );
+        assert!(
+            !reads[0].as_ref().unwrap().complete,
+            "a publication over its share was reported complete"
+        );
+    }
+
+    /// Review of #228: a repeated rkey read as empty-and-complete, and an empty
+    /// request still went to the network.
+    #[tokio::test]
+    async fn repeated_and_empty_requests_are_handled() {
+        let (plc, hits) = serve_repo(
+            SHARED,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "alpha",
+                    json!({ "name": "Alpha", "url": "https://alpha.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2rpaaaaaa2a",
+                    shared_doc("alpha", "a1", "2026-07-11T00:00:00Z"),
+                ),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let none = fetch_repo(&client, &plc, SHARED, &[]).await.unwrap();
+        assert!(none.is_empty());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty request reached the network"
+        );
+        let twice = fetch_repo(
+            &client,
+            &plc,
+            SHARED,
+            &["alpha".to_string(), "alpha".to_string()],
+        )
+        .await
+        .unwrap();
+        for read in &twice {
+            assert_eq!(
+                read.as_ref().unwrap().entries.len(),
+                1,
+                "a repeated rkey read as empty"
+            );
+        }
+    }
+
+    /// Review of #228: nothing checked that each publication's documents are
+    /// stored under ITS feed — swapping them passed the whole suite.
+    #[tokio::test]
+    async fn a_group_stores_each_publications_documents_under_its_own_feed() {
+        let (plc, _) = serve_repo(
+            SHARED,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "alpha",
+                    json!({ "name": "Alpha", "url": "https://alpha.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "beta",
+                    json!({ "name": "Beta", "url": "https://beta.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2grpaaaaa2a",
+                    shared_doc("alpha", "only-alpha", "2026-07-11T00:00:00Z"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2grpaaaaa2b",
+                    shared_doc("beta", "only-beta", "2026-07-10T00:00:00Z"),
+                ),
+            ],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        let mut feeds = Vec::new();
+        for rkey in ["alpha", "beta"] {
+            let url = format!("at://{SHARED}/{}/{rkey}", nsid::STANDARD_PUBLICATION);
+            crate::store::upsert_feed(
+                &pool,
+                &crate::store::NewFeed {
+                    url: url.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            feeds.push(
+                crate::store::get_feed_by_url(&pool, &url)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcomes = crate::feed::poll_publication_group(&pool, &client, &config, &feeds).await;
+        assert_eq!(outcomes.len(), 2);
+        for (feed, want) in feeds.iter().zip(["only-alpha", "only-beta"]) {
+            let titles: Vec<String> =
+                sqlx::query_scalar("SELECT title FROM entries WHERE feed_id = ?")
+                    .bind(feed.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                titles,
+                vec![want.to_string()],
+                "{} got another publication's documents",
+                feed.url
+            );
+        }
     }
 
     /// **A0 — the 0.4.0 acceptance test.** A subscribed publication is due, is

@@ -292,6 +292,15 @@ Today's largest measured publisher is 152 documents (about 7 pages). If a
 subscribed publication ever approaches the limit, keep the partial read on
 timeout instead of raising the deadline.
 
+**Decided in review of step 2b: a one-repo group shares one read, one 30 s
+deadline and one byte budget.** Each publication in a group has its own
+document cap and its own share of the budget, so a big sibling cannot starve a
+quiet one of records or bytes. The group still finishes when its slowest member
+does, and the DB-size watermark is checked once per group, so a group can store
+up to 16 publications past it. Neither bites at measured scale (the largest
+repo's nine publications hold 38 documents, two pages); revisit if a member's
+own reads approach 2,000 documents.
+
 ### 3. Subscribe form
 
 Accept a publication URI in the form, behind the same flag. Two spellings reach
