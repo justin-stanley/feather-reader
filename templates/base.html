@@ -4,7 +4,31 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <title>{% block title %}FeatherReader{% endblock %}</title>
+    <title>{% block title %}{{ card.title }}{% endblock %}</title>
+    {#- The link card: what a posted link to this page unfurls as. Card fetchers
+        (Bluesky's cardyb, Slack, Discord, …) read this initial HTML server-side
+        with no JS and no cookies, and resolve nothing relative — every URL below
+        is absolute on the public origin. A private view gets the site's generic
+        card and noindex; see `web::Card`. -#}
+    <meta name="description" content="{{ card.description }}" />
+    <link rel="canonical" href="{{ card.url }}" />
+    {%- if card.private %}
+    <meta name="robots" content="noindex" />
+    {%- endif %}
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FeatherReader" />
+    <meta property="og:title" content="{{ card.title }}" />
+    <meta property="og:description" content="{{ card.description }}" />
+    <meta property="og:url" content="{{ card.url }}" />
+    <meta property="og:image" content="{{ card.image }}" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="A feather beside the FeatherReader wordmark and its tagline, read, quietly." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="{{ card.title }}" />
+    <meta name="twitter:description" content="{{ card.description }}" />
+    <meta name="twitter:image" content="{{ card.image }}" />
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" />

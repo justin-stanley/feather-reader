@@ -948,6 +948,14 @@ async fn about(State(state): State<AppState>) -> Response {
         None
     };
     render(&AboutTemplate {
+        card: Card::public(
+            &state.config,
+            "/about",
+            "About — FeatherReader",
+            "What FeatherReader is and isn't: an open-source, atproto-native reader for \
+             RSS feeds and standard.site publications, run as an experiment, free to \
+             self-host under the AGPL.",
+        ),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -1081,6 +1089,13 @@ async fn stats(State(state): State<AppState>) -> Response {
     };
 
     render(&StatsTemplate {
+        card: Card::public(
+            &state.config,
+            "/stats",
+            "Stats — FeatherReader",
+            "Is this instance's poller keeping up? Aggregate feed-polling health — \
+             counts only; no feed and no reader is named.",
+        ),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -1157,8 +1172,16 @@ async fn adoption_line(state: &AppState) -> Option<AdoptionLine> {
 /// `GET /privacy` — the plain-language privacy page: no account/tracking, data
 /// lives in the user's PDS, what the server caches, and the session-token
 /// handling. A static render; readable whether or not a session exists.
-async fn privacy() -> Response {
+async fn privacy(State(state): State<AppState>) -> Response {
     render(&PrivacyTemplate {
+        card: Card::public(
+            &state.config,
+            "/privacy",
+            "Privacy — FeatherReader",
+            "No account and no tracking: your subscriptions and reading state live in \
+             your own PDS. What this server caches, for how long, and how the session \
+             token is handled.",
+        ),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -1168,8 +1191,15 @@ async fn privacy() -> Response {
 /// `GET /terms` — the terms of use: the experimental / as-is disclaimer,
 /// acceptable use, the AGPL/self-host note, and the liability limitation. A
 /// static render; readable whether or not a session exists.
-async fn terms() -> Response {
+async fn terms(State(state): State<AppState>) -> Response {
     render(&TermsTemplate {
+        card: Card::public(
+            &state.config,
+            "/terms",
+            "Terms — FeatherReader",
+            "The terms of use: an experimental service offered as-is with no warranty, \
+             what acceptable use means here, and the AGPL self-host note.",
+        ),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -1271,10 +1301,93 @@ struct Nav {
 /// trims it.
 pub(crate) const FEED_URL_PATTERN: &str = "\\s*(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Tt])://.+";
 
+// ---------------------------------------------------------------------------
+// Link cards (Open Graph / Twitter / Bluesky)
+// ---------------------------------------------------------------------------
+
+/// The site's own title: the landing page's, and the one every private view
+/// shows instead of its own.
+const SITE_TITLE: &str = "FeatherReader — read, quietly";
+
+/// The site's one-paragraph description: the landing page's, and the one every
+/// private view shows instead of its own.
+const SITE_DESCRIPTION: &str = "A minimalist, atproto-native reader for RSS feeds and \
+standard.site publications. Your subscriptions live in your own PDS — no signup, no \
+password, no tracking.";
+
+/// Where the share image is served, relative to the public origin. The file is
+/// `static/social-card.png`, rendered from `static/social-card.svg` by
+/// `scripts/social-card.sh`; `base.html` advertises its dimensions, and a test
+/// checks the PNG's own header agrees.
+const SHARE_IMAGE_PATH: &str = "/static/social-card.png";
+
+/// What a link to a page unfurls as when it is posted — on Bluesky, in a chat,
+/// anywhere that reads Open Graph tags. `base.html` renders it into `<head>`.
+///
+/// Measured before this existed: Bluesky's card service
+/// (`cardyb.bsky.app/v1/extract?url=https://feather-reader.com/`) returned
+/// `{"title":"FeatherReader — read, quietly","description":"","image":""}`,
+/// because `<title>` was the only tag it could find. Card fetchers read the
+/// initial HTML server-side, run no JS, and resolve nothing relative, so every
+/// URL here is absolute on [`Config::public_url`] — `https://feather-reader.com`
+/// in production, whatever `FEATHERREADER_PUBLIC_URL` says elsewhere.
+#[derive(Debug, Clone)]
+pub(crate) struct Card {
+    /// `og:title`. On a public page, the same text as its `<title>`.
+    pub title: String,
+    /// `og:description` and `<meta name="description">`: one or two plain
+    /// sentences about THIS page, not the site.
+    pub description: String,
+    /// `og:url` and `<link rel="canonical">`: absolute, on the public origin.
+    pub url: String,
+    /// `og:image`: absolute, on the public origin.
+    pub image: String,
+    /// Set on a page that renders a session's private view. The card is then
+    /// the site's generic one — nothing from the view reaches `<head>` — and
+    /// the page is `noindex`.
+    pub private: bool,
+}
+
+impl Card {
+    /// The card of the public page at `path` (leading slash) on this instance.
+    fn public(
+        config: &Config,
+        path: &str,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        let origin = config.public_url.trim_end_matches('/');
+        Card {
+            title: title.into(),
+            description: description.into(),
+            url: format!("{origin}{path}"),
+            image: format!("{origin}{SHARE_IMAGE_PATH}"),
+            private: false,
+        }
+    }
+
+    /// The landing page's card: the site's own title and description.
+    fn site(config: &Config) -> Self {
+        Card::public(config, "/", SITE_TITLE, SITE_DESCRIPTION)
+    }
+
+    /// The card of a page that renders a session's private view: the site's
+    /// generic card pointing at the front door, plus `noindex`. The view's
+    /// heading, feed names and handle stay out of `<head>`.
+    fn private(config: &Config) -> Self {
+        Card {
+            private: true,
+            ..Card::site(config)
+        }
+    }
+}
+
 /// The reader index (`GET /`).
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
+    /// The link card. A private view: the site's generic card, `noindex`.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1320,6 +1433,8 @@ struct IndexTemplate {
 #[derive(Template)]
 #[template(path = "manage.html")]
 struct ManageTemplate {
+    /// The link card. A private view: the site's generic card, `noindex`.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1358,6 +1473,8 @@ struct AdoptionLine {
 #[derive(Template)]
 #[template(path = "about.html")]
 struct AboutTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1381,6 +1498,8 @@ struct AboutTemplate {
 #[derive(Template)]
 #[template(path = "stats.html")]
 struct StatsTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1412,6 +1531,8 @@ struct StatsTemplate {
 #[derive(Template)]
 #[template(path = "privacy.html")]
 struct PrivacyTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1422,6 +1543,8 @@ struct PrivacyTemplate {
 #[derive(Template)]
 #[template(path = "terms.html")]
 struct TermsTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1432,6 +1555,8 @@ struct TermsTemplate {
 #[derive(Template)]
 #[template(path = "landing.html")]
 struct LandingTemplate {
+    /// The link card: the site's own title and description.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     crates_url: &'static str,
@@ -1445,6 +1570,8 @@ struct LandingTemplate {
 #[derive(Template)]
 #[template(path = "entry.html")]
 struct EntryTemplate {
+    /// The link card. A private view: the site's generic card, `noindex`.
+    card: Card,
     version: &'static str,
     repo_url: &'static str,
     kofi_url: &'static str,
@@ -1501,6 +1628,8 @@ struct EntryActionBarTemplate {
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     repo_url: &'static str,
     error: String,
     /// A neutral/success banner (e.g. the post-delete "signed out" confirmation),
@@ -1512,6 +1641,8 @@ struct LoginTemplate {
 #[derive(Template)]
 #[template(path = "beta_redeem.html")]
 struct BetaRedeemTemplate {
+    /// The link card: this page's own title and description.
+    card: Card,
     repo_url: &'static str,
     error: String,
     /// When true the seat cap is full: hide the form and show the "capacity
@@ -1914,6 +2045,7 @@ async fn index(
         // /login. /login remains the entry point for the actual OAuth sign-in.
         None => {
             return Ok(render(&LandingTemplate {
+                card: Card::site(&state.config),
                 version: VERSION,
                 repo_url: REPO_URL,
                 crates_url: CRATES_URL,
@@ -2368,6 +2500,7 @@ async fn index(
     let next_href = (page * ENTRIES_PER_PAGE < total).then(|| page_href(page + 1));
 
     let tmpl = IndexTemplate {
+        card: Card::private(&state.config),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -2426,6 +2559,7 @@ async fn manage(
     );
 
     let tmpl = ManageTemplate {
+        card: Card::private(&state.config),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -2667,6 +2801,7 @@ async fn entry_view(
     );
 
     let tmpl = EntryTemplate {
+        card: Card::private(&state.config),
         version: VERSION,
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
@@ -3688,6 +3823,7 @@ async fn login_form(
         return start_oauth(&state, &handle).await;
     }
     render(&LoginTemplate {
+        card: login_card(&state.config),
         repo_url: REPO_URL,
         error: q.error.unwrap_or_default(),
         flash: q.flash.unwrap_or_default(),
@@ -3703,7 +3839,7 @@ async fn login_submit(
 ) -> Response {
     let handle = form.handle.trim();
     if handle.is_empty() {
-        return login_error("Enter your atproto handle.");
+        return login_error(&state, "Enter your atproto handle.");
     }
     if !may_start_oauth(&state, &headers, handle).await {
         return Redirect::to("/beta/redeem").into_response();
@@ -3813,7 +3949,7 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
         crate::metrics::Backend::Rust => {
             let Some(runtime) = state.oauth.as_deref() else {
                 warn!("the rust backend is live but its OAuth runtime is absent");
-                return login_error("Login is not available right now.");
+                return login_error(state, "Login is not available right now.");
             };
             match crate::oauth::login::start(
                 runtime,
@@ -3842,7 +3978,7 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
                     // The handle the user typed is logged; the error is not shown
                     // to them verbatim, since it can name internal hosts.
                     warn!(%err, %handle, "could not start the OAuth login");
-                    login_error("Could not start login for that handle.")
+                    login_error(state, "Could not start login for that handle.")
                 }
             }
         }
@@ -3962,7 +4098,7 @@ async fn oauth_callback(
             "OAuth callback returned an error"
         );
         if sidecar_handoff || state.oauth.is_none() {
-            return login_error(&format!("Login failed: {slug}"));
+            return login_error(&state, &format!("Login failed: {slug}"));
         }
         // Fall through: the Rust arm consumes the pending row and validates
         // `iss` against it, and reports the failure afterwards.
@@ -3976,17 +4112,17 @@ async fn oauth_callback(
             Ok(Some(s)) => s,
             Ok(None) => {
                 warn!("OAuth callback session_id did not resolve (expired/unknown)");
-                return login_error("Login session expired — please try again.");
+                return login_error(&state, "Login session expired — please try again.");
             }
             Err(err) => {
                 warn!(%err, "failed to resolve OAuth session via the sidecar");
-                return login_error("Login failed talking to the auth service.");
+                return login_error(&state, "Login failed talking to the auth service.");
             }
         }
     } else {
         let Some(runtime) = state.oauth.as_deref() else {
             warn!("an OAuth callback arrived with no sidecar session and no Rust runtime");
-            return login_error("Login failed: this login could not be completed.");
+            return login_error(&state, "Login failed: this login could not be completed.");
         };
         let params = crate::oauth::flow::CallbackParams {
             code: q.code.clone(),
@@ -4019,7 +4155,7 @@ async fn oauth_callback(
                 // Never echoed to the browser: the message can name the issuer,
                 // the PDS, and why a binding check failed.
                 warn!(%err, "could not complete the OAuth callback");
-                let mut resp = login_error("Login failed — please try again.");
+                let mut resp = login_error(&state, "Login failed — please try again.");
                 clear_binding_cookie(&mut resp);
                 return resp;
             }
@@ -4056,14 +4192,14 @@ async fn oauth_callback(
             }
             Ok(Err(policy)) => {
                 warn!(did = %session.did, ?policy, "invite redeem failed at callback");
-                let mut resp = redeem_bounce(&policy).into_response();
+                let mut resp = redeem_bounce(&state, &policy).into_response();
                 // The reservation is spent/invalid — drop the stale invite cookie.
                 clear_invite_cookie(&mut resp);
                 return resp;
             }
             Err(err) => {
                 warn!(%err, did = %session.did, "invite redeem infra error at callback");
-                return login_error("Login failed while confirming your invite.");
+                return login_error(&state, "Login failed while confirming your invite.");
             }
         }
     }
@@ -4309,9 +4445,21 @@ async fn account_delete(
     Ok(resp)
 }
 
+/// The `/login` card, shared by the form and its error re-render.
+fn login_card(config: &Config) -> Card {
+    Card::public(
+        config,
+        "/login",
+        "Sign in — FeatherReader",
+        "Sign in to FeatherReader with your atproto handle. You approve access on \
+         your own server — no signup, no password.",
+    )
+}
+
 /// Re-render the login form with an error banner.
-fn login_error(msg: &str) -> Response {
+fn login_error(state: &AppState, msg: &str) -> Response {
     render(&LoginTemplate {
+        card: login_card(&state.config),
         repo_url: REPO_URL,
         error: msg.to_string(),
         flash: String::new(),
@@ -4336,6 +4484,7 @@ async fn beta_redeem_form(State(state): State<AppState>) -> Response {
         .map(|n| n >= state.config.beta_cap)
         .unwrap_or(false);
     render(&BetaRedeemTemplate {
+        card: redeem_card(&state.config),
         repo_url: REPO_URL,
         error: String::new(),
         capacity_full: full,
@@ -4358,6 +4507,7 @@ async fn beta_redeem_submit(
     let code = form.code.trim().to_uppercase();
     if code.is_empty() {
         return render(&BetaRedeemTemplate {
+            card: redeem_card(&state.config),
             repo_url: REPO_URL,
             error: "Enter your invite code.".to_string(),
             capacity_full: false,
@@ -4374,7 +4524,7 @@ async fn beta_redeem_submit(
         }
         Err(policy) => {
             warn!(?policy, "invite code preflight rejected");
-            redeem_bounce(&policy)
+            redeem_bounce(&state, &policy)
         }
     }
 }
@@ -4427,7 +4577,7 @@ async fn preflight_code(state: &AppState, code: &str) -> Result<(), store::Redee
 
 /// Map a [`store::RedeemError`] to the invite page with the right message. Used
 /// by both the preflight (`POST /beta/redeem`) and the callback bind path.
-fn redeem_bounce(policy: &store::RedeemError) -> Response {
+fn redeem_bounce(state: &AppState, policy: &store::RedeemError) -> Response {
     use store::RedeemError::*;
     let (msg, capacity_full) = match policy {
         NotFound => ("That invite code isn't valid.", false),
@@ -4436,10 +4586,23 @@ fn redeem_bounce(policy: &store::RedeemError) -> Response {
         CapacityFull => ("", true),
     };
     render(&BetaRedeemTemplate {
+        card: redeem_card(&state.config),
         repo_url: REPO_URL,
         error: msg.to_string(),
         capacity_full,
     })
+}
+
+/// The `/beta/redeem` card, shared by the form, its re-renders and the claim
+/// link's bounce.
+fn redeem_card(config: &Config) -> Card {
+    Card::public(
+        config,
+        "/beta/redeem",
+        "Redeem an invite — FeatherReader",
+        "Redeem a closed-beta invite code for this FeatherReader instance, then sign \
+         in with your atproto handle.",
+    )
 }
 
 /// Query for `POST /admin/invites` — how many codes to mint (`?n=`, default 1).
@@ -4665,7 +4828,7 @@ async fn claim(State(state): State<AppState>, Query(q): Query<ClaimQuery>) -> Re
         Some(t) if !t.is_empty() => t,
         _ => {
             warn!("claim link with no token");
-            return redeem_bounce(&store::RedeemError::NotFound);
+            return redeem_bounce(&state, &store::RedeemError::NotFound);
         }
     };
 
@@ -4675,7 +4838,7 @@ async fn claim(State(state): State<AppState>, Query(q): Query<ClaimQuery>) -> Re
         Some(c) => c,
         None => {
             warn!("claim token invalid (bad signature / malformed)");
-            return redeem_bounce(&store::RedeemError::NotFound);
+            return redeem_bounce(&state, &store::RedeemError::NotFound);
         }
     };
 
@@ -4692,7 +4855,7 @@ async fn claim(State(state): State<AppState>, Query(q): Query<ClaimQuery>) -> Re
         }
         Err(policy) => {
             warn!(?policy, "claim token preflight rejected");
-            redeem_bounce(&policy)
+            redeem_bounce(&state, &policy)
         }
     }
 }
@@ -7207,7 +7370,12 @@ mod tests {
         let did = "did:plc:reader";
         let state = standard_site_state(false, did).await;
         assert!(!state.config.standard_site);
-        let body = signed_in_body(state, "/manage", did).await;
+        let page = signed_in_body(state, "/manage", did).await;
+        // The `<head>` carries the site's link card, whose one-line description
+        // names standard.site whatever the flag says — as the landing page does
+        // with the flag off (a stored publication is polled regardless). What
+        // must not advertise is the page: everything after `</head>`.
+        let body = &page[page.find("</head>").expect("a <head>")..];
         assert!(
             !body.contains("site.standard.publication"),
             "a refused form must not be advertised: {body}"
@@ -7217,7 +7385,7 @@ mod tests {
             "a refused form must not be advertised: {body}"
         );
         assert!(
-            feed_url_input(&body).contains("type=\"url\""),
+            feed_url_input(body).contains("type=\"url\""),
             "with the flag off the input is unchanged"
         );
     }
@@ -7376,6 +7544,242 @@ mod tests {
             home.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    // -- link cards (Open Graph) -----------------------------------------------
+    //
+    // Bluesky's card service fetches the HTML server-side, runs no JS, and
+    // resolves nothing relative. Measured before these tags existed:
+    // `cardyb.bsky.app/v1/extract?url=https://feather-reader.com/` returned
+    // `{"title":"FeatherReader — read, quietly","description":"","image":""}`.
+
+    /// Everything up to `</head>` — the only part a card fetcher reads.
+    fn head(body: &str) -> &str {
+        let end = body.find("</head>").expect("a <head>");
+        &body[..end]
+    }
+
+    /// The `content` of the first `<meta …>` tag carrying `attr` (e.g.
+    /// `property="og:title"`), or `None` when no tag carries it.
+    fn meta(head: &str, attr: &str) -> Option<String> {
+        let tag_start = head.find(attr)?;
+        let rest = &head[tag_start..];
+        let tag_end = rest.find('>')?;
+        let tag = &rest[..tag_end];
+        let content = tag.find("content=\"")? + "content=\"".len();
+        let close = tag[content..].find('"')?;
+        Some(tag[content..content + close].to_string())
+    }
+
+    /// A state whose public origin is production's. The card URLs must be
+    /// absolute on THAT origin: a relative `/static/…` is what the card
+    /// fetcher cannot use.
+    async fn production_origin_state() -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &["did:plc:admin".to_string()])
+            .await
+            .unwrap();
+        let config = Config {
+            allowed_dids: vec!["did:plc:admin".to_string()],
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            public_url: "https://feather-reader.com".to_string(),
+            ..Config::default()
+        };
+        AppState::new(config, db).unwrap()
+    }
+
+    /// The landing page and /about each carry a complete card with absolute
+    /// https URLs, and the two describe different things.
+    #[tokio::test]
+    async fn landing_and_about_render_open_graph_cards_with_absolute_urls() {
+        let landing = public_body(production_origin_state().await, "/").await;
+        let about = public_body(production_origin_state().await, "/about").await;
+        let (lh, ah) = (head(&landing), head(&about));
+
+        assert_eq!(
+            meta(lh, "property=\"og:title\"").as_deref(),
+            Some("FeatherReader — read, quietly"),
+            "{lh}"
+        );
+        assert_eq!(
+            meta(ah, "property=\"og:title\"").as_deref(),
+            Some("About — FeatherReader"),
+            "{ah}"
+        );
+        for (h, path) in [(lh, "/"), (ah, "/about")] {
+            let url = format!("https://feather-reader.com{path}");
+            assert_eq!(
+                meta(h, "property=\"og:url\"").as_deref(),
+                Some(url.as_str())
+            );
+            assert!(
+                h.contains(&format!("<link rel=\"canonical\" href=\"{url}\"")),
+                "{path} must carry a canonical link: {h}"
+            );
+            let image = meta(h, "property=\"og:image\"").unwrap_or_default();
+            assert!(
+                image.starts_with("https://feather-reader.com/static/"),
+                "{path}: og:image must be absolute on the public origin, got {image:?}"
+            );
+            assert_eq!(
+                meta(h, "name=\"twitter:card\"").as_deref(),
+                Some("summary_large_image")
+            );
+            assert_eq!(meta(h, "property=\"og:type\"").as_deref(), Some("website"));
+            assert_eq!(
+                meta(h, "property=\"og:site_name\"").as_deref(),
+                Some("FeatherReader")
+            );
+            let description = meta(h, "property=\"og:description\"").unwrap_or_default();
+            assert!(!description.is_empty(), "{path}: og:description is empty");
+            assert_eq!(
+                meta(h, "name=\"description\"").as_deref(),
+                Some(description.as_str()),
+                "{path}: the meta description and og:description must agree"
+            );
+        }
+        assert_ne!(
+            meta(lh, "property=\"og:description\""),
+            meta(ah, "property=\"og:description\""),
+            "the landing page and /about must not share a description"
+        );
+    }
+
+    /// The origin comes from `FEATHERREADER_PUBLIC_URL`, not a constant.
+    #[tokio::test]
+    async fn card_urls_follow_the_configured_public_url() {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &[]).await.unwrap();
+        let config = Config {
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            public_url: "https://reader.example.org".to_string(),
+            ..Config::default()
+        };
+        let body = public_body(AppState::new(config, db).unwrap(), "/privacy").await;
+        let h = head(&body);
+        assert_eq!(
+            meta(h, "property=\"og:url\"").as_deref(),
+            Some("https://reader.example.org/privacy")
+        );
+        assert_eq!(
+            meta(h, "property=\"og:image\"").as_deref(),
+            Some("https://reader.example.org/static/social-card.png")
+        );
+    }
+
+    /// Every signed-out page describes itself: no two share a description,
+    /// and each `og:url` is its own path.
+    #[tokio::test]
+    async fn public_pages_each_carry_their_own_description() {
+        let paths = [
+            "/",
+            "/about",
+            "/privacy",
+            "/terms",
+            "/stats",
+            "/login",
+            "/beta/redeem",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            let body = public_body(production_origin_state().await, path).await;
+            let h = head(&body);
+            let description = meta(h, "name=\"description\"").unwrap_or_default();
+            assert!(!description.is_empty(), "{path} has no description: {h}");
+            assert!(
+                seen.insert(description.clone()),
+                "{path} repeats another page's description: {description:?}"
+            );
+            assert_eq!(
+                meta(h, "property=\"og:url\"").as_deref(),
+                Some(format!("https://feather-reader.com{path}").as_str()),
+                "{path}"
+            );
+            assert!(
+                !h.contains("name=\"robots\""),
+                "{path} is public and must not be noindex: {h}"
+            );
+        }
+    }
+
+    /// The share image is served from `/static` as a PNG of the dimensions the
+    /// tags promise, well under the 1 MB card fetchers tolerate, and cacheable.
+    #[tokio::test]
+    async fn share_image_is_served_as_a_png_of_the_advertised_size() {
+        let landing = public_body(production_origin_state().await, "/").await;
+        let h = head(&landing);
+        let image = meta(h, "property=\"og:image\"").unwrap();
+        let path = image.strip_prefix("https://feather-reader.com").unwrap();
+        let width: u32 = meta(h, "property=\"og:image:width\"")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let height: u32 = meta(h, "property=\"og:image:height\"")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!((width, height), (1200, 630), "Bluesky renders ~1.91:1");
+        assert_eq!(
+            meta(h, "property=\"og:image:type\"").as_deref(),
+            Some("image/png")
+        );
+        assert!(
+            !meta(h, "property=\"og:image:alt\"")
+                .unwrap_or_default()
+                .is_empty(),
+            "the image needs alt text"
+        );
+
+        let resp = router(production_origin_state().await)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "public, max-age=300");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("the image is under 1 MB");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+        // IHDR: width and height, big-endian, at offsets 16 and 20.
+        let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            (be(16), be(20)),
+            (width, height),
+            "the PNG's own dimensions must match the tags"
+        );
+    }
+
+    /// A page that renders a session's private view carries the site's generic
+    /// card — nothing from the view reaches `<head>` — and is `noindex`.
+    #[tokio::test]
+    async fn private_pages_keep_user_data_out_of_the_card() {
+        for path in ["/", "/manage"] {
+            let state = production_origin_state().await;
+            let body = signed_in_body(state, path, "did:plc:admin").await;
+            let h = head(&body);
+            assert!(
+                h.contains("<meta name=\"robots\" content=\"noindex\""),
+                "{path}: a private view must be noindex: {h}"
+            );
+            assert_eq!(
+                meta(h, "property=\"og:title\"").as_deref(),
+                Some("FeatherReader — read, quietly"),
+                "{path}: the card of a private view is the site's generic one"
+            );
+            assert_eq!(
+                meta(h, "property=\"og:url\"").as_deref(),
+                Some("https://feather-reader.com/"),
+                "{path}: og:url of a private view is the front door, not the private path"
+            );
+            for private in ["reader.example", "did:plc:admin"] {
+                assert!(
+                    !h.contains(private),
+                    "{path}: {private:?} must not reach <head>: {h}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -10781,6 +11185,7 @@ mod tests {
             folder: None,
         };
         let tmpl = ManageTemplate {
+            card: Card::private(&Config::default()),
             version: VERSION,
             repo_url: REPO_URL,
             kofi_url: KOFI_URL,
