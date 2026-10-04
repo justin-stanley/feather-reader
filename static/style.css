@@ -1191,6 +1191,17 @@ kbd {
   color: var(--muted);
 }
 
+/* Inline record names and at:// URIs in hints and prose. A publication URI is
+   one unbroken token longer than a phone is wide, so it must be allowed to
+   wrap anywhere rather than force a horizontal scroll. */
+.form-hint code,
+.point code,
+.about code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
 /* Discovered feed card (htmx swaps this in under the form) */
 .discovered {
   display: flex;
@@ -2104,6 +2115,15 @@ html[data-overlay="1"] .kbd-overlay {
   color: var(--ink-soft);
 }
 
+.point a {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.point a:hover {
+  text-decoration-color: var(--accent);
+}
+
 .experiment {
   margin: var(--s7) 0 var(--s6);
   padding-top: var(--s5);
@@ -2138,7 +2158,8 @@ html[data-overlay="1"] .kbd-overlay {
     max-width: 52rem;
   }
   .points {
-    grid-template-columns: 1fr 1fr 1fr;
+    /* Four points: two by two, so no row is left with a lone column. */
+    grid-template-columns: 1fr 1fr;
     gap: var(--s5);
   }
   .shot {

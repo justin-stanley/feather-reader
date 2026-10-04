@@ -16,6 +16,40 @@ deploying is separate.
 
 ## Unreleased
 
+### Added
+
+- **The website says what 0.4.0 does.** The landing page and `/about` describe
+  standard.site publications beside RSS feeds — what a publication is (a
+  `site.standard.publication` record whose articles are
+  `site.standard.document` records in the author's repo), what is shown (title,
+  date, link, plain-text summary; never the per-platform `content`), that the
+  subscription is the same portable `community.lexicon.rss.subscription`
+  record, and how to subscribe. The subscribe form on `/manage` gains a hint
+  with both accepted spellings, `at://did:plc:…/site.standard.publication/…`
+  and the handle form. **Every how-to-subscribe line is conditional on
+  `FEATHERREADER_STANDARD_SITE`**: with it off, `add_subscription` refuses
+  every `at://` paste, so the pages say the instance is not accepting new
+  publication subscriptions instead of advertising a form that would be
+  refused. The flag is threaded into `LandingTemplate`, `AboutTemplate` and
+  `ManageTemplate`; `web` tests pin both states of each page.
+
+### Fixed
+
+- **The DID form of a publication URI could not be submitted from a browser.**
+  The subscribe input was `type="url"`, which browsers validate with the WHATWG
+  URL parser — and that parser rejects `at://did:plc:…/…` (the colons in the
+  DID read as a port), the same failure `url::Url::parse` has that
+  `feed::is_storable_feed_url` works around. So the form #230 added accepted
+  the DID form on the server and refused it client-side, with no request
+  sent. Established with Node's WHATWG `URL` (`ERR_INVALID_URL` for the DID
+  form; the handle form parses). With the flag on the input is now
+  `type="text"` with `inputmode="url"`; with it off it is unchanged. A text
+  input loses the browser's scheme check, so it carries a `pattern`
+  (`web::FEED_URL_PATTERN`) that still asks for `http(s)://` or `at://`, in
+  any case and with surrounding whitespace allowed (a text input, unlike
+  `type="url"`, does not trim before checking); otherwise `example.com/blog`
+  reached the handler and came back as "Couldn't find a feed".
+
 ### CI
 
 - **The crate publish is dispatched by `release-image`, not triggered by

@@ -20,8 +20,8 @@
       <h1>FeatherReader is a calm, quiet reader — and a public experiment.</h1>
 
       <p class="about-lede">
-        A typography-first RSS reader for people who left algorithmic feeds on
-        purpose. Read, quietly.
+        A typography-first reader of RSS feeds and standard.site publications,
+        for people who left algorithmic feeds on purpose. Read, quietly.
       </p>
 
       <h2>This is an experiment</h2>
@@ -47,6 +47,39 @@
         its secret in the URL, and this server never stores or writes such a secret
         anywhere. Private/paid-feed support will arrive when atproto's permissioned
         data (private records) ships.
+      </p>
+
+      <h2>RSS feeds and standard.site publications</h2>
+      <p>
+        FeatherReader reads two kinds of subscription. One is the ordinary public
+        RSS or Atom feed. The other is a
+        <a href="https://standard.site" rel="noopener noreferrer">standard.site</a>
+        publication: a <code>site.standard.publication</code> record in the
+        author's own atproto repo, whose articles are
+        <code>site.standard.document</code> records in the same repo. There is
+        no feed document to fetch — FeatherReader reads those records directly,
+        without signing in to anything, and shows each article's title, date,
+        link and plain-text summary. It deliberately does not render a
+        document's rich <code>content</code>, which differs from one publishing
+        platform to the next; the link takes you to the article as the author
+        published it.
+      </p>
+      <p>
+        A publication subscription is the same
+        <code>community.lexicon.rss.subscription</code> record as a feed, with
+        the publication's <code>at://</code> URI where a feed URL would be, so it
+        is just as portable. Publications are re-read on the same interval as
+        feeds and sit beside them in the reading list, in order.
+        {% if standard_site %}
+          To subscribe, paste <code>at://did:plc:…/site.standard.publication/…</code>
+          into the subscribe form — or the handle form
+          <code>at://alice.example.com/site.standard.publication/…</code>, which
+          is resolved to its DID before it is saved. Only the DID form is stored,
+          because a handle is a mutable name for an account.
+        {% else %}
+          This instance isn't accepting new publication subscriptions yet;
+          publications it already follows are still read.
+        {% endif %}
       </p>
 
       <h2>Open source &amp; self-hostable</h2>

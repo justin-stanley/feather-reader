@@ -16,8 +16,8 @@
     <p class="hero-tag">read, quietly</p>
 
     <p class="hero-lede">
-      A minimalist, atproto-native RSS reader — your subscriptions live in
-      <strong>your own PDS</strong>.
+      A minimalist, atproto-native reader for RSS feeds and standard.site
+      publications — your subscriptions live in <strong>your own PDS</strong>.
     </p>
 
     <div class="hero-cta">
@@ -58,6 +58,22 @@
         open-standard <code>community.lexicon.rss.*</code> records in
         <em>your</em> atproto PDS — portable to any reader that speaks the
         lexicon. Leaving is as easy as arriving.
+      </p>
+    </li>
+    <li class="point">
+      <h2>RSS feeds and standard.site publications</h2>
+      <p>
+        Subscribe to any public RSS or Atom feed — or to a
+        <a href="https://standard.site" rel="noopener noreferrer">standard.site</a>
+        publication, whose articles are records in the author's own atproto
+        repo rather than a feed document. Both sit in the same list, in order.
+        {% if standard_site %}
+          Paste <code>at://did:plc:…/site.standard.publication/…</code>, or the
+          handle form <code>at://alice.example.com/site.standard.publication/…</code>.
+        {% else %}
+          This instance isn't accepting new publication subscriptions yet;
+          publications it already follows are still read.
+        {% endif %}
       </p>
     </li>
     <li class="point">
