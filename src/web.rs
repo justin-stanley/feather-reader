@@ -230,6 +230,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/about", get(about))
+        .route("/standard-site", get(standard_site))
         .route("/stats", get(stats))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
@@ -626,7 +627,7 @@ async fn rate_limit(
 
 /// Cache-Control middleware. Emits `public, max-age=300` on the cacheable
 /// logged-out surfaces (the `/login` landing without a handle, `/about`,
-/// `/privacy`, `/terms`, and the `/static/*` assets) and `no-store` on the
+/// `/standard-site`, `/privacy`, `/terms`, and the `/static/*` assets) and `no-store` on the
 /// authenticated app pages, so a CDN /
 /// browser can hold the viral landing while never caching a signed-in user's
 /// private view. Never overrides a handler that already set Cache-Control.
@@ -639,6 +640,7 @@ async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
         && !req.uri().query().unwrap_or("").contains("handle=");
     let public = is_login_landing
         || path == "/about"
+        || path == "/standard-site"
         || path == "/privacy"
         || path == "/terms"
         || path.starts_with("/static/");
@@ -953,6 +955,21 @@ async fn about(State(state): State<AppState>) -> Response {
         kofi_url: KOFI_URL,
         adoption,
         standard_site: state.config.standard_site,
+    })
+}
+
+/// `GET /standard-site` — the public feature page for standard.site
+/// publications: what a publication is, what FeatherReader shows from one, how
+/// to subscribe, the limits, and the latest releases. Readable whether or not
+/// a session exists, like `/about`. Every how-to-subscribe line is conditional
+/// on `Config::standard_site`, as on the other public pages.
+async fn standard_site(State(state): State<AppState>) -> Response {
+    render(&StandardSiteTemplate {
+        version: VERSION,
+        repo_url: REPO_URL,
+        kofi_url: KOFI_URL,
+        standard_site: state.config.standard_site,
+        releases: RELEASES,
     })
 }
 
@@ -1367,6 +1384,75 @@ struct AboutTemplate {
     standard_site: bool,
 }
 
+/// The public `/standard-site` feature page. Carries the same footer fields
+/// as the other public pages, the standard.site flag, and the release list for
+/// the "latest releases" call-out.
+#[derive(Template)]
+#[template(path = "standard_site.html")]
+struct StandardSiteTemplate {
+    version: &'static str,
+    repo_url: &'static str,
+    kofi_url: &'static str,
+    /// `Config::standard_site`: whether the page may tell a visitor how to
+    /// subscribe to a publication here. See [`ManageTemplate::standard_site`].
+    standard_site: bool,
+    /// [`RELEASES`], newest first, for `templates/releases.html`.
+    releases: &'static [Release],
+}
+
+/// One tagged release, as the "latest releases" call-out
+/// (`templates/releases.html`) shows it on `/standard-site` and the landing
+/// page. The links are derived from `version` and `date`, so a release is
+/// described in exactly one place: an entry in [`RELEASES`].
+pub(crate) struct Release {
+    /// The crate version, without the `v` (`"0.4.1"`). The tag is `v{version}`.
+    pub(crate) version: &'static str,
+    /// The release date, `YYYY-MM-DD`, as the CHANGELOG heading has it.
+    pub(crate) date: &'static str,
+    /// One or two plain sentences for a visitor. No markup: the template escapes it.
+    pub(crate) summary: &'static str,
+}
+
+impl Release {
+    /// The GitHub release page: `{REPO_URL}/releases/tag/v{version}`.
+    pub(crate) fn url(&self) -> String {
+        format!("{REPO_URL}/releases/tag/v{}", self.version)
+    }
+
+    /// The release's section of `CHANGELOG.md` on `main`. GitHub derives the
+    /// anchor for a heading `## 0.4.1 — 2026-10-04` as `041--2026-10-04`: the
+    /// dots dropped, the em dash dropped, each space a hyphen.
+    pub(crate) fn changelog_url(&self) -> String {
+        format!(
+            "{REPO_URL}/blob/main/CHANGELOG.md#{}--{}",
+            self.version.replace('.', ""),
+            self.date
+        )
+    }
+}
+
+/// **The one place a release is described for the website.** Newest first.
+/// To announce the next release, add one entry at the top; the call-out on
+/// `/standard-site` and the landing page, and both links, follow from it.
+/// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
+pub(crate) const RELEASES: &[Release] = &[
+    Release {
+        version: "0.4.1",
+        date: "2026-10-04",
+        summary: "The public pages explain standard.site publications, and the \
+                  subscribe form can submit the DID form of a publication URI, \
+                  which browsers refused in 0.4.0.",
+    },
+    Release {
+        version: "0.4.0",
+        date: "2026-10-03",
+        summary: "standard.site support: publications are read from their \
+                  authors' atproto repos as subscriptions, beside RSS, on their \
+                  own polling loop. Every stored field from a feed or a \
+                  publication now has a size bound.",
+    },
+];
+
 /// The public `/stats` page — is the poller keeping up?
 ///
 /// Aggregate only, deliberately. It is published to anyone, so it carries no
@@ -1439,6 +1525,8 @@ struct LandingTemplate {
     /// `Config::standard_site`: whether the publications point may tell a
     /// visitor how to subscribe to one here. See [`ManageTemplate::standard_site`].
     standard_site: bool,
+    /// [`RELEASES`], newest first, for the quiet "latest releases" strip.
+    releases: &'static [Release],
 }
 
 /// The single-entry reader view (`GET /entries/:id`).
@@ -1919,6 +2007,7 @@ async fn index(
                 crates_url: CRATES_URL,
                 kofi_url: KOFI_URL,
                 standard_site: state.config.standard_site,
+                releases: RELEASES,
             }))
         }
     };
@@ -7212,8 +7301,20 @@ mod tests {
             !body.contains("site.standard.publication"),
             "a refused form must not be advertised: {body}"
         );
+        // The shared footer links the `/standard-site` feature page on every
+        // page, flag on or off — that page itself says the instance isn't
+        // accepting new publication subscriptions — so the check is on the
+        // page above the footer, where the form and its hints are.
+        let above_footer = body
+            .split("<footer")
+            .next()
+            .expect("split yields at least one piece");
         assert!(
-            !body.contains("standard.site"),
+            above_footer.contains("id=\"feed-url\""),
+            "the form must be above the footer: {body}"
+        );
+        assert!(
+            !above_footer.contains("standard.site"),
             "a refused form must not be advertised: {body}"
         );
         assert!(
@@ -7291,6 +7392,176 @@ mod tests {
         assert!(
             body.contains("isn't accepting new publication subscriptions"),
             "{body}"
+        );
+    }
+
+    // ---- the standard.site feature page (`/standard-site`) -----------------
+    //
+    // A public page, like `/about`: what a publication is, what is shown from
+    // it, how to subscribe (flag-conditional, as on the other public pages),
+    // and the honest limits. It also carries the "latest releases" call-out.
+
+    /// Signed out, with the default config, the page renders.
+    #[tokio::test]
+    async fn standard_site_page_renders_signed_out() {
+        let body = public_body(test_state(&[]).await, "/standard-site").await;
+        assert!(body.contains("site.standard.publication"), "{body}");
+        assert!(body.contains("site.standard.document"), "{body}");
+        assert!(
+            body.contains("<title>standard.site — FeatherReader</title>"),
+            "{body}"
+        );
+    }
+
+    /// Flag on: the page says how to subscribe, in both spellings, and that a
+    /// handle is resolved to its DID.
+    #[tokio::test]
+    async fn standard_site_page_tells_how_to_subscribe_when_on() {
+        let body = public_body(
+            standard_site_state(true, "did:plc:x").await,
+            "/standard-site",
+        )
+        .await;
+        assert!(
+            body.contains("at://did:plc:…/site.standard.publication/…"),
+            "the DID form must be shown: {body}"
+        );
+        assert!(
+            body.contains("at://alice.example.com/site.standard.publication/…"),
+            "the handle form must be shown: {body}"
+        );
+        assert!(
+            body.contains("resolved to its DID"),
+            "the handle resolution must be stated: {body}"
+        );
+        assert!(
+            !body.contains("isn't accepting new publication subscriptions"),
+            "{body}"
+        );
+    }
+
+    /// Flag off: `add_subscription` refuses every `at://` paste, so the page
+    /// must not tell visitors to paste one — it says new publication
+    /// subscriptions are not accepted here, and that stored ones are still read.
+    #[tokio::test]
+    async fn standard_site_page_does_not_tell_visitors_to_paste_when_off() {
+        let state = standard_site_state(false, "did:plc:x").await;
+        assert!(!state.config.standard_site);
+        let body = public_body(state, "/standard-site").await;
+        assert!(body.contains("site.standard.publication"), "{body}");
+        assert!(
+            !body.contains("at://did:plc:…/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            !body.contains("at://alice.example.com/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            body.contains("isn't accepting new publication subscriptions"),
+            "the page must say the form is closed here: {body}"
+        );
+        assert!(
+            body.contains("already follows are still read"),
+            "stored publications are polled whatever the flag says: {body}"
+        );
+    }
+
+    /// The releases call-out links each release's GitHub page and the
+    /// changelog, on the feature page and on the landing page.
+    #[tokio::test]
+    async fn releases_callout_links_the_release_pages() {
+        for path in ["/standard-site", "/"] {
+            let body = public_body(test_state(&[]).await, path).await;
+            for tag in ["v0.4.1", "v0.4.0"] {
+                let href = format!(
+                    "href=\"https://github.com/justin-stanley/feather-reader/releases/tag/{tag}\""
+                );
+                assert!(body.contains(&href), "{path} must link {tag}: {body}");
+            }
+            assert!(
+                body.contains(
+                    "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md"
+                ),
+                "{path} must link the changelog: {body}"
+            );
+        }
+    }
+
+    /// The feature page is reachable from the landing page, from `/about`, and
+    /// from the shared footer (`/privacy` renders nothing but prose and that
+    /// footer, so it stands in for every page that includes it).
+    #[tokio::test]
+    async fn landing_about_and_footer_link_the_standard_site_page() {
+        for path in ["/", "/about", "/privacy"] {
+            let body = public_body(test_state(&[]).await, path).await;
+            assert!(
+                body.contains("href=\"/standard-site\""),
+                "{path} must link the feature page: {body}"
+            );
+        }
+    }
+
+    /// `RELEASES` is the one place a release is described, so its shape is
+    /// pinned: newest first, dates as the CHANGELOG headings spell them, and
+    /// both derived links pointing where the template promises.
+    #[test]
+    fn releases_are_newest_first_and_link_the_tag_and_changelog() {
+        assert!(!RELEASES.is_empty());
+        let parse = |v: &str| -> Vec<u32> {
+            v.split('.')
+                .map(|p| p.parse::<u32>().expect("a numeric version part"))
+                .collect()
+        };
+        for pair in RELEASES.windows(2) {
+            assert!(
+                parse(pair[0].version) > parse(pair[1].version),
+                "{} must come before {}",
+                pair[0].version,
+                pair[1].version
+            );
+        }
+        for r in RELEASES {
+            assert_eq!(parse(r.version).len(), 3, "{}", r.version);
+            assert!(
+                chrono::NaiveDate::parse_from_str(r.date, "%Y-%m-%d").is_ok(),
+                "{} is not YYYY-MM-DD",
+                r.date
+            );
+            assert!(!r.summary.trim().is_empty());
+            assert!(!r.summary.contains('<'), "the summary is plain text");
+            assert_eq!(
+                r.url(),
+                format!(
+                    "https://github.com/justin-stanley/feather-reader/releases/tag/v{}",
+                    r.version
+                )
+            );
+        }
+        let latest = &RELEASES[0];
+        assert_eq!(latest.version, "0.4.1");
+        assert_eq!(
+            latest.changelog_url(),
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#041--2026-10-04"
+        );
+    }
+
+    /// Public and static like `/about`, so it is cacheable on the same terms.
+    #[tokio::test]
+    async fn standard_site_page_is_publicly_cacheable() {
+        let resp = router(test_state(&[]).await)
+            .oneshot(
+                Request::builder()
+                    .uri("/standard-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300"
         );
     }
 

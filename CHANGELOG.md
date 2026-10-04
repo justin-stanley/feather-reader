@@ -14,6 +14,37 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Added
+
+- **A public feature page for standard.site, at `/standard-site`.** What a
+  publication is (a `site.standard.publication` record whose articles are
+  `site.standard.document` records in the author's repo), what FeatherReader
+  shows from one (title, date, link, plain-text summary from `description` or
+  `textContent`; never the per-platform `content`), that the subscription is
+  the same portable `community.lexicon.rss.subscription` record re-read on the
+  same interval on its own loop, how to subscribe, and the limits: summaries
+  only, public repos only, reading only (no `site.standard.graph.subscription`),
+  the 30 s read deadline, and that a non-publication `at://` row is kept as
+  `unsupported`. **The how-to-subscribe section is conditional on
+  `FEATHERREADER_STANDARD_SITE`** exactly as the landing and about pages are
+  (#234): with it off, the page says the instance isn't accepting new
+  publication subscriptions and that the ones it already follows are still
+  read. Public and cacheable like `/about` (`public, max-age=300`). Linked
+  from the landing page's publications point, from `/about`, and from the
+  shared footer. Every claim on the page was checked against
+  `standard_site.rs`, `feed.rs`, `web::add_subscription` and
+  `design/STANDARD-SITE-0.4.0.md`.
+- **A "latest releases" call-out** on `/standard-site` and the landing page,
+  summarising 0.4.1 and 0.4.0 in a sentence or two each and linking each
+  GitHub release page and its CHANGELOG section. **The data lives in one
+  place, `web::RELEASES`** (a `const` slice of `web::Release { version, date,
+  summary }`): the two URLs are derived from `version` and `date`, and
+  `templates/releases.html` renders whatever the slice holds, so announcing
+  the next release is one new entry at the top. A test pins the shape (newest
+  first, `YYYY-MM-DD` dates, the tag and changelog-anchor URL forms).
+
 ## 0.4.1 — 2026-10-04
 
 The public pages say what 0.4.0 does, and the subscribe form can submit the

@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}standard.site — FeatherReader{% endblock %}
+
+{% block body %}
+<div class="shell shell-plain" id="shell">
+  <header class="topbar">
+    <a class="icon-btn" href="/" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 5l-7 7 7 7"/>
+      </svg>
+    </a>
+    <h1 class="topbar-title">standard.site</h1>
+    <span class="icon-btn" aria-hidden="true"></span>
+  </header>
+
+  <main class="content" id="content">
+    <div class="about">
+      <h1>FeatherReader reads standard.site publications, beside your feeds.</h1>
+
+      <p class="about-lede">
+        Since 0.4.0, a publication written to its author's atproto repo is a
+        subscription here like any RSS feed: same list, same order, same
+        portable record in your own PDS.
+      </p>
+
+      <h2>What a publication is</h2>
+      <p>
+        <a href="https://standard.site" rel="noopener noreferrer">standard.site</a>
+        is a lexicon for publishing on atproto. A publication is a
+        <code>site.standard.publication</code> record in the author's own repo
+        — a name and a site URL — and each article is a
+        <code>site.standard.document</code> record in the same repo, naming the
+        publication it belongs to. There is no feed document anywhere: the
+        articles <em>are</em> the records, and they live with the author, not
+        with any platform.
+      </p>
+
+      <h2>What FeatherReader does with one</h2>
+      <p>
+        FeatherReader reads those two collections directly from the author's
+        PDS, without signing in to anything. It shows each article's title,
+        date, link and a plain-text summary, taken from the document's
+        <code>description</code> or, failing that, its <code>textContent</code>.
+        An article with neither still appears as its title, date and link — the
+        same thing an RSS reader shows for a title-only feed.
+      </p>
+      <p>
+        It deliberately does not render a document's rich <code>content</code>.
+        That field is not a standard: measured across the publications
+        FeatherReader follows, it carried six different wrappers and twenty-two
+        block types from five publishing platforms, and the set grows with each
+        new platform. The link takes you to the article as its author published
+        it.
+      </p>
+      <p>
+        A publication subscription is the same
+        <code>community.lexicon.rss.subscription</code> record as a feed, with
+        the publication's <code>at://</code> URI where a feed URL would be — so
+        it is just as portable, and it exports in your OPML like everything
+        else. Publications are re-read on the same interval as feeds, on their
+        own polling loop, so a slow publication never holds up your RSS. When
+        one author's repo holds several publications you follow, it is read
+        once per round for all of them.
+      </p>
+
+      <h2>How to subscribe</h2>
+      {% if standard_site %}
+      <p>
+        Paste the publication's URI into the subscribe form on the manage page,
+        in either spelling:
+      </p>
+      <ul>
+        <li><code>at://did:plc:…/site.standard.publication/…</code> — the DID form</li>
+        <li><code>at://alice.example.com/site.standard.publication/…</code> — the handle form</li>
+      </ul>
+      <p>
+        A handle is resolved to its DID before the subscription is saved, and
+        only the DID form is stored, because a handle is a mutable name for an
+        account. The first read runs at once, so the articles appear
+        immediately. A publication can also arrive in an OPML import, as the
+        DID form.
+      </p>
+      {% else %}
+      <p>
+        This instance isn't accepting new publication subscriptions yet;
+        publications it already follows are still read on every round. The
+        switch is <code>FEATHERREADER_STANDARD_SITE</code> on a self-hosted
+        instance.
+      </p>
+      {% endif %}
+
+      <h2>Limits, honestly</h2>
+      <ul>
+        <li>
+          <strong>Summaries, not full articles.</strong> The rich
+          <code>content</code> is never rendered, for the reasons above. If a
+          document has neither a <code>description</code> nor
+          <code>textContent</code>, you get the title, date and link only.
+        </li>
+        <li>
+          <strong>Public repos only.</strong> FeatherReader reads without
+          signing in, so a publication must be readable by anyone.
+          <code>did:plc</code> and <code>did:web</code> authors are supported.
+        </li>
+        <li>
+          <strong>Reading only.</strong> FeatherReader does not publish, and it
+          does not read or write standard.site's own
+          <code>site.standard.graph.subscription</code> records, so a
+          subscription made in another standard.site client does not appear
+          here on its own.
+        </li>
+        <li>
+          <strong>One read has a deadline</strong> (30 seconds by default). A
+          publication with thousands of documents could exceed it and fail to
+          update; the largest one followed when this was measured ran to seven
+          pages of twenty-five.
+        </li>
+        <li>
+          <strong>An <code>at://</code> URI that is not a publication is never
+          read.</strong> Another collection, a non-canonical spelling or an
+          invalid DID is kept as <em>unsupported</em> rather than retried as a
+          broken feed.
+        </li>
+      </ul>
+
+      {% include "releases.html" %}
+    </div>
+
+    <div class="colophon">
+      <img src="/static/jts-colophon.svg" alt="JTS" width="44" height="44" />
+      <p>Built by <a href="https://justin-stanley.com" rel="noopener noreferrer">Justin Stanley</a></p>
+    </div>
+
+    {% include "footer.html" %}
+  </main>
+</div>
+{% endblock %}
