@@ -1,0 +1,21 @@
+{#- The "latest releases" call-out. Data comes from `web::RELEASES`, newest
+    first; each entry carries its own release-page and changelog links, so
+    announcing a release is one entry there and nothing here. Included by
+    standard_site.html and landing.html, both of which hold `releases`. -#}
+<section class="releases" aria-labelledby="releases-heading">
+  <h2 id="releases-heading">Latest releases</h2>
+  <ul class="release-list">
+    {% for r in releases %}
+    <li class="release">
+      <p class="release-head">
+        <a class="release-tag" href="{{ r.url() }}" rel="noopener noreferrer">v{{ r.version }}</a>
+        <time datetime="{{ r.date }}">{{ r.date }}</time>
+      </p>
+      <p class="release-summary">
+        {{ r.summary }}
+        <a class="release-changelog" href="{{ r.changelog_url() }}" rel="noopener noreferrer">Changelog</a>
+      </p>
+    </li>
+    {% endfor %}
+  </ul>
+</section>

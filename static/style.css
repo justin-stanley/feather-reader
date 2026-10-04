@@ -2141,6 +2141,93 @@ html[data-overlay="1"] .kbd-overlay {
   color: var(--ink-soft);
 }
 
+/* --------------------------------------------------------------------------
+   Latest releases — templates/releases.html, on /standard-site (inside .about)
+   and the landing page (inside .landing). Same quiet register as .experiment:
+   a hairline, small UI type, muted ink; the accent only on the two links. The
+   data is web::RELEASES, so this styles a list of unknown length, not two
+   hard-coded rows.
+   -------------------------------------------------------------------------- */
+.releases {
+  margin: var(--s7) 0 0;
+  padding-top: var(--s5);
+  border-top: 1px solid var(--line-soft);
+}
+
+.releases h2 {
+  margin: 0 0 var(--s3);
+  font-family: var(--font-serif);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+/* `.releases` scoping beats `.about ul` / `.about li`, which would otherwise
+   indent the list and add their margins to the grid gap on /standard-site. */
+.releases .release-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--s3);
+}
+
+.releases .release-list > li {
+  margin: 0;
+}
+
+.release p,
+.about .release p {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.release-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s2);
+}
+
+.release-head time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.release-tag {
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.release-tag:hover,
+.release-changelog:hover {
+  color: var(--accent-deep);
+  text-decoration: underline;
+}
+
+.release-changelog {
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* On /about-styled pages the prose links are underlined; the release links
+   follow the footer's quieter convention instead, like .experiment's. */
+.about .release-tag,
+.about .release-changelog {
+  text-decoration: none;
+}
+
+/* Same specificity as the rule above and later, so hover still underlines. */
+.about .release-tag:hover,
+.about .release-changelog:hover {
+  text-decoration: underline;
+}
+
 @media (min-width: 43.75em) {
   .hero {
     padding-top: calc(var(--s8) + var(--s5));
