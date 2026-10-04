@@ -15,10 +15,10 @@ production on 2026-10-03, after 0.3.10.
 
 ## Status, 2026-10-03
 
-**The reading and storing half is built. Nothing runs it yet.** A publication
-can be fetched, turned into entries, dated, retained and stored, and all of it is
-tested. No scheduler calls it, the subscribe form refuses it, and the flag that
-permits storing one is off in production.
+**Status as of step 3: publications are read, polled, and subscribable from
+the form.** What remains is step 4 (display edge cases, #213) and step 5
+(turning the flag on in production). The status table below was written at the
+start of the work and is kept current per row.
 
 | Piece | State | Where |
 |---|---|---|
@@ -29,9 +29,9 @@ permits storing one is off in production.
 | Stable dates from the record key; future dates discarded | **built** (#186) | `standard_site.rs` |
 | `feeds.kind`, re-derived from the URL on every start | **built** (#184, #189), upgrade-safe since 0.3.10 (#219) | `feed::FeedKind`, `store.rs` |
 | `at://` storable, as an allowlist entry behind a flag | **built** (#183) | `feed::is_storable_feed_url(url, allow_at_uri)` |
-| **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`; one read at a time, `publication_read_deadline` 30 s |
+| **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`, one repo read at a time; a subscribe from the form reads once more, inline, alongside it; `publication_read_deadline` 30 s |
 | **One walk per repo per tick** | **built** (step 2b) | `standard_site::fetch_repo`, `feed::poll_publication_group`; up to 16 publications of one repo per read |
-| **Subscribe form** | **not started** | refuses `at://` (`config.rs` flag doc) |
+| **Subscribe form** | **built** (step 3) | DID and handle forms, behind the flag; `web::publication_url_from_paste` |
 | **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
 
 ### Why it matters, now

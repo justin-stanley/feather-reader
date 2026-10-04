@@ -222,8 +222,8 @@ operation in the table has recorded zero errors on both.
 
 `FEATHERREADER_STANDARD_SITE` (default `false`) allows this instance to
 **store** a subscription to a [standard.site](https://standard.site)
-publication — one that arrives through an OPML import, or as a record another
-client wrote to your repo:
+publication — pasted into the subscribe form, imported via OPML, or written to
+your repo by another client:
 
 ```sh
 FEATHERREADER_STANDARD_SITE=true
@@ -246,14 +246,12 @@ that is not a well-formed publication — another collection, a handle, a
 non-canonical spelling — is classed `unsupported` and never polled, so it is not
 reported as somebody else's website being down.
 
-**Pasting an `at://` URI into the subscribe form does not work yet either**,
-with the flag on or off: the add path must fetch what you paste to find the
-feed in it, and nothing can fetch `at://`. It answers honestly — "not a kind of
-feed this instance can subscribe to" — rather than storing something it cannot
-poll. Both halves land together with the reader.
-
-Setting the flag today therefore lets an imported or externally-written
-subscription be kept; articles arrive once the reader is wired to the scheduler.
+**With the flag on, you can also paste a publication into the subscribe form**:
+`at://did:plc:…/site.standard.publication/…`, or the handle form
+`at://alice.example.com/site.standard.publication/…`, which is resolved to its
+DID before it is stored. Anything else under `at://` is refused as "not a kind
+of feed this instance can subscribe to". With the flag off, every `at://` paste
+is refused that way.
 
 ### Switching
 

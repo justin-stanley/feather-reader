@@ -35,7 +35,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — pasted into the subscribe form (a handle is resolved to its DID), imported via OPML, or written by another client. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -179,9 +179,8 @@ pub struct Config {
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
     /// Whether an `at://` standard.site publication subscription may be
-    /// **stored** — via OPML import or a record another client wrote. The
-    /// subscribe form cannot take one yet: the add path must fetch what is
-    /// pasted and nothing fetches `at://`, so it refuses with its own message.
+    /// **stored** — pasted into the subscribe form (a handle is resolved to its
+    /// DID first), imported via OPML, or written by another client.
     /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
     /// **This flag does not gate polling.** Since 0.4.0 a stored publication
