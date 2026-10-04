@@ -1,6 +1,6 @@
 # Changelog
 
-Engineering detail for the 0.3.x line, newest first. Covers everything since
+Engineering detail, newest first. Covers everything since
 0.3.0. Work that has landed on `main` but is not yet tagged appears under
 **Unreleased**, when there is any.
 
