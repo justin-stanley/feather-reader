@@ -30,6 +30,9 @@
     <div class="manage">
       <h1>Manage feeds</h1>
 
+      {% if !alert.is_empty() %}
+        <p class="flash error" role="alert">{{ alert }}</p>
+      {% endif %}
       {% if !flash.is_empty() %}
         <p class="flash" role="status">{{ flash }}</p>
       {% endif %}

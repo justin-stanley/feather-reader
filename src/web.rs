@@ -1268,6 +1268,9 @@ struct IndexTemplate {
     repo_url: &'static str,
     kofi_url: &'static str,
     flash: String,
+    /// Shown as `role="alert"` when the subscription list is the cached one
+    /// because the PDS listing failed; empty otherwise.
+    alert: String,
     /// The shared rail (drawer + desktop sidebar) navigation model.
     nav: Nav,
     /// The article list for the selected scope + view.
@@ -1310,6 +1313,8 @@ struct ManageTemplate {
     repo_url: &'static str,
     kofi_url: &'static str,
     flash: String,
+    /// See [`IndexTemplate::alert`].
+    alert: String,
     nav: Nav,
     /// All folders as move-targets for the subscribe folder select.
     folder_options: Vec<FolderOption>,
@@ -1715,10 +1720,39 @@ struct ResolvedSub {
 /// local cache row so unread counts work, and return them resolved. Best-effort
 /// on the sidecar: a failure falls back to the local cache alone.
 async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> {
+    resolve_subscriptions_noting(state, did).await.0
+}
+
+/// What to tell a reader whose subscription list could not be read from their
+/// PDS, so the last-known list being shown does not pass for a fresh one.
+///
+/// **A malformed record is named as such** (#177): the walk refuses rather than
+/// drop that subscription, and "unreachable" would send the reader looking at
+/// their network when the cause is a record some client wrote into their repo.
+fn subscriptions_alert(err: &anyhow::Error) -> String {
+    match err.downcast_ref::<crate::atproto::MalformedRecords>() {
+        Some(m) => format!(
+            "{} record(s) in your subscription list could not be read, so it was not \
+             refreshed. Showing your last-known subscriptions; nothing was removed.",
+            m.count
+        ),
+        None => "Your subscription list could not be read from your PDS just now. \
+                 Showing your last-known subscriptions."
+            .to_string(),
+    }
+}
+
+/// [`resolve_subscriptions`], plus the alert to show when the list shown is the
+/// cached one because the PDS listing failed.
+async fn resolve_subscriptions_noting(
+    state: &AppState,
+    did: &str,
+) -> (Vec<ResolvedSub>, Option<String>) {
     let pool = &state.db;
     let subs = match state.repo().list_subscriptions_sorted(did).await {
         Ok(s) => s,
         Err(err) => {
+            let alert = subscriptions_alert(&err);
             warn!(%err, %did, "could not list PDS subscriptions; showing this DID's cached subscriptions only");
             // Fail CLOSED: the PDS is the source of truth for what this DID
             // follows. When it is unreachable we must NOT widen the caller's
@@ -1738,7 +1772,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                                    feed list, which is not the same as having none");
                 Vec::new()
             });
-            return feeds
+            let cached = feeds
                 .into_iter()
                 .map(|f| ResolvedSub {
                     rkey: String::new(),
@@ -1746,6 +1780,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
                     feed: Some(f),
                 })
                 .collect();
+            return (cached, Some(alert));
         }
     };
 
@@ -1827,7 +1862,7 @@ async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> 
     // scoped entry/feed read + read/star mutation authorizes against exactly
     // the feeds this DID follows right now. This is THE per-DID isolation hook.
     sync_sub_refs(pool, did, &out).await;
-    out
+    (out, None)
 }
 
 /// Refresh the `sub_ref` projection for `did` to exactly the feed ids present
@@ -1866,7 +1901,7 @@ async fn index(
     let did = user.did.clone();
     let pool = &state.db;
 
-    let subs = resolve_subscriptions(&state, &did).await;
+    let (subs, alert) = resolve_subscriptions_noting(&state, &did).await;
 
     // View: unread (default) | all | starred.
     let view = match q.view.as_deref() {
@@ -2313,6 +2348,7 @@ async fn index(
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
         flash: q.flash.unwrap_or_default(),
+        alert: alert.unwrap_or_default(),
         nav,
         entries,
         heading,
@@ -2351,7 +2387,7 @@ async fn manage(
     };
     let did = user.did.clone();
 
-    let subs = resolve_subscriptions(&state, &did).await;
+    let (subs, alert) = resolve_subscriptions_noting(&state, &did).await;
     let (folder_views, loose_feeds, folder_options) =
         build_sidebar(&state, &did, &subs, None, None).await;
 
@@ -2370,6 +2406,7 @@ async fn manage(
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
         flash: q.flash.unwrap_or_default(),
+        alert: alert.unwrap_or_default(),
         nav,
         folder_options,
         folders: folder_views,
@@ -10168,6 +10205,7 @@ mod tests {
             repo_url: REPO_URL,
             kofi_url: KOFI_URL,
             flash: String::new(),
+            alert: String::new(),
             nav,
             folder_options,
             folders: vec![FolderView {
@@ -11865,6 +11903,92 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A sidecar whose every `listRecords` page carries one good record and
+    /// one with no `uri` — the #177 shape — for any collection.
+    async fn spawn_malformed_sidecar() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = serde_json::json!({ "ok": true, "data": { "records": [
+                    { "uri": "at://did:plc:alerted/c/3labGOOD", "cid": "bafy", "value": {} },
+                    { "cid": "bafy", "value": {} },
+                ]}})
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn page_body(state: AppState, did: &str, uri: &str) -> (StatusCode, String) {
+        let cookie = session_cookie(&state, did, None);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// **#177: a malformed record in the reader's own repo is refused, and the
+    /// reader is told.** Refusing keeps `replace_sub_refs` from dropping the
+    /// subscription that record was; telling them keeps the stale list from
+    /// looking like the real one. Both the reading page and the manage page.
+    #[tokio::test]
+    async fn a_malformed_subscription_record_raises_an_alert() {
+        let did = "did:plc:alerted";
+        for page in ["/", "/manage"] {
+            let sidecar = spawn_malformed_sidecar().await;
+            let state = test_state_with_sidecar(&[did], &sidecar).await;
+            let (status, body) = page_body(state, did, page).await;
+            assert_eq!(status, StatusCode::OK, "{page} did not render");
+            assert!(
+                body.contains(r#"role="alert""#) && body.contains("could not be read"),
+                "{page} rendered no alert for a refused subscription list"
+            );
+            assert!(
+                body.contains("1 record(s) in your subscription list"),
+                "{page} gave the generic alert, not the malformed-record one"
+            );
+        }
+    }
+
+    /// The control: a healthy listing raises no alert.
+    #[tokio::test]
+    async fn a_healthy_subscription_listing_raises_no_alert() {
+        let did = "did:plc:exporter";
+        let sidecar = spawn_export_sidecar(None).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (status, body) = page_body(state, did, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("could not be read"),
+            "a healthy listing raised an alert"
+        );
     }
 
     /// `GET /opml/export` against the mock, returning `(status, headers, body)`.
