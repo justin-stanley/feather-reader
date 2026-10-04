@@ -14,7 +14,7 @@
 //!   is `Authorization: DPoP <token>` plus a `DPoP` proof whose `ath` binds to
 //!   that token; either alone is useless.
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -82,12 +82,51 @@ impl Repo<'_> {
         .await?;
 
         if !outcome.is_success() {
-            bail!(
+            // **The rejection as a value, under the same sentence as before.**
+            // The sidecar client already surfaces an `AtProtoError::Xrpc`; this
+            // one only said it in a string, so a caller that has to tell "the
+            // PDS refused this" from "the network broke" — the read-state
+            // reconcile (#241) — could match on nothing sturdier than wording.
+            // The context keeps `Display` byte-for-byte what it was.
+            let rejection = Self::rejection(&outcome.body, outcome.status);
+            return Err(anyhow::Error::new(rejection).context(format!(
                 "{nsid} failed: {}",
                 xrpc_error(&outcome.body, outcome.status)
-            );
+            )));
         }
         Ok(outcome)
+    }
+
+    /// A non-2xx answer as the [`crate::atproto::AtProtoError::Xrpc`] the
+    /// sidecar client produces for the same answer, so one matcher serves both.
+    ///
+    /// The same length bound as [`Self::error_fields`] before any parse, and the
+    /// same `"Unknown"` fallback `atproto::xrpc_error_from` uses for a body that
+    /// is not an error document.
+    fn rejection(body: &[u8], status: u16) -> crate::atproto::AtProtoError {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            error: Option<String>,
+            message: Option<String>,
+        }
+        let fields = super::error_body_worth_parsing(body)
+            .then(|| serde_json::from_slice::<Fields>(body).ok())
+            .flatten();
+        let (error, message) = match fields {
+            Some(Fields {
+                error: Some(error),
+                message,
+            }) => (error, message),
+            _ => ("Unknown".to_string(), None),
+        };
+        crate::atproto::AtProtoError::Xrpc {
+            status: reqwest::StatusCode::from_u16(status)
+                // Unreachable: reqwest already parsed this status. Not a 500,
+                // so it can never read as the reference PDS's mismatch.
+                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
+            error,
+            message,
+        }
     }
 
     /// [`send_raw`](Self::send_raw), then the body as JSON.
@@ -1076,6 +1115,65 @@ mod tests {
             None,
             "an oversized error body was deserialised to fish out one string",
         );
+    }
+
+    /// **A PDS rejection is structured, not only a sentence (#241).**
+    ///
+    /// The read-state flusher has to tell "the PDS refused this batch" from "the
+    /// network broke", and the sidecar client already said so with
+    /// [`crate::atproto::AtProtoError::Xrpc`]. This client only said it in a
+    /// string, so the one backend production runs could be matched on nothing
+    /// sturdier than its wording. The rendered message must not change: it is
+    /// what every existing log line and assertion reads.
+    #[tokio::test]
+    async fn a_rejected_write_carries_the_status_and_error_name() {
+        use axum::response::IntoResponse as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = format!("rejecting-{}.xrpc.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(
+                    json!({ "error": "InternalServerError", "message": "Internal Server Error" }),
+                ),
+            )
+                .into_response()
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://{host}:{}", addr.port());
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .apply_writes(&[WriteOp::Delete {
+                collection: crate::lexicon::nsid::READ_STATE.into(),
+                rkey: "rs-0".into(),
+            }])
+            .await
+            .expect_err("a 500 is a failure");
+        assert_eq!(
+            err.to_string(),
+            "com.atproto.repo.applyWrites failed: status 500 \
+             (InternalServerError: Internal Server Error)",
+            "the rendered message changed",
+        );
+        let xrpc = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::atproto::AtProtoError>());
+        match xrpc {
+            Some(crate::atproto::AtProtoError::Xrpc { status, error, .. }) => {
+                assert_eq!(status.as_u16(), 500);
+                assert_eq!(error, "InternalServerError");
+            }
+            other => panic!("no structured XRPC error in the chain: {other:?}"),
+        }
     }
 
     /// **The write path parses a PDS body too, and it had no bound before the
