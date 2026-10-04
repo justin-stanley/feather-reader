@@ -222,8 +222,8 @@ operation in the table has recorded zero errors on both.
 
 `FEATHERREADER_STANDARD_SITE` (default `false`) allows this instance to
 **store** a subscription to a [standard.site](https://standard.site)
-publication — one that arrives through an OPML import, or as a record another
-client wrote to your repo:
+publication — pasted into the subscribe form, imported via OPML, or written to
+your repo by another client:
 
 ```sh
 FEATHERREADER_STANDARD_SITE=true

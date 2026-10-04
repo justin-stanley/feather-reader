@@ -3017,7 +3017,6 @@ struct SubscribeForm {
     folder: Option<String>,
 }
 
-/// `POST /subscriptions` — subscribe by URL.
 /// The DID-form URL to store for a pasted `at://` publication, or the flash
 /// to refuse it with.
 ///
@@ -3041,7 +3040,13 @@ async fn publication_url_from_paste(state: &AppState, input: &str) -> Result<Str
     let did = if crate::oauth::identity::is_atproto_did(&uri.authority) {
         uri.authority.clone()
     } else {
-        crate::atproto::resolve_handle(&state.http, &state.config.resolver_base, &uri.authority)
+        let handle =
+            // Validated as a handle before it is sent anywhere: an authority
+            // that is neither a DID nor a handle (`did:plc:TOOSHORT`, an
+            // uppercase DID, a newline) is unsupported, not a lookup (found in
+            // review).
+            crate::oauth::identity::normalize_handle(&uri.authority).map_err(|_| unsupported())?;
+        crate::atproto::resolve_handle(&state.http, &state.config.resolver_base, &handle)
             .await
             .map_err(|err| {
                 warn!(%err, handle = %uri.authority, "could not resolve a pasted publication's handle");
@@ -3060,6 +3065,7 @@ async fn publication_url_from_paste(state: &AppState, input: &str) -> Result<Str
     Ok(url)
 }
 
+/// `POST /subscriptions` — subscribe by URL.
 async fn add_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3075,18 +3081,27 @@ async fn add_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
-    // An `at://` paste is refused here, whatever the flag says: this path must
-    // FETCH what was pasted to find the feed in it, and nothing fetches
-    // `at://` until the standard.site reader is wired. Letting a well-formed
-    // one through produced "Couldn't find a feed" and a `warn!` for an
-    // expected condition; letting a malformed one reach the privacy arm, which
-    // fails closed as `Private`, told the reader a typo was a paid feed. Only
-    // `at://` is pre-checked — an http(s) or scheme-less paste keeps its
-    // "Couldn't find a feed" path below, which is the accurate answer there.
-    // Case-insensitive, unlike the storage guards: `Url::parse` folds the
-    // scheme, so `AT://…` would otherwise skip both this and the classifier's
-    // at:// arm, parse as `at`, and draw the private/paid flash off the rkey.
-    // This decides a MESSAGE; nothing about storage keys off it.
+    // Per-DID subscription cap: bound one account's storage/poller footprint on
+    // the small box. Checked BEFORE any fetch/resolve so an over-cap account
+    // can't even trigger an outbound request. `<= 0` disables the cap.
+    let cap = state.config.max_subs_per_did;
+    if cap > 0 {
+        match store::count_subscriptions_for_did(pool, &did).await {
+            Ok(n) if n >= cap => {
+                info!(%did, current = n, cap, "refused subscribe: per-DID subscription cap reached");
+                return Ok(Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc(&format!(
+                        "Subscription limit reached ({cap}). Remove a feed before adding another."
+                    ))
+                ))
+                .into_response());
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, %did, "could not count subscriptions for cap check; allowing"),
+        }
+    }
+
     // **An at:// paste is a standard.site publication, read by the poller
     // since 0.4.0**: canonicalised and resolved to its DID form here, then it
     // joins the ordinary path below. With the flag off it is refused as it
@@ -3120,27 +3135,6 @@ async fn add_subscription(
         return Ok(
             Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
         );
-    }
-
-    // Per-DID subscription cap: bound one account's storage/poller footprint on
-    // the small box. Checked BEFORE any fetch/resolve so an over-cap account
-    // can't even trigger an outbound request. `<= 0` disables the cap.
-    let cap = state.config.max_subs_per_did;
-    if cap > 0 {
-        match store::count_subscriptions_for_did(pool, &did).await {
-            Ok(n) if n >= cap => {
-                info!(%did, current = n, cap, "refused subscribe: per-DID subscription cap reached");
-                return Ok(Redirect::to(&format!(
-                    "/?flash={}",
-                    qenc(&format!(
-                        "Subscription limit reached ({cap}). Remove a feed before adding another."
-                    ))
-                ))
-                .into_response());
-            }
-            Ok(_) => {}
-            Err(err) => warn!(%err, %did, "could not count subscriptions for cap check; allowing"),
-        }
     }
 
     let resolved = match publication_url {
@@ -9786,6 +9780,108 @@ mod tests {
         );
     }
 
+    /// A resolver answering `did` that counts how often it was asked.
+    async fn serve_counting_resolver(
+        did: &str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let (base, hits) = crate::net::tests::serve_body_counted(
+            serde_json::json!({ "did": did }).to_string().into_bytes(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let host = format!("counting-resolver-{port}.test");
+        crate::net::test_host_override(&host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        (format!("http://{host}:{port}"), hits)
+    }
+
+    /// Review of #230: the per-DID cap is documented as checked "BEFORE any
+    /// fetch/resolve so an over-cap account can't even trigger an outbound
+    /// request" — a handle paste resolved the handle first.
+    #[tokio::test]
+    async fn an_over_cap_handle_paste_makes_no_outbound_request() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (resolver, hits) = serve_counting_resolver("did:plc:ohutz6x5acjmpuulp3x7wxxc").await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.resolver_base = resolver;
+                c.max_subs_per_did = 1;
+            },
+        );
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://already.example/feed.xml".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed_id])
+            .await
+            .unwrap();
+        let loc = subscribe(
+            &state,
+            did,
+            "at%3A%2F%2Falice.example.com%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+        )
+        .await;
+        assert!(
+            loc.contains("Subscription%20limit"),
+            "expected the cap flash: {loc}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an over-cap paste resolved a handle"
+        );
+    }
+
+    /// Review of #230: an authority that is neither a valid DID nor a valid
+    /// handle — `did:plc:TOOSHORT`, an uppercase DID — went to the resolver as
+    /// a "handle". It is unsupported, and asks nobody anything.
+    #[tokio::test]
+    async fn a_malformed_did_paste_is_unsupported_with_the_flag_on() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (resolver, hits) = serve_counting_resolver("did:plc:ohutz6x5acjmpuulp3x7wxxc").await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.resolver_base = resolver;
+            },
+        );
+        for authority in [
+            "did%3Aplc%3ATOOSHORT",
+            "did%3Aplc%3AOHUTZ6X5ACJMPUULP3X7WXXC",
+            "bad%0Ahandle.example",
+        ] {
+            let loc = subscribe(
+                &state,
+                did,
+                &format!("at%3A%2F%2F{authority}%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h"),
+            )
+            .await;
+            assert!(
+                loc.contains("kind%20of%20feed"),
+                "{authority}: expected the unsupported flash: {loc}"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a malformed authority reached the resolver"
+        );
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
     /// A handle that does not resolve is refused, and nothing is stored.
     #[tokio::test]
     async fn an_unresolvable_handle_paste_is_refused() {
@@ -9804,8 +9900,8 @@ mod tests {
         )
         .await;
         assert!(
-            loc.contains("flash="),
-            "an unresolvable handle was accepted: {loc}"
+            loc.contains("resolve%20the%20handle"),
+            "expected the unresolvable-handle flash: {loc}"
         );
         assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
     }

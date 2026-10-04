@@ -666,7 +666,9 @@ async fn poll_due_once(
 /// RSS poller's is the one reported, and overdue publications still show in
 /// `/stats`), and its one read runs ALONGSIDE the RSS poller's
 /// `DEFAULT_POLL_CONCURRENCY`, not within it — one more fetch in flight than
-/// before, bounded by the walk budget.
+/// before, bounded by the walk budget. (A subscribe from the form also runs one
+/// publication read inline, outside both loops, bounded per request by the
+/// per-IP rate limit on `/subscriptions`.)
 pub async fn run_publication_poller(
     state: AppState,
     mut shutdown: watch::Receiver<()>,
