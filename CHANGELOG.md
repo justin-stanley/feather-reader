@@ -45,6 +45,45 @@ deploying is separate.
   the next release is one new entry at the top. A test pins the shape (newest
   first, `YYYY-MM-DD` dates, the tag and changelog-anchor URL forms).
 
+### Link cards for posted links
+
+- **A feather-reader.com link now unfurls with a description and an image.**
+  Measured before the change with Bluesky's own card service:
+  `cardyb.bsky.app/v1/extract?url=https://feather-reader.com/` returned
+  `{"title":"FeatherReader — read, quietly","description":"","image":""}`,
+  because `<title>` was the only tag in `base.html` it could use. Every page
+  now carries a `web::Card` — `<meta name="description">`, the Open Graph
+  set (`og:type`, `og:site_name`, `og:title`, `og:description`, `og:url`,
+  `og:image` with type, width, height and alt), `twitter:card`
+  (`summary_large_image`) and `<link rel="canonical">`. Card fetchers read
+  the initial HTML server-side, run no JS, send no cookies and resolve
+  nothing relative, so `og:url` and `og:image` are absolute on
+  `Config::public_url` (`FEATHERREADER_PUBLIC_URL`; production's is
+  `https://feather-reader.com`). Each signed-out page — `/`, `/about`,
+  `/privacy`, `/terms`, `/stats`, `/login`, `/beta/redeem` — has its own
+  title and description; a page that renders a session's private view
+  (`/`, `/manage`, `/entries/:id`) carries the site's generic card pointing
+  at the front door, plus `noindex`, so no heading, feed name or handle
+  reaches `<head>`.
+- **The share image** is `static/social-card.png`, 1200×630 (the ~1.91:1
+  Bluesky renders), 69 KB, served from `/static` with the same
+  `public, max-age=300` as the other assets. Its source is
+  `static/social-card.svg` — the favicon's feather in spruce beside the
+  wordmark and tagline, in the light-scheme tokens from `style.css` — and
+  `scripts/social-card.sh` regenerates the PNG with whichever of
+  `rsvg-convert`, `sips` (macOS, built in) or headless Chrome is present;
+  no Rust dependency, no font fetched.
+- Tests (router level, each failing before the change): the landing page
+  and `/about` render the card with absolute `https` URLs; the origin
+  follows the configured public URL; every public page has its own
+  description and `og:url`; the image is served as `image/png`, under 1 MB,
+  with a PNG header whose dimensions match the tags; private views carry the
+  generic card, `noindex`, and neither the handle nor the DID in `<head>`.
+- Not verifiable before a deploy: the cardyb check above, re-run against
+  production.
+
+---
+
 ## 0.4.1 — 2026-10-04
 
 The public pages say what 0.4.0 does, and the subscribe form can submit the

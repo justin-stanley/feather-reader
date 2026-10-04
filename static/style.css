@@ -2162,12 +2162,18 @@ html[data-overlay="1"] .kbd-overlay {
   letter-spacing: -0.005em;
 }
 
-.release-list {
+/* `.releases` scoping beats `.about ul` / `.about li`, which would otherwise
+   indent the list and add their margins to the grid gap on /standard-site. */
+.releases .release-list {
   margin: 0;
   padding: 0;
   list-style: none;
   display: grid;
   gap: var(--s3);
+}
+
+.releases .release-list > li {
+  margin: 0;
 }
 
 .release p,
@@ -2214,6 +2220,12 @@ html[data-overlay="1"] .kbd-overlay {
 .about .release-tag,
 .about .release-changelog {
   text-decoration: none;
+}
+
+/* Same specificity as the rule above and later, so hover still underlines. */
+.about .release-tag:hover,
+.about .release-changelog:hover {
+  text-decoration: underline;
 }
 
 @media (min-width: 43.75em) {

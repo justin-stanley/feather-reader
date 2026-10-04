@@ -129,6 +129,9 @@ kill_timeout = "45s"
   # cutover is a one-line edit. See "BACKEND CUTOVER" in the header: "rust"
   # additionally REQUIRES FEATHERREADER_OAUTH_ENCRYPTION_KEY as a secret.
   FEATHERREADER_REPO_BACKEND = "rust"
+  # standard.site publications may be STORED: pasted into the subscribe form, or
+  # imported. Stored ones are polled either way; this gates storage, not reading.
+  FEATHERREADER_STANDARD_SITE = "true"
   # Cloudflare fronts Fly, so the real client IP is CF-Connecting-IP. This is
   # authoritative ONLY if the origin is locked to Cloudflare (see Caddyfile note
   # + MANUAL STEP: CF-only origin allowlist).
