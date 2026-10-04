@@ -265,8 +265,8 @@ impl RecordWalk {
 /// further 128 of transient page because the per-page check compared against the
 /// ceiling instead of what was left.
 ///
-/// **Only one caller threads it today**, and that caller has no production entry
-/// point yet: the publication reader is not wired to the poller. Every live read
+/// **Only one caller threads it today**: the publication reader, polled by the
+/// scheduler's publication loop since 0.4.0. Every other live read
 /// builds its own ceiling per walk, so the per-request total is still a multiple
 /// of this number — two walks on an OPML export, four on a login — and nothing
 /// bounds concurrent requests at all.
@@ -483,7 +483,25 @@ pub enum AtProtoError {
         did: String,
         /// Why resolution failed.
         reason: String,
+        /// The same, as a value a caller can branch on without reading `reason`.
+        cause: DidResolutionCause,
     },
+}
+
+/// Why a DID did not resolve to a PDS, structured — so a poller can file a
+/// deleted account under "the server answered" rather than "the network broke".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DidResolutionCause {
+    /// A DID method this reader does not resolve.
+    UnsupportedMethod,
+    /// The DID document fetch got an answer, and it was not a success (a
+    /// tombstoned or unknown DID is a 404 from the PLC directory).
+    Status,
+    /// The DID document has no `#atproto_pds` service.
+    NoPdsEndpoint,
+    /// The PDS endpoint it names is refused by the SSRF guard.
+    NotAPublicTarget,
 }
 
 impl AtProtoError {
@@ -677,6 +695,7 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         return Err(AtProtoError::DidResolution {
             did: did.to_string(),
             reason: "unsupported DID method (only did:plc and did:web are handled)".to_string(),
+            cause: DidResolutionCause::UnsupportedMethod,
         }
         .into());
     };
@@ -691,6 +710,7 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         return Err(AtProtoError::DidResolution {
             did: did.to_string(),
             reason: format!("DID document fetch returned {}", resp.status()),
+            cause: DidResolutionCause::Status,
         }
         .into());
     }
@@ -706,6 +726,7 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         .ok_or_else(|| AtProtoError::DidResolution {
             did: did.to_string(),
             reason: "DID document has no #atproto_pds service endpoint".to_string(),
+            cause: DidResolutionCause::NoPdsEndpoint,
         })?;
 
     // SSRF guard on the RESOLVED endpoint: the `serviceEndpoint` is fully
@@ -717,6 +738,7 @@ pub async fn resolve_did_to_pds(client: &Client, plc_directory: &str, did: &str)
         .map_err(|e| AtProtoError::DidResolution {
             did: did.to_string(),
             reason: format!("PDS serviceEndpoint is not a public target: {e}"),
+            cause: DidResolutionCause::NotAPublicTarget,
         })?;
     Ok(endpoint)
 }

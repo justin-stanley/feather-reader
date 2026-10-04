@@ -9565,8 +9565,10 @@ mod tests {
     }
 
     /// **With the flag ON, a well-formed at:// paste is still refused as
-    /// unsupported** — not "Couldn't find a feed" plus a `warn!`. Nothing can
-    /// fetch `at://` until the reader is wired, whatever the flag says, and the
+    /// unsupported** — not "Couldn't find a feed" plus a `warn!`. The add path
+    /// cannot fetch `at://` until the subscribe form learns it (0.4.0 step 3),
+    /// whatever the flag says — the poller reads publications, the form does
+    /// not — and the
     /// docs promise this answer "with the flag on or off". This is also the
     /// suite's first state with the flag on: every other site passes the flag
     /// through with `false`, where a literal `false` would be indistinguishable.

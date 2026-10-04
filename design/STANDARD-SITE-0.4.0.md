@@ -29,7 +29,7 @@ permits storing one is off in production.
 | Stable dates from the record key; future dates discarded | **built** (#186) | `standard_site.rs` |
 | `feeds.kind`, re-derived from the URL on every start | **built** (#184, #189), upgrade-safe since 0.3.10 (#219) | `feed::FeedKind`, `store.rs` |
 | `at://` storable, as an allowlist entry behind a flag | **built** (#183) | `feed::is_storable_feed_url(url, allow_at_uri)` |
-| **Polling** | **not started** | `FeedKind::POLLABLE` is `[Rss]` (`feed.rs:763`) |
+| **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`; one read at a time, `publication_read_deadline` 30 s |
 | **One walk per repo per tick** | **not started** | |
 | **Subscribe form** | **not started** | refuses `at://` (`config.rs` flag doc) |
 | **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
@@ -283,6 +283,14 @@ per walk at concurrency 4 before relying on it.
   Group due publications by DID, walk the repo's documents once, and split by
   `site`. This is the cheapest cadence win measured; a `rev`-based "has anything
   changed" check is still not measured and stays out of scope.
+
+**Decided in review of #225: a publication read has a 30 s deadline, and a read
+that misses it stores nothing.** That keeps the read in flight at shutdown
+inside Fly's 45 s `kill_timeout`. The cost: a publication that needs on the
+order of 80 sequential pages (about 2,000 documents) would fail every poll.
+Today's largest measured publisher is 152 documents (about 7 pages). If a
+subscribed publication ever approaches the limit, keep the partial read on
+timeout instead of raising the deadline.
 
 ### 3. Subscribe form
 

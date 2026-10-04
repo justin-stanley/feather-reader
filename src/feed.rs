@@ -718,24 +718,29 @@ pub enum FailureKind {
 pub enum FeedKind {
     /// An RSS/Atom/JSON feed document fetched over http(s).
     Rss,
-    /// An `at://…/site.standard.publication/…` record pair in somebody's PDS.
-    /// Storable behind `FEATHERREADER_STANDARD_SITE`; **not yet pollable**, so
-    /// [`FeedKind::POLLABLE`] excludes it. Wiring the reader is what moves it.
+    /// An `at://…/site.standard.publication/…` record pair in somebody's PDS,
+    /// read by `standard_site` and pollable since 0.4.0.
     Publication,
+    /// Any other `at://` row: another collection, or a spelling the storage
+    /// guard would refuse. Rows like this predate that guard. **Never
+    /// pollable** — handing one to the standard.site reader would fail its
+    /// collection check every tick and publish it as an unreachable publisher —
+    /// and counted as unpollable so the capacity it holds stays visible.
+    Unsupported,
 }
 
 impl FeedKind {
-    /// The kinds the scheduler may select. The single place that changes when
-    /// the standard.site reader is wired to the poller.
+    /// The kinds the scheduler may select: RSS, and since 0.4.0 standard.site
+    /// publications. [`FeedKind::Unsupported`] is the kind it never selects.
     ///
-    /// **This is the canonical home of the at:// exclusion; the other sites
-    /// point here.** It used to be a SQL string predicate in `store`, carrying
+    /// **This is the canonical home of the exclusion; the other sites point
+    /// here.** It used to be a SQL string predicate in `store`, carrying
     /// its own copy of the rule — which is how one reader (`count_feeds`) came
     /// to drift from it unnoticed.
     ///
-    /// Why an unpollable kind is skipped rather than failed: `poll_feed`
-    /// reaches `net::guarded_get`, whose `check_scheme` refuses any non-http(s)
-    /// scheme, and the standard.site reader is not yet wired to the scheduler.
+    /// Why an unpollable kind is skipped rather than failed: an `Unsupported`
+    /// row names nothing either reader can fetch — another collection, a handle,
+    /// a non-canonical spelling — so polling it could only fail.
     /// Handing such a row to the poller does not leave the feature dormant — it
     /// manufactures one permanent failure per row, which the public cause
     /// histogram then reports as an unreachable publisher. Unsupported is not
@@ -760,7 +765,7 @@ impl FeedKind {
     /// `/stats` shows a climbing backlog and nothing logs why. Bounded and
     /// harmless at ninety feeds; not at ten thousand. Whoever wires the next
     /// kind should seed or stagger `next_poll` for the rows it admits.
-    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
+    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss, FeedKind::Publication];
 
     /// The kinds whose entries the retention **window** applies to.
     ///
@@ -788,6 +793,7 @@ impl FeedKind {
         match self {
             FeedKind::Rss => "rss",
             FeedKind::Publication => "publication",
+            FeedKind::Unsupported => "unsupported",
         }
     }
 
@@ -797,6 +803,7 @@ impl FeedKind {
         match raw {
             "rss" => Some(FeedKind::Rss),
             "publication" => Some(FeedKind::Publication),
+            "unsupported" => Some(FeedKind::Unsupported),
             _ => None,
         }
     }
@@ -817,10 +824,19 @@ impl FeedKind {
     /// the `fetch` bucket as an unreachable publisher. Storing a non-canonical
     /// spelling is separately refused, because `feeds.url` is UNIQUE.
     pub fn of(url: &str) -> Self {
-        if crate::atproto::strip_at_prefix(url).is_some() {
-            FeedKind::Publication
-        } else {
-            FeedKind::Rss
+        match crate::atproto::strip_at_prefix(url) {
+            // **Only a URI the storage guard would accept is a publication.**
+            // Since publications became pollable, "it is an at-URI" is no longer
+            // a safe enough reason: another collection would be polled, fail,
+            // and back off forever while reading as an unreachable publisher.
+            // The canonical lowercase scheme too, for the same reason: storage
+            // refuses `At://` (#183), and a legacy row spelled that way would
+            // otherwise be polled and fail its parse every tick.
+            Some(rest) if url.starts_with("at://") && is_storable_publication_uri(rest) => {
+                FeedKind::Publication
+            }
+            Some(_) => FeedKind::Unsupported,
+            None => FeedKind::Rss,
         }
     }
 }
@@ -991,8 +1007,105 @@ pub async fn poll_feed_by_kind(
 ) -> Result<PollOutcome> {
     match FeedKind::of(&feed.url) {
         FeedKind::Rss => poll_feed(pool, client, feed, config.max_entries_per_feed).await,
-        FeedKind::Publication => todo!("0.4.0 step 2: poll a standard.site publication"),
+        FeedKind::Publication => poll_publication(pool, client, config, feed).await,
+        // Never selected: `due_feeds` reads only POLLABLE kinds. A defensive
+        // failure rather than a panic if a caller hands one in anyway.
+        FeedKind::Unsupported => Ok(PollOutcome::Failed {
+            backoff: backoff_for(1),
+            kind: FailureKind::Parse,
+            detail: failure_detail(format!("{} is not a feed this reader can poll", feed.url)),
+        }),
     }
+}
+
+/// What a failed publication read is filed under in the cause histogram.
+///
+/// **`Fetch` means the request never produced a response**, so it is the
+/// fallback, not the default answer: a PLC directory or PDS that answered —
+/// with a 404 for a tombstoned DID, `RepoNotFound`, `RepoDeactivated` — is
+/// `Status`, and an answer that was not what it claimed to be is `Parse`. Filed
+/// as `Fetch`, a deleted account read as its server being down (found in
+/// review).
+fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
+    use crate::atproto::{AtProtoError, DidResolutionCause};
+    for cause in err.chain() {
+        if cause.is::<crate::standard_site::NotAPublication>() || cause.is::<serde_json::Error>() {
+            return FailureKind::Parse;
+        }
+        match cause.downcast_ref::<AtProtoError>() {
+            Some(AtProtoError::Xrpc { .. }) => return FailureKind::Status,
+            Some(AtProtoError::DidResolution { cause, .. }) => {
+                return match cause {
+                    DidResolutionCause::Status => FailureKind::Status,
+                    DidResolutionCause::UnsupportedMethod | DidResolutionCause::NoPdsEndpoint => {
+                        FailureKind::Parse
+                    }
+                    DidResolutionCause::NotAPublicTarget => FailureKind::Fetch,
+                }
+            }
+            _ => {}
+        }
+    }
+    FailureKind::Fetch
+}
+
+/// Read a standard.site publication from its author's PDS and store it.
+///
+/// A source failure — an unparseable URI, an unreachable PLC directory or
+/// PDS, a walk that failed — is a [`PollOutcome::Failed`] with backoff, like an
+/// RSS fetch failure, so `settle_poll` and `/stats` treat both kinds alike.
+/// Only a broken local store is an `Err`, which `store_publication` decides.
+async fn poll_publication(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feed: &Feed,
+) -> Result<PollOutcome> {
+    let Some(uri) = crate::standard_site::AtUri::parse(&feed.url) else {
+        return Ok(PollOutcome::Failed {
+            backoff: backoff_for(1),
+            kind: FailureKind::Parse,
+            detail: failure_detail(format!("{} is not a readable at:// URI", feed.url)),
+        });
+    };
+    // **One deadline for the whole read.** It is otherwise bounded only per
+    // request (FETCH_TIMEOUT x MAX_LIST_PAGES): hours, against a repo that
+    // pages slowly, all of it holding up the publication loop.
+    let fetched = tokio::time::timeout(
+        config.publication_read_deadline,
+        crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri),
+    )
+    .await;
+    let read = match fetched {
+        Ok(Ok(read)) => read,
+        Ok(Err(err)) => {
+            return Ok(PollOutcome::Failed {
+                backoff: backoff_for(1),
+                kind: publication_failure_kind(&err),
+                detail: failure_detail(format!("{err:#}")),
+            })
+        }
+        Err(_) => {
+            return Ok(PollOutcome::Failed {
+                backoff: backoff_for(1),
+                kind: FailureKind::Fetch,
+                detail: failure_detail(format!(
+                    "the read did not finish within {:?}",
+                    config.publication_read_deadline
+                )),
+            })
+        }
+    };
+    let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
+    crate::standard_site::store_publication(
+        pool,
+        &feed.url,
+        read,
+        config.max_entries_per_feed,
+        retention_days,
+        retention_hard_days,
+    )
+    .await
 }
 
 /// Fetch, parse, sanitize, normalize, and store a single feed.
@@ -2559,6 +2672,33 @@ mod tests {
     /// `at://` — but `feeds.url` is UNIQUE, so accepting both is two rows for
     /// one publication. Recognised (not passed through to the generic checks
     /// as if it were an ordinary URL), then refused for the spelling.
+    /// Since publications are polled, only a URI the storage guard accepts is
+    /// a publication. Any other at-URI is Unsupported, which no poller reads.
+    #[test]
+    fn only_a_storable_publication_uri_is_a_publication() {
+        let did = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
+        let pubn = crate::lexicon::nsid::STANDARD_PUBLICATION;
+        assert_eq!(
+            FeedKind::of(&format!("at://{did}/{pubn}/3lab")),
+            FeedKind::Publication
+        );
+        for unsupported in [
+            format!("at://{did}/app.bsky.feed.post/3lab"),
+            format!("At://{did}/{pubn}/3lab"),
+            format!("at://alice.example.com/{pubn}/3lab"),
+            format!("at://did:plc:short/{pubn}/3lab"),
+        ] {
+            assert_eq!(
+                FeedKind::of(&unsupported),
+                FeedKind::Unsupported,
+                "{unsupported}"
+            );
+        }
+        assert_eq!(FeedKind::of("https://example.com/feed.xml"), FeedKind::Rss);
+        assert!(!FeedKind::POLLABLE.contains(&FeedKind::Unsupported));
+        assert_eq!(FeedKind::parse("unsupported"), Some(FeedKind::Unsupported));
+    }
+
     #[test]
     fn a_non_canonical_at_uri_spelling_is_recognised_and_refused() {
         for odd in [
