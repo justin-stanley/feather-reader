@@ -1061,51 +1061,113 @@ async fn poll_publication(
     config: &crate::config::Config,
     feed: &Feed,
 ) -> Result<PollOutcome> {
-    let Some(uri) = crate::standard_site::AtUri::parse(&feed.url) else {
-        return Ok(PollOutcome::Failed {
+    poll_publication_group(pool, client, config, std::slice::from_ref(feed))
+        .await
+        .pop()
+        .unwrap_or_else(|| Err(anyhow::anyhow!("no outcome for {}", feed.url)))
+}
+
+/// Read several publications **from one repo** with one walk of its documents
+/// (`standard_site::fetch_repo`), and store each. One outcome per feed, in
+/// order. The caller groups by repo; a feed from another repo, or one whose
+/// URL is not a publication URI, gets its own failure and does not affect the
+/// rest.
+///
+/// **Why one walk:** cost scales with the repo, not the publication. Nine
+/// publications in one repo were nine full walks of its documents.
+pub async fn poll_publication_group(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feeds: &[Feed],
+) -> Vec<Result<PollOutcome>> {
+    let failed = |kind: FailureKind, detail: String| -> Result<PollOutcome> {
+        Ok(PollOutcome::Failed {
             backoff: backoff_for(1),
-            kind: FailureKind::Parse,
-            detail: failure_detail(format!("{} is not a readable at:// URI", feed.url)),
-        });
+            kind,
+            detail: failure_detail(detail),
+        })
     };
+    let uris: Vec<Option<crate::standard_site::AtUri>> = feeds
+        .iter()
+        .map(|f| crate::standard_site::AtUri::parse(&f.url))
+        .collect();
+    let Some(did) = uris.iter().flatten().next().map(|u| u.authority.clone()) else {
+        return feeds
+            .iter()
+            .map(|f| {
+                failed(
+                    FailureKind::Parse,
+                    format!("{} is not a readable at:// URI", f.url),
+                )
+            })
+            .collect();
+    };
+    // Only the feeds of that repo with a publication URI are read together.
+    let readable: Vec<usize> = (0..feeds.len())
+        .filter(|&i| {
+            uris[i].as_ref().is_some_and(|u| {
+                u.authority == did && u.collection == crate::lexicon::nsid::STANDARD_PUBLICATION
+            })
+        })
+        .collect();
+    let rkeys: Vec<String> = readable
+        .iter()
+        .map(|&i| uris[i].as_ref().unwrap().rkey.clone())
+        .collect();
+
     // **One deadline for the whole read.** It is otherwise bounded only per
     // request (FETCH_TIMEOUT x MAX_LIST_PAGES): hours, against a repo that
     // pages slowly, all of it holding up the publication loop.
     let fetched = tokio::time::timeout(
         config.publication_read_deadline,
-        crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri),
+        crate::standard_site::fetch_repo(client, &config.oauth.plc_directory, &did, &rkeys),
     )
     .await;
-    let read = match fetched {
-        Ok(Ok(read)) => read,
-        Ok(Err(err)) => {
-            return Ok(PollOutcome::Failed {
-                backoff: backoff_for(1),
-                kind: publication_failure_kind(&err),
-                detail: failure_detail(format!("{err:#}")),
-            })
+    let mut reads: Vec<Option<anyhow::Result<crate::standard_site::PublicationRead>>> =
+        feeds.iter().map(|_| None).collect();
+    let repo_failure = match fetched {
+        Ok(Ok(per)) => {
+            for (slot, read) in readable.iter().zip(per) {
+                reads[*slot] = Some(read);
+            }
+            None
         }
-        Err(_) => {
-            return Ok(PollOutcome::Failed {
-                backoff: backoff_for(1),
-                kind: FailureKind::Fetch,
-                detail: failure_detail(format!(
-                    "the read did not finish within {:?}",
-                    config.publication_read_deadline
-                )),
-            })
-        }
+        Ok(Err(err)) => Some((publication_failure_kind(&err), format!("{err:#}"))),
+        Err(_) => Some((
+            FailureKind::Fetch,
+            format!(
+                "the read did not finish within {:?}",
+                config.publication_read_deadline
+            ),
+        )),
     };
+
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
-    crate::standard_site::store_publication(
-        pool,
-        &feed.url,
-        read,
-        config.max_entries_per_feed,
-        retention_days,
-        retention_hard_days,
-    )
-    .await
+    let mut out = Vec::with_capacity(feeds.len());
+    for (i, feed) in feeds.iter().enumerate() {
+        let outcome = match (reads[i].take(), &repo_failure) {
+            (Some(Ok(read)), _) => {
+                crate::standard_site::store_publication(
+                    pool,
+                    &feed.url,
+                    read,
+                    config.max_entries_per_feed,
+                    retention_days,
+                    retention_hard_days,
+                )
+                .await
+            }
+            (Some(Err(err)), _) => failed(publication_failure_kind(&err), format!("{err:#}")),
+            (None, Some((kind, detail))) if readable.contains(&i) => failed(*kind, detail.clone()),
+            (None, _) => failed(
+                FailureKind::Parse,
+                format!("{} is not a publication in {did}", feed.url),
+            ),
+        };
+        out.push(outcome);
+    }
+    out
 }
 
 /// Fetch, parse, sanitize, normalize, and store a single feed.
