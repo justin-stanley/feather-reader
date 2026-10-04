@@ -14,6 +14,19 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### CI
+
+- **The crate publish is dispatched by `release-image`, not triggered by
+  `workflow_run`.** crates.io Trusted Publishing refuses the `workflow_run`
+  event ("does not support the `workflow_run` event trigger due to security
+  concerns"), so the ordering #223 added failed the first real release: v0.4.0's
+  automatic publish was rejected, and 0.4.0 was published by dispatching
+  `release-crate.yml` against the tag by hand. `release-image` now ends with a
+  job that dispatches it, after the gate passes and the image is pushed; the
+  order is unchanged.
+
 ## 0.4.0 — 2026-10-03
 
 **standard.site support.** FeatherReader now reads standard.site publications
