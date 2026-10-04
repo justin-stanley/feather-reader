@@ -1,6 +1,6 @@
 # Changelog
 
-Engineering detail for the 0.3.x line, newest first. Covers everything since
+Engineering detail, newest first. Covers everything since
 0.3.0. Work that has landed on `main` but is not yet tagged appears under
 **Unreleased**, when there is any.
 
@@ -14,7 +14,103 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.0 — 2026-10-03
+
+**standard.site support.** FeatherReader now reads standard.site publications
+(`site.standard.publication` / `site.standard.document` records in their
+authors' atproto repos) as subscriptions, alongside RSS. The 19 publication
+subscriptions already stored in production start delivering when this version
+is deployed. Plan and measurements: `design/STANDARD-SITE-0.4.0.md`.
+
+### Upgrade notes
+
+- **No schema change.** Upgrading from 0.3.10 is a deploy. Rolling back to
+  0.3.10 is safe: it re-derives `feeds.kind` from the URL at start (so the new
+  `unsupported` kind becomes `publication` again, which it does not poll).
+- **Two data fixes run at every start, both no-ops once done:** `feeds.kind` is
+  re-derived from the URL, as since 0.3.9, now with a third kind, `unsupported`
+  (below). And any entry stored with a `published` date more than two days in
+  the future has that date cleared (#213).
+- **A stored publication is polled whatever `FEATHERREADER_STANDARD_SITE` says.**
+  The flag decides what may be STORED: with it on, a publication can also be
+  pasted into the subscribe form. With it off, nothing new is stored, but the
+  rows already stored are read.
+- **New settings:** `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` (default
+  `30`, must be at least 1): the longest one publication read may take. It is
+  kept under Fly's 45 s `kill_timeout`, so the read in flight at shutdown can
+  finish.
+- **Stricter settings:** `FEATHERREADER_POLL_INTERVAL=0` is now refused at
+  startup. It made a healthy feed due again the moment it was read.
+- **A new background loop**, the publication poller, starts 75 s after boot.
+  `FEATHERREADER_STARTUP_DELAY_SECS` shortens it like the others.
+
+### Added
+
+- **Publications are polled** (#225). They have their own loop
+  (`scheduler::run_publication_poller`), separate from the RSS poller, so a
+  slow publication can never hold up RSS. It reads due publications as they
+  come, checks shutdown and the DB-size watermark before each read, and reads a
+  row at most once per pass.
+- **Each publisher's repo is read once per pass, however many of its
+  publications are due** (#228). Up to 16 per read, each with its own document
+  cap, so a busy publication cannot starve a quiet sibling of documents.
+- **Subscribe from the form** (#230). With the flag on, paste
+  `at://did:plc:…/site.standard.publication/…` or the handle form
+  `at://alice.example.com/site.standard.publication/…`. The handle is resolved
+  to its DID before storing. The first poll runs at once, so articles appear
+  immediately.
+- **A new feed kind, `unsupported`** (#225), for any `at://` row that is not a
+  well-formed publication: another collection, a handle, a non-canonical
+  spelling, an invalid DID. Such rows are never polled, and are counted as
+  unpollable on `/admin/metrics`.
+
+### Security
+
+- **Every stored field from a feed or a publication has a size bound** (#224,
+  closes #205), set from production's 4,389 real entries: title 5,000 bytes,
+  author 1,000, URL 8,192, stored body 2 MiB, entry id 2,048 (an over-long id
+  becomes a stable hash). Over-long values are truncated, never refused. A body
+  is sanitised first and bounded after, so markup the sanitiser strips never
+  counts against it. Plain text is bounded exactly in one pass.
+- **One malformed record no longer costs a whole page** (#224, closes #177).
+  In a reader's own repo, the listing is REFUSED (skipping would silently drop a
+  subscription) and the reading and manage pages show an alert. In a
+  publisher's repo the record is skipped, counted, and charged to the walk's
+  byte budget.
+- **A publication read has an overall deadline** (#225), so a slowly paging
+  repo cannot hold the publication loop for hours.
+
+### Changed
+
+- **Publication failures are filed under what happened** (#225). A deleted
+  publication record, a tombstoned DID (PLC 404), `RepoNotFound` or
+  `RepoDeactivated` is `status` or `parse`, not `fetch`, in the `/stats` cause
+  histogram. `fetch` is kept for answers that never arrived.
+
+### API (breaking, for users of the `feather-reader` crate)
+
+- `atproto::AtProtoError::DidResolution` gains a `cause:
+  atproto::DidResolutionCause` field (`#[non_exhaustive]`).
+- `atproto::ListRecordsResponse` gains `malformed` and `wire_bytes`;
+  `atproto::RecordWalk` gains `malformed`. Code constructing either by struct
+  literal must set them.
+- New: `atproto::MalformedRecords`, `standard_site::fetch_repo`,
+  `standard_site::NotAPublication`, `feed::poll_feed_by_kind`,
+  `feed::poll_publication_group`, `store::due_feeds_of_kind`,
+  `store::stagger_unscheduled`.
+
+### Known, not fixed here
+
+- **#226:** ammonia's time is quadratic in some inputs (`&`, deep nesting,
+  U+00A0), and sanitising runs on the poller's async task. Predates 0.4.0.
+- **#227:** some answered-but-bad publication reads are still filed as `fetch`
+  (an empty body, a 200 error envelope, running out of pages).
+- **#229:** a one-repo group shares one byte budget, so in principle big
+  siblings can starve a quiet publication of bytes. It is not reachable at
+  measured scale.
+- **Recorded decisions:** a group of up to 16 publications shares one 30 s
+  deadline, and checks the watermark once. A publication needing ~80 pages
+  (~2,000 documents) would miss the deadline; today's largest is 7.
 
 ### CI
 
