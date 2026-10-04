@@ -1476,7 +1476,18 @@ impl PdsClient {
     /// handler in `web.rs` is in this crate. Private is what makes the wrappers
     /// a fact rather than a convention, and it costs nothing: nothing outside
     /// this module ever called it.
+    ///
+    /// Sent in chunks within the PDS's limits — see [`apply_writes_chunked`]
+    /// for what a failure part-way means. This used to send any batch as one
+    /// call, including an empty one; an empty batch now sends nothing, as the
+    /// other two clients already did.
     async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
+        apply_writes_chunked(writes, |chunk| self.apply_writes_once(chunk)).await
+    }
+
+    /// One `applyWrites` call, unchunked. Reached only through
+    /// [`apply_writes`](Self::apply_writes).
+    async fn apply_writes_once(&self, writes: &[WriteOp]) -> Result<()> {
         let url = self.xrpc_url("com.atproto.repo.applyWrites");
         let ops: Vec<Value> = writes.iter().map(WriteOp::to_json).collect();
         let body = json!({
@@ -1552,7 +1563,7 @@ impl PdsClient {
             .await
     }
 
-    /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call —
+    /// Batch-flush many dirty [`ReadState`] cursors via `applyWrites` (chunked) —
     /// the debounced read-state flusher's coalesced write.
     ///
     /// Each `(rkey, state, pds_created)` becomes a `create` op at the feed-derived
@@ -2072,10 +2083,20 @@ impl SidecarClient {
     /// handler in `web.rs` is in this crate. Private is what makes the wrappers
     /// a fact rather than a convention, and it costs nothing: nothing outside
     /// this module ever called it.
+    ///
+    /// Sent in chunks within the PDS's limits — see [`apply_writes_chunked`]
+    /// for what a failure part-way means. **Chunked here, not in the sidecar**,
+    /// although the sidecar is what calls the PDS: it answers one
+    /// `/internal/repo` request with one result, which has no way to say that
+    /// half a batch landed, and this client is its only caller. Chunking here
+    /// also keeps the hop itself under the sidecar's 1 MiB Fastify body limit.
     async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
+        apply_writes_chunked(writes, |chunk| self.apply_writes_once(did, chunk)).await
+    }
+
+    /// One `/internal/repo` `applyWrites`, unchunked. Reached only through
+    /// [`apply_writes`](Self::apply_writes).
+    async fn apply_writes_once(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
         let ops: Vec<Value> = writes.iter().map(WriteOp::to_sidecar_json).collect();
         let body = json!({
             "did": did,
@@ -2138,7 +2159,7 @@ impl SidecarClient {
             .await
     }
 
-    /// Batch-flush many dirty [`ReadState`] cursors in one `applyWrites` call.
+    /// Batch-flush many dirty [`ReadState`] cursors via `applyWrites` (chunked).
     ///
     /// Each `(rkey, state, pds_created)` becomes a `create` op at the feed-derived
     /// rkey when the record does NOT yet exist (`pds_created == false`), and an
@@ -2218,13 +2239,17 @@ impl SidecarClient {
         Ok(subs)
     }
 
-    /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
+    /// Batch-add many subscriptions via `applyWrites` (chunked) — the OPML-import path.
     ///
     /// Each feed becomes one `create` op. Client-side monotonic `tid`
     /// rkeys are assigned so the batch is deterministic and the imported feeds
     /// keep OPML order (server-assigned tids would also be monotonic, but pinning
     /// them here makes the whole import reproducible and testable offline).
     /// Returns the assigned rkeys in input order.
+    ///
+    /// More than [`APPLY_WRITES_MAX_OPS`] feeds is more than one call, so the
+    /// import can part-land: on an error, [`ApplyWritesIncomplete::of`] gives
+    /// `landed`, and the first `landed` of `subs` are in the repo.
     pub async fn add_subscriptions_bulk(
         &self,
         did: &str,
@@ -2368,6 +2393,185 @@ pub(crate) fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Res
             })
         })
         .collect()
+}
+
+/// Most writes one `com.atproto.repo.applyWrites` call may carry.
+///
+/// **The limit is the reference PDS's, not the lexicon's.** The lexicon's
+/// `writes` array has no `maxLength` (checked against
+/// `lexicons/com/atproto/repo/applyWrites.json` on bluesky-social/atproto
+/// `main`, and against its history back to 2024-02); the cap is enforced by the
+/// handler, `packages/pds/src/api/com/atproto/repo/applyWrites.ts`
+/// (`if (writes.length > 200) throw new InvalidRequestError('Too many writes.
+/// Max: 200')`, unchanged at a0c49d9). vlpds documents the same figure for its
+/// commit coalescing. A PDS that allows more loses nothing by being sent 200.
+pub const APPLY_WRITES_MAX_OPS: usize = 200;
+
+/// Most bytes of serialized writes one `applyWrites` call may carry.
+///
+/// **Sized to the smallest limit a deployed PDS is known to apply, not the
+/// largest.** The reference PDS took `applyWrites` bodies up to its server-wide
+/// `jsonLimit` of 150 KiB (`150 * 1024` in `packages/pds/src/index.ts`) until
+/// atproto#4989 (2026-05-21) raised the record methods to `1_000_000` bytes.
+/// Self-hosted PDSes run older releases for months, so the 150 KiB figure is
+/// the live one for some readers. The other limits on this path are all
+/// larger: the newer reference PDS's 1,000,000 bytes, the sidecar hop's Fastify
+/// default `bodyLimit` of 1 MiB, and vlpds's coalesced commit of "up to 200
+/// operations or 1 MB of record bytes".
+///
+/// 128 KiB leaves 22 KiB under 150 KiB for what this does not count — the
+/// `{"repo": …, "writes": [ ]}` envelope, around a hundred bytes — and is
+/// measured on the PDS-shaped op (`WriteOp::to_json`), which is also what the
+/// sidecar forwards and is larger than the sidecar's own request shape.
+///
+/// What it costs, measured: 200 subscriptions with a title and site URL each
+/// are ~76 KB, so an ordinary OPML import is still one call per 200 feeds. A
+/// read-state cursor with a full 1,000-id set is ~10 KB with the store's
+/// integer entry ids (~20 KB with both sets full), so a flush crosses the
+/// bound at around a dozen full cursors — rare, since a cursor is compacted at
+/// half the cap — and a refused body is worse than an extra round trip.
+///
+/// A single op larger than this is still sent, alone: it cannot be split, and
+/// the PDS is the one to judge it.
+pub const APPLY_WRITES_MAX_BYTES: usize = 128 * 1024;
+
+/// Split a batch into the consecutive ranges [`apply_writes_chunked`] sends,
+/// each within [`APPLY_WRITES_MAX_OPS`] and [`APPLY_WRITES_MAX_BYTES`].
+///
+/// Ranges rather than slices so a caller can say WHICH writes a chunk held.
+/// Order is preserved, every op is in exactly one range, and no range is empty;
+/// an empty batch yields no ranges.
+pub(crate) fn chunk_writes(writes: &[WriteOp]) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (i, op) in writes.iter().enumerate() {
+        // +1 for the comma between array elements.
+        let size = op.to_json().to_string().len() + 1;
+        let held = i - start;
+        if held > 0 && (held == APPLY_WRITES_MAX_OPS || bytes + size > APPLY_WRITES_MAX_BYTES) {
+            chunks.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < writes.len() {
+        chunks.push(start..writes.len());
+    }
+    chunks
+}
+
+/// Send `writes` as consecutive `applyWrites` calls within the PDS's limits,
+/// stopping at the first that fails.
+///
+/// **Every client's `apply_writes` goes through this**, so no caller can send
+/// an oversized call: the OAuth client ([`crate::oauth::xrpc::Repo`]), the
+/// sidecar client ([`SidecarClient`]) and the direct client ([`PdsClient`]).
+/// `send` is that client's single-call primitive.
+///
+/// **The batch is no longer atomic.** `applyWrites` is atomic per CALL, so a
+/// split batch can half-land. The contract a caller gets instead:
+///
+/// * chunks go in input order, one at a time, and a failure stops the run —
+///   so what landed is always a PREFIX of `writes`;
+/// * on failure the error carries an [`ApplyWritesIncomplete`] saying how long
+///   that prefix is, how many writes after it are in doubt (the failed chunk:
+///   atomic, so all or none, but a timeout cannot say which), and that the
+///   rest were never sent.
+///
+/// Stopping rather than carrying on is what keeps that a prefix: sending chunk
+/// 3 after chunk 2 failed would leave a gap no caller could describe in one
+/// number, and a gap in an OPML import is feeds silently missing from the
+/// middle of the list.
+pub(crate) async fn apply_writes_chunked<'a, F, Fut>(
+    writes: &'a [WriteOp],
+    mut send: F,
+) -> Result<()>
+where
+    F: FnMut(&'a [WriteOp]) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let chunks = chunk_writes(writes);
+    let count = chunks.len();
+    for (i, range) in chunks.into_iter().enumerate() {
+        let (landed, in_doubt) = (range.start, range.len());
+        if let Err(cause) = send(&writes[range]).await {
+            return Err(ApplyWritesIncomplete {
+                landed,
+                in_doubt,
+                total: writes.len(),
+                chunk: i + 1,
+                chunks: count,
+                cause,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// How far a chunked `applyWrites` got before a chunk failed — carried by the
+/// error from every client's `apply_writes`, and so from `flush_read_states`
+/// and `add_subscriptions_bulk`.
+///
+/// Read it with [`ApplyWritesIncomplete::of`]. In terms of the caller's own
+/// input, in order:
+///
+/// * `writes[..landed]` were committed (each chunk was acknowledged);
+/// * `writes[landed..landed + in_doubt]` were the failed call — usually not
+///   committed, but a timeout or a lost response cannot rule it out;
+/// * everything after was never sent.
+///
+/// Display is the underlying failure's message, with the progress appended
+/// when the batch had more than one chunk, so a log line still names the
+/// PDS's reason. The failure's own causes stay reachable through
+/// [`anyhow::Error::chain`].
+#[derive(Debug)]
+pub struct ApplyWritesIncomplete {
+    /// Writes committed, counted from the start of the input.
+    pub landed: usize,
+    /// Writes in the failed call, starting at `landed`.
+    pub in_doubt: usize,
+    /// Writes in the whole batch.
+    pub total: usize,
+    chunk: usize,
+    chunks: usize,
+    cause: anyhow::Error,
+}
+
+impl ApplyWritesIncomplete {
+    /// The progress record an `apply_writes` error carries, if it has one.
+    pub fn of(err: &anyhow::Error) -> Option<&Self> {
+        err.chain().find_map(|e| e.downcast_ref::<Self>())
+    }
+
+    /// The failure that stopped the run, as the client reported it.
+    pub fn cause(&self) -> &anyhow::Error {
+        &self.cause
+    }
+}
+
+impl std::fmt::Display for ApplyWritesIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if self.chunks > 1 {
+            write!(
+                f,
+                " (applyWrites call {} of {}; {} of {} writes had landed)",
+                self.chunk, self.chunks, self.landed, self.total
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ApplyWritesIncomplete {
+    // The cause's own Display is already in ours, so the chain continues from
+    // ITS source — `{:#}` would otherwise print the PDS's message twice.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause.chain().nth(1)
+    }
 }
 
 /// One operation in a `PdsClient::apply_writes` batch.
@@ -6028,5 +6232,406 @@ pub(crate) mod tests {
         extend_bounded(&mut out, page(60), 100, "c").unwrap();
         extend_bounded(&mut out, page(40), 100, "c").unwrap();
         assert_eq!(out.len(), 100, "exactly the cap must be allowed");
+    }
+
+    // -- applyWrites chunking (#240) ----------------------------------------
+
+    /// Every `applyWrites` call a fake saw, as the `writes` array it carried.
+    pub(crate) type ApplyWritesLog = Arc<std::sync::Mutex<Vec<Vec<Value>>>>;
+
+    /// A fake that answers `applyWrites` the way a strict PDS does, on BOTH
+    /// shapes this crate sends it in: the PDS's own
+    /// `/xrpc/com.atproto.repo.applyWrites` (the direct and OAuth clients) and
+    /// the sidecar's `/internal/repo` (`action: "applyWrites"`).
+    ///
+    /// It refuses what the reference PDS refuses — more than 200 writes
+    /// (`InvalidRequest: Too many writes. Max: 200`, from
+    /// `packages/pds/src/api/com/atproto/repo/applyWrites.ts`) and a body over
+    /// the 150 KiB `jsonLimit` every reference PDS before atproto#4989 applied
+    /// to it — so a test that sends an unchunked batch fails the way production
+    /// would, rather than passing against a fake that accepts anything.
+    ///
+    /// Every call is logged, refused or not, so a test can assert that a later
+    /// chunk was never SENT. `fail_call` (1-based) answers that call with a 500.
+    pub(crate) async fn serve_apply_writes(fail_call: Option<usize>) -> (String, ApplyWritesLog) {
+        use axum::body::Bytes;
+        use axum::http::{StatusCode as Status, Uri};
+        use axum::response::IntoResponse;
+
+        const PRE_4989_JSON_LIMIT: usize = 150 * 1024;
+        let log: ApplyWritesLog = Arc::default();
+        let sink = Arc::clone(&log);
+        let app = axum::Router::new()
+            .fallback(move |uri: Uri, body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let sidecar = uri.path() == "/internal/repo";
+                    let reply = |status: Status, error: &str, message: &str| {
+                        let body = if sidecar {
+                            json!({ "ok": false, "error": error, "message": message, "status": status.as_u16() })
+                        } else {
+                            json!({ "error": error, "message": message })
+                        };
+                        (status, axum::Json(body)).into_response()
+                    };
+                    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    // Anything else a handler sends on the way (a folder
+                    // listing, say) is answered empty and not logged, so the
+                    // log and `fail_call` count `applyWrites` calls only.
+                    let Some(writes) = parsed["writes"].as_array().cloned() else {
+                        let empty = json!({ "records": [] });
+                        return if sidecar {
+                            axum::Json(json!({ "ok": true, "data": empty })).into_response()
+                        } else {
+                            axum::Json(empty).into_response()
+                        };
+                    };
+                    let call = {
+                        let mut calls = sink.lock().unwrap();
+                        calls.push(writes.clone());
+                        calls.len()
+                    };
+                    if body.len() > PRE_4989_JSON_LIMIT {
+                        return reply(
+                            Status::PAYLOAD_TOO_LARGE,
+                            "PayloadTooLarge",
+                            "request entity too large",
+                        );
+                    }
+                    if writes.len() > 200 {
+                        return reply(
+                            Status::BAD_REQUEST,
+                            "InvalidRequest",
+                            "Too many writes. Max: 200",
+                        );
+                    }
+                    if fail_call == Some(call) {
+                        return reply(
+                            Status::INTERNAL_SERVER_ERROR,
+                            "InternalServerError",
+                            "boom",
+                        );
+                    }
+                    let data =
+                        json!({ "commit": { "cid": "bafycommit", "rev": "3l" }, "results": [] });
+                    if sidecar {
+                        axum::Json(json!({ "ok": true, "data": data })).into_response()
+                    } else {
+                        axum::Json(data).into_response()
+                    }
+                }
+            })
+            // The fake must see an oversized body to refuse it, not have axum
+            // refuse it first at its own 2 MB default.
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    /// `n` distinct vetted subscriptions, in a known order.
+    fn vetted_subs(n: usize) -> Vec<crate::vetted::VettedSubscription> {
+        (0..n)
+            .map(|i| {
+                crate::vetted::VettedSubscription::new(&lexicon::Subscription::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    "2026-07-12T00:00:00.000Z",
+                ))
+            })
+            .collect()
+    }
+
+    /// The `rkey` of every write a run of calls carried, flattened in send order.
+    pub(crate) fn sent_rkeys(log: &ApplyWritesLog) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|w| w["rkey"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// How many writes each call carried, in send order.
+    pub(crate) fn call_sizes(log: &ApplyWritesLog) -> Vec<usize> {
+        log.lock().unwrap().iter().map(Vec::len).collect()
+    }
+
+    const CHUNK_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+
+    fn chunk_sidecar(base: &str) -> SidecarClient {
+        SidecarClient::new(Client::new(), base, base, "secret")
+    }
+
+    /// **201 writes are two calls, 200 then 1, in order.** The OPML import used
+    /// to send every feed in one `applyWrites`, which the reference PDS refuses
+    /// past 200 — so any import over 200 feeds failed outright.
+    #[tokio::test]
+    async fn sidecar_bulk_add_of_201_is_two_calls_in_order() {
+        let (base, log) = serve_apply_writes(None).await;
+        let rkeys = chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(201))
+            .await
+            .expect("a 201-feed import must succeed against a PDS that caps at 200");
+
+        assert_eq!(call_sizes(&log), vec![200, 1]);
+        let urls: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|w| w["value"]["url"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = (0..201)
+            .map(|i| format!("https://f{i}.example/feed.xml"))
+            .collect();
+        assert_eq!(urls, expected, "ops must keep input order across chunks");
+        assert_eq!(
+            sent_rkeys(&log),
+            rkeys,
+            "the returned rkeys are the ones written, in order"
+        );
+    }
+
+    /// 500 — the default per-DID cap, so the largest import a stock instance
+    /// sends — is three calls.
+    #[tokio::test]
+    async fn sidecar_bulk_add_of_500_is_three_calls() {
+        let (base, log) = serve_apply_writes(None).await;
+        chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(500))
+            .await
+            .expect("bulk write");
+        assert_eq!(call_sizes(&log), vec![200, 200, 100]);
+    }
+
+    /// Exactly the limit is ONE call: chunking must not split a batch that fits.
+    #[tokio::test]
+    async fn sidecar_bulk_add_of_exactly_200_is_one_call() {
+        let (base, log) = serve_apply_writes(None).await;
+        chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(200))
+            .await
+            .expect("bulk write");
+        assert_eq!(call_sizes(&log), vec![200]);
+    }
+
+    /// Nothing to write is no call at all — the behaviour both live clients
+    /// already had (the sidecar refuses an empty `writes[]` with a 400).
+    #[tokio::test]
+    async fn sidecar_bulk_add_of_nothing_sends_nothing() {
+        let (base, log) = serve_apply_writes(None).await;
+        let rkeys = chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &[])
+            .await
+            .expect("an empty import is not an error");
+        assert!(rkeys.is_empty());
+        assert!(
+            call_sizes(&log).is_empty(),
+            "an empty batch must not be sent"
+        );
+    }
+
+    /// **A failed chunk stops the run.** Chunk 2 of 3 fails: the call returns
+    /// an error, and chunk 3 is never sent — sending it would commit writes
+    /// after a gap, which no caller could describe as a prefix.
+    #[tokio::test]
+    async fn sidecar_bulk_add_stops_at_the_first_failed_chunk() {
+        let (base, log) = serve_apply_writes(Some(2)).await;
+        let err = chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(500))
+            .await
+            .expect_err("a failed chunk must fail the call");
+        assert_eq!(call_sizes(&log), vec![200, 200], "chunk 3 must NOT be sent");
+        assert!(
+            format!("{err:#}").contains("boom"),
+            "the PDS's reason was lost: {err:#}"
+        );
+        let progress = ApplyWritesIncomplete::of(&err).expect("the error says how far it got");
+        assert_eq!(
+            (progress.landed, progress.in_doubt, progress.total),
+            (200, 200, 500),
+            "chunk 1 landed, chunk 2 is in doubt, chunk 3 was never sent"
+        );
+        // A plain `%err` log line still names the PDS's reason.
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    /// A batch that fit in one call fails exactly as it did before chunking:
+    /// the same message, and nothing landed.
+    #[tokio::test]
+    async fn a_single_chunk_failure_reads_as_it_always_did() {
+        let (base, _log) = serve_apply_writes(Some(1)).await;
+        let err = chunk_sidecar(&base)
+            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(3))
+            .await
+            .expect_err("refused");
+        let progress = ApplyWritesIncomplete::of(&err).expect("progress");
+        assert_eq!((progress.landed, progress.in_doubt), (0, 3));
+        assert!(
+            !err.to_string().contains("applyWrites call"),
+            "a one-call batch has no progress to report: {err}"
+        );
+        assert_eq!(
+            format!("{err:#}").matches("boom").count(),
+            1,
+            "the cause must not print twice in the chain: {err:#}"
+        );
+    }
+
+    fn create_ops(n: usize, value_bytes: usize) -> Vec<WriteOp> {
+        (0..n)
+            .map(|i| WriteOp::Create {
+                collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                rkey: Some(format!("rk{i:05}")),
+                value: json!({ "pad": "x".repeat(value_bytes) }),
+            })
+            .collect()
+    }
+
+    /// The op-count boundary, on small ops the byte bound never touches.
+    #[test]
+    // A one-range Vec IS the expected value here: one chunk spanning the batch.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn chunks_split_at_200_ops_and_not_before() {
+        for (n, want) in [
+            (0, vec![]),
+            (1, vec![0..1]),
+            (200, vec![0..200]),
+            (201, vec![0..200, 200..201]),
+            (500, vec![0..200, 200..400, 400..500]),
+        ] {
+            assert_eq!(chunk_writes(&create_ops(n, 8)), want, "{n} ops");
+        }
+    }
+
+    /// **The byte bound splits under 200 ops, and every chunk fits it.**
+    #[test]
+    fn chunks_split_on_bytes_and_each_fits() {
+        let ops = create_ops(40, 10_000);
+        let chunks = chunk_writes(&ops);
+        assert!(chunks.len() > 1, "400 KB went out as {chunks:?}");
+        let mut next = 0;
+        for range in &chunks {
+            assert_eq!(range.start, next, "chunks must be consecutive: {chunks:?}");
+            next = range.end;
+            let body = json!({
+                "repo": CHUNK_DID,
+                "writes": ops[range.clone()].iter().map(WriteOp::to_json).collect::<Vec<_>>(),
+            })
+            .to_string();
+            assert!(
+                body.len() <= APPLY_WRITES_MAX_BYTES + 200,
+                "a {}-byte body for {range:?}",
+                body.len()
+            );
+        }
+        assert_eq!(next, ops.len(), "every op, once");
+    }
+
+    /// **The byte bound does not split an ordinary import.** 200 subscriptions
+    /// with a title and a site URL each fit one call, so the common OPML
+    /// import pays one round trip per 200 feeds and no more — the figure the
+    /// bound's doc comment rests on.
+    #[test]
+    fn a_realistic_200_feed_import_is_one_call() {
+        let ops: Vec<WriteOp> = (0..200)
+            .map(|i| {
+                let mut sub = lexicon::Subscription::new(
+                    format!("https://www.example-blog-{i:03}.com/feeds/posts/default.xml"),
+                    "2026-07-12T00:00:00.000Z",
+                );
+                sub.title = Some(format!("An Example Blog With A Fairly Long Title {i}"));
+                sub.site_url = Some(format!("https://www.example-blog-{i:03}.com/"));
+                WriteOp::Create {
+                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                    rkey: Some(format!("3lab2c4d5e{i:03}")),
+                    value: serde_json::to_value(&sub).unwrap(),
+                }
+            })
+            .collect();
+        // ~76 KB measured.
+        let bytes: usize = ops.iter().map(|op| op.to_json().to_string().len()).sum();
+        assert_eq!(chunk_writes(&ops), vec![0..200], "{bytes} bytes");
+    }
+
+    /// An op bigger than the bound cannot be split: it goes alone, and the
+    /// ops around it are not dragged into its call.
+    #[test]
+    fn an_oversized_op_goes_alone() {
+        let mut ops = create_ops(3, 8);
+        ops.insert(1, create_ops(1, APPLY_WRITES_MAX_BYTES + 1).remove(0));
+        assert_eq!(chunk_writes(&ops), vec![0..1, 1..2, 2..4]);
+    }
+
+    /// Read-state cursors as large as the lexicon allows: 1,000 ids each.
+    fn big_cursors(n: usize) -> Vec<(String, ReadState, bool)> {
+        (0..n)
+            .map(|i| {
+                let mut state = ReadState::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    None,
+                    "2026-07-12T00:00:00.000Z",
+                );
+                state.read_ids = (0..ReadState::MAX_IDS)
+                    .map(|j| format!("https://f{i}.example/posts/{j:04}/an-entry-permalink"))
+                    .collect();
+                (format!("rk{i:04}"), state, i % 2 == 0)
+            })
+            .collect()
+    }
+
+    /// **The byte bound splits a batch well under 200 ops.** Ten full cursors
+    /// are ~500 KB: under the op cap, over every older reference PDS's 150 KiB
+    /// body limit. Each call must fit, and together they must carry every
+    /// cursor, once, in order.
+    #[tokio::test]
+    async fn sidecar_read_state_flush_splits_on_bytes_under_200_ops() {
+        let (base, log) = serve_apply_writes(None).await;
+        let cursors = big_cursors(10);
+        chunk_sidecar(&base)
+            .flush_read_states(CHUNK_DID, &cursors)
+            .await
+            .expect("a byte-heavy flush must succeed in chunks");
+
+        let sizes = call_sizes(&log);
+        assert!(
+            sizes.len() > 1,
+            "a ~500 KB flush went out as one call: {sizes:?}"
+        );
+        let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
+        assert_eq!(sent_rkeys(&log), want, "every cursor, once, in order");
+    }
+
+    /// The direct (app-password) client gets the same chunking: its
+    /// `flush_read_states` is the same op list on a different wire.
+    #[tokio::test]
+    async fn direct_client_read_state_flush_of_201_is_two_calls() {
+        let (base, log) = serve_apply_writes(None).await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let host = format!("chunk-direct-{port}.test");
+        crate::net::test_host_override(&host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let client = PdsClient::new(
+            ssrf_test_client(),
+            format!("http://{host}:{port}"),
+            CHUNK_DID,
+            Auth::Session(SessionAuth {
+                did: CHUNK_DID.to_string(),
+                handle: None,
+                access_jwt: "jwt".to_string(),
+                refresh_jwt: None,
+            }),
+        );
+        let cursors: Vec<(String, ReadState, bool)> = (0..201)
+            .map(|i| {
+                let feed = format!("https://f{i}.example/feed.xml");
+                let state = ReadState::new(feed, None, "2026-07-12T00:00:00.000Z");
+                (format!("rk{i:04}"), state, true)
+            })
+            .collect();
+        client.flush_read_states(&cursors).await.expect("flush");
+        assert_eq!(call_sizes(&log), vec![200, 1]);
+        let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
+        assert_eq!(sent_rkeys(&log), want);
     }
 }

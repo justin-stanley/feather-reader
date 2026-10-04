@@ -354,7 +354,8 @@ impl Repo<'_> {
         rust: add_subscriptions_bulk
     }
 
-    /// OPML import — one `applyWrites` for the whole batch.
+    /// OPML import — `applyWrites`, one call per 200 feeds. A failure part-way
+    /// leaves a prefix written; see [`crate::atproto::ApplyWritesIncomplete`].
     ///
     /// Vets every record first — see [`crate::vetted::VettedSubscription::all`]. An import is the path where the
     /// URLs are least trustworthy: the file is arbitrary, and 200 of them arrive
@@ -453,7 +454,9 @@ impl Repo<'_> {
     }
 
     dispatch! {
-        /// Flush dirty cursors in one `applyWrites` — the hottest write path.
+        /// Flush dirty cursors via `applyWrites`, chunked — the hottest write path.
+        /// A failure part-way leaves a prefix written; see
+        /// [`crate::atproto::ApplyWritesIncomplete`].
         flush_read_states(cursors: &[(String, ReadState, bool)]) -> (),
         sidecar: flush_read_states,
         rust: flush_read_states
