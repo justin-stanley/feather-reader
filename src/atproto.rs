@@ -491,6 +491,7 @@ pub enum AtProtoError {
 /// Why a DID did not resolve to a PDS, structured — so a poller can file a
 /// deleted account under "the server answered" rather than "the network broke".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DidResolutionCause {
     /// A DID method this reader does not resolve.
     UnsupportedMethod,

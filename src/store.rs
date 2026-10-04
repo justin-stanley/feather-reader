@@ -1037,6 +1037,26 @@ pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Durat
     upsert_feed(pool, &nf).await.map(|_| ())
 }
 
+/// [`due_feeds`] for one kind only. The RSS poller and the publication poller
+/// each select their own, so neither can be held by the other's reads.
+pub async fn due_feeds_of_kind(
+    pool: &SqlitePool,
+    as_of: &str,
+    kind: crate::feed::FeedKind,
+    limit: i64,
+) -> Result<Vec<Feed>> {
+    sqlx::query_as::<_, Feed>(
+        "SELECT * FROM feeds WHERE (next_poll IS NULL OR next_poll <= ?1) AND kind = ?2 \
+         ORDER BY next_poll IS NOT NULL, next_poll ASC LIMIT ?3",
+    )
+    .bind(as_of)
+    .bind(kind.as_str())
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("due_feeds_of_kind failed")
+}
+
 /// Spread the first polls of never-polled `kind` rows across `spread`.
 ///
 /// **Admitting a kind to the poller makes every row of it due at once.**
