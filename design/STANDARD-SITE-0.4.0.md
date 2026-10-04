@@ -293,9 +293,10 @@ subscribed publication ever approaches the limit, keep the partial read on
 timeout instead of raising the deadline.
 
 **Decided in review of step 2b: a one-repo group shares one read, one 30 s
-deadline and one byte budget.** Each publication in a group has its own
-document cap and its own share of the budget, so a big sibling cannot starve a
-quiet one of records or bytes. The group still finishes when its slowest member
+deadline and one byte budget.** Each publication in a group has its own document cap, so a big sibling cannot
+starve a quiet one of records. The byte budget is shared, so in principle a big
+sibling can starve a quiet one of BYTES (#229, not reachable at measured scale;
+a static per-publication share was tried and removed for being worse). The group still finishes when its slowest member
 does, and the DB-size watermark is checked once per group, so a group can store
 up to 16 publications past it. Neither bites at measured scale (the largest
 repo's nine publications hold 38 documents, two pages); revisit if a member's
