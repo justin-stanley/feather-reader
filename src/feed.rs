@@ -1018,6 +1018,37 @@ pub async fn poll_feed_by_kind(
     }
 }
 
+/// What a failed publication read is filed under in the cause histogram.
+///
+/// **`Fetch` means the request never produced a response**, so it is the
+/// fallback, not the default answer: a PLC directory or PDS that answered —
+/// with a 404 for a tombstoned DID, `RepoNotFound`, `RepoDeactivated` — is
+/// `Status`, and an answer that was not what it claimed to be is `Parse`. Filed
+/// as `Fetch`, a deleted account read as its server being down (found in
+/// review).
+fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
+    use crate::atproto::{AtProtoError, DidResolutionCause};
+    for cause in err.chain() {
+        if cause.is::<crate::standard_site::NotAPublication>() || cause.is::<serde_json::Error>() {
+            return FailureKind::Parse;
+        }
+        match cause.downcast_ref::<AtProtoError>() {
+            Some(AtProtoError::Xrpc { .. }) => return FailureKind::Status,
+            Some(AtProtoError::DidResolution { cause, .. }) => {
+                return match cause {
+                    DidResolutionCause::Status => FailureKind::Status,
+                    DidResolutionCause::UnsupportedMethod | DidResolutionCause::NoPdsEndpoint => {
+                        FailureKind::Parse
+                    }
+                    DidResolutionCause::NotAPublicTarget => FailureKind::Fetch,
+                }
+            }
+            _ => {}
+        }
+    }
+    FailureKind::Fetch
+}
+
 /// Read a standard.site publication from its author's PDS and store it.
 ///
 /// A source failure — an unparseable URI, an unreachable PLC directory or
@@ -1037,24 +1068,32 @@ async fn poll_publication(
             detail: failure_detail(format!("{} is not a readable at:// URI", feed.url)),
         });
     };
-    let read = match crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri).await {
-        Ok(read) => read,
-        Err(err) => {
-            // The repo answering with something that is not this publication
-            // is not a transport failure, and must not be counted as one.
-            let kind = if err
-                .downcast_ref::<crate::standard_site::NotAPublication>()
-                .is_some()
-            {
-                FailureKind::Parse
-            } else {
-                FailureKind::Fetch
-            };
+    // **One deadline for the whole read.** It is otherwise bounded only per
+    // request (FETCH_TIMEOUT x MAX_LIST_PAGES): hours, against a repo that
+    // pages slowly, all of it holding one of the publication slots.
+    let fetched = tokio::time::timeout(
+        config.publication_read_deadline,
+        crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri),
+    )
+    .await;
+    let read = match fetched {
+        Ok(Ok(read)) => read,
+        Ok(Err(err)) => {
             return Ok(PollOutcome::Failed {
                 backoff: backoff_for(1),
-                kind,
+                kind: publication_failure_kind(&err),
                 detail: failure_detail(format!("{err:#}")),
-            });
+            })
+        }
+        Err(_) => {
+            return Ok(PollOutcome::Failed {
+                backoff: backoff_for(1),
+                kind: FailureKind::Fetch,
+                detail: failure_detail(format!(
+                    "the read did not finish within {:?}",
+                    config.publication_read_deadline
+                )),
+            })
         }
     };
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);

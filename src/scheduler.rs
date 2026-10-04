@@ -625,21 +625,40 @@ async fn poll_due_once(
         let default_interval = state.config.poll_interval;
         let config = Arc::clone(&state.config);
         if feed::FeedKind::of(&feed.url) == feed::FeedKind::Publication {
-            // **Its own, smaller limit, waited for INSIDE the task.** Waiting in
-            // this loop would hold every RSS feed behind it in the batch; the
-            // task holds nothing while it waits — the publication permit first,
-            // then an overall slot — so RSS launches are not delayed by it.
+            // **Outside the tick, not drained by it.** Publications run one at
+            // a time with a read deadline of minutes; waiting for them here held
+            // the tick — and every RSS feed due after it — for the sum of their
+            // reads (found in review). So the row is leased forward NOW, which
+            // stops the next tick launching it again while it waits, and its
+            // task is not in `handles`.
+            if let Err(err) =
+                store::set_next_poll(&pool, &feed.url, cadence_for(&feed, default_interval)).await
+            {
+                warn!(feed = %feed.url, %err, "could not lease a publication forward; leaving it for the next tick");
+                continue;
+            }
+            // The task waits for the publication permit, then an overall slot,
+            // holding neither while it waits for the other — and gives up if
+            // shutdown is asked for first, so a SIGTERM does not have to sit
+            // through a queue of publication reads.
             let publications = Arc::clone(publication_limiter);
             let all = Arc::clone(limiter);
-            handles.push(tokio::spawn(async move {
-                let Ok(_one) = publications.acquire_owned().await else {
-                    return;
+            let mut stop = shutdown.clone();
+            tokio::spawn(async move {
+                let permits = async {
+                    let one = publications.acquire_owned().await.ok()?;
+                    let slot = all.acquire_owned().await.ok()?;
+                    Some((one, slot))
                 };
-                let Ok(_slot) = all.acquire_owned().await else {
-                    return;
-                };
-                poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
-            }));
+                tokio::select! {
+                    _ = stop.changed() => {}
+                    permits = permits => {
+                        if let Some(_held) = permits {
+                            poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
+                        }
+                    }
+                }
+            });
         } else {
             // Acquire a permit *before* launching so at most `concurrency`
             // fetches are ever in flight; the permit is released when the task
@@ -1690,6 +1709,57 @@ mod tests {
     fn jitter_never_returns_a_sub_second_period() {
         assert!(jittered(Duration::from_secs(1), "x") >= Duration::from_secs(1));
         assert!(jittered(Duration::from_millis(1), "x") >= Duration::from_secs(1));
+    }
+
+    // ── 0.4.0: a publication does not hold the tick ────────────────────────
+
+    /// Review of #225: `poll_due_once` drained every task it spawned, and
+    /// publications run one at a time with no overall deadline, so one slow
+    /// publication held the tick — and every RSS feed behind it — for as long
+    /// as it took. A publication now runs outside the tick: here it can never
+    /// get a slot (a zero-permit limit), and the tick must still return.
+    #[tokio::test]
+    async fn a_waiting_publication_does_not_hold_the_tick() {
+        let state = rust_state().await;
+        let url = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let client = feed::build_client().unwrap();
+        let limiter = Arc::new(Semaphore::new(4));
+        let never = Arc::new(Semaphore::new(0));
+        let (_tx, shutdown) = watch::channel(());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_due_once(
+                &state,
+                &client,
+                &limiter,
+                &never,
+                50,
+                Duration::ZERO,
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("the tick waited on a publication that cannot run")
+        .unwrap();
+        // Leased forward at launch, so the next tick does not launch it again
+        // while this one still waits.
+        let row = store::get_feed_by_url(&state.db, url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.next_poll.is_some(),
+            "a waiting publication was not leased"
+        );
     }
 
     // ── #117: orphaned dirty read-state ──────────────────────────────────────

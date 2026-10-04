@@ -1323,7 +1323,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
-        for host in ["plc.repo.test", "pds.repo.test"] {
+        // Unique per server: the override table is process-wide and tests run
+        // in parallel, so a shared name would let one test reach another's.
+        let (plc_host, pds_host) = (
+            format!("plc-{port}.repo.test"),
+            format!("pds-{port}.repo.test"),
+        );
+        for host in [&plc_host, &pds_host] {
             crate::net::test_host_override(host, addr);
         }
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1341,7 +1347,7 @@ mod tests {
                             "service": [{
                                 "id": "#atproto_pds",
                                 "type": "AtprotoPersonalDataServer",
-                                "serviceEndpoint": format!("http://pds.repo.test:{port}"),
+                                "serviceEndpoint": format!("http://{pds_host}:{port}"),
                             }],
                         }));
                     }
@@ -1368,7 +1374,7 @@ mod tests {
             },
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://plc.repo.test:{port}"), hits)
+        (format!("http://{plc_host}:{port}"), hits)
     }
 
     /// **The mocked repo reads through the real fetch path.** Pins that
@@ -1514,6 +1520,167 @@ mod tests {
                 }
             ),
             "a deleted publication was filed as a network failure: {outcome:?}"
+        );
+    }
+
+    /// A PLC directory and PDS on one port that answer however the test says:
+    /// the PLC lookup with `plc_status` (200 serves a DID document), and every
+    /// `listRecords` with `(status, body)` after `delay` — or, when `endless`,
+    /// a fresh page of one sibling document, forever.
+    async fn serve_answering(
+        did: &'static str,
+        plc_status: u16,
+        pds: (u16, &'static str),
+        delay: std::time::Duration,
+        endless: bool,
+    ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (plc_host, pds_host) = (
+            format!("plc-{port}.answer.test"),
+            format!("pds-{port}.answer.test"),
+        );
+        crate::net::test_host_override(&plc_host, addr);
+        crate::net::test_host_override(&pds_host, addr);
+        let pages = Arc::new(AtomicUsize::new(0));
+        let endpoint = format!("http://{pds_host}:{port}");
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let pages = Arc::clone(&pages);
+            let endpoint = endpoint.clone();
+            async move {
+                use axum::response::IntoResponse;
+                if req.uri().path() == format!("/{did}") {
+                    let status = axum::http::StatusCode::from_u16(plc_status).unwrap();
+                    let doc = json!({ "id": did, "service": [{ "id": "#atproto_pds",
+                        "type": "AtprotoPersonalDataServer", "serviceEndpoint": endpoint }] });
+                    return (status, axum::Json(doc)).into_response();
+                }
+                tokio::time::sleep(delay).await;
+                if endless {
+                    let n = pages.fetch_add(1, Ordering::SeqCst);
+                    let body = json!({ "records": [{
+                        "uri": format!("at://{did}/{}/3lend{n:08}", nsid::STANDARD_DOCUMENT),
+                        "cid": "b",
+                        "value": { "title": "x", "path": "/x", "publishedAt": "2026-07-11T00:00:00Z",
+                                   "site": format!("at://{did}/{}/other", nsid::STANDARD_PUBLICATION) } }],
+                        "cursor": format!("c{n}") });
+                    return axum::Json(body).into_response();
+                }
+                let status = axum::http::StatusCode::from_u16(pds.0).unwrap();
+                (status, [("content-type", "application/json")], pds.1).into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{plc_host}:{port}")
+    }
+
+    async fn poll_publication_at(
+        did: &str,
+        plc: String,
+        deadline: Option<std::time::Duration>,
+    ) -> crate::feed::PollOutcome {
+        let site = format!("at://{did}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        if let Some(d) = deadline {
+            config.publication_read_deadline = d;
+        }
+        let client = crate::feed::build_client().unwrap();
+        crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap()
+    }
+
+    fn kind_of(outcome: &crate::feed::PollOutcome) -> Option<crate::feed::FailureKind> {
+        match outcome {
+            crate::feed::PollOutcome::Failed { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Review of #225: one publication read had no overall deadline — only
+    /// FETCH_TIMEOUT per request x MAX_LIST_PAGES — and the tick waited for it.
+    #[tokio::test]
+    async fn a_publication_read_has_an_overall_deadline() {
+        const DID: &str = "did:plc:slowrepoaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(
+            DID,
+            200,
+            (200, ""),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let outcome =
+            poll_publication_at(DID, plc, Some(std::time::Duration::from_millis(300))).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the read ran {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Fetch),
+            "{outcome:?}"
+        );
+    }
+
+    /// Review of #225: answers that ARRIVED were filed as `Fetch` ("the request
+    /// never produced a response"), putting deleted and deactivated accounts in
+    /// the network bucket.
+    #[tokio::test]
+    async fn a_publication_failure_is_filed_under_what_happened() {
+        let zero = std::time::Duration::ZERO;
+        const GONE: &str = "did:plc:tombstonedaaaaaaaaaaaaaa";
+        let plc = serve_answering(GONE, 404, (200, ""), zero, false).await;
+        let outcome = poll_publication_at(GONE, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Status),
+            "PLC 404: {outcome:?}"
+        );
+
+        const NOREPO: &str = "did:plc:norepoaaaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(
+            NOREPO,
+            200,
+            (400, r#"{"error":"RepoNotFound"}"#),
+            zero,
+            false,
+        )
+        .await;
+        let outcome = poll_publication_at(NOREPO, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Status),
+            "RepoNotFound: {outcome:?}"
+        );
+
+        const GARBLED: &str = "did:plc:garbledaaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(GARBLED, 200, (200, r#"{"records":"x"}"#), zero, false).await;
+        let outcome = poll_publication_at(GARBLED, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Parse),
+            "garbled body: {outcome:?}"
         );
     }
 

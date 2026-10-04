@@ -12,6 +12,8 @@
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
+//! | `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` | `120` | The longest one standard.site publication read may take before it is a failure. |
+//! | `FEATHERREADER_PUBLICATION_POLL_CONCURRENCY` | `1` | Publications read at once, within the overall poll concurrency. |
 //! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
@@ -77,6 +79,10 @@ pub struct Config {
     pub allowed_dids: Vec<String>,
     /// The default per-feed poll interval.
     pub poll_interval: Duration,
+    /// The longest one standard.site publication read may take, start to
+    /// finish. A read is otherwise bounded only per request (`FETCH_TIMEOUT` x
+    /// `MAX_LIST_PAGES`), which is hours against a repo that pages slowly.
+    pub publication_read_deadline: Duration,
     /// Cache eviction window, in days: a READ, UNSTARRED entry older than this
     /// is dropped from the local cache. Starred and still-unread entries are
     /// kept past this window — but NOT indefinitely: see `retention_hard_days`,
@@ -358,6 +364,7 @@ impl Default for Config {
             public_url: "http://localhost:8080".to_string(),
             allowed_dids: Vec::new(),
             poll_interval: Duration::from_secs(3600),
+            publication_read_deadline: Duration::from_secs(120),
             retention_days: 14,
             retention_hard_days: 180,
             publication_retention_days: 3_650,
@@ -456,6 +463,15 @@ impl Config {
             })
             .unwrap_or(defaults.allowed_dids);
 
+        let publication_read_deadline =
+            match env_opt("FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS") {
+                Some(raw) => Duration::from_secs(raw.parse().with_context(|| {
+                    format!(
+                    "FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS: expected seconds, got {raw:?}"
+                )
+                })?),
+                None => defaults.publication_read_deadline,
+            };
         let poll_interval = match env_opt("FEATHERREADER_POLL_INTERVAL") {
             Some(raw) => {
                 let secs: u64 = raw.parse().with_context(|| {
@@ -638,6 +654,7 @@ impl Config {
             public_url,
             allowed_dids,
             poll_interval,
+            publication_read_deadline,
             retention_days,
             retention_hard_days,
             publication_retention_days,
