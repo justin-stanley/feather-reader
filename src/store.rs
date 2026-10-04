@@ -285,15 +285,12 @@ CREATE TABLE IF NOT EXISTS entries (
     fetched_at   TEXT NOT NULL,
     UNIQUE (feed_id, guid)
 );
--- `fetched_at` is in the index so the queries that sort on
--- `COALESCE(published, fetched_at)` stay COVERING. Without it the planner
--- still uses the index to find a feed's rows but must then visit each one to
--- read `fetched_at`, and the sort key is computed before `LIMIT` truncates
--- anything — so the lookups scale with every row in every subscribed feed,
--- not with the page. `(feed_id, published)` is a prefix of this, so it serves
--- everything the old index did; `apply_migrations` drops that one.
-CREATE INDEX IF NOT EXISTS idx_entries_feed_effective
-    ON entries (feed_id, published, fetched_at);
+-- The list and prev/next queries order on `COALESCE(published, fetched_at)`
+-- (#187). Measured on the real query shape (LEFT JOIN entry_state, EXISTS
+-- sub_ref), this index serves them as well as it served bare `published`; a
+-- `(feed_id, published, fetched_at)` replacement was tried and was ~3.8x
+-- slower on the default prev/next query, which never chose it (review of #213).
+CREATE INDEX IF NOT EXISTS idx_entries_feed_published ON entries (feed_id, published);
 
 CREATE TABLE IF NOT EXISTS entry_state (
     did        TEXT NOT NULL,
@@ -774,15 +771,19 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     .await
     .context("creating idx_invite_codes_intended_active")?;
 
-    // Superseded by `idx_entries_feed_effective`, which carries `fetched_at` as a
-    // third column so the `COALESCE(published, fetched_at)` orderings stay
-    // covering. `(feed_id, published)` is a prefix of the new index, so nothing it
-    // served is lost — and keeping both would charge every entry insert for a
-    // second index answering no query the first does not.
-    sqlx::query("DROP INDEX IF EXISTS idx_entries_feed_published")
+    // **Re-date rows stored with a future date before ingest refused them**
+    // (#188). An item dated 2999 that has since left its feed is never polled
+    // again to be corrected, so it would stay first in the list and survive the
+    // per-feed cap. Cleared, `fetched_at` dates it. The same bound ingest uses;
+    // a no-op once there are none.
+    let ceiling = (chrono::Utc::now()
+        + chrono::Duration::days(crate::feed::MAX_FUTURE_PUBLISHED_DAYS))
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    sqlx::query("UPDATE entries SET published = NULL WHERE published > ?1")
+        .bind(&ceiling)
         .execute(pool)
         .await
-        .context("dropping the superseded idx_entries_feed_published")?;
+        .context("clearing stored future publication dates")?;
     Ok(())
 }
 
@@ -4976,67 +4977,51 @@ mod tests {
         Ok(feed_id)
     }
 
-    /// **The index claim, pinned — because otherwise it is a comment.**
-    ///
-    /// `idx_entries_feed_effective` carries `fetched_at` as a third column so the
-    /// `COALESCE(published, fetched_at)` orderings stay covering. Drop that column
-    /// and every query still returns the right rows in the right order, so no
-    /// other test notices; what changes is that the planner must visit each
-    /// candidate row to read `fetched_at`, and the sort key is computed before
-    /// `LIMIT`, so on the prev/next path that is every entry in every subscribed
-    /// feed on every article open.
-    ///
-    /// This does assert a planner outcome, which is a little brittle by nature.
-    /// It earns that: the alternative is a performance property stated only in a
-    /// comment, and this file's history is mostly comments that stopped being
-    /// true. The superseded `(feed_id, published)` index must also be gone — it
-    /// is a prefix of the new one, so keeping it would charge every entry insert
-    /// for a second index answering no query the first does not.
+    /// Review of #213: the ceiling only stops NEW future dates. A row stored
+    /// with one before it, whose item has since left its feed, is never polled
+    /// again to be corrected — so it stayed first in the list and survived the
+    /// per-feed cap forever. Startup re-dates it.
     #[tokio::test]
-    async fn the_entry_index_covers_the_ordering_the_queries_actually_use() -> Result<()> {
+    async fn a_stored_future_date_is_cleared_at_startup() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
-        seed_big_entries(&pool, "did:plc:idx", 20).await?;
-
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-            "EXPLAIN QUERY PLAN SELECT e.id FROM entries e \
-             JOIN sub_ref s ON s.feed_id = e.feed_id AND s.did = 'did:plc:idx' \
-             ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT 5000",
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://clock.example/f.xml".into(),
+                ..Default::default()
+            },
         )
-        .fetch_all(&pool)
         .await?;
-        let steps: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
-        assert!(
-            steps
-                .iter()
-                .any(|s| s.contains("COVERING INDEX idx_entries_feed_effective")),
-            "the ordering no longer reads from a covering index, so every \
-             candidate row is visited to compute the sort key: {steps:?}",
-        );
-
-        // **The drop has to be exercised on a database that HAS the old index.**
-        // A fresh one never creates it, so asserting its absence here would pass
-        // whether or not the migration runs — which is exactly what the first
-        // version of this test did. Recreate it, re-run the migrations (they are
-        // idempotent), and then look.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_entries_feed_published ON entries (feed_id, published)",
-        )
-        .execute(&pool)
-        .await?;
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        for (guid, published) in [
+            ("bogus", "2999-01-01T00:00:00Z"),
+            ("soon", tomorrow.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO entries (feed_id, guid, published, fetched_at) \
+                 VALUES (?1, ?2, ?3, '2026-07-11T00:00:00Z')",
+            )
+            .bind(feed_id)
+            .bind(guid)
+            .bind(published)
+            .execute(&pool)
+            .await?;
+        }
         apply_migrations(&pool).await?;
-        let indexes: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entries'",
-        )
-        .fetch_all(&pool)
-        .await?;
-        let names: Vec<&str> = indexes.iter().map(|i| i.0.as_str()).collect();
-        assert!(
-            !names.contains(&"idx_entries_feed_published"),
-            "the superseded index survived the migration: {names:?}",
+        let dated: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT guid, published FROM entries ORDER BY guid")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            dated[0],
+            ("bogus".to_string(), None),
+            "a 2999 date survived startup"
         );
-        assert!(
-            names.contains(&"idx_entries_feed_effective"),
-            "the migration dropped the old index without the new one existing: {names:?}",
+        assert_eq!(
+            dated[1].1.as_deref(),
+            Some(tomorrow.as_str()),
+            "a near-future date was cleared"
         );
         Ok(())
     }
@@ -5059,23 +5044,15 @@ mod tests {
     /// Both directions here: the undated row must come first, AND the two dated
     /// rows must stay in their own order, or "order by nothing" would pass.
     ///
-    /// **On the index worry, measured rather than assumed.** #187 flagged that a
-    /// `COALESCE` in `ORDER BY` cannot use `idx_entries_feed_published`, and
-    /// suggested an expression index might be needed. `EXPLAIN QUERY PLAN` says
-    /// it is moot — both forms already end in `USE TEMP B-TREE FOR ORDER BY`,
-    /// because the join fans out across every subscribed feed and several index
-    /// ranges have to be merged, so the bare `published DESC` was not using the
-    /// index for ordering either. The one real difference was `COVERING INDEX` →
-    /// `INDEX` on `entries`, because `fetched_at` was not in the index and the
-    /// rows then had to be visited.
-    ///
-    /// **That cost is NOT "per page", and an earlier version of this comment said
-    /// it was.** The sort key is computed before `LIMIT` truncates anything, so
-    /// the lookups scale with every row matching the `WHERE` clause. For
-    /// `list_entries` the difference is small; for `list_entry_ids`, called with
-    /// `web::PREV_NEXT_MAX` on every article open, it is every entry in every
-    /// subscribed feed. So `fetched_at` is now the index's third column
-    /// (`idx_entries_feed_effective`) and both orderings are covering again.
+    /// **On the index worry, measured on the query the app actually sends.**
+    /// #187 flagged that a `COALESCE` in `ORDER BY` cannot use
+    /// `idx_entries_feed_published` for ordering. The real list and prev/next
+    /// queries (LEFT JOIN `entry_state`, EXISTS `sub_ref`) did not use it for
+    /// ordering before this change either, and timing them at 40 feeds x 1,000
+    /// entries showed the new ordering costs nothing on the existing index. A
+    /// `(feed_id, published, fetched_at)` index meant to keep them covering was
+    /// never chosen on the default prev/next query and made it ~3.8x slower,
+    /// so it was not kept (review of #213).
     #[tokio::test]
     async fn an_undated_entry_leads_the_reading_list_as_it_leads_the_cap() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;

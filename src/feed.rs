@@ -1469,7 +1469,7 @@ fn entry_time(e: &RawEntry) -> Option<String> {
 /// worth keeping, and both stop being future without help. Anything further is
 /// refused, because a date that never becomes past is what makes a row
 /// permanently unsweepable and permanently first in the reading list.
-const MAX_FUTURE_PUBLISHED_DAYS: i64 = 2;
+pub(crate) const MAX_FUTURE_PUBLISHED_DAYS: i64 = 2;
 
 /// Extract the plain string content of a feed [`Text`] node.
 fn text_plain(t: &Text) -> String {
@@ -2113,8 +2113,6 @@ mod tests {
         assert_eq!(e.guid, "https://example.com/post");
     }
 
-    /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
-    /// (no network) and assert the entries come out sanitized and well-shaped.
     /// **A stated date in the future is discarded, not stored and not clamped.**
     ///
     /// `entry_time` was `e.published.or(e.updated)` with no ceiling, so an item
@@ -2133,9 +2131,9 @@ mod tests {
     /// and the row can never age at all. Clamping moves the defect. Falling back
     /// to undated lets `fetched_at` date it, and that holds still.
     ///
-    /// The ceiling carries the SAME `CLOCK_SKEW_GRACE_SECS` allowance the
-    /// publication path uses, so the two ingest paths agree about what "future"
-    /// means rather than one being stricter by accident.
+    /// The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`] (two days), deliberately
+    /// looser than the publication path's five-minute grace: a publication can
+    /// fall back to its record key's TID, and a feed has no such fallback.
     #[test]
     fn a_future_dated_rss_item_is_stored_undated_rather_than_dated_in_2999() {
         let future = r#"<?xml version="1.0"?>
@@ -2228,6 +2226,8 @@ mod tests {
         );
     }
 
+    /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
+    /// (no network) and assert the entries come out sanitized and well-shaped.
     #[test]
     fn rss_parses_and_sanitizes() {
         let parsed = feed_rs::parser::parse(RSS_SAMPLE.as_bytes()).expect("RSS should parse");

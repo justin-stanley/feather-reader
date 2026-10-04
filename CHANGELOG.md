@@ -62,9 +62,8 @@ deploying is separate.
 
   Each candidate is judged separately rather than the winner of `or`, so a feed
   with a bogus `pubDate` beside a credible `atom:updated` keeps the good date —
-  that is the ordinary shape of a broken-clock feed, not a rare one. The ceiling
-  carries the same `CLOCK_SKEW_GRACE_SECS` allowance the publication path uses,
-  so the two ingest paths agree about what "future" means.
+  that is the ordinary shape of a broken-clock feed, not a rare one. The ceiling is two days, deliberately looser than the publication path's
+  five-minute grace (see the last paragraph below).
 
 - **An undated entry was the newest row to the cap and the oldest to the reading
   list** (#187). The per-feed keep-set and both sweeps order on
@@ -76,19 +75,19 @@ deploying is separate.
   reader would see it. `site.standard.document` makes `publishedAt` optional, so
   publication feeds reach this far more readily than RSS ever did.
 
-  The issue's index worry was half right, and measuring said which half.
-  `EXPLAIN QUERY PLAN` shows both forms already ending in `USE TEMP B-TREE FOR
-  ORDER BY` — the join fans out across every subscribed feed and several index
-  ranges must be merged, so the bare ordering was not using the index for
-  sorting either, and no expression index is needed. But the loss of `COVERING
-  INDEX` is not "bounded by `LIMIT`" as first claimed: the sort key is computed
-  before `LIMIT` truncates anything, so the row lookups scale with every row
-  matching the `WHERE` clause. On the prev/next path, which runs on every
-  article open with a 5000 limit, that is every entry in every subscribed feed.
-  So `fetched_at` is now the index's third column
-  (`idx_entries_feed_effective`), both orderings are covering again, and
-  `apply_migrations` drops the superseded `(feed_id, published)` index, which was
-  a prefix of the new one.
+  The index worry was measured on the query the app actually sends (a LEFT
+  JOIN on `entry_state` and an EXISTS on `sub_ref`), and the existing
+  `(feed_id, published)` index serves the new ordering as well as it served the
+  old one. A `(feed_id, published, fetched_at)` replacement meant to keep the
+  queries covering was tried and removed in review: the default prev/next query
+  never chose it, and with the old index dropped that query ran about 3.8x
+  slower (34 ms against 9 ms at 40 feeds x 1,000 entries). **No schema
+  change.**
+
+  **Rows already stored with a future date are re-dated at startup**: their
+  `published` is cleared, so `fetched_at` dates them. Otherwise an item dated
+  2999 that has already left its feed would never be polled again to be
+  corrected, and would stay first in the list and survive the per-feed cap.
 
   The future-date bound is **two days**, not the publication path's five-minute
   clock-skew grace, and the asymmetry is deliberate. There a refused

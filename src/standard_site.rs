@@ -240,8 +240,8 @@ pub fn entries_from_records(
     // The SAME allowance the record-key branch gets. A publisher's clock runs
     // ahead of ours as readily as a PDS's does, and judging a stated date
     // against a bare `now` while the rkey below gets five minutes discarded a
-    // perfectly good date and left the newest post undated — which, ordered on
-    // a bare `published DESC`, puts it at the bottom of the list.
+    // perfectly good date and left the newest post undated — dated, then, by
+    // when we first saw it rather than when it was written.
     let ceiling = now + chrono::Duration::seconds(crate::atproto::CLOCK_SKEW_GRACE_SECS);
     records
         .iter()
