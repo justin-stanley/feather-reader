@@ -295,10 +295,9 @@ pub fn entries_from_records(
                 summary: non_blank(doc.description)
                     .or_else(|| non_blank(doc.text_content))
                     .map(|raw| {
-                        crate::feed::render_bounded(
+                        crate::feed::plain_text_to_html_bounded(
                             &raw,
                             crate::feed::MAX_CONTENT_HTML_BYTES,
-                            crate::feed::plain_text_to_html,
                         )
                     }),
             })

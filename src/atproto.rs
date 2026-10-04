@@ -1135,7 +1135,15 @@ impl PdsClient {
             // pages of junk walks every page MAX_LIST_PAGES allows — gigabytes —
             // under a budget meant to stop it (found in review). The whole page
             // is charged: conservative, and only on pages that skipped something.
-            if page.malformed > 0 && !budget.charge(page.wire_bytes) {
+            // Charged ONCE, at the larger of what crossed the wire and what the
+            // kept records retain: a parsed record can hold up to 42x its wire
+            // size, so the wire alone under-charges (third review of #224).
+            if page.malformed > 0
+                && !budget.charge(
+                    page.wire_bytes
+                        .max(page.records.iter().map(approx_bytes).sum()),
+                )
+            {
                 anyhow::bail!(
                     "listRecords for {collection} exceeded the {max_bytes}-byte cap on pages \
                      of malformed records — refusing to read further"
@@ -1284,9 +1292,6 @@ impl PdsClient {
             // As in `walk_all_within`: skipped records are invisible to the
             // per-record charge, so their page pays for them here.
             let wire_charged = page.malformed > 0;
-            if wire_charged && !budget.charge(page.wire_bytes) {
-                return Ok(walk(RecordWalk::partial(out), malformed + page.malformed));
-            }
             malformed += page.malformed;
             let got = page.records.len() + page.malformed;
             // Is there a next page that is actually new? (A PDS may echo a
@@ -1301,10 +1306,14 @@ impl PdsClient {
             // number. A page of records the filter rejects entirely charges
             // nothing against the total and can still hold hundreds of
             // megabytes, so no single page may exceed the walk's budget alone.
-            // A page charged by its wire size above has already paid for its
-            // transient AND its kept records; neither check applies again.
-            let page_cost: usize = page.records.iter().map(approx_bytes).sum();
-            if !wire_charged && page_cost > budget.remaining() {
+            // On a page that skipped records, the transient is the larger of
+            // its wire size and its parsed records: the skipped ones are
+            // invisible to the per-record sum.
+            let mut page_cost: usize = page.records.iter().map(approx_bytes).sum();
+            if wire_charged {
+                page_cost = page_cost.max(page.wire_bytes);
+            }
+            if page_cost > budget.remaining() {
                 return Ok(walk(RecordWalk::partial(out), malformed));
             }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
@@ -1314,10 +1323,14 @@ impl PdsClient {
             // a subset of it. Written as `if !admit(…) { return }` it reads as a
             // second stopping rule, and a reader would look for the case that
             // trips it. There isn't one — the call is the bookkeeping.
-            if !wire_charged {
-                let charged = budget.admit(&kept);
-                debug_assert!(charged, "the page charge already proved this fits");
-            }
+            // A page that skipped records also pays for the skipped bytes,
+            // once: the larger of its wire size and what it keeps.
+            let charged = if wire_charged {
+                budget.charge(page.wire_bytes.max(kept.iter().map(approx_bytes).sum()))
+            } else {
+                budget.admit(&kept)
+            };
+            debug_assert!(charged, "the page charge already proved this fits");
             if extend_truncating(&mut out, kept, max_records) {
                 return Ok(walk(RecordWalk::partial(out), malformed));
             }
@@ -4814,6 +4827,87 @@ pub(crate) mod tests {
             "one tiny malformed record per page cut short a walk that fits"
         );
         assert_eq!(walk.records.len(), clean_records.len());
+    }
+
+    /// Third review of #224: charging a page that skipped a record only its
+    /// wire size let a walk retain what it never paid for — a parsed record
+    /// can hold up to 42x its wire size. Pages of dense `[[],[],…]` values, each
+    /// with one malformed record beside them, retained 18x the budget.
+    #[tokio::test]
+    async fn a_page_that_skipped_a_record_still_pays_for_what_it_keeps() {
+        let dense = format!("[{}]", vec!["[]"; 2000].join(","));
+        let pages = |with_bad: bool| -> Vec<Vec<u8>> {
+            (0..3)
+                .map(|i| {
+                    let mut records: Vec<String> = (0..99)
+                        .map(|r| {
+                            format!(r#"{{"uri":"at://did:plc:x/c/3l{i}x{r}","value":{dense}}}"#)
+                        })
+                        .collect();
+                    if with_bad {
+                        records.push(r#"{"cid":"b","value":{}}"#.to_string());
+                    }
+                    let cursor = if i < 2 {
+                        format!(r#","cursor":"p{}""#, i + 1)
+                    } else {
+                        String::new()
+                    };
+                    format!(r#"{{"records":[{}]{cursor}}}"#, records.join(",")).into_bytes()
+                })
+                .collect()
+        };
+        const BUDGET: usize = 4 * 1024 * 1024;
+        // Control: without the malformed records the walk is refused.
+        let (base, _) = host_for(pages(false), "retained-control.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        client
+            .list_all_records_skipping_within("c", &mut ByteBudget::new(BUDGET))
+            .await
+            .expect_err("control: the clean pages fit a budget they exceed");
+
+        let (base, _) = host_for(pages(true), "retained-skipping.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        client
+            .list_all_records_skipping_within("c", &mut ByteBudget::new(BUDGET))
+            .await
+            .expect_err("one malformed record per page bought pages the budget refuses");
+
+        // The documents walk, with pages that each FIT the remaining budget
+        // but together exceed it: only charging what the kept records retain
+        // can stop it. (Pages each bigger than the budget are stopped by the
+        // transient check alone and prove nothing about the charge.)
+        let small_dense = format!("[{}]", vec!["[]"; 120].join(","));
+        let fitting_pages: Vec<Vec<u8>> = (0..6)
+            .map(|i| {
+                let mut records: Vec<String> = (0..99)
+                    .map(|r| {
+                        format!(r#"{{"uri":"at://did:plc:x/c/3m{i}x{r}","value":{small_dense}}}"#)
+                    })
+                    .collect();
+                records.push(r#"{"cid":"b","value":{}}"#.to_string());
+                let cursor = if i < 5 {
+                    format!(r#","cursor":"q{}""#, i + 1)
+                } else {
+                    String::new()
+                };
+                format!(r#"{{"records":[{}]{cursor}}}"#, records.join(",")).into_bytes()
+            })
+            .collect();
+        let (base, _) = host_for(fitting_pages, "retained-recent.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let walk = client
+            .list_recent_matching_within("c", 10_000, &mut ByteBudget::new(BUDGET), 100, |_| true)
+            .await
+            .unwrap();
+        let retained: usize = walk.records.iter().map(approx_bytes).sum();
+        assert!(
+            retained <= BUDGET,
+            "retained {retained} under a {BUDGET}-byte budget"
+        );
+        assert!(
+            !walk.complete,
+            "pages totalling more than the budget were all kept"
+        );
     }
 
     /// The reader's own repo: this walk feeds `replace_sub_refs`, so skipping

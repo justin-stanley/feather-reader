@@ -1187,7 +1187,7 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
         .as_ref()
         .and_then(|c| c.body.as_deref())
         .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
-        .map(|raw| render_bounded(raw, MAX_CONTENT_HTML_BYTES, sanitize_html));
+        .map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES));
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
@@ -1303,7 +1303,7 @@ pub(crate) const MAX_AUTHOR_BYTES: usize = 1_000;
 /// better than no link; at 35x the longest real one it should never happen.
 pub(crate) const MAX_URL_BYTES: usize = 8_192;
 /// See [`MAX_TITLE_BYTES`]. Applies to the STORED HTML, after sanitizing or
-/// escaping — see [`render_bounded`] for why that is the bound that matters.
+/// escaping — see [`sanitize_html_bounded`] for why that is the bound that matters.
 pub(crate) const MAX_CONTENT_HTML_BYTES: usize = 2 * 1024 * 1024;
 /// An entry id longer than this is replaced by a stable hash of the whole id
 /// (see [`bound_guid`]): it is the dedup key, under a UNIQUE index.
@@ -1319,85 +1319,73 @@ fn floor_char_boundary(s: &str, at: usize) -> usize {
 
 /// `s` cut to at most `max` bytes, on a character boundary. Plain-text fields
 /// only: cutting markup or an escaped string here could split a tag or an
-/// entity, which is what [`render_bounded`] exists for.
+/// entity, which is what [`sanitize_html_bounded`] and [`plain_text_to_html_bounded`] exist for.
 pub(crate) fn bound_text(mut s: String, max: usize) -> String {
     let cut = floor_char_boundary(&s, max);
     s.truncate(cut);
     s
 }
 
-/// Render `raw` with `render` (sanitize or escape) so the **output** fits `max`.
+/// Plain text escaped into `content_html`, cut so the **output** fits `max`.
 ///
-/// **The bound is on what is stored, so it is checked after rendering.**
-/// Escaping grows text (`&` becomes five bytes) and sanitizing can grow it too,
-/// so a cap on the input bounds nothing. Cutting the output instead would split
-/// a tag or an entity. So the INPUT is cut — on a character boundary, before
-/// rendering, where `ammonia` closes whatever the cut left open and escaping
-/// has no entity to split — and re-cut, shorter, if the result still does not
-/// fit.
-///
-/// **The whole input is rendered first, when it is no bigger than one fetched
-/// body.** Sanitizing can also SHRINK markup: a large inline `data:` image,
-/// `<svg>` or `<style>` is stripped entirely. Cutting first threw away the
-/// article behind such a block — the cut ended inside it, and nothing was kept
-/// (found in review). An RSS body is at most `net::MAX_BODY_BYTES`, so it always
-/// renders whole first. A bigger input can only be plain text read from a
-/// record walk, which escaping never shrinks, so cutting it first loses nothing
-/// and spares escaping it all.
-///
-/// **The search is bounded, by rounds, not by convergence.** The first version
-/// shrank the cut in proportion to the overshoot. When the bytes beyond the
-/// cut are ones the sanitizer strips anyway, cutting them changes nothing, and
-/// it crept a few bytes a round — measured, hours of CPU for one entry, on
-/// the poller's async task. It also could jump into a stripped prefix and keep
-/// nothing (both found in review). So: try the whole input once, then
-/// binary-search the longest prefix whose output fits, at most
-/// [`MAX_RENDER_ROUNDS`] renders, keeping the best fit seen, and stopping once
-/// the cut is known to within 1/1024 of `max`.
-pub(crate) fn render_bounded(raw: &str, max: usize, render: impl Fn(&str) -> String) -> String {
-    // The whole input, when it is small enough to have been one fetched body.
-    // Larger input is plain text, which escaping never shrinks, so no prefix
-    // longer than `max` can fit and that is the search's upper end.
-    let upper = if raw.len() <= crate::net::MAX_BODY_BYTES {
-        raw.len()
-    } else {
-        floor_char_boundary(raw, max)
-    };
-    let first = render(&raw[..upper]);
-    if first.len() <= max {
-        return first;
-    }
-    // `lo` always renders within `max` (the empty prefix trivially does);
-    // `hi` never does. The search stops once they are within `resolution`.
-    let (mut lo, mut hi) = (0usize, upper);
-    let mut best = String::new();
-    let resolution = (max / 1024).max(1);
-    // **The first probe is proportional**, which is where an input that mostly
-    // survives rendering lands — one probe, within resolution, done. The
-    // halving that follows bounds the cases where it is wrong.
-    let mut probe = (upper as u128 * max as u128 / first.len() as u128) as usize;
-    for _ in 0..MAX_RENDER_ROUNDS {
-        if hi - lo <= resolution {
+/// **Exact, in one pass.** Escaping is a fixed size per character (`&` is
+/// five bytes, `<` and `>` four, a newline `<br>` four, anything else its UTF-8
+/// length), so the longest prefix whose escaped form fits is found by adding
+/// those up — no rendering, no search. Three rounds of review found bugs in a
+/// generic re-render search that this replaces (#224).
+pub(crate) fn plain_text_to_html_bounded(raw: &str, max: usize) -> String {
+    let mut size = 0usize;
+    let mut cut = raw.len();
+    for (i, c) in raw.char_indices() {
+        let escaped = match c {
+            '&' => 5,
+            '<' | '>' | '\n' => 4,
+            c => c.len_utf8(),
+        };
+        if size + escaped > max {
+            cut = i;
             break;
         }
-        let mid = floor_char_boundary(raw, probe.clamp(lo + 1, hi - 1));
-        probe = lo + (hi - lo) / 2;
-        if mid <= lo {
-            break;
-        }
-        let out = render(&raw[..mid]);
-        if out.len() <= max {
-            lo = mid;
-            best = out;
-        } else {
-            hi = mid;
-        }
+        size += escaped;
     }
-    best
+    plain_text_to_html(&raw[..cut])
 }
 
-/// The most renders [`render_bounded`] spends on one value after the first.
-const MAX_RENDER_ROUNDS: usize = 12;
+/// Feed HTML sanitized into `content_html`, cut so the **output** fits `max`.
+///
+/// **Sanitize once, then cut the sanitized output, not the input.** Cutting
+/// the input made the result depend on how much of it the sanitizer would
+/// strip — a large `data:` image, `<style>` or unterminated comment — and the
+/// searches that tried to account for that kept nothing, or ran for hours, in
+/// review (#224). Sanitized HTML is already clean: cutting it on a character
+/// boundary and sanitizing that prefix again only closes the tags the cut left
+/// open, so the second pass grows it by little. The cut leaves a margin for that
+/// growth and retries with a wider one if the margin was not enough.
+///
+/// Cost: the first sanitize is the one every body always had; the bounded
+/// passes run on at most `max` bytes of already-clean HTML, and only for a body
+/// over the bound.
+pub(crate) fn sanitize_html_bounded(raw: &str, max: usize) -> String {
+    let clean = sanitize_html(raw);
+    if clean.len() <= max {
+        return clean;
+    }
+    let mut margin = (max / 64).max(64);
+    for _ in 0..SANITIZE_BOUND_ATTEMPTS {
+        let cut = floor_char_boundary(&clean, max.saturating_sub(margin));
+        let again = sanitize_html(&clean[..cut]);
+        if again.len() <= max {
+            return again;
+        }
+        margin = margin.saturating_mul(4).max(again.len() - max + margin);
+    }
+    // Unreachable in practice — re-sanitizing clean HTML grows it by its open
+    // tags' closers — but the bound is a guarantee, so it has a floor.
+    String::new()
+}
+
+/// How many cut-and-resanitize passes [`sanitize_html_bounded`] tries.
+const SANITIZE_BOUND_ATTEMPTS: usize = 4;
 
 /// An entry id, or a stable stand-in for one too long to index.
 ///
@@ -1651,7 +1639,7 @@ mod tests {
     #[test]
     fn rendered_content_fits_even_when_rendering_grows_it() {
         // Escaping turns each `&` into `&amp;` — five bytes from one.
-        let out = render_bounded(&"&".repeat(1_000), 100, plain_text_to_html);
+        let out = plain_text_to_html_bounded(&"&".repeat(1_000), 100);
         assert!(
             out.len() <= 100,
             "escaped output not bounded: {} bytes",
@@ -1712,7 +1700,7 @@ mod tests {
             r#"<p><img src="data:image/png;base64,{}"></p><p>the article</p>"#,
             "A".repeat(MAX + 16 * 1024)
         );
-        let html = render_bounded(&body, MAX, sanitize_html);
+        let html = sanitize_html_bounded(&body, MAX);
         assert!(
             html.contains("the article"),
             "the article was cut away: {} bytes kept",
@@ -1725,29 +1713,17 @@ mod tests {
     /// few bytes a round when the bytes beyond the cut were ones the sanitizer
     /// strips anyway — measured at ~32 bytes/round, hours for one entry, on the
     /// poller's async task. The number of renders must be bounded.
+    /// Review of #224: a cut into bytes the sanitizer strips anyway (here an
+    /// unterminated comment) crept a few bytes a round, for hours. Bounding
+    /// works on the SANITIZED output now, so stripped input costs nothing.
     #[test]
-    fn bounding_content_renders_a_bounded_number_of_times() {
-        // Scaled down: `max` is a parameter, and debug-build ammonia over the
-        // real 2 MiB bound took minutes per test. The shape is what matters.
+    fn content_cut_beside_stripped_bytes_still_keeps_what_fits() {
         const MAX: usize = 64 * 1024;
-        let article = "a".repeat(MAX + 8);
-        // An unterminated comment: ammonia drops all of it, so cutting into it
-        // removes input without shrinking output.
-        let body = format!("<p>{article}</p><!--{}", "x".repeat(16 * MAX));
-        let calls = std::cell::Cell::new(0u32);
-        let html = render_bounded(&body, MAX, |s| {
-            calls.set(calls.get() + 1);
-            // Fail fast rather than hang: the bug this pins ran for hours.
-            assert!(
-                calls.get() <= 16,
-                "{} renders for one entry and counting",
-                calls.get()
-            );
-            sanitize_html(s)
-        });
+        let body = format!("<p>{}</p><!--{}", "a".repeat(MAX + 8), "x".repeat(16 * MAX));
+        let html = sanitize_html_bounded(&body, MAX);
         assert!(html.len() <= MAX);
         assert!(
-            html.len() > MAX / 2,
+            html.len() > MAX - MAX / 16,
             "kept far less than fits: {}",
             html.len()
         );
@@ -1755,22 +1731,57 @@ mod tests {
 
     /// Also from that review: a cut landing inside a stripped prefix stored an
     /// empty body when an article that fits followed it.
+    /// Also from review: a cut landing inside a stripped prefix stored an
+    /// empty body when an article that fits followed it.
     #[test]
     fn a_stripped_prefix_does_not_leave_an_empty_body() {
         const MAX: usize = 64 * 1024;
-        // The reviewer's case, scaled: a stripped image three times the bound,
-        // then an article that escaping grows past it.
         let body = format!(
             r#"<p><img src="data:image/png;base64,{}"></p><p>{}</p>"#,
             "A".repeat(3 * MAX),
             "&".repeat(MAX)
         );
-        let html = render_bounded(&body, MAX, sanitize_html);
+        let html = sanitize_html_bounded(&body, MAX);
         assert!(html.len() <= MAX);
         assert!(
-            html.contains("&amp;&amp;"),
-            "nothing of the article was kept: {} bytes",
+            html.len() > MAX - MAX / 16,
+            "nothing like what fits was kept: {} bytes",
             html.len()
+        );
+    }
+
+    /// Third review: a multi-byte character where the search's stale probe
+    /// landed ended it early, keeping 0 bytes where ~2 MiB fit.
+    #[test]
+    fn a_stripped_multibyte_prefix_does_not_leave_an_empty_body() {
+        const MAX: usize = 64 * 1024;
+        let body = format!(
+            "<!--{}--><p>{}</p>",
+            "漢".repeat(MAX),
+            "&".repeat(MAX * 3 / 10)
+        );
+        let html = sanitize_html_bounded(&body, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+    }
+
+    /// The plain-text bound is exact: escaping is linear, so the longest
+    /// fitting prefix is found in one pass, never by search.
+    #[test]
+    fn the_plain_text_bound_is_exact() {
+        const MAX: usize = 64 * 1024;
+        let raw = format!("{}{}", "漢".repeat(MAX / 4), "&".repeat(MAX / 10));
+        let out = plain_text_to_html_bounded(&raw, MAX);
+        assert!(out.len() <= MAX);
+        // The next character would not have fitted: '&' escapes to 5 bytes.
+        assert!(out.len() > MAX - 5, "kept {} of {MAX}", out.len());
+        assert!(
+            raw.starts_with(&out.replace("&amp;", "&")),
+            "not a prefix of the input"
         );
     }
 
