@@ -31,7 +31,7 @@ permits storing one is off in production.
 | `at://` storable, as an allowlist entry behind a flag | **built** (#183) | `feed::is_storable_feed_url(url, allow_at_uri)` |
 | **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`; one read at a time, `publication_read_deadline` 30 s |
 | **One walk per repo per tick** | **built** (step 2b) | `standard_site::fetch_repo`, `feed::poll_publication_group`; up to 16 publications of one repo per read |
-| **Subscribe form** | **not started** | refuses `at://` (`config.rs` flag doc) |
+| **Subscribe form** | **built** (step 3) | DID and handle forms, behind the flag; `web::publication_url_from_paste` |
 | **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
 
 ### Why it matters, now

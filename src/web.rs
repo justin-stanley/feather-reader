@@ -3018,6 +3018,48 @@ struct SubscribeForm {
 }
 
 /// `POST /subscriptions` — subscribe by URL.
+/// The DID-form URL to store for a pasted `at://` publication, or the flash
+/// to refuse it with.
+///
+/// - The scheme is canonicalised: `At://` is the same publication, and
+///   storing a second spelling makes a second row for it (#183).
+/// - It must name a `site.standard.publication`; anything else is not a feed
+///   this instance can read.
+/// - A handle is resolved to its DID: a handle is a mutable name, and
+///   `feeds.url` is keyed on identity, so only the DID form is stored.
+async fn publication_url_from_paste(state: &AppState, input: &str) -> Result<String, String> {
+    let unsupported = || UNSUPPORTED_FEED_URL_REFUSAL.to_string();
+    let canonical = format!(
+        "{}{}",
+        crate::atproto::AT_URI_PREFIX,
+        &input[crate::atproto::AT_URI_PREFIX.len()..]
+    );
+    let uri = crate::standard_site::AtUri::parse(&canonical).ok_or_else(unsupported)?;
+    if uri.collection != lexicon::nsid::STANDARD_PUBLICATION {
+        return Err(unsupported());
+    }
+    let did = if crate::oauth::identity::is_atproto_did(&uri.authority) {
+        uri.authority.clone()
+    } else {
+        crate::atproto::resolve_handle(&state.http, &state.config.resolver_base, &uri.authority)
+            .await
+            .map_err(|err| {
+                warn!(%err, handle = %uri.authority, "could not resolve a pasted publication's handle");
+                format!("Couldn't resolve the handle {} to an account.", uri.authority)
+            })?
+    };
+    let url = format!(
+        "{}{did}/{}/{}",
+        crate::atproto::AT_URI_PREFIX,
+        uri.collection,
+        uri.rkey
+    );
+    if !feed::is_storable_feed_url(&url, true) {
+        return Err(unsupported());
+    }
+    Ok(url)
+}
+
 async fn add_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3045,21 +3087,35 @@ async fn add_subscription(
     // scheme, so `AT://…` would otherwise skip both this and the classifier's
     // at:// arm, parse as `at`, and draw the private/paid flash off the rkey.
     // This decides a MESSAGE; nothing about storage keys off it.
-    if input
+    // **An at:// paste is a standard.site publication, read by the poller
+    // since 0.4.0**: canonicalised and resolved to its DID form here, then it
+    // joins the ordinary path below. With the flag off it is refused as it
+    // always was — the flag gates what may be stored.
+    let is_at_uri = input
         .get(..crate::atproto::AT_URI_PREFIX.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(crate::atproto::AT_URI_PREFIX))
-    {
-        info!(url = %input, %did, "refused an at:// paste: the add path cannot fetch one (not stored)");
-        return Ok(
-            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
-                .into_response(),
-        );
-    }
+        .is_some_and(|p| p.eq_ignore_ascii_case(crate::atproto::AT_URI_PREFIX));
+    let publication_url = if is_at_uri {
+        if !state.config.standard_site {
+            info!(url = %input, %did, "refused an at:// paste: standard.site is off (not stored)");
+            return Ok(
+                Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                    .into_response(),
+            );
+        }
+        match publication_url_from_paste(&state, &input).await {
+            Ok(url) => Some(url),
+            Err(flash) => {
+                info!(url = %input, %did, %flash, "refused an at:// paste (not stored)");
+                return Ok(Redirect::to(&format!("/?flash={}", qenc(&flash))).into_response());
+            }
+        }
+    } else {
+        None
+    };
 
-    // Block private/paid feeds BEFORE any fetch/resolve so a secret-bearing URL is
-    // never even requested. Public feeds only until atproto permissioned data
-    // ships; there is no override and nothing is stored or written.
-    if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&input) {
+    if let feed::FeedPrivacy::Private(reason) =
+        feed::classify_feed_privacy(publication_url.as_deref().unwrap_or(&input))
+    {
         info!(url = %input, %reason, %did, "refused private/paid feed at add (not fetched or stored)");
         return Ok(
             Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
@@ -3087,7 +3143,11 @@ async fn add_subscription(
         }
     }
 
-    let feed_url = match resolve_feed_url(&state.config, &input).await {
+    let resolved = match publication_url {
+        Some(url) => Ok(url),
+        None => resolve_feed_url(&state.config, &input).await,
+    };
+    let feed_url = match resolved {
         Ok(u) => u,
         Err(err) => {
             warn!(%err, url = %input, "could not resolve a feed from the given URL");
@@ -3153,8 +3213,7 @@ async fn add_subscription(
 
     if let Ok(client) = feed::build_client() {
         if let Some(feed_row) = store::get_feed_by_url(pool, &feed_url).await? {
-            match feed::poll_feed(pool, &client, &feed_row, state.config.max_entries_per_feed).await
-            {
+            match feed::poll_feed_by_kind(pool, &client, &state.config, &feed_row).await {
                 Ok(outcome) => {
                     info!(feed = %feed_url, ?outcome, "polled new subscription");
                     // **This path is not the scheduler, so it must settle the
@@ -9564,20 +9623,9 @@ mod tests {
         );
     }
 
-    /// **With the flag ON, a well-formed at:// paste is still refused as
-    /// unsupported** — not "Couldn't find a feed" plus a `warn!`. The add path
-    /// cannot fetch `at://` until the subscribe form learns it (0.4.0 step 3),
-    /// whatever the flag says — the poller reads publications, the form does
-    /// not — and the
-    /// docs promise this answer "with the flag on or off". This is also the
-    /// suite's first state with the flag on: every other site passes the flag
-    /// through with `false`, where a literal `false` would be indistinguishable.
-    #[tokio::test]
-    async fn a_well_formed_at_uri_paste_is_refused_as_unsupported_with_the_flag_on() {
-        let did = "did:plc:renamer5";
-        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
-        let cookie = session_cookie(&state, did, None);
+    /// POST `/subscriptions` with `url`, returning the redirect target.
+    async fn subscribe(state: &AppState, did: &str, url_enc: &str) -> String {
+        let cookie = session_cookie(state, did, None);
         let resp = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -9585,23 +9633,220 @@ mod tests {
                     .uri("/subscriptions")
                     .header(header::COOKIE, cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("url={AT_URI_SUB_ENC}")))
+                    .body(Body::from(format!("url={url_enc}")))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let loc = resp
-            .headers()
+        resp.headers()
             .get(header::LOCATION)
             .unwrap()
             .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A `com.atproto.identity.resolveHandle` that answers `did` for anything.
+    async fn serve_resolver(did: &str) -> String {
+        let base = crate::net::tests::serve_body(
+            serde_json::json!({ "did": did }).to_string().into_bytes(),
+        )
+        .await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
             .unwrap();
+        let host = format!("resolver-{port}.test");
+        crate::net::test_host_override(&host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        format!("http://{host}:{port}")
+    }
+
+    fn with_config(mut state: AppState, f: impl FnOnce(&mut Config)) -> AppState {
+        let mut config = (*state.config).clone();
+        f(&mut config);
+        state.config = std::sync::Arc::new(config);
+        state
+    }
+
+    /// **0.4.0 step 3: with the flag ON, a well-formed at:// paste is
+    /// subscribed.** It was refused as unsupported while nothing could read a
+    /// publication; the poller reads them now. Stored in DID form, as a
+    /// `publication`, and written to the reader's PDS like any subscription.
+    #[tokio::test]
+    async fn a_well_formed_at_uri_paste_is_subscribed_with_the_flag_on() {
+        let did = "did:plc:renamer5";
+        let (sidecar, log) = spawn_logging_sidecar().await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+            },
+        );
+        let loc = subscribe(&state, did, AT_URI_SUB_ENC).await;
+        assert_eq!(loc, "/", "the paste was refused: {loc}");
+        let row = store::get_feed_by_url(&state.db, AT_URI_SUB)
+            .await
+            .unwrap()
+            .expect("no feed row");
+        assert_eq!(feed::FeedKind::of(&row.url), feed::FeedKind::Publication);
+        let sent = log.lock().unwrap().join("\n");
+        assert!(
+            sent.contains(AT_URI_SUB),
+            "the subscription was not written to the PDS: {sent}"
+        );
+    }
+
+    /// **A0 through the form** — the 0.4.0 exit test, end to end: a reader
+    /// pastes a publication, it is stored and written to their PDS, and the
+    /// first poll — the one subscribing runs at once — stores its documents.
+    #[tokio::test]
+    async fn a0_subscribing_from_the_form_delivers_entries() {
+        let did = "did:plc:renamer5";
+        let author = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
+        let site = AT_URI_SUB;
+        let (plc, _) = crate::standard_site::tests::serve_repo(
+            author,
+            vec![
+                (
+                    lexicon::nsid::STANDARD_PUBLICATION,
+                    "3lab2c4d5e6f7g8h",
+                    serde_json::json!({ "name": "A0 Journal", "url": "https://a0.example" }),
+                ),
+                (
+                    lexicon::nsid::STANDARD_DOCUMENT,
+                    "3l2a0frmaaa2a",
+                    serde_json::json!({ "title": "From the form", "path": "/f",
+                        "publishedAt": "2026-07-11T00:00:00Z", "site": site }),
+                ),
+            ],
+        )
+        .await;
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.oauth.plc_directory = plc;
+            },
+        );
+        assert_eq!(subscribe(&state, did, AT_URI_SUB_ENC).await, "/");
+        let row = store::get_feed_by_url(&state.db, site)
+            .await
+            .unwrap()
+            .unwrap();
+        let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM entries WHERE feed_id = ?")
+            .bind(row.id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles,
+            vec!["From the form".to_string()],
+            "the first poll stored nothing"
+        );
+        assert_eq!(row.title.as_deref(), Some("A0 Journal"));
+    }
+
+    /// A handle-form paste is resolved to the DID before it is stored: a
+    /// handle is a mutable name, and `feeds.url` is keyed on identity.
+    #[tokio::test]
+    async fn a_handle_form_paste_is_stored_by_its_did() {
+        let did = "did:plc:renamer5";
+        let author = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let resolver = serve_resolver(author).await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.resolver_base = resolver;
+                c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+            },
+        );
+        let loc = subscribe(
+            &state,
+            did,
+            "at%3A%2F%2Falice.example.com%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+        )
+        .await;
+        assert_eq!(loc, "/", "the paste was refused: {loc}");
+        assert!(
+            store::get_feed_by_url(&state.db, AT_URI_SUB)
+                .await
+                .unwrap()
+                .is_some(),
+            "not stored by its DID"
+        );
+        assert_eq!(
+            store::count_feeds(&state.db).await.unwrap(),
+            1,
+            "the handle form was stored too"
+        );
+    }
+
+    /// A handle that does not resolve is refused, and nothing is stored.
+    #[tokio::test]
+    async fn an_unresolvable_handle_paste_is_refused() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.resolver_base = "http://resolver.nowhere.invalid".into();
+            },
+        );
+        let loc = subscribe(
+            &state,
+            did,
+            "at%3A%2F%2Fnobody.example.com%2Fsite.standard.publication%2F3lab2c4d5e6f7g8h",
+        )
+        .await;
+        assert!(
+            loc.contains("flash="),
+            "an unresolvable handle was accepted: {loc}"
+        );
+        assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// An at:// URI that is not a publication is refused, flag on or off.
+    #[tokio::test]
+    async fn a_non_publication_at_uri_paste_is_refused() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
+        let loc = subscribe(
+            &state,
+            did,
+            "at%3A%2F%2Fdid%3Aplc%3Aohutz6x5acjmpuulp3x7wxxc%2Fapp.bsky.feed.post%2F3lab2c4d5e6f7g8h",
+        )
+        .await;
         assert!(
             loc.contains("kind%20of%20feed"),
             "expected the unsupported flash: {loc}"
         );
         assert_eq!(store::count_feeds(&state.db).await.unwrap(), 0);
+    }
+
+    /// A mixed-case scheme is canonicalised at input, not refused and not
+    /// stored as a second spelling of the same publication.
+    #[tokio::test]
+    async fn a_mixed_case_at_scheme_paste_is_stored_canonically() {
+        let did = "did:plc:renamer5";
+        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let state = with_config(
+            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            |c| {
+                c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+            },
+        );
+        let loc = subscribe(&state, did, &AT_URI_SUB_ENC.replacen("at", "At", 1)).await;
+        assert_eq!(loc, "/", "the paste was refused: {loc}");
+        assert!(store::get_feed_by_url(&state.db, AT_URI_SUB)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// **With the flag ON, an OPML at:// entry is stored.** The one storage
