@@ -41,9 +41,19 @@
       <section class="manage-section" aria-labelledby="add-h">
         <h2 id="add-h">Add a feed</h2>
         <form class="add-feed-form" method="post" action="/subscriptions">
-          <label class="visually-hidden" for="feed-url">Feed or site URL</label>
-          <input class="input" id="feed-url" name="url" type="url" inputmode="url"
-                 placeholder="Paste a feed or site URL…" required />
+          {% if standard_site %}
+            {# `type="text"`, not `type="url"`: a browser validates `url` with the
+               WHATWG URL parser, which rejects `at://did:plc:…/…` (the colons in
+               the DID read as a port), so the DID form could never be submitted. #}
+            <label class="visually-hidden" for="feed-url">Feed, site or publication URL</label>
+            <input class="input" id="feed-url" name="url" type="text" inputmode="url"
+                   autocapitalize="off" autocorrect="off" spellcheck="false"
+                   placeholder="Paste a feed, site or at:// publication URL…" required />
+          {% else %}
+            <label class="visually-hidden" for="feed-url">Feed or site URL</label>
+            <input class="input" id="feed-url" name="url" type="url" inputmode="url"
+                   placeholder="Paste a feed or site URL…" required />
+          {% endif %}
           {% if !folder_options.is_empty() %}
             <label class="visually-hidden" for="folder-pick">Folder</label>
             <select class="select" id="folder-pick" name="folder">
@@ -59,6 +69,15 @@
           </button>
         </form>
         <p class="form-hint">A site URL works too — FeatherReader discovers the feed.</p>
+        {% if standard_site %}
+          <p class="form-hint">
+            A <a href="https://standard.site" rel="noopener noreferrer">standard.site</a>
+            publication works too: paste
+            <code>at://did:plc:…/site.standard.publication/…</code> or the handle form
+            <code>at://alice.example.com/site.standard.publication/…</code>. The handle is
+            resolved to its DID before saving, and the first read runs right away.
+          </p>
+        {% endif %}
         <p class="form-hint">
           Public feeds only for now. Private/paid feeds (Substack <code>/feed/private/…</code>,
           Patreon <code>?auth=</code>, members-only newsletters, private podcasts) aren't supported

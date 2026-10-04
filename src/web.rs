@@ -952,6 +952,7 @@ async fn about(State(state): State<AppState>) -> Response {
         repo_url: REPO_URL,
         kofi_url: KOFI_URL,
         adoption,
+        standard_site: state.config.standard_site,
     })
 }
 
@@ -1321,6 +1322,12 @@ struct ManageTemplate {
     /// Folders (each with feeds) + loose feeds, for the "Your feeds" list.
     folders: Vec<FolderView>,
     loose_feeds: Vec<FeedView>,
+    /// `Config::standard_site`. With it on, the subscribe form says a
+    /// `site.standard.publication` URI is accepted and its input drops
+    /// `type="url"`, whose browser validation rejects the DID form. With it off
+    /// `add_subscription` refuses every `at://` paste, so the form must not
+    /// advertise one.
+    standard_site: bool,
 }
 
 /// The optional one-line adoption fact at the bottom of `/about`
@@ -1345,6 +1352,9 @@ struct AboutTemplate {
     repo_url: &'static str,
     kofi_url: &'static str,
     adoption: Option<AdoptionLine>,
+    /// `Config::standard_site`: whether the publications section may tell the
+    /// reader how to subscribe to one here. See [`ManageTemplate::standard_site`].
+    standard_site: bool,
 }
 
 /// The public `/stats` page — is the poller keeping up?
@@ -1416,6 +1426,9 @@ struct LandingTemplate {
     repo_url: &'static str,
     crates_url: &'static str,
     kofi_url: &'static str,
+    /// `Config::standard_site`: whether the publications point may tell a
+    /// visitor how to subscribe to one here. See [`ManageTemplate::standard_site`].
+    standard_site: bool,
 }
 
 /// The single-entry reader view (`GET /entries/:id`).
@@ -1895,6 +1908,7 @@ async fn index(
                 repo_url: REPO_URL,
                 crates_url: CRATES_URL,
                 kofi_url: KOFI_URL,
+                standard_site: state.config.standard_site,
             }))
         }
     };
@@ -2411,6 +2425,7 @@ async fn manage(
         folder_options,
         folders: folder_views,
         loose_feeds,
+        standard_site: state.config.standard_site,
     };
     Ok(render(&tmpl))
 }
@@ -7057,6 +7072,202 @@ mod tests {
         assert!(!body.contains("atproto network"));
     }
 
+    // ---- standard.site on the public pages and the subscribe form ----------
+    //
+    // `FEATHERREADER_STANDARD_SITE` gates what may be STORED (`add_subscription`
+    // refuses every `at://` paste with it off), so a page that tells the reader
+    // to paste a publication URI is advertising a form that will be refused
+    // unless the flag is on. These pin both halves: with the flag on the pages
+    // say how; with it off they do not.
+
+    /// A state with the standard.site flag chosen, and `did` holding a seat so
+    /// `/manage` renders for it.
+    async fn standard_site_state(standard_site: bool, did: &str) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &[did.to_string()]).await.unwrap();
+        let config = Config {
+            allowed_dids: vec![did.to_string()],
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            standard_site,
+            ..Config::default()
+        };
+        AppState::new(config, db).unwrap()
+    }
+
+    /// `GET path` as `did`, asserted 200, body as a string.
+    async fn signed_in_body(state: AppState, path: &str, did: &str) -> String {
+        let cookie = session_cookie(&state, did, Some("reader.example"));
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// `GET path` signed out, asserted 200, body as a string.
+    async fn public_body(state: AppState, path: &str) -> String {
+        let resp = router(state)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The `<input … id="feed-url" …>` tag of the subscribe form, whole.
+    fn feed_url_input(body: &str) -> &str {
+        let start = body
+            .find("id=\"feed-url\"")
+            .and_then(|i| body[..i].rfind("<input"))
+            .expect("the subscribe form's URL input renders");
+        let end = body[start..].find('>').expect("the input tag closes") + start + 1;
+        &body[start..end]
+    }
+
+    /// Flag on: the subscribe form says a publication URI is accepted, and shows
+    /// both spellings the handler takes (DID and handle).
+    #[tokio::test]
+    async fn manage_hints_at_publications_when_the_flag_is_on() {
+        let did = "did:plc:reader";
+        let body = signed_in_body(standard_site_state(true, did).await, "/manage", did).await;
+        assert!(
+            body.contains("at://did:plc:…/site.standard.publication/…"),
+            "the DID form must be shown: {body}"
+        );
+        assert!(
+            body.contains("at://alice.example.com/site.standard.publication/…"),
+            "the handle form must be shown: {body}"
+        );
+    }
+
+    /// Flag on: the URL input must not be `type="url"`. A browser validates
+    /// that type with the WHATWG URL parser, which REJECTS the DID form —
+    /// `at://did:plc:…/…` fails as an invalid port, the same failure
+    /// `url::Url::parse` has (see `feed::is_storable_feed_url`) — so the form
+    /// would refuse to submit the very string the hint asks for.
+    #[tokio::test]
+    async fn manage_url_input_accepts_a_did_uri_when_the_flag_is_on() {
+        let did = "did:plc:reader";
+        let body = signed_in_body(standard_site_state(true, did).await, "/manage", did).await;
+        let input = feed_url_input(&body);
+        assert!(
+            input.contains("type=\"text\""),
+            "the input must be type=text so a DID-form at:// URI can be submitted: {input}"
+        );
+        assert!(
+            input.contains("inputmode=\"url\""),
+            "the URL keyboard is still wanted: {input}"
+        );
+    }
+
+    /// Flag off: every `at://` paste is refused, so the form must not say
+    /// publications are accepted — and the input keeps browser URL validation.
+    #[tokio::test]
+    async fn manage_does_not_advertise_publications_when_the_flag_is_off() {
+        let did = "did:plc:reader";
+        let state = standard_site_state(false, did).await;
+        assert!(!state.config.standard_site);
+        let body = signed_in_body(state, "/manage", did).await;
+        assert!(
+            !body.contains("site.standard.publication"),
+            "a refused form must not be advertised: {body}"
+        );
+        assert!(
+            !body.contains("standard.site"),
+            "a refused form must not be advertised: {body}"
+        );
+        assert!(
+            feed_url_input(&body).contains("type=\"url\""),
+            "with the flag off the input is unchanged"
+        );
+    }
+
+    /// Flag on: the landing page says publications sit beside feeds AND how to
+    /// subscribe to one.
+    #[tokio::test]
+    async fn landing_describes_publications_and_how_to_subscribe_when_on() {
+        let body = public_body(standard_site_state(true, "did:plc:x").await, "/").await;
+        assert!(body.contains("standard.site"), "{body}");
+        assert!(
+            body.contains("at://did:plc:…/site.standard.publication/…"),
+            "the landing page must show the DID form: {body}"
+        );
+        assert!(
+            body.contains("at://alice.example.com/site.standard.publication/…"),
+            "the landing page must show the handle form: {body}"
+        );
+    }
+
+    /// Flag off: the landing page still says what a publication is (a stored
+    /// one is polled whatever the flag says), but shows no paste instructions
+    /// and says new ones are not accepted here.
+    #[tokio::test]
+    async fn landing_does_not_tell_visitors_to_paste_a_publication_when_off() {
+        let body = public_body(standard_site_state(false, "did:plc:x").await, "/").await;
+        assert!(body.contains("standard.site"), "{body}");
+        assert!(
+            !body.contains("at://did:plc:…/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            !body.contains("at://alice.example.com/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            body.contains("isn't accepting new publication subscriptions"),
+            "the page must say the form is closed here: {body}"
+        );
+    }
+
+    /// Flag on: /about has a publications section with both spellings.
+    #[tokio::test]
+    async fn about_describes_publications_and_how_to_subscribe_when_on() {
+        let body = public_body(standard_site_state(true, "did:plc:x").await, "/about").await;
+        assert!(body.contains("site.standard.publication"), "{body}");
+        assert!(body.contains("site.standard.document"), "{body}");
+        assert!(
+            body.contains("at://did:plc:…/site.standard.publication/…"),
+            "{body}"
+        );
+        assert!(
+            body.contains("at://alice.example.com/site.standard.publication/…"),
+            "{body}"
+        );
+    }
+
+    /// Flag off: /about keeps the description, drops the paste instructions.
+    #[tokio::test]
+    async fn about_does_not_tell_visitors_to_paste_a_publication_when_off() {
+        let body = public_body(standard_site_state(false, "did:plc:x").await, "/about").await;
+        assert!(body.contains("site.standard.publication"), "{body}");
+        assert!(
+            !body.contains("at://did:plc:…/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            !body.contains("at://alice.example.com/site.standard.publication/…"),
+            "no paste instructions with the flag off: {body}"
+        );
+        assert!(
+            body.contains("isn't accepting new publication subscriptions"),
+            "{body}"
+        );
+    }
+
     #[tokio::test]
     async fn cache_control_public_on_about_no_store_on_authed() {
         let state = test_state(&["did:plc:admin"]).await;
@@ -10559,6 +10770,7 @@ mod tests {
                 selected: false,
             }],
             loose_feeds: vec![loose],
+            standard_site: false,
         };
         let html = tmpl.render().unwrap();
 
