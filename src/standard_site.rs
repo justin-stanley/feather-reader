@@ -1818,14 +1818,14 @@ mod tests {
         config.oauth.plc_directory = plc;
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let feed = crate::store::due_feeds(&pool, &now, 50)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|f| f.url == site)
-            .expect(
-                "the publication is not handed to the poller: FeedKind::POLLABLE must include it",
-            );
+        // The publication loop's own selection, so A0 tests what runs.
+        let feed =
+            crate::store::due_feeds_of_kind(&pool, &now, crate::feed::FeedKind::Publication, 50)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|f| f.url == site)
+                .expect("the publication is not handed to the publication poller");
 
         let client = crate::feed::build_client().unwrap();
         let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)

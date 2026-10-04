@@ -1070,7 +1070,7 @@ async fn poll_publication(
     };
     // **One deadline for the whole read.** It is otherwise bounded only per
     // request (FETCH_TIMEOUT x MAX_LIST_PAGES): hours, against a repo that
-    // pages slowly, all of it holding one of the publication slots.
+    // pages slowly, all of it holding up the publication loop.
     let fetched = tokio::time::timeout(
         config.publication_read_deadline,
         crate::standard_site::fetch(client, &config.oauth.plc_directory, &uri),

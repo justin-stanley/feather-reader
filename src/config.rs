@@ -13,7 +13,7 @@
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
 //! | `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` | `30` | The longest one standard.site publication read may take before it is a failure. Under Fly's 45 s `kill_timeout`, so the read in flight at shutdown can finish. Must be at least 1. |
-//! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
+//! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/75/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PUBLICATION_RETENTION_DAYS` | `3650` | Absolute ceiling for entries of a kind the rolling window does not apply to — a standard.site publication. Publications are bounded by COUNT (`max_entries_per_feed`) instead of by age, because measurement says a 14-day window stores NOTHING from a real publication: the newest documents on three of them were 109 to 241 days old. This is the "not immortal" backstop, not the space bound. `0` disables it. |
@@ -471,6 +471,11 @@ impl Config {
                 let secs: u64 = raw.parse().with_context(|| {
                     format!("FEATHERREADER_POLL_INTERVAL: expected seconds, got {raw:?}")
                 })?;
+                // Zero makes a healthy poll due again the moment it finishes.
+                anyhow::ensure!(
+                    secs > 0,
+                    "FEATHERREADER_POLL_INTERVAL must be at least 1 second"
+                );
                 Duration::from_secs(secs)
             }
             None => defaults.poll_interval,
