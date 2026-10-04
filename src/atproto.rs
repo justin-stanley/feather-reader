@@ -265,8 +265,8 @@ impl RecordWalk {
 /// further 128 of transient page because the per-page check compared against the
 /// ceiling instead of what was left.
 ///
-/// **Only one caller threads it today**, and that caller has no production entry
-/// point yet: the publication reader is not wired to the poller. Every live read
+/// **Only one caller threads it today**: the publication reader, polled by the
+/// scheduler's publication loop since 0.4.0. Every other live read
 /// builds its own ceiling per walk, so the per-request total is still a multiple
 /// of this number — two walks on an OPML export, four on a login — and nothing
 /// bounds concurrent requests at all.

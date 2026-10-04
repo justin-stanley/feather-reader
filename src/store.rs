@@ -6693,9 +6693,8 @@ mod tests {
 
     /// **An `at://` feed is never selected for polling.**
     ///
-    /// Nothing can poll one: `poll_feed` goes through `net::guarded_get`, whose
-    /// `check_scheme` refuses any non-http(s) scheme, and the standard.site
-    /// reader is not wired to the scheduler. Selecting them anyway does not
+    /// (Since 0.4.0 these are rows of kind `unsupported`: an at-URI that is not a
+    /// well-formed publication, which no reader can fetch.) Selecting them does not
     /// leave the feature dormant — it manufactures a permanent failure per row,
     /// which since the cause histogram is *published* as an unreachable
     /// publisher. This instance already carries 19 such rows, subscribed before

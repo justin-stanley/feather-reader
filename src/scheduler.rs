@@ -219,9 +219,11 @@ impl Loop {
 
 /// The loop that polls `kind`, or `None` for a kind nothing polls.
 ///
-/// Exhaustive on purpose: a new `FeedKind` does not compile until it is given a
-/// loop or explicitly none, and `every_pollable_kind_has_a_poller` checks that
-/// what `FeedKind::POLLABLE` calls pollable is actually polled.
+/// Exhaustive on purpose: in a test build, a new `FeedKind` does not compile
+/// until it is given a loop here or explicitly none, and
+/// `every_pollable_kind_has_a_poller` checks the POLLABLE kinds against that.
+/// **It is a record, not a mechanism**: each loop selects its own kind
+/// directly, and nothing in production reads this map.
 #[cfg(test)]
 const fn poller_for(kind: feed::FeedKind) -> Option<Loop> {
     match kind {
@@ -722,35 +724,45 @@ async fn poll_publications_once(
     client: &reqwest::Client,
     shutdown: &watch::Receiver<()>,
 ) -> anyhow::Result<()> {
-    // **A row is read at most once per pass.** The next row is re-selected
-    // after every read, and a row whose next poll could not be written (a full
-    // or read-only volume) stays due, so without this the pass re-read it in a
-    // tight loop — thousands of full reads a second (found in review).
+    poll_publications_with(state, shutdown, |feed, interval| async move {
+        poll_and_reschedule(&state.db, client, &feed, interval, &state.config).await;
+    })
+    .await
+}
+
+/// [`poll_publications_once`] with the read injected, so the pass's own rules
+/// — which row next, how often, with which interval, when to stop — are
+/// testable without a network, the way `poll_and_reschedule_with` is.
+async fn poll_publications_with<F, Fut>(
+    state: &AppState,
+    shutdown: &watch::Receiver<()>,
+    mut poll: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Feed, Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // **A row is read at most once per pass, and a row that is still due does
+    // not stop the pass.** The next row is re-selected after every read, and a
+    // row whose next poll could not be written (a full or read-only volume)
+    // stays due at the head of the order. Re-reading it was a tight loop
+    // (thousands of reads a second); returning at it starved every publication
+    // behind it, every pass (both found in review). So the pass skips what it
+    // has read and moves on.
     let mut read = std::collections::HashSet::new();
     loop {
         if shutdown.has_changed().unwrap_or(true) || over_watermark(state).await {
             return Ok(());
         }
         let now = now_rfc3339();
-        let Some(feed) = store::due_feeds_of_kind(&state.db, &now, feed::FeedKind::Publication, 1)
-            .await?
-            .into_iter()
-            .next()
-        else {
+        let limit = i64::try_from(read.len() + 1).unwrap_or(i64::MAX);
+        let candidates =
+            store::due_feeds_of_kind(&state.db, &now, feed::FeedKind::Publication, limit).await?;
+        let Some(feed) = candidates.into_iter().find(|f| !read.contains(&f.id)) else {
             return Ok(());
         };
-        if !read.insert(feed.id) {
-            warn!(feed = %feed.url, "a publication is still due after it was read; leaving it for the next pass");
-            return Ok(());
-        }
-        poll_and_reschedule(
-            &state.db,
-            client,
-            &feed,
-            state.config.poll_interval,
-            &state.config,
-        )
-        .await;
+        read.insert(feed.id);
+        poll(feed, state.config.poll_interval).await;
     }
 }
 
@@ -1898,6 +1910,86 @@ mod tests {
             row.next_poll, None,
             "a publication was read over the watermark"
         );
+    }
+
+    /// Fourth review of #225: a row still due after its read made the pass
+    /// return, and it sorts first, so every pass read only it — every other
+    /// publication starved behind it for as long as its writes failed.
+    #[tokio::test]
+    async fn a_stuck_row_does_not_starve_the_rest() {
+        let state = state_with_due(&[PUB_A, PUB_B]).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut seen = Vec::new();
+        // A read that leaves the row due, as one whose writes fail does.
+        poll_publications_with(&state, &shutdown, |feed, _| {
+            seen.push(feed.url.clone());
+            async {}
+        })
+        .await
+        .unwrap();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![PUB_A.to_string(), PUB_B.to_string()],
+            "every due row, once each"
+        );
+    }
+
+    /// A healthy read is rescheduled one configured interval out. Every other
+    /// loop test fails its read, so only the backoff path ran — a pass handing
+    /// `Duration::ZERO` would re-read every healthy publication every tick.
+    #[tokio::test]
+    async fn a_pass_reschedules_with_the_configured_interval() {
+        let state = with_config(state_with_due(&[PUB_A]).await, |c| {
+            c.poll_interval = Duration::from_secs(1234);
+        })
+        .await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut intervals = Vec::new();
+        poll_publications_with(&state, &shutdown, |feed, interval| {
+            intervals.push(interval);
+            let db = state.db.clone();
+            async move {
+                store::set_next_poll(&db, &feed.url, interval)
+                    .await
+                    .unwrap()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(intervals, vec![Duration::from_secs(1234)]);
+    }
+
+    /// The watermark is checked before EVERY read, not once per pass: a pass
+    /// can be long, and each read can store a lot.
+    #[tokio::test]
+    async fn the_watermark_is_checked_before_every_read() {
+        let state = state_with_due(&[PUB_A, PUB_B]).await;
+        let size = store::db_size_bytes(&state.db).await.unwrap();
+        let state = with_config(state, |c| c.db_size_watermark_bytes = size + 64 * 1024).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut reads = 0;
+        poll_publications_with(&state, &shutdown, |feed, interval| {
+            reads += 1;
+            let db = state.db.clone();
+            async move {
+                // The first read grows the database past the watermark.
+                sqlx::query("CREATE TABLE IF NOT EXISTS ballast (b BLOB)")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO ballast VALUES (zeroblob(1048576))")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                store::set_next_poll(&db, &feed.url, interval)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reads, 1, "a second publication was read over the watermark");
     }
 
     /// The RSS tick pauses at the watermark too. It always did; it had no test

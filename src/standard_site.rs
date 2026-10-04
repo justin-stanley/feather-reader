@@ -1811,10 +1811,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut config = crate::config::Config {
-            standard_site: true,
-            ..crate::config::Config::default()
-        };
+        // The flag gates storing, not reading, so A0 runs with it off.
+        let mut config = crate::config::Config::default();
         config.oauth.plc_directory = plc;
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);

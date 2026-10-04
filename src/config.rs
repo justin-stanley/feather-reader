@@ -11,7 +11,7 @@
 //! | `FEATHERREADER_DB`           | `featherreader.db`       | Path to the SQLite cache file. |
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
-//! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
+//! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. At least 1; 0 is refused at startup. |
 //! | `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` | `30` | The longest one standard.site publication read may take before it is a failure. Under Fly's 45 s `kill_timeout`, so the read in flight at shutdown can finish. Must be at least 1. |
 //! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/75/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
@@ -466,20 +466,10 @@ impl Config {
             env_opt("FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS"),
             defaults.publication_read_deadline,
         )?;
-        let poll_interval = match env_opt("FEATHERREADER_POLL_INTERVAL") {
-            Some(raw) => {
-                let secs: u64 = raw.parse().with_context(|| {
-                    format!("FEATHERREADER_POLL_INTERVAL: expected seconds, got {raw:?}")
-                })?;
-                // Zero makes a healthy poll due again the moment it finishes.
-                anyhow::ensure!(
-                    secs > 0,
-                    "FEATHERREADER_POLL_INTERVAL must be at least 1 second"
-                );
-                Duration::from_secs(secs)
-            }
-            None => defaults.poll_interval,
-        };
+        let poll_interval = poll_interval_from(
+            env_opt("FEATHERREADER_POLL_INTERVAL"),
+            defaults.poll_interval,
+        )?;
 
         let retention_hard_days = match env_opt("FEATHERREADER_RETENTION_HARD_DAYS") {
             Some(raw) => raw.parse().with_context(|| {
@@ -943,6 +933,23 @@ fn parse_bool(raw: &str) -> Result<bool> {
     }
 }
 
+/// Parse `FEATHERREADER_POLL_INTERVAL`. **Zero is refused:** a healthy poll
+/// would be due again the moment it finished, and the publication loop would
+/// read every healthy publication on every pass.
+fn poll_interval_from(raw: Option<String>, default: Duration) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("FEATHERREADER_POLL_INTERVAL: expected seconds, got {raw:?}"))?;
+    anyhow::ensure!(
+        secs > 0,
+        "FEATHERREADER_POLL_INTERVAL must be at least 1 second"
+    );
+    Ok(Duration::from_secs(secs))
+}
+
 /// Parse `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS`. **Zero is refused:**
 /// it would fail every publication read, as `Fetch`, with nothing saying why.
 fn publication_read_deadline_from(raw: Option<String>, default: Duration) -> Result<Duration> {
@@ -961,6 +968,18 @@ fn publication_read_deadline_from(raw: Option<String>, default: Duration) -> Res
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_poll_interval_is_refused() {
+        let d = Duration::from_secs(3600);
+        assert!(poll_interval_from(Some("0".into()), d).is_err());
+        assert_eq!(
+            poll_interval_from(Some("60".into()), d).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(poll_interval_from(None, d).unwrap(), d);
+    }
 
     #[test]
     fn a_zero_publication_read_deadline_is_refused() {
@@ -972,7 +991,6 @@ mod tests {
         );
         assert_eq!(publication_read_deadline_from(None, d).unwrap(), d);
     }
-    use super::*;
 
     /// A ceiling inside the window is refused at BOOT, not ignored at sweep time.
     ///
