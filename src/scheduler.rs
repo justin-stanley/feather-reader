@@ -26,7 +26,8 @@
 //! scans the store for **dirty** per-feed read cursors ([`store::dirty_cursors`])
 //! across every DID, coalesces each DID's dirty cursors into **one**
 //! `com.atproto.repo.applyWrites` batch via
-//! `SidecarClient::flush_read_states`, and — only on success — clears the
+//! `SidecarClient::flush_read_states` (sent as several calls past 200 cursors
+//! or 128 KiB — `atproto::apply_writes_chunked`), and — only on success — clears the
 //! `dirty` flag ([`store::clear_cursor_dirty`]). Dozens of articles read in one
 //! sitting collapse into one write per feed (one record per feed, keyed by a
 //! feed-derived rkey), and several feeds' cursors ride one round-trip. It also
@@ -1377,7 +1378,7 @@ pub async fn run_flusher(state: AppState, mut shutdown: watch::Receiver<()>) {
 }
 
 /// Flush every DID that has dirty cursors. Coalesces each DID's dirty cursors
-/// into a single `applyWrites` batch, then clears the `dirty` flag on the ones
+/// into one `applyWrites` batch (chunked by the client), then clears the `dirty` flag on the ones
 /// that flushed successfully.
 async fn flush_all_dirty(state: &AppState, parked: &mut HashSet<String>) -> anyhow::Result<()> {
     let dids = dids_with_dirty_cursors(&state.db).await?;

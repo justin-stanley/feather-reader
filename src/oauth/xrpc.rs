@@ -369,11 +369,18 @@ impl Repo<'_> {
         Ok(())
     }
 
-    /// A batch of writes in one round trip.
+    /// A batch of writes, in as few round trips as the PDS's limits allow.
+    ///
+    /// Chunked by `crate::atproto::apply_writes_chunked`, which says what a
+    /// failure part-way means: the batch is atomic per CALL, not as a whole.
     pub async fn apply_writes(&self, writes: &[WriteOp]) -> Result<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
+        crate::atproto::apply_writes_chunked(writes, |chunk| self.apply_writes_once(chunk)).await
+    }
+
+    /// One `applyWrites` call, unchunked. Private: an oversized call is a
+    /// refused call, so nothing reaches this except through
+    /// [`apply_writes`](Self::apply_writes).
+    async fn apply_writes_once(&self, writes: &[WriteOp]) -> Result<()> {
         let ops: Vec<Value> = writes.iter().map(WriteOp::to_json).collect();
         let body = json!({ "repo": self.session.sub, "writes": ops });
         self.send(
@@ -486,10 +493,13 @@ impl Repo<'_> {
             .await
     }
 
-    /// Batch-add many subscriptions in one `applyWrites` — the OPML-import path.
+    /// Batch-add many subscriptions via `applyWrites` (chunked) — the OPML-import path.
     ///
-    /// One round trip rather than N: an import of several hundred feeds is the
-    /// case this exists for.
+    /// One round trip per 200 feeds rather than one per feed: an import of
+    /// several hundred feeds is the case this exists for. More than one call
+    /// means the import can part-land; on an error,
+    /// [`crate::atproto::ApplyWritesIncomplete::of`] gives `landed`, and the
+    /// first `landed` of `subs` are in the repo.
     /// Returns the new rkeys, which are assigned HERE rather than by the server:
     /// client-side TIDs keep the imported feeds in input order and make the
     /// batch reproducible. The sidecar client does the same, with the same
@@ -595,11 +605,14 @@ impl Repo<'_> {
         Ok(())
     }
 
-    /// Flush many dirty read cursors in one `applyWrites`.
+    /// Flush many dirty read cursors via `applyWrites` (chunked).
     ///
     /// Read state changes on nearly every page view, so this is the hottest
     /// write path in the app; one round trip per flush rather than per feed is
-    /// the whole point.
+    /// the whole point. A flush past the op or byte bound is several calls,
+    /// and a failure part-way leaves the first
+    /// [`landed`](crate::atproto::ApplyWritesIncomplete::landed) cursors
+    /// written — see `crate::atproto::apply_writes_chunked`.
     /// The `bool` is whether the record already exists in the PDS. It is not
     /// optional bookkeeping: an `#update` on a missing record ERRORS, and
     /// `applyWrites` is atomic per repo, so one not-yet-created cursor in the
@@ -1399,5 +1412,122 @@ mod tests {
         s.aud = "http://127.0.0.1:2583".into();
         let repo = repo(&http, &pool, &s, &key);
         assert!(repo.apply_writes(&[]).await.is_ok());
+    }
+
+    // ── applyWrites chunking (#240) ──────────────────────────────────────────
+    //
+    // This is the production backend, so the chunking is asserted here on the
+    // bytes it sends to a fake PDS that refuses what the reference PDS refuses
+    // (see `crate::atproto::tests::serve_apply_writes`).
+
+    /// A session pointed at the strict fake, reached through a per-port host
+    /// override (the override table is process-wide and tests run in parallel).
+    async fn strict_pds(
+        fail_call: Option<usize>,
+    ) -> (
+        OAuthSession,
+        SqlitePool,
+        crate::atproto::tests::ApplyWritesLog,
+    ) {
+        let (base, log) = crate::atproto::tests::serve_apply_writes(fail_call).await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let host = format!("chunk-oauth-{port}.test");
+        crate::net::test_host_override(&host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let mut s = session();
+        s.aud = format!("http://{host}:{port}");
+        (s, pool, log)
+    }
+
+    fn subs(n: usize) -> Vec<crate::vetted::VettedSubscription> {
+        (0..n)
+            .map(|i| {
+                crate::vetted::VettedSubscription::new(&crate::lexicon::Subscription::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    "2026-07-12T00:00:00.000Z",
+                ))
+            })
+            .collect()
+    }
+
+    /// **An OPML import of 201 feeds is two calls, 200 then 1, in order** — on
+    /// the backend production runs. One call of 201 is what the reference PDS
+    /// refuses with `Too many writes. Max: 200`.
+    #[tokio::test]
+    async fn bulk_subscribe_of_201_is_two_calls_in_order() {
+        let (s, pool, log) = strict_pds(None).await;
+        let (http, key) = (Client::new(), SigningKey::generate("k"));
+        let rkeys = repo(&http, &pool, &s, &key)
+            .add_subscriptions_bulk(&subs(201))
+            .await
+            .expect("a 201-feed import must succeed against a PDS that caps at 200");
+        assert_eq!(crate::atproto::tests::call_sizes(&log), vec![200, 1]);
+        assert_eq!(
+            crate::atproto::tests::sent_rkeys(&log),
+            rkeys,
+            "every feed, once, in input order"
+        );
+    }
+
+    /// 500 feeds — the default per-DID cap — are three calls; exactly 200 is one.
+    #[tokio::test]
+    async fn bulk_subscribe_splits_at_200_and_not_before() {
+        for (n, want) in [(500, vec![200, 200, 100]), (200, vec![200])] {
+            let (s, pool, log) = strict_pds(None).await;
+            let (http, key) = (Client::new(), SigningKey::generate("k"));
+            repo(&http, &pool, &s, &key)
+                .add_subscriptions_bulk(&subs(n))
+                .await
+                .expect("bulk write");
+            assert_eq!(crate::atproto::tests::call_sizes(&log), want, "{n} feeds");
+        }
+    }
+
+    /// **A failed chunk stops the run**, and chunk 3 is never sent.
+    #[tokio::test]
+    async fn bulk_subscribe_stops_at_the_first_failed_chunk() {
+        let (s, pool, log) = strict_pds(Some(2)).await;
+        let (http, key) = (Client::new(), SigningKey::generate("k"));
+        let err = repo(&http, &pool, &s, &key)
+            .add_subscriptions_bulk(&subs(500))
+            .await
+            .expect_err("a failed chunk must fail the call");
+        assert_eq!(
+            crate::atproto::tests::call_sizes(&log),
+            vec![200, 200],
+            "chunk 3 must NOT be sent"
+        );
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+    }
+
+    /// **The byte bound splits a read-state flush well under 200 ops.** Ten
+    /// cursors at the lexicon's 1,000-id cap are ~500 KB — one call of that is
+    /// refused by every reference PDS older than atproto#4989.
+    #[tokio::test]
+    async fn read_state_flush_splits_on_bytes_under_200_ops() {
+        let (s, pool, log) = strict_pds(None).await;
+        let (http, key) = (Client::new(), SigningKey::generate("k"));
+        let cursors: Vec<(String, crate::lexicon::ReadState, bool)> = (0..10)
+            .map(|i| {
+                let mut state = crate::lexicon::ReadState::new(
+                    format!("https://f{i}.example/feed.xml"),
+                    None,
+                    "2026-07-12T00:00:00.000Z",
+                );
+                state.read_ids = (0..crate::lexicon::ReadState::MAX_IDS)
+                    .map(|j| format!("https://f{i}.example/posts/{j:04}/an-entry-permalink"))
+                    .collect();
+                (format!("rk{i:04}"), state, false)
+            })
+            .collect();
+        repo(&http, &pool, &s, &key)
+            .flush_read_states(&cursors)
+            .await
+            .expect("a byte-heavy flush must succeed in chunks");
+        let sizes = crate::atproto::tests::call_sizes(&log);
+        assert!(sizes.len() > 1, "one call for ~500 KB: {sizes:?}");
+        let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
+        assert_eq!(crate::atproto::tests::sent_rkeys(&log), want);
     }
 }

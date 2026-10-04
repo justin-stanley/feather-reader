@@ -44,6 +44,28 @@ deploying is separate.
   including a batch that landed in part; each added guard was mutated and
   every mutation failed a test.
 
+- **An OPML import of more than 200 feeds failed outright, and a large
+  read-state flush could too (#240).** `add_subscriptions_bulk` sent one
+  `applyWrites` create per feed in a single call (up to the 500-feed per-DID
+  cap), and `flush_read_states` sent every dirty cursor for a DID in one call.
+  The reference PDS refuses more than 200 writes a call (`Too many writes.
+  Max: 200`, in `packages/pds/src/api/com/atproto/repo/applyWrites.ts`; the
+  lexicon itself sets no `maxLength`), and before atproto#4989 (2026-05-21) it
+  also refused an `applyWrites` body over its 150 KiB `jsonLimit`.
+  `atproto::apply_writes_chunked` now sits under every client's
+  `apply_writes` — OAuth, sidecar and direct — and sends calls of at most 200
+  writes and 128 KiB of serialized writes, in input order, stopping at the
+  first failure. A split batch is atomic per call, not as a whole, so the
+  error carries `atproto::ApplyWritesIncomplete`: the first `landed` writes
+  committed, the failed call's writes are in doubt, and nothing after it was
+  sent. The OPML import now reports a part-landed import as "Imported 200 of
+  450 feeds…" rather than "nothing was imported". The read-state flusher still
+  treats any error as a failed flush; the landed prefix is there for it to use
+  (#241). An empty batch on the direct client now sends nothing, as the other
+  two clients already did. Established with a fake PDS that refuses what the
+  reference PDS refuses, on all three clients and through `POST /opml`; the
+  refusals were confirmed red before the fix, not assumed.
+
 ## 0.4.2 — 2026-10-04
 
 A public feature page for standard.site, a latest-releases call-out, and link

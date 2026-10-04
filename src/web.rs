@@ -5307,7 +5307,7 @@ fn clear_invite_cookie(resp: &mut Response) {
 /// (field `opml`). The parsed feeds each become a `community.lexicon.rss.folder`
 /// (for any named folders) + a `community.lexicon.rss.subscription` record in the
 /// user's PDS via the records layer's bulk-add (`add_subscriptions_bulk`, one
-/// `applyWrites` round-trip). Feeds are also upserted into the local cache so
+/// `applyWrites` round-trip per 200 feeds). Feeds are also upserted into the local cache so
 /// they show immediately; polling is left to the background poller.
 async fn import_opml(
     State(state): State<AppState>,
@@ -5543,17 +5543,28 @@ async fn import_opml(
     // poller hint. This used to `warn!` and then report "Imported N feeds"
     // regardless, so a total failure read as a total success — and the reader
     // would only discover otherwise on their next visit, with an empty sidebar.
-    let pds_written = match state.repo().add_subscriptions_bulk(&did, &subs).await {
+    //
+    // **And a part-landed write is not a failed one.** The batch goes out in
+    // calls of at most 200 (#240: the reference PDS refuses more), sent in
+    // order and stopped at the first failure, so what landed is a prefix of
+    // `subs` and the error says how long. Saying "nothing was imported" after
+    // the first 200 of 450 landed would send the reader to import the file
+    // again, which adds those 200 a second time. Nothing local needs undoing
+    // either way: the reader's `sub_ref` projection is rebuilt from the repo on
+    // the next read, and a cached `feeds` row with no subscriber is the same
+    // poller hint the total-failure path has always left behind.
+    let landed = match state.repo().add_subscriptions_bulk(&did, &subs).await {
         Ok(rkeys) => {
             info!(%did, count = rkeys.len(), skipped = skipped_private.len(), "imported OPML subscriptions to PDS (batched)");
-            true
+            rkeys.len()
         }
         Err(err) => {
-            warn!(%err, %did, "OPML PDS batch write failed (feeds cached locally)");
-            false
+            let landed = crate::atproto::ApplyWritesIncomplete::of(&err).map_or(0, |p| p.landed);
+            warn!(%err, %did, landed, total = subs.len(), "OPML PDS batch write failed (feeds cached locally)");
+            landed
         }
     };
-    if !pds_written {
+    if landed == 0 && !subs.is_empty() {
         return Ok(Redirect::to(&format!(
             "/?flash={}",
             qenc(
@@ -5565,7 +5576,17 @@ async fn import_opml(
     }
 
     // Report the import count, plus any private/paid feeds skipped as unsupported.
-    let mut flash = format!("Imported {} feeds", subs.len());
+    let mut flash = if landed < subs.len() {
+        format!(
+            "Imported {landed} of {} feeds: your PDS stopped accepting them part-way, so the \
+             other {} may not have been saved. Importing the same file again would add the first \
+             {landed} a second time",
+            subs.len(),
+            subs.len() - landed
+        )
+    } else {
+        format!("Imported {} feeds", subs.len())
+    };
     if uncached > 0 {
         flash.push_str(&format!(
             ". {uncached} of them could not be cached locally and may not update until the next import."
@@ -9430,6 +9451,76 @@ mod tests {
             feeds <= 3,
             "OPML import blew past the global ceiling: {feeds} feeds cached with cap=3"
         );
+    }
+
+    /// POST an OPML of `n` feeds as `did` against a strict fake PDS behind the
+    /// sidecar, and return the flash it redirected with plus the fake's log.
+    async fn import_against_strict_pds(
+        did: &str,
+        n: usize,
+        fail_call: Option<usize>,
+    ) -> (String, crate::atproto::tests::ApplyWritesLog) {
+        let (sidecar, log) = crate::atproto::tests::serve_apply_writes(fail_call).await;
+        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let cookie = session_cookie(&state, did, None);
+        let (ct, body) = opml_multipart(opml_with_feeds(n).as_bytes());
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/opml")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers()[header::LOCATION].to_str().unwrap();
+        let flash = url::Url::parse(&format!("http://x{loc}"))
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "flash")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        (flash, log)
+    }
+
+    /// **An OPML import of more than 200 feeds succeeds** against a PDS that
+    /// refuses more than 200 writes a call, as the reference PDS does. It used
+    /// to go out as one `applyWrites` and fail outright, importing nothing.
+    #[tokio::test]
+    async fn opml_import_of_450_feeds_succeeds_against_a_pds_capping_at_200() {
+        let (flash, log) = import_against_strict_pds("did:plc:bigimport", 450, None).await;
+        assert_eq!(flash, "Imported 450 feeds", "{flash}");
+        assert_eq!(crate::atproto::tests::call_sizes(&log), vec![200, 200, 50]);
+    }
+
+    /// **A part-landed import says so.** Chunk 2 of 3 fails: chunk 1's 200
+    /// feeds are in the reader's repo, and "nothing was imported" — what the
+    /// handler said for any failure — would be false.
+    #[tokio::test]
+    async fn opml_import_that_part_lands_reports_what_landed() {
+        let (flash, log) = import_against_strict_pds("did:plc:partimport", 450, Some(2)).await;
+        assert_eq!(crate::atproto::tests::call_sizes(&log), vec![200, 200]);
+        assert!(
+            flash.contains("200 of 450"),
+            "the landed count is not reported: {flash}"
+        );
+        assert!(
+            !flash.contains("nothing was imported"),
+            "200 feeds landed and the reader was told none did: {flash}"
+        );
+    }
+
+    /// A batch that failed on its first call still reports that nothing was
+    /// imported — true, since nothing after a failed call is sent.
+    #[tokio::test]
+    async fn opml_import_that_fails_on_the_first_call_imports_nothing() {
+        let (flash, log) = import_against_strict_pds("did:plc:noimport", 450, Some(1)).await;
+        assert_eq!(crate::atproto::tests::call_sizes(&log), vec![200]);
+        assert!(flash.contains("nothing was imported"), "{flash}");
     }
 
     /// **A malformed `at://` on the add path is "not a kind of feed we take",
