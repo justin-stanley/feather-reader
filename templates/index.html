@@ -31,6 +31,9 @@
   {% include "rail.html" %}
 
   <main class="content" id="content">
+    {% if !alert.is_empty() %}
+      <p class="flash error" role="alert">{{ alert }}</p>
+    {% endif %}
     {% if !flash.is_empty() %}
       <p class="flash" role="status">{{ flash }}</p>
     {% endif %}
