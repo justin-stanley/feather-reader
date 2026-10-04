@@ -12297,6 +12297,74 @@ mod tests {
         (status, String::from_utf8_lossy(&body).to_string())
     }
 
+    /// **0.4.0 step 4: a publication document with neither summary field
+    /// renders as a title, a date and a link** — 8% of measured documents
+    /// (37 of 449) carry neither `description` nor `textContent`. That is what
+    /// an RSS reader shows for a title-only feed, not an error, in the list and
+    /// on the article page alike.
+    #[tokio::test]
+    async fn a_publication_entry_with_no_summary_renders_title_date_and_link() {
+        let did = "did:plc:displayer";
+        let state = test_state(&[did]).await;
+        let url = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: url.into(),
+                title: Some("Quiet Journal".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed_id])
+            .await
+            .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[store::NewEntry {
+                guid: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.document/3l2nosumaaa2a"
+                    .into(),
+                url: Some("https://quiet.example/no-summary".into()),
+                title: Some("A title-only article".into()),
+                published: Some("2026-07-11T00:00:00Z".into()),
+                content_html: None,
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        let (status, list) = page_body(state.clone(), did, "/?view=all").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            list.contains("A title-only article"),
+            "the entry is missing from the list"
+        );
+
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?")
+            .bind(feed_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let (status, page) = page_body(state, did, &format!("/entries/{id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the article page failed for an entry with no body"
+        );
+        assert!(page.contains("A title-only article"));
+        assert!(
+            page.contains("https://quiet.example/no-summary"),
+            "no link to the original"
+        );
+        assert!(
+            page.contains(r#"<time datetime=""#),
+            "no date on the article page"
+        );
+    }
+
     /// **#177: a malformed record in the reader's own repo is refused, and the
     /// reader is told.** Refusing keeps `replace_sub_refs` from dropping the
     /// subscription that record was; telling them keeps the stale list from

@@ -32,6 +32,7 @@ start of the work and is kept current per row.
 | **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`, one repo read at a time; a subscribe from the form reads once more, inline, alongside it; `publication_read_deadline` 30 s |
 | **One walk per repo per tick** | **built** (step 2b) | `standard_site::fetch_repo`, `feed::poll_publication_group`; up to 16 publications of one repo per read |
 | **Subscribe form** | **built** (step 3) | DID and handle forms, behind the flag; `web::publication_url_from_paste` |
+| **Display** | **checked** (step 4) | a document with no summary renders as title, date and link (`web` test); an empty publication is a healthy poll (`standard_site` test); undated and future dates via #213 |
 | **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
 
 ### Why it matters, now
