@@ -1359,33 +1359,70 @@ pub(crate) fn plain_text_to_html_bounded(raw: &str, max: usize) -> String {
 /// searches that tried to account for that kept nothing, or ran for hours, in
 /// review (#224). Sanitized HTML is already clean: cutting it on a character
 /// boundary and sanitizing that prefix again only closes the tags the cut left
-/// open, so the second pass grows it by little. The cut leaves a margin for that
-/// growth and retries with a wider one if the margin was not enough.
+/// open, so the second pass usually grows it by little. The first cut leaves a
+/// margin for that growth; deeply nested markup, whose closers can outgrow any
+/// margin, falls through to a bounded bisection.
 ///
 /// Cost: the first sanitize is the one every body always had; the bounded
-/// passes run on at most `max` bytes of already-clean HTML, and only for a body
-/// over the bound.
+/// passes — one, or at most 1 + [`SANITIZE_BOUND_ATTEMPTS`] — run on at most
+/// `max` bytes of already-clean HTML, and only for a body over the bound.
 pub(crate) fn sanitize_html_bounded(raw: &str, max: usize) -> String {
     let clean = sanitize_html(raw);
     if clean.len() <= max {
         return clean;
     }
-    let mut margin = (max / 64).max(64);
-    for _ in 0..SANITIZE_BOUND_ATTEMPTS {
-        let cut = floor_char_boundary(&clean, max.saturating_sub(margin));
-        let again = sanitize_html(&clean[..cut]);
-        if again.len() <= max {
-            return again;
-        }
-        margin = margin.saturating_mul(4).max(again.len() - max + margin);
+    // First, the cut that almost always works: just under the bound, with a
+    // margin for the closers the cut leaves open. When it fits, that is the
+    // answer — within 1/64 of the bound, in one extra pass.
+    let margin = (max / 64).max(64);
+    let first = floor_char_boundary(&clean, max.saturating_sub(margin));
+    let again = sanitize_html(&clean[..first]);
+    if again.len() <= max {
+        return again;
     }
-    // Unreachable in practice — re-sanitizing clean HTML grows it by its open
-    // tags' closers — but the bound is a guarantee, so it has a floor.
-    String::new()
+    // **Then a bounded bisection, not a widening margin.** A closing tag is
+    // longer than the tag it opens, so a cut through deeply nested markup can
+    // grow past the bound by more than any fixed margin; widening the margin
+    // 4x a round reached a cut of 0 and stored nothing where nearly all of it
+    // fit (found in review). `lo` always fits (the empty prefix does), `hi`
+    // never does, and the next probe is taken AFTER they move.
+    let (mut lo, mut hi) = (0usize, first);
+    let mut best = String::new();
+    let resolution = (max / 1024).max(1);
+    for _ in 0..SANITIZE_BOUND_ATTEMPTS {
+        if hi - lo <= resolution {
+            break;
+        }
+        let mut cut = floor_char_boundary(&clean, lo + (hi - lo) / 2);
+        if cut <= lo {
+            // A multi-byte character straddles the midpoint: step past it
+            // rather than give up.
+            cut = ceil_char_boundary(&clean, lo + 1);
+            if cut >= hi {
+                break;
+            }
+        }
+        let out = sanitize_html(&clean[..cut]);
+        if out.len() <= max {
+            lo = cut;
+            best = out;
+        } else {
+            hi = cut;
+        }
+    }
+    best
 }
 
-/// How many cut-and-resanitize passes [`sanitize_html_bounded`] tries.
-const SANITIZE_BOUND_ATTEMPTS: usize = 4;
+/// The smallest index `>= at` that is a character boundary of `s`.
+fn ceil_char_boundary(s: &str, at: usize) -> usize {
+    (at..=s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len())
+}
+
+/// The most bisection passes [`sanitize_html_bounded`] spends after its first
+/// cut: enough to resolve a 2 MiB bound to about 1/1024 of it.
+const SANITIZE_BOUND_ATTEMPTS: usize = 14;
 
 /// An entry id, or a stable stand-in for one too long to index.
 ///
@@ -1761,6 +1798,31 @@ mod tests {
             "&".repeat(MAX * 3 / 10)
         );
         let html = sanitize_html_bounded(&body, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+    }
+
+    /// Fourth review of #224: a closing tag is longer than the tag it closes,
+    /// so a cut through nested markup grew past the bound on re-sanitizing,
+    /// and the widening margin jumped straight to a cut of 0 — an empty body
+    /// where nearly all of it fit.
+    #[test]
+    fn nested_markup_is_cut_not_emptied() {
+        const MAX: usize = 64 * 1024;
+        let html = sanitize_html_bounded(&"<span>".repeat(16_384), MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX / 3,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+
+        let mixed = format!("{}{}", "t".repeat(MAX * 3 / 4), "<span>".repeat(MAX / 8));
+        let html = sanitize_html_bounded(&mixed, MAX);
         assert!(html.len() <= MAX);
         assert!(
             html.len() > MAX - MAX / 16,
