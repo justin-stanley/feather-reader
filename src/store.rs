@@ -285,6 +285,11 @@ CREATE TABLE IF NOT EXISTS entries (
     fetched_at   TEXT NOT NULL,
     UNIQUE (feed_id, guid)
 );
+-- The list and prev/next queries order on `COALESCE(published, fetched_at)`
+-- (#187). Measured on the real query shape (LEFT JOIN entry_state, EXISTS
+-- sub_ref), this index serves them as well as it served bare `published`; a
+-- `(feed_id, published, fetched_at)` replacement was tried and was ~3.8x
+-- slower on the default prev/next query, which never chose it (review of #213).
 CREATE INDEX IF NOT EXISTS idx_entries_feed_published ON entries (feed_id, published);
 
 CREATE TABLE IF NOT EXISTS entry_state (
@@ -765,6 +770,20 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await
     .context("creating idx_invite_codes_intended_active")?;
+
+    // **Re-date rows stored with a future date before ingest refused them**
+    // (#188). An item dated 2999 that has since left its feed is never polled
+    // again to be corrected, so it would stay first in the list and survive the
+    // per-feed cap. Cleared, `fetched_at` dates it. The same bound ingest uses;
+    // a no-op once there are none.
+    let ceiling = (chrono::Utc::now()
+        + chrono::Duration::days(crate::feed::MAX_FUTURE_PUBLISHED_DAYS))
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    sqlx::query("UPDATE entries SET published = NULL WHERE published > ?1")
+        .bind(&ceiling)
+        .execute(pool)
+        .await
+        .context("clearing stored future publication dates")?;
     Ok(())
 }
 
@@ -2648,7 +2667,7 @@ pub async fn list_entries(
     }
     let (mut sql, n) = list_entries_sql(view, feed_ids);
     sql.push_str(&format!(
-        " ORDER BY e.published DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
+        " ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT ?{} OFFSET ?{}",
         n + 2,
         n + 3
     ));
@@ -2704,7 +2723,7 @@ pub async fn list_entry_ids(
     }
     let (mut sql, n) = list_query_sql(Projection::Ids, view, feed_ids);
     sql.push_str(&format!(
-        " ORDER BY e.published DESC, e.id DESC LIMIT ?{}",
+        " ORDER BY COALESCE(e.published, e.fetched_at) DESC, e.id DESC LIMIT ?{}",
         n + 2
     ));
     let q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
@@ -4956,6 +4975,150 @@ mod tests {
         insert_entries(pool, feed_id, &entries, 0).await?;
         replace_sub_refs(pool, did, &[feed_id]).await?;
         Ok(feed_id)
+    }
+
+    /// Review of #213: the ceiling only stops NEW future dates. A row stored
+    /// with one before it, whose item has since left its feed, is never polled
+    /// again to be corrected — so it stayed first in the list and survived the
+    /// per-feed cap forever. Startup re-dates it.
+    #[tokio::test]
+    async fn a_stored_future_date_is_cleared_at_startup() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://clock.example/f.xml".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        for (guid, published) in [
+            ("bogus", "2999-01-01T00:00:00Z"),
+            ("soon", tomorrow.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO entries (feed_id, guid, published, fetched_at) \
+                 VALUES (?1, ?2, ?3, '2026-07-11T00:00:00Z')",
+            )
+            .bind(feed_id)
+            .bind(guid)
+            .bind(published)
+            .execute(&pool)
+            .await?;
+        }
+        apply_migrations(&pool).await?;
+        let dated: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT guid, published FROM entries ORDER BY guid")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            dated[0],
+            ("bogus".to_string(), None),
+            "a 2999 date survived startup"
+        );
+        assert_eq!(
+            dated[1].1.as_deref(),
+            Some(tomorrow.as_str()),
+            "a near-future date was cleared"
+        );
+        Ok(())
+    }
+
+    /// **The cap, the reading list and prev/next must agree about what an undated
+    /// entry's date IS.** They did not, and the disagreement had a direction.
+    ///
+    /// The per-feed keep-set and both retention sweeps order on
+    /// `COALESCE(published, fetched_at)` — correctly, because a feed of undated
+    /// items would otherwise trim its own freshest rows. The reading list
+    /// ordered on bare `e.published DESC`, and in SQLite `NULL` sorts LAST under
+    /// `DESC`. So one undated entry was simultaneously the NEWEST row in the
+    /// feed as far as eviction was concerned, and the OLDEST row in every list
+    /// view — parked below years of read articles where no reader would see it,
+    /// while the cap declined to drop it to make room for something they would.
+    ///
+    /// `site.standard.document` makes `publishedAt` optional, so publication
+    /// feeds reach this far more readily than RSS ever did.
+    ///
+    /// Both directions here: the undated row must come first, AND the two dated
+    /// rows must stay in their own order, or "order by nothing" would pass.
+    ///
+    /// **On the index worry, measured on the query the app actually sends.**
+    /// #187 flagged that a `COALESCE` in `ORDER BY` cannot use
+    /// `idx_entries_feed_published` for ordering. The real list and prev/next
+    /// queries (LEFT JOIN `entry_state`, EXISTS `sub_ref`) did not use it for
+    /// ordering before this change either, and timing them at 40 feeds x 1,000
+    /// entries showed the new ordering costs nothing on the existing index. A
+    /// `(feed_id, published, fetched_at)` index meant to keep them covering was
+    /// never chosen on the default prev/next query and made it ~3.8x slower,
+    /// so it was not kept (review of #213).
+    #[tokio::test]
+    async fn an_undated_entry_leads_the_reading_list_as_it_leads_the_cap() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:undated";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://undated.example/f.xml".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                NewEntry {
+                    guid: "dated-old".to_string(),
+                    title: Some("Old".to_string()),
+                    published: Some("2024-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                NewEntry {
+                    guid: "dated-new".to_string(),
+                    title: Some("Newer".to_string()),
+                    published: Some("2025-01-01T00:00:00Z".to_string()),
+                    ..Default::default()
+                },
+                // No `published` at all — dated by `fetched_at`, which is now,
+                // so it is the freshest row in the feed.
+                NewEntry {
+                    guid: "undated".to_string(),
+                    title: Some("Undated".to_string()),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+
+        let rows = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        let order: Vec<&str> = rows.iter().map(|r| r.guid.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["undated", "dated-new", "dated-old"],
+            "the list disagrees with the cap about an undated entry's date",
+        );
+
+        // `list_entry_ids` is the sequence PREV/NEXT walks — its only non-test
+        // caller is `web::neighbors_in_scope`. Ordered differently from the
+        // list, "next entry" would take the reader somewhere that is not the
+        // next row on screen. (`mark_read` and `mark_all_read` are id-based and
+        // never use this ordering; an earlier version of this comment said they
+        // did, naming a failure that cannot happen and omitting the one that
+        // can.)
+        let ids = list_entry_ids(&pool, did, ListView::All, None, 100).await?;
+        let by_guid: std::collections::HashMap<i64, &str> =
+            rows.iter().map(|r| (r.id, r.guid.as_str())).collect();
+        let id_order: Vec<&str> = ids.iter().filter_map(|i| by_guid.get(i).copied()).collect();
+        assert_eq!(
+            id_order,
+            vec!["undated", "dated-new", "dated-old"],
+            "the id projection orders differently from the list it projects",
+        );
+        Ok(())
     }
 
     /// `limit` is honoured, and `offset` walks the same ordering without gaps or

@@ -1414,10 +1414,62 @@ fn entry_author(e: &RawEntry) -> Option<String> {
     e.authors.first().map(|p| p.name.clone())
 }
 
-/// Best publication time (published, else updated) as an RFC3339 string.
+/// Best CREDIBLE publication time (published, else updated) as an RFC3339
+/// string, or `None` when neither is credible.
+///
+/// **A date in the future is discarded, not clamped, and not stored.** There was
+/// no upper bound here, so an item dated in the year 2999 was stored verbatim
+/// and became permanent: both retention sweeps test
+/// `COALESCE(published, fetched_at) < cutoff` and a future date is never less
+/// than either, the per-feed keep-set orders on the same expression `DESC` where
+/// it is rank one forever, and every list view puts it at the top. A publisher
+/// with a broken clock does that by accident; anyone wanting a permanent slot at
+/// the top of a reader's list does it on purpose.
+///
+/// Discarded rather than clamped to now because the entry upsert refreshes
+/// `published` on every poll while stamping `fetched_at` once — so a value
+/// derived from the current clock is rewritten every cycle and the row can never
+/// age at all. Clamping relocates the defect. Undated is the honest answer, and
+/// `fetched_at` then dates the row and holds still. That is the rule the
+/// publication path already follows; see `standard_site::entries_from_records`.
+///
+/// **Each candidate is judged separately**, so a bogus `<published>` beside a
+/// credible `<updated>` keeps the good date. That helps Atom and only Atom: for
+/// RSS 2 `feed-rs` copies `published` into `updated` when `updated` is absent
+/// (`parser/rss2/mod.rs`), so the second candidate holds the same value and the
+/// fall-through is a no-op. Worth keeping for the format where two independent
+/// dates exist; worth not overstating for the one where they do not.
+///
+/// **The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`], NOT the publication path's
+/// clock-skew grace, and the asymmetry is deliberate.** There, a refused
+/// `publishedAt` falls back to the record key's TID — the real write time, a
+/// credible date — so a five-minute bound costs almost nothing. Here there is no
+/// such fallback: refusing leaves the entry undated and the reader sees no date
+/// at all. Five minutes is sized for skew between two clocks, while the ordinary
+/// cause of a future `pubDate` is a local time stamped `+0000` (up to 14 hours
+/// out, the widest real UTC offset) or a post scheduled a little ahead. Those are
+/// dates worth keeping, and they stop being future on their own.
+///
+/// What the bound must prevent is a date that can never become past, because that
+/// is what makes a row permanently unsweepable, un-evictable and first in the
+/// list.
 fn entry_time(e: &RawEntry) -> Option<String> {
-    e.published.or(e.updated).map(fmt_time)
+    let ceiling = Utc::now() + chrono::Duration::days(MAX_FUTURE_PUBLISHED_DAYS);
+    e.published
+        .filter(|d| *d <= ceiling)
+        .or_else(|| e.updated.filter(|d| *d <= ceiling))
+        .map(fmt_time)
 }
+
+/// How far ahead of now a feed may date an entry before [`entry_time`] refuses
+/// the date and lets `fetched_at` stand in.
+///
+/// Two days: the widest real UTC offset is +14:00, so a local time mislabelled as
+/// UTC lands inside this, as does a post scheduled slightly ahead. Both are dates
+/// worth keeping, and both stop being future without help. Anything further is
+/// refused, because a date that never becomes past is what makes a row
+/// permanently unsweepable and permanently first in the reading list.
+pub(crate) const MAX_FUTURE_PUBLISHED_DAYS: i64 = 2;
 
 /// Extract the plain string content of a feed [`Text`] node.
 fn text_plain(t: &Text) -> String {
@@ -2059,6 +2111,119 @@ mod tests {
         assert_eq!(e.content_html.unwrap(), sanitize_html(&body));
         assert_eq!(e.title.as_deref(), Some("A normal title"));
         assert_eq!(e.guid, "https://example.com/post");
+    }
+
+    /// **A stated date in the future is discarded, not stored and not clamped.**
+    ///
+    /// `entry_time` was `e.published.or(e.updated)` with no ceiling, so an item
+    /// dated in the year 2999 was stored verbatim and then became permanent:
+    /// both retention sweeps test `COALESCE(published, fetched_at) < cutoff` and
+    /// a future date is never less than either; the per-feed keep-set orders on
+    /// the same expression `DESC`, where it is rank one forever; and every list
+    /// view orders on `published DESC`, where it sits at the top. One item in one
+    /// feed, there for good. A publisher with a broken clock does this by
+    /// accident.
+    ///
+    /// Discarded rather than clamped to now, which is the rule `#186`
+    /// established on the atproto side and the reasoning transfers exactly: the
+    /// entry upsert refreshes `published` on every poll but stamps `fetched_at`
+    /// once, so a value derived from the current clock is rewritten every cycle
+    /// and the row can never age at all. Clamping moves the defect. Falling back
+    /// to undated lets `fetched_at` date it, and that holds still.
+    ///
+    /// The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`] (two days), deliberately
+    /// looser than the publication path's five-minute grace: a publication can
+    /// fall back to its record key's TID, and a feed has no such fallback.
+    #[test]
+    fn a_future_dated_rss_item_is_stored_undated_rather_than_dated_in_2999() {
+        let future = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Clock</title><link>https://clock.example/</link>
+<item><title>From the future</title><link>https://clock.example/1</link>
+<guid>https://clock.example/1</guid>
+<pubDate>Sat, 01 Jan 2999 00:00:00 GMT</pubDate></item>
+</channel></rss>"#;
+        let parsed = feed_rs::parser::parse(future.as_bytes()).expect("should parse");
+        // The fixture is only meaningful if feed-rs actually read the date.
+        assert!(
+            parsed.entries[0].published.is_some(),
+            "the fixture's pubDate did not parse, so this test proves nothing",
+        );
+
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(
+            e.published, None,
+            "a year-2999 date was stored, which makes the row unsweepable, \
+             un-evictable and permanently first in the reading list",
+        );
+
+        // And the other direction: an ordinary past date must survive, or this
+        // would be satisfied by discarding every date.
+        let past = future.replace("01 Jan 2999", "01 Jan 2020");
+        let parsed = feed_rs::parser::parse(past.as_bytes()).expect("should parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published
+                .as_deref()
+                .is_some_and(|p| p.starts_with("2020")),
+            "an ordinary past date was discarded: {:?}",
+            e.published,
+        );
+
+        // **A merely MISLABELLED date must survive.** The ordinary cause of a
+        // future `pubDate` is a local time stamped `+0000` — up to 14 hours out,
+        // not a clock a few minutes fast. Refusing those would leave real
+        // articles undated and dateless on screen, which is why the bound is two
+        // days rather than the publication path's five-minute skew grace.
+        let soon = (Utc::now() + chrono::Duration::hours(14)).to_rfc2822();
+        let near = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &soon);
+        let parsed = feed_rs::parser::parse(near.as_bytes()).expect("should parse");
+        assert!(
+            parsed.entries[0].published.is_some(),
+            "the mislabelled-date fixture did not parse",
+        );
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published.is_some(),
+            "a date 14 hours ahead — the widest real UTC offset — was refused, \
+             so a timezone-mislabelled article loses its date entirely",
+        );
+
+        // And the bound still bounds: a month out is refused.
+        let far = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
+        let month = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &far);
+        let parsed = feed_rs::parser::parse(month.as_bytes()).expect("should parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(
+            e.published, None,
+            "a date a month ahead was kept, so the row leads the list for a month",
+        );
+
+        // **Each candidate is judged separately, not the winner of `or`.**
+        //
+        // Atom specifically: for RSS 2 `feed-rs` copies `published` into
+        // `updated` when `updated` is absent, so the second candidate holds the
+        // same bogus value and the fall-through cannot help. Only a format
+        // carrying two independent dates exercises this.
+        let both = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Clock</title>
+<entry><title>Mixed</title><id>https://clock.example/2</id>
+<link href="https://clock.example/2"/>
+<published>2999-01-01T00:00:00Z</published>
+<updated>2020-06-01T00:00:00Z</updated></entry></feed>"#;
+        let parsed = feed_rs::parser::parse(both.as_bytes()).expect("should parse");
+        assert!(
+            parsed.entries[0].published.is_some() && parsed.entries[0].updated.is_some(),
+            "the fixture needs BOTH dates parsed for this case to mean anything",
+        );
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(
+            e.published
+                .as_deref()
+                .is_some_and(|p| p.starts_with("2020")),
+            "a credible `updated` was discarded along with a bogus `published`, \
+             leaving the entry undated: {:?}",
+            e.published,
+        );
     }
 
     /// Parse a static RSS sample through feed-rs + our normalize/sanitize path

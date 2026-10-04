@@ -44,6 +44,61 @@ deploying is separate.
   `:latest` for every non-prerelease version tag, so it can. Corrected; deploys
   are by digest regardless.
 
+### Fixed
+
+- **A future-dated RSS item was unsweepable and permanently first in the reading
+  list** (#188). `feed::entry_time` was `e.published.or(e.updated)` with no upper
+  bound, so an item dated in the year 2999 was stored verbatim and then became
+  permanent: both retention sweeps test `COALESCE(published, fetched_at) <
+  cutoff` and a future date is never less than either, the per-feed keep-set
+  orders on the same expression `DESC` where it is rank one forever, and every
+  list view puts it at the top. One item in one feed, there for good.
+
+  Discarded rather than clamped to now, which is the rule the publication path
+  already follows (#186) and the reasoning transfers: the entry upsert refreshes
+  `published` every poll but stamps `fetched_at` once, so a clock-derived value
+  is rewritten every cycle and the row can never age. Undated is the honest
+  answer, and `fetched_at` then dates it and holds still.
+
+  Each candidate is judged separately rather than the winner of `or`, so a feed
+  with a bogus `pubDate` beside a credible `atom:updated` keeps the good date —
+  that is the ordinary shape of a broken-clock feed, not a rare one. The ceiling is two days, deliberately looser than the publication path's
+  five-minute grace (see the last paragraph below).
+
+- **An undated entry was the newest row to the cap and the oldest to the reading
+  list** (#187). The per-feed keep-set and both sweeps order on
+  `COALESCE(published, fetched_at)` — correctly, or a feed of undated items
+  would trim its own freshest rows. `list_entries` and the id projection behind
+  "mark this page read" ordered on bare `e.published DESC`, and in SQLite `NULL`
+  sorts LAST under `DESC`. So one undated entry was at once safe from eviction
+  and parked at the bottom of every list below years of read articles, where no
+  reader would see it. `site.standard.document` makes `publishedAt` optional, so
+  publication feeds reach this far more readily than RSS ever did.
+
+  The index worry was measured on the query the app actually sends (a LEFT
+  JOIN on `entry_state` and an EXISTS on `sub_ref`), and the existing
+  `(feed_id, published)` index serves the new ordering as well as it served the
+  old one. A `(feed_id, published, fetched_at)` replacement meant to keep the
+  queries covering was tried and removed in review: the default prev/next query
+  never chose it, and with the old index dropped that query ran about 3.8x
+  slower (34 ms against 9 ms at 40 feeds x 1,000 entries). **No schema
+  change.**
+
+  **Rows already stored with a future date are re-dated at startup**: their
+  `published` is cleared, so `fetched_at` dates them. Otherwise an item dated
+  2999 that has already left its feed would never be polled again to be
+  corrected, and would stay first in the list and survive the per-feed cap.
+
+  The future-date bound is **two days**, not the publication path's five-minute
+  clock-skew grace, and the asymmetry is deliberate. There a refused
+  `publishedAt` falls back to the record key's TID — a real write time — so a
+  tight bound costs almost nothing. In a feed there is no such fallback, and the
+  ordinary cause of a future `pubDate` is a local time stamped `+0000` (up to 14
+  hours out) or a post scheduled slightly ahead; refusing those would leave real
+  articles with no date on screen. What the bound must prevent is a date that can
+  never become past, and two days clears the whole UTC offset range while still
+  refusing the year 2999 by a wide margin.
+
 ---
 
 ## 0.3.10 — 2026-10-03
