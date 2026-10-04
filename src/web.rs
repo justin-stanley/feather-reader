@@ -1564,6 +1564,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.4.2",
+        date: "2026-10-04",
+        summary: "A public standard.site feature page with this list of recent \
+                  releases, and link cards: a posted feather-reader.com link \
+                  now unfurls with a description and an image.",
+    },
+    Release {
         version: "0.4.1",
         date: "2026-10-04",
         summary: "The public pages explain standard.site publications, and the \
@@ -7716,11 +7723,13 @@ mod tests {
                 )
             );
         }
+        // The newest entry is this build's own version, so a release cannot
+        // ship without adding itself to the call-out.
         let latest = &RELEASES[0];
-        assert_eq!(latest.version, "0.4.1");
+        assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#041--2026-10-04"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#042--2026-10-04"
         );
     }
 
