@@ -18,8 +18,11 @@ cd "$(dirname "$0")/.."
 
 src=static/social-card.svg
 out=static/social-card.png
-tmp="$(mktemp -t social-card).png"
-trap 'rm -f "$tmp"' EXIT
+# A private directory, so the file keeps its .png name (the renderers infer the
+# format from it) and portable: GNU mktemp needs XXXXXX in a template.
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/social-card.XXXXXX")"
+trap 'rm -rf "$tmpdir"' EXIT
+tmp="$tmpdir/social-card.png"
 
 chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 if command -v rsvg-convert >/dev/null 2>&1; then
