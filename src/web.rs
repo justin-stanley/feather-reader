@@ -1261,14 +1261,17 @@ struct Nav {
     manage_active: bool,
 }
 
-/// The reader index (`GET /`).
 /// The subscribe input's `pattern` when standard.site is on, and the input is
 /// `type="text"` (see `templates/manage.html`). It keeps the browser asking for
 /// a scheme, as `type="url"` did, while admitting `at://`. Matched in any case,
 /// because the handler canonicalises the scheme. Browsers compile `pattern`
-/// with the `v` flag and anchor it at both ends.
-pub(crate) const FEED_URL_PATTERN: &str = "(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Tt])://.+";
+/// with the `v` flag and anchor it at both ends. Unlike `type="url"`, a text
+/// input does not strip surrounding whitespace before checking, so the pattern
+/// allows it: a URL pasted with a leading space is common, and the handler
+/// trims it.
+pub(crate) const FEED_URL_PATTERN: &str = "\\s*(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Tt])://.+";
 
+/// The reader index (`GET /`).
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
