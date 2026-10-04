@@ -11,8 +11,9 @@
 //! | `FEATHERREADER_DB`           | `featherreader.db`       | Path to the SQLite cache file. |
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
-//! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. |
-//! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
+//! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. At least 1; 0 is refused at startup. |
+//! | `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` | `30` | The longest one standard.site publication read may take before it is a failure. Under Fly's 45 s `kill_timeout`, so the read in flight at shutdown can finish. Must be at least 1. |
+//! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/75/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PUBLICATION_RETENTION_DAYS` | `3650` | Absolute ceiling for entries of a kind the rolling window does not apply to — a standard.site publication. Publications are bounded by COUNT (`max_entries_per_feed`) instead of by age, because measurement says a 14-day window stores NOTHING from a real publication: the newest documents on three of them were 109 to 241 days old. This is the "not immortal" backstop, not the space bound. `0` disables it. |
@@ -34,7 +35,7 @@
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
 //! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
-//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — one arriving via OPML import or a record another client wrote. The subscribe form cannot take one yet, and nothing polls one: `at://` rows are skipped by kind, not failed (see `feed::FeedKind::POLLABLE`). Both land with the standard.site reader. |
+//! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — pasted into the subscribe form (a handle is resolved to its DID), imported via OPML, or written by another client. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
@@ -77,6 +78,10 @@ pub struct Config {
     pub allowed_dids: Vec<String>,
     /// The default per-feed poll interval.
     pub poll_interval: Duration,
+    /// The longest one standard.site publication read may take, start to
+    /// finish. A read is otherwise bounded only per request (`FETCH_TIMEOUT` x
+    /// `MAX_LIST_PAGES`), which is hours against a repo that pages slowly.
+    pub publication_read_deadline: Duration,
     /// Cache eviction window, in days: a READ, UNSTARRED entry older than this
     /// is dropped from the local cache. Starred and still-unread entries are
     /// kept past this window — but NOT indefinitely: see `retention_hard_days`,
@@ -174,16 +179,15 @@ pub struct Config {
     /// nothing until this is set deliberately.
     pub repo_backend: crate::metrics::Backend,
     /// Whether an `at://` standard.site publication subscription may be
-    /// **stored** — via OPML import or a record another client wrote. The
-    /// subscribe form cannot take one yet: the add path must fetch what is
-    /// pasted and nothing fetches `at://`, so it refuses with its own message.
+    /// **stored** — pasted into the subscribe form (a handle is resolved to its
+    /// DID first), imported via OPML, or written by another client.
     /// From `FEATHERREADER_STANDARD_SITE`, default **off**.
     ///
-    /// **This flag does not gate polling; nothing does, because nothing polls
-    /// an `at://` row.** An earlier version of this comment claimed one flag
-    /// gated both. It did not — nothing outside the storable guards read it.
-    /// Why `at://` rows are skipped rather than failed, and where that one
-    /// decision lives, is documented once on [`crate::feed::FeedKind::POLLABLE`].
+    /// **This flag does not gate polling.** Since 0.4.0 a stored publication
+    /// row is polled like any feed, flag on or off: the flag decides what may
+    /// be stored, and a row already stored is read. Which `at://` rows are
+    /// publications, and which are `Unsupported` and never polled, is decided
+    /// once by [`crate::feed::FeedKind::of`].
     pub standard_site: bool,
     /// Base URL of the atproto handle resolver (`com.atproto.identity.resolveHandle`),
     /// no trailing slash. Used by the pre-handshake beta gate to turn a submitted
@@ -358,6 +362,7 @@ impl Default for Config {
             public_url: "http://localhost:8080".to_string(),
             allowed_dids: Vec::new(),
             poll_interval: Duration::from_secs(3600),
+            publication_read_deadline: Duration::from_secs(30),
             retention_days: 14,
             retention_hard_days: 180,
             publication_retention_days: 3_650,
@@ -415,7 +420,11 @@ impl Config {
     pub fn retention_for(&self, kind: crate::feed::FeedKind) -> (u32, u32) {
         match kind {
             crate::feed::FeedKind::Rss => (self.retention_days, self.retention_hard_days),
-            crate::feed::FeedKind::Publication => (0, self.publication_retention_days),
+            // An Unsupported row never stores entries; it inherits the archive
+            // bound so no kind outside AGED is ever unbounded.
+            crate::feed::FeedKind::Publication | crate::feed::FeedKind::Unsupported => {
+                (0, self.publication_retention_days)
+            }
         }
     }
 
@@ -452,15 +461,14 @@ impl Config {
             })
             .unwrap_or(defaults.allowed_dids);
 
-        let poll_interval = match env_opt("FEATHERREADER_POLL_INTERVAL") {
-            Some(raw) => {
-                let secs: u64 = raw.parse().with_context(|| {
-                    format!("FEATHERREADER_POLL_INTERVAL: expected seconds, got {raw:?}")
-                })?;
-                Duration::from_secs(secs)
-            }
-            None => defaults.poll_interval,
-        };
+        let publication_read_deadline = publication_read_deadline_from(
+            env_opt("FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS"),
+            defaults.publication_read_deadline,
+        )?;
+        let poll_interval = poll_interval_from(
+            env_opt("FEATHERREADER_POLL_INTERVAL"),
+            defaults.poll_interval,
+        )?;
 
         let retention_hard_days = match env_opt("FEATHERREADER_RETENTION_HARD_DAYS") {
             Some(raw) => raw.parse().with_context(|| {
@@ -634,6 +642,7 @@ impl Config {
             public_url,
             allowed_dids,
             poll_interval,
+            publication_read_deadline,
             retention_days,
             retention_hard_days,
             publication_retention_days,
@@ -923,9 +932,64 @@ fn parse_bool(raw: &str) -> Result<bool> {
     }
 }
 
+/// Parse `FEATHERREADER_POLL_INTERVAL`. **Zero is refused:** a healthy poll
+/// would be due again the moment it finished, and the publication loop would
+/// read every healthy publication on every pass.
+fn poll_interval_from(raw: Option<String>, default: Duration) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("FEATHERREADER_POLL_INTERVAL: expected seconds, got {raw:?}"))?;
+    anyhow::ensure!(
+        secs > 0,
+        "FEATHERREADER_POLL_INTERVAL must be at least 1 second"
+    );
+    Ok(Duration::from_secs(secs))
+}
+
+/// Parse `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS`. **Zero is refused:**
+/// it would fail every publication read, as `Fetch`, with nothing saying why.
+fn publication_read_deadline_from(raw: Option<String>, default: Duration) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let secs: u64 = raw.parse().with_context(|| {
+        format!("FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS: expected seconds, got {raw:?}")
+    })?;
+    anyhow::ensure!(
+        secs > 0,
+        "FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS must be at least 1; 0 would fail every publication read"
+    );
+    Ok(Duration::from_secs(secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_poll_interval_is_refused() {
+        let d = Duration::from_secs(3600);
+        assert!(poll_interval_from(Some("0".into()), d).is_err());
+        assert_eq!(
+            poll_interval_from(Some("60".into()), d).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(poll_interval_from(None, d).unwrap(), d);
+    }
+
+    #[test]
+    fn a_zero_publication_read_deadline_is_refused() {
+        let d = Duration::from_secs(30);
+        assert!(publication_read_deadline_from(Some("0".into()), d).is_err());
+        assert_eq!(
+            publication_read_deadline_from(Some("5".into()), d).unwrap(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(publication_read_deadline_from(None, d).unwrap(), d);
+    }
 
     /// A ceiling inside the window is refused at BOOT, not ignored at sweep time.
     ///

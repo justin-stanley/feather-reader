@@ -718,24 +718,29 @@ pub enum FailureKind {
 pub enum FeedKind {
     /// An RSS/Atom/JSON feed document fetched over http(s).
     Rss,
-    /// An `at://…/site.standard.publication/…` record pair in somebody's PDS.
-    /// Storable behind `FEATHERREADER_STANDARD_SITE`; **not yet pollable**, so
-    /// [`FeedKind::POLLABLE`] excludes it. Wiring the reader is what moves it.
+    /// An `at://…/site.standard.publication/…` record pair in somebody's PDS,
+    /// read by `standard_site` and pollable since 0.4.0.
     Publication,
+    /// Any other `at://` row: another collection, or a spelling the storage
+    /// guard would refuse. Rows like this predate that guard. **Never
+    /// pollable** — handing one to the standard.site reader would fail its
+    /// collection check every tick and publish it as an unreachable publisher —
+    /// and counted as unpollable so the capacity it holds stays visible.
+    Unsupported,
 }
 
 impl FeedKind {
-    /// The kinds the scheduler may select. The single place that changes when
-    /// the standard.site reader is wired to the poller.
+    /// The kinds the scheduler may select: RSS, and since 0.4.0 standard.site
+    /// publications. [`FeedKind::Unsupported`] is the kind it never selects.
     ///
-    /// **This is the canonical home of the at:// exclusion; the other sites
-    /// point here.** It used to be a SQL string predicate in `store`, carrying
+    /// **This is the canonical home of the exclusion; the other sites point
+    /// here.** It used to be a SQL string predicate in `store`, carrying
     /// its own copy of the rule — which is how one reader (`count_feeds`) came
     /// to drift from it unnoticed.
     ///
-    /// Why an unpollable kind is skipped rather than failed: `poll_feed`
-    /// reaches `net::guarded_get`, whose `check_scheme` refuses any non-http(s)
-    /// scheme, and the standard.site reader is not yet wired to the scheduler.
+    /// Why an unpollable kind is skipped rather than failed: an `Unsupported`
+    /// row names nothing either reader can fetch — another collection, a handle,
+    /// a non-canonical spelling — so polling it could only fail.
     /// Handing such a row to the poller does not leave the feature dormant — it
     /// manufactures one permanent failure per row, which the public cause
     /// histogram then reports as an unreachable publisher. Unsupported is not
@@ -760,7 +765,7 @@ impl FeedKind {
     /// `/stats` shows a climbing backlog and nothing logs why. Bounded and
     /// harmless at ninety feeds; not at ten thousand. Whoever wires the next
     /// kind should seed or stagger `next_poll` for the rows it admits.
-    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss];
+    pub const POLLABLE: &'static [FeedKind] = &[FeedKind::Rss, FeedKind::Publication];
 
     /// The kinds whose entries the retention **window** applies to.
     ///
@@ -788,6 +793,7 @@ impl FeedKind {
         match self {
             FeedKind::Rss => "rss",
             FeedKind::Publication => "publication",
+            FeedKind::Unsupported => "unsupported",
         }
     }
 
@@ -797,6 +803,7 @@ impl FeedKind {
         match raw {
             "rss" => Some(FeedKind::Rss),
             "publication" => Some(FeedKind::Publication),
+            "unsupported" => Some(FeedKind::Unsupported),
             _ => None,
         }
     }
@@ -817,10 +824,19 @@ impl FeedKind {
     /// the `fetch` bucket as an unreachable publisher. Storing a non-canonical
     /// spelling is separately refused, because `feeds.url` is UNIQUE.
     pub fn of(url: &str) -> Self {
-        if crate::atproto::strip_at_prefix(url).is_some() {
-            FeedKind::Publication
-        } else {
-            FeedKind::Rss
+        match crate::atproto::strip_at_prefix(url) {
+            // **Only a URI the storage guard would accept is a publication.**
+            // Since publications became pollable, "it is an at-URI" is no longer
+            // a safe enough reason: another collection would be polled, fail,
+            // and back off forever while reading as an unreachable publisher.
+            // The canonical lowercase scheme too, for the same reason: storage
+            // refuses `At://` (#183), and a legacy row spelled that way would
+            // otherwise be polled and fail its parse every tick.
+            Some(rest) if url.starts_with("at://") && is_storable_publication_uri(rest) => {
+                FeedKind::Publication
+            }
+            Some(_) => FeedKind::Unsupported,
+            None => FeedKind::Rss,
         }
     }
 }
@@ -977,6 +993,183 @@ pub fn backoff_for(consecutive_errors: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Poll one feed by **what it is**: an RSS/Atom/JSON document over HTTP, or a
+/// standard.site publication read from its author's PDS.
+///
+/// The single entry point the scheduler calls, so the choice of reader lives
+/// with [`FeedKind`] and not in the poll loop. Same contract as [`poll_feed`]:
+/// `Err` is a broken local store, never a misbehaving source.
+pub async fn poll_feed_by_kind(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feed: &Feed,
+) -> Result<PollOutcome> {
+    match FeedKind::of(&feed.url) {
+        FeedKind::Rss => poll_feed(pool, client, feed, config.max_entries_per_feed).await,
+        FeedKind::Publication => poll_publication(pool, client, config, feed).await,
+        // Never selected: `due_feeds` reads only POLLABLE kinds. A defensive
+        // failure rather than a panic if a caller hands one in anyway.
+        FeedKind::Unsupported => Ok(PollOutcome::Failed {
+            backoff: backoff_for(1),
+            kind: FailureKind::Parse,
+            detail: failure_detail(format!("{} is not a feed this reader can poll", feed.url)),
+        }),
+    }
+}
+
+/// What a failed publication read is filed under in the cause histogram.
+///
+/// **`Fetch` means the request never produced a response**, so it is the
+/// fallback, not the default answer: a PLC directory or PDS that answered —
+/// with a 404 for a tombstoned DID, `RepoNotFound`, `RepoDeactivated` — is
+/// `Status`, and an answer that was not what it claimed to be is `Parse`. Filed
+/// as `Fetch`, a deleted account read as its server being down (found in
+/// review).
+fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
+    use crate::atproto::{AtProtoError, DidResolutionCause};
+    for cause in err.chain() {
+        if cause.is::<crate::standard_site::NotAPublication>() || cause.is::<serde_json::Error>() {
+            return FailureKind::Parse;
+        }
+        match cause.downcast_ref::<AtProtoError>() {
+            Some(AtProtoError::Xrpc { .. }) => return FailureKind::Status,
+            Some(AtProtoError::DidResolution { cause, .. }) => {
+                return match cause {
+                    DidResolutionCause::Status => FailureKind::Status,
+                    DidResolutionCause::UnsupportedMethod | DidResolutionCause::NoPdsEndpoint => {
+                        FailureKind::Parse
+                    }
+                    DidResolutionCause::NotAPublicTarget => FailureKind::Fetch,
+                }
+            }
+            _ => {}
+        }
+    }
+    FailureKind::Fetch
+}
+
+/// Read a standard.site publication from its author's PDS and store it.
+///
+/// A source failure — an unparseable URI, an unreachable PLC directory or
+/// PDS, a walk that failed — is a [`PollOutcome::Failed`] with backoff, like an
+/// RSS fetch failure, so `settle_poll` and `/stats` treat both kinds alike.
+/// Only a broken local store is an `Err`, which `store_publication` decides.
+async fn poll_publication(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feed: &Feed,
+) -> Result<PollOutcome> {
+    poll_publication_group(pool, client, config, std::slice::from_ref(feed))
+        .await
+        .pop()
+        .unwrap_or_else(|| Err(anyhow::anyhow!("no outcome for {}", feed.url)))
+}
+
+/// Read several publications **from one repo** with one walk of its documents
+/// (`standard_site::fetch_repo`), and store each. One outcome per feed, in
+/// order. The caller groups by repo; a feed from another repo, or one whose
+/// URL is not a publication URI, gets its own failure and does not affect the
+/// rest.
+///
+/// **Why one walk:** cost scales with the repo, not the publication. Nine
+/// publications in one repo were nine full walks of its documents.
+pub async fn poll_publication_group(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feeds: &[Feed],
+) -> Vec<Result<PollOutcome>> {
+    let failed = |kind: FailureKind, detail: String| -> Result<PollOutcome> {
+        Ok(PollOutcome::Failed {
+            backoff: backoff_for(1),
+            kind,
+            detail: failure_detail(detail),
+        })
+    };
+    let uris: Vec<Option<crate::standard_site::AtUri>> = feeds
+        .iter()
+        .map(|f| crate::standard_site::AtUri::parse(&f.url))
+        .collect();
+    let Some(did) = uris.iter().flatten().next().map(|u| u.authority.clone()) else {
+        return feeds
+            .iter()
+            .map(|f| {
+                failed(
+                    FailureKind::Parse,
+                    format!("{} is not a readable at:// URI", f.url),
+                )
+            })
+            .collect();
+    };
+    // Only the feeds of that repo with a publication URI are read together.
+    let readable: Vec<usize> = (0..feeds.len())
+        .filter(|&i| {
+            uris[i].as_ref().is_some_and(|u| {
+                u.authority == did && u.collection == crate::lexicon::nsid::STANDARD_PUBLICATION
+            })
+        })
+        .collect();
+    let rkeys: Vec<String> = readable
+        .iter()
+        .map(|&i| uris[i].as_ref().unwrap().rkey.clone())
+        .collect();
+
+    // **One deadline for the whole read.** It is otherwise bounded only per
+    // request (FETCH_TIMEOUT x MAX_LIST_PAGES): hours, against a repo that
+    // pages slowly, all of it holding up the publication loop.
+    let fetched = tokio::time::timeout(
+        config.publication_read_deadline,
+        crate::standard_site::fetch_repo(client, &config.oauth.plc_directory, &did, &rkeys),
+    )
+    .await;
+    let mut reads: Vec<Option<anyhow::Result<crate::standard_site::PublicationRead>>> =
+        feeds.iter().map(|_| None).collect();
+    let repo_failure = match fetched {
+        Ok(Ok(per)) => {
+            for (slot, read) in readable.iter().zip(per) {
+                reads[*slot] = Some(read);
+            }
+            None
+        }
+        Ok(Err(err)) => Some((publication_failure_kind(&err), format!("{err:#}"))),
+        Err(_) => Some((
+            FailureKind::Fetch,
+            format!(
+                "the read did not finish within {:?}",
+                config.publication_read_deadline
+            ),
+        )),
+    };
+
+    let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
+    let mut out = Vec::with_capacity(feeds.len());
+    for (i, feed) in feeds.iter().enumerate() {
+        let outcome = match (reads[i].take(), &repo_failure) {
+            (Some(Ok(read)), _) => {
+                crate::standard_site::store_publication(
+                    pool,
+                    &feed.url,
+                    read,
+                    config.max_entries_per_feed,
+                    retention_days,
+                    retention_hard_days,
+                )
+                .await
+            }
+            (Some(Err(err)), _) => failed(publication_failure_kind(&err), format!("{err:#}")),
+            (None, Some((kind, detail))) if readable.contains(&i) => failed(*kind, detail.clone()),
+            (None, _) => failed(
+                FailureKind::Parse,
+                format!("{} is not a publication in {did}", feed.url),
+            ),
+        };
+        out.push(outcome);
+    }
+    out
+}
+
 /// Fetch, parse, sanitize, normalize, and store a single feed.
 ///
 /// Performs a conditional GET using the feed's stored `ETag` / `Last-Modified`.
@@ -1131,7 +1324,10 @@ async fn touch_polled(
 /// Extract `(title, site_url)` from a parsed feed. `site_url` prefers an
 /// `alternate`/no-rel HTML link over the feed's self link.
 fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
-    let title = parsed.title.as_ref().map(text_plain);
+    let title = parsed
+        .title
+        .as_ref()
+        .map(|t| bound_text(text_plain(t), MAX_TITLE_BYTES));
     let site_url = parsed
         .links
         .iter()
@@ -1149,7 +1345,7 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
                 .find(|l| l.rel.as_deref() != Some("self"))
         })
         .or_else(|| parsed.links.first())
-        .map(|l| l.href.clone());
+        .map(|l| bound_text(l.href.clone(), MAX_URL_BYTES));
     (title, site_url)
 }
 
@@ -1166,7 +1362,7 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
         .as_ref()
         .and_then(|c| c.body.as_deref())
         .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
-        .map(sanitize_html);
+        .map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES));
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
@@ -1180,10 +1376,13 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
     };
 
     NewEntry {
-        guid,
-        url,
-        title: e.title.as_ref().map(text_plain),
-        author: entry_author(e),
+        guid: bound_guid(guid),
+        url: url.map(|u| bound_text(u, MAX_URL_BYTES)),
+        title: e
+            .title
+            .as_ref()
+            .map(|t| bound_text(text_plain(t), MAX_TITLE_BYTES)),
+        author: entry_author(e).map(|a| bound_text(a, MAX_AUTHOR_BYTES)),
         published: entry_time(e),
         content_html,
         fetched_at: None, // store defaults to "now".
@@ -1307,6 +1506,165 @@ pub(crate) fn plain_text_to_html(raw: &str) -> String {
     // Safe by order: every `<` from the input is already `&lt;` before this
     // adds a real tag.
     escaped.replace('\n', "<br>")
+}
+
+/// **What one entry, or one feed row, may store per field (#205).**
+///
+/// Every field below arrives from someone else's server — an RSS document or a
+/// publisher's `site.standard.document` record — and nothing between the wire
+/// and SQLite used to shorten it. A title could be megabytes, then indexed, read
+/// back and rendered into every list view of that feed.
+///
+/// Chosen from measurement, not guessed. Production's 4,389 entries on
+/// 2026-10-03: title max 253 bytes (p99 148), url max 235 (p99 178), author max
+/// 26, content_html max 86,969 (p99 17,535). Each bound is at least 8x the
+/// largest real value, so no ordinary article is touched; `MAX_TITLE_BYTES` is
+/// `site.standard.document`'s own `title.maxLength`.
+///
+/// **Truncated, never refused.** Dropping an article because one field is long
+/// is the failure mode the retention work was careful to avoid.
+pub(crate) const MAX_TITLE_BYTES: usize = 5_000;
+/// See [`MAX_TITLE_BYTES`].
+pub(crate) const MAX_AUTHOR_BYTES: usize = 1_000;
+/// See [`MAX_TITLE_BYTES`]. A truncated URL is a broken link, which was judged
+/// better than no link; at 35x the longest real one it should never happen.
+pub(crate) const MAX_URL_BYTES: usize = 8_192;
+/// See [`MAX_TITLE_BYTES`]. Applies to the STORED HTML, after sanitizing or
+/// escaping — see [`sanitize_html_bounded`] for why that is the bound that matters.
+pub(crate) const MAX_CONTENT_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// An entry id longer than this is replaced by a stable hash of the whole id
+/// (see [`bound_guid`]): it is the dedup key, under a UNIQUE index.
+pub(crate) const MAX_GUID_BYTES: usize = 2_048;
+
+/// The largest index `<= at` that is a character boundary of `s`.
+fn floor_char_boundary(s: &str, at: usize) -> usize {
+    if at >= s.len() {
+        return s.len();
+    }
+    (0..=at).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary. Plain-text fields
+/// only: cutting markup or an escaped string here could split a tag or an
+/// entity, which is what [`sanitize_html_bounded`] and [`plain_text_to_html_bounded`] exist for.
+pub(crate) fn bound_text(mut s: String, max: usize) -> String {
+    let cut = floor_char_boundary(&s, max);
+    s.truncate(cut);
+    s
+}
+
+/// Plain text escaped into `content_html`, cut so the **output** fits `max`.
+///
+/// **Exact, in one pass.** Escaping is a fixed size per character (`&` is
+/// five bytes, `<` and `>` four, a newline `<br>` four, anything else its UTF-8
+/// length), so the longest prefix whose escaped form fits is found by adding
+/// those up — no rendering, no search. Three rounds of review found bugs in a
+/// generic re-render search that this replaces (#224).
+pub(crate) fn plain_text_to_html_bounded(raw: &str, max: usize) -> String {
+    let mut size = 0usize;
+    let mut cut = raw.len();
+    for (i, c) in raw.char_indices() {
+        let escaped = match c {
+            '&' => 5,
+            '<' | '>' | '\n' => 4,
+            c => c.len_utf8(),
+        };
+        if size + escaped > max {
+            cut = i;
+            break;
+        }
+        size += escaped;
+    }
+    plain_text_to_html(&raw[..cut])
+}
+
+/// Feed HTML sanitized into `content_html`, cut so the **output** fits `max`.
+///
+/// **Sanitize once, then cut the sanitized output, not the input.** Cutting
+/// the input made the result depend on how much of it the sanitizer would
+/// strip — a large `data:` image, `<style>` or unterminated comment — and the
+/// searches that tried to account for that kept nothing, or ran for hours, in
+/// review (#224). Sanitized HTML is already clean: cutting it on a character
+/// boundary and sanitizing that prefix again only closes the tags the cut left
+/// open, so the second pass usually grows it by little. The first cut leaves a
+/// margin for that growth; deeply nested markup, whose closers can outgrow any
+/// margin, falls through to a bounded bisection.
+///
+/// Cost: the first sanitize is the one every body always had; the bounded
+/// passes — one, or at most 1 + [`SANITIZE_BOUND_ATTEMPTS`] — run on at most
+/// `max` bytes of already-clean HTML, and only for a body over the bound.
+pub(crate) fn sanitize_html_bounded(raw: &str, max: usize) -> String {
+    let clean = sanitize_html(raw);
+    if clean.len() <= max {
+        return clean;
+    }
+    // First, the cut that almost always works: just under the bound, with a
+    // margin for the closers the cut leaves open. When it fits, that is the
+    // answer — within 1/64 of the bound, in one extra pass.
+    let margin = (max / 64).max(64);
+    let first = floor_char_boundary(&clean, max.saturating_sub(margin));
+    let again = sanitize_html(&clean[..first]);
+    if again.len() <= max {
+        return again;
+    }
+    // **Then a bounded bisection, not a widening margin.** A closing tag is
+    // longer than the tag it opens, so a cut through deeply nested markup can
+    // grow past the bound by more than any fixed margin; widening the margin
+    // 4x a round reached a cut of 0 and stored nothing where nearly all of it
+    // fit (found in review). `lo` always fits (the empty prefix does), `hi`
+    // never does, and the next probe is taken AFTER they move.
+    let (mut lo, mut hi) = (0usize, first);
+    let mut best = String::new();
+    let resolution = (max / 1024).max(1);
+    for _ in 0..SANITIZE_BOUND_ATTEMPTS {
+        if hi - lo <= resolution {
+            break;
+        }
+        let mut cut = floor_char_boundary(&clean, lo + (hi - lo) / 2);
+        if cut <= lo {
+            // A multi-byte character straddles the midpoint: step past it
+            // rather than give up.
+            cut = ceil_char_boundary(&clean, lo + 1);
+            if cut >= hi {
+                break;
+            }
+        }
+        let out = sanitize_html(&clean[..cut]);
+        if out.len() <= max {
+            lo = cut;
+            best = out;
+        } else {
+            hi = cut;
+        }
+    }
+    best
+}
+
+/// The smallest index `>= at` that is a character boundary of `s`.
+fn ceil_char_boundary(s: &str, at: usize) -> usize {
+    (at..=s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len())
+}
+
+/// The most bisection passes [`sanitize_html_bounded`] spends after its first
+/// cut: enough to resolve a 2 MiB bound to about 1/1024 of it.
+const SANITIZE_BOUND_ATTEMPTS: usize = 14;
+
+/// An entry id, or a stable stand-in for one too long to index.
+///
+/// The id is the dedup key under `UNIQUE (feed_id, guid)`, so truncating it
+/// would merge distinct entries that share a long prefix. A hash of the WHOLE
+/// id keeps them apart and keeps the same entry deduplicating across polls —
+/// the same construction as [`stable_guid`].
+pub(crate) fn bound_guid(guid: String) -> String {
+    if guid.len() <= MAX_GUID_BYTES {
+        return guid;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    guid.hash(&mut h);
+    format!("featherreader:long-guid:{:016x}", h.finish())
 }
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
@@ -1515,6 +1873,245 @@ mod tests {
     <content type="html"><![CDATA[<p>Safe <em>text</em>.</p><script>steal()</script><iframe src="evil"></iframe>]]></content>
   </entry>
 </feed>"#;
+
+    // ---- #205: what one entry may store, per field ----------------------
+
+    /// An RSS document carrying one item with exactly these fields.
+    fn rss_with_fields(title: &str, link: &str, author: &str, body: &str, guid: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
+<title>{title}</title><link>https://example.com/{link}</link>
+<item><title>{title}</title><link>https://example.com/{link}</link><guid>{guid}</guid>
+<dc:creator>{author}</dc:creator><description><![CDATA[{body}]]></description></item>
+</channel></rss>"#
+        )
+    }
+
+    #[test]
+    fn bound_text_cuts_on_a_character_boundary() {
+        // 'é' is two bytes, so an odd limit lands mid-character.
+        let cut = bound_text("é".repeat(100), 51);
+        assert!(cut.len() <= 51, "not bounded: {} bytes", cut.len());
+        assert_eq!(cut, "é".repeat(25), "cut too short or mid-character");
+        assert_eq!(
+            bound_text("short".into(), 51),
+            "short",
+            "a short value changed"
+        );
+    }
+
+    #[test]
+    fn rendered_content_fits_even_when_rendering_grows_it() {
+        // Escaping turns each `&` into `&amp;` — five bytes from one.
+        let out = plain_text_to_html_bounded(&"&".repeat(1_000), 100);
+        assert!(
+            out.len() <= 100,
+            "escaped output not bounded: {} bytes",
+            out.len()
+        );
+        assert!(!out.is_empty(), "bounded to nothing");
+        assert_eq!(
+            out.matches("&amp;").count() * 5,
+            out.len(),
+            "cut mid-entity: {out}"
+        );
+    }
+
+    #[test]
+    fn an_rss_items_text_fields_are_bounded() {
+        let big = "x".repeat(100_000);
+        let xml = rss_with_fields(&big, &big, &big, "body", "id-1");
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(e.title.as_ref().unwrap().len() <= MAX_TITLE_BYTES, "title");
+        assert!(e.url.as_ref().unwrap().len() <= MAX_URL_BYTES, "url");
+        assert!(
+            e.author.as_ref().unwrap().len() <= MAX_AUTHOR_BYTES,
+            "author"
+        );
+        let (title, site) = feed_metadata(&parsed);
+        assert!(title.unwrap().len() <= MAX_TITLE_BYTES, "feed title");
+        assert!(site.unwrap().len() <= MAX_URL_BYTES, "feed site url");
+    }
+
+    #[test]
+    fn an_rss_body_is_bounded_and_still_well_formed() {
+        // Long enough to need cutting, with markup straddling the cut.
+        let body = format!("<p>{}<b>tail</b></p>", "a".repeat(MAX_CONTENT_HTML_BYTES));
+        let xml = rss_with_fields("t", "l", "a", &body, "id-2");
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let html = normalize_entry(&parsed.entries[0]).content_html.unwrap();
+        assert!(
+            html.len() <= MAX_CONTENT_HTML_BYTES,
+            "body not bounded: {}",
+            html.len()
+        );
+        assert_eq!(
+            sanitize_html(&html),
+            html,
+            "the stored body is not well-formed sanitized HTML"
+        );
+    }
+
+    /// Review of #224: cutting the INPUT first threw away content that would
+    /// have fit. A large inline `data:` image, which ammonia strips anyway,
+    /// ahead of the article left the cut ending inside the image tag, and the
+    /// article was stored as an empty body.
+    #[test]
+    fn content_the_sanitizer_strips_does_not_count_against_the_bound() {
+        const MAX: usize = 64 * 1024;
+        let body = format!(
+            r#"<p><img src="data:image/png;base64,{}"></p><p>the article</p>"#,
+            "A".repeat(MAX + 16 * 1024)
+        );
+        let html = sanitize_html_bounded(&body, MAX);
+        assert!(
+            html.contains("the article"),
+            "the article was cut away: {} bytes kept",
+            html.len()
+        );
+        assert!(html.len() <= MAX);
+    }
+
+    /// Review of #224 (second round): the re-cut loop shrank its input by a
+    /// few bytes a round when the bytes beyond the cut were ones the sanitizer
+    /// strips anyway — measured at ~32 bytes/round, hours for one entry, on the
+    /// poller's async task. The number of renders must be bounded.
+    /// Review of #224: a cut into bytes the sanitizer strips anyway (here an
+    /// unterminated comment) crept a few bytes a round, for hours. Bounding
+    /// works on the SANITIZED output now, so stripped input costs nothing.
+    #[test]
+    fn content_cut_beside_stripped_bytes_still_keeps_what_fits() {
+        const MAX: usize = 64 * 1024;
+        let body = format!("<p>{}</p><!--{}", "a".repeat(MAX + 8), "x".repeat(16 * MAX));
+        let html = sanitize_html_bounded(&body, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "kept far less than fits: {}",
+            html.len()
+        );
+    }
+
+    /// Also from that review: a cut landing inside a stripped prefix stored an
+    /// empty body when an article that fits followed it.
+    /// Also from review: a cut landing inside a stripped prefix stored an
+    /// empty body when an article that fits followed it.
+    #[test]
+    fn a_stripped_prefix_does_not_leave_an_empty_body() {
+        const MAX: usize = 64 * 1024;
+        let body = format!(
+            r#"<p><img src="data:image/png;base64,{}"></p><p>{}</p>"#,
+            "A".repeat(3 * MAX),
+            "&".repeat(MAX)
+        );
+        let html = sanitize_html_bounded(&body, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "nothing like what fits was kept: {} bytes",
+            html.len()
+        );
+    }
+
+    /// Third review: a multi-byte character where the search's stale probe
+    /// landed ended it early, keeping 0 bytes where ~2 MiB fit.
+    #[test]
+    fn a_stripped_multibyte_prefix_does_not_leave_an_empty_body() {
+        const MAX: usize = 64 * 1024;
+        let body = format!(
+            "<!--{}--><p>{}</p>",
+            "漢".repeat(MAX),
+            "&".repeat(MAX * 3 / 10)
+        );
+        let html = sanitize_html_bounded(&body, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+    }
+
+    /// Fourth review of #224: a closing tag is longer than the tag it closes,
+    /// so a cut through nested markup grew past the bound on re-sanitizing,
+    /// and the widening margin jumped straight to a cut of 0 — an empty body
+    /// where nearly all of it fit.
+    #[test]
+    fn nested_markup_is_cut_not_emptied() {
+        const MAX: usize = 64 * 1024;
+        let html = sanitize_html_bounded(&"<span>".repeat(16_384), MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX / 3,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+
+        let mixed = format!("{}{}", "t".repeat(MAX * 3 / 4), "<span>".repeat(MAX / 8));
+        let html = sanitize_html_bounded(&mixed, MAX);
+        assert!(html.len() <= MAX);
+        assert!(
+            html.len() > MAX - MAX / 16,
+            "kept {} of ~{MAX} that fits",
+            html.len()
+        );
+    }
+
+    /// The plain-text bound is exact: escaping is linear, so the longest
+    /// fitting prefix is found in one pass, never by search.
+    #[test]
+    fn the_plain_text_bound_is_exact() {
+        const MAX: usize = 64 * 1024;
+        let raw = format!("{}{}", "漢".repeat(MAX / 4), "&".repeat(MAX / 10));
+        let out = plain_text_to_html_bounded(&raw, MAX);
+        assert!(out.len() <= MAX);
+        // The next character would not have fitted: '&' escapes to 5 bytes.
+        assert!(out.len() > MAX - 5, "kept {} of {MAX}", out.len());
+        assert!(
+            raw.starts_with(&out.replace("&amp;", "&")),
+            "not a prefix of the input"
+        );
+    }
+
+    #[test]
+    fn an_overlong_rss_guid_becomes_a_stable_short_one() {
+        let long = "g".repeat(10_000);
+        let xml = rss_with_fields("t", "l", "a", "b", &long);
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let a = normalize_entry(&parsed.entries[0]).guid;
+        let b = normalize_entry(&parsed.entries[0]).guid;
+        assert!(a.len() <= MAX_GUID_BYTES, "guid not bounded: {}", a.len());
+        assert_eq!(
+            a, b,
+            "the stand-in is not stable, so the entry would duplicate"
+        );
+        let other = rss_with_fields("t", "l", "a", "b", &format!("{long}h"));
+        let other = feed_rs::parser::parse(other.as_bytes()).unwrap();
+        assert_ne!(
+            a,
+            normalize_entry(&other.entries[0]).guid,
+            "two ids collapsed into one"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_long_article_is_untouched() {
+        // The largest body production held on 2026-10-03 was 86,969 bytes.
+        let body = format!("<p>{}</p>", "word ".repeat(18_000));
+        let xml = rss_with_fields(
+            "A normal title",
+            "post",
+            "Author",
+            &body,
+            "https://example.com/post",
+        );
+        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(e.content_html.unwrap(), sanitize_html(&body));
+        assert_eq!(e.title.as_deref(), Some("A normal title"));
+        assert_eq!(e.guid, "https://example.com/post");
+    }
 
     /// Parse a static RSS sample through feed-rs + our normalize/sanitize path
     /// (no network) and assert the entries come out sanitized and well-shaped.
@@ -2302,6 +2899,33 @@ mod tests {
     /// `at://` — but `feeds.url` is UNIQUE, so accepting both is two rows for
     /// one publication. Recognised (not passed through to the generic checks
     /// as if it were an ordinary URL), then refused for the spelling.
+    /// Since publications are polled, only a URI the storage guard accepts is
+    /// a publication. Any other at-URI is Unsupported, which no poller reads.
+    #[test]
+    fn only_a_storable_publication_uri_is_a_publication() {
+        let did = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
+        let pubn = crate::lexicon::nsid::STANDARD_PUBLICATION;
+        assert_eq!(
+            FeedKind::of(&format!("at://{did}/{pubn}/3lab")),
+            FeedKind::Publication
+        );
+        for unsupported in [
+            format!("at://{did}/app.bsky.feed.post/3lab"),
+            format!("At://{did}/{pubn}/3lab"),
+            format!("at://alice.example.com/{pubn}/3lab"),
+            format!("at://did:plc:short/{pubn}/3lab"),
+        ] {
+            assert_eq!(
+                FeedKind::of(&unsupported),
+                FeedKind::Unsupported,
+                "{unsupported}"
+            );
+        }
+        assert_eq!(FeedKind::of("https://example.com/feed.xml"), FeedKind::Rss);
+        assert!(!FeedKind::POLLABLE.contains(&FeedKind::Unsupported));
+        assert_eq!(FeedKind::parse("unsupported"), Some(FeedKind::Unsupported));
+    }
+
     #[test]
     fn a_non_canonical_at_uri_spelling_is_recognised_and_refused() {
         for odd in [

@@ -9,7 +9,8 @@
 //! ## Poll scheduler ([`run_poller`])
 //!
 //! A single interval loop that, on each tick, asks the store for the feeds
-//! whose `next_poll` is **due** ([`store::due_feeds`]) and polls each with
+//! whose `next_poll` is **due** ([`store::due_feeds_of_kind`], RSS only; standard.site
+//! publications have their own loop, [`run_publication_poller`]) and polls each with
 //! [`feed::poll_feed`] — which already does the conditional GET (`ETag` /
 //! `Last-Modified`) and returns a [`feed::PollOutcome`]. The scheduler owns
 //! **cadence**: `poll_feed` deliberately leaves `next_poll = None`, so after
@@ -127,6 +128,9 @@ const POLLER_STARTUP_DELAY: Duration = Duration::from_secs(30);
 const PENDING_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(45);
 const CODE_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
+/// The standard.site publication poller's first tick (0.4.0). Between the
+/// code sweeper's and the retention sweeper's, so no two loops share a second.
+const PUBLICATION_POLLER_STARTUP_DELAY: Duration = Duration::from_secs(75);
 
 /// Which background loop an offset belongs to.
 ///
@@ -143,6 +147,7 @@ const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Loop {
     Poller,
+    PublicationPoller,
     PendingSweep,
     CodeSweep,
     Retention,
@@ -154,8 +159,9 @@ impl Loop {
     ///
     /// A variant missing from here is never STARTED — a visible absence — rather
     /// than started with the wrong offset, which was silent.
-    const ALL: [Loop; 5] = [
+    const ALL: [Loop; 6] = [
         Loop::Poller,
+        Loop::PublicationPoller,
         Loop::PendingSweep,
         Loop::CodeSweep,
         Loop::Retention,
@@ -187,6 +193,9 @@ impl Loop {
     ) -> tokio::task::JoinHandle<()> {
         match self {
             Loop::Poller => tokio::spawn(run_poller(state, shutdown, startup)),
+            Loop::PublicationPoller => {
+                tokio::spawn(run_publication_poller(state, shutdown, startup))
+            }
             Loop::PendingSweep => tokio::spawn(run_pending_sweeper(state, shutdown, startup)),
             Loop::CodeSweep => tokio::spawn(run_code_sweeper(state, shutdown, startup)),
             Loop::Retention => tokio::spawn(run_retention_sweeper(state, shutdown, startup)),
@@ -199,11 +208,28 @@ impl Loop {
     const fn startup_offset(self) -> Duration {
         match self {
             Loop::Poller => POLLER_STARTUP_DELAY,
+            Loop::PublicationPoller => PUBLICATION_POLLER_STARTUP_DELAY,
             Loop::PendingSweep => PENDING_SWEEP_STARTUP_DELAY,
             Loop::CodeSweep => CODE_SWEEP_STARTUP_DELAY,
             Loop::Retention => RETENTION_STARTUP_DELAY,
             Loop::Adoption => ADOPTION_STARTUP_DELAY,
         }
+    }
+}
+
+/// The loop that polls `kind`, or `None` for a kind nothing polls.
+///
+/// Exhaustive on purpose: in a test build, a new `FeedKind` does not compile
+/// until it is given a loop here or explicitly none, and
+/// `every_pollable_kind_has_a_poller` checks the POLLABLE kinds against that.
+/// **It is a record, not a mechanism**: each loop selects its own kind
+/// directly, and nothing in production reads this map.
+#[cfg(test)]
+const fn poller_for(kind: feed::FeedKind) -> Option<Loop> {
+    match kind {
+        feed::FeedKind::Rss => Some(Loop::Poller),
+        feed::FeedKind::Publication => Some(Loop::PublicationPoller),
+        feed::FeedKind::Unsupported => None,
     }
 }
 
@@ -379,7 +405,7 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
     state.runtime_health.set_schedulers_enabled(true);
 
     info!(
-        "spawning background schedulers (poller + sweepers + adoption probe + read-state flusher)"
+        "spawning background schedulers (RSS poller + publication poller + sweepers + adoption probe + read-state flusher)"
     );
 
     // **Driven off the registry, not five hand-written lines.** Every offset-
@@ -497,20 +523,11 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, star
     }
 }
 
-/// One poll round: select due feeds and poll each, concurrency-bounded and
-/// staggered. Feed-level failures are handled per-feed (rescheduled with the
-/// outcome's backoff); only a store-level failure to *select* propagates.
-async fn poll_due_once(
-    state: &AppState,
-    client: &reqwest::Client,
-    limiter: &Arc<Semaphore>,
-    batch: i64,
-    stagger: Duration,
-    shutdown: &watch::Receiver<()>,
-) -> anyhow::Result<()> {
-    // DB-size watermark: above it, stop pulling NEW content so a small box can't
-    // be filled to a crash by the poller. Reads/serving continue; only fetching
-    // is paused. `<= 0` disables the watermark.
+/// Whether new fetching is paused at the DB-size watermark. Above it, nothing
+/// new is fetched — RSS or publication — so a small box cannot be filled to a
+/// crash by the pollers. Shared by both loops: the publication loop, the bigger
+/// writer, once ran without it (found in review).
+async fn over_watermark(state: &AppState) -> bool {
     let watermark = state.config.db_size_watermark_bytes;
     if watermark > 0 {
         match store::db_size_bytes(&state.db).await {
@@ -537,15 +554,37 @@ async fn poll_due_once(
                 // `polled_last_hour` falling with nothing to say which of the two
                 // causes was responsible. See `runtime_health`.
                 state.runtime_health.set_watermark(true);
-                return Ok(());
+                return true;
             }
             Ok(_) => state.runtime_health.set_watermark(false),
             Err(err) => warn!(%err, "could not read DB size for watermark check; polling anyway"),
         }
     }
+    false
+}
+
+/// One poll round: select due feeds and poll each, concurrency-bounded and
+/// staggered. Feed-level failures are handled per-feed (rescheduled with the
+/// outcome's backoff); only a store-level failure to *select* propagates.
+async fn poll_due_once(
+    state: &AppState,
+    client: &reqwest::Client,
+    limiter: &Arc<Semaphore>,
+    batch: i64,
+    stagger: Duration,
+    shutdown: &watch::Receiver<()>,
+) -> anyhow::Result<()> {
+    // DB-size watermark: above it, stop pulling NEW content so a small box can't
+    // be filled to a crash by the poller. Reads/serving continue; only fetching
+    // is paused. `<= 0` disables the watermark.
+    if over_watermark(state).await {
+        return Ok(());
+    }
 
     let now = now_rfc3339();
-    let due = store::due_feeds(&state.db, &now, batch).await?;
+    // RSS only: publications have their own loop (`run_publication_poller`),
+    // so a slow publication read can never hold this tick.
+    let due = store::due_feeds_of_kind(&state.db, &now, feed::FeedKind::Rss, batch).await?;
     if due.is_empty() {
         debug!("poll scheduler: no feeds due");
         return Ok(());
@@ -573,26 +612,20 @@ async fn poll_due_once(
             abandoned += 1;
             continue;
         }
-        // Acquire a permit *before* launching so at most `concurrency` fetches
-        // are ever in flight; the permit is released when the task ends.
+        let pool = state.db.clone();
+        let client = client.clone();
+        let default_interval = state.config.poll_interval;
+        let config = Arc::clone(&state.config);
+        // Acquire a permit *before* launching so at most `concurrency`
+        // fetches are ever in flight; the permit is released when the task
+        // ends.
         let permit = match Arc::clone(limiter).acquire_owned().await {
             Ok(p) => p,
             Err(_) => break, // semaphore closed — shutting down
         };
-        let pool = state.db.clone();
-        let client = client.clone();
-        let default_interval = state.config.poll_interval;
-        let max_entries_per_feed = state.config.max_entries_per_feed;
         handles.push(tokio::spawn(async move {
             let _permit = permit; // held for the duration of this poll
-            poll_and_reschedule(
-                &pool,
-                &client,
-                &feed,
-                default_interval,
-                max_entries_per_feed,
-            )
-            .await;
+            poll_and_reschedule(&pool, &client, &feed, default_interval, &config).await;
         }));
         // Stagger launches so a batch doesn't fire in one instant.
         if !stagger.is_zero() {
@@ -617,6 +650,186 @@ async fn poll_due_once(
     Ok(())
 }
 
+/// The standard.site publication poller (0.4.0): its own loop, so the RSS
+/// poller's tick never waits on a publication.
+///
+/// **One publication at a time, selected only when it is about to be read.**
+/// An earlier shape ran publications as tasks off the RSS tick: they held the
+/// tick for the sum of their reads, and once detached, a row whose lease ran
+/// out while its task waited was queued again, without bound, and a queued row
+/// was deferred an interval by every deploy (all found in review). Selecting
+/// the next due row only when ready to read it has none of those: nothing waits
+/// in a queue, a row not yet read keeps its `next_poll`, and the read in flight
+/// at shutdown is the only one, bounded by `publication_read_deadline`.
+///
+/// Two things this does NOT do, on purpose: it has no `/health` heartbeat (the
+/// RSS poller's is the one reported, and overdue publications still show in
+/// `/stats`), and its one read runs ALONGSIDE the RSS poller's
+/// `DEFAULT_POLL_CONCURRENCY`, not within it — one more fetch in flight than
+/// before, bounded by the walk budget. (A subscribe from the form also runs one
+/// publication read inline, outside both loops, bounded per request by the
+/// per-IP rate limit on `/subscriptions`.)
+pub async fn run_publication_poller(
+    state: AppState,
+    mut shutdown: watch::Receiver<()>,
+    startup: Duration,
+) {
+    let client = match feed::build_client() {
+        Ok(c) => c,
+        Err(err) => {
+            error!(%err, "publication poller: failed to build HTTP client; it will not run");
+            return;
+        }
+    };
+    // Publications became pollable in 0.4.0, and every row of a newly admitted
+    // kind is due at once. Spread the never-polled ones across one interval so
+    // they arrive as a trickle, not as one pass of N back-to-back reads.
+    match store::stagger_unscheduled(
+        &state.db,
+        feed::FeedKind::Publication,
+        state.config.poll_interval,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(
+            scheduled = n,
+            "staggered the first poll of never-polled publications"
+        ),
+        Err(err) => {
+            warn!(%err, "could not stagger never-polled publications; they will all be due at once")
+        }
+    }
+
+    let tick = env_duration_secs("FEATHERREADER_POLL_TICK_SECS", DEFAULT_POLL_TICK);
+    let mut ticker = delayed_interval(startup, tick);
+    loop {
+        tokio::select! {
+            _ = shutdown_fired(&mut shutdown) => {
+                info!("publication poller: shutdown signal received, stopping");
+                break;
+            }
+            _ = ticker.tick() => {
+                if let Err(err) = poll_publications_once(&state, &client, &shutdown).await {
+                    error!(%err, "publication poller: pass failed");
+                }
+            }
+        }
+    }
+}
+
+/// Read every due publication, one at a time, until none is due or shutdown is
+/// asked for. Each is selected only when it is about to be read, and leased by
+/// `poll_and_reschedule` before its fetch, as every feed is.
+async fn poll_publications_once(
+    state: &AppState,
+    client: &reqwest::Client,
+    shutdown: &watch::Receiver<()>,
+) -> anyhow::Result<()> {
+    poll_publications_with(state, shutdown, |feeds, interval| async move {
+        poll_group_and_reschedule(&state.db, client, &feeds, interval, &state.config).await;
+    })
+    .await
+}
+
+/// The most publications from one repo read together. A group shares one read
+/// and one deadline, so it is bounded; the rest of a big repo's due
+/// publications are read next, in another group.
+const MAX_PUBLICATION_GROUP: usize = 16;
+
+/// [`poll_publications_once`] with the read injected, so the pass's own rules
+/// — which rows next, grouped how, how often, with which interval, when to
+/// stop — are testable without a network, the way `poll_and_reschedule_with`
+/// is.
+async fn poll_publications_with<F, Fut>(
+    state: &AppState,
+    shutdown: &watch::Receiver<()>,
+    mut poll: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Vec<Feed>, Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // **A row is read at most once per pass, and a row that is still due does
+    // not stop the pass.** The next rows are re-selected after every read, and
+    // a row whose next poll could not be written (a full or read-only volume)
+    // stays due at the head of the order. Re-reading it was a tight loop
+    // (thousands of reads a second); returning at it starved every publication
+    // behind it, every pass (both found in review). So the pass skips what it
+    // has read and moves on.
+    let mut read = std::collections::HashSet::new();
+    let repo_of =
+        |f: &Feed| feather_reader::standard_site::AtUri::parse(&f.url).map(|u| u.authority);
+    loop {
+        if shutdown.has_changed().unwrap_or(true) || over_watermark(state).await {
+            return Ok(());
+        }
+        let now = now_rfc3339();
+        let due: Vec<Feed> = store::due_feeds_of_kind(
+            &state.db,
+            &now,
+            feed::FeedKind::Publication,
+            // Past every row already read, so rows that stay due after
+            // their read cannot fill the window (found in review).
+            i64::try_from(read.len() + 1_000).unwrap_or(i64::MAX),
+        )
+        .await?
+        .into_iter()
+        .filter(|f| !read.contains(&f.id))
+        .collect();
+        let Some(head) = due.first() else {
+            return Ok(());
+        };
+        // **Every due publication in the head's repo, read together**: one
+        // walk of that repo's documents instead of one per publication.
+        let repo = repo_of(head);
+        let group: Vec<Feed> = due
+            .iter()
+            .filter(|f| repo.is_some() && repo_of(f) == repo)
+            .take(MAX_PUBLICATION_GROUP)
+            .cloned()
+            .collect();
+        let group = if group.is_empty() {
+            vec![head.clone()]
+        } else {
+            group
+        };
+        read.extend(group.iter().map(|f| f.id));
+        poll(group, state.config.poll_interval).await;
+    }
+}
+
+/// Lease every feed in a one-repo group, read the group once, and settle each
+/// feed with its own outcome — `poll_and_reschedule_with`, for a group.
+async fn poll_group_and_reschedule(
+    pool: &Pool,
+    client: &reqwest::Client,
+    feeds: &[Feed],
+    default_interval: Duration,
+    config: &feather_reader::config::Config,
+) {
+    for f in feeds {
+        if let Err(err) = store::set_next_poll(pool, &f.url, cadence_for(f, default_interval)).await
+        {
+            warn!(feed = %f.url, %err, "failed to lease next_poll before fetching");
+        }
+    }
+    let outcomes = feed::poll_publication_group(pool, client, config, feeds).await;
+    for (f, outcome) in feeds.iter().zip(outcomes) {
+        match outcome {
+            Ok(o) => feed::settle_poll(pool, &f.url, &o, cadence_for(f, default_interval)).await,
+            Err(err) => {
+                error!(feed = %f.url, %err, "polled: store error");
+                if let Err(err) =
+                    store::set_next_poll(pool, &f.url, cadence_for(f, default_interval)).await
+                {
+                    error!(feed = %f.url, %err, "failed to persist next_poll");
+                }
+            }
+        }
+    }
+}
+
 /// Poll one feed and persist its **next** poll time.
 ///
 /// [`feed::poll_feed`] never returns `Err` for a merely-broken feed (only for a
@@ -629,10 +842,13 @@ async fn poll_and_reschedule(
     client: &reqwest::Client,
     feed: &Feed,
     default_interval: Duration,
-    max_entries_per_feed: i64,
+    config: &feather_reader::config::Config,
 ) {
+    // By kind: an RSS feed is fetched over HTTP, a standard.site publication is
+    // read from its author's PDS. One entry point, so the choice lives with
+    // `FeedKind` and not here.
     poll_and_reschedule_with(pool, feed, default_interval, |pool, feed| {
-        feed::poll_feed(pool, client, feed, max_entries_per_feed)
+        feed::poll_feed_by_kind(pool, client, config, feed)
     })
     .await;
 }
@@ -1526,8 +1742,9 @@ mod tests {
     /// The startup offset each loop is documented to run on, spelled out
     /// independently of `Loop::startup_offset`'s match arms so the two have to
     /// agree. Naming the constants here instead would reintroduce the tautology.
-    const DOCUMENTED_OFFSETS: [(Loop, u64); 5] = [
+    const DOCUMENTED_OFFSETS: [(Loop, u64); 6] = [
         (Loop::Poller, 30),
+        (Loop::PublicationPoller, 75),
         (Loop::PendingSweep, 45),
         (Loop::CodeSweep, 60),
         (Loop::Retention, 90),
@@ -1628,6 +1845,355 @@ mod tests {
     fn jitter_never_returns_a_sub_second_period() {
         assert!(jittered(Duration::from_secs(1), "x") >= Duration::from_secs(1));
         assert!(jittered(Duration::from_millis(1), "x") >= Duration::from_secs(1));
+    }
+
+    // ── 0.4.0: publications have their own loop ───────────────────────────
+
+    async fn state_with_due(urls: &[&str]) -> AppState {
+        let state = rust_state().await;
+        for url in urls {
+            store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state
+    }
+
+    const PUB_A: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+    const PUB_B: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lac";
+    /// In ANOTHER repo from PUB_A and PUB_B.
+    const PUB_C: &str = "at://did:plc:anotherrepoaaaaaaaaaaaaa/site.standard.publication/3lad";
+
+    /// The RSS tick never selects a publication: a slow publication read once
+    /// held it, and every RSS feed behind it, for as long as it took.
+    #[tokio::test]
+    async fn the_rss_tick_never_selects_a_publication() {
+        let state = state_with_due(&[PUB_A]).await;
+        let client = feed::build_client().unwrap();
+        let (_tx, shutdown) = watch::channel(());
+        poll_due_once(
+            &state,
+            &client,
+            &Arc::new(Semaphore::new(4)),
+            50,
+            Duration::ZERO,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        let row = store::get_feed_by_url(&state.db, PUB_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.next_poll, None, "the RSS tick touched a publication");
+    }
+
+    /// A pass reads each due publication once and stops: nothing is queued,
+    /// so nothing can be queued twice. (The PLC directory is unreachable, so
+    /// each read fails fast and is rescheduled with backoff.)
+    #[tokio::test]
+    async fn a_publication_pass_reads_each_due_row_once_and_stops() {
+        let mut state = state_with_due(&[PUB_A, PUB_B]).await;
+        let mut config = (*state.config).clone();
+        config.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+        state.config = Arc::new(config);
+        let client = feed::build_client().unwrap();
+        let (_tx, shutdown) = watch::channel(());
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            poll_publications_once(&state, &client, &shutdown),
+        )
+        .await
+        .expect("the pass did not stop")
+        .unwrap();
+        for url in [PUB_A, PUB_B] {
+            let row = store::get_feed_by_url(&state.db, url)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.next_poll.is_some(), "{url} was not read");
+            assert_eq!(row.consecutive_errors, 1, "{url} was read other than once");
+        }
+    }
+
+    /// Once shutdown is asked for, a pass reads nothing more — and a row it did
+    /// not read keeps its `next_poll`, so the next boot reads it at once instead
+    /// of an interval later.
+    #[tokio::test]
+    async fn a_publication_pass_reads_nothing_after_shutdown() {
+        let state = state_with_due(&[PUB_A]).await;
+        let client = feed::build_client().unwrap();
+        let (tx, shutdown) = watch::channel(());
+        tx.send(()).unwrap();
+        poll_publications_once(&state, &client, &shutdown)
+            .await
+            .unwrap();
+        let row = store::get_feed_by_url(&state.db, PUB_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.next_poll, None,
+            "a row the pass never read was deferred"
+        );
+    }
+
+    async fn with_config(
+        mut state: AppState,
+        f: impl FnOnce(&mut feather_reader::config::Config),
+    ) -> AppState {
+        let mut config = (*state.config).clone();
+        f(&mut config);
+        state.config = Arc::new(config);
+        state
+    }
+
+    /// Third review of #225: over the DB-size watermark the RSS poller pauses,
+    /// and the publication loop — the biggest writer — kept reading.
+    #[tokio::test]
+    async fn a_publication_pass_respects_the_watermark() {
+        let state = with_config(state_with_due(&[PUB_A]).await, |c| {
+            c.db_size_watermark_bytes = 1;
+            c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+        })
+        .await;
+        let client = feed::build_client().unwrap();
+        let (_tx, shutdown) = watch::channel(());
+        poll_publications_once(&state, &client, &shutdown)
+            .await
+            .unwrap();
+        let row = store::get_feed_by_url(&state.db, PUB_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.next_poll, None,
+            "a publication was read over the watermark"
+        );
+    }
+
+    /// Fourth review of #225: a row still due after its read made the pass
+    /// return, and it sorts first, so every pass read only it — every other
+    /// publication starved behind it for as long as its writes failed.
+    #[tokio::test]
+    async fn a_stuck_row_does_not_starve_the_rest() {
+        let state = state_with_due(&[PUB_A, PUB_C]).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut seen = Vec::new();
+        // A read that leaves the rows due, as one whose writes fail does.
+        poll_publications_with(&state, &shutdown, |feeds, _| {
+            seen.extend(feeds.iter().map(|f| f.url.clone()));
+            async {}
+        })
+        .await
+        .unwrap();
+        seen.sort();
+        let mut want = vec![PUB_A.to_string(), PUB_C.to_string()];
+        want.sort();
+        assert_eq!(seen, want, "every due row, once each");
+    }
+
+    /// A healthy read is rescheduled one configured interval out. Every other
+    /// loop test fails its read, so only the backoff path ran — a pass handing
+    /// `Duration::ZERO` would re-read every healthy publication every tick.
+    #[tokio::test]
+    async fn a_pass_reschedules_with_the_configured_interval() {
+        let state = with_config(state_with_due(&[PUB_A]).await, |c| {
+            c.poll_interval = Duration::from_secs(1234);
+        })
+        .await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut intervals = Vec::new();
+        poll_publications_with(&state, &shutdown, |feeds, interval| {
+            intervals.push(interval);
+            let db = state.db.clone();
+            async move {
+                for f in feeds {
+                    store::set_next_poll(&db, &f.url, interval).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(intervals, vec![Duration::from_secs(1234)]);
+    }
+
+    /// The watermark is checked before EVERY read, not once per pass: a pass
+    /// can be long, and each read can store a lot.
+    #[tokio::test]
+    async fn the_watermark_is_checked_before_every_read() {
+        // Two REPOS, so two reads: rows of one repo are read together.
+        let state = state_with_due(&[PUB_A, PUB_C]).await;
+        let size = store::db_size_bytes(&state.db).await.unwrap();
+        let state = with_config(state, |c| c.db_size_watermark_bytes = size + 64 * 1024).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut reads = 0;
+        poll_publications_with(&state, &shutdown, |feeds, interval| {
+            reads += 1;
+            let db = state.db.clone();
+            async move {
+                // The first read grows the database past the watermark.
+                sqlx::query("CREATE TABLE IF NOT EXISTS ballast (b BLOB)")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO ballast VALUES (zeroblob(1048576))")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                for f in feeds {
+                    store::set_next_poll(&db, &f.url, interval).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reads, 1, "a second repo was read over the watermark");
+    }
+
+    /// 0.4.0 step 2b: due publications in one repo are read together — one
+    /// walk of its documents — and a publication in another repo separately.
+    #[tokio::test]
+    async fn publications_in_one_repo_are_read_together() {
+        let state = state_with_due(&[PUB_A, PUB_B, PUB_C]).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        poll_publications_with(&state, &shutdown, |feeds, _| {
+            let mut urls: Vec<String> = feeds.iter().map(|f| f.url.clone()).collect();
+            urls.sort();
+            calls.push(urls);
+            async {}
+        })
+        .await
+        .unwrap();
+        calls.sort();
+        let mut want = vec![
+            vec![PUB_A.to_string(), PUB_B.to_string()],
+            vec![PUB_C.to_string()],
+        ];
+        want.sort();
+        assert_eq!(calls, want, "one read per repo");
+    }
+
+    /// Review of #228: the pass selected 1,000 due rows a round, so with more
+    /// than that still due after their reads (failing writes), every row past
+    /// the first 1,000 was skipped for the whole pass.
+    #[tokio::test]
+    async fn more_than_a_thousand_stuck_rows_are_all_read() {
+        // 1,005 publications, each in its own repo (a valid did:plc each).
+        let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz234567".chars().collect();
+        let did = |mut n: usize| {
+            let mut s = String::new();
+            for _ in 0..24 {
+                s.push(alphabet[n % 32]);
+                n /= 32;
+            }
+            format!("did:plc:{s}")
+        };
+        let urls: Vec<String> = (0..1005)
+            .map(|i| format!("at://{}/site.standard.publication/3lab", did(i)))
+            .collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let state = state_with_due(&refs).await;
+        let (_tx, shutdown) = watch::channel(());
+        let mut read = 0usize;
+        // Reads that leave every row due, as failing writes do.
+        poll_publications_with(&state, &shutdown, |feeds, _| {
+            read += feeds.len();
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(read, 1005, "rows past the selection window were skipped");
+    }
+
+    /// The RSS tick pauses at the watermark too. It always did; it had no test
+    /// until the check moved into `over_watermark`, shared with the
+    /// publication loop.
+    #[tokio::test]
+    async fn the_rss_tick_respects_the_watermark() {
+        let rss = "https://rss.example/feed.xml";
+        let state = with_config(state_with_due(&[rss]).await, |c| {
+            c.db_size_watermark_bytes = 1
+        })
+        .await;
+        let client = feed::build_client().unwrap();
+        let (_tx, shutdown) = watch::channel(());
+        poll_due_once(
+            &state,
+            &client,
+            &Arc::new(Semaphore::new(4)),
+            50,
+            Duration::ZERO,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        let row = store::get_feed_by_url(&state.db, rss)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.next_poll, None,
+            "an RSS feed was polled over the watermark"
+        );
+    }
+
+    /// Third review of #225: a row whose next poll cannot be written stays
+    /// due, and the pass re-selected it at once — 11,571 reads in 10 s. A pass
+    /// reads a row at most once, whatever the store does.
+    #[tokio::test]
+    async fn a_pass_never_reads_the_same_row_twice() {
+        let state = with_config(state_with_due(&[PUB_A]).await, |c| {
+            c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+        })
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER no_lease BEFORE UPDATE OF next_poll ON feeds \
+             WHEN NEW.kind = 'publication' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let client = feed::build_client().unwrap();
+        let (_tx, shutdown) = watch::channel(());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            poll_publications_once(&state, &client, &shutdown),
+        )
+        .await
+        .expect("the pass kept re-reading a row it could not reschedule")
+        .unwrap();
+        let row = store::get_feed_by_url(&state.db, PUB_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.consecutive_errors, 1,
+            "read {} times in one pass",
+            row.consecutive_errors
+        );
+    }
+
+    /// Every kind the store calls pollable has a loop that polls it. A kind
+    /// added to `FeedKind::POLLABLE` with no poller would be counted as due and
+    /// overdue by `/stats`, and read by nothing.
+    #[test]
+    fn every_pollable_kind_has_a_poller() {
+        for kind in feed::FeedKind::POLLABLE {
+            let poller = poller_for(*kind);
+            assert!(
+                poller.is_some_and(|l| Loop::ALL.contains(&l)),
+                "{kind:?} has no running poller"
+            );
+        }
+        assert_eq!(poller_for(feed::FeedKind::Unsupported), None);
     }
 
     // ── #117: orphaned dirty read-state ──────────────────────────────────────

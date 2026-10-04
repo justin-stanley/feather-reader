@@ -89,7 +89,7 @@ impl std::fmt::Display for AtUri {
 /// whether an empty result is a quiet blog or a read that gave up, and the
 /// caller has no other way to tell. `fetch` used to drop it on the floor after
 /// logging a warning.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PublicationRead {
     pub publication: Publication,
     pub entries: Vec<Entry>,
@@ -139,7 +139,9 @@ impl From<Entry> for crate::store::NewEntry {
     /// so wiring the reader to the scheduler has nothing left to decide.
     fn from(e: Entry) -> Self {
         crate::store::NewEntry {
-            guid: e.guid,
+            // The document's URI, which the publisher's PDS chose: bounded like
+            // any entry id before it reaches the UNIQUE index (found in review).
+            guid: crate::feed::bound_guid(e.guid),
             url: e.url,
             title: Some(e.title),
             author: None,
@@ -203,8 +205,10 @@ pub fn publication_from_records(
     Some((
         entry.uri.clone(),
         Publication {
-            name: value.name,
-            url,
+            name: value
+                .name
+                .map(|n| crate::feed::bound_text(n, crate::feed::MAX_TITLE_BYTES)),
+            url: crate::feed::bound_text(url, crate::feed::MAX_URL_BYTES),
         },
     ))
 }
@@ -250,7 +254,7 @@ pub fn entries_from_records(
             }
             Some(Entry {
                 guid: record.uri.clone(),
-                title: doc.title,
+                title: crate::feed::bound_text(doc.title, crate::feed::MAX_TITLE_BYTES),
                 // **Three rules, in order: what the publisher credibly said,
                 // then when the record was written, then nothing.**
                 //
@@ -283,13 +287,19 @@ pub fn entries_from_records(
                 // all linking to the site root.
                 url: non_blank(doc.path)
                     .as_deref()
-                    .and_then(|path| join_path(base.as_ref(), path)),
+                    .and_then(|path| join_path(base.as_ref(), path))
+                    .map(|u| crate::feed::bound_text(u, crate::feed::MAX_URL_BYTES)),
                 // `description` first — the authored summary — but only when it
                 // actually says something: a blank one must not shadow the body.
                 // Then ESCAPED, not sanitised: both fields are plain text.
                 summary: non_blank(doc.description)
                     .or_else(|| non_blank(doc.text_content))
-                    .map(|raw| crate::feed::plain_text_to_html(&raw)),
+                    .map(|raw| {
+                        crate::feed::plain_text_to_html_bounded(
+                            &raw,
+                            crate::feed::MAX_CONTENT_HTML_BYTES,
+                        )
+                    }),
             })
         })
         .collect()
@@ -515,8 +525,8 @@ fn join_path(base: Option<&url::Url>, path: &str) -> Option<String> {
 /// closure over the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentFate {
-    /// Belongs to the publication being read.
-    Keep,
+    /// Belongs to the requested publication at this index.
+    Keep(usize),
     /// Belongs to another publication **in this repo** — normal, and the
     /// reason the `site` filter exists. Not a signal of anything.
     Sibling,
@@ -530,11 +540,11 @@ enum DocumentFate {
 
 fn classify_document(
     record: &crate::atproto::RecordEntry,
-    canonical_site: &str,
+    wanted: &std::collections::HashMap<String, usize>,
     known: &std::collections::HashSet<&str>,
 ) -> DocumentFate {
     match serde_json::from_value::<DocumentValue>(record.value.clone()) {
-        Ok(doc) if doc.site == canonical_site => DocumentFate::Keep,
+        Ok(doc) if wanted.contains_key(&doc.site) => DocumentFate::Keep(wanted[&doc.site]),
         Ok(doc) if known.contains(doc.site.as_str()) => DocumentFate::Sibling,
         Ok(_) => DocumentFate::Orphan,
         Err(_) => DocumentFate::Malformed,
@@ -566,60 +576,158 @@ pub async fn fetch(
     plc_directory: &str,
     uri: &AtUri,
 ) -> anyhow::Result<PublicationRead> {
-    use anyhow::Context;
-
     // The collection is part of the identity of what was subscribed to, and
     // this function is `pub`: without the check it lists publications and
     // matches on rkey alone, so `at://did/app.bsky.feed.post/<rkey>` would be
     // "read as a publication" whenever a publication shares that rkey.
-    anyhow::ensure!(
-        uri.collection == nsid::STANDARD_PUBLICATION,
-        "{uri} is not a {} URI",
-        nsid::STANDARD_PUBLICATION
-    );
+    if uri.collection != nsid::STANDARD_PUBLICATION {
+        return Err(
+            NotAPublication(format!("{uri} is not a {} URI", nsid::STANDARD_PUBLICATION)).into(),
+        );
+    }
+    fetch_repo(
+        http,
+        plc_directory,
+        &uri.authority,
+        std::slice::from_ref(&uri.rkey),
+    )
+    .await?
+    .pop()
+    .unwrap_or_else(|| Err(NotAPublication(format!("{uri} was not read")).into()))
+}
 
-    let pds = crate::atproto::resolve_did_to_pds(http, plc_directory, &uri.authority)
+/// **The repo answered, and what it holds is not this publication** — the
+/// record was deleted, never existed, or is unreadable, or the URI names
+/// another collection.
+///
+/// Typed so the poller can tell it from a network failure: filed as `Fetch`,
+/// an author deleting their publication read as their server being down, in
+/// the public cause histogram (found in review).
+#[derive(Debug)]
+pub struct NotAPublication(pub String);
+
+impl std::fmt::Display for NotAPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotAPublication {}
+
+/// Read several publications in ONE repo with one walk of its documents.
+pub async fn fetch_repo(
+    http: &reqwest::Client,
+    plc_directory: &str,
+    did: &str,
+    rkeys: &[String],
+) -> anyhow::Result<Vec<anyhow::Result<PublicationRead>>> {
+    fetch_repo_capped(
+        http,
+        plc_directory,
+        did,
+        rkeys,
+        crate::atproto::MAX_LARGE_RECORDS,
+        crate::atproto::MAX_LIST_BYTES,
+    )
+    .await
+}
+
+/// [`fetch_repo`] with the per-publication document cap passed in, so the
+/// fairness between siblings is testable without 2,000 documents.
+pub(crate) async fn fetch_repo_capped(
+    http: &reqwest::Client,
+    plc_directory: &str,
+    did: &str,
+    requested: &[String],
+    per_site_cap: usize,
+    budget_bytes: usize,
+) -> anyhow::Result<Vec<anyhow::Result<PublicationRead>>> {
+    use anyhow::Context;
+
+    // Nothing asked for, nothing fetched (found in review: an empty request
+    // still resolved the DID and listed the repo).
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Each rkey read once; a repeat gets a copy of its read. Indexing by the
+    // raw list made the first of two equal rkeys an empty, "complete" read.
+    let mut rkeys: Vec<String> = Vec::new();
+    for r in requested {
+        if !rkeys.contains(r) {
+            rkeys.push(r.clone());
+        }
+    }
+    let rkeys = rkeys.as_slice();
+
+    let pds = crate::atproto::resolve_did_to_pds(http, plc_directory, did)
         .await
-        .with_context(|| format!("resolving the PDS for {}", uri.authority))?;
-    let client = crate::atproto::PdsClient::anonymous(http.clone(), pds, uri.authority.clone());
+        .with_context(|| format!("resolving the PDS for {did}"))?;
+    let client = crate::atproto::PdsClient::anonymous(http.clone(), pds, did.to_string());
 
     // **One budget for both walks, because they nest.** The publications are
-    // still held when the documents walk runs — `known` borrows them, and the
-    // `keep` closure captures that — so two independent ceilings let this one
-    // read hold twice the bound the box was sized for. Threading a single budget
-    // makes the limit a property of the read rather than of each walk, and the
-    // borrow checker keeps it that way where a comment would not.
-    let mut budget = crate::atproto::ByteBudget::new(crate::atproto::MAX_LIST_BYTES);
-    let publications = client
-        .list_all_records_within(nsid::STANDARD_PUBLICATION, &mut budget)
+    // still held when the documents walk runs, so two ceilings would let this
+    // read hold twice the bound the box was sized for.
+    let mut budget = crate::atproto::ByteBudget::new(budget_bytes);
+    let (publications, skipped_publications) = client
+        .list_all_records_skipping_within(nsid::STANDARD_PUBLICATION, &mut budget)
         .await
-        .with_context(|| format!("listing publications for {}", uri.authority))?;
-    let (canonical_site, publication) = publication_from_records(&uri.rkey, &publications)
-        .with_context(|| format!("{uri} is not a readable site.standard.publication"))?;
+        .with_context(|| format!("listing publications for {did}"))?;
+    if skipped_publications > 0 {
+        tracing::warn!(
+            repo = %did,
+            skipped = skipped_publications,
+            "skipped malformed publication records in this repo"
+        );
+    }
 
-    // **Filtered inside the walk, so the cap counts THIS publication's
-    // documents.** A repo-wide cap applied before the filter starves a quiet
-    // publication whose busy sibling fills the window — it returns nothing,
-    // permanently, and worse with every post the sibling makes.
-    //
-    // The page is smaller than the protocol default because a document
-    // carries the whole article (~17 KB measured, and the `content` union this
-    // module ignores is still on the wire): 100 long-form articles per page
-    // can exceed `read_capped`'s 8 MB and fail the walk outright.
+    // Each requested publication, if this repo holds it.
+    let wanted: Vec<Option<(String, Publication)>> = rkeys
+        .iter()
+        .map(|rkey| publication_from_records(rkey, &publications))
+        .collect();
+    let index_of: std::collections::HashMap<String, usize> = wanted
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| w.as_ref().map(|(site, _)| (site.clone(), i)))
+        .collect();
+    let not_found = |rkey: &str| {
+        anyhow::Error::new(NotAPublication(format!(
+            "at://{did}/{}/{rkey} is not a readable site.standard.publication",
+            nsid::STANDARD_PUBLICATION
+        )))
+    };
+    if index_of.is_empty() {
+        return Ok(requested.iter().map(|r| Err(not_found(r))).collect());
+    }
+
+    // **One walk of the documents for every requested publication, with a
+    // cap PER publication.** Filtered inside the walk, so each cap counts
+    // that publication's own documents: a shared cap would let a busy
+    // publication fill the window and starve a quiet sibling — permanently,
+    // and worse with every post the busy one makes.
     let known: std::collections::HashSet<&str> =
         publications.iter().map(|p| p.uri.as_str()).collect();
+    let mut kept_per = vec![0usize; rkeys.len()];
+    let mut capped = vec![false; rkeys.len()];
     let mut orphaned = 0usize;
     let documents = client
         .list_recent_matching_within(
             nsid::STANDARD_DOCUMENT,
-            crate::atproto::MAX_LARGE_RECORDS,
+            per_site_cap.saturating_mul(index_of.len()),
             &mut budget,
             DOCUMENT_PAGE_SIZE,
-            // Orphans are counted while WALKING, not over the kept window: a
-            // truncated slice would both miss orphans and stay silent in
-            // exactly the case where the feed went empty structurally.
-            |record| match classify_document(record, &canonical_site, &known) {
-                DocumentFate::Keep => true,
+            |record| match classify_document(record, &index_of, &known) {
+                DocumentFate::Keep(i) if kept_per[i] < per_site_cap => {
+                    kept_per[i] += 1;
+                    true
+                }
+                DocumentFate::Keep(i) => {
+                    capped[i] = true;
+                    false
+                }
+                // Orphans are counted while WALKING: a `site` spelling nothing
+                // in this repo matches looks exactly like an empty publication
+                // otherwise.
                 DocumentFate::Orphan => {
                     orphaned += 1;
                     false
@@ -628,8 +736,60 @@ pub async fn fetch(
             },
         )
         .await
-        .with_context(|| format!("listing documents for {canonical_site}"))?;
-    Ok(read_from(publication, &canonical_site, documents, orphaned))
+        .with_context(|| format!("listing documents for {did}"))?;
+
+    // Split the one walk back into one read per publication.
+    let mut per_site: Vec<Vec<crate::atproto::RecordEntry>> = vec![Vec::new(); rkeys.len()];
+    for record in documents.records {
+        let site = serde_json::from_value::<DocumentValue>(record.value.clone()).map(|d| d.site);
+        if let Some(&i) = site.ok().as_deref().and_then(|s| index_of.get(s)) {
+            per_site[i].push(record);
+        }
+    }
+    let reads: Vec<anyhow::Result<PublicationRead>> = wanted
+        .into_iter()
+        .zip(per_site)
+        .enumerate()
+        .map(|(i, (w, records))| match w {
+            None => Err(not_found(&rkeys[i])),
+            Some((site, publication)) => {
+                let walk = crate::atproto::RecordWalk {
+                    records,
+                    complete: documents.complete && !capped[i],
+                    malformed: documents.malformed,
+                };
+                Ok(read_from(publication, &site, walk, orphaned))
+            }
+        })
+        .collect();
+    // Moved out, not cloned: one copy of every read is the bound the shared
+    // budget was sized for. Only a repeated rkey gets a copy.
+    let mut reads: Vec<Option<anyhow::Result<PublicationRead>>> =
+        reads.into_iter().map(Some).collect();
+    let positions: Vec<usize> = requested
+        .iter()
+        .map(|r| {
+            rkeys
+                .iter()
+                .position(|k| k == r)
+                .expect("every requested rkey is in rkeys")
+        })
+        .collect();
+    Ok(positions
+        .iter()
+        .enumerate()
+        .map(|(n, &u)| {
+            let repeated_later = positions[n + 1..].contains(&u);
+            match (&reads[u], repeated_later) {
+                (Some(Ok(read)), true) => Ok(read.clone()),
+                (Some(Err(_)), _) | (None, _) => Err(not_found(&requested[n])),
+                (Some(Ok(_)), false) => match reads[u].take() {
+                    Some(Ok(read)) => Ok(read),
+                    _ => Err(not_found(&requested[n])),
+                },
+            }
+        })
+        .collect())
 }
 
 /// Assemble a [`PublicationRead`] from a finished walk.
@@ -667,6 +827,16 @@ fn read_from(
     // would call this healthy forever; if the repo HAD documents and none
     // matched, say so, because that is the shape of a bug rather than of a
     // quiet blog.
+    // **Skipped records are said out loud** (#177), for the same reason as
+    // orphans below: a document we could not read looks exactly like one that
+    // was never written.
+    if documents.malformed > 0 {
+        tracing::warn!(
+            site = %canonical_site,
+            skipped = documents.malformed,
+            "skipped malformed document records for this publication"
+        );
+    }
     if orphaned > 0 {
         tracing::warn!(
             site = %canonical_site,
@@ -682,7 +852,7 @@ fn read_from(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::atproto::RecordEntry;
     use serde_json::json;
@@ -704,6 +874,7 @@ mod tests {
             let walk = crate::atproto::RecordWalk {
                 records: Vec::new(),
                 complete,
+                malformed: 0,
             };
             let read = read_from(publication.clone(), "at://d/c/r", walk, 0);
             assert_eq!(
@@ -1255,6 +1426,957 @@ mod tests {
         )
     }
 
+    /// A PLC directory and the author's PDS, both on one loopback port, for a
+    /// repo holding `records` (`(collection, rkey, value)`; an empty rkey serves
+    /// a malformed envelope with no `uri`). Each collection is
+    /// served as one full page carrying a cursor, then an empty page, because a
+    /// real PDS returns a cursor on its final page and the walk must stop on the
+    /// empty one. Returns the PLC base URL and a count of `listRecords` calls.
+    pub(crate) async fn serve_repo(
+        did: &'static str,
+        records: Vec<(&'static str, &'static str, serde_json::Value)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::extract::{Query, Request};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        // Unique per server: the override table is process-wide and tests run
+        // in parallel, so a shared name would let one test reach another's.
+        let (plc_host, pds_host) = (
+            format!("plc-{port}.repo.test"),
+            format!("pds-{port}.repo.test"),
+        );
+        for host in [&plc_host, &pds_host] {
+            crate::net::test_host_override(host, addr);
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let records = Arc::new(records);
+        let app = axum::Router::new().fallback(
+            move |Query(q): Query<HashMap<String, String>>, req: Request| {
+                let records = Arc::clone(&records);
+                let counter = Arc::clone(&counter);
+                async move {
+                    let path = req.uri().path().to_string();
+                    if path == format!("/{did}") {
+                        return axum::Json(json!({
+                            "id": did,
+                            "service": [{
+                                "id": "#atproto_pds",
+                                "type": "AtprotoPersonalDataServer",
+                                "serviceEndpoint": format!("http://{pds_host}:{port}"),
+                            }],
+                        }));
+                    }
+                    assert_eq!(path, "/xrpc/com.atproto.repo.listRecords", "unexpected request");
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let collection = q.get("collection").cloned().unwrap_or_default();
+                    // Pages honour `limit` and an offset cursor, and a cursor
+                    // comes back on the final page too, as a real PDS's does.
+                    let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+                    let offset: usize = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let page: Vec<_> = records
+                        .iter()
+                        .filter(|(c, _, _)| *c == collection)
+                        .skip(offset)
+                        .take(limit)
+                        .map(|(c, rkey, value)| {
+                            // An empty rkey serves the #177 shape: an envelope
+                            // with no `uri`, which no record can be read from.
+                            if rkey.is_empty() {
+                                return json!({ "cid": "bafy", "value": value });
+                            }
+                            json!({ "uri": format!("at://{did}/{c}/{rkey}"), "cid": "bafy", "value": value })
+                        })
+                        .collect();
+                    let next = (offset + page.len()).to_string();
+                    axum::Json(json!({ "records": page, "cursor": next }))
+                }
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{plc_host}:{port}"), hits)
+    }
+
+    /// **The mocked repo reads through the real fetch path.** Pins that
+    /// [`serve_repo`] is a faithful enough PDS for A0 and the polling tests to
+    /// mean something: PLC resolution, both walks, the `site` filter and the
+    /// empty-page stop all run for real.
+    #[tokio::test]
+    async fn fetch_reads_a_publication_from_a_mocked_repo() {
+        const OWN: &str = "did:plc:fetchmock";
+        let site = format!("at://{OWN}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let sibling = format!("at://{OWN}/{}/other", nsid::STANDARD_PUBLICATION);
+        let doc = |site: &str, title: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": "/p", "site": site })
+        };
+        let (plc, hits) = serve_repo(
+            OWN,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "mine",
+                    json!({ "name": "Mine", "url": "https://mine.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "other",
+                    json!({ "name": "Other", "url": "https://other.example" }),
+                ),
+                (nsid::STANDARD_DOCUMENT, "3l2fmaaaaaa2a", doc(&site, "kept")),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2fmaaaaaa2b",
+                    doc(&sibling, "sibling's"),
+                ),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let read = fetch(&client, &plc, &AtUri::parse(&site).unwrap())
+            .await
+            .unwrap();
+        assert!(read.complete, "the walk did not finish");
+        assert_eq!(read.publication.name.as_deref(), Some("Mine"));
+        let titles: Vec<&str> = read.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["kept"],
+            "the site filter let a sibling through"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two collections, each a full page then an empty one"
+        );
+    }
+
+    /// A read that fails — here, a DID whose PLC directory cannot be reached —
+    /// is a poll FAILURE with backoff, never an `Err`: `Err` from the poll seam
+    /// means the local store is broken.
+    #[tokio::test]
+    async fn a_failed_publication_read_is_a_poll_failure() {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        // A VALID DID, so the row is a Publication and the failure is the
+        // network's — an invalid one is Unsupported and fails for another reason.
+        let url = format!(
+            "at://did:plc:unreachableaaaaaaaaaaaaa/{}/x",
+            nsid::STANDARD_PUBLICATION
+        );
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &url)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = "http://plc.nowhere.invalid".into();
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .expect("a source failure surfaced as a store error");
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Failed {
+                    kind: crate::feed::FailureKind::Fetch,
+                    ..
+                }
+            ),
+            "an unreachable publication was not a fetch failure: {outcome:?}"
+        );
+    }
+
+    /// Review of #225: an author who deletes their publication record is not
+    /// an unreachable publisher. Every fetch error used to be filed as
+    /// `Fetch`, putting it in the public histogram's network bucket.
+    #[tokio::test]
+    async fn a_deleted_publication_record_is_not_an_unreachable_publisher() {
+        const GONE: &str = "did:plc:goneaaaaaaaaaaaaaaaaaaaa";
+        let site = format!("at://{GONE}/{}/deleted", nsid::STANDARD_PUBLICATION);
+        // The repo answers, but holds no record with that rkey.
+        let (plc, _) = serve_repo(
+            GONE,
+            vec![(
+                nsid::STANDARD_PUBLICATION,
+                "another",
+                json!({ "name": "Other", "url": "https://o.example" }),
+            )],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Failed {
+                    kind: crate::feed::FailureKind::Parse,
+                    ..
+                }
+            ),
+            "a deleted publication was filed as a network failure: {outcome:?}"
+        );
+    }
+
+    /// A PLC directory and PDS on one port that answer however the test says:
+    /// the PLC lookup with `plc_status` (200 serves a DID document), and every
+    /// `listRecords` with `(status, body)` after `delay` — or, when `endless`,
+    /// a fresh page of one sibling document, forever.
+    async fn serve_answering(
+        did: &'static str,
+        plc_status: u16,
+        pds: (u16, &'static str),
+        delay: std::time::Duration,
+        endless: bool,
+    ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (plc_host, pds_host) = (
+            format!("plc-{port}.answer.test"),
+            format!("pds-{port}.answer.test"),
+        );
+        crate::net::test_host_override(&plc_host, addr);
+        crate::net::test_host_override(&pds_host, addr);
+        let pages = Arc::new(AtomicUsize::new(0));
+        let endpoint = format!("http://{pds_host}:{port}");
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let pages = Arc::clone(&pages);
+            let endpoint = endpoint.clone();
+            async move {
+                use axum::response::IntoResponse;
+                if req.uri().path() == format!("/{did}") {
+                    let status = axum::http::StatusCode::from_u16(plc_status).unwrap();
+                    let doc = json!({ "id": did, "service": [{ "id": "#atproto_pds",
+                        "type": "AtprotoPersonalDataServer", "serviceEndpoint": endpoint }] });
+                    return (status, axum::Json(doc)).into_response();
+                }
+                tokio::time::sleep(delay).await;
+                if endless {
+                    let n = pages.fetch_add(1, Ordering::SeqCst);
+                    let body = json!({ "records": [{
+                        "uri": format!("at://{did}/{}/3lend{n:08}", nsid::STANDARD_DOCUMENT),
+                        "cid": "b",
+                        "value": { "title": "x", "path": "/x", "publishedAt": "2026-07-11T00:00:00Z",
+                                   "site": format!("at://{did}/{}/other", nsid::STANDARD_PUBLICATION) } }],
+                        "cursor": format!("c{n}") });
+                    return axum::Json(body).into_response();
+                }
+                let status = axum::http::StatusCode::from_u16(pds.0).unwrap();
+                (status, [("content-type", "application/json")], pds.1).into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{plc_host}:{port}")
+    }
+
+    async fn poll_publication_at(
+        did: &str,
+        plc: String,
+        deadline: Option<std::time::Duration>,
+    ) -> crate::feed::PollOutcome {
+        let site = format!("at://{did}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        if let Some(d) = deadline {
+            config.publication_read_deadline = d;
+        }
+        let client = crate::feed::build_client().unwrap();
+        crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap()
+    }
+
+    fn kind_of(outcome: &crate::feed::PollOutcome) -> Option<crate::feed::FailureKind> {
+        match outcome {
+            crate::feed::PollOutcome::Failed { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Review of #225: one publication read had no overall deadline — only
+    /// FETCH_TIMEOUT per request x MAX_LIST_PAGES — and the tick waited for it.
+    #[tokio::test]
+    async fn a_publication_read_has_an_overall_deadline() {
+        const DID: &str = "did:plc:slowrepoaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(
+            DID,
+            200,
+            (200, ""),
+            std::time::Duration::from_millis(50),
+            true,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let outcome =
+            poll_publication_at(DID, plc, Some(std::time::Duration::from_millis(300))).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the read ran {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Fetch),
+            "{outcome:?}"
+        );
+    }
+
+    /// Review of #225: answers that ARRIVED were filed as `Fetch` ("the request
+    /// never produced a response"), putting deleted and deactivated accounts in
+    /// the network bucket.
+    #[tokio::test]
+    async fn a_publication_failure_is_filed_under_what_happened() {
+        let zero = std::time::Duration::ZERO;
+        const GONE: &str = "did:plc:tombstonedaaaaaaaaaaaaaa";
+        let plc = serve_answering(GONE, 404, (200, ""), zero, false).await;
+        let outcome = poll_publication_at(GONE, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Status),
+            "PLC 404: {outcome:?}"
+        );
+
+        const NOREPO: &str = "did:plc:norepoaaaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(
+            NOREPO,
+            200,
+            (400, r#"{"error":"RepoNotFound"}"#),
+            zero,
+            false,
+        )
+        .await;
+        let outcome = poll_publication_at(NOREPO, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Status),
+            "RepoNotFound: {outcome:?}"
+        );
+
+        const GARBLED: &str = "did:plc:garbledaaaaaaaaaaaaaaaaa";
+        let plc = serve_answering(GARBLED, 200, (200, r#"{"records":"x"}"#), zero, false).await;
+        let outcome = poll_publication_at(GARBLED, plc, None).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(crate::feed::FailureKind::Parse),
+            "garbled body: {outcome:?}"
+        );
+    }
+
+    /// Two of 17 measured publications had no documents. That is a healthy,
+    /// empty feed — not a failure, and not a reason to back off.
+    #[tokio::test]
+    async fn an_empty_publication_is_a_healthy_poll() {
+        const EMPTY: &str = "did:plc:emptypubaaaaaaaaaaaaaaaa";
+        let site = format!("at://{EMPTY}/{}/quiet", nsid::STANDARD_PUBLICATION);
+        let (plc, _) = serve_repo(
+            EMPTY,
+            vec![(
+                nsid::STANDARD_PUBLICATION,
+                "quiet",
+                json!({ "name": "Quiet", "url": "https://quiet.example" }),
+            )],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &site)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 0 }
+            ),
+            "an empty publication was not a healthy poll: {outcome:?}"
+        );
+    }
+
+    /// **#177 through the real fetch path.** A stranger's repo with one
+    /// malformed publication record and one malformed document, each beside
+    /// good ones: both are skipped, and the publication still reads.
+    #[tokio::test]
+    async fn fetch_skips_malformed_records_beside_good_ones() {
+        const OWN: &str = "did:plc:malformedrepo";
+        let site = format!("at://{OWN}/{}/mine", nsid::STANDARD_PUBLICATION);
+        let doc = |title: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": "/p", "site": site })
+        };
+        let (plc, _) = serve_repo(
+            OWN,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "",
+                    json!({ "name": "Broken", "url": "https://x.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "mine",
+                    json!({ "name": "Mine", "url": "https://mine.example" }),
+                ),
+                (nsid::STANDARD_DOCUMENT, "", doc("unreadable")),
+                (nsid::STANDARD_DOCUMENT, "3l2mfaaaaaa2a", doc("kept")),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let read = fetch(&client, &plc, &AtUri::parse(&site).unwrap())
+            .await
+            .expect("a malformed record stalled a stranger's publication");
+        assert!(read.complete);
+        let titles: Vec<&str> = read.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["kept"]);
+    }
+
+    // ---- 0.4.0 step 2b: one walk per repo ------------------------------------
+
+    const SHARED: &str = "did:plc:sharedrepoaaaaaaaaaaaaaa";
+
+    fn shared_doc(site_rkey: &str, title: &str, at: &str) -> serde_json::Value {
+        json!({ "title": title, "publishedAt": at, "path": format!("/{title}"),
+                "site": format!("at://{SHARED}/{}/{site_rkey}", nsid::STANDARD_PUBLICATION) })
+    }
+
+    /// Cost scales with the repo, not the publication: nine publications in one
+    /// repo were nine full walks of its documents. Two due publications in one
+    /// repo now cost one walk, and each still gets only its own documents.
+    #[tokio::test]
+    async fn two_publications_in_one_repo_cost_one_walk() {
+        let (plc, hits) = serve_repo(
+            SHARED,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "alpha",
+                    json!({ "name": "Alpha", "url": "https://alpha.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "beta",
+                    json!({ "name": "Beta", "url": "https://beta.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2shaaaaaa2a",
+                    shared_doc("alpha", "a1", "2026-07-11T00:00:00Z"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2shaaaaaa2b",
+                    shared_doc("beta", "b1", "2026-07-10T00:00:00Z"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2shaaaaaa2c",
+                    shared_doc("alpha", "a2", "2026-07-09T00:00:00Z"),
+                ),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let reads = fetch_repo(
+            &client,
+            &plc,
+            SHARED,
+            &["alpha".to_string(), "beta".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two collections walked once each (a page then an empty page), not once per publication"
+        );
+        let titles = |r: &anyhow::Result<PublicationRead>| {
+            let mut t: Vec<String> = r
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| e.title.clone())
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(titles(&reads[0]), vec!["a1", "a2"]);
+        assert_eq!(titles(&reads[1]), vec!["b1"]);
+    }
+
+    /// One walk for several publications must not let a busy one fill the
+    /// window and starve a quiet sibling: each publication has its own cap.
+    #[tokio::test]
+    async fn a_busy_publication_does_not_starve_its_quiet_sibling() {
+        let mut records = vec![
+            (
+                nsid::STANDARD_PUBLICATION,
+                "busy",
+                json!({ "name": "Busy", "url": "https://busy.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "quiet",
+                json!({ "name": "Quiet", "url": "https://quiet.example" }),
+            ),
+        ];
+        for (rkey, title) in [
+            ("3l2bsaaaaaa2a", "b1"),
+            ("3l2bsaaaaaa2b", "b2"),
+            ("3l2bsaaaaaa2c", "b3"),
+            ("3l2bsaaaaaa2d", "b4"),
+            ("3l2bsaaaaaa2e", "b5"),
+        ] {
+            records.push((
+                nsid::STANDARD_DOCUMENT,
+                rkey,
+                shared_doc("busy", title, "2026-07-11T00:00:00Z"),
+            ));
+        }
+        records.push((
+            nsid::STANDARD_DOCUMENT,
+            "3l2bsaaaaaa2f",
+            shared_doc("quiet", "q1", "2026-01-01T00:00:00Z"),
+        ));
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let reads = fetch_repo_capped(
+            &client,
+            &plc,
+            SHARED,
+            &["busy".to_string(), "quiet".to_string()],
+            2,
+            crate::atproto::MAX_LIST_BYTES,
+        )
+        .await
+        .unwrap();
+        let busy = reads[0].as_ref().unwrap();
+        let quiet = reads[1].as_ref().unwrap();
+        assert_eq!(
+            busy.entries.len(),
+            2,
+            "the busy publication was not capped at its own cap"
+        );
+        assert!(!busy.complete, "a capped publication was reported complete");
+        assert_eq!(quiet.entries.len(), 1, "the quiet sibling was starved");
+        assert!(quiet.complete);
+    }
+
+    /// **A known limitation, kept as a test.** A one-repo group shares one byte
+    /// budget, so big siblings can spend it and the walk stops before a quiet
+    /// publication's documents. A static per-publication share fixed this and
+    /// broke two worse things (a busy publication beside idle siblings was cut
+    /// to a fraction, and one large document failed its publication every poll),
+    /// so it was removed. Unreachable at measured scale.
+    #[tokio::test]
+    #[ignore = "known limitation: a one-repo group shares one byte budget (#229)"]
+    async fn big_siblings_do_not_spend_a_quiet_publications_share() {
+        let body = "w".repeat(20 * 1024);
+        let mut records = vec![
+            (
+                nsid::STANDARD_PUBLICATION,
+                "big1",
+                json!({ "name": "Big 1", "url": "https://b1.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "big2",
+                json!({ "name": "Big 2", "url": "https://b2.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "quiet",
+                json!({ "name": "Quiet", "url": "https://q.example" }),
+            ),
+        ];
+        for i in 0..200 {
+            let rkey: &'static str = Box::leak(format!("3l2big{i:06}").into_boxed_str());
+            let site = if i % 2 == 0 { "big1" } else { "big2" };
+            let mut doc = shared_doc(site, &format!("d{i}"), "2026-07-11T00:00:00Z");
+            doc["textContent"] = json!(body);
+            records.push((nsid::STANDARD_DOCUMENT, rkey, doc));
+        }
+        records.push((
+            nsid::STANDARD_DOCUMENT,
+            "3l2zzzzzzzzzz",
+            shared_doc("quiet", "q1", "2026-01-01T00:00:00Z"),
+        ));
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let rkeys: Vec<String> = ["big1", "big2", "quiet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let reads = fetch_repo_capped(&client, &plc, SHARED, &rkeys, 2_000, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let quiet = reads[2].as_ref().unwrap();
+        assert_eq!(
+            quiet.entries.len(),
+            1,
+            "the quiet publication was starved of bytes by its siblings"
+        );
+        assert!(
+            !reads[0].as_ref().unwrap().complete,
+            "a publication over its share was reported complete"
+        );
+    }
+
+    /// Second review of #228: a static per-publication byte share cut a busy
+    /// publication beside idle siblings to a fraction of what it reads alone
+    /// (376 of 1,200 at production scale). Grouping must never read a
+    /// publication worse than reading it alone.
+    #[tokio::test]
+    async fn a_busy_publication_beside_idle_siblings_reads_as_it_would_alone() {
+        let body = "w".repeat(20 * 1024);
+        let mut records: Vec<(&'static str, &'static str, serde_json::Value)> = Vec::new();
+        let rkeys: Vec<String> = (0..16).map(|i| format!("p{i:02}")).collect();
+        for r in &rkeys {
+            let r: &'static str = Box::leak(r.clone().into_boxed_str());
+            records.push((
+                nsid::STANDARD_PUBLICATION,
+                r,
+                json!({ "name": r, "url": "https://p.example" }),
+            ));
+        }
+        for i in 0..100 {
+            let rkey: &'static str = Box::leak(format!("3l2bus{i:06}").into_boxed_str());
+            let mut doc = shared_doc("p00", &format!("d{i}"), "2026-07-11T00:00:00Z");
+            doc["textContent"] = json!(body);
+            records.push((nsid::STANDARD_DOCUMENT, rkey, doc));
+        }
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let budget = 4 * 1024 * 1024;
+        let alone = fetch_repo_capped(&client, &plc, SHARED, &rkeys[..1], 2_000, budget)
+            .await
+            .unwrap();
+        let grouped = fetch_repo_capped(&client, &plc, SHARED, &rkeys, 2_000, budget)
+            .await
+            .unwrap();
+        let (a, g) = (alone[0].as_ref().unwrap(), grouped[0].as_ref().unwrap());
+        assert_eq!((a.entries.len(), a.complete), (100, true));
+        assert_eq!(
+            (g.entries.len(), g.complete),
+            (100, true),
+            "grouping read it worse than alone"
+        );
+    }
+
+    /// Second review of #228: one document larger than a static share made its
+    /// publication fail every poll ("stopped before its first document").
+    #[tokio::test]
+    async fn one_large_document_does_not_fail_its_publication_in_a_group() {
+        let mut big = shared_doc("big", "huge", "2026-07-11T00:00:00Z");
+        big["textContent"] = json!("w".repeat(500 * 1024));
+        let records = vec![
+            (
+                nsid::STANDARD_PUBLICATION,
+                "big",
+                json!({ "name": "Big", "url": "https://b.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "other",
+                json!({ "name": "Other", "url": "https://o.example" }),
+            ),
+            (nsid::STANDARD_DOCUMENT, "3l2hugeaaaa2a", big),
+        ];
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let rkeys = vec!["big".to_string(), "other".to_string()];
+        let reads = fetch_repo_capped(&client, &plc, SHARED, &rkeys, 2_000, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            reads[0].as_ref().unwrap().entries.len(),
+            1,
+            "a large document was dropped"
+        );
+    }
+
+    /// Second review of #228: one result per REQUESTED rkey, even when none is
+    /// in the repo and they repeat.
+    #[tokio::test]
+    async fn every_requested_rkey_gets_a_result() {
+        let (plc, _) = serve_repo(
+            SHARED,
+            vec![(
+                nsid::STANDARD_PUBLICATION,
+                "alpha",
+                json!({ "name": "Alpha", "url": "https://alpha.example" }),
+            )],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let reads = fetch_repo(
+            &client,
+            &plc,
+            SHARED,
+            &["nope".to_string(), "nope".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().all(|r| r.is_err()));
+    }
+
+    /// Review of #228: a repeated rkey read as empty-and-complete, and an empty
+    /// request still went to the network.
+    #[tokio::test]
+    async fn repeated_and_empty_requests_are_handled() {
+        let (plc, hits) = serve_repo(
+            SHARED,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "alpha",
+                    json!({ "name": "Alpha", "url": "https://alpha.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2rpaaaaaa2a",
+                    shared_doc("alpha", "a1", "2026-07-11T00:00:00Z"),
+                ),
+            ],
+        )
+        .await;
+        let client = crate::feed::build_client().unwrap();
+        let none = fetch_repo(&client, &plc, SHARED, &[]).await.unwrap();
+        assert!(none.is_empty());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty request reached the network"
+        );
+        let twice = fetch_repo(
+            &client,
+            &plc,
+            SHARED,
+            &["alpha".to_string(), "alpha".to_string()],
+        )
+        .await
+        .unwrap();
+        for read in &twice {
+            assert_eq!(
+                read.as_ref().unwrap().entries.len(),
+                1,
+                "a repeated rkey read as empty"
+            );
+        }
+    }
+
+    /// Review of #228: nothing checked that each publication's documents are
+    /// stored under ITS feed — swapping them passed the whole suite.
+    #[tokio::test]
+    async fn a_group_stores_each_publications_documents_under_its_own_feed() {
+        let (plc, _) = serve_repo(
+            SHARED,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "alpha",
+                    json!({ "name": "Alpha", "url": "https://alpha.example" }),
+                ),
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "beta",
+                    json!({ "name": "Beta", "url": "https://beta.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2grpaaaaa2a",
+                    shared_doc("alpha", "only-alpha", "2026-07-11T00:00:00Z"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2grpaaaaa2b",
+                    shared_doc("beta", "only-beta", "2026-07-10T00:00:00Z"),
+                ),
+            ],
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        let mut feeds = Vec::new();
+        for rkey in ["alpha", "beta"] {
+            let url = format!("at://{SHARED}/{}/{rkey}", nsid::STANDARD_PUBLICATION);
+            crate::store::upsert_feed(
+                &pool,
+                &crate::store::NewFeed {
+                    url: url.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            feeds.push(
+                crate::store::get_feed_by_url(&pool, &url)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        let client = crate::feed::build_client().unwrap();
+        let outcomes = crate::feed::poll_publication_group(&pool, &client, &config, &feeds).await;
+        assert_eq!(outcomes.len(), 2);
+        for (feed, want) in feeds.iter().zip(["only-alpha", "only-beta"]) {
+            let titles: Vec<String> =
+                sqlx::query_scalar("SELECT title FROM entries WHERE feed_id = ?")
+                    .bind(feed.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                titles,
+                vec![want.to_string()],
+                "{} got another publication's documents",
+                feed.url
+            );
+        }
+    }
+
+    /// **A0 — the 0.4.0 acceptance test.** A subscribed publication is due, is
+    /// polled by the standard.site reader, and its documents land as entries.
+    ///
+    /// It starts from the stored row the subscribe form will create; step 3 of
+    /// `design/STANDARD-SITE-0.4.0.md` extends it through the form itself.
+    #[tokio::test]
+    async fn a_publication_subscription_delivers_entries_end_to_end() {
+        const A0: &str = "did:plc:acceptanceaaaaaaaaaaaaaa";
+        let site = format!("at://{A0}/{}/a0pub", nsid::STANDARD_PUBLICATION);
+        let document = |title: &str, path: &str| {
+            json!({ "title": title, "publishedAt": "2026-07-11T00:00:00Z",
+                    "path": path, "site": site, "textContent": "body" })
+        };
+        let (plc, _hits) = serve_repo(
+            A0,
+            vec![
+                (
+                    nsid::STANDARD_PUBLICATION,
+                    "a0pub",
+                    json!({ "name": "A0 Journal", "url": "https://a0.example" }),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2a0aaaaaa2a",
+                    document("First post", "/first"),
+                ),
+                (
+                    nsid::STANDARD_DOCUMENT,
+                    "3l2a0aaaaaa2b",
+                    document("Second post", "/second"),
+                ),
+            ],
+        )
+        .await;
+
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: site.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // The flag gates storing, not reading, so A0 runs with it off.
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // The publication loop's own selection, so A0 tests what runs.
+        let feed =
+            crate::store::due_feeds_of_kind(&pool, &now, crate::feed::FeedKind::Publication, 50)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|f| f.url == site)
+                .expect("the publication is not handed to the publication poller");
+
+        let client = crate::feed::build_client().unwrap();
+        let outcome = crate::feed::poll_feed_by_kind(&pool, &client, &config, &feed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::feed::PollOutcome::Updated { new_entries: 2 }
+            ),
+            "expected two new entries, got {outcome:?}"
+        );
+        let titles: Vec<String> =
+            sqlx::query_scalar("SELECT title FROM entries WHERE feed_id = ? ORDER BY title")
+                .bind(feed.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(titles, vec!["First post", "Second post"]);
+    }
+
     fn canonical(rkey: &str) -> String {
         format!("at://{DID}/{}/{rkey}", nsid::STANDARD_PUBLICATION)
     }
@@ -1374,6 +2496,83 @@ mod tests {
             urls[1], None,
             "a document path that escapes its publication's origin must yield no URL"
         );
+    }
+
+    // ---- #205: a publisher's strings are bounded before they are stored ----
+
+    #[test]
+    fn a_documents_text_fields_are_bounded_before_they_are_stored() {
+        let site = canonical("pub");
+        let big = "x".repeat(8 * 1024 * 1024);
+        let records = vec![
+            publication("pub", "https://scanash.com"),
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                "3l2bigaaaaa2a",
+                json!({ "title": big, "publishedAt": "2026-07-11T00:00:00Z",
+                        "path": format!("/{}", "p".repeat(20_000)), "site": site,
+                        "textContent": "<".repeat(3 * 1024 * 1024) }),
+            ),
+        ];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        let entries = entries_from_records(&site, &publication, &records);
+        let e = &entries[0];
+        assert!(
+            e.title.len() <= crate::feed::MAX_TITLE_BYTES,
+            "title: {}",
+            e.title.len()
+        );
+        let url = e
+            .url
+            .as_ref()
+            .expect("an overlong path is truncated, not dropped");
+        assert!(
+            url.len() <= crate::feed::MAX_URL_BYTES,
+            "url: {}",
+            url.len()
+        );
+        let summary = e.summary.as_ref().unwrap();
+        assert!(
+            summary.len() <= crate::feed::MAX_CONTENT_HTML_BYTES,
+            "the ESCAPED summary is what is stored: {}",
+            summary.len()
+        );
+    }
+
+    /// Review of #224: the document's URI is the entry id, chosen by the
+    /// publisher's PDS, and it went into the same UNIQUE-indexed column the
+    /// RSS path bounds.
+    #[test]
+    fn a_documents_uri_is_bounded_as_an_entry_id() {
+        let site = canonical("pub");
+        let records = vec![
+            publication("pub", "https://scanash.com"),
+            rec(
+                nsid::STANDARD_DOCUMENT,
+                &"k".repeat(100_000),
+                json!({ "title": "t", "publishedAt": "2026-07-11T00:00:00Z",
+                        "path": "/p", "site": site }),
+            ),
+        ];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        let entries = entries_from_records(&site, &publication, &records);
+        let stored: crate::store::NewEntry = entries[0].clone().into();
+        assert!(
+            stored.guid.len() <= crate::feed::MAX_GUID_BYTES,
+            "guid: {}",
+            stored.guid.len()
+        );
+    }
+
+    #[test]
+    fn a_publications_own_name_is_bounded() {
+        let records = vec![rec(
+            nsid::STANDARD_PUBLICATION,
+            "pub",
+            json!({ "name": "n".repeat(100_000), "url": "https://scanash.com" }),
+        )];
+        let (_, publication) = publication_from_records("pub", &records).unwrap();
+        assert!(publication.name.unwrap().len() <= crate::feed::MAX_TITLE_BYTES);
     }
 
     /// 8% of measured documents (37 of 449) carry neither summary field.
@@ -1876,11 +3075,12 @@ mod tests {
         ];
         let known: std::collections::HashSet<&str> = pubs.iter().map(|p| p.uri.as_str()).collect();
         let mine = canonical("a");
-        let fate = |d: &crate::atproto::RecordEntry| classify_document(d, &mine, &known);
+        let wanted: std::collections::HashMap<String, usize> = [(mine.clone(), 0)].into();
+        let fate = |d: &crate::atproto::RecordEntry| classify_document(d, &wanted, &known);
 
         assert_eq!(
             fate(&document("d1", &mine, "Mine", "/1")),
-            DocumentFate::Keep
+            DocumentFate::Keep(0)
         );
         assert_eq!(
             fate(&document("d2", &canonical("b"), "B's", "/2")),
