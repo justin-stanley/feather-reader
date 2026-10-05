@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use feed_rs::model::{Entry as RawEntry, Feed as RawFeed, Text};
+use feed_rs::model::{Entry as RawEntry, Feed as RawFeed, Link as RawLink, Text};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
@@ -1258,7 +1258,7 @@ pub async fn poll_feed(
     };
 
     // --- parse (malformed feed => log + skip, never panic) -------------------
-    let parsed = match feed_rs::parser::parse(&body[..]) {
+    let parsed = match parse_feed(&body[..]) {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(feed = %feed.url, error = %e, "malformed feed; skipping");
@@ -1349,6 +1349,67 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
     (title, site_url)
 }
 
+/// Parse a feed body with feed-rs, generating ids for id-less entries the way
+/// feed-rs 2.4 did.
+///
+/// An entry's id is its dedup key, so how feed-rs fills a missing one is part
+/// of FeatherReader's storage contract. feed-rs 3.0 also puts `<comments>` and
+/// `wfw:commentRss` URLs in `entry.links`, and its default generator hashes the
+/// FIRST link with the title — so an id-less item listing its comments link
+/// before `<link>` got a new id on upgrade, and was stored a second time. This
+/// generator hashes the first link that is not a comments link, which is the
+/// link 2.4 hashed, through the same public 2.4/3.0 function.
+///
+/// With no such link, it returns an empty id rather than feed-rs's fallback (a
+/// random UUID, which made the item a new row on every poll); `normalize_entry`
+/// then derives [`stable_guid`]. `parse` has no base URI, so feed-rs's
+/// uri+title branch was never reached and nothing else is lost.
+///
+/// **A panic inside feed-rs is returned as an error.** feed-rs 3.0 panics on
+/// some hostile-but-plausible input — an author address with a multi-byte
+/// character beside it, e.g. `jose@example.com（José）` (its name/address
+/// splitter slices on a byte that is not a character boundary). Feed bodies are
+/// arbitrary web input, so any such panic is a malformed feed: it takes the
+/// ordinary parse-failure path (logged, `FailureKind::Parse`, backed off) rather
+/// than unwinding out of the poll task, which recorded nothing and left the
+/// feed silently un-polled. Unwinding is safe here: the parser is built and
+/// dropped inside the closure and touches no state of ours.
+fn parse_feed(body: &[u8]) -> Result<RawFeed> {
+    let parsed = std::panic::catch_unwind(|| {
+        feed_rs::parser::Builder::new()
+            .id_generator(entry_id)
+            .build()
+            .parse(body)
+    });
+    match parsed {
+        Ok(result) => Ok(result?),
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            anyhow::bail!("feed parser panicked: {why}")
+        }
+    }
+}
+
+/// The id generator [`parse_feed`] installs; see there.
+fn entry_id(links: &[RawLink], title: &Option<Text>, _uri: Option<&str>) -> String {
+    match links.iter().find(|l| is_primary_link(l)) {
+        Some(link) => feed_rs::parser::generate_id_from_link_and_title(link, title),
+        None => String::new(),
+    }
+}
+
+/// Whether a link is one of the entry's own links rather than a pointer to its
+/// comments (feed-rs 3.0's `<comments>` / `wfw:commentRss`, marked by
+/// `target`). Only these are candidates for the permalink and the id, which is
+/// all feed-rs 2.4 ever put in `entry.links`.
+fn is_primary_link(l: &RawLink) -> bool {
+    l.target.is_none()
+}
+
 /// Turn a parsed [`RawEntry`] into the store's [`NewEntry`], sanitizing HTML.
 ///
 /// Content preference: full `content` body, else `summary`. Whichever is chosen
@@ -1391,11 +1452,14 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
 
 /// The raw best-permalink URL for an entry (no scheme filtering) — used only as
 /// a dedup GUID, never rendered as an href.
+///
+/// Comments links are never candidates (see [`is_primary_link`]).
 fn raw_entry_link(e: &RawEntry) -> Option<String> {
-    e.links
-        .iter()
+    let mut links = e.links.iter().filter(|l| is_primary_link(l));
+    links
+        .clone()
         .find(|l| l.rel.as_deref() == Some("alternate") || l.rel.is_none())
-        .or_else(|| e.links.first())
+        .or_else(|| links.next())
         .map(|l| l.href.clone())
 }
 
@@ -1409,9 +1473,26 @@ fn entry_link(e: &RawEntry) -> Option<String> {
     raw_entry_link(e).and_then(|href| crate::net::safe_link(&href))
 }
 
-/// First author name, if any.
+/// The first author's name, if it has one.
+///
+/// feed-rs 3.0 splits RSS's `address (Name)` into an email and a name, but
+/// keeps the parentheses: `(Name)`. They are stripped here. An author given
+/// only as an address has no name and no byline — the address is not shown.
+/// (feed-rs 2.4 named every RSS `<author>` "author", and an Atom author with no
+/// name "unknown"; those placeholders were stored as bylines.)
+///
+/// The byline is the first author that has a name once stripped: an item may
+/// give `<author>` as a bare address and the name in `<dc:creator>`.
 fn entry_author(e: &RawEntry) -> Option<String> {
-    e.authors.first().map(|p| p.name.clone())
+    e.authors.iter().find_map(|p| {
+        let name = p.name.as_deref()?.trim();
+        let name = [('(', ')'), ('<', '>'), ('[', ']')]
+            .iter()
+            .find_map(|&(open, close)| name.strip_prefix(open)?.strip_suffix(close))
+            .unwrap_or(name)
+            .trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
 }
 
 /// Best CREDIBLE publication time (published, else updated) as an RFC3339
@@ -1434,11 +1515,12 @@ fn entry_author(e: &RawEntry) -> Option<String> {
 /// publication path already follows; see `standard_site::entries_from_records`.
 ///
 /// **Each candidate is judged separately**, so a bogus `<published>` beside a
-/// credible `<updated>` keeps the good date. That helps Atom and only Atom: for
-/// RSS 2 `feed-rs` copies `published` into `updated` when `updated` is absent
-/// (`parser/rss2/mod.rs`), so the second candidate holds the same value and the
-/// fall-through is a no-op. Worth keeping for the format where two independent
-/// dates exist; worth not overstating for the one where they do not.
+/// credible `<updated>` keeps the good date. That helps Atom, and RSS 2 only
+/// when the item carries an `<atom:updated>` (read since feed-rs 3.0):
+/// otherwise `feed-rs` copies `published` into `updated` when `updated` is
+/// absent (`parser/rss2/mod.rs`), so the second candidate holds the same value
+/// and the fall-through is a no-op. Worth keeping where two independent dates
+/// exist; worth not overstating where they do not.
 ///
 /// **The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`], NOT the publication path's
 /// clock-skew grace, and the asymmetry is deliberate.** There, a refused
@@ -1662,9 +1744,21 @@ pub(crate) fn bound_guid(guid: String) -> String {
         return guid;
     }
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = dedup_hasher();
     guid.hash(&mut h);
     format!("featherreader:long-guid:{:016x}", h.finish())
+}
+
+/// The hasher behind the stored dedup keys of [`bound_guid`] and
+/// [`stable_guid`]: SipHash-1-3 with zero keys, from the `siphasher` crate.
+///
+/// **Not `std`'s `DefaultHasher`**, whose algorithm the standard library
+/// documents as unspecified and free to change between Rust releases: a
+/// toolchain bump could re-key every such entry, and each would be stored a
+/// second time. `DefaultHasher` is SipHash-1-3 with zero keys today, so this
+/// produces the values already stored; tests pin them.
+fn dedup_hasher() -> siphasher::sip::SipHasher13 {
+    siphasher::sip::SipHasher13::new_with_keys(0, 0)
 }
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
@@ -1682,9 +1776,13 @@ fn now_rfc3339() -> String {
 /// supply neither an id nor a usable link id. Deterministic so re-fetches dedup.
 fn stable_guid(e: &RawEntry) -> String {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = dedup_hasher();
     e.title.as_ref().map(|t| t.content.as_str()).hash(&mut h);
-    e.links.first().map(|l| l.href.as_str()).hash(&mut h);
+    e.links
+        .iter()
+        .find(|l| is_primary_link(l))
+        .map(|l| l.href.as_str())
+        .hash(&mut h);
     e.summary.as_ref().map(|s| s.content.as_str()).hash(&mut h);
     format!("featherreader:synthetic:{:016x}", h.finish())
 }
@@ -1921,7 +2019,7 @@ mod tests {
     fn an_rss_items_text_fields_are_bounded() {
         let big = "x".repeat(100_000);
         let xml = rss_with_fields(&big, &big, &big, "body", "id-1");
-        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
         let e = normalize_entry(&parsed.entries[0]);
         assert!(e.title.as_ref().unwrap().len() <= MAX_TITLE_BYTES, "title");
         assert!(e.url.as_ref().unwrap().len() <= MAX_URL_BYTES, "url");
@@ -1939,7 +2037,7 @@ mod tests {
         // Long enough to need cutting, with markup straddling the cut.
         let body = format!("<p>{}<b>tail</b></p>", "a".repeat(MAX_CONTENT_HTML_BYTES));
         let xml = rss_with_fields("t", "l", "a", &body, "id-2");
-        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
         let html = normalize_entry(&parsed.entries[0]).content_html.unwrap();
         assert!(
             html.len() <= MAX_CONTENT_HTML_BYTES,
@@ -2078,7 +2176,7 @@ mod tests {
     fn an_overlong_rss_guid_becomes_a_stable_short_one() {
         let long = "g".repeat(10_000);
         let xml = rss_with_fields("t", "l", "a", "b", &long);
-        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
         let a = normalize_entry(&parsed.entries[0]).guid;
         let b = normalize_entry(&parsed.entries[0]).guid;
         assert!(a.len() <= MAX_GUID_BYTES, "guid not bounded: {}", a.len());
@@ -2087,7 +2185,7 @@ mod tests {
             "the stand-in is not stable, so the entry would duplicate"
         );
         let other = rss_with_fields("t", "l", "a", "b", &format!("{long}h"));
-        let other = feed_rs::parser::parse(other.as_bytes()).unwrap();
+        let other = parse_feed(other.as_bytes()).unwrap();
         assert_ne!(
             a,
             normalize_entry(&other.entries[0]).guid,
@@ -2106,7 +2204,7 @@ mod tests {
             &body,
             "https://example.com/post",
         );
-        let parsed = feed_rs::parser::parse(xml.as_bytes()).unwrap();
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
         let e = normalize_entry(&parsed.entries[0]);
         assert_eq!(e.content_html.unwrap(), sanitize_html(&body));
         assert_eq!(e.title.as_deref(), Some("A normal title"));
@@ -2142,7 +2240,7 @@ mod tests {
 <guid>https://clock.example/1</guid>
 <pubDate>Sat, 01 Jan 2999 00:00:00 GMT</pubDate></item>
 </channel></rss>"#;
-        let parsed = feed_rs::parser::parse(future.as_bytes()).expect("should parse");
+        let parsed = parse_feed(future.as_bytes()).expect("should parse");
         // The fixture is only meaningful if feed-rs actually read the date.
         assert!(
             parsed.entries[0].published.is_some(),
@@ -2159,7 +2257,7 @@ mod tests {
         // And the other direction: an ordinary past date must survive, or this
         // would be satisfied by discarding every date.
         let past = future.replace("01 Jan 2999", "01 Jan 2020");
-        let parsed = feed_rs::parser::parse(past.as_bytes()).expect("should parse");
+        let parsed = parse_feed(past.as_bytes()).expect("should parse");
         let e = normalize_entry(&parsed.entries[0]);
         assert!(
             e.published
@@ -2176,7 +2274,7 @@ mod tests {
         // days rather than the publication path's five-minute skew grace.
         let soon = (Utc::now() + chrono::Duration::hours(14)).to_rfc2822();
         let near = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &soon);
-        let parsed = feed_rs::parser::parse(near.as_bytes()).expect("should parse");
+        let parsed = parse_feed(near.as_bytes()).expect("should parse");
         assert!(
             parsed.entries[0].published.is_some(),
             "the mislabelled-date fixture did not parse",
@@ -2191,7 +2289,7 @@ mod tests {
         // And the bound still bounds: a month out is refused.
         let far = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
         let month = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &far);
-        let parsed = feed_rs::parser::parse(month.as_bytes()).expect("should parse");
+        let parsed = parse_feed(month.as_bytes()).expect("should parse");
         let e = normalize_entry(&parsed.entries[0]);
         assert_eq!(
             e.published, None,
@@ -2210,7 +2308,7 @@ mod tests {
 <link href="https://clock.example/2"/>
 <published>2999-01-01T00:00:00Z</published>
 <updated>2020-06-01T00:00:00Z</updated></entry></feed>"#;
-        let parsed = feed_rs::parser::parse(both.as_bytes()).expect("should parse");
+        let parsed = parse_feed(both.as_bytes()).expect("should parse");
         assert!(
             parsed.entries[0].published.is_some() && parsed.entries[0].updated.is_some(),
             "the fixture needs BOTH dates parsed for this case to mean anything",
@@ -2230,7 +2328,7 @@ mod tests {
     /// (no network) and assert the entries come out sanitized and well-shaped.
     #[test]
     fn rss_parses_and_sanitizes() {
-        let parsed = feed_rs::parser::parse(RSS_SAMPLE.as_bytes()).expect("RSS should parse");
+        let parsed = parse_feed(RSS_SAMPLE.as_bytes()).expect("RSS should parse");
         assert_eq!(
             parsed.title.as_ref().map(text_plain).as_deref(),
             Some("Example RSS Feed")
@@ -2272,7 +2370,7 @@ mod tests {
     /// the subscription's `siteUrl`, published to the reader's PDS.
     #[test]
     fn atom_prefers_alternate_over_a_self_link_listed_first() {
-        let parsed = feed_rs::parser::parse(ATOM_SELF_FIRST.as_bytes()).expect("Atom should parse");
+        let parsed = parse_feed(ATOM_SELF_FIRST.as_bytes()).expect("Atom should parse");
         let (title, site) = feed_metadata(&parsed);
         assert_eq!(title.as_deref(), Some("Example Atom Feed"));
         // alternate link preferred over rel="self".
@@ -2281,7 +2379,7 @@ mod tests {
 
     #[test]
     fn atom_parses_and_sanitizes() {
-        let parsed = feed_rs::parser::parse(ATOM_SAMPLE.as_bytes()).expect("Atom should parse");
+        let parsed = parse_feed(ATOM_SAMPLE.as_bytes()).expect("Atom should parse");
         let (title, site) = feed_metadata(&parsed);
         assert_eq!(title.as_deref(), Some("Example Atom Feed"));
         // alternate link preferred over rel="self".
@@ -2488,20 +2586,339 @@ mod tests {
 
     #[test]
     fn synthetic_guid_is_stable_and_dedups() {
-        // An item with neither guid nor link: feed-rs will hash the link (absent)
-        // to a UUID id, but to exercise *our* synthetic fallback we clear the id
-        // on the parsed entry and confirm normalize yields a deterministic guid.
+        // An item with neither guid nor link: `parse_feed` leaves its id empty
+        // (feed-rs's own fallback is a random UUID). Clearing id and links
+        // anyway keeps this a test of *our* synthetic fallback alone.
         let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel>
             <title>t</title>
             <item><title>only a title</title><description>body</description></item>
         </channel></rss>"#;
-        let mut parsed = feed_rs::parser::parse(xml.as_bytes()).expect("parse");
+        let mut parsed = parse_feed(xml.as_bytes()).expect("parse");
         parsed.entries[0].id.clear();
         parsed.entries[0].links.clear();
         let g1 = normalize_entry(&parsed.entries[0]).guid;
         let g2 = normalize_entry(&parsed.entries[0]).guid;
         assert_eq!(g1, g2);
         assert!(g1.starts_with("featherreader:synthetic:"));
+    }
+
+    // ---- feed-rs 3.0: entry identity and links held to their 2.4 values ----
+    //
+    // The guid is the dedup key under `UNIQUE (feed_id, guid)`. If a parser
+    // upgrade changes it, every reader gets every live entry of that feed a
+    // second time. The pinned ids below are what feed-rs 2.4.0 generated for
+    // these exact bytes.
+
+    /// An id-less item with an ordinary link keeps the id 2.4 generated.
+    #[test]
+    fn a_generated_entry_id_is_the_one_feed_rs_2_4_produced() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><item><title>No guid here</title><link>https://n.example/post</link></item></channel></rss>"#;
+        let e = normalize_entry(&parse_feed(xml.as_bytes()).expect("parse").entries[0]);
+        assert_eq!(e.guid, "5813b43a0512aaef2750311bf4d978a");
+        assert_eq!(e.url.as_deref(), Some("https://n.example/post"));
+    }
+
+    /// **feed-rs 3.0 adds `<comments>` and `wfw:commentRss` to `entry.links`.**
+    /// Listed before `<link>`, the comments URL became the entry's permalink,
+    /// and for an id-less item it was hashed into the generated id, so the
+    /// same item got a new guid after the upgrade: a duplicate in every
+    /// reader's list.
+    #[test]
+    fn a_comments_link_listed_first_is_neither_the_permalink_nor_the_id() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:wfw="http://wellformedweb.org/CommentAPI/"><channel><title>c</title><link>https://c.example/</link>
+<item><title>Comments listed first, no guid</title><comments>https://c.example/1#comments</comments><link>https://c.example/1</link><wfw:commentRss>https://c.example/1/feed</wfw:commentRss></item>
+<item><title>Comments first, guid present</title><comments>https://c.example/6#comments</comments><link>https://c.example/6</link><guid>c6</guid></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let e0 = normalize_entry(&parsed.entries[0]);
+        assert_eq!(
+            e0.guid, "cd0017f2746ee934cf45ca0125100796",
+            "the generated id moved, so this item would be stored twice"
+        );
+        assert_eq!(e0.url.as_deref(), Some("https://c.example/1"));
+        let e1 = normalize_entry(&parsed.entries[1]);
+        assert_eq!(e1.guid, "c6");
+        assert_eq!(e1.url.as_deref(), Some("https://c.example/6"));
+    }
+
+    /// The same for Atom, where 3.0 also reads `wfw:commentRss`.
+    #[test]
+    fn an_atom_comment_feed_link_is_neither_the_permalink_nor_the_id() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:wfw="http://wellformedweb.org/CommentAPI/"><title>a</title>
+<entry><title>commentRss before link, no id</title><wfw:commentRss>https://a.example/1/feed</wfw:commentRss><link href="https://a.example/1"/><updated>2020-06-01T00:00:00Z</updated></entry>
+</feed>"#;
+        let e = normalize_entry(&parse_feed(xml.as_bytes()).expect("parse").entries[0]);
+        assert_eq!(e.guid, "5148a3d11836efc42f82a7b25a38383d");
+        assert_eq!(e.url.as_deref(), Some("https://a.example/1"));
+    }
+
+    /// **An item with no guid and no permalink gets a guid that holds still.**
+    /// feed-rs's default generator falls back to a random UUID when an entry
+    /// has no link, so such an item was a new row on every poll (in 2.4 as in
+    /// 3.0). It now falls through to [`stable_guid`]. A comments link is not a
+    /// permalink, so an item carrying only one is in the same position — and
+    /// is not given the comments page as its URL.
+    #[test]
+    fn an_item_without_guid_or_permalink_dedups_across_polls() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+<item><title>only a title</title><description>body</description></item>
+<item><title>Only a comments link</title><comments>https://c.example/2#comments</comments></item>
+</channel></rss>"#;
+        let first = parse_feed(xml.as_bytes()).expect("parse");
+        let second = parse_feed(xml.as_bytes()).expect("parse");
+        for i in 0..2 {
+            let a = normalize_entry(&first.entries[i]);
+            let b = normalize_entry(&second.entries[i]);
+            assert_eq!(
+                a.guid, b.guid,
+                "entry {i}'s guid changed between two parses"
+            );
+            assert!(a.guid.starts_with("featherreader:synthetic:"), "{}", a.guid);
+            assert_eq!(a.url, None, "entry {i}");
+        }
+    }
+
+    /// **The author is the person's name.** feed-rs 2.4 named every RSS
+    /// `<author>` "author" (the element name; the text went to `email`) and an
+    /// Atom author with an empty `<name>` "unknown", and FeatherReader stored
+    /// those words as the byline. 3.0 splits name from address but leaves the
+    /// `(Name)` of the RSS `address (Name)` form in its parentheses.
+    #[test]
+    fn the_author_is_the_name_not_the_element_or_the_address() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>p</title>
+<item><title>a1</title><guid>a1</guid><author>alice@example.com (Alice Example)</author></item>
+<item><title>a2</title><guid>a2</guid><author>bob@example.com</author></item>
+<item><title>a3</title><guid>a3</guid><author>Carol</author></item>
+<item><title>a4</title><guid>a4</guid><dc:creator>Dave &lt;dave@example.com&gt;</dc:creator></item>
+<item><title>a5</title><guid>a5</guid><author>erin@example.com ()</author></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let authors: Vec<Option<String>> = parsed
+            .entries
+            .iter()
+            .map(|e| normalize_entry(e).author)
+            .collect();
+        assert_eq!(
+            authors,
+            vec![
+                Some("Alice Example".to_string()),
+                None,
+                Some("Carol".to_string()),
+                Some("Dave".to_string()),
+                None,
+            ]
+        );
+
+        let atom = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>a</title>
+<entry><id>x1</id><title>t</title><author><name></name></author></entry>
+<entry><id>x2</id><title>t</title><author><name>Bob</name></author></entry>
+</feed>"#;
+        let parsed = parse_feed(atom.as_bytes()).expect("parse");
+        assert_eq!(normalize_entry(&parsed.entries[0]).author, None);
+        assert_eq!(
+            normalize_entry(&parsed.entries[1]).author.as_deref(),
+            Some("Bob")
+        );
+    }
+
+    /// **The byline is the first author that HAS a name.** An item giving
+    /// `<author>` as a bare address and the name in `<dc:creator>` has two
+    /// people, and the first has no name; taking only the first lost the byline.
+    #[test]
+    fn the_byline_is_the_first_author_with_a_name() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>p</title>
+<item><title>b1</title><guid>b1</guid><author>bob@example.com</author><dc:creator>Bob Smith</dc:creator></item>
+<item><title>b2</title><guid>b2</guid><author>erin@example.com ()</author><dc:creator>Erin</dc:creator></item>
+<item><title>b3</title><guid>b3</guid><author>only@example.com</author></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let authors: Vec<Option<String>> = parsed
+            .entries
+            .iter()
+            .map(|e| normalize_entry(e).author)
+            .collect();
+        assert_eq!(
+            authors,
+            vec![
+                Some("Bob Smith".to_string()),
+                Some("Erin".to_string()),
+                None
+            ]
+        );
+    }
+
+    /// Author strings that make feed-rs 3.0 panic: its name/address splitter
+    /// (`parser/util/mod.rs`, `parse_person_name_email`) slices one byte either
+    /// side of the address, which is not a character boundary when a multi-byte
+    /// character touches it.
+    const PANICKING_AUTHORS: [&str; 3] = [
+        "jose@example.com（José）",
+        "«zoe@example.com» Zoë Long Name Here",
+        "Zoë Long Name «zoe@example.com»",
+    ];
+
+    /// Every place feed-rs runs that splitter, as a whole document around `v`.
+    fn documents_with_author(v: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "rss author",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><item><title>x</title><guid>g</guid><author>{v}</author></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss dc:creator",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>t</title><item><title>x</title><guid>g</guid><dc:creator>{v}</dc:creator></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss managingEditor",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><managingEditor>{v}</managingEditor><item><title>x</title><guid>g</guid></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss webMaster",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><webMaster>{v}</webMaster><item><title>x</title><guid>g</guid></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss1 dc:creator",
+                format!(
+                    r#"<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>t</title></channel><item><title>x</title><link>https://e.example/1</link><dc:creator>{v}</dc:creator></item></rdf:RDF>"#
+                ),
+            ),
+            (
+                "json author",
+                format!(
+                    r#"{{"version":"https://jsonfeed.org/version/1.1","title":"t","items":[{{"id":"1","content_text":"x","authors":[{{"name":"{v}"}}]}}]}}"#
+                ),
+            ),
+        ]
+    }
+
+    /// **A parser panic is a parse failure, not a crash.** feed-rs 3.0 panics
+    /// on [`PANICKING_AUTHORS`]. Uncaught, the panic escaped `poll_feed`, killed
+    /// the poll task after the scheduler had already moved `next_poll`, and
+    /// recorded no failure — the feed stopped updating with nothing to say why.
+    #[test]
+    fn a_feed_rs_panic_is_returned_as_an_error() {
+        for v in PANICKING_AUTHORS {
+            for (slot, doc) in documents_with_author(v) {
+                let err = match parse_feed(doc.as_bytes()) {
+                    Ok(_) => {
+                        panic!("{slot} {v:?}: parsed; the fixture no longer reaches the panic")
+                    }
+                    Err(e) => format!("{e:#}"),
+                };
+                assert!(err.contains("panicked"), "{slot} {v:?}: {err}");
+            }
+        }
+        // The same slots with an ASCII neighbour parse normally.
+        for (slot, doc) in documents_with_author("jose@example.com (Jose)") {
+            assert!(parse_feed(doc.as_bytes()).is_ok(), "{slot}");
+        }
+    }
+
+    /// End to end: a poll of a feed that panics the parser reports
+    /// `FailureKind::Parse`, so it is backed off and its `last_error` says why.
+    #[tokio::test]
+    async fn a_poll_of_a_feed_that_panics_the_parser_is_a_parse_failure() {
+        let doc = &documents_with_author(PANICKING_AUTHORS[0])[0].1;
+        let base = crate::net::tests::serve_body(doc.as_bytes().to_vec()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "panicking-author.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let url = format!("http://panicking-author.test:{port}/feed.xml");
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &url)
+            .await
+            .unwrap()
+            .unwrap();
+        let client = build_client().unwrap();
+        let outcome = poll_feed(&pool, &client, &feed, 0)
+            .await
+            .expect("a parser panic surfaced as a store error");
+        match outcome {
+            PollOutcome::Failed {
+                kind: FailureKind::Parse,
+                detail,
+                ..
+            } => assert!(detail.contains("panicked"), "{detail}"),
+            other => panic!("expected a parse failure, got {other:?}"),
+        }
+    }
+
+    // ---- dedup-key hashes are fixed across toolchains -------------------
+    //
+    // `stable_guid` and `bound_guid` are stored dedup keys. They were built on
+    // `std`'s `DefaultHasher`, whose algorithm the standard library documents
+    // as unspecified and subject to change between releases; a toolchain bump
+    // could have re-keyed every such entry and duplicated it. The values below
+    // were produced by that `DefaultHasher` code, so they also prove the
+    // replacement hashes identically today.
+
+    #[test]
+    fn a_synthetic_guid_is_the_value_already_stored() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+<item><title>only a title</title><description>body</description></item>
+<item><description>no title either</description></item>
+<item><title>Tïtle wíth ünïcode</title></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let guids: Vec<String> = parsed
+            .entries
+            .iter()
+            .map(|e| normalize_entry(e).guid)
+            .collect();
+        assert_eq!(
+            guids,
+            vec![
+                "featherreader:synthetic:964034cf9a24b551".to_string(),
+                "featherreader:synthetic:baa7c19198c76b30".into(),
+                "featherreader:synthetic:34b72cc7fa0a59ac".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_guid_is_the_value_already_stored() {
+        let a = bound_guid("g".repeat(MAX_GUID_BYTES + 1));
+        let b = bound_guid(format!(
+            "https://long.example/{}",
+            "ü".repeat(MAX_GUID_BYTES)
+        ));
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            (
+                "featherreader:long-guid:966404db20ef8f05",
+                "featherreader:long-guid:a1d631602455ace4",
+            )
+        );
     }
 
     #[test]
@@ -2515,7 +2932,7 @@ mod tests {
               <guid>evil-1</guid>
             </item>
         </channel></rss>"#;
-        let parsed = feed_rs::parser::parse(xml.as_bytes()).expect("parse");
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
         let e = normalize_entry(&parsed.entries[0]);
         // url is dropped (not a safe http(s) link)…
         assert_eq!(e.url, None);
@@ -2527,7 +2944,7 @@ mod tests {
             <title>t</title>
             <item><title>d</title><link>data:text/html,<script>1</script></link><guid>d1</guid></item>
         </channel></rss>"#;
-        let parsed2 = feed_rs::parser::parse(xml2.as_bytes()).expect("parse");
+        let parsed2 = parse_feed(xml2.as_bytes()).expect("parse");
         let e2 = normalize_entry(&parsed2.entries[0]);
         assert_eq!(e2.url, None);
 
@@ -2536,7 +2953,7 @@ mod tests {
             <title>t</title>
             <item><title>ok</title><link>https://ok.example/post</link><guid>ok1</guid></item>
         </channel></rss>"#;
-        let parsed3 = feed_rs::parser::parse(xml3.as_bytes()).expect("parse");
+        let parsed3 = parse_feed(xml3.as_bytes()).expect("parse");
         let e3 = normalize_entry(&parsed3.entries[0]);
         assert_eq!(e3.url.as_deref(), Some("https://ok.example/post"));
     }
