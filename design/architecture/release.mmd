@@ -1,0 +1,12 @@
+flowchart TB
+    Tag["Push a tag vX.Y.Z"] --> Build
+    subgraph Img["release-image.yml"]
+        Build["Build the candidate image once<br/>(loaded locally, not pushed)"] --> Gate["Upgrade-boot gate — scripts/upgrade-boot.sh<br/>previous release (deploy/upgrade-from) creates and seeds a DB<br/>candidate migrates it and boots to a healthy /health<br/>previous release boots again on the migrated DB"]
+        Gate -->|"pass"| Push["Push that exact image to ghcr.io<br/>tags X.Y.Z, X.Y, sha, latest"]
+        Push --> Attest["Attest SLSA build provenance<br/>bound to the image digest (Sigstore, keyless)"]
+        Attest --> Dispatch["Dispatch release-crate.yml against the tag"]
+    end
+    Gate -->|"fail"| Stop["Nothing pushed, no tag moved, no crate"]
+    Dispatch --> Crate["release-crate.yml<br/>tag must equal the Cargo.toml version<br/>crates.io Trusted Publishing via OIDC, then cargo publish"]
+    Crate --> Crates[("crates.io")]
+    Attest --> Deploy["Manual deploy<br/>resolve the tag to its digest<br/>gh attestation verify, fail-closed<br/>fly deploy by digest<br/>then bump deploy/upgrade-from"]

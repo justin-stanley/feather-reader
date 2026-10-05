@@ -132,27 +132,14 @@ listener reachable off loopback; the Rust app and the optional Node sidecar
 bind `127.0.0.1`. Ports and components are from [`fly.toml`](fly.toml), the
 [`Dockerfile`](Dockerfile) and [`deploy/Caddyfile`](deploy/Caddyfile).
 
-```mermaid
-flowchart LR
-    Browser["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>TLS · proxy · cache<br/>injects X-Origin-Auth"]
-    subgraph Fly["Fly.io — one machine, one container (tini + gosu)"]
-        Caddy["Caddy :8080<br/>origin lock · the only public listener"]
-        App["featherreader (Rust, axum, askama)<br/>127.0.0.1:8082"]
-        Side["Node OAuth sidecar<br/>127.0.0.1:8081<br/>started only on the sidecar backend"]
-        Vol[("/data volume<br/>SQLite cache · OAuth sessions · signing key")]
-        Caddy -->|"everything (and /oauth/* on the rust backend)"| App
-        Caddy -.->|"/oauth/* on the sidecar backend"| Side
-        App --- Vol
-        App -.->|"/internal/* over loopback"| Side
-        Side -.- Vol
-    end
-    CF -->|"X-Origin-Auth"| Caddy
-    App -->|"conditional GET · SSRF-guarded"| Feeds[("RSS / Atom hosts")]
-    App <-->|"OAuth · com.atproto.repo.*"| PDS[("Your PDS")]
-    App -->|"anonymous listRecords"| Pubs[("Publishers' PDSes")]
-    App -->|"did:plc resolution"| PLC[("plc.directory")]
-    Side -.->|"OAuth · repo calls"| PDS
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/runtime-dark.png">
+    <img alt="Request path: browser to Cloudflare (which injects X-Origin-Auth) to Caddy on :8080 in one Fly container, then the Rust app on 127.0.0.1:8082 (and the Node OAuth sidecar on :8081 on the sidecar backend), with a /data volume; outbound to RSS hosts, your PDS, publishers' PDSes and plc.directory." src="design/architecture/runtime-light.png" width="820">
+  </picture>
+</p>
+
+<sub>Source: [`design/architecture/runtime.mmd`](design/architecture/runtime.mmd). Images, not inline Mermaid, so they show on every GitHub surface, the mobile app included.</sub>
 
 Dashed links exist only on `FEATHERREADER_REPO_BACKEND=sidecar`; on `rust` the
 app owns the OAuth flow and the sidecar process is not started (see
@@ -170,28 +157,14 @@ Your PDS is the source of truth; SQLite is a cache that can be deleted and
 rebuilt. Tables are from [`src/store.rs`](src/store.rs); the flush path is
 [`src/readstate.rs`](src/readstate.rs).
 
-```mermaid
-flowchart LR
-    subgraph PDS["Your atproto PDS — the source of truth"]
-        Sub["community.lexicon.rss.subscription<br/>one per feed or publication"]
-        Fol["community.lexicon.rss.folder"]
-        Sav["community.lexicon.rss.saved<br/>one per star"]
-        RS["community.lexicon.rss.readState<br/>one per feed, batched"]
-    end
-    subgraph Cache["FeatherReader's SQLite — a disposable cache"]
-        Feeds[("feeds + entries<br/>shared across readers, deduped by URL")]
-        Ref[("sub_ref<br/>per-DID subscription projection")]
-        State[("entry_state + read_cursor<br/>per-DID working copy, with a dirty bit")]
-    end
-    UI["You: subscribe · folder · star · mark read"] -->|"createRecord · putRecord · deleteRecord"| Sub
-    UI -->|"createRecord · putRecord · deleteRecord"| Fol
-    UI -->|"createRecord · deleteRecord"| Sav
-    UI -->|"local write, marks the cursor dirty"| State
-    Sub -->|"listRecords on each page load, mirrored into"| Ref
-    Ref -->|"scopes every entry read and mutation"| Feeds
-    State -->|"flusher: one applyWrites per DID<br/>~60 s debounce, once more at shutdown"| RS
-    Other["Any other reader that speaks the lexicon"] -.->|"reads the same records"| Sub
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/ownership-dark.png">
+    <img alt="Your PDS holds community.lexicon.rss subscription, folder, saved and readState records; FeatherReader's SQLite is a disposable cache (feeds and entries, the sub_ref projection, entry_state and read_cursor) synced by listRecords on page load and a read-state flusher that sends one applyWrites per DID." src="design/architecture/ownership-light.png" width="820">
+  </picture>
+</p>
+
+<sub>Source: [`design/architecture/ownership.mmd`](design/architecture/ownership.mmd). Images, not inline Mermaid, so they show on every GitHub surface, the mobile app included.</sub>
 
 Subscriptions, folders and stars are written to your PDS as you act. Read
 state is debounced: marking articles read sets a local dirty bit, and the
@@ -211,19 +184,14 @@ every sweep at once; `FEATHERREADER_STARTUP_DELAY_SECS` shortens them for dev
 runs. RSS feeds and publications have separate loops, so a slow publication
 read can never hold up RSS.
 
-```mermaid
-flowchart TB
-    Sched["scheduler::spawn<br/>distinct first-tick offsets per loop"]
-    Sched --> RSS["RSS poller<br/>first tick 30 s · wakes every 60 s"]
-    Sched --> Pub["Publication poller<br/>first tick 75 s · wakes every 60 s"]
-    Sched --> Flush["Read-state flusher<br/>every ~60 s, and at shutdown"]
-    Sched --> Sweeps["Sweepers<br/>pending logins: 45 s, then every 15 min<br/>invite codes: 60 s, then hourly<br/>retention: 90 s, then daily<br/>adoption probe: 5 min, then daily"]
-    RSS -->|"feeds whose next_poll is due: fetchHint or FEATHERREADER_POLL_INTERVAL (1 h)<br/>50 per tick · 4 concurrent · 250 ms stagger"| Get["Conditional GET<br/>ETag / Last-Modified · SSRF guard · backoff on failure"]
-    Get --> Store[("sanitise · size-bound every field · store<br/>newest 2000 per feed")]
-    Pub -->|"due publications, grouped by publisher DID<br/>one repo walk per publisher per pass"| Resolve["Resolve did:plc at plc.directory<br/>vet the PDS endpoint (SSRF guard)"]
-    Resolve --> List["Anonymous listRecords<br/>site.standard.publication, then site.standard.document filtered on site<br/>up to 16 publications per walk · malformed records skipped and counted · 30 s deadline"]
-    List --> Store
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/polling-dark.png">
+    <img alt="scheduler::spawn starts the RSS poller, publication poller, read-state flusher and sweepers at distinct offsets; RSS feeds are fetched by conditional GET, publications by resolving the publisher's DID and an anonymous listRecords walk, and both are size-bounded and stored." src="design/architecture/polling-light.png" width="640">
+  </picture>
+</p>
+
+<sub>Source: [`design/architecture/polling.mmd`](design/architecture/polling.mmd). Images, not inline Mermaid, so they show on every GitHub surface, the mobile app included.</sub>
 
 Retention is the cache's, not yours: read, unstarred entries leave after
 `FEATHERREADER_RETENTION_DAYS` (14), everything after
@@ -406,20 +374,14 @@ after it (rollback). 0.3.9 passed every other check and crash-looped
 production on its first boot; this is the gate that would have stopped it.
 Deployment is deliberately manual, and by digest.
 
-```mermaid
-flowchart TB
-    Tag["Push a tag vX.Y.Z"] --> Build
-    subgraph Img["release-image.yml"]
-        Build["Build the candidate image once<br/>(loaded locally, not pushed)"] --> Gate["Upgrade-boot gate — scripts/upgrade-boot.sh<br/>previous release (deploy/upgrade-from) creates and seeds a DB<br/>candidate migrates it and boots to a healthy /health<br/>previous release boots again on the migrated DB"]
-        Gate -->|"pass"| Push["Push that exact image to ghcr.io<br/>tags X.Y.Z, X.Y, sha, latest"]
-        Push --> Attest["Attest SLSA build provenance<br/>bound to the image digest (Sigstore, keyless)"]
-        Attest --> Dispatch["Dispatch release-crate.yml against the tag"]
-    end
-    Gate -->|"fail"| Stop["Nothing pushed, no tag moved, no crate"]
-    Dispatch --> Crate["release-crate.yml<br/>tag must equal the Cargo.toml version<br/>crates.io Trusted Publishing via OIDC, then cargo publish"]
-    Crate --> Crates[("crates.io")]
-    Attest --> Deploy["Manual deploy<br/>resolve the tag to its digest<br/>gh attestation verify, fail-closed<br/>fly deploy by digest<br/>then bump deploy/upgrade-from"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/architecture/release-dark.png">
+    <img alt="Release pipeline: a tag builds the image once, the upgrade-boot gate runs it against the previous release, then the exact image is pushed and attested and release-crate.yml is dispatched to publish to crates.io; deploy is manual, by verified digest." src="design/architecture/release-light.png" width="520">
+  </picture>
+</p>
+
+<sub>Source: [`design/architecture/release.mmd`](design/architecture/release.mmd). Images, not inline Mermaid, so they show on every GitHub surface, the mobile app included.</sub>
 
 The crate is dispatched rather than triggered by `workflow_run`, because
 crates.io Trusted Publishing refuses that event. `:latest` is published for
