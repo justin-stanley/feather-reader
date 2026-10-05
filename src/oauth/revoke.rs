@@ -360,10 +360,11 @@ pub struct RevokeAllReport {
     /// The server could not be told, with the reason. The local row is deleted
     /// regardless, so these tokens may stay live at the PDS until they expire.
     pub failed: Vec<(String, String)>,
-    /// Subjects found by a RE-LIST after the walk — sessions created or
-    /// rotated back into the store while it ran (a login on the still-serving
-    /// app). Each was then signed out too, and its outcome is in the lists
-    /// above.
+    /// Subjects ABSENT from the first listing and found by a re-list — sessions
+    /// created while the walk ran (a login on the still-serving app). A row
+    /// that was there from the start and merely retried is not one of these.
+    /// Each was signed out too; its outcome is in the lists above, which hold
+    /// ONE final outcome per DID (a later pass overwrites an earlier one).
     pub late: Vec<String>,
 }
 
@@ -410,54 +411,71 @@ where
     S: FnMut(String, i64) -> Fut,
     Fut: std::future::Future<Output = Revocation>,
 {
-    let mut report = RevokeAllReport::default();
+    // The FINAL outcome per DID, in first-seen order: a later pass overwrites
+    // an earlier one, so a DID that failed (left in place) and was then revoked
+    // by the re-list is reported revoked — once — and not also failed.
+    let mut order: Vec<String> = Vec::new();
+    let mut outcomes: std::collections::HashMap<String, Revocation> = Default::default();
+    // DIDs absent from the first listing: these appeared DURING the walk.
+    let mut late: Vec<String> = Vec::new();
+
     let mut subs = super::store::list_session_subs(pool).await?;
+    let initial: std::collections::HashSet<String> = subs.iter().cloned().collect();
     // The first walk, then up to RE_LIST_PASSES more over whatever is stored
     // AFTER it: sessions created (a login on the still-serving app) or left in
     // place (one that kept rotating) while the walk ran. Defence in depth — the
     // refresh no longer resurrects a deleted row, but a login legitimately
     // creates one.
     for pass in 0..=RE_LIST_PASSES {
-        let mut failed_this_pass = Vec::new();
         for sub in subs {
-            if pass > 0 && !report.late.contains(&sub) {
-                report.late.push(sub.clone());
+            if !outcomes.contains_key(&sub) {
+                order.push(sub.clone());
+                if !initial.contains(&sub) {
+                    late.push(sub.clone());
+                }
             }
             // Read the clock PER SESSION. `now` becomes the client assertion's
             // `iat`, and an assertion lives only 60 s: one timestamp taken at
             // the start would be expired for every session reached after the
             // first minute, so those revocations would all be rejected.
             let now = clock();
-            match sign_out(sub.clone(), now).await {
-                Revocation::Revoked => report.revoked.push(sub),
-                Revocation::NoSession => report.no_session.push(sub),
-                Revocation::Failed(reason) => {
-                    failed_this_pass.push(sub.clone());
-                    report.failed.push((sub, reason));
-                }
-            }
+            let outcome = sign_out(sub.clone(), now).await;
+            outcomes.insert(sub, outcome);
         }
         subs = super::store::list_session_subs(pool).await?;
         if subs.is_empty() {
-            return Ok(report);
+            break;
         }
         if pass == RE_LIST_PASSES {
-            // Out of passes and the store is still not empty. Say so for each
-            // DID not already reported failed in this pass: these sessions are
-            // still on record, and possibly live.
+            // Out of passes and the store is still not empty: these sessions
+            // are still on record, and possibly live, whatever the last
+            // attempt said. A failure keeps its own reason.
             for sub in subs {
-                if !failed_this_pass.contains(&sub) {
-                    report.failed.push((
-                        sub,
-                        format!(
-                            "still stored after {} passes (a login or refresh keeps \
-                             re-creating it); not signed out",
-                            RE_LIST_PASSES + 1
-                        ),
+                if !outcomes.contains_key(&sub) {
+                    order.push(sub.clone());
+                }
+                let entry = outcomes.entry(sub).or_insert(Revocation::NoSession);
+                if !matches!(entry, Revocation::Failed(_)) {
+                    *entry = Revocation::Failed(format!(
+                        "still stored after {} passes (a login or refresh keeps \
+                         re-creating it); not signed out",
+                        RE_LIST_PASSES + 1
                     ));
                 }
             }
             break;
+        }
+    }
+
+    let mut report = RevokeAllReport {
+        late,
+        ..RevokeAllReport::default()
+    };
+    for sub in order {
+        match outcomes.remove(&sub) {
+            Some(Revocation::Revoked) => report.revoked.push(sub),
+            Some(Revocation::NoSession) | None => report.no_session.push(sub),
+            Some(Revocation::Failed(reason)) => report.failed.push((sub, reason)),
         }
     }
     Ok(report)
@@ -1424,6 +1442,141 @@ mod tests {
             .find(|(sub, _)| sub == SUBS[0])
             .expect("a session still stored after every pass was not reported");
         assert!(still.1.contains("still stored"), "{}", still.1);
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "one entry per DID: {:?}",
+            report.failed
+        );
+        assert!(
+            report.revoked.is_empty(),
+            "a DID still stored at the end was ALSO reported revoked: {:?}",
+            report.revoked
+        );
+        assert!(
+            report.late.is_empty(),
+            "a row present from the start is not one that appeared during the walk"
+        );
+    }
+
+    /// **The report is the FINAL outcome per DID.** A session that fails in
+    /// the first pass (left in place — it kept rotating) and is revoked by the
+    /// re-list is revoked: reporting it as failed too made the run exit 3 and
+    /// warn that its tokens "may stay live" when they had been revoked. And a
+    /// row there from the start is not "late".
+    #[tokio::test]
+    async fn a_did_that_fails_then_succeeds_is_reported_revoked_only() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                async move {
+                    let n = {
+                        let mut c = calls.lock().unwrap();
+                        c.push(sub.clone());
+                        c.len()
+                    };
+                    if n == 1 {
+                        // Kept rotating: left in place, reported failed.
+                        return Revocation::Failed("kept changing".into());
+                    }
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(report.revoked, vec![SUBS[0].to_string()]);
+        assert!(
+            report.failed.is_empty(),
+            "a DID revoked by the re-list is still reported failed: {:?}",
+            report.failed
+        );
+        assert!(
+            report.late.is_empty(),
+            "mislabelled as late: {:?}",
+            report.late
+        );
+    }
+
+    /// **One failure does not end the first walk.** Each failing session here
+    /// is still deleted (as a real sign-out does), so a walk that stopped at
+    /// the first failure and left the rest to the re-list would get through
+    /// only three of four sessions before running out of passes — and report
+    /// the fourth "still stored", never attempted.
+    #[tokio::test]
+    async fn every_session_is_attempted_in_the_first_walk_despite_failures() {
+        let (pool, _) = db().await;
+        let subs = [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "did:plc:cccccccccccccccccccccccc",
+            "did:plc:dddddddddddddddddddddddd",
+        ];
+        for sub in subs {
+            insert_raw(&pool, sub).await;
+        }
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let pool = pool.clone();
+                async move {
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Failed("the PDS said no".into())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.failed.len(), 4, "{:?}", report.failed);
+        assert!(
+            report
+                .failed
+                .iter()
+                .all(|(_, reason)| reason == "the PDS said no"),
+            "a session was never attempted: {:?}",
+            report.failed
+        );
+    }
+
+    /// A DID that fails in every pass is ONE failed entry, with the last
+    /// reason — not one per pass.
+    #[tokio::test]
+    async fn a_did_that_fails_every_pass_is_one_failed_entry() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |_, _| async { Revocation::Failed("kept changing".into()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "the same DID was counted once per pass: {:?}",
+            report.failed
+        );
+        assert_eq!(report.failed[0].0, SUBS[0]);
+        assert!(report.revoked.is_empty() && report.late.is_empty());
     }
 
     /// A row that disappears mid-sign-out (a concurrent `/logout`) is not an

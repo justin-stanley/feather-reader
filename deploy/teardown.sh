@@ -26,9 +26,12 @@
 #      itself (src/web.rs). PDSes cache those for only 600 s, so revoking after
 #      the stop would fail at most PDSes and leave those tokens live.
 #   3. stop the services   — nothing writes mid-wipe, and no new logins.
-#   4. rust revoke (sweep) — catches sessions created between 2 and 3. Usually
-#      a no-op; a session found here may fail to revoke (metadata now offline),
-#      but its row is still deleted and the failure reported.
+#   4. rust revoke (sweep) — catches sessions created between 2 and 3. Runs
+#      ONLY if FEATHERREADER_DB still holds Rust sessions (counted directly
+#      with sqlite3), and with FR_SWEEP_CMD if set: the services are stopped
+#      now, so a wrapper that needs them (docker compose exec) cannot run it.
+#      A session found here may fail to revoke (metadata now offline), but its
+#      row is still deleted and the failure reported.
 #   5. wipe.
 # Each Rust pass must end with the binary's summary line
 # (`revoke-all-sessions: revoked=N no_session=M failed=K`) and exit 0 (all
@@ -68,6 +71,12 @@
 #                             (exit 2, nothing deleted) unless it is the
 #                             production client: confidential, a real encryption
 #                             key, and the existing signing key.
+#   FR_SWEEP_CMD="..."        the post-stop sweep's command, if FR_REVOKE_CMD
+#                             needs the running service. Default: FR_REVOKE_CMD.
+#                             For Docker: FR_REVOKE_CMD='docker compose exec -T
+#                             featherreader featherreader --revoke-all-sessions'
+#                             and FR_SWEEP_CMD='docker compose run --rm -T
+#                             featherreader featherreader --revoke-all-sessions'.
 #   FR_TEARDOWN_YES=1         skip the interactive confirmation
 #   FR_STOP_CMD="..."         command to stop the services before the wipe
 #                             (e.g. "systemctl stop featherreader oauth-sidecar")
@@ -145,11 +154,12 @@ fi
 # is not this command at all — an older featherreader ignores the unknown flag,
 # tries to start a server and exits 1 when the port is taken, and a wrapper
 # (docker compose exec, ssh) fails with 1 too.
+#   $1 the pass ("main pass" / "sweep"), $2 the command to run.
 rust_revoke() {
-  echo "==> Revoking all Rust-backend sessions ($1): $revoke_cmd"
+  echo "==> Revoking all Rust-backend sessions ($1): $2"
   local rc=0 out last failed
   out="$(mktemp "${TMPDIR:-/tmp}/fr-revoke.XXXXXX")"
-  eval "$revoke_cmd" >"$out" || rc=$?
+  eval "$2" >"$out" || rc=$?
   cat "$out"
   # `tr -d '\r'`: a TTY wrapper (docker compose exec from a terminal, ssh -t,
   # fly ssh console) turns every \n into \r\n, and a trailing \r would make the
@@ -175,9 +185,26 @@ rust_revoke() {
     else
       echo "       Is the binary older than this script, or did a wrapper fail?" >&2
     fi
+    if [ "$1" = "sweep" ] && [ -z "${FR_SWEEP_CMD:-}" ]; then
+      echo "       The sweep runs AFTER the stop, so a command that needs the" >&2
+      echo "       running service (docker compose exec, fly ssh console) cannot" >&2
+      echo "       work here. Set FR_SWEEP_CMD to one that runs without it, e.g." >&2
+      echo "       FR_SWEEP_CMD='docker compose run --rm featherreader featherreader --revoke-all-sessions'" >&2
+      echo "       — the services are stopped; re-running the teardown is safe." >&2
+    fi
     echo "       ABORTING before the wipe; see deploy/teardown.md." >&2
     exit 2
   fi
+}
+
+# Rust session rows left in FEATHERREADER_DB, read directly — no service
+# needed. "unknown" if it cannot be read (the sweep then runs, to be safe).
+count_rust_rows() {
+  if [ ! -f "$FEATHERREADER_DB" ]; then
+    echo 0
+    return
+  fi
+  sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;' 2>/dev/null || echo unknown
 }
 
 # 1. Revoke every sidecar DID at its PDS (needs the sidecar still running).
@@ -204,7 +231,7 @@ if [ "$sidecar_step" = 1 ]; then
 fi
 
 # 2. Rust revoke, main pass — while the app still serves its client metadata.
-if [ "$rust_step" = 1 ]; then rust_revoke "main pass"; fi
+if [ "$rust_step" = 1 ]; then rust_revoke "main pass" "$revoke_cmd"; fi
 
 # 3. Stop the services so nothing writes mid-wipe.
 if [ -n "${FR_STOP_CMD:-}" ]; then
@@ -215,7 +242,19 @@ else
 fi
 
 # 4. Rust revoke, sweep — sessions created between the main pass and the stop.
-if [ "$rust_step" = 1 ]; then rust_revoke "sweep"; fi
+#    Only if any are left: counted straight from the file, because the usual
+#    main-pass command (`docker compose exec`, `fly ssh console`) needs the
+#    service this step runs after stopping. A teardown whose main pass emptied
+#    the store must not be wedged by a sweep that cannot start.
+if [ "$rust_step" = 1 ]; then
+  left="$(count_rust_rows)"
+  if [ "$left" = 0 ]; then
+    echo "==> No Rust sessions left after the stop — sweep skipped."
+  else
+    echo "==> $left Rust session(s) left after the stop — sweeping."
+    rust_revoke "sweep" "${FR_SWEEP_CMD:-$revoke_cmd}"
+  fi
+fi
 
 # 5. Clean WAL flush + delete the volumes and the signing keys.
 echo "==> Wiping SQLite volumes with a clean WAL checkpoint…"

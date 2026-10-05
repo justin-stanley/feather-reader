@@ -175,7 +175,9 @@ The script runs, in order:
 1. The sidecar revoke.
 2. The Rust revoke (main pass), while the app is still serving.
 3. `FR_STOP_CMD`.
-4. The Rust revoke again (sweep).
+4. The Rust revoke again (sweep), **only if** `FEATHERREADER_DB` still holds
+   Rust sessions. The script counts them directly with `sqlite3`, so this step
+   needs no running service. The sweep uses `FR_SWEEP_CMD` when it is set.
 5. The wipe: both SQLite volumes with a clean WAL checkpoint, the sidecar JWK,
    and the Rust signing key.
 
@@ -191,6 +193,18 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
         FEATHERREADER_OAUTH_KEY_PATH=/var/lib/featherreader/oauth-signing-key.json \
         FR_REVOKE_CMD='set -a; . /etc/featherreader/env; set +a; /usr/local/bin/featherreader --revoke-all-sessions' \
         FR_STOP_CMD="systemctl stop featherreader" \
+        deploy/teardown.sh
+
+# rust backend in Docker Compose (data on the host at /srv/featherreader/data).
+# The main pass runs INSIDE the running container (`exec`); the sweep runs
+# after the stop, when there is no container to exec into, so it uses a
+# one-off container from the same image and env (`run --rm`). `-T`: no TTY.
+sudo -E FEATHERREADER_DB=/srv/featherreader/data/featherreader.db \
+        FEATHERREADER_REPO_BACKEND=rust \
+        FEATHERREADER_OAUTH_KEY_PATH=/srv/featherreader/data/oauth-signing-key.json \
+        FR_REVOKE_CMD='docker compose exec -T featherreader featherreader --revoke-all-sessions' \
+        FR_SWEEP_CMD='docker compose run --rm -T featherreader featherreader --revoke-all-sessions' \
+        FR_STOP_CMD="docker compose stop featherreader" \
         deploy/teardown.sh
 
 # sidecar backend: as before, plus FR_REVOKE_CMD if FEATHERREADER_DB holds any
@@ -216,6 +230,17 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
     holds Rust sessions. Merely having it available is not enough; otherwise
     the binary would refuse with "no database" and block a teardown with
     nothing Rust to revoke.
+- **`FR_SWEEP_CMD`** is the post-stop sweep's command and defaults to
+  `FR_REVOKE_CMD`.
+  - Set it whenever `FR_REVOKE_CMD` needs the running service
+    (`docker compose exec`): after the stop, that command fails.
+  - The sweep runs only if Rust sessions are left, so with nothing left a
+    failing wrapper is never invoked.
+  - If sessions *are* left and the sweep fails, the script aborts before the
+    wipe and names `FR_SWEEP_CMD`. The services are already stopped then, so
+    re-running the teardown with it set is safe.
+  - In the paths above, `FEATHERREADER_DB` and `FEATHERREADER_OAUTH_KEY_PATH`
+    are **host** paths: the script counts rows and wipes files from the host.
 - **The script refuses** (exit 2, before anything irreversible) when the
   backend is `rust`, or `FEATHERREADER_DB` holds Rust sessions, and there is no
   revoke command.
@@ -293,9 +318,12 @@ step 2; it should report `0 revoked`.
    sudo systemctl stop featherreader oauth-sidecar   # or: docker compose stop …
    ```
 
-4. **Sweep**: run `featherreader --revoke-all-sessions` once more, for any
-   session created between step 2 and the stop. It normally reports
-   `0 revoked`.
+4. **Sweep** if anything is left. Check
+   `sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;'`.
+   If the count is not 0, run `featherreader --revoke-all-sessions` once more
+   for the sessions created between step 2 and the stop. Run it without the
+   stopped service: the binary directly, or `docker compose run --rm …`, not
+   `exec`.
 
 5. **Clean WAL flush, then delete both SQLite volumes and the signing keys.** A `wal_checkpoint(TRUNCATE)`
    folds the write-ahead log back into the main file so a snapshot/backup taken

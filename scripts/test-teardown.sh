@@ -64,10 +64,14 @@ done
 echo "sidecar-revoke \$body" >>"$LOG"
 EOF
   # The Rust revoke. Successive calls take successive lines of $T/revoke-exits
-  # (the last repeats), each "CODE SENTINEL":
+  # (the last repeats), each "CODE SENTINEL [EOL [del]]":
   #   CODE      the exit code;
   #   SENTINEL  `-` print none (an older binary, a failing wrapper), or `fN`
-  #             print the real binary's last line with failed=N.
+  #             print the real binary's last line with failed=N;
+  #   EOL       `lf` (default) or `crlf`;
+  #   del       delete every Rust session row, as the real binary does. Without
+  #             it the rows stay — as if a login landed in the gap — so the
+  #             post-stop sweep has something to do.
   # It records whether the app DB was still there and which FEATHERREADER_DB it
   # was handed, so the test can prove it ran before the wipe on the right file.
   cat >"$T/bin/revoke-stub" <<EOF
@@ -75,7 +79,10 @@ EOF
 n=\$(grep -c '^rust-revoke' "$LOG")
 line=\$(sed -n "\$((n + 1))p" "$T/revoke-exits" 2>/dev/null)
 [ -n "\$line" ] || line=\$(tail -n 1 "$T/revoke-exits" 2>/dev/null)
-read -r code sentinel eol <<<"\$line"
+read -r code sentinel eol del <<<"\$line"
+if [ "\${del:-}" = del ]; then
+  "$SQLITE3" "\$FEATHERREADER_DB" 'DELETE FROM oauth_session;'
+fi
 # eol=crlf: what a TTY wrapper (docker compose exec, ssh -t, fly ssh console)
 # makes of every newline.
 end='\n'; [ "\${eol:-}" = crlf ] && end='\r\n'
@@ -205,6 +212,43 @@ run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "exits non-zero" '[ "$CODE" != 0 ]'
 check "the app DB and key are still present" '[ -f "$APP_DB" ] && [ -f "$KEY" ]'
+teardown_sandbox
+
+# The sweep runs AFTER the stop. A revoke command that needs the running
+# service (`docker compose exec`) then fails with no sentinel. That must not
+# wedge a teardown whose main pass already emptied the store.
+echo "== wrapper sweep fails after the stop, but no Rust rows remain: sweep skipped, wipes"
+setup; sidecar_env
+printf '0 f0 lf del\n1 -\n' >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits 0" '[ "$CODE" = 0 ]'
+check "order is sidecar-revoke rust-revoke stop (got: $(order))" \
+      '[ "$(order)" = "sidecar-revoke rust-revoke stop" ]'
+check "says the sweep was skipped" 'grep -qi "sweep skipped" <<<"$OUT"'
+check "every file is wiped" 'none_present'
+teardown_sandbox
+
+echo "== wrapper sweep fails after the stop with Rust rows left: abort, hint FR_SWEEP_CMD"
+setup; sidecar_env
+printf '0 f0\n1 -\n' >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits non-zero" '[ "$CODE" != 0 ]'
+check "the app DB and key are still present" '[ -f "$APP_DB" ] && [ -f "$KEY" ]'
+check "the message names FR_SWEEP_CMD" 'grep -q "FR_SWEEP_CMD" <<<"$OUT"'
+teardown_sandbox
+
+echo "== FR_SWEEP_CMD, when set, runs the sweep instead of FR_REVOKE_CMD"
+setup; sidecar_env
+printf '0 f0\n0 f0\n' >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub" \
+    FR_SWEEP_CMD="echo sweep-cmd >>'$LOG'; $T/bin/revoke-stub"
+check "exits 0" '[ "$CODE" = 0 ]'
+check "order is sidecar-revoke rust-revoke stop sweep-cmd rust-revoke (got: $(order))" \
+      '[ "$(order)" = "sidecar-revoke rust-revoke stop sweep-cmd rust-revoke" ]'
+check "every file is wiped" 'none_present'
 teardown_sandbox
 
 echo "== CRLF output from a TTY wrapper, exit 0 + sentinel: proceeds"

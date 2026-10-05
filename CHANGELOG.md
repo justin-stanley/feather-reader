@@ -63,6 +63,11 @@ deploying is separate.
   **Teardown order.** The script runs: the sidecar revoke, then the Rust
   revoke **while the app still serves**, then the stop, then a Rust sweep,
   then the wipe. The wipe now also removes `FEATHERREADER_OAUTH_KEY_PATH`.
+  The sweep runs only if `FEATHERREADER_DB` still holds Rust sessions, counted
+  directly with `sqlite3`. It uses `FR_SWEEP_CMD` when set. A main-pass
+  command that needs the running service (`docker compose exec`) cannot run
+  after the stop, and used to abort every container teardown at this step;
+  for Docker the sweep is `docker compose run --rm`.
   The main pass runs before the stop for a measured reason. A PDS
   authenticates a confidential client before revoking
   (`@atproto/oauth-provider` 0.23.1, `revoke()` → `authenticateClient`),
@@ -103,14 +108,16 @@ deploying is separate.
 
   As defence in depth, `revoke_all` lists the store again after its walk and
   walks anything new, up to 2 extra passes. Anything still stored after that
-  is reported as failed.
+  is reported as failed. The report holds one **final** outcome per DID, so a
+  DID that failed and was then revoked by the re-list is reported revoked.
+  `late` lists only DIDs absent from the first listing.
 
-  **Tests.** New `scripts/test-teardown.sh`, 64 assertions, runs the real
+  **Tests.** New `scripts/test-teardown.sh`, 74 assertions, runs the real
   script against throwaway SQLite files with stub commands. It is wired into
   CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
   of the first 30 failed. Each later round's cases failed first against the
   script before that round's fix: the sentinel cases (17), the sidecar-backend
-  cases (6) and the CRLF cases (5).
+  cases (6), the CRLF cases (5) and the post-stop sweep cases (6).
 
   Tests against a real-TLS fake authorization server cover:
 
@@ -122,11 +129,13 @@ deploying is separate.
 
   Injected-hook tests cover a rotation between read and delete, a row that
   keeps rotating, a row deleted concurrently, sessions created during the
-  walk, and the bounded re-list. Main-binary tests cover the dev-client,
+  walk, the bounded re-list, and one final outcome per DID (fail then succeed
+  is revoked only; failing every pass is one entry). Main-binary tests cover
+  the dev-client,
   Null-codec and keyless refusals.
 
-  Each new guard was broken on its own and a test failed every time (42 of
-  42).
+  Each new guard was broken on its own and a test failed every time (48 of
+  48).
   `deploy/teardown.md` gains the procedure, including Fly's.
 
 ### Docs
