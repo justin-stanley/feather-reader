@@ -400,6 +400,145 @@ pub async fn revoke_all(
     .await
 }
 
+/// Whether `runtime` is the production client — the only one that can revoke
+/// production's sessions. The first check [`preflight`] makes.
+///
+/// An incomplete environment does not fail to build a runtime; it builds the
+/// WRONG one. Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to
+/// localhost, which is not production-like, so the production checks
+/// (encryption key included) never run and the runtime comes up as atproto's
+/// public dev client — possibly with the pass-through `Null` codec. Revoking
+/// with that sends every token under the wrong `client_id` or fails to decrypt
+/// every row, and each sign-out deletes its row anyway. So a run that will
+/// touch stored sessions requires all three: the confidential client (a
+/// non-loopback public URL), a real encryption codec, and the loaded key.
+///
+/// The `Null` codec needs its own check: it "decrypts" a ciphertext by
+/// returning it unchanged, so the decrypt pre-flight would count production's
+/// encrypted rows as readable.
+pub fn fit_to_revoke(runtime: &super::runtime::OauthRuntime) -> Result<()> {
+    let mut missing = Vec::new();
+    if runtime.auth_method != AuthMethod::PrivateKeyJwt {
+        missing.push(
+            "the confidential client (FEATHERREADER_PUBLIC_URL is loopback or unset, so this \
+             would revoke as the public dev client)",
+        );
+    }
+    if matches!(runtime.codec, super::crypto::Codec::Null) {
+        missing.push("an encryption key (FEATHERREADER_OAUTH_ENCRYPTION_KEY is unset)");
+    }
+    if runtime.client_key.is_none() {
+        missing.push("the signing key (FEATHERREADER_OAUTH_KEY_PATH)");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "not the production OAuth client — missing {}. Run this inside the app's own \
+             environment",
+            missing.join("; ")
+        )
+    }
+}
+
+/// Prove, BEFORE anything is signed out, that this process holds the
+/// production client's real secrets — not merely a codec and a key file.
+///
+/// Every sign-out deletes its row whatever the PDS says, so a run with the
+/// wrong secrets does not fail safe: it deletes every row unrevoked.
+///
+/// * **The encryption key.** A wrong or rotated
+///   `FEATHERREADER_OAUTH_ENCRYPTION_KEY` decrypts nothing. If there are rows
+///   and NONE decrypts, refuse. (Some readable and some not is a real store
+///   with some unreadable rows; those cannot be revoked by anyone, and are
+///   reported as failed by the walk.)
+/// * **The signing key.** A relative `FEATHERREADER_OAUTH_KEY_PATH` run from
+///   the wrong directory can load SOME key — one no PDS has. Its public half
+///   must be in the JWKS the app actually serves at `jwks_url`. A mismatch
+///   always refuses. A JWKS that cannot be fetched refuses too, except on the
+///   post-stop `sweep`, where the app is stopped and cannot serve it.
+///
+/// With no sessions stored there is nothing to protect, and no check (or
+/// network request) is made.
+pub async fn preflight(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    jwks_url: &str,
+    sweep: bool,
+) -> Result<()> {
+    let subs = super::store::list_session_subs(pool).await?;
+    if subs.is_empty() {
+        return Ok(());
+    }
+
+    // The client: confidential, a real codec, a loaded key.
+    fit_to_revoke(runtime)?;
+
+    // The encryption key: at least one row must decrypt.
+    let mut readable = 0usize;
+    for sub in &subs {
+        if matches!(
+            super::store::get_session(pool, &runtime.codec, sub).await,
+            Ok(Some(_))
+        ) {
+            readable += 1;
+        }
+    }
+    if readable == 0 {
+        anyhow::bail!(
+            "none of the {} stored session(s) decrypts with this \
+             FEATHERREADER_OAUTH_ENCRYPTION_KEY — it is not the key the app wrote them \
+             with (wrong, or rotated). Signing out would delete every row unrevoked",
+            subs.len()
+        );
+    }
+
+    // The signing key: its public half must be what the app serves.
+    let key = runtime
+        .client_key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no client signing key is loaded"))?;
+    let ours = key.thumbprint()?;
+    let served = match super::fetch::get_json(http, jwks_url, super::fetch::JSON).await {
+        Ok(doc) => doc,
+        Err(err) if sweep => {
+            tracing::warn!(
+                %err,
+                "sweep: the app's JWKS is unreachable (expected once the app is stopped); \
+                 the signing key was checked on the main pass"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err.context(format!(
+                "could not fetch the app's JWKS at {jwks_url} to confirm the signing key. \
+                 The main pass runs while the app is serving, so this should be reachable; \
+                 refusing rather than signing with a key no PDS may know"
+            )));
+        }
+    };
+    let matches = served
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|jwk| {
+            jwk.get("kid").and_then(serde_json::Value::as_str) == Some(key.kid())
+                && super::keys::SigningKey::public_thumbprint_of(&jwk.to_string()).ok()
+                    == Some(ours.clone())
+        });
+    if !matches {
+        anyhow::bail!(
+            "the loaded signing key (FEATHERREADER_OAUTH_KEY_PATH, kid {:?}) is not the key \
+             the app serves at {jwks_url}. Every client assertion would be rejected and every \
+             row deleted unrevoked. Point FEATHERREADER_OAUTH_KEY_PATH at the app's own key",
+            key.kid()
+        );
+    }
+    Ok(())
+}
+
 /// [`revoke_all`] with the per-session sign-out injected, so sessions that
 /// appear DURING the walk can be simulated.
 async fn revoke_all_with<S, Fut>(
@@ -1601,5 +1740,195 @@ mod tests {
         .await;
         assert_eq!(outcome, Revocation::Revoked);
         assert_eq!(seen.lock().unwrap().len(), 1, "retried a row that was gone");
+    }
+
+    // ── the pre-flight: the secrets are the production ones ──────────────────
+
+    /// A JWKS server over real TLS serving `doc` at `/oauth/jwks.json` (or
+    /// nothing, when `doc` is `None`). Returns the URL to check.
+    async fn jwks_server(doc: Option<String>) -> String {
+        let (addr, _log) = crate::net::spawn_tls(move |_| {
+            let mut r = std::collections::HashMap::new();
+            if let Some(doc) = doc {
+                r.insert(
+                    "/oauth/jwks.json".to_string(),
+                    vec![crate::net::TestResponse::json(200, doc)],
+                );
+            }
+            r
+        })
+        .await;
+        crate::net::test_host_override("pds-e2e.test", addr);
+        format!("https://pds-e2e.test:{}/oauth/jwks.json", addr.port())
+    }
+
+    async fn pool_with_readable_session(codec_key: &str) -> sqlx::SqlitePool {
+        let (pool, _) = db().await;
+        let codec = super::super::crypto::Codec::new(Some(codec_key)).unwrap();
+        stored(&pool, &codec).await;
+        pool
+    }
+
+    /// **A wrong (or rotated) encryption key is refused before anything is
+    /// signed out.** It decrypts nothing, so every sign-out would hit an
+    /// unreadable row — and delete it. The run "completed", the teardown
+    /// wiped, and every token was dropped unrevoked.
+    #[tokio::test]
+    async fn a_wrong_encryption_key_is_refused_by_the_preflight() {
+        let rt = confidential_runtime("wrongenc");
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let pool = pool_with_readable_session(other).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+
+        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
+            .await
+            .expect_err("a key that decrypts nothing was accepted");
+        assert!(format!("{err:#}").contains("ENCRYPTION_KEY"), "{err:#}");
+        assert_eq!(
+            session_rows(&pool).await,
+            1,
+            "the preflight deleted something"
+        );
+    }
+
+    /// Some rows readable and some not is a real store with a few unreadable
+    /// rows (which the walk reports as failed) — not a wrong key.
+    #[tokio::test]
+    async fn some_unreadable_rows_do_not_fail_the_preflight() {
+        let rt = confidential_runtime("someunread");
+        let pool = pool_with_readable_session(KEY).await;
+        insert_raw(&pool, SUBS[1]).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+        preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
+            .await
+            .expect("one readable row proves the key");
+    }
+
+    /// The loaded signing key must be the one the app SERVES. A different
+    /// key — a relative key path resolved in the wrong directory — signs
+    /// assertions no PDS can verify, and every row would be deleted unrevoked.
+    /// Refused on the sweep too: a fetched mismatch is never "expected".
+    #[tokio::test]
+    async fn a_signing_key_the_app_does_not_serve_is_refused() {
+        let rt = confidential_runtime("wrongsig");
+        let pool = pool_with_readable_session(KEY).await;
+        let stranger = super::super::keys::SigningKey::generate(super::super::runtime::CLIENT_KID);
+        let url = jwks_server(Some(stranger.jwks_document().unwrap().to_string())).await;
+
+        for sweep in [false, true] {
+            let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, sweep)
+                .await
+                .expect_err("a signing key the PDSes have never seen was accepted");
+            assert!(format!("{err:#}").contains("not the key"), "{err:#}");
+        }
+        assert_eq!(session_rows(&pool).await, 1);
+    }
+
+    /// The matching key passes.
+    #[tokio::test]
+    async fn the_served_signing_key_passes_the_preflight() {
+        let rt = confidential_runtime("rightsig");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+        preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
+            .await
+            .expect("the served key was refused");
+    }
+
+    /// An unreachable JWKS refuses the main pass (the app is meant to be up)
+    /// but not the post-stop sweep (it is meant to be down).
+    #[tokio::test]
+    async fn an_unreachable_jwks_refuses_the_main_pass_but_not_the_sweep() {
+        let rt = confidential_runtime("nojwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = jwks_server(None).await;
+
+        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
+            .await
+            .expect_err("an unverifiable signing key was accepted on the main pass");
+        assert!(format!("{err:#}").contains("could not fetch"), "{err:#}");
+        preflight(&rt, &reqwest::Client::new(), &pool, &url, true)
+            .await
+            .expect("the sweep cannot reach a stopped app's JWKS, and must not need to");
+    }
+
+    /// **The `Null` codec is refused even though everything else passes.** It
+    /// "decrypts" by returning the stored value unchanged, so every row looks
+    /// readable to the decrypt check; the served key matches. Only the fitness
+    /// check stands between it and revoking with ciphertext for tokens.
+    #[tokio::test]
+    async fn a_null_codec_runtime_is_refused_even_when_the_rest_passes() {
+        let rt = super::super::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: None,
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-revoke-test-key-{}-nullcodec.json",
+                    std::process::id()
+                )),
+                plc_directory: "https://plc.invalid".to_string(),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .unwrap();
+        assert!(matches!(rt.codec, super::super::crypto::Codec::Null));
+        let (pool, _) = db().await;
+        stored(&pool, &rt.codec).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+
+        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
+            .await
+            .expect_err("the Null codec was accepted");
+        assert!(format!("{err:#}").contains("encryption key"), "{err:#}");
+    }
+
+    /// With nothing stored there is nothing to protect: no check, no request.
+    #[tokio::test]
+    async fn an_empty_store_needs_no_preflight() {
+        let rt = confidential_runtime("emptypre");
+        let (pool, _) = db().await;
+        preflight(
+            &rt,
+            &reqwest::Client::new(),
+            &pool,
+            "https://unreachable.invalid/oauth/jwks.json",
+            false,
+        )
+        .await
+        .expect("an empty store was refused");
     }
 }

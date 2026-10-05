@@ -69,7 +69,9 @@ deadline-bounded.
   up: the newest tokens are left on record and the DID is reported as failed.
 - **No resurrection.** The app's own refresh no longer writes back a session
   that was signed out while it ran. It revokes the tokens it just obtained
-  instead.
+  instead. It does the same when another writer (a re-login) replaced the row
+  meanwhile: theirs is kept, and our unstored tokens from the old grant are
+  revoked.
 - **Re-list.** After the walk, the store is listed again. Sessions that
   appeared meanwhile (a login on the still-serving app) are walked too, for up
   to two extra passes. Anything still stored after that is reported as failed.
@@ -97,11 +99,25 @@ What makes it exit `2`:
 - a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH` (it will not create one);
 - the Rust OAuth client cannot be built while sessions are stored;
 - the client is not the production one while sessions are stored: a loopback
-  or unset public URL, no encryption key, or no signing key.
+  or unset public URL, no encryption key, or no signing key;
+- **the encryption key is the wrong one**: rows are stored and *none* of them
+  decrypts. Some readable and some not passes; the unreadable ones are
+  reported as failed;
+- **the signing key is not the one the app serves**: its public half is not in
+  `{FEATHERREADER_PUBLIC_URL}/oauth/jwks.json`;
+- **that JWKS could not be fetched**, on the main pass only. The app is meant
+  to be up then. The post-stop sweep (`--revoke-all-sessions --sweep`, which
+  `teardown.sh` passes) tolerates an unreachable JWKS, but still refuses a key
+  it fetches and that does not match.
 
-The last three only stop it when sessions are stored. A missing key matters
-because a freshly created key is one no PDS can verify: every revocation would
-fail, and the rows would be deleted anyway.
+All but the first three only stop it when sessions are stored, and all of
+them are checked **before the first sign-out**, so nothing is deleted.
+
+The checks are about *which* secrets the command holds, not just *whether* it
+holds them. With the wrong secrets, every sign-out "works": the revocation
+fails, the row is deleted anyway, and the run used to exit 3 and let the
+teardown wipe. A freshly created signing key is the same problem: no PDS can
+verify it.
 
 Partial failure is `3` rather than `1` because `1` is what everything else
 exits with. That includes an **older `featherreader`** (0.4.4 or earlier),
@@ -232,6 +248,9 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
     nothing Rust to revoke.
 - **`FR_SWEEP_CMD`** is the post-stop sweep's command and defaults to
   `FR_REVOKE_CMD`.
+  - The script **appends ` --sweep`** to it, so it must end with the
+    `featherreader --revoke-all-sessions` invocation. `--sweep` lets the
+    stopped app's JWKS be unreachable; a mismatched key still refuses.
   - Set it whenever `FR_REVOKE_CMD` needs the running service
     (`docker compose exec`): after the stop, that command fails.
   - The sweep runs only if Rust sessions are left, so with nothing left a
@@ -320,10 +339,10 @@ step 2; it should report `0 revoked`.
 
 4. **Sweep** if anything is left. Check
    `sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;'`.
-   If the count is not 0, run `featherreader --revoke-all-sessions` once more
-   for the sessions created between step 2 and the stop. Run it without the
-   stopped service: the binary directly, or `docker compose run --rm …`, not
-   `exec`.
+   If the count is not 0, run `featherreader --revoke-all-sessions --sweep`
+   once more for the sessions created between step 2 and the stop. Run it
+   without the stopped service: the binary directly, or
+   `docker compose run --rm …`, not `exec`.
 
 5. **Clean WAL flush, then delete both SQLite volumes and the signing keys.** A `wal_checkpoint(TRUNCATE)`
    folds the write-ahead log back into the main file so a snapshot/backup taken

@@ -157,6 +157,26 @@ teardown_sandbox
 # On the sidecar backend a revoke command being AVAILABLE is not a reason to
 # run it: with no app DB (or no Rust sessions in it) the binary would refuse
 # with 2 ("no database") and abort a teardown that has nothing Rust to revoke.
+# An app DB sqlite3 cannot read (corrupt, locked, wrong permissions) is NOT "no
+# Rust sessions": reading it as 0 skipped the Rust step on the sidecar backend
+# and wiped whatever tokens it held unrevoked.
+echo "== sidecar backend, unreadable app DB, no revoke command: refuse"
+setup; sidecar_env
+echo "not a sqlite database" >"$APP_DB"
+run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FR_STOP_CMD="echo stop >>'$LOG'"
+check "exits non-zero" '[ "$CODE" != 0 ]'
+check "every file is still present" 'all_present'
+check "nothing was revoked or stopped (log: $(order))" '[ ! -s "$LOG" ]'
+teardown_sandbox
+
+echo "== sidecar backend, unreadable app DB, revoke command available: rust step runs"
+setup; sidecar_env
+echo "not a sqlite database" >"$APP_DB"
+run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "the rust revoke ran (got: $(order))" 'grep -q "^rust-revoke" "$LOG"'
+teardown_sandbox
+
 for variant in "no app DB" "app DB without Rust sessions"; do
   echo "== sidecar backend, revoke command available, $variant: rust step skipped"
   setup; sidecar_env
@@ -320,8 +340,12 @@ EOF
 chmod +x "$T/bin/featherreader"
 run FEATHERREADER_REPO_BACKEND=rust FR_STOP_CMD="echo stop >>'$LOG'"
 check "exits 0" '[ "$CODE" = 0 ]'
-check "ran featherreader --revoke-all-sessions twice" \
-      '[ "$(grep -c "args=--revoke-all-sessions\$" "$LOG")" = 2 ]'
+check "the main pass ran featherreader --revoke-all-sessions" \
+      '[ "$(grep -c "args=--revoke-all-sessions\$" "$LOG")" = 1 ]'
+# The sweep runs after the stop, when the app's /oauth/jwks.json cannot be
+# reached; --sweep tells the binary that is expected (a MISMATCH still refuses).
+check "the sweep ran it with --sweep" \
+      '[ "$(grep -c "args=--revoke-all-sessions --sweep\$" "$LOG")" = 1 ]'
 teardown_sandbox
 
 echo

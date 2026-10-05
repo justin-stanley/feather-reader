@@ -70,13 +70,17 @@
 #                             variables here. With sessions stored it refuses
 #                             (exit 2, nothing deleted) unless it is the
 #                             production client: confidential, a real encryption
-#                             key, and the existing signing key.
+#                             key that DECRYPTS the stored rows, and the signing
+#                             key the app SERVES at /oauth/jwks.json.
 #   FR_SWEEP_CMD="..."        the post-stop sweep's command, if FR_REVOKE_CMD
 #                             needs the running service. Default: FR_REVOKE_CMD.
 #                             For Docker: FR_REVOKE_CMD='docker compose exec -T
 #                             featherreader featherreader --revoke-all-sessions'
 #                             and FR_SWEEP_CMD='docker compose run --rm -T
 #                             featherreader featherreader --revoke-all-sessions'.
+#                             The script APPENDS ` --sweep` (the app's JWKS is
+#                             unreachable once it is stopped), so the command
+#                             must end with the featherreader invocation.
 #   FR_TEARDOWN_YES=1         skip the interactive confirmation
 #   FR_STOP_CMD="..."         command to stop the services before the wipe
 #                             (e.g. "systemctl stop featherreader oauth-sidecar")
@@ -102,11 +106,20 @@ if [ "$sidecar_step" = 1 ]; then
   command -v curl >/dev/null || { echo "FATAL: curl not found" >&2; exit 2; }
 fi
 
-# Rust sessions present? A missing file or table counts as none.
-rust_rows=0
-if [ -f "$FEATHERREADER_DB" ]; then
-  rust_rows="$(sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;' 2>/dev/null || echo 0)"
-fi
+# Rust session rows in FEATHERREADER_DB, read directly — no service needed.
+# 0 only when there is no file; "unknown" whenever sqlite3 cannot answer
+# (corrupt, locked, unreadable, no such table). Unknown is NEVER read as 0:
+# that would skip the Rust step and wipe whatever tokens the file holds.
+count_rust_rows() {
+  if [ ! -e "$FEATHERREADER_DB" ]; then
+    echo 0
+    return
+  fi
+  sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;' 2>/dev/null || echo unknown
+}
+
+# Rust sessions present? Anything but a definite 0 runs the Rust step.
+rust_rows="$(count_rust_rows)"
 
 # Decide the Rust revoke command up front: refusing must happen BEFORE anything
 # irreversible (the sidecar revoke signs people out), not halfway through.
@@ -197,16 +210,6 @@ rust_revoke() {
   fi
 }
 
-# Rust session rows left in FEATHERREADER_DB, read directly — no service
-# needed. "unknown" if it cannot be read (the sweep then runs, to be safe).
-count_rust_rows() {
-  if [ ! -f "$FEATHERREADER_DB" ]; then
-    echo 0
-    return
-  fi
-  sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;' 2>/dev/null || echo unknown
-}
-
 # 1. Revoke every sidecar DID at its PDS (needs the sidecar still running).
 if [ "$sidecar_step" = 1 ]; then
   echo "==> Revoking all sidecar sessions at their PDSes…"
@@ -252,7 +255,11 @@ if [ "$rust_step" = 1 ]; then
     echo "==> No Rust sessions left after the stop — sweep skipped."
   else
     echo "==> $left Rust session(s) left after the stop — sweeping."
-    rust_revoke "sweep" "${FR_SWEEP_CMD:-$revoke_cmd}"
+    # `--sweep`, appended (so the command must END with the featherreader
+    # invocation): the app is stopped, so its /oauth/jwks.json cannot be
+    # fetched for the signing-key check — expected here, and only here. A
+    # key that is fetched and does not match still refuses.
+    rust_revoke "sweep" "${FR_SWEEP_CMD:-$revoke_cmd} --sweep"
   fi
 fi
 

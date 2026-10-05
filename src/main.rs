@@ -40,7 +40,8 @@ async fn main() -> Result<()> {
     // `?`, so every failure of this mode is an explicit exit 2 ("nothing done")
     // rather than whatever an error from `main` happens to exit with.
     if wants_revoke_all(std::env::args()) {
-        std::process::exit(run_revoke_all().await);
+        let sweep = wants_sweep(std::env::args());
+        std::process::exit(run_revoke_all(sweep).await);
     }
 
     // 1. Configuration — env-driven, every knob defaulted.
@@ -268,6 +269,18 @@ fn wants_revoke_all<I: IntoIterator<Item = String>>(args: I) -> bool {
         .any(|a| a == REVOKE_ALL_SESSIONS_FLAG)
 }
 
+/// `--revoke-all-sessions --sweep`: the post-stop pass `deploy/teardown.sh`
+/// makes after stopping the app.
+const SWEEP_FLAG: &str = "--sweep";
+
+/// Whether this is the post-stop sweep. Only relaxes ONE check: that the app's
+/// `/oauth/jwks.json` can be fetched to confirm the signing key — impossible
+/// once the app is stopped. A fetched key that does not match still refuses.
+/// Skips `argv[0]`, like the other flags.
+fn wants_sweep<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().skip(1).any(|a| a == SWEEP_FLAG)
+}
+
 /// The exit code for a completed revoke-all: any failure is reported, because
 /// those tokens may still be live at their PDS even though the rows are gone.
 fn revoke_all_exit_code(report: &feather_reader::oauth::revoke::RevokeAllReport) -> i32 {
@@ -306,7 +319,7 @@ fn unconfigured_exit_code(stored_sessions: usize) -> i32 {
 /// row in its own statement, so the lock is never held across a network call;
 /// and a delete that still cannot get the lock is reported as that DID's
 /// failure, not a crash of the whole run.
-async fn run_revoke_all() -> i32 {
+async fn run_revoke_all(sweep: bool) -> i32 {
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -315,12 +328,12 @@ async fn run_revoke_all() -> i32 {
         }
     };
     init_tracing();
-    run_revoke_all_with(&config).await
+    run_revoke_all_with(&config, sweep).await
 }
 
 /// [`run_revoke_all`] after configuration — split out so the refusals that
 /// depend on files on disk can be tested.
-async fn run_revoke_all_with(config: &Config) -> i32 {
+async fn run_revoke_all_with(config: &Config, sweep: bool) -> i32 {
     // `store::init` creates a missing database. Here that would answer "0
     // sessions, all good" about the WRONG file and let a teardown wipe the
     // real one with every token still live.
@@ -350,58 +363,24 @@ async fn run_revoke_all_with(config: &Config) -> i32 {
     // `OauthRuntime::without_creating_key`). A missing key is a runtime that
     // cannot be built, which refuses if any session is stored.
     let runtime = feather_reader::oauth::runtime::OauthRuntime::without_creating_key(config);
-    let code = revoke_all_sessions(&db, runtime, &http).await;
+    let code = revoke_all_sessions(&db, runtime, &http, sweep).await;
     db.close().await;
     code
 }
 
-/// Whether `runtime` is the production client — the only one that can revoke
-/// production's sessions.
-///
-/// An incomplete environment does not fail to build a runtime; it builds the
-/// WRONG one. Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to
-/// localhost, which is not production-like, so the production checks
-/// (encryption key included) never run and the runtime comes up as atproto's
-/// public dev client — possibly with the pass-through `Null` codec. Revoking
-/// with that sends every token under the wrong `client_id` or fails to decrypt
-/// every row, and each sign-out deletes its row anyway. So a run that will
-/// touch stored sessions requires all three: the confidential client (a
-/// non-loopback public URL), a real encryption codec, and the loaded key.
-fn fit_to_revoke(runtime: &feather_reader::oauth::runtime::OauthRuntime) -> Result<()> {
-    use feather_reader::oauth::client_auth::AuthMethod;
-    use feather_reader::oauth::crypto::Codec;
-    let mut missing = Vec::new();
-    if runtime.auth_method != AuthMethod::PrivateKeyJwt {
-        missing.push(
-            "the confidential client (FEATHERREADER_PUBLIC_URL is loopback or unset, so this \
-             would revoke as the public dev client)",
-        );
-    }
-    if matches!(runtime.codec, Codec::Null) {
-        missing.push("an encryption key (FEATHERREADER_OAUTH_ENCRYPTION_KEY is unset)");
-    }
-    if runtime.client_key.is_none() {
-        missing.push("the signing key (FEATHERREADER_OAUTH_KEY_PATH)");
-    }
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "not the production OAuth client — missing {}. Run this inside the app's own \
-             environment",
-            missing.join("; ")
-        )
-    }
-}
-
 /// Revoke every stored session with `runtime`, printing a line per DID and a
 /// summary. Returns the process exit code.
+///
+/// Whether the runtime is the PRODUCTION client (confidential, a real codec,
+/// the served signing key) is the pre-flight's job
+/// ([`feather_reader::oauth::revoke::preflight`]), which runs before the first
+/// sign-out whenever sessions are stored.
 async fn revoke_all_sessions(
     db: &store::Pool,
     runtime: Result<feather_reader::oauth::runtime::OauthRuntime>,
     http: &reqwest::Client,
+    sweep: bool,
 ) -> i32 {
-    let runtime = runtime.and_then(|rt| fit_to_revoke(&rt).map(|()| rt));
     let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -434,6 +413,20 @@ async fn revoke_all_sessions(
             return code;
         }
     };
+
+    // The secrets must be the production ones, not merely present: a wrong
+    // encryption key or signing key "works" — every sign-out fails and
+    // deletes its row. Checked before the first sign-out. Nothing deleted.
+    let jwks_url = feather_reader::oauth::metadata::jwks_uri(&runtime.client);
+    if let Err(err) =
+        feather_reader::oauth::revoke::preflight(&runtime, http, db, &jwks_url, sweep).await
+    {
+        eprintln!(
+            "revoke-all: ABORT — {err:#}. Nothing was revoked and NOTHING WAS DELETED. Run \
+             this inside the app's own environment."
+        );
+        return REVOKE_EXIT_ABORT;
+    }
 
     // A clock, not a timestamp: each sign-out mints a 60-second client
     // assertion, so the time must be read per session (see `revoke_all`).
@@ -613,10 +606,72 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feather_reader::oauth::revoke::RevokeAllReport;
+    use feather_reader::oauth::revoke::{fit_to_revoke, RevokeAllReport};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--sweep` is an argument too, and only ever relaxes the sweep's JWKS
+    /// reachability check — so it must not be read off argv[0] either.
+    #[test]
+    fn the_sweep_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_sweep(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions",
+            "--sweep"
+        ])));
+        assert!(!wants_sweep(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_sweep(args(&["--sweep", "--revoke-all-sessions"])));
+    }
+
+    /// **A store no row of which decrypts is refused before anything is
+    /// signed out**: a wrong or rotated encryption key. The production client
+    /// is otherwise intact (confidential, real codec, the existing key), so
+    /// only the pre-flight stands between this and deleting every row
+    /// unrevoked. Offline: the decrypt check runs before the JWKS fetch.
+    #[tokio::test]
+    async fn a_wrong_encryption_key_is_refused_and_deletes_nothing() {
+        let dir = scratch("wrongenc");
+        let config = confidential_config(&dir);
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(fit_to_revoke(&runtime).is_ok(), "precondition: fit");
+
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let other = feather_reader::oauth::crypto::Codec::new(Some(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ))
+        .unwrap();
+        for i in 0..2 {
+            feather_reader::oauth::store::put_session(
+                &db,
+                &other,
+                &feather_reader::oauth::store::OAuthSession {
+                    sub: format!("did:plc:{i:024}"),
+                    issuer: "https://as.invalid".into(),
+                    aud: "https://pds.invalid".into(),
+                    dpop_key_jwk: "{}".into(),
+                    access_token: "a".into(),
+                    refresh_token: "r".into(),
+                    token_type: "DPoP".into(),
+                    granted_scope: "atproto".into(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let code = revoke_all_sessions(&db, Ok(runtime), &reqwest::Client::new(), false).await;
+        assert_eq!(
+            code, 2,
+            "a key that decrypts nothing was allowed to sign out"
+        );
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The flag is matched as an ARGUMENT only: a binary whose install path
@@ -709,7 +764,7 @@ mod tests {
     async fn a_missing_database_is_refused_and_not_created() {
         let dir = scratch("nodb");
         let config = confidential_config(&dir);
-        assert_eq!(run_revoke_all_with(&config).await, 2);
+        assert_eq!(run_revoke_all_with(&config, false).await, 2);
         assert!(
             !config.db_path.exists(),
             "the revoke-all created a database at the wrong path"
@@ -741,7 +796,7 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        assert_eq!(run_revoke_all_with(&config).await, 2);
+        assert_eq!(run_revoke_all_with(&config, false).await, 2);
         assert!(
             !config.oauth.key_path.exists(),
             "the revoke-all CREATED a signing key the PDSes have never seen"
@@ -780,7 +835,7 @@ mod tests {
         assert!(why.contains("public dev client"), "{why}");
 
         let db = db_with_rows(2).await;
-        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new()).await;
+        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new(), false).await;
         assert_eq!(code, 2, "revoked as the public dev client");
         assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
         let _ = std::fs::remove_dir_all(&dir);
@@ -804,7 +859,7 @@ mod tests {
         );
 
         let db = db_with_rows(2).await;
-        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new()).await;
+        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new(), false).await;
         assert_eq!(code, 2, "revoked with the Null codec");
         assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
         let _ = std::fs::remove_dir_all(&dir);
@@ -879,6 +934,7 @@ mod tests {
             &db,
             Err(anyhow::anyhow!("no encryption key")),
             &reqwest::Client::new(),
+            false,
         )
         .await;
         assert_eq!(code, 2);
@@ -892,6 +948,7 @@ mod tests {
             &db,
             Err(anyhow::anyhow!("no encryption key")),
             &reqwest::Client::new(),
+            false,
         )
         .await;
         assert_eq!(code, 0);

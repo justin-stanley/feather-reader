@@ -172,13 +172,16 @@ pub async fn valid_session(
 /// A refresh succeeded at the server, but the row it started from is no longer
 /// on record. Two cases:
 ///
-/// * **Rewritten** by another writer (another process's refresh, a re-login):
-///   theirs is the session on record, so it is returned and ours is NOT
-///   written over it. Our tokens are not revoked: from a single-use rotation
-///   they may share a grant with theirs, and revoking ours could end both.
+/// Either way the tokens this refresh just obtained are stored NOWHERE, and
+/// are revoked (best-effort, bounded) rather than left live at the PDS:
+///
+/// * **Rewritten** by another writer: theirs is the session on record, so it
+///   is returned and ours is not written over it. In practice that writer is
+///   a RE-LOGIN — a new grant. It cannot be a concurrent refresh of the same
+///   token: refresh tokens are single-use, and ours succeeded. So our tokens
+///   belong to the old grant, which nothing references any more.
 /// * **Gone**: it was signed out while we refreshed. We now hold a live token
-///   set for a session that no longer exists; it is revoked (best-effort,
-///   bounded) instead of being written back, and the caller gets the same
+///   set for a session that no longer exists, and the caller gets the same
 ///   "no session" error a signed-out user gets.
 async fn lost_the_row(
     pool: &sqlx::SqlitePool,
@@ -188,9 +191,7 @@ async fn lost_the_row(
     obtained: &OAuthSession,
     now: i64,
 ) -> Result<OAuthSession> {
-    if let Some(current) = super::store::get_session(pool, codec, &obtained.sub).await? {
-        return Ok(current);
-    }
+    let current = super::store::get_session(pool, codec, &obtained.sub).await?;
     let outcome = super::revoke::revoke_orphaned(
         pool,
         http,
@@ -209,8 +210,12 @@ async fn lost_the_row(
         tracing::warn!(
             sub = %obtained.sub,
             %reason,
-            "a session signed out during its refresh: the new tokens could not be revoked"
+            "a session changed or was signed out during its refresh: the refresh's \
+             unstored new tokens could not be revoked"
         );
+    }
+    if let Some(current) = current {
+        return Ok(current);
     }
     bail!(
         "no session for {}: it was signed out while being refreshed (the new tokens were \
@@ -630,8 +635,12 @@ mod tests {
         );
     }
 
-    /// **No lost update:** a row another writer rotated while this refresh ran
-    /// is kept, not overwritten — and theirs is what the caller gets.
+    /// **No lost update, and no orphaned grant:** a row another writer
+    /// rewrote while this refresh ran (in practice a RE-LOGIN — a concurrent
+    /// refresh of the same single-use token cannot also have succeeded) is
+    /// kept, not overwritten, and theirs is what the caller gets. The tokens
+    /// THIS refresh obtained belong to the old grant, are stored nowhere, and
+    /// would stay live at the PDS — so they are revoked.
     #[tokio::test]
     async fn a_refresh_does_not_overwrite_a_concurrent_rotation() {
         let (base, log) = token_server().await;
@@ -669,12 +678,20 @@ mod tests {
             "the other writer's rotation was overwritten"
         );
         assert_eq!(got.refresh_token, "their-refresh");
+        let revokes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /revoke"))
+            .cloned()
+            .collect();
         assert!(
-            !log.lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.starts_with("POST /revoke")),
-            "revoked a token that may share a grant with the live one"
+            revokes.iter().any(|r| r.contains("token=rotated-refresh")),
+            "the refresh's own fresh token was left live, stored nowhere:\n{revokes:#?}"
+        );
+        assert!(
+            !revokes.iter().any(|r| r.contains("their-refresh")),
+            "revoked the OTHER writer's live token:\n{revokes:#?}"
         );
     }
 

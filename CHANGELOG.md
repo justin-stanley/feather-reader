@@ -52,7 +52,16 @@ deploying is separate.
     or unset public URL, no encryption key, or no signing key. An incomplete
     environment does not fail to start; it starts as atproto's public dev
     client, or with a codec that cannot read a row. Every revocation would
-    then fail while every row was deleted.
+    then fail while every row was deleted;
+  - sessions stored while the secrets are present but **not the production
+    ones**, checked in a pre-flight before the first sign-out:
+    - no stored row decrypts with the encryption key (wrong or rotated);
+    - the loaded signing key's thumbprint and `kid` are not in the JWKS the
+      app serves at `/oauth/jwks.json`, as with a relative key path resolved
+      in the wrong directory;
+    - that JWKS cannot be fetched on the main pass. The post-stop
+      `--revoke-all-sessions --sweep`, which `teardown.sh` appends, tolerates
+      an unreachable JWKS but not a mismatch.
 
   A completed run prints a last line,
   `revoke-all-sessions: revoked=N no_session=M failed=K`. Partial failure is
@@ -84,7 +93,9 @@ deploying is separate.
   The `SIDECAR_*` variables are optional on the `rust` backend when no
   `SIDECAR_DB` exists. On the `sidecar` backend the Rust step runs only if
   `FEATHERREADER_DB` holds Rust sessions, not merely because a revoke command
-  is available.
+  is available. A DB `sqlite3` cannot read (corrupt, locked, unreadable) is
+  counted as "unknown", never 0. The Rust step then runs, or the script
+  refuses if there is no revoke command, instead of being silently skipped.
 
   **Sign-out vs. a concurrent refresh.** This changes `/logout` and
   `/account/delete` too. The app refreshes a session under an in-process lock;
@@ -103,8 +114,9 @@ deploying is separate.
     with fresh tokens. It is now a conditional `UPDATE` against the version
     the refresh started from. If the row is gone, the fresh tokens are revoked
     (best-effort, bounded) and the caller gets "no session". If another writer
-    rotated the row, theirs is kept and returned, so no update is lost.
-    Login's write is still an upsert.
+    (a re-login: a new grant) replaced the row, theirs is kept and returned,
+    so no update is lost. Our fresh tokens, from the old grant and stored
+    nowhere, are revoked too. Login's write is still an upsert.
 
   As defence in depth, `revoke_all` lists the store again after its walk and
   walks anything new, up to 2 extra passes. Anything still stored after that
@@ -112,12 +124,13 @@ deploying is separate.
   DID that failed and was then revoked by the re-list is reported revoked.
   `late` lists only DIDs absent from the first listing.
 
-  **Tests.** New `scripts/test-teardown.sh`, 74 assertions, runs the real
+  **Tests.** New `scripts/test-teardown.sh`, 79 assertions, runs the real
   script against throwaway SQLite files with stub commands. It is wired into
   CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
   of the first 30 failed. Each later round's cases failed first against the
   script before that round's fix: the sentinel cases (17), the sidecar-backend
-  cases (6), the CRLF cases (5) and the post-stop sweep cases (6).
+  cases (6), the CRLF cases (5), the post-stop sweep cases (6), the
+  unreadable-DB cases (4) and `--sweep` (2).
 
   Tests against a real-TLS fake authorization server cover:
 
@@ -125,17 +138,22 @@ deploying is separate.
     an empty store;
   - each assertion's `iat` coming from its own clock reading;
   - a refresh against a deleted row (no resurrection, fresh token revoked) and
-    against another writer's rotation (no lost update).
+    against another writer's replacement (no lost update, our fresh token
+    revoked, theirs not);
+  - the pre-flight against a fake JWKS: matching, mismatching (main pass and
+    sweep), and unreachable (main pass refused, sweep allowed). Also a wrong
+    encryption key, a Null codec that passes everything else, and a partly
+    unreadable store.
 
   Injected-hook tests cover a rotation between read and delete, a row that
   keeps rotating, a row deleted concurrently, sessions created during the
   walk, the bounded re-list, and one final outcome per DID (fail then succeed
   is revoked only; failing every pass is one entry). Main-binary tests cover
-  the dev-client,
-  Null-codec and keyless refusals.
+  the dev-client, Null-codec, keyless and wrong-encryption-key refusals, and
+  `--sweep` parsing.
 
-  Each new guard was broken on its own and a test failed every time (48 of
-  48).
+  Each new guard was broken on its own and a test failed every time (58 of
+  58).
   `deploy/teardown.md` gains the procedure, including Fly's.
 
 ### Docs
