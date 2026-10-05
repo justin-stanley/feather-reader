@@ -45,12 +45,12 @@ having written down next to the tiers that are still open.
 
 > Done in PR #101 (pre-squash `1cfae77`): `store::list_entries` takes `limit`/`offset` over the body-free `EntryListRow`.
 
-`get_unread_for_did` (`store.rs:1571`), `get_starred_for_did` (`:1593`) and
-`entries_for_feed` (`:1210`) all do `SELECT e.*` with **no `LIMIT`**. Verified:
+`get_unread_for_did`, `get_starred_for_did` and `entries_for_feed` in `store.rs`
+(now test-only wrappers over `list_entries`) all did `SELECT e.*` with **no `LIMIT`**. Verified:
 zero `LIMIT` tokens across all three. `e.*` includes `content_html`, which is
 essentially all of the measured 11.9 KB/entry.
 
-`EntryRow` (`web.rs:760`) is `{id, title, feed_title, published, read, starred,
+`EntryRow` in `web.rs` is `{id, title, feed_title, published, read, starred,
 link, cached}` — **it never reads the body**. So the body is loaded, allocated,
 and then dropped, on every page load. `GET /` calls the first two and then
 `.cloned()`s the filtered result, a second full copy. `?view=all` loops every
@@ -89,7 +89,7 @@ keeps `SELECT e.*`, which is what it is for.
 
 > Done in PR #101 (pre-squash `ba9951a`): see the REQUIRED and BACKEND CUTOVER blocks in `fly.toml`.
 
-`config.rs:629-640` refuses to boot when `FEATHERREADER_REPO_BACKEND=rust` on a
+`Config::from_env` in `config.rs` refuses to boot when `FEATHERREADER_REPO_BACKEND=rust` on a
 prod-like instance without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. Verified:
 `fly.toml` (107 lines) never mentions that variable, in either its REQUIRED or
 OPTIONAL SECRETS block.
@@ -209,7 +209,7 @@ would have landed — each having waited for the entire sweep.
 
 > Done in PR #101 (pre-squash `75f1c53`): INCREMENTAL at creation, `--migrate-auto-vacuum`, `journal_size_limit`.
 
-`store.rs:731-741` uses `PRAGMA incremental_vacuum` only when `PRAGMA
+`store::reclaim` used `PRAGMA incremental_vacuum` only when `PRAGMA
 auto_vacuum == 2`. Verified: `auto_vacuum` is **read** there and **never set**
 anywhere in the tree, so SQLite's default (NONE = 0) applies and the
 full-`VACUUM` branch is the one that actually runs — daily, and after a prune.
@@ -424,7 +424,8 @@ product's own voice. `known_error_slug` is now `pub(crate)` and both the log and
 the page carry only a `&'static str` from the fixed list; the description is
 dropped, keeping only its length.
 
-`web.rs:2839` logs it at `warn!`. `oauth/flow.rs:186-199` deliberately reduces
+The OAuth callback handler in `web.rs` logged it at `warn!`. `oauth/flow.rs`'s
+`known_error_slug` deliberately reduces
 the callback `error` to a known slug and drops the description for precisely
 this reason; the older arm in `web.rs` never got the same treatment.
 Attacker-controlled free text, including newlines, into the log stream.
@@ -450,7 +451,7 @@ asserts the property it was actually written for (not refused by the feed cap).
 
 `unwrap_or_default()` / `let _ =` on paths where failure is silent and
 user-visible. Two are literal support tickets: `let _ = store::upsert_feed(…)`
-(verified at `web.rs:1219`, `:2411`, `:3956`) means a subscription can exist in
+(verified at three call sites in `web.rs`) means a subscription can exist in
 the PDS and never be polled — "I added a feed and it never updates" — and
 `feeds_for_did(…).unwrap_or_default()` renders an empty sidebar on a DB error:
 "all my feeds vanished". Also: a failed PDS `update_subscription` is a `warn!`
@@ -543,7 +544,8 @@ remaining two are worth doing for the same reason:
   there for caller four.
 
   > Still open (audited 2026-10-05): `upsert_feed` takes `&NewFeed`, a struct
-  > with all-public fields, and has about 20 call sites. Tracked in issue #260.
+  > with all-public fields, and has eight non-test call sites (`web.rs` four,
+  > `feed.rs` two, `store.rs` and `standard_site.rs` one each). Tracked in issue #260.
 - **`is_rate_limited_path` should invert** into a per-route opt-out declared at
   the router, so adding a route forces a decision instead of defaulting to
   unguarded. Its current test asserts coverage only for routes already in the

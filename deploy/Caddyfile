@@ -23,9 +23,9 @@
 #         (user denied / OAuth error). NEITHER carries session_id or
 #         error_description. This MUST reach the sidecar — only it holds the
 #         per-request PKCE/state row and can call oauthClient.callback().
-#       - SIDECAR -> RUST APP:  ?session_id=<id>  on success (server.ts:196), or
+#       - SIDECAR -> RUST APP:  ?session_id=<id>  on success (the `/callback` handler), or
 #         ?error=OAuthCallbackFailed&error_description=<msg>  on the sidecar's own
-#         failure hand-off (server.ts:200-204). Both are app-bound.
+#         failure hand-off (its `catch` arm). Both are app-bound.
 #     So we route /oauth/callback to the APP when it carries `session_id` OR
 #     `error_description` (the sidecar->app hop markers), and let everything else
 #     under /oauth/callback (crucially the PDS's `?error=&state=` deny path) fall

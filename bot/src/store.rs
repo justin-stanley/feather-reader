@@ -277,7 +277,7 @@ impl Store {
         self.count_mints_at(now() - window_secs)
     }
 
-    /// [`count_mints_since`] with the cutoff passed in rather than derived from
+    /// [`Self::count_mints_since`] with the cutoff passed in rather than derived from
     /// the clock.
     ///
     /// Split out because `now()` is whole seconds. `record_mint` stamps
@@ -300,7 +300,7 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Record a mint at an explicit instant. [`record_mint`] is this with the
+    /// Record a mint at an explicit instant. [`Self::record_mint`] is this with the
     /// clock supplied; tests pin a fixed instant so no assertion depends on
     /// when it runs. One INSERT, so the two cannot drift apart.
     fn record_mint_at(&self, did: &str, at: i64) -> Result<()> {

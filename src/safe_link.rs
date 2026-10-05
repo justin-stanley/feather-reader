@@ -1,7 +1,7 @@
 //! The `href` type.
 //!
 //! **This is its own module because of the tuple field.** A private field is
-//! private to the MODULE, and `web.rs` is a single ~9,000-line file holding every
+//! private to the MODULE, and `web.rs` is a single ~13,600-line file holding every
 //! `EntryRow` construction — so while the type lived there,
 //! `SafeLink("javascript:alert(1)")` compiled and rendered verbatim into an
 //! `href`. An adversarial review demonstrated exactly that, five different ways.

@@ -910,7 +910,7 @@ fn env_opt(key: &str) -> Option<String> {
 ///
 /// This deliberately breaks the "a present-but-bad var fails loud" rule, because
 /// here that rule had a worse failure mode than the thing it was guarding:
-/// `Config::from_env` runs before `init_tracing` (`main.rs:38` vs `:41`), so a
+/// `Config::from_env` runs before `init_tracing` (steps 1 and 2 in `main`), so a
 /// hard error is an unexplained non-zero exit, and `deploy/container-entrypoint.sh`
 /// turns that into a restart loop. A typo in an **optional metric's** host list
 /// would have taken the whole reader offline. `run_adoption_probe` already

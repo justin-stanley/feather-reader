@@ -7,11 +7,7 @@ name: CodeQL
 # CodeQL CLI + query packs; the self-hosted CI VM does not). So this workflow
 # uses `ubuntu-latest`, NOT the self-hosted runner.
 #
-#   * While the repo is PRIVATE, GitHub-hosted runs consume Actions minutes.
-#   * Once the repo is PUBLIC, GitHub-hosted Actions (and code scanning) are
-#     FREE — this is the intended steady state for the OSS release.
-#
-# Now the repo is public, GitHub-hosted Actions + code scanning are free, so it
+# The repo is public, so GitHub-hosted Actions + code scanning are free, and it
 # runs on every PR to `main` (per-PR SAST), on push to `main`, and on a weekly
 # schedule. See .github/workflows/README.md.
 #
@@ -52,10 +48,11 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    # Code scanning needs GitHub Advanced Security on a PRIVATE repo, so the SARIF
-    # upload fails while private. Skip until the repo is public (free + enabled then).
+    # Code scanning needs GitHub Advanced Security on a PRIVATE repo (e.g. a
+    # private fork), where the SARIF upload would fail, so it is skipped there.
+    # This repo is public, so it always runs here.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted: free once public; see header note
+    runs-on: ubuntu-latest  # GitHub-hosted: free for this public repo; see header note
     permissions:
       actions: read
       contents: read

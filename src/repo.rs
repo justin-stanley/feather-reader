@@ -1,7 +1,7 @@
 //! The one place the two repo backends are chosen between, and timed.
 //!
 //! Every `com.atproto.repo.*` call the reader makes goes through here, so the
-//! cutover is a single `match` rather than a swap at twelve call sites — and,
+//! cutover is a single `match` rather than a swap at every call site — and,
 //! just as importantly, both backends are measured at the same boundary by the
 //! same wrapper. Timers placed separately on each path would be comparing the
 //! timers.

@@ -242,8 +242,8 @@ reader is not silently subscribed to something that will never deliver.
 
 **#18 — decommission the Node sidecar.** It has been dead weight in the image since
 the cutover — `/app/oauth-sidecar` is **72 MB** on the running machine. Deleting it
-removes **~1,735 lines of TS** (2,734 with its tests), the Node build stage, the six
-npm CI steps, the dependabot npm group, and one of the two Caddy routings — which
+removes **~1,735 lines of TS** (2,734 with its tests), the Node build stage, the
+`sidecar` CI job's seven npm steps, the dependabot npm group, and one of the two Caddy routings — which
 also removes the deploy-time login-routing caveat.
 
 **It also closes a real SSRF gap.** The sidecar guards **nothing** — an earlier draft

@@ -17,8 +17,15 @@
 //! - [`feed`]    — polite fetching (conditional GET, backoff), feed-rs parsing,
 //!   and ammonia sanitization.
 //! - [`atproto`] — the atproto identity + PDS record layer (subscriptions,
-//!   folders, saved, batched read-state sync). Live repo writes go through the
-//!   OAuth confidential-client sidecar ([`atproto::SidecarClient`]).
+//!   folders, saved, batched read-state sync), including the Node sidecar's
+//!   client ([`atproto::SidecarClient`]).
+//! - [`oauth`]   — the Rust-native atproto OAuth client (the `rust` repo
+//!   backend, which production runs).
+//! - [`repo`]    — the one dispatcher every `com.atproto.repo.*` call goes
+//!   through, choosing the sidecar or the Rust client by
+//!   `FEATHERREADER_REPO_BACKEND`.
+//! - [`standard_site`] — reading standard.site publications from their
+//!   authors' repos.
 //! - [`network`] — read-only queries against the *public* atproto network (the
 //!   relay adoption probe). A projection, never a source of truth, and never on
 //!   a reader path.

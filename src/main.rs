@@ -7,10 +7,11 @@
 //! 2. Initialize tracing (respecting `RUST_LOG`).
 //! 3. Open + migrate the per-DID SQLite cache via [`store::init`].
 //! 4. Build the shared [`AppState`] (pool + HTTP client + atproto sidecar).
-//! 5. Spawn the background schedulers — the **poll scheduler** and the
-//!    **read-state flusher** — as `tokio` tasks, behind a config flag so
-//!    tests/dev can disable them ([`scheduler::spawn`]). Both share the same
-//!    graceful-shutdown signal as the HTTP server.
+//! 5. Spawn the background schedulers — the RSS and publication **pollers**,
+//!    the **read-state flusher**, the sweepers, the adoption probe and the
+//!    metrics flusher — as `tokio` tasks, behind a config flag so tests/dev can
+//!    disable them ([`scheduler::spawn`]). All share the same graceful-shutdown
+//!    signal as the HTTP server.
 //! 6. Build the axum `axum::Router` via [`web::router`] and serve until shutdown.
 //!
 //! Shutdown is broadcast to *both* the server and the background tasks via a
@@ -25,7 +26,7 @@ use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-// The background schedulers (poll scheduler + read-state flusher) live in
+// The background schedulers (pollers, flushers, sweepers, adoption probe) live in
 // `scheduler.rs` and are compiled as a module of the *binary* crate — they wire
 // the library's public seams (AppState / store / feed / atproto / config)
 // together, which is the binary's job, not the library's.

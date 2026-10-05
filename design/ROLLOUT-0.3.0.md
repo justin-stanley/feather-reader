@@ -91,7 +91,7 @@ is cleared; see Stage 3.
 
 **No OAuth change.** `fly.toml` keeps `FEATHERREADER_REPO_BACKEND = "sidecar"`, so
 this deploy carries the Tier 1–4 and review-round fixes and nothing else. Verified
-safe: `config.rs:672` gates `FEATHERREADER_OAUTH_ENCRYPTION_KEY` on the rust
+safe: `Config::from_env` gates `FEATHERREADER_OAUTH_ENCRYPTION_KEY` on the rust
 backend only, and `config::tests::the_sidecar_backend_boots_without_an_oauth_encryption_key`
 pins it. The key does **not** need to be set for this stage.
 
@@ -203,7 +203,7 @@ Stage 1.**
 
 `src/oauth/login.rs` contained exactly two tests and **neither called `complete`**
 — the function that performs the authorization-code exchange. It is reachable only
-on the rust backend (`web.rs:3449` gates it on `repo_backend`), so it was dormant
+on the rust backend (`web.rs`'s `start_oauth` gates it on `repo_backend`), so it was dormant
 in production, but flipping to `rust` makes it every user's login path.
 
 Seven guards could each be deleted with the entire suite green. All seven now fail
