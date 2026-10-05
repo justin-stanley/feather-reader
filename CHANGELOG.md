@@ -31,6 +31,15 @@ deploying is separate.
   global prefix, since under a refused prefix they would pass without the
   ISATAP decoder.
 
+- **A local `docker build` no longer sends the app's OAuth signing key to the
+  Docker daemon** (#218). `.dockerignore` excluded the sidecar's `*.jwk.json`
+  but not the Rust app's `oauth-signing-key.json`, which is gitignored and
+  present in local checkouts; it now excludes `**/oauth-signing-key*.json`, and
+  `.claude` (local worktree copies). Measured with a probe build that copies the
+  whole context: before, the key and `.claude` were in it (50.8 MB); after,
+  neither (4.0 MB). Shipped images were never affected: the Dockerfile copies
+  named paths only, and release images build from a clean CI checkout.
+
 ## 0.4.3 — 2026-10-05
 
 Two write-path fixes that apply on any PDS: `applyWrites` is sent in calls of

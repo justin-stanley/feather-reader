@@ -28,6 +28,10 @@ secrets
 **/secrets
 *.pem
 *.key
+# The Rust app's confidential-client ES256 signing key (FEATHERREADER_OAUTH_KEY_PATH,
+# default `oauth-signing-key.json`; gitignored). Matched anywhere and under any
+# suffix so a rename or a copy in a subdirectory stays out of the context too.
+**/oauth-signing-key*.json
 
 # --- Local runtime state (SQLite DBs + the sidecar signing JWK) -----------
 *.db
@@ -42,4 +46,6 @@ deploy/teardown.*
 !README.md
 .DS_Store
 **/.DS_Store
+# Claude Code's local state, including whole worktree copies of this repo.
+.claude
 
