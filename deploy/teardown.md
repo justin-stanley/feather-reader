@@ -9,8 +9,8 @@ There are two related but distinct wipes:
 
 | Layer | What it holds | Wiped by |
 |---|---|---|
-| **Rust app** (`featherreader`) | The SQLite cache: `entry_state`, `read_cursor`, `sub_ref`, `beta_access`, `invite_codes`, plus the shared `feeds`/`entries` cache. Signed session cookies are keyed by DID but hold no server secret beyond the cookie HMAC. | Deleting `FEATHERREADER_DB` (+ `-wal`/`-shm`). |
-| **Rust OAuth client** (`FEATHERREADER_REPO_BACKEND=rust`) | Per-DID OAuth tokens (refresh + access) and the session DPoP key, in the app's own SQLite (`FEATHERREADER_DB`, tables `oauth_session` / `oauth_state` / `oauth_nonce`), AEAD-encrypted at rest under `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. | `POST /logout` or `POST /account/delete` per DID (revokes at the PDS via RFC 7009 **and** drops the row), then deleting the DB. Revocation is attempted first, because it needs the tokens the delete destroys. |
+| **Rust app** (`featherreader`) | The SQLite cache: `entry_state`, `read_cursor`, `sub_ref`, `beta_access`, `invite_codes`, the shared `feeds`/`entries` cache, and operational tables (`network_stat`, `repo_timing`, `repo_timing_total`, `ballast`). Signed session cookies are keyed by DID but hold no server secret beyond the cookie HMAC. | Deleting `FEATHERREADER_DB` (+ `-wal`/`-shm`). |
+| **Rust OAuth client** (`FEATHERREADER_REPO_BACKEND=rust`) | Per-DID OAuth tokens (refresh + access) and the session DPoP key, in the app's own SQLite (`FEATHERREADER_DB`, tables `oauth_session` / `oauth_state` / `oauth_nonce`), AEAD-encrypted at rest under `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. | The user's own `POST /logout` or `POST /account/delete` (revokes at the PDS via RFC 7009 **and** drops the row). An operator has no per-DID or fleet-wide revoke here; deleting the DB drops the tokens unrevoked. Revocation is attempted first, because it needs the tokens the delete destroys. |
 | **OAuth sidecar** (`oauth-sidecar`) | Per-DID OAuth tokens (refresh + access, DPoP keys) and the `session_id` handoff rows, in its own SQLite (`SIDECAR_DB`), AEAD-encrypted at rest. Plus the confidential-client signing JWK at `${SIDECAR_DB}.jwk.json`. | `POST /internal/revoke` per DID (revokes at the PDS **and** drops the row), then deleting `SIDECAR_DB`. |
 
 A user-initiated `POST /account/delete` already does the per-user version of both
@@ -38,6 +38,13 @@ runbook is the **fleet-wide** version.
 Use this for a maintenance window or a temporary pause where you intend to come
 back. It does **not** revoke tokens or delete anything.
 
+The commands below assume you run the app and sidecar as two services named
+`featherreader` and `oauth-sidecar`; adjust to your setup. For the supplied
+container image (one container, all state under `/data`; on Fly, the
+`featherreader_data` volume), stop the container or machine instead, and the
+files to wipe are `/data/featherreader.db*`, `/data/oauth-sidecar.db*`,
+`/data/oauth-sidecar.db.jwk.json` and `/data/oauth-signing-key.json`.
+
 ```bash
 # systemd
 sudo systemctl stop featherreader oauth-sidecar
@@ -64,8 +71,12 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
         SIDECAR_DB=/var/lib/featherreader/oauth-sidecar.db \
         SIDECAR_PUBLIC_URL=http://127.0.0.1:8081 \
         SIDECAR_INTERNAL_SECRET="$(cat /etc/featherreader/internal_secret)" \
+        FR_STOP_CMD="systemctl stop featherreader oauth-sidecar" \
         deploy/teardown.sh
 ```
+
+`FR_STOP_CMD` stops the services between the revoke (which needs them running)
+and the wipe. Without it the script assumes they are already stopped.
 
 ### Manual steps (what the script does)
 

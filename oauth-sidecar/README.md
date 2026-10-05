@@ -19,8 +19,9 @@ shared-secret-guarded internal HTTP API.
 ## Run (dev)
 
 ```bash
-npm install
+npm ci
 npm run build
+SIDECAR_DEV=true \
 SIDECAR_PUBLIC_URL=http://127.0.0.1:8081 \
 SIDECAR_APP_CALLBACK_URL=http://localhost:8080/oauth/callback \
 npm start
@@ -30,6 +31,9 @@ npm start
 In dev/localhost mode the sidecar uses atproto's **localhost development client**
 (`client_id` = `http://localhost?redirect_uri=…&scope=…`), so no published JWKS
 or PKI is needed and it boots + is manually testable. See `.env.example`.
+
+`SIDECAR_DEV=true` is required for this: a localhost URL alone does not relax
+the secret checks, and without it the sidecar refuses to boot.
 
 ## Endpoints
 
@@ -46,6 +50,7 @@ or PKI is needed and it boots + is manually testable. See `.env.example`.
 |---|---|
 | `GET /internal/session/:id` | Resolve `session_id` → `{did, handle}`. |
 | `POST /internal/repo` | Authed `com.atproto.repo.*` op (`list`/`create`/`put`/`delete`/`applyWrites`) on the DID's repo. |
+| `POST /internal/revoke` | Body `{did}`. Revokes the DID's tokens at its PDS and drops the stored session. Used by `/logout`, `/account/delete` and `deploy/teardown.sh`. |
 | `GET /internal/health` | Secret-guarded liveness. |
 
 The exact request/response JSON shapes are documented at the top of
@@ -54,7 +59,8 @@ The exact request/response JSON shapes are documented at the top of
 ## Production
 
 Set `SIDECAR_PUBLIC_URL=https://feather-reader.com/oauth` (or a dedicated
-subdomain), a strong `SIDECAR_INTERNAL_SECRET`, and
+subdomain), a strong `SIDECAR_INTERNAL_SECRET`, `SIDECAR_ENC_KEY`
+(`openssl rand -base64 32`; the sidecar refuses to boot without it), and
 `SIDECAR_APP_CALLBACK_URL=https://feather-reader.com/oauth/callback`. The
 confidential-client signing key is generated once and persisted to
 `${SIDECAR_DB}.jwk.json` (keep it with the DB volume); `/jwks.json` serves its
