@@ -106,25 +106,83 @@ pub async fn sign_out(
     sub: &str,
     now: i64,
 ) -> Revocation {
-    let session = match super::store::get_session(pool, codec, sub).await {
-        Ok(Some(session)) => session,
-        Ok(None) => return Revocation::NoSession,
-        Err(err) => {
-            // Still delete: an unreadable row is exactly the state a sign-out
-            // should clear, and leaving it wedges every later request.
-            let _ = super::store::delete_session(pool, sub).await;
-            return Revocation::Failed(format!("reading the session: {err:#}"));
-        }
-    };
-
-    bounded_then_delete(
-        pool,
-        sub,
-        ctx.deadline,
-        revoke_tokens(pool, http, ctx, &session, now),
-    )
+    sign_out_with(pool, codec, sub, ctx.deadline, |session| async move {
+        revoke_tokens(pool, http, ctx, &session, now).await
+    })
     .await
 }
+
+/// [`sign_out`] with the revocation injected, so a row rotated mid-sign-out
+/// can be simulated deterministically.
+async fn sign_out_with<F, Fut>(
+    pool: &sqlx::SqlitePool,
+    codec: &super::crypto::Codec,
+    sub: &str,
+    deadline: std::time::Duration,
+    mut revoke: F,
+) -> Revocation
+where
+    F: FnMut(OAuthSession) -> Fut,
+    Fut: std::future::Future<Output = Revocation>,
+{
+    // The outcome of the last attempt whose row then changed under it.
+    let mut previous: Option<Revocation> = None;
+    for _ in 0..MAX_SIGN_OUT_ATTEMPTS {
+        let (session, version) = match super::store::get_session_versioned(pool, codec, sub).await {
+            Ok(Some(read)) => read,
+            // Gone — first time round, there was nothing to sign out; after
+            // a `Changed`, someone else (a concurrent `/logout`) deleted it
+            // once we had revoked what we read, so report that revocation.
+            Ok(None) => return previous.unwrap_or(Revocation::NoSession),
+            Err(err) => {
+                // Still delete: an unreadable row is exactly the state a
+                // sign-out should clear, and leaving it wedges every later
+                // request. No refresh can rotate a row nothing can read.
+                let _ = super::store::delete_session(pool, sub).await;
+                return Revocation::Failed(format!("reading the session: {err:#}"));
+            }
+        };
+
+        match bounded_then_delete(pool, sub, &version, deadline, revoke(session)).await {
+            Attempt::Done(outcome) => return outcome,
+            // Rotated (or removed) while we revoked: read again and revoke the
+            // tokens that are actually on record now.
+            Attempt::Changed(outcome) => previous = Some(outcome),
+        }
+    }
+    // Still rotating. Leave the newest tokens IN PLACE — deleting them would
+    // drop a live token unrevoked with no record left to retry from — and say
+    // so, so the operator's sweep (or the user's next sign-out) can finish it.
+    Revocation::Failed(format!(
+        "the session kept changing while it was being signed out ({MAX_SIGN_OUT_ATTEMPTS} \
+         attempts, each overtaken by a refresh); its newest tokens were left in place"
+    ))
+}
+
+/// Revoke a token set that has NO local row to delete — bounded by
+/// `ctx.deadline`, best-effort, never touching the store's sessions.
+///
+/// For tokens obtained for a session that was signed out while they were being
+/// obtained: a refresh that finds its row deleted holds a live grant nobody
+/// will ever use, and dropping it would leave it live at the PDS until expiry.
+pub(crate) async fn revoke_orphaned(
+    pool: &sqlx::SqlitePool,
+    http: &reqwest::Client,
+    ctx: &RevokeContext<'_>,
+    session: &OAuthSession,
+    now: i64,
+) -> Revocation {
+    match tokio::time::timeout(ctx.deadline, revoke_tokens(pool, http, ctx, session, now)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Revocation::Failed(format!(
+            "revocation did not finish within {:?}",
+            ctx.deadline
+        )),
+    }
+}
+
+/// The deadline a background revocation (not a user's sign-out) waits for.
+pub(crate) const ORPHAN_REVOKE_DEADLINE: std::time::Duration = REVOKE_DEADLINE;
 
 /// The revocation request itself. Errors become [`Revocation::Failed`] rather
 /// than propagating: every caller has already committed to signing out.
@@ -242,8 +300,8 @@ pub async fn sign_out_discovering(
     //
     // Bounded HERE rather than by wrapping the whole operation, so this function
     // still ENDS in a call to `sign_out` — which owns the contract that matters
-    // (a bounded attempt, then an unconditional local delete) and is where that
-    // contract is tested. Wrapping instead meant production stopped going
+    // (a bounded attempt, then a local delete whatever the server said) and is
+    // where that contract is tested. Wrapping instead meant production stopped going
     // through `sign_out` at all, leaving three invariant tests aimed at a
     // function nothing called. Worst case is two deadlines, one per phase, which
     // is what independently bounding each phase costs.
@@ -302,6 +360,11 @@ pub struct RevokeAllReport {
     /// The server could not be told, with the reason. The local row is deleted
     /// regardless, so these tokens may stay live at the PDS until they expire.
     pub failed: Vec<(String, String)>,
+    /// Subjects found by a RE-LIST after the walk — sessions created or
+    /// rotated back into the store while it ran (a login on the still-serving
+    /// app). Each was then signed out too, and its outcome is in the lists
+    /// above.
+    pub late: Vec<String>,
 }
 
 /// Sign EVERY stored session out — the operator's fleet-wide revoke (#257).
@@ -311,8 +374,8 @@ pub struct RevokeAllReport {
 /// live at its PDS until it expired. This walks the store and runs each subject
 /// through [`sign_out_discovering`] — the same function `/logout` and
 /// `/account/delete` use, so it inherits that function's contract: a bounded
-/// attempt at the server, then an unconditional local delete, including for a
-/// row that no longer decrypts.
+/// attempt at the server, then a local delete (of the version it revoked)
+/// whatever the server said, including for a row that no longer decrypts.
 ///
 /// **A failure does not stop the walk.** Every later session would otherwise be
 /// left neither revoked nor deleted. Failures are collected with their reasons
@@ -328,37 +391,119 @@ pub async fn revoke_all(
     runtime: &super::runtime::OauthRuntime,
     http: &reqwest::Client,
     pool: &sqlx::SqlitePool,
-    mut clock: impl FnMut() -> i64,
+    clock: impl FnMut() -> i64,
 ) -> Result<RevokeAllReport> {
+    revoke_all_with(pool, clock, |sub, now| async move {
+        sign_out_discovering(runtime, http, pool, &sub, now).await
+    })
+    .await
+}
+
+/// [`revoke_all`] with the per-session sign-out injected, so sessions that
+/// appear DURING the walk can be simulated.
+async fn revoke_all_with<S, Fut>(
+    pool: &sqlx::SqlitePool,
+    mut clock: impl FnMut() -> i64,
+    mut sign_out: S,
+) -> Result<RevokeAllReport>
+where
+    S: FnMut(String, i64) -> Fut,
+    Fut: std::future::Future<Output = Revocation>,
+{
     let mut report = RevokeAllReport::default();
-    for sub in super::store::list_session_subs(pool).await? {
-        // Read the clock PER SESSION. `now` becomes the client assertion's
-        // `iat`, and an assertion lives only 60 s: one timestamp taken at the
-        // start would be expired for every session reached after the first
-        // minute, so those revocations would all be rejected.
-        let now = clock();
-        match sign_out_discovering(runtime, http, pool, &sub, now).await {
-            Revocation::Revoked => report.revoked.push(sub),
-            Revocation::NoSession => report.no_session.push(sub),
-            Revocation::Failed(reason) => report.failed.push((sub, reason)),
+    let mut subs = super::store::list_session_subs(pool).await?;
+    // The first walk, then up to RE_LIST_PASSES more over whatever is stored
+    // AFTER it: sessions created (a login on the still-serving app) or left in
+    // place (one that kept rotating) while the walk ran. Defence in depth — the
+    // refresh no longer resurrects a deleted row, but a login legitimately
+    // creates one.
+    for pass in 0..=RE_LIST_PASSES {
+        let mut failed_this_pass = Vec::new();
+        for sub in subs {
+            if pass > 0 && !report.late.contains(&sub) {
+                report.late.push(sub.clone());
+            }
+            // Read the clock PER SESSION. `now` becomes the client assertion's
+            // `iat`, and an assertion lives only 60 s: one timestamp taken at
+            // the start would be expired for every session reached after the
+            // first minute, so those revocations would all be rejected.
+            let now = clock();
+            match sign_out(sub.clone(), now).await {
+                Revocation::Revoked => report.revoked.push(sub),
+                Revocation::NoSession => report.no_session.push(sub),
+                Revocation::Failed(reason) => {
+                    failed_this_pass.push(sub.clone());
+                    report.failed.push((sub, reason));
+                }
+            }
+        }
+        subs = super::store::list_session_subs(pool).await?;
+        if subs.is_empty() {
+            return Ok(report);
+        }
+        if pass == RE_LIST_PASSES {
+            // Out of passes and the store is still not empty. Say so for each
+            // DID not already reported failed in this pass: these sessions are
+            // still on record, and possibly live.
+            for sub in subs {
+                if !failed_this_pass.contains(&sub) {
+                    report.failed.push((
+                        sub,
+                        format!(
+                            "still stored after {} passes (a login or refresh keeps \
+                             re-creating it); not signed out",
+                            RE_LIST_PASSES + 1
+                        ),
+                    ));
+                }
+            }
+            break;
         }
     }
     Ok(report)
 }
 
-/// Run `attempt` under `deadline`, then delete the local session **whatever
-/// happened** — including when the deadline expired.
+/// Extra walks [`revoke_all`] makes over sessions that appeared during the
+/// previous one.
+const RE_LIST_PASSES: usize = 2;
+
+/// How many times a sign-out re-reads and re-revokes a session that a
+/// concurrent refresh keeps rotating, before giving up and leaving the newest
+/// tokens on record.
+const MAX_SIGN_OUT_ATTEMPTS: usize = 3;
+
+/// What one bounded attempt ended in.
+#[derive(Debug)]
+enum Attempt {
+    /// The row that was revoked has been deleted (or the delete failed, which
+    /// is reported in the outcome). Final.
+    Done(Revocation),
+    /// The row was rewritten or removed after it was read, so the revoked token
+    /// was not the one on record. Nothing was deleted.
+    Changed(Revocation),
+}
+
+/// Run `attempt` under `deadline`, then delete the local session — **whatever
+/// the server said**, including when the deadline expired — provided the row
+/// still holds the `version` that was revoked.
 ///
 /// The single implementation of the sign-out contract, so there is no second
 /// copy to drift. Separated out from [`sign_out`] so the bound can be tested
 /// against a future that never resolves, rather than against a network address
 /// that may be refused instantly in one environment and hang in another.
+///
+/// **Compare-and-delete, not delete.** A refresh can rotate the row between
+/// the read and here (the live app refreshes under an in-process lock that
+/// neither the operator's revoke-all nor a racing `/logout` holds). An
+/// unconditional delete then removed the ROTATED token, which was never
+/// revoked; the caller now re-reads and revokes that one instead.
 async fn bounded_then_delete<F>(
     pool: &sqlx::SqlitePool,
     sub: &str,
+    version: &super::store::SessionVersion,
     deadline: std::time::Duration,
     attempt: F,
-) -> Revocation
+) -> Attempt
 where
     F: std::future::Future<Output = Revocation>,
 {
@@ -369,11 +514,15 @@ where
         )),
     };
 
-    // Unconditional, exactly as in `sign_out`: the user asked to be logged out.
-    if let Err(err) = super::store::delete_session(pool, sub).await {
-        return Revocation::Failed(format!("deleting the local session: {err:#}"));
+    // Unconditional on the OUTCOME — the user asked to be logged out — but
+    // conditional on the row being the one whose tokens were just revoked.
+    match super::store::delete_session_if_unchanged(pool, sub, version).await {
+        Ok(true) => Attempt::Done(outcome),
+        Ok(false) => Attempt::Changed(outcome),
+        Err(err) => Attempt::Done(Revocation::Failed(format!(
+            "deleting the local session: {err:#}"
+        ))),
     }
-    outcome
 }
 
 #[cfg(test)]
@@ -581,10 +730,15 @@ mod tests {
         let (pool, codec) = db().await;
         stored(&pool, &codec).await;
 
+        let (_, version) = super::super::store::get_session_versioned(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .unwrap();
         let started = std::time::Instant::now();
-        let outcome = super::bounded_then_delete(
+        let attempt = super::bounded_then_delete(
             &pool,
             DID,
+            &version,
             std::time::Duration::from_millis(50),
             std::future::pending::<Revocation>(),
         )
@@ -594,6 +748,9 @@ mod tests {
             "the bound did not fire"
         );
 
+        let Attempt::Done(outcome) = attempt else {
+            panic!("the unchanged row was not deleted: {attempt:?}");
+        };
         match &outcome {
             Revocation::Failed(reason) => assert!(
                 reason.contains("did not finish within"),
@@ -927,6 +1084,11 @@ mod tests {
             .expect("listing the sessions");
 
         assert_eq!(revoke_requests(&log).len(), 3, "a failure stopped the walk");
+        assert!(
+            report.late.is_empty(),
+            "the first walk missed sessions a re-list had to find: {:?}",
+            report.late
+        );
         assert_eq!(
             report.revoked,
             vec![SUBS[0].to_string(), SUBS[2].to_string()]
@@ -1058,5 +1220,233 @@ mod tests {
             vec![NOW, NOW + 100, NOW + 200],
             "the assertions reused one timestamp — later ones would be expired on arrival"
         );
+    }
+
+    // ── a refresh racing the sign-out ────────────────────────────────────────
+
+    /// Store a session with refresh token `refresh` under a fresh codec — what
+    /// the live app's refresh does, from its own process, with the same key.
+    async fn rotate_to(pool: &sqlx::SqlitePool, refresh: &str) {
+        let codec = super::super::crypto::Codec::new(Some(KEY)).unwrap();
+        let key = super::super::keys::SigningKey::generate("session");
+        let session = OAuthSession {
+            dpop_key_jwk: key.to_jwk_json().unwrap(),
+            ..session("access-rotated", refresh)
+        };
+        super::super::store::put_session(pool, &codec, &session)
+            .await
+            .unwrap();
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// **A refresh that rotates the row mid-sign-out gets ITS token revoked
+    /// too — and the new token's row is never deleted unrevoked.**
+    ///
+    /// The live app refreshes under an in-process lock the operator's
+    /// revoke-all (a separate process) cannot take. The sign-out read R1; the
+    /// app rotated to R2; the PDS answers 200 for the already-rotated R1; and
+    /// an unconditional delete then removed the row holding R2 — reported as
+    /// revoked, never revoked, and gone from the record the post-stop sweep
+    /// reads. The same interleaving reaches `/logout` against a request's
+    /// background refresh, which takes that lock while `/logout` does not.
+    #[tokio::test]
+    async fn a_session_rotated_mid_sign_out_has_the_new_token_revoked_too() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                let first = {
+                    let mut v = seen.lock().unwrap();
+                    v.push(s.refresh_token.clone());
+                    v.len() == 1
+                };
+                if first {
+                    // The app's refresh lands between our read and our delete.
+                    rotate_to(&pool, "refresh-R2").await;
+                }
+                Revocation::Revoked
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["refresh-xyz".to_string(), "refresh-R2".to_string()],
+            "the rotated token was never presented for revocation"
+        );
+        assert_eq!(outcome, Revocation::Revoked);
+        assert!(
+            super::super::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the session survived a sign-out that revoked every version of it"
+        );
+    }
+
+    /// A row that keeps rotating is given up on after a bounded number of
+    /// attempts — reported as a failure, and the LATEST token left on record
+    /// (so a later pass can revoke it) rather than deleted unrevoked.
+    #[tokio::test]
+    async fn a_session_that_keeps_rotating_is_reported_and_left_in_place() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                let n = {
+                    let mut v = seen.lock().unwrap();
+                    v.push(s.refresh_token.clone());
+                    v.len()
+                };
+                rotate_to(&pool, &format!("refresh-R{}", n + 1)).await;
+                Revocation::Revoked
+            }
+        })
+        .await;
+
+        let attempts = seen.lock().unwrap().len();
+        assert_eq!(attempts, 3, "the retries were not bounded at 3");
+        match &outcome {
+            Revocation::Failed(reason) => assert!(
+                reason.contains("kept changing"),
+                "failed for the wrong reason: {reason}"
+            ),
+            other => panic!("a still-rotating session must not report success: {other:?}"),
+        }
+        let left = super::super::store::get_session(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .expect("the newest token was deleted unrevoked");
+        assert_eq!(left.refresh_token, "refresh-R4");
+    }
+
+    // ── sessions that appear during the walk ─────────────────────────────────
+
+    async fn insert_raw(pool: &sqlx::SqlitePool, sub: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO oauth_session (sub, issuer, aud, dpop_key_jwk, \
+             access_token, refresh_token, token_type, granted_scope, expires_at) \
+             VALUES (?, 'https://as.invalid', 'https://pds.invalid', 'x', 'x', 'x', \
+             'DPoP', 'atproto', NULL)",
+        )
+        .bind(sub)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// **A session created during the walk is found and signed out too.**
+    ///
+    /// The main pass runs while the app still serves (it must — the PDSes
+    /// fetch our client metadata to authenticate the revocation), so a login
+    /// can land behind the walk's cursor. Defence in depth: after the walk the
+    /// store is listed again, and anything new is walked as well.
+    #[tokio::test]
+    async fn a_session_created_during_the_walk_is_signed_out_by_a_re_list() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                async move {
+                    let first = {
+                        let mut c = calls.lock().unwrap();
+                        c.push(sub.clone());
+                        c.len() == 1
+                    };
+                    if first {
+                        // A user logs in while the first session is revoked.
+                        insert_raw(&pool, SUBS[1]).await;
+                    }
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![SUBS[0].to_string(), SUBS[1].to_string()],
+            "the session created mid-walk was never signed out"
+        );
+        assert_eq!(report.late, vec![SUBS[1].to_string()]);
+        assert_eq!(report.revoked.len(), 2);
+        assert_eq!(session_rows(&pool).await, 0);
+    }
+
+    /// The re-list is bounded: a store that keeps refilling is walked at most
+    /// twice more, and what remains is reported as FAILED (so the exit code
+    /// and the teardown say so) rather than looping forever.
+    #[tokio::test]
+    async fn the_re_list_is_bounded_and_reports_what_remains() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push(sub);
+                    // Never removed: it keeps coming back.
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "not bounded at 1 + 2 passes"
+        );
+        let still = report
+            .failed
+            .iter()
+            .find(|(sub, _)| sub == SUBS[0])
+            .expect("a session still stored after every pass was not reported");
+        assert!(still.1.contains("still stored"), "{}", still.1);
+    }
+
+    /// A row that disappears mid-sign-out (a concurrent `/logout`) is not an
+    /// error and not retried: the token that was read has been revoked, and
+    /// there is nothing left to delete.
+    #[tokio::test]
+    async fn a_session_deleted_mid_sign_out_reports_the_revocation() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                seen.lock().unwrap().push(s.refresh_token.clone());
+                super::super::store::delete_session(&pool, DID)
+                    .await
+                    .unwrap();
+                Revocation::Revoked
+            }
+        })
+        .await;
+        assert_eq!(outcome, Revocation::Revoked);
+        assert_eq!(seen.lock().unwrap().len(), 1, "retried a row that was gone");
     }
 }

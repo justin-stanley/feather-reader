@@ -46,12 +46,28 @@
 # Optional:
 #   FEATHERREADER_REPO_BACKEND  `rust` or `sidecar` (the app's default)
 #   FEATHERREADER_OAUTH_KEY_PATH  the Rust client's signing key; removed if set
-#   FR_REVOKE_CMD="..."       the Rust revoke, run with this environment (so it
-#                             sees FEATHERREADER_DB and the app's keys). Default:
+#   FR_REVOKE_CMD="..."       the Rust revoke. Default:
 #                             `featherreader --revoke-all-sessions` when
 #                             `featherreader` is on PATH. Required (the script
 #                             refuses without it) on the rust backend, or
-#                             whenever FEATHERREADER_DB holds Rust sessions.
+#                             whenever FEATHERREADER_DB holds Rust sessions; on
+#                             the sidecar backend it runs ONLY if there are.
+#                             It needs the app's FULL runtime environment — the
+#                             same one the serving app has: FEATHERREADER_DB,
+#                             FEATHERREADER_PUBLIC_URL (non-loopback),
+#                             FEATHERREADER_OAUTH_ENCRYPTION_KEY,
+#                             FEATHERREADER_OAUTH_KEY_PATH (the existing key),
+#                             FEATHERREADER_REPO_BACKEND, and the secrets
+#                             Config requires on a production-like instance
+#                             (FEATHERREADER_COOKIE_SECRET,
+#                             SIDECAR_INTERNAL_SECRET, …). Run it INSIDE that
+#                             environment — e.g. sourcing the systemd
+#                             EnvironmentFile, `docker compose exec featherreader
+#                             …`, or `fly ssh console -C` — not by re-typing
+#                             variables here. With sessions stored it refuses
+#                             (exit 2, nothing deleted) unless it is the
+#                             production client: confidential, a real encryption
+#                             key, and the existing signing key.
 #   FR_TEARDOWN_YES=1         skip the interactive confirmation
 #   FR_STOP_CMD="..."         command to stop the services before the wipe
 #                             (e.g. "systemctl stop featherreader oauth-sidecar")
@@ -89,6 +105,10 @@ revoke_cmd="${FR_REVOKE_CMD:-}"
 if [ -z "$revoke_cmd" ] && command -v featherreader >/dev/null; then
   revoke_cmd="featherreader --revoke-all-sessions"
 fi
+# Runs on the rust backend, or wherever FEATHERREADER_DB holds Rust sessions —
+# and NOT merely because a revoke command is available: on the sidecar backend
+# with no app DB, the binary would (rightly) refuse with "no database" and
+# abort a teardown that has nothing Rust to revoke.
 rust_step=0
 if [ "$backend" = "rust" ] || [ "${rust_rows:-0}" != "0" ]; then
   rust_step=1
@@ -100,8 +120,6 @@ if [ "$backend" = "rust" ] || [ "${rust_rows:-0}" != "0" ]; then
     echo "       deploy/teardown.md. Nothing has been changed." >&2
     exit 2
   fi
-elif [ -n "$revoke_cmd" ]; then
-  rust_step=1
 fi
 
 echo "FeatherReader TEARDOWN — this deletes ALL user data and revokes ALL sessions."
@@ -133,7 +151,10 @@ rust_revoke() {
   out="$(mktemp "${TMPDIR:-/tmp}/fr-revoke.XXXXXX")"
   eval "$revoke_cmd" >"$out" || rc=$?
   cat "$out"
-  last="$(grep -v '^[[:space:]]*$' "$out" | tail -n 1 || true)"
+  # `tr -d '\r'`: a TTY wrapper (docker compose exec from a terminal, ssh -t,
+  # fly ssh console) turns every \n into \r\n, and a trailing \r would make the
+  # sentinel never match — failing safe, but a teardown that can never finish.
+  last="$(tr -d '\r' <"$out" | grep -v '^[[:space:]]*$' | tail -n 1 || true)"
   rm -f "$out"
   failed=""
   if [[ "$last" =~ ^revoke-all-sessions:\ revoked=[0-9]+\ no_session=[0-9]+\ failed=([0-9]+)$ ]]; then
@@ -147,8 +168,14 @@ rust_revoke() {
   else
     echo "FATAL: the Rust revoke ($1) exited $rc with last line \"$last\" —" >&2
     echo "       not a completed --revoke-all-sessions (exit 0 or 3 plus its" >&2
-    echo "       summary line). Is the binary older than this script? ABORTING" >&2
-    echo "       before the wipe; see deploy/teardown.md." >&2
+    echo "       summary line)." >&2
+    if [ "$rc" = 2 ]; then
+      echo "       It REFUSED and deleted nothing; its reason is printed above" >&2
+      echo "       (usually an incomplete environment)." >&2
+    else
+      echo "       Is the binary older than this script, or did a wrapper fail?" >&2
+    fi
+    echo "       ABORTING before the wipe; see deploy/teardown.md." >&2
     exit 2
   fi
 }

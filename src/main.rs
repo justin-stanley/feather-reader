@@ -355,6 +355,45 @@ async fn run_revoke_all_with(config: &Config) -> i32 {
     code
 }
 
+/// Whether `runtime` is the production client — the only one that can revoke
+/// production's sessions.
+///
+/// An incomplete environment does not fail to build a runtime; it builds the
+/// WRONG one. Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to
+/// localhost, which is not production-like, so the production checks
+/// (encryption key included) never run and the runtime comes up as atproto's
+/// public dev client — possibly with the pass-through `Null` codec. Revoking
+/// with that sends every token under the wrong `client_id` or fails to decrypt
+/// every row, and each sign-out deletes its row anyway. So a run that will
+/// touch stored sessions requires all three: the confidential client (a
+/// non-loopback public URL), a real encryption codec, and the loaded key.
+fn fit_to_revoke(runtime: &feather_reader::oauth::runtime::OauthRuntime) -> Result<()> {
+    use feather_reader::oauth::client_auth::AuthMethod;
+    use feather_reader::oauth::crypto::Codec;
+    let mut missing = Vec::new();
+    if runtime.auth_method != AuthMethod::PrivateKeyJwt {
+        missing.push(
+            "the confidential client (FEATHERREADER_PUBLIC_URL is loopback or unset, so this \
+             would revoke as the public dev client)",
+        );
+    }
+    if matches!(runtime.codec, Codec::Null) {
+        missing.push("an encryption key (FEATHERREADER_OAUTH_ENCRYPTION_KEY is unset)");
+    }
+    if runtime.client_key.is_none() {
+        missing.push("the signing key (FEATHERREADER_OAUTH_KEY_PATH)");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "not the production OAuth client — missing {}. Run this inside the app's own \
+             environment",
+            missing.join("; ")
+        )
+    }
+}
+
 /// Revoke every stored session with `runtime`, printing a line per DID and a
 /// summary. Returns the process exit code.
 async fn revoke_all_sessions(
@@ -362,6 +401,7 @@ async fn revoke_all_sessions(
     runtime: Result<feather_reader::oauth::runtime::OauthRuntime>,
     http: &reqwest::Client,
 ) -> i32 {
+    let runtime = runtime.and_then(|rt| fit_to_revoke(&rt).map(|()| rt));
     let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -411,14 +451,20 @@ async fn revoke_all_sessions(
     for did in &report.no_session {
         println!("    already signed out {did}");
     }
-    for (did, reason) in &report.failed {
-        println!("    FAILED  {did}: {reason} (local session deleted anyway)");
+    for did in &report.late {
+        println!("    appeared during the walk (signed out by a re-list) {did}");
     }
+    for (did, reason) in &report.failed {
+        println!("    FAILED  {did}: {reason}");
+    }
+    // A failed revocation still deletes its row, EXCEPT a session that kept
+    // rotating or kept reappearing: that one is left on record, possibly live.
     println!(
-        "revoke-all: {} revoked, {} already gone, {} failed; every stored session was deleted.",
+        "revoke-all: {} revoked, {} already gone, {} failed ({} appeared during the walk).",
         report.revoked.len(),
         report.no_session.len(),
-        report.failed.len()
+        report.failed.len(),
+        report.late.len()
     );
     // LAST, always: the teardown requires it before it will wipe.
     println!("{}", revoke_all_sentinel(&report));
@@ -597,6 +643,7 @@ mod tests {
             revoked: vec!["did:plc:a".into()],
             no_session: vec!["did:plc:b".into()],
             failed: vec![],
+            late: vec![],
         };
         assert_eq!(revoke_all_exit_code(&ok), 0);
         let some_failed = RevokeAllReport {
@@ -618,6 +665,7 @@ mod tests {
             revoked: vec!["a".into(), "b".into()],
             no_session: vec!["c".into()],
             failed: vec![("d".into(), "x".into())],
+            late: vec![],
         };
         assert_eq!(
             revoke_all_sentinel(&report),
@@ -705,6 +753,86 @@ mod tests {
             "rows were deleted without a revocation"
         );
         pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **An incomplete environment must not revoke as the wrong client.**
+    ///
+    /// Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to localhost:
+    /// not production-like, so the production checks are skipped and the
+    /// runtime builds as atproto's PUBLIC dev client. Every revocation is then
+    /// sent under the wrong `client_id` (or the rows fail to decrypt), the
+    /// sign-out deletes each row anyway, and a teardown proceeds over live
+    /// tokens. With sessions stored, that runtime is refused and nothing goes.
+    #[tokio::test]
+    async fn a_public_dev_client_runtime_is_refused_while_sessions_are_stored() {
+        let dir = scratch("devclient");
+        let mut config = confidential_config(&dir);
+        config.public_url = "http://127.0.0.1:8080".into();
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+        assert!(runtime.is_ok(), "precondition: the dev runtime builds");
+        // Named as what it is, so the operator knows WHICH variable is missing
+        // (the keyless check alone would also refuse, for a misleading reason).
+        let why = format!(
+            "{:#}",
+            fit_to_revoke(runtime.as_ref().unwrap()).expect_err("the dev client was accepted")
+        );
+        assert!(why.contains("public dev client"), "{why}");
+
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new()).await;
+        assert_eq!(code, 2, "revoked as the public dev client");
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a confidential client with NO encryption key: the `Null`
+    /// codec cannot read a single production row, so every sign-out would
+    /// fail and delete.
+    #[tokio::test]
+    async fn a_null_codec_runtime_is_refused_while_sessions_are_stored() {
+        let dir = scratch("nullcodec");
+        let mut config = confidential_config(&dir);
+        config.oauth.encryption_key = None;
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+        assert!(
+            matches!(
+                runtime.as_ref().map(|rt| &rt.codec),
+                Ok(feather_reader::oauth::crypto::Codec::Null)
+            ),
+            "precondition: a confidential runtime with the Null codec"
+        );
+
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new()).await;
+        assert_eq!(code, 2, "revoked with the Null codec");
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fitness check accepts exactly the production client: confidential,
+    /// a real codec, and a loaded key.
+    #[test]
+    fn only_the_production_client_is_fit_to_revoke() {
+        let dir = scratch("fit");
+        let config = confidential_config(&dir);
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(fit_to_revoke(&rt).is_ok(), "{:?}", fit_to_revoke(&rt).err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A confidential client WITHOUT its key (the sidecar backend, no key file
+    /// on disk — `new` then neither loads nor creates one) cannot sign a single
+    /// client assertion, so it is not fit either.
+    #[test]
+    fn a_confidential_client_without_its_key_is_not_fit() {
+        let dir = scratch("nokeyfit");
+        let mut config = confidential_config(&dir);
+        config.repo_backend = feather_reader::metrics::Backend::Sidecar;
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(rt.client_key.is_none(), "precondition: no key loaded");
+        let err = fit_to_revoke(&rt).expect_err("a keyless confidential client was accepted");
+        assert!(format!("{err:#}").contains("signing key"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

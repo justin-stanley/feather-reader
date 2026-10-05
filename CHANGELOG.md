@@ -30,14 +30,15 @@ deploying is separate.
   `oauth_session` row with `oauth::store::list_session_subs`, which reads
   `sub` only, so rows that no longer decrypt are listed too. Each row goes
   through `sign_out_discovering`, the same sign-out `/logout` uses: a bounded
-  RFC 7009 revocation, then an unconditional delete. A failure does not stop
+  RFC 7009 revocation, then a delete whatever the PDS said. A failure does not stop
   the walk. The clock is read **per session**, because each sign-out mints a
   client assertion that is valid for 60 s. A single timestamp taken at the
   start would have expired every assertion sent after the first minute, so
   those revocations would have been rejected while their rows were deleted.
 
-  **Exit codes.** `0` means all revoked. `3` means some revocations failed,
-  but every row is deleted anyway. `2` means nothing was done, and in that
+  **Exit codes.** `0` means all revoked. `3` means some revocations failed;
+  their rows are deleted anyway, except one that kept rotating or reappearing.
+  `2` means nothing was done, and in that
   case nothing is deleted either. The causes of `2`:
 
   - bad configuration;
@@ -46,7 +47,12 @@ deploying is separate.
   - an unreadable store;
   - a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH`: this mode loads
     the key and never creates one, since a fresh key is one no PDS can verify;
-  - sessions stored with no buildable OAuth runtime.
+  - sessions stored with no buildable OAuth runtime;
+  - sessions stored while the client is not the production one: a loopback
+    or unset public URL, no encryption key, or no signing key. An incomplete
+    environment does not fail to start; it starts as atproto's public dev
+    client, or with a codec that cannot read a row. Every revocation would
+    then fail while every row was deleted.
 
   A completed run prints a last line,
   `revoke-all-sessions: revoked=N no_session=M failed=K`. Partial failure is
@@ -69,21 +75,58 @@ deploying is separate.
   sessions) and there is no revoke command. A Rust pass proceeds only on exit
   `0` with `failed=0`, or exit `3` with `failed>0` (which warns), and only if
   the sentinel is the last line of output. Anything else aborts before the
-  wipe. The `SIDECAR_*` variables are optional on the `rust` backend when no
-  `SIDECAR_DB` exists.
+  wipe. `\r` is stripped first, so a TTY wrapper's CRLF output still matches.
+  The `SIDECAR_*` variables are optional on the `rust` backend when no
+  `SIDECAR_DB` exists. On the `sidecar` backend the Rust step runs only if
+  `FEATHERREADER_DB` holds Rust sessions, not merely because a revoke command
+  is available.
 
-  **Tests.** New `scripts/test-teardown.sh`, 51 assertions, runs the real
+  **Sign-out vs. a concurrent refresh.** This changes `/logout` and
+  `/account/delete` too. The app refreshes a session under an in-process lock;
+  a sign-out does not take it, and the operator's revoke-all runs in another
+  process. Two interleavings left a live token behind:
+
+  - **Rotate, then delete.** The sign-out read R1. The refresh rotated the row
+    to R2. The PDS answered 200 for the stale R1, and the sign-out then deleted
+    the row holding R2, which was reported revoked and never revoked. The
+    sign-out's delete is now a compare-and-delete (`DELETE … WHERE` the stored
+    ciphertexts match what was read). On a mismatch it re-reads and revokes
+    the new tokens, up to 3 attempts. Past that it reports a failure and
+    **leaves** the newest tokens on record rather than deleting them unrevoked.
+  - **Delete, then rotate (resurrection).** The refresh's write was an upsert,
+    so a refresh in flight across a sign-out re-created the deleted session
+    with fresh tokens. It is now a conditional `UPDATE` against the version
+    the refresh started from. If the row is gone, the fresh tokens are revoked
+    (best-effort, bounded) and the caller gets "no session". If another writer
+    rotated the row, theirs is kept and returned, so no update is lost.
+    Login's write is still an upsert.
+
+  As defence in depth, `revoke_all` lists the store again after its walk and
+  walks anything new, up to 2 extra passes. Anything still stored after that
+  is reported as failed.
+
+  **Tests.** New `scripts/test-teardown.sh`, 64 assertions, runs the real
   script against throwaway SQLite files with stub commands. It is wired into
   CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
-  of the first 30 failed; the sentinel and exit-code cases failed 17 of 51
-  before the script required the sentinel.
+  of the first 30 failed. Each later round's cases failed first against the
+  script before that round's fix: the sentinel cases (17), the sidecar-backend
+  cases (6) and the CRLF cases (5).
 
-  Tests against a real-TLS fake authorization server cover revoke-all: every
-  session revoked, one server failing, an unreadable row, an empty store, and
-  each assertion's `iat` coming from its own clock reading.
+  Tests against a real-TLS fake authorization server cover:
 
-  Each new guard was broken on its own and a test failed every time (26 of
-  26).
+  - revoke-all: every session revoked, one server failing, an unreadable row,
+    an empty store;
+  - each assertion's `iat` coming from its own clock reading;
+  - a refresh against a deleted row (no resurrection, fresh token revoked) and
+    against another writer's rotation (no lost update).
+
+  Injected-hook tests cover a rotation between read and delete, a row that
+  keeps rotating, a row deleted concurrently, sessions created during the
+  walk, and the bounded re-list. Main-binary tests cover the dev-client,
+  Null-codec and keyless refusals.
+
+  Each new guard was broken on its own and a test failed every time (42 of
+  42).
   `deploy/teardown.md` gains the procedure, including Fly's.
 
 ### Docs

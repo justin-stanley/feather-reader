@@ -153,6 +153,7 @@ impl Repo<'_> {
                 client_id: &rust.client_id,
                 auth_method: rust.auth_method,
                 client_key: rust.client_key.as_ref(),
+                revocation_endpoint: server.revocation_endpoint.as_deref(),
             };
             oauth::session::valid_session(
                 &self.state.db,

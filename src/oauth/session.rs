@@ -122,6 +122,10 @@ pub struct RefreshContext<'a> {
     /// The confidential client's signing key. Required for `private_key_jwt`,
     /// unused by the localhost dev client.
     pub client_key: Option<&'a super::keys::SigningKey>,
+    /// From the same discovery as `token_endpoint`. Used only when a refresh
+    /// finds its session was signed out while it ran: the tokens it just
+    /// obtained belong to no one, and are revoked rather than left live.
+    pub revocation_endpoint: Option<&'a str>,
 }
 
 /// Read a session, refreshing it first if it is close to expiry.
@@ -150,7 +154,7 @@ pub async fn valid_session(
 
     // Re-read AFTER acquiring the lock: whoever held it may have refreshed while
     // we waited, and presenting the token they just replaced would burn it.
-    let session = super::store::get_session(pool, codec, sub)
+    let (session, version) = super::store::get_session_versioned(pool, codec, sub)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session for {sub} disappeared while waiting to refresh"))?;
     if !super::token::is_stale(session.expires_at, now) {
@@ -162,15 +166,72 @@ pub async fn valid_session(
     // line missed every refresh that failed in discovery, which is where the two
     // likeliest failures live (an unreachable PDS, and the issuer-mismatch
     // check). See the span in `repo.rs`.
-    refresh_locked(pool, codec, http, &session, ctx, now).await
+    refresh_locked(pool, codec, http, &session, &version, ctx, now).await
 }
 
-/// The refresh itself. Called with the subject's lock held.
+/// A refresh succeeded at the server, but the row it started from is no longer
+/// on record. Two cases:
+///
+/// * **Rewritten** by another writer (another process's refresh, a re-login):
+///   theirs is the session on record, so it is returned and ours is NOT
+///   written over it. Our tokens are not revoked: from a single-use rotation
+///   they may share a grant with theirs, and revoking ours could end both.
+/// * **Gone**: it was signed out while we refreshed. We now hold a live token
+///   set for a session that no longer exists; it is revoked (best-effort,
+///   bounded) instead of being written back, and the caller gets the same
+///   "no session" error a signed-out user gets.
+async fn lost_the_row(
+    pool: &sqlx::SqlitePool,
+    codec: &super::crypto::Codec,
+    http: &reqwest::Client,
+    ctx: &RefreshContext<'_>,
+    obtained: &OAuthSession,
+    now: i64,
+) -> Result<OAuthSession> {
+    if let Some(current) = super::store::get_session(pool, codec, &obtained.sub).await? {
+        return Ok(current);
+    }
+    let outcome = super::revoke::revoke_orphaned(
+        pool,
+        http,
+        &super::revoke::RevokeContext {
+            revocation_endpoint: ctx.revocation_endpoint,
+            client_id: ctx.client_id,
+            auth_method: ctx.auth_method,
+            client_key: ctx.client_key,
+            deadline: super::revoke::ORPHAN_REVOKE_DEADLINE,
+        },
+        obtained,
+        now,
+    )
+    .await;
+    if let super::revoke::Revocation::Failed(reason) = &outcome {
+        tracing::warn!(
+            sub = %obtained.sub,
+            %reason,
+            "a session signed out during its refresh: the new tokens could not be revoked"
+        );
+    }
+    bail!(
+        "no session for {}: it was signed out while being refreshed (the new tokens were \
+         not stored{})",
+        obtained.sub,
+        if outcome == super::revoke::Revocation::Revoked {
+            ", and were revoked"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The refresh itself. Called with the subject's lock held; `version` is the
+/// stored form of `session` as read under that lock.
 async fn refresh_locked(
     pool: &sqlx::SqlitePool,
     codec: &super::crypto::Codec,
     http: &reqwest::Client,
     session: &OAuthSession,
+    version: &super::store::SessionVersion,
     ctx: &RefreshContext<'_>,
     now: i64,
 ) -> Result<OAuthSession> {
@@ -218,7 +279,15 @@ async fn refresh_locked(
     if outcome.is_success() {
         let response = super::token::parse_token_response(&outcome.json()?)?;
         let updated = apply_refresh(session, &response, now)?;
-        super::store::put_session(pool, codec, &updated).await?;
+        // **Conditional on the row we started from — never an upsert.** The
+        // lock above is in-process; a sign-out (`/logout`, account deletion,
+        // the operator's revoke-all in another process) does not take it. An
+        // upsert landing after such a sign-out's delete RESURRECTED the
+        // session with these fresh tokens, after it had been reported signed
+        // out.
+        if !super::store::update_session_if_unchanged(pool, codec, &updated, version).await? {
+            return lost_the_row(pool, codec, http, ctx, &updated, now).await;
+        }
         // Logged because a refresh is otherwise INVISIBLE: it rotates both
         // tokens and is the one path that can silently end a session, but it
         // happens inside an ordinary page load and the metrics record that call
@@ -438,5 +507,203 @@ mod tests {
         assert!(same_issuer("https://pds.example.com/", "https://pds.example.com").is_err());
         assert!(same_issuer("https://PDS.example.com", "https://pds.example.com").is_err());
         assert!(same_issuer("", "https://pds.example.com").is_err());
+    }
+
+    // ── the refresh's write vs a concurrent sign-out ─────────────────────────
+
+    const KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// An authorization server over real TLS whose `/token` rotates to
+    /// `rotated-refresh` and whose `/revoke` accepts.
+    async fn token_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let (addr, log) = crate::net::spawn_tls(|_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert(
+                "/token".to_string(),
+                vec![crate::net::TestResponse::json(
+                    200,
+                    serde_json::json!({
+                        "access_token": "rotated-access",
+                        "refresh_token": "rotated-refresh",
+                        "token_type": "DPoP",
+                        "scope": "atproto",
+                        "sub": DID,
+                        "expires_in": 3600,
+                    })
+                    .to_string(),
+                )],
+            );
+            r.insert(
+                "/revoke".to_string(),
+                vec![crate::net::TestResponse::json(200, "{}")],
+            );
+            r
+        })
+        .await;
+        crate::net::test_host_override("as-e2e.test", addr);
+        (format!("https://as-e2e.test:{}", addr.port()), log)
+    }
+
+    /// An expired session stored under a real codec, and the version read back.
+    async fn stored_stale() -> (
+        sqlx::SqlitePool,
+        crate::oauth::crypto::Codec,
+        OAuthSession,
+        crate::oauth::store::SessionVersion,
+    ) {
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        let codec = crate::oauth::crypto::Codec::new(Some(KEY)).unwrap();
+        let stale = OAuthSession {
+            dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                .to_jwk_json()
+                .unwrap(),
+            expires_at: Some(NOW - 1),
+            ..session()
+        };
+        crate::oauth::store::put_session(&pool, &codec, &stale)
+            .await
+            .unwrap();
+        let (read, version) = crate::oauth::store::get_session_versioned(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .unwrap();
+        (pool, codec, read, version)
+    }
+
+    fn ctx<'a>(token: &'a str, revoke: &'a str) -> RefreshContext<'a> {
+        RefreshContext {
+            token_endpoint: token,
+            client_id: "http://localhost",
+            auth_method: super::super::client_auth::AuthMethod::None,
+            client_key: None,
+            revocation_endpoint: Some(revoke),
+        }
+    }
+
+    /// **A refresh must not resurrect a session signed out while it ran.**
+    ///
+    /// The refresh lock is in-process; a sign-out does not take it (and the
+    /// operator's revoke-all runs in another process). The refresh's write was
+    /// an upsert, so a sign-out that deleted the row while the token request
+    /// was in flight was undone: the session came back holding the fresh
+    /// tokens, after being reported signed out — and on Fly no later pass
+    /// would ever see it. The fresh tokens belong to no one, so they are
+    /// revoked instead.
+    #[tokio::test]
+    async fn a_refresh_does_not_resurrect_a_session_signed_out_mid_refresh() {
+        let (base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (pool, codec, session, version) = stored_stale().await;
+
+        // The sign-out lands while the refresh is in flight.
+        crate::oauth::store::delete_session(&pool, DID)
+            .await
+            .unwrap();
+
+        let result = refresh_locked(
+            &pool,
+            &codec,
+            &reqwest::Client::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await;
+
+        assert!(
+            crate::oauth::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the refresh RESURRECTED a signed-out session"
+        );
+        let err = result.expect_err("a signed-out session must not be handed back");
+        assert!(
+            format!("{err:#}").contains("signed out while being refreshed"),
+            "{err:#}"
+        );
+        let seen = log.lock().unwrap().join("\n---\n");
+        assert!(
+            seen.contains("POST /revoke") && seen.contains("token=rotated-refresh"),
+            "the orphaned fresh token was left live:\n{seen}"
+        );
+    }
+
+    /// **No lost update:** a row another writer rotated while this refresh ran
+    /// is kept, not overwritten — and theirs is what the caller gets.
+    #[tokio::test]
+    async fn a_refresh_does_not_overwrite_a_concurrent_rotation() {
+        let (base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (pool, codec, session, version) = stored_stale().await;
+
+        let theirs = OAuthSession {
+            refresh_token: "their-refresh".into(),
+            access_token: "their-access".into(),
+            expires_at: Some(NOW + 3600),
+            ..session.clone()
+        };
+        crate::oauth::store::put_session(&pool, &codec, &theirs)
+            .await
+            .unwrap();
+
+        let got = refresh_locked(
+            &pool,
+            &codec,
+            &reqwest::Client::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect("a concurrent rotation is not an error");
+
+        let stored = crate::oauth::store::get_session(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.refresh_token, "their-refresh",
+            "the other writer's rotation was overwritten"
+        );
+        assert_eq!(got.refresh_token, "their-refresh");
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("POST /revoke")),
+            "revoked a token that may share a grant with the live one"
+        );
+    }
+
+    /// The ordinary refresh still writes.
+    #[tokio::test]
+    async fn an_uncontested_refresh_stores_the_rotated_tokens() {
+        let (base, _log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (pool, codec, session, version) = stored_stale().await;
+
+        let got = refresh_locked(
+            &pool,
+            &codec,
+            &reqwest::Client::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect("refresh");
+        assert_eq!(got.refresh_token, "rotated-refresh");
+        assert_eq!(
+            crate::oauth::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .unwrap()
+                .refresh_token,
+            "rotated-refresh"
+        );
     }
 }

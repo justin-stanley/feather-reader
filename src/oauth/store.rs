@@ -422,6 +422,7 @@ struct SessionRow {
 /// re-auth after expiry), and a plain insert would fail on the primary key and
 /// 500 every subsequent login.
 pub async fn put_session(pool: &SqlitePool, codec: &Codec, session: &OAuthSession) -> Result<()> {
+    let [dpop_key_jwk, access_token, refresh_token] = encrypt_secrets(codec, session);
     sqlx::query(
         r#"
         INSERT INTO oauth_session (
@@ -442,42 +443,9 @@ pub async fn put_session(pool: &SqlitePool, codec: &Codec, session: &OAuthSessio
     .bind(&session.sub)
     .bind(&session.issuer)
     .bind(&session.aud)
-    .bind(codec.encrypt_bound(
-        &session.dpop_key_jwk,
-        &session_aad(
-            &session.sub,
-            "dpop_key_jwk",
-            &session.issuer,
-            &session.aud,
-            &session.token_type,
-            &session.granted_scope,
-            session.expires_at,
-        ),
-    ))
-    .bind(codec.encrypt_bound(
-        &session.access_token,
-        &session_aad(
-            &session.sub,
-            "access_token",
-            &session.issuer,
-            &session.aud,
-            &session.token_type,
-            &session.granted_scope,
-            session.expires_at,
-        ),
-    ))
-    .bind(codec.encrypt_bound(
-        &session.refresh_token,
-        &session_aad(
-            &session.sub,
-            "refresh_token",
-            &session.issuer,
-            &session.aud,
-            &session.token_type,
-            &session.granted_scope,
-            session.expires_at,
-        ),
-    ))
+    .bind(dpop_key_jwk)
+    .bind(access_token)
+    .bind(refresh_token)
     .bind(&session.token_type)
     .bind(&session.granted_scope)
     .bind(session.expires_at)
@@ -493,6 +461,32 @@ pub async fn get_session(
     codec: &Codec,
     sub: &str,
 ) -> Result<Option<OAuthSession>> {
+    Ok(get_session_versioned(pool, codec, sub)
+        .await?
+        .map(|(session, _)| session))
+}
+
+/// The stored form of a session's secrets, exactly as read — what
+/// [`delete_session_if_unchanged`] compares against.
+///
+/// Every write re-encrypts under a fresh nonce, so ANY `put_session` since the
+/// read (a refresh rotating the tokens, a re-login) changes these, even one that
+/// happened to store the same plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionVersion {
+    dpop_key_jwk: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+/// [`get_session`], also returning the [`SessionVersion`] of the row it read —
+/// both from ONE row read, so the version is guaranteed to be the one the
+/// returned tokens came from.
+pub async fn get_session_versioned(
+    pool: &SqlitePool,
+    codec: &Codec,
+    sub: &str,
+) -> Result<Option<(OAuthSession, SessionVersion)>> {
     let row: Option<SessionRow> = sqlx::query_as(
         r#"
         SELECT sub, issuer, aud, dpop_key_jwk, access_token, refresh_token,
@@ -517,7 +511,7 @@ pub async fn get_session(
             row.expires_at,
         )
     };
-    Ok(Some(OAuthSession {
+    let session = OAuthSession {
         dpop_key_jwk: codec
             .decrypt_bound(&row.dpop_key_jwk, &aad("dpop_key_jwk"))
             .context("decrypting the session DPoP key (or its bound context was altered)")?,
@@ -533,7 +527,116 @@ pub async fn get_session(
         token_type: row.token_type,
         granted_scope: row.granted_scope,
         expires_at: row.expires_at,
-    }))
+    };
+    let version = SessionVersion {
+        dpop_key_jwk: row.dpop_key_jwk,
+        access_token: row.access_token,
+        refresh_token: row.refresh_token,
+    };
+    Ok(Some((session, version)))
+}
+
+/// Replace a session's tokens ONLY if the row still holds the secrets of
+/// `version` — the one the refresh started from. `true` if it was written;
+/// `false` if the row is gone or was rewritten since (nothing is written).
+///
+/// The refresh's write. [`put_session`] is an upsert, which is right for a
+/// login and wrong here: a sign-out (a `/logout`, the operator's revoke-all)
+/// that deleted the row while the refresh was in flight would have it
+/// RESURRECTED with the brand-new tokens, after reporting it signed out. And a
+/// row another writer rotated meanwhile would be silently overwritten.
+pub async fn update_session_if_unchanged(
+    pool: &SqlitePool,
+    codec: &Codec,
+    session: &OAuthSession,
+    version: &SessionVersion,
+) -> Result<bool> {
+    let [dpop_key_jwk, access_token, refresh_token] = encrypt_secrets(codec, session);
+    // One statement, so the comparison and the write are atomic.
+    let result = sqlx::query(
+        r#"
+        UPDATE oauth_session SET
+            issuer        = ?2,
+            aud           = ?3,
+            dpop_key_jwk  = ?4,
+            access_token  = ?5,
+            refresh_token = ?6,
+            token_type    = ?7,
+            granted_scope = ?8,
+            expires_at    = ?9
+        WHERE sub = ?1
+          AND dpop_key_jwk = ?10 AND access_token = ?11 AND refresh_token = ?12
+        "#,
+    )
+    .bind(&session.sub)
+    .bind(&session.issuer)
+    .bind(&session.aud)
+    .bind(dpop_key_jwk)
+    .bind(access_token)
+    .bind(refresh_token)
+    .bind(&session.token_type)
+    .bind(&session.granted_scope)
+    .bind(session.expires_at)
+    .bind(&version.dpop_key_jwk)
+    .bind(&version.access_token)
+    .bind(&version.refresh_token)
+    .execute(pool)
+    .await
+    .context("updating the OAuth session (if unchanged)")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// A session's three secret columns, encrypted and bound to the row's context
+/// exactly as [`put_session`] stores them.
+fn encrypt_secrets(codec: &Codec, session: &OAuthSession) -> [String; 3] {
+    let bound = |column: &str, plaintext: &str| {
+        codec.encrypt_bound(
+            plaintext,
+            &session_aad(
+                &session.sub,
+                column,
+                &session.issuer,
+                &session.aud,
+                &session.token_type,
+                &session.granted_scope,
+                session.expires_at,
+            ),
+        )
+    };
+    [
+        bound("dpop_key_jwk", &session.dpop_key_jwk),
+        bound("access_token", &session.access_token),
+        bound("refresh_token", &session.refresh_token),
+    ]
+}
+
+/// Delete a session ONLY if it still holds the secrets of `version`. `true` if
+/// it was deleted; `false` if the row is gone or has been rewritten since.
+///
+/// The sign-out's delete. A sign-out revokes the token it READ and then
+/// deletes; if a refresh rotated the row in between (the live app refreshes
+/// under an in-process lock a separate process cannot share), an
+/// unconditional delete removes the NEW token — never revoked, and no longer
+/// on record for anyone to revoke.
+pub async fn delete_session_if_unchanged(
+    pool: &SqlitePool,
+    sub: &str,
+    version: &SessionVersion,
+) -> Result<bool> {
+    // One statement: the comparison and the delete are atomic, so a write
+    // landing between "check" and "delete" is impossible.
+    let result = sqlx::query(
+        "DELETE FROM oauth_session WHERE sub = ?1 AND dpop_key_jwk = ?2 \
+         AND access_token = ?3 AND refresh_token = ?4",
+    )
+    .bind(sub)
+    .bind(&version.dpop_key_jwk)
+    .bind(&version.access_token)
+    .bind(&version.refresh_token)
+    .execute(pool)
+    .await
+    .context("deleting the OAuth session (if unchanged)")?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Every stored session's subject DID, in a stable order.
@@ -1262,6 +1365,46 @@ mod tests {
             .await?;
 
         assert!(get_session(&pool, &codec, DID).await.is_err());
+        Ok(())
+    }
+
+    /// **The conditional delete removes only the version that was read.** A
+    /// refresh that rotated the row since — even one storing identical
+    /// plaintext, since every write re-encrypts — leaves it in place.
+    #[tokio::test]
+    async fn a_rewritten_session_is_not_deleted_by_a_stale_version() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        put_session(&pool, &codec, &session()).await?;
+        let (_, stale) = get_session_versioned(&pool, &codec, DID).await?.unwrap();
+
+        let rotated = OAuthSession {
+            refresh_token: "refresh-rotated".into(),
+            ..session()
+        };
+        put_session(&pool, &codec, &rotated).await?;
+        assert!(
+            !delete_session_if_unchanged(&pool, DID, &stale).await?,
+            "reported deleting a row it should have left"
+        );
+        assert_eq!(
+            get_session(&pool, &codec, DID)
+                .await?
+                .unwrap()
+                .refresh_token,
+            "refresh-rotated",
+            "the ROTATED token was deleted on the strength of a stale read"
+        );
+
+        // Identical plaintext, rewritten: still a different version.
+        let (_, before) = get_session_versioned(&pool, &codec, DID).await?.unwrap();
+        put_session(&pool, &codec, &rotated).await?;
+        assert!(!delete_session_if_unchanged(&pool, DID, &before).await?);
+
+        // The current version deletes.
+        let (_, current) = get_session_versioned(&pool, &codec, DID).await?.unwrap();
+        assert!(delete_session_if_unchanged(&pool, DID, &current).await?);
+        assert!(get_session(&pool, &codec, DID).await?.is_none());
+        assert!(!delete_session_if_unchanged(&pool, DID, &current).await?);
         Ok(())
     }
 

@@ -28,16 +28,51 @@ them is the app binary itself:
 featherreader --revoke-all-sessions
 ```
 
-It must run with the **app's own environment**: `FEATHERREADER_DB`,
-`FEATHERREADER_OAUTH_ENCRYPTION_KEY`, `FEATHERREADER_PUBLIC_URL`,
-`FEATHERREADER_OAUTH_KEY_PATH` and the secrets `Config` insists on in
-production. For every row of `oauth_session` it runs the same sign-out that
-`/logout` uses: it discovers the PDS's revocation endpoint, revokes the refresh
-token there (RFC 7009), and deletes the row **whatever the PDS says**, including
-rows that no longer decrypt. Sign-outs run one at a time, and each is
-deadline-bounded. Each sign-out reads the clock afresh, because its client
-assertion is valid for only 60 s. A long walk therefore never sends an expired
-assertion.
+**Run it inside the app's own environment.** Use one of:
+
+- `fly ssh console -C`;
+- `docker compose exec featherreader …`;
+- the service's systemd `EnvironmentFile`, sourced:
+  `set -a; . /etc/featherreader/env; set +a`.
+
+Don't rebuild that environment by hand. It needs the app's **full** runtime
+environment:
+
+- `FEATHERREADER_DB`;
+- `FEATHERREADER_PUBLIC_URL` (the real, non-loopback URL);
+- `FEATHERREADER_OAUTH_ENCRYPTION_KEY`;
+- `FEATHERREADER_OAUTH_KEY_PATH`, pointing at the **existing** key;
+- `FEATHERREADER_REPO_BACKEND`;
+- the secrets `Config` requires on a production-like instance
+  (`FEATHERREADER_COOKIE_SECRET`, `SIDECAR_INTERNAL_SECRET`, …).
+
+An incomplete environment does not fail to start; it starts as the **wrong
+client**. Without `FEATHERREADER_PUBLIC_URL`, the config falls back to
+localhost, so it would revoke as atproto's public dev client. Without the
+encryption key, it can't read a single row. Either way every revocation fails
+and every row is deleted anyway. So while sessions are stored, it refuses with
+exit 2 and deletes nothing unless it is the production client: confidential,
+with a real encryption key and the existing signing key.
+
+For every row of `oauth_session` it runs the same sign-out that `/logout`
+uses: it discovers the PDS's revocation endpoint, revokes the refresh token
+there (RFC 7009), and deletes the row **whatever the PDS says**, including rows
+that no longer decrypt. Sign-outs run one at a time, and each is
+deadline-bounded.
+
+- **Clock per session.** Each sign-out reads the clock afresh, because its
+  client assertion is valid for only 60 s. A long walk therefore never sends an
+  expired assertion.
+- **Rotation during sign-out.** The delete is a **compare-and-delete**. If the
+  live app rotated the session's tokens while it was being revoked, the row is
+  read again and the new tokens are revoked too. After 3 such attempts it gives
+  up: the newest tokens are left on record and the DID is reported as failed.
+- **No resurrection.** The app's own refresh no longer writes back a session
+  that was signed out while it ran. It revokes the tokens it just obtained
+  instead.
+- **Re-list.** After the walk, the store is listed again. Sessions that
+  appeared meanwhile (a login on the still-serving app) are walked too, for up
+  to two extra passes. Anything still stored after that is reported as failed.
 
 It prints a line per DID, a summary, and, **last**, a sentinel line:
 
@@ -50,7 +85,7 @@ It then exits with:
 | Exit | Meaning | `teardown.sh` does |
 |---|---|---|
 | `0` + sentinel with `failed=0` | Every session revoked, or none stored. | Continues. |
-| `3` + sentinel with `failed>0` | Some revocations failed. **Every row is still deleted.** Those tokens may stay live at their PDS until they expire. | Warns and continues. |
+| `3` + sentinel with `failed>0` | Some revocations failed. Those rows are still deleted, except a session that kept rotating or kept reappearing, which is left on record. Those tokens may stay live at their PDS until they expire. | Warns and continues. |
 | `2`, no sentinel | Nothing was done and **nothing deleted**; fix the cause and run it again. See the list below. | Aborts before the wipe. |
 | anything else, or a missing or contradictory sentinel | Not a completed revoke-all. | Aborts before the wipe. |
 
@@ -60,9 +95,11 @@ What makes it exit `2`:
 - no database at `FEATHERREADER_DB` (it will not create one and report "0 sessions" about the wrong file);
 - an unreadable store;
 - a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH` (it will not create one);
-- the Rust OAuth client cannot be built while sessions are stored.
+- the Rust OAuth client cannot be built while sessions are stored;
+- the client is not the production one while sessions are stored: a loopback
+  or unset public URL, no encryption key, or no signing key.
 
-The last two only stop it when sessions are stored. A missing key matters
+The last three only stop it when sessions are stored. A missing key matters
 because a freshly created key is one no PDS can verify: every revocation would
 fail, and the rows would be deleted anyway.
 
@@ -167,12 +204,24 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
 ```
 
 - **`FR_REVOKE_CMD`** defaults to `featherreader --revoke-all-sessions` when
-  `featherreader` is on `PATH`. It runs with the script's environment, and
-  `FEATHERREADER_DB` is exported to it, so it revokes the file that is about to
-  be wiped.
+  `featherreader` is on `PATH`.
+  - It runs with the script's environment, and `FEATHERREADER_DB` is exported
+    to it.
+  - Make it source the app's own environment, as above. The script's handful
+    of variables is **not** enough: see
+    [the full list](#revoking-the-rust-backends-sessions).
+  - If the env file also sets `FEATHERREADER_DB`, it must name the same file
+    the script will wipe.
+  - On the `sidecar` backend it runs **only** if `FEATHERREADER_DB` exists and
+    holds Rust sessions. Merely having it available is not enough; otherwise
+    the binary would refuse with "no database" and block a teardown with
+    nothing Rust to revoke.
 - **The script refuses** (exit 2, before anything irreversible) when the
   backend is `rust`, or `FEATHERREADER_DB` holds Rust sessions, and there is no
   revoke command.
+- **TTY wrappers.** A revoke command run through one (`docker compose exec`
+  from a terminal, `ssh -t`) produces CRLF output. The script strips the `\r`
+  before it reads the sentinel.
 - **The `SIDECAR_*` variables** are optional on the `rust` backend when no
   `SIDECAR_DB` file exists.
 - **`FR_STOP_CMD`** stops the services between the two Rust passes. Without it

@@ -75,12 +75,15 @@ EOF
 n=\$(grep -c '^rust-revoke' "$LOG")
 line=\$(sed -n "\$((n + 1))p" "$T/revoke-exits" 2>/dev/null)
 [ -n "\$line" ] || line=\$(tail -n 1 "$T/revoke-exits" 2>/dev/null)
-read -r code sentinel <<<"\$line"
+read -r code sentinel eol <<<"\$line"
+# eol=crlf: what a TTY wrapper (docker compose exec, ssh -t, fly ssh console)
+# makes of every newline.
+end='\n'; [ "\${eol:-}" = crlf ] && end='\r\n'
 [ -f "\$FEATHERREADER_DB" ] && present=db-present || present=db-absent
 echo "rust-revoke \$present \$FEATHERREADER_DB" >>"$LOG"
-echo "    revoked did:plc:rust1"
+printf "    revoked did:plc:rust1\$end"
 case "\$sentinel" in
-  f*) echo "revoke-all-sessions: revoked=1 no_session=0 failed=\${sentinel#f}" ;;
+  f*) printf "revoke-all-sessions: revoked=1 no_session=0 failed=%s\$end" "\${sentinel#f}" ;;
 esac
 exit "\${code:-0}"
 EOF
@@ -144,6 +147,26 @@ check "order is sidecar-revoke stop (got: $(order))" '[ "$(order)" = "sidecar-re
 check "both DBs are wiped" '[ ! -e "$APP_DB" ] && [ ! -e "$SC_DB" ]'
 teardown_sandbox
 
+# On the sidecar backend a revoke command being AVAILABLE is not a reason to
+# run it: with no app DB (or no Rust sessions in it) the binary would refuse
+# with 2 ("no database") and abort a teardown that has nothing Rust to revoke.
+for variant in "no app DB" "app DB without Rust sessions"; do
+  echo "== sidecar backend, revoke command available, $variant: rust step skipped"
+  setup; sidecar_env
+  if [ "$variant" = "no app DB" ]; then
+    rm -f "$APP_DB"
+  else
+    "$SQLITE3" "$APP_DB" "DELETE FROM oauth_session;"
+  fi
+  echo "2 -" >"$T/revoke-exits"
+  run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" \
+      FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+  check "exits 0" '[ "$CODE" = 0 ]'
+  check "order is sidecar-revoke stop (got: $(order))" '[ "$(order)" = "sidecar-revoke stop" ]'
+  check "the sidecar DB is wiped" '[ ! -e "$SC_DB" ]'
+  teardown_sandbox
+done
+
 # Outcomes of the FIRST pass that must abort with nothing stopped or wiped.
 # Only (0 + sentinel failed=0) and (3 + sentinel failed>0) may proceed.
 #   "2 -"  the binary's own "nothing done"
@@ -182,6 +205,34 @@ run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "exits non-zero" '[ "$CODE" != 0 ]'
 check "the app DB and key are still present" '[ -f "$APP_DB" ] && [ -f "$KEY" ]'
+teardown_sandbox
+
+echo "== CRLF output from a TTY wrapper, exit 0 + sentinel: proceeds"
+setup; sidecar_env
+echo "0 f0 crlf" >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits 0" '[ "$CODE" = 0 ]'
+check "every file is wiped" 'none_present'
+teardown_sandbox
+
+echo "== CRLF output from a TTY wrapper, exit 3 + failed>0: warns and wipes"
+setup; sidecar_env
+echo "3 f2 crlf" >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits 0" '[ "$CODE" = 0 ]'
+check "warns about 2 failures" 'grep -q "WARN: 2 Rust revocation" <<<"$OUT"'
+check "every file is wiped" 'none_present'
+teardown_sandbox
+
+echo "== CRLF output, exit 1 + sentinel: still aborts"
+setup; sidecar_env
+echo "1 f1 crlf" >"$T/revoke-exits"
+run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits non-zero" '[ "$CODE" != 0 ]'
+check "every file is still present" 'all_present'
 teardown_sandbox
 
 echo "== rust revoke exits 3 with its sentinel (some failures): warn and wipe"
