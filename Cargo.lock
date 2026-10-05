@@ -844,6 +844,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "siphasher",
  "sqlx",
  "subtle",
  "thiserror",

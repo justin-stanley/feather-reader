@@ -39,6 +39,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "g
 
 # --- feed parsing --------------------------------------------------------
 feed-rs = "3.0"
+# A specified hash for stored dedup keys (`feed::dedup_hasher`); std's
+# `DefaultHasher` may change between Rust releases. Already in the tree via
+# feed-rs and phf.
+siphasher = "1"
 
 # --- HTML sanitization (feeds are hostile input) -------------------------
 ammonia = "4"

@@ -1364,11 +1364,34 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
 /// random UUID, which made the item a new row on every poll); `normalize_entry`
 /// then derives [`stable_guid`]. `parse` has no base URI, so feed-rs's
 /// uri+title branch was never reached and nothing else is lost.
-fn parse_feed(body: &[u8]) -> Result<RawFeed, feed_rs::parser::ParseFeedError> {
-    feed_rs::parser::Builder::new()
-        .id_generator(entry_id)
-        .build()
-        .parse(body)
+///
+/// **A panic inside feed-rs is returned as an error.** feed-rs 3.0 panics on
+/// some hostile-but-plausible input — an author address with a multi-byte
+/// character beside it, e.g. `jose@example.com（José）` (its name/address
+/// splitter slices on a byte that is not a character boundary). Feed bodies are
+/// arbitrary web input, so any such panic is a malformed feed: it takes the
+/// ordinary parse-failure path (logged, `FailureKind::Parse`, backed off) rather
+/// than unwinding out of the poll task, which recorded nothing and left the
+/// feed silently un-polled. Unwinding is safe here: the parser is built and
+/// dropped inside the closure and touches no state of ours.
+fn parse_feed(body: &[u8]) -> Result<RawFeed> {
+    let parsed = std::panic::catch_unwind(|| {
+        feed_rs::parser::Builder::new()
+            .id_generator(entry_id)
+            .build()
+            .parse(body)
+    });
+    match parsed {
+        Ok(result) => Ok(result?),
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            anyhow::bail!("feed parser panicked: {why}")
+        }
+    }
 }
 
 /// The id generator [`parse_feed`] installs; see there.
@@ -1457,14 +1480,19 @@ fn entry_link(e: &RawEntry) -> Option<String> {
 /// only as an address has no name and no byline — the address is not shown.
 /// (feed-rs 2.4 named every RSS `<author>` "author", and an Atom author with no
 /// name "unknown"; those placeholders were stored as bylines.)
+///
+/// The byline is the first author that has a name once stripped: an item may
+/// give `<author>` as a bare address and the name in `<dc:creator>`.
 fn entry_author(e: &RawEntry) -> Option<String> {
-    let name = e.authors.first()?.name.as_deref()?.trim();
-    let name = [('(', ')'), ('<', '>'), ('[', ']')]
-        .iter()
-        .find_map(|&(open, close)| name.strip_prefix(open)?.strip_suffix(close))
-        .unwrap_or(name)
-        .trim();
-    (!name.is_empty()).then(|| name.to_string())
+    e.authors.iter().find_map(|p| {
+        let name = p.name.as_deref()?.trim();
+        let name = [('(', ')'), ('<', '>'), ('[', ']')]
+            .iter()
+            .find_map(|&(open, close)| name.strip_prefix(open)?.strip_suffix(close))
+            .unwrap_or(name)
+            .trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
 }
 
 /// Best CREDIBLE publication time (published, else updated) as an RFC3339
@@ -1716,9 +1744,21 @@ pub(crate) fn bound_guid(guid: String) -> String {
         return guid;
     }
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = dedup_hasher();
     guid.hash(&mut h);
     format!("featherreader:long-guid:{:016x}", h.finish())
+}
+
+/// The hasher behind the stored dedup keys of [`bound_guid`] and
+/// [`stable_guid`]: SipHash-1-3 with zero keys, from the `siphasher` crate.
+///
+/// **Not `std`'s `DefaultHasher`**, whose algorithm the standard library
+/// documents as unspecified and free to change between Rust releases: a
+/// toolchain bump could re-key every such entry, and each would be stored a
+/// second time. `DefaultHasher` is SipHash-1-3 with zero keys today, so this
+/// produces the values already stored; tests pin them.
+fn dedup_hasher() -> siphasher::sip::SipHasher13 {
+    siphasher::sip::SipHasher13::new_with_keys(0, 0)
 }
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
@@ -1736,7 +1776,7 @@ fn now_rfc3339() -> String {
 /// supply neither an id nor a usable link id. Deterministic so re-fetches dedup.
 fn stable_guid(e: &RawEntry) -> String {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = dedup_hasher();
     e.title.as_ref().map(|t| t.content.as_str()).hash(&mut h);
     e.links
         .iter()
@@ -2682,6 +2722,202 @@ mod tests {
         assert_eq!(
             normalize_entry(&parsed.entries[1]).author.as_deref(),
             Some("Bob")
+        );
+    }
+
+    /// **The byline is the first author that HAS a name.** An item giving
+    /// `<author>` as a bare address and the name in `<dc:creator>` has two
+    /// people, and the first has no name; taking only the first lost the byline.
+    #[test]
+    fn the_byline_is_the_first_author_with_a_name() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>p</title>
+<item><title>b1</title><guid>b1</guid><author>bob@example.com</author><dc:creator>Bob Smith</dc:creator></item>
+<item><title>b2</title><guid>b2</guid><author>erin@example.com ()</author><dc:creator>Erin</dc:creator></item>
+<item><title>b3</title><guid>b3</guid><author>only@example.com</author></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let authors: Vec<Option<String>> = parsed
+            .entries
+            .iter()
+            .map(|e| normalize_entry(e).author)
+            .collect();
+        assert_eq!(
+            authors,
+            vec![
+                Some("Bob Smith".to_string()),
+                Some("Erin".to_string()),
+                None
+            ]
+        );
+    }
+
+    /// Author strings that make feed-rs 3.0 panic: its name/address splitter
+    /// (`parser/util/mod.rs`, `parse_person_name_email`) slices one byte either
+    /// side of the address, which is not a character boundary when a multi-byte
+    /// character touches it.
+    const PANICKING_AUTHORS: [&str; 3] = [
+        "jose@example.com（José）",
+        "«zoe@example.com» Zoë Long Name Here",
+        "Zoë Long Name «zoe@example.com»",
+    ];
+
+    /// Every place feed-rs runs that splitter, as a whole document around `v`.
+    fn documents_with_author(v: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "rss author",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><item><title>x</title><guid>g</guid><author>{v}</author></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss dc:creator",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>t</title><item><title>x</title><guid>g</guid><dc:creator>{v}</dc:creator></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss managingEditor",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><managingEditor>{v}</managingEditor><item><title>x</title><guid>g</guid></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss webMaster",
+                format!(
+                    r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><webMaster>{v}</webMaster><item><title>x</title><guid>g</guid></item></channel></rss>"#
+                ),
+            ),
+            (
+                "rss1 dc:creator",
+                format!(
+                    r#"<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>t</title></channel><item><title>x</title><link>https://e.example/1</link><dc:creator>{v}</dc:creator></item></rdf:RDF>"#
+                ),
+            ),
+            (
+                "json author",
+                format!(
+                    r#"{{"version":"https://jsonfeed.org/version/1.1","title":"t","items":[{{"id":"1","content_text":"x","authors":[{{"name":"{v}"}}]}}]}}"#
+                ),
+            ),
+        ]
+    }
+
+    /// **A parser panic is a parse failure, not a crash.** feed-rs 3.0 panics
+    /// on [`PANICKING_AUTHORS`]. Uncaught, the panic escaped `poll_feed`, killed
+    /// the poll task after the scheduler had already moved `next_poll`, and
+    /// recorded no failure — the feed stopped updating with nothing to say why.
+    #[test]
+    fn a_feed_rs_panic_is_returned_as_an_error() {
+        for v in PANICKING_AUTHORS {
+            for (slot, doc) in documents_with_author(v) {
+                let err = match parse_feed(doc.as_bytes()) {
+                    Ok(_) => {
+                        panic!("{slot} {v:?}: parsed; the fixture no longer reaches the panic")
+                    }
+                    Err(e) => format!("{e:#}"),
+                };
+                assert!(err.contains("panicked"), "{slot} {v:?}: {err}");
+            }
+        }
+        // The same slots with an ASCII neighbour parse normally.
+        for (slot, doc) in documents_with_author("jose@example.com (Jose)") {
+            assert!(parse_feed(doc.as_bytes()).is_ok(), "{slot}");
+        }
+    }
+
+    /// End to end: a poll of a feed that panics the parser reports
+    /// `FailureKind::Parse`, so it is backed off and its `last_error` says why.
+    #[tokio::test]
+    async fn a_poll_of_a_feed_that_panics_the_parser_is_a_parse_failure() {
+        let doc = &documents_with_author(PANICKING_AUTHORS[0])[0].1;
+        let base = crate::net::tests::serve_body(doc.as_bytes().to_vec()).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "panicking-author.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let url = format!("http://panicking-author.test:{port}/feed.xml");
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &crate::store::NewFeed {
+                url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &url)
+            .await
+            .unwrap()
+            .unwrap();
+        let client = build_client().unwrap();
+        let outcome = poll_feed(&pool, &client, &feed, 0)
+            .await
+            .expect("a parser panic surfaced as a store error");
+        match outcome {
+            PollOutcome::Failed {
+                kind: FailureKind::Parse,
+                detail,
+                ..
+            } => assert!(detail.contains("panicked"), "{detail}"),
+            other => panic!("expected a parse failure, got {other:?}"),
+        }
+    }
+
+    // ---- dedup-key hashes are fixed across toolchains -------------------
+    //
+    // `stable_guid` and `bound_guid` are stored dedup keys. They were built on
+    // `std`'s `DefaultHasher`, whose algorithm the standard library documents
+    // as unspecified and subject to change between releases; a toolchain bump
+    // could have re-keyed every such entry and duplicated it. The values below
+    // were produced by that `DefaultHasher` code, so they also prove the
+    // replacement hashes identically today.
+
+    #[test]
+    fn a_synthetic_guid_is_the_value_already_stored() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+<item><title>only a title</title><description>body</description></item>
+<item><description>no title either</description></item>
+<item><title>Tïtle wíth ünïcode</title></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let guids: Vec<String> = parsed
+            .entries
+            .iter()
+            .map(|e| normalize_entry(e).guid)
+            .collect();
+        assert_eq!(
+            guids,
+            vec![
+                "featherreader:synthetic:964034cf9a24b551".to_string(),
+                "featherreader:synthetic:baa7c19198c76b30".into(),
+                "featherreader:synthetic:34b72cc7fa0a59ac".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_guid_is_the_value_already_stored() {
+        let a = bound_guid("g".repeat(MAX_GUID_BYTES + 1));
+        let b = bound_guid(format!(
+            "https://long.example/{}",
+            "ü".repeat(MAX_GUID_BYTES)
+        ));
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            (
+                "featherreader:long-guid:966404db20ef8f05",
+                "featherreader:long-guid:a1d631602455ace4",
+            )
         );
     }
 
