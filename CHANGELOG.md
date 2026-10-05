@@ -43,6 +43,21 @@ deploying is separate.
   against a stateful fake repo with the reference's create/update semantics,
   including a batch that landed in part; each added guard was mutated and
   every mutation failed a test.
+- **A read-state flush split by #240 that failed part-way starved every
+  cursor after the failure.** The calls go in rkey order and stop at the first
+  failure, but `flush_did` settled cursors only on full success, so call 1's
+  committed creates stayed dirty with `pds_created` false, went out again as
+  `#create`, were refused, and stopped the run at the same place every round.
+  On any flush error carrying `ApplyWritesIncomplete`, the landed prefix is now
+  marked created and cleaned (the same conditional `updated_at` clear as a
+  success) before anything else is decided, and the reconcile retries only
+  what did not land; a retry that part-lands is settled the same way. The
+  mismatch match now also walks `ApplyWritesIncomplete`'s own cause, because
+  that error's `source()` skips its cause's top layer — on the sidecar client
+  that layer IS the `AtProtoError`, and every sidecar reconcile test went red
+  on the merge until it did. A retry that fails again now carries the PDS's
+  reason in its message, so the flusher's and sign-out's `%err` log lines say
+  why, not only "failed again".
 
 - **An OPML import of more than 200 feeds failed outright, and a large
   read-state flush could too (#240).** `add_subscriptions_bulk` sent one

@@ -8401,6 +8401,41 @@ mod tests {
         (format!("http://{addr}"), log)
     }
 
+    /// **The sign-out flush settles a split flush's landed prefix too.** It is
+    /// `readstate::flush_did` under a timeout, so it shares the fix — pinned
+    /// here so a sign-out path that grew its own flush would not silently lose
+    /// it. Call 1 of 2 lands, call 2's connection drops: the landed cursors are
+    /// created and clean, the rest stay dirty to park until the next sign-in.
+    #[tokio::test]
+    async fn the_sign_out_flush_settles_what_a_split_flush_landed() {
+        use crate::readstate::tests as rs;
+        for backend in [
+            crate::metrics::Backend::Sidecar,
+            crate::metrics::Backend::Rust,
+        ] {
+            let fake = std::sync::Arc::new(std::sync::Mutex::new(rs::FakeRepo::default()));
+            let state = rs::state_on(backend, &fake).await;
+            for i in 0..250 {
+                rs::mark_read(&state, i, "1").await;
+            }
+            fake.lock().unwrap().drop_call = Some(2);
+
+            flush_before_revoke(&state, rs::DID).await;
+
+            let order = rs::send_order(250);
+            let (landed, rest) = order.split_at(crate::atproto::APPLY_WRITES_MAX_OPS);
+            for &i in landed {
+                let c = rs::cursor(&state, i).await;
+                assert!(c.pds_created && !c.dirty, "{backend:?}: feed {i}");
+            }
+            for &i in rest {
+                let c = rs::cursor(&state, i).await;
+                assert!(c.dirty && !c.pds_created, "{backend:?}: feed {i}");
+            }
+            assert_eq!(fake.lock().unwrap().apply_calls, 2, "{backend:?}");
+        }
+    }
+
     /// **Sign-out flushes dirty read-state BEFORE it revokes — through the
     /// route.** The previous version of this test called
     /// `flush_before_revoke` and `revoke_everywhere` itself and asserted one

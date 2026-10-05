@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::Context as _;
 use tracing::{info, warn};
 
 use crate::atproto::AtProtoError;
@@ -50,9 +49,18 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         batch.insert(rkey, (record, cursor));
     }
 
-    // ONE applyWrites round-trip for all of this DID's dirty feeds.
+    // ONE applyWrites batch for all of this DID's dirty feeds — sent as several
+    // calls past the PDS's per-call limits (#240), in rkey order.
     let ops = batch_ops(&batch);
     if let Err(err) = state.repo().flush_read_states(did, &ops).await {
+        // **What landed is settled first, whatever went wrong after it.** A
+        // split batch commits call by call, so a failure in call 2 can follow a
+        // call 1 that created its records. Left dirty with `pds_created` false,
+        // those cursors went out again next round as `#create` on keys that now
+        // exist, the PDS refused, the run stopped at that call — and because the
+        // order is fixed, every cursor sorted after them starved, every round.
+        settle_landed(state, did, &mut batch, &err).await;
+
         // **A flag that disagrees with the PDS wedged this DID forever (#241).**
         //
         // `pds_created` picks create-vs-update and is learned only from a
@@ -60,13 +68,14 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         // database against a repo that already holds these stable rkeys, leaves
         // it false over a record that exists; a record deleted elsewhere leaves
         // it true over one that does not. Either way one op fails, applyWrites
-        // is atomic, the whole batch fails — and the next flush sends the same
+        // is atomic, the whole call fails — and the next flush sends the same
         // batch. Nothing ever corrected the flag.
         //
         // So on a failure that COULD be that, ask the PDS once what exists, and
-        // retry once if the answer changes anything. Never in a loop: a retry
-        // that fails again is returned like any other failure, and the corrected
-        // flags it leaves behind make the next round an ordinary flush.
+        // retry what did not land, once, if the answer changes anything. Never
+        // in a loop: a retry that fails again is returned like any other
+        // failure, and the corrected flags it leaves behind make the next round
+        // an ordinary flush.
         //
         // Not ALSO proactively, on each DID's first flush after startup: that
         // costs every healthy DID a listing per restart to save a wedged one a
@@ -87,40 +96,73 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
             }
         }
         let ops = batch_ops(&batch);
-        state
-            .repo()
-            .flush_read_states(did, &ops)
-            .await
-            .context("read-state flush failed again after reconciling pds_created")?;
+        if let Err(retry_err) = state.repo().flush_read_states(did, &ops).await {
+            // The retry can split and part-land too.
+            settle_landed(state, did, &mut batch, &retry_err).await;
+            // **The reason goes IN the message, not only under it.** Both
+            // callers log `%err`, which prints an anyhow context's outermost
+            // message alone, so a bare "failed again" dropped the PDS's status
+            // and error name from the log. Switching the callers to `{:#}`
+            // instead would print the reason twice on every flush failure:
+            // the Rust client's rejection, and `ApplyWritesIncomplete`, both
+            // already repeat their cause in their own message. The chain is
+            // kept, so `ApplyWritesIncomplete::of` still reads the progress.
+            let context =
+                format!("read-state flush failed again after reconciling pds_created: {retry_err}");
+            return Err(retry_err.context(context));
+        }
     }
 
-    // Success — for each flushed cursor: mark its PDS record as created (so future
-    // flushes emit an update), then clear `dirty` but ONLY if its `updated_at`
-    // still matches the snapshot we just flushed. A mark-read that landed DURING
-    // the in-flight PDS write bumped `updated_at` and re-dirtied the row; the
-    // conditional clear leaves that row dirty so its new reads re-flush next
-    // round instead of being silently dropped.
     let flushed = batch.len();
     for (_rkey, (_record, cursor)) in batch {
-        // Flip the created flag first: the record now exists in the PDS regardless
-        // of whether the dirty-clear below is a no-op due to a concurrent bump.
-        if !cursor.pds_created {
-            if let Err(err) = store::mark_cursor_pds_created(&state.db, did, &cursor.feed_url).await
-            {
-                warn!(%did, feed = %cursor.feed_url, %err, "failed to mark cursor pds_created");
-            }
-        }
-        if let Err(err) =
-            store::clear_cursor_dirty(&state.db, did, &cursor.feed_url, &cursor.updated_at).await
-        {
-            // The PDS write already landed; a failure to clear the local flag
-            // just means we harmlessly re-flush this cursor next round.
-            warn!(%did, feed = %cursor.feed_url, %err, "failed to clear cursor dirty flag");
-        }
+        settle(state, did, &cursor).await;
     }
 
     info!(%did, feeds = flushed, "read-state flusher: flushed dirty cursors");
     Ok(())
+}
+
+/// Record that `cursor`'s write landed: mark its PDS record as created (so
+/// future flushes emit an update), then clear `dirty` but ONLY if its
+/// `updated_at` still matches the snapshot that was flushed. A mark-read that
+/// landed DURING the in-flight PDS write bumped `updated_at` and re-dirtied the
+/// row; the conditional clear leaves that row dirty so its new reads re-flush
+/// next round instead of being silently dropped.
+async fn settle(state: &AppState, did: &str, cursor: &ReadCursor) {
+    // Flip the created flag first: the record now exists in the PDS regardless
+    // of whether the dirty-clear below is a no-op due to a concurrent bump.
+    if !cursor.pds_created {
+        if let Err(err) = store::mark_cursor_pds_created(&state.db, did, &cursor.feed_url).await {
+            warn!(%did, feed = %cursor.feed_url, %err, "failed to mark cursor pds_created");
+        }
+    }
+    if let Err(err) =
+        store::clear_cursor_dirty(&state.db, did, &cursor.feed_url, &cursor.updated_at).await
+    {
+        // The PDS write already landed; a failure to clear the local flag
+        // just means we harmlessly re-flush this cursor next round.
+        warn!(%did, feed = %cursor.feed_url, %err, "failed to clear cursor dirty flag");
+    }
+}
+
+/// Settle, and take out of `batch`, the cursors a failed flush DID write.
+///
+/// A chunked `applyWrites` stops at the first failing call, so what landed is
+/// a prefix of the ops — and the ops are `batch` in its own (rkey) order, so
+/// it is a prefix of `batch` too. [`crate::atproto::ApplyWritesIncomplete`]
+/// says how long. The failed call's own writes are in doubt and stay in the
+/// batch, dirty: a later round, or the reconcile, finds out which landed.
+async fn settle_landed(state: &AppState, did: &str, batch: &mut Batch, err: &anyhow::Error) {
+    let landed = crate::atproto::ApplyWritesIncomplete::of(err).map_or(0, |p| p.landed);
+    let keys: Vec<String> = batch.keys().take(landed).cloned().collect();
+    for key in keys {
+        if let Some((_record, cursor)) = batch.remove(&key) {
+            settle(state, did, &cursor).await;
+        }
+    }
+    if landed > 0 {
+        info!(%did, landed, "read-state flusher: a split flush failed part-way; settled what landed");
+    }
 }
 
 /// One flush's cursors, by rkey: the record to write and the row it came from.
@@ -166,7 +208,15 @@ fn batch_ops(batch: &Batch) -> Vec<(String, ReadState, bool)> {
 /// round to a PDS that is already struggling. If such a write did land, the
 /// next round's create meets the record and reconciles then.
 fn may_be_existence_mismatch(err: &anyhow::Error) -> bool {
+    // **The chunked write's own cause is walked too, explicitly.** Every flush
+    // error now arrives wrapped in `ApplyWritesIncomplete`, whose `source()`
+    // continues from its cause's SOURCE (so `{:#}` does not print the PDS's
+    // message twice). On the sidecar client the cause IS the `AtProtoError`,
+    // so `err.chain()` skips it — measured: every sidecar reconcile test went
+    // red on the merge with #240 until this was added.
+    let wrapped = crate::atproto::ApplyWritesIncomplete::of(err).map(|p| p.cause().chain());
     err.chain()
+        .chain(wrapped.into_iter().flatten())
         .any(|cause| match cause.downcast_ref::<AtProtoError>() {
             Some(AtProtoError::Xrpc { status, error, .. }) => match status.as_u16() {
                 500 => error == "InternalServerError",
@@ -397,7 +447,7 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -553,7 +603,7 @@ mod tests {
 
     use crate::metrics::Backend;
 
-    const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    pub(crate) const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
 
     /// An applyWrites failure the fake answers with.
     #[derive(Clone, Copy, Debug)]
@@ -573,12 +623,12 @@ mod tests {
     /// One account's `readState` collection, with the reference PDS's
     /// create/update semantics and atomicity, and counters for what was asked.
     #[derive(Default)]
-    struct FakeRepo {
-        records: BTreeMap<String, serde_json::Value>,
-        apply_calls: usize,
+    pub(crate) struct FakeRepo {
+        pub(crate) records: BTreeMap<String, serde_json::Value>,
+        pub(crate) apply_calls: usize,
         /// listRecords requests with no cursor — one per walk, however many
         /// pages that walk turns out to need.
-        list_walks: usize,
+        pub(crate) list_walks: usize,
         /// Fail every applyWrites with this, whatever its ops.
         always_fail: Option<Fail>,
         /// Land the first N ops of the next applyWrites, then answer 503 — a
@@ -586,7 +636,16 @@ mod tests {
         partial_then_503: Option<usize>,
         /// Answer every listRecords with a 503.
         list_fails: bool,
+        /// Drop the connection, unanswered, on this applyWrites call (1-based)
+        /// — a transport failure after the earlier calls committed.
+        pub(crate) drop_call: Option<usize>,
     }
+
+    /// Not an answer: the fake hangs up instead of replying.
+    const HANG_UP: Fail = Fail {
+        status: 0,
+        error: "connection dropped",
+    };
 
     impl FakeRepo {
         fn op(w: &serde_json::Value) -> (String, String, serde_json::Value) {
@@ -605,6 +664,16 @@ mod tests {
 
         fn apply(&mut self, writes: &[serde_json::Value]) -> Result<(), Fail> {
             self.apply_calls += 1;
+            if self.drop_call == Some(self.apply_calls) {
+                return Err(HANG_UP);
+            }
+            // The reference PDS's per-call cap, which #240 chunks under.
+            if writes.len() > crate::atproto::APPLY_WRITES_MAX_OPS {
+                return Err(Fail {
+                    status: 400,
+                    error: "InvalidRequest",
+                });
+            }
             if let Some(fail) = self.always_fail {
                 return Err(fail);
             }
@@ -663,6 +732,15 @@ mod tests {
         }
     }
 
+    /// Abandon the request mid-flight, so the client sees the connection close
+    /// with no response — a transport failure, not an answer. Unwinding the
+    /// handler drops hyper's connection task; `resume_unwind` skips the panic
+    /// hook, so it does not read as a test failure in the output. The caller
+    /// releases the fake's lock first, or the unwind would poison it.
+    fn hang_up() -> axum::response::Response {
+        std::panic::resume_unwind(Box::new("fake PDS hung up"))
+    }
+
     /// Serve `fake` as BOTH a sidecar (`/internal/repo`) and a PDS (`/xrpc/*`),
     /// so one fixture drives either backend. Returns the sidecar base URL and
     /// the PDS audience a session should carry.
@@ -709,6 +787,10 @@ mod tests {
                             }
                             Some("applyWrites") => {
                                 match fake.apply(req["writes"].as_array().unwrap()) {
+                                    Err(f) if f.status == HANG_UP.status => {
+                                        drop(fake);
+                                        hang_up()
+                                    }
                                     Ok(()) => {
                                         reply(200, serde_json::json!({ "ok": true, "data": {} }))
                                     }
@@ -741,6 +823,10 @@ mod tests {
                     "/xrpc/com.atproto.repo.applyWrites" => {
                         let req: serde_json::Value = serde_json::from_slice(&raw).unwrap();
                         match fake.apply(req["writes"].as_array().unwrap()) {
+                            Err(f) if f.status == HANG_UP.status => {
+                                drop(fake);
+                                hang_up()
+                            }
                             Ok(()) => reply(200, serde_json::json!({ "results": [] })),
                             Err(f) => reply(
                                 f.status,
@@ -761,7 +847,7 @@ mod tests {
 
     /// An `AppState` on `backend`, pointed at the fake — the sidecar through its
     /// internal URL, the Rust client through a live session whose `aud` is it.
-    async fn state_on(backend: Backend, fake: &Arc<Mutex<FakeRepo>>) -> AppState {
+    pub(crate) async fn state_on(backend: Backend, fake: &Arc<Mutex<FakeRepo>>) -> AppState {
         let (sidecar, aud) = serve_fake(Arc::clone(fake)).await;
         let db = store::init_url("sqlite::memory:").await.unwrap();
         let state = AppState::new(
@@ -813,13 +899,13 @@ mod tests {
         state
     }
 
-    fn feed(i: usize) -> String {
+    pub(crate) fn feed(i: usize) -> String {
         format!("https://f{i}.example/feed.xml")
     }
 
     /// A dirty cursor for feed `i`, as a mark-read leaves it. `updated_at`
     /// differs per call so the conditional dirty-clear sees a new snapshot.
-    async fn mark_read(state: &AppState, i: usize, id: &str) {
+    pub(crate) async fn mark_read(state: &AppState, i: usize, id: &str) {
         static TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         store::upsert_cursor(
@@ -853,7 +939,7 @@ mod tests {
         );
     }
 
-    async fn cursor(state: &AppState, i: usize) -> ReadCursor {
+    pub(crate) async fn cursor(state: &AppState, i: usize) -> ReadCursor {
         store::get_cursor(&state.db, DID, &feed(i))
             .await
             .unwrap()
@@ -1098,9 +1184,20 @@ mod tests {
             mark_read(&state, 1, "1").await;
             fake.lock().unwrap().always_fail = Some(MISMATCH);
 
-            flush_did(&state, DID)
+            let err = flush_did(&state, DID)
                 .await
                 .expect_err("a retry that fails again is a failure");
+            // Both callers log `%err` — the plain Display, which for an anyhow
+            // context is the OUTERMOST message only. The PDS's reason for the
+            // second refusal must be in it, or the log says "failed again"
+            // and nothing about why.
+            let shown = err.to_string();
+            assert!(
+                shown.contains("after reconciling")
+                    && shown.contains("500")
+                    && shown.contains("InternalServerError"),
+                "{backend:?}: the logged line lost the PDS's reason: {shown}"
+            );
 
             let c = cursor(&state, 1).await;
             assert!(c.dirty, "{backend:?}: the reads were dropped");
@@ -1215,6 +1312,221 @@ mod tests {
             assert!(c.dirty && !c.pds_created, "{backend:?}");
             let f = fake.lock().unwrap();
             assert_eq!((f.list_walks, f.apply_calls), (1, 1), "{backend:?}");
+        }
+    }
+
+    // ── #240 × #241: a flush split into several applyWrites calls ────────────
+
+    /// Feeds `0..n` in the order the flush sends them: the batch is keyed by
+    /// rkey, so a split's first call holds the lowest rkeys.
+    pub(crate) fn send_order(n: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| read_state_rkey(&feed(i)));
+        order
+    }
+
+    /// **(a) Call 1 lands, call 2 hits a transport failure.** Call 1's creates
+    /// are committed, so its cursors must be marked created and clean NOW. Left
+    /// as they were, the next round re-sends them as `#create`, the PDS refuses,
+    /// and — the calls stop at the first failure, in a fixed rkey order — every
+    /// cursor sorted after them starves, every round. A transport failure is not
+    /// a mismatch, so nothing is listed; the next flush sends only what did not
+    /// land, plus a re-dirtied landed cursor as an UPDATE.
+    #[tokio::test]
+    async fn a_split_flush_keeps_what_landed_when_a_later_call_fails() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            for i in 0..250 {
+                mark_read(&state, i, "1").await;
+            }
+            fake.lock().unwrap().drop_call = Some(2);
+
+            let err = flush_did(&state, DID)
+                .await
+                .expect_err("the second call failed");
+            // What callers log (`%err`) says how far the split got.
+            assert!(
+                err.to_string().contains("200 of 250 writes had landed"),
+                "{backend:?}: the logged line lost the progress: {err}"
+            );
+
+            let order = send_order(250);
+            let (landed, rest) = order.split_at(crate::atproto::APPLY_WRITES_MAX_OPS);
+            for &i in landed {
+                let c = cursor(&state, i).await;
+                assert!(
+                    c.pds_created && !c.dirty,
+                    "{backend:?}: feed {i} landed in call 1 but was not settled"
+                );
+            }
+            for &i in rest {
+                let c = cursor(&state, i).await;
+                assert!(
+                    c.dirty && !c.pds_created,
+                    "{backend:?}: feed {i} never landed"
+                );
+            }
+            {
+                let f = fake.lock().unwrap();
+                assert_eq!(f.records.len(), 200, "{backend:?}: fixture");
+                assert_eq!((f.list_walks, f.apply_calls), (0, 2), "{backend:?}");
+            }
+
+            // A landed feed is read again: it must go as #update now — the
+            // fake refuses a #create on an existing key.
+            mark_read(&state, landed[0], "2").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: the remainder did not flush: {e:#}"));
+            for i in 0..250 {
+                let c = cursor(&state, i).await;
+                assert!(c.pds_created && !c.dirty, "{backend:?}: feed {i}");
+            }
+            assert_eq!(
+                read_ids_on_pds(&fake, landed[0]),
+                serde_json::json!(["2"]),
+                "{backend:?}"
+            );
+            let f = fake.lock().unwrap();
+            assert_eq!(f.records.len(), 250, "{backend:?}");
+            assert_eq!(
+                (f.list_walks, f.apply_calls),
+                (0, 3),
+                "{backend:?}: 51 writes are one call, and nothing needed listing"
+            );
+        }
+    }
+
+    /// **(b) Call 1 lands, call 2 meets records that already exist.** The
+    /// mismatch arrives wrapped in the chunked write's progress error, and must
+    /// still be recognised: one listing, the flags corrected, and ONE retry of
+    /// what did not land — not of the 200 that did.
+    #[tokio::test]
+    async fn a_mismatch_in_a_later_call_reconciles_and_retries_only_the_rest() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let order = send_order(250);
+            for &i in &order[240..] {
+                existing(&fake, i);
+            }
+            for i in 0..250 {
+                mark_read(&state, i, "3").await;
+            }
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: did not converge: {e:#}"));
+
+            for i in 0..250 {
+                let c = cursor(&state, i).await;
+                assert!(c.pds_created && !c.dirty, "{backend:?}: feed {i}");
+                assert_eq!(
+                    read_ids_on_pds(&fake, i),
+                    serde_json::json!(["3"]),
+                    "{backend:?}: feed {i}"
+                );
+            }
+            let f = fake.lock().unwrap();
+            assert_eq!(f.records.len(), 250, "{backend:?}");
+            assert_eq!(f.list_walks, 1, "{backend:?}: expected one reconcile");
+            assert_eq!(
+                f.apply_calls, 3,
+                "{backend:?}: call 1, call 2 refused, then one retry of the 50 left"
+            );
+        }
+    }
+
+    /// **The classifier sees through the chunked write's progress error.**
+    /// `ApplyWritesIncomplete::source` continues from its cause's SOURCE, so a
+    /// cause that IS the `AtProtoError` — the sidecar client's shape — does not
+    /// appear in `err.chain()` at all. Both shapes, through the real wrapper.
+    #[tokio::test]
+    async fn a_mismatch_is_recognised_inside_a_chunked_write_error() {
+        let op = crate::atproto::WriteOp::Delete {
+            collection: crate::lexicon::nsid::READ_STATE.into(),
+            rkey: "rs-0".into(),
+        };
+        let mismatch = || AtProtoError::Xrpc {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error: "InternalServerError".into(),
+            message: None,
+        };
+        // Sidecar shape: the cause is the AtProtoError itself.
+        let bare = crate::atproto::apply_writes_chunked(std::slice::from_ref(&op), |_| async {
+            Err(mismatch().into())
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            crate::atproto::ApplyWritesIncomplete::of(&bare).is_some(),
+            "fixture: not wrapped"
+        );
+        assert!(may_be_existence_mismatch(&bare), "sidecar shape: {bare:#}");
+        // Rust-client shape: the AtProtoError behind a context.
+        let wrapped = crate::atproto::apply_writes_chunked(std::slice::from_ref(&op), |_| async {
+            Err(anyhow::Error::new(mismatch()).context("applyWrites failed"))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            may_be_existence_mismatch(&wrapped),
+            "rust shape: {wrapped:#}"
+        );
+        // And an unrelated failure, wrapped, is still unrelated.
+        let transport =
+            crate::atproto::apply_writes_chunked(std::slice::from_ref(&op), |_| async {
+                Err(anyhow::anyhow!("connection reset"))
+            })
+            .await
+            .unwrap_err();
+        assert!(!may_be_existence_mismatch(&transport));
+    }
+
+    /// **The retry can part-land too.** Call 1 is refused outright (it meets
+    /// records that exist), the reconcile corrects them, and the retry — 250
+    /// writes, so two calls — loses its second call's connection. The retry's
+    /// landed prefix must be settled exactly like the first attempt's, or its
+    /// 190 fresh creates go out as `#create` again next round.
+    #[tokio::test]
+    async fn a_retry_that_part_lands_settles_what_it_landed() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let order = send_order(250);
+            for &i in &order[..10] {
+                existing(&fake, i);
+            }
+            for i in 0..250 {
+                mark_read(&state, i, "4").await;
+            }
+            // Call 1 refused (mismatch), call 2 is the retry's first, call 3
+            // the retry's second.
+            fake.lock().unwrap().drop_call = Some(3);
+
+            let err = flush_did(&state, DID)
+                .await
+                .expect_err("the retry's second call failed");
+            assert!(
+                err.to_string().contains("after reconciling"),
+                "{backend:?}: {err}"
+            );
+
+            let (landed, rest) = order.split_at(crate::atproto::APPLY_WRITES_MAX_OPS);
+            for &i in landed {
+                let c = cursor(&state, i).await;
+                assert!(
+                    c.pds_created && !c.dirty,
+                    "{backend:?}: feed {i} landed in the retry but was not settled"
+                );
+            }
+            for &i in rest {
+                let c = cursor(&state, i).await;
+                assert!(c.dirty && !c.pds_created, "{backend:?}: feed {i}");
+            }
+            let f = fake.lock().unwrap();
+            assert_eq!((f.list_walks, f.apply_calls), (1, 3), "{backend:?}");
         }
     }
 }
