@@ -7,6 +7,14 @@
 > registration is still invite-only. The sidecar (#18) has not been removed;
 > it still ships in the image for the `sidecar` backend. Current state:
 > [`CHANGELOG.md`](../CHANGELOG.md).
+>
+> **Per-item status (audited 2026-10-05).** Since this was written: 1a is done
+> (PR #120), 1b is partly done (PR #122, PR #135), 1c is done (PR #127), 1d was
+> resolved by supporting `at://` publications in 0.4.0, and both observability
+> gaps closed (PR #113). The `href` defence shipped in v0.3.3 (PR #111, PR #152).
+> **Still open:** the soak sign-off (not recorded anywhere), #18, #17 and #19,
+> and the `oauth_state` purge. The wiki sentence in §3 is corrected. Whether the
+> Cloudflare tokens were revoked can't be verified.
 
 Where things stand after 2026-09-13, and what to do next in what order.
 
@@ -27,6 +35,8 @@ and the nearest independent record is the wiki's "It is **21 MB**" note.)
 > it was.** PR #111 merged 43 minutes *after* this document was opened, and is
 > **still undeployed** — the machine last updated at the cutover. Issue #115 also
 > records it as partial: `entry.html`'s two hrefs are still raw `String`.
+>
+> Since deployed in v0.3.3 (ops runbook). Issue #115 was closed by PR #152.
 
 ---
 
@@ -78,6 +88,9 @@ hazard for no benefit. `.db` + `-wal` gives the identical correct answer.
 **Pass:** `err_count` stays 0 across a week, and at least one **refresh** has
 happened (the first access token must age out for that path to run at all).
 
+> Unrecorded (audited 2026-10-05): no sign-off that the soak passed exists in the
+> repo or the ops runbook. The runbook last calls it "the open gating item".
+
 Two properties of `err_count` bound what that claim can mean:
 
 - **It is all-time cumulative, not windowed.** A time-bounded claim needs a
@@ -91,6 +104,8 @@ Two properties of `err_count` bound what that claim can mean:
 ### Known observability gaps
 
 **Both are addressed by PR #113, which was not yet open when this was written.**
+
+> Done in PR #113.
 Described as they stood on `main` at the cutover:
 
 - **A refresh failure is only visible indirectly** — it surfaces as an error on the
@@ -109,6 +124,10 @@ Described as they stood on `main` at the cutover:
 Ordered by value. None of these touch the OAuth path in production.
 
 ### 1a. The SSRF enforcement seam *(highest remaining security value)*
+
+> Done in PR #120: per-hop re-validation, cross-origin credential stripping and
+> multi-answer DNS are each pinned by a mutation-verified test. It used a
+> `#[cfg(test)]` host override rather than an injectable resolver.
 
 `is_forbidden_ip` is well covered; everything that carries its verdict to the
 socket is not. Two of four gaps were closed on 2026-09-13 (the `.resolve()` connect
@@ -148,11 +167,17 @@ change to this guard; it is the precedent for the method, not the subject.)
 
 ### 1b. End-to-end login test
 
+> Partly done in PR #122 (a TLS test CA) and PR #135. `login::complete` is now
+> driven over real TLS to the token endpoint, including the mix-up refusal. No
+> test drives start → callback → stored session in one run.
+
 `login::complete`'s individual guards are pinned; their **sequencing** is not.
 Nothing drives a full login. This is more pressing than it was, because that path
 is now live. Depends on the same seam as 1a.
 
 ### 1c. The remaining bad tests
+
+> Done in PR #127.
 
 Roughly ten confirmed by mutation on 2026-09-13 and not yet fixed. Mechanical;
 each has a known failing mutation already identified:
@@ -186,6 +211,9 @@ Three of these are worse than "weak", and the specifics are the fix instructions
 
 ### 1d. The `at://` feeds
 
+> Resolved in 0.4.0: `at://` standard.site publications are polled (PR #164,
+> PR #225, PR #228, PR #230).
+
 19 of 111 feeds are `at://did:plc:…/site.standard.publication/…` — **never once
 polled**, each at exactly 35 consecutive errors, one subscriber each (a single DID
 accounts for all 19). `check_scheme` allows `http`/`https` only, so they can never
@@ -205,6 +233,11 @@ reader is not silently subscribed to something that will never deliver.
 ---
 
 ## 2. After the soak passes
+
+> Still open (audited 2026-10-05): the sidecar ships in the image, and #17 and
+> #19 have not started. The sidecar's `NodeOAuthClient` still gets no `fetch`
+> override. The code and entrypoint both default `FEATHERREADER_REPO_BACKEND` to
+> `sidecar`, so an unset variable selects the unguarded client.
 
 **#18 — decommission the Node sidecar.** It has been dead weight in the image since
 the cutover — `/app/oauth-sidecar` is **72 MB** on the running machine. Deleting it
@@ -236,6 +269,8 @@ the load, which #17 establishes.
   (An earlier draft paired `oauth_nonce` with it. That half is vacuous —
   `oauth_nonce` is keyed by **origin** and has no DID column, so there is nothing
   DID-scoped in it to clear.)
+  > Still open (audited 2026-10-05): `purge_did_data` does not touch
+  > `oauth_state`. Rows go only through the expiry sweep.
 - **One place in the wiki credits `min_machines_running` for machine recovery**
   while `fly.toml` says it is inert under `auto_stop_machines = "off"`: the
   `container-entrypoint.sh` section of `/runbooks/featherreader-deploy` ("exit
@@ -246,9 +281,12 @@ the load, which #17 establishes.
   not a safety net"). So this is one stale sentence, not a drifted page. Still
   uncorrected because nobody has *measured* what recreates the machine — and
   guessing is how it drifted in the first place.
+  > Done: the ops runbook's entrypoint section now credits
+  > `auto_start_machines = true` and calls `min_machines_running` inert.
 - **Revoke the one-time Cloudflare Transform Rules token** if not already done, and
   confirm the 2026-07-06 cache-rules token's revocation, which the wiki still
   records as unverified.
+  > Unverified: no record either way.
 
 ---
 
