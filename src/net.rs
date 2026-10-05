@@ -11,9 +11,10 @@
 //!
 //! 1. **Scheme allow-list** — only `http` / `https`. No `file:`, `gopher:`, …
 //! 2. **IP allow-list** — the target host is resolved to IP(s) and rejected if
-//!    *any* resolved address is loopback, link-local (`169.254.0.0/16`,
-//!    `fe80::/10`), private (`10/8`, `172.16/12`, `192.168/16`), ULA
-//!    (`fc00::/7`), multicast, unspecified, or broadcast.
+//!    *any* resolved address is one no public feed can live at: loopback,
+//!    link-local, private, ULA, multicast, unspecified, broadcast, and the
+//!    reserved, shared and documentation ranges — including any of those
+//!    embedded in an IPv6 address. [`is_forbidden_ip`] has the complete list.
 //! 3. **Per-hop re-validation** — auto-redirect is disabled and redirects are
 //!    followed manually, re-running (1) and (2) on **every** hop, so a benign
 //!    first host cannot bounce us onto an internal one.
@@ -79,8 +80,41 @@ pub(crate) const WORST_CASE_REQUEST: Duration =
     Duration::from_secs(FETCH_TIMEOUT.as_secs() * (MAX_REDIRECTS as u64 + 1));
 
 /// Whether an already-resolved IP address is one we must never connect to on
-/// behalf of an untrusted URL (SSRF sinks): loopback, link-local, private,
-/// ULA, multicast, unspecified, or broadcast.
+/// behalf of an untrusted URL (SSRF sinks).
+///
+/// This is the complete list; keep it in step with the code.
+///
+/// **IPv4**
+///
+/// * `0.0.0.0/8` — "this network", including the unspecified `0.0.0.0` (RFC 1122 §3.2.1.3)
+/// * `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` — private (RFC 1918)
+/// * `100.64.0.0/10` — shared address space, carrier-grade NAT and overlay VPNs (RFC 6598)
+/// * `127.0.0.0/8` — loopback (RFC 1122 §3.2.1.3)
+/// * `169.254.0.0/16` — link-local, where cloud metadata lives (RFC 3927)
+/// * `192.0.0.0/24` — IETF protocol assignments (RFC 6890)
+/// * `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` — documentation,
+///   TEST-NET-1/2/3 (RFC 5737)
+/// * `198.18.0.0/15` — benchmarking (RFC 2544)
+/// * `224.0.0.0/4` — multicast (RFC 5771)
+/// * `240.0.0.0/4` — reserved (RFC 1112 §4), which includes the limited
+///   broadcast address `255.255.255.255` (RFC 919)
+///
+/// **IPv6**
+///
+/// * `::` unspecified and `::1` loopback (RFC 4291)
+/// * `100::/64` — discard-only (RFC 6666)
+/// * `2001:db8::/32` — documentation (RFC 3849)
+/// * `fc00::/7` — unique local (RFC 4193)
+/// * `fe80::/10` — link-local (RFC 4291)
+/// * `fec0::/10` — site-local, deprecated but still routed internally on some
+///   networks (RFC 3879)
+/// * `ff00::/8` — multicast (RFC 4291)
+/// * Any address that embeds a forbidden IPv4 one: mapped and compatible
+///   (RFC 4291), IPv4-translated (RFC 2765), NAT64 (RFC 6052), 6to4 (RFC 3056),
+///   Teredo (RFC 4380) and ISATAP (RFC 5214). These are decoded and checked
+///   against the same IPv4 list above. The rest of `64:ff9b::/32` outside the
+///   well-known `/96`, including RFC 8215's local-use `64:ff9b:1::/48`, is
+///   refused outright. See `embedded_v4`.
 pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_forbidden_v4(v4),
@@ -93,8 +127,14 @@ fn is_forbidden_v4(ip: &Ipv4Addr) -> bool {
         || ip.is_private()      // 10/8, 172.16/12, 192.168/16
         || ip.is_link_local()   // 169.254.0.0/16 (cloud metadata)
         || ip.is_unspecified()  // 0.0.0.0
-        || ip.is_broadcast()    // 255.255.255.255
         || ip.is_multicast()    // 224.0.0.0/4
+        // 240.0.0.0/4 reserved (RFC 1112 §4). This also covers the broadcast
+        // address 255.255.255.255, so a separate `is_broadcast()` would be dead.
+        || matches!(ip.octets(), [240..=255, ..])
+        // Documentation ranges, TEST-NET-1/2/3 (RFC 5737).
+        || matches!(ip.octets(), [192, 0, 2, _])
+        || matches!(ip.octets(), [198, 51, 100, _])
+        || matches!(ip.octets(), [203, 0, 113, _])
         // Carrier-grade NAT / "this-host" / benchmarking ranges — not routable
         // to a legitimate public feed, but reachable internally.
         || matches!(ip.octets(), [0, ..])
@@ -126,9 +166,16 @@ fn is_forbidden_v6(ip: &Ipv6Addr) -> bool {
     let seg = ip.segments();
     // fe80::/10 link-local (incl. RFC-4291 metadata equivalents).
     let link_local = (seg[0] & 0xffc0) == 0xfe80;
+    // fec0::/10 site-local: deprecated (RFC 3879), but some networks still
+    // route it internally.
+    let site_local = (seg[0] & 0xffc0) == 0xfec0;
     // fc00::/7 unique-local addresses.
     let ula = (seg[0] & 0xfe00) == 0xfc00;
-    link_local || ula
+    // 100::/64 discard-only (RFC 6666).
+    let discard = seg[..4] == [0x0100, 0, 0, 0];
+    // 2001:db8::/32 documentation (RFC 3849). Never globally routed.
+    let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+    link_local || site_local || ula || discard || documentation
 }
 
 /// Every IPv4 address `ip` embeds under a translation scheme, for re-checking
@@ -1435,8 +1482,12 @@ pub(crate) mod tests {
             // IANA-reserved `00-00-5E-FE` OUI, under ANY /64 — so unlike the
             // four above there is no prefix to anchor on, and a perfectly
             // ordinary-looking global address can carry one.
-            ("2001:db8::5efe:7f00:1", "ISATAP -> 127.0.0.1"),
-            ("2001:db8::5efe:a9fe:a9fe", "ISATAP -> 169.254.169.254"),
+            //
+            // These sit under a real global prefix, not the `2001:db8::/32`
+            // documentation one: that prefix is refused on its own (#217), so
+            // a fixture there would pass with the ISATAP arm deleted.
+            ("2606:4700::5efe:7f00:1", "ISATAP -> 127.0.0.1"),
+            ("2606:4700::5efe:a9fe:a9fe", "ISATAP -> 169.254.169.254"),
             // All four values the IID's first byte can take, kept as named
             // regressions. RFC 5214 spells it `000000ug`, so `u` and `g` are
             // both free. The first draft of this guard enumerated only the two
@@ -1444,11 +1495,11 @@ pub(crate) mod tests {
             // of a guard that read as complete. Reverting the arm to that
             // enumeration fails on the `g=1` rows below.
             (
-                "2001:db8::200:5efe:a9fe:a9fe",
+                "2606:4700::200:5efe:a9fe:a9fe",
                 "ISATAP u=1 g=0 -> 169.254.169.254",
             ),
-            ("2001:db8::100:5efe:7f00:1", "ISATAP u=0 g=1 -> 127.0.0.1"),
-            ("2001:db8::300:5efe:7f00:1", "ISATAP u=1 g=1 -> 127.0.0.1"),
+            ("2606:4700::100:5efe:7f00:1", "ISATAP u=0 g=1 -> 127.0.0.1"),
+            ("2606:4700::300:5efe:7f00:1", "ISATAP u=1 g=1 -> 127.0.0.1"),
             (
                 "2606:4700::5efe:c0a8:1",
                 "ISATAP under a REAL public prefix -> 192.168.0.1",
@@ -1599,7 +1650,7 @@ pub(crate) mod tests {
     /// not something to discover from a bypass.
     #[test]
     fn a_reserved_bit_in_the_isatap_identifier_does_not_buy_a_bypass() {
-        let ip: IpAddr = "2001:db8::400:5efe:7f00:1".parse().unwrap();
+        let ip: IpAddr = "2606:4700::400:5efe:7f00:1".parse().unwrap();
         assert!(
             is_forbidden_ip(&ip),
             "an identifier carrying 00-00-5E-FE and 127.0.0.1 was allowed \
@@ -2293,6 +2344,160 @@ pub(crate) mod tests {
                 !is_forbidden_ip(&parsed),
                 "{ip} is public and must be allowed"
             );
+        }
+    }
+
+    /// **Reserved and documentation ranges no public feed can live in (#217).**
+    ///
+    /// Each range is pinned at its first, a middle and its last address, so a
+    /// rule that is missing, or narrower than its CIDR, fails here. The
+    /// neighbours just outside are in
+    /// `the_reserved_ranges_stop_at_their_boundaries`.
+    #[test]
+    fn forbids_reserved_and_documentation_ranges() {
+        for (ip, what) in [
+            // 240.0.0.0/4, reserved (RFC 1112 §4). `is_broadcast()` only ever
+            // covered the top address of it.
+            ("240.0.0.0", "240/4 reserved, first"),
+            ("247.255.0.1", "240/4 reserved, middle"),
+            ("255.255.255.254", "240/4 reserved, last below broadcast"),
+            ("255.255.255.255", "240/4 reserved, limited broadcast"),
+            // RFC 5737 documentation ranges.
+            ("192.0.2.0", "TEST-NET-1, first"),
+            ("192.0.2.128", "TEST-NET-1, middle"),
+            ("192.0.2.255", "TEST-NET-1, last"),
+            ("198.51.100.0", "TEST-NET-2, first"),
+            ("198.51.100.128", "TEST-NET-2, middle"),
+            ("198.51.100.255", "TEST-NET-2, last"),
+            ("203.0.113.0", "TEST-NET-3, first"),
+            ("203.0.113.128", "TEST-NET-3, middle"),
+            ("203.0.113.255", "TEST-NET-3, last"),
+            // fec0::/10, deprecated site-local (RFC 3879).
+            ("fec0::", "site-local, first"),
+            ("fee0::1", "site-local, middle"),
+            (
+                "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "site-local, last",
+            ),
+            // 100::/64, discard-only (RFC 6666).
+            ("100::", "discard-only, first"),
+            ("100::8000:0:0:0", "discard-only, middle"),
+            ("100::ffff:ffff:ffff:ffff", "discard-only, last"),
+            // 2001:db8::/32, documentation (RFC 3849).
+            ("2001:db8::", "IPv6 documentation, first"),
+            ("2001:db8:8000::1", "IPv6 documentation, middle"),
+            (
+                "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+                "IPv6 documentation, last",
+            ),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} is {what} and was allowed");
+        }
+    }
+
+    /// The other side of each boundary in `forbids_reserved_and_documentation_ranges`.
+    ///
+    /// Most of these are allowed, and an off-by-one or an over-wide mask fails
+    /// on them. Three are not, because the range's neighbour is already refused
+    /// by an older rule; they are asserted anyway, with the rule named, so that
+    /// the new lines cannot quietly take over or drop what the old ones did.
+    /// `240/4` has no upper neighbour and `fec0::/10` has none that is allowed:
+    /// `fe80::/10` sits below it and `ff00::/8` above.
+    #[test]
+    fn the_reserved_ranges_stop_at_their_boundaries() {
+        for ip in [
+            "192.0.1.255",                            // below TEST-NET-1
+            "192.0.3.0",                              // above TEST-NET-1
+            "198.51.99.255",                          // below TEST-NET-2
+            "198.51.101.0",                           // above TEST-NET-2
+            "203.0.112.255",                          // below TEST-NET-3
+            "203.0.114.0",                            // above TEST-NET-3
+            "ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",  // below 100::/64
+            "100:0:0:1::",                            // above 100::/64
+            "2001:db7:ffff:ffff:ffff:ffff:ffff:ffff", // below 2001:db8::/32
+            "2001:db9::",                             // above 2001:db8::/32
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(&parsed),
+                "{ip} is just outside a reserved range and was refused — a \
+                 boundary is wrong",
+            );
+        }
+        for (ip, rule) in [
+            ("239.255.255.255", "multicast, 224.0.0.0/4"),
+            (
+                "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "link-local, fe80::/10",
+            ),
+            ("ff00::", "multicast, ff00::/8"),
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(&parsed), "{ip} must stay refused as {rule}");
+        }
+    }
+
+    /// **Every new IPv4 range is refused through every IPv6 wrapping the guard
+    /// unwraps (#217 on top of #210).** That holds because `is_forbidden_v6`
+    /// sends both the `to_ipv4()` result and every [`embedded_v4`] candidate
+    /// through the one `is_forbidden_v4`. This test is what keeps that true if
+    /// someone gives either path its own list.
+    ///
+    /// Teredo keeps the OTHER field at 8.8.8.8, so each case fails for the
+    /// field its label names. The neighbours of the ranges, wrapped the same
+    /// way, stay allowed.
+    #[test]
+    fn the_reserved_ipv4_ranges_are_refused_inside_ipv6() {
+        fn wrappings(v4: Ipv4Addr) -> Vec<(&'static str, Ipv6Addr)> {
+            let [a, b, c, d] = v4.octets();
+            let hi = u16::from_be_bytes([a, b]);
+            let lo = u16::from_be_bytes([c, d]);
+            vec![
+                ("mapped", v4.to_ipv6_mapped()),
+                ("compatible", v4.to_ipv6_compatible()),
+                ("NAT64", Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, hi, lo)),
+                ("6to4", Ipv6Addr::new(0x2002, hi, lo, 0, 0, 0, 0, 0)),
+                ("translated", Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, hi, lo)),
+                (
+                    "Teredo server",
+                    Ipv6Addr::new(0x2001, 0, hi, lo, 0, 0, 0xf7f7, 0xf7f7),
+                ),
+                (
+                    "Teredo client",
+                    Ipv6Addr::new(0x2001, 0, 0x0808, 0x0808, 0, 0, !hi, !lo),
+                ),
+                (
+                    "ISATAP",
+                    Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0x5efe, hi, lo),
+                ),
+            ]
+        }
+        for v4 in [
+            "240.0.0.0",
+            "247.255.0.1",
+            "255.255.255.254",
+            "192.0.2.0",
+            "192.0.2.255",
+            "198.51.100.0",
+            "198.51.100.255",
+            "203.0.113.0",
+            "203.0.113.255",
+        ] {
+            for (form, v6) in wrappings(v4.parse().unwrap()) {
+                assert!(
+                    is_forbidden_ip(&IpAddr::V6(v6)),
+                    "{v6} ({form} of {v4}) was allowed",
+                );
+            }
+        }
+        for v4 in ["192.0.3.0", "198.51.99.255", "203.0.114.0"] {
+            for (form, v6) in wrappings(v4.parse().unwrap()) {
+                assert!(
+                    !is_forbidden_ip(&IpAddr::V6(v6)),
+                    "{v6} ({form} of public {v4}) was refused",
+                );
+            }
         }
     }
 
