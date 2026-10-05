@@ -1104,10 +1104,12 @@ pub async fn run_retention_sweeper(
 ///
 /// Two kill switches: `FEATHERREADER_ADOPTION_INTERVAL_SECS=0` (or an empty
 /// `FEATHERREADER_RELAY_HOSTS`) stops just this loop, and the pre-existing
-/// `FEATHERREADER_DISABLE_SCHEDULER` stops it with the other four.
+/// `FEATHERREADER_DISABLE_SCHEDULER` stops it with every other background task
+/// (the five other offset loops in [`Loop::ALL`], the read-state flusher and the
+/// metrics flusher).
 ///
-/// It deviates from its four siblings in exactly one way: `interval_at` with an
-/// [`ADOPTION_STARTUP_DELAY`] instead of an immediate first tick, because this
+/// It deviates from the other offset loops in exactly one way: `interval_at` with
+/// an [`ADOPTION_STARTUP_DELAY`] (5 min) instead of a seconds-scale offset, because this
 /// tick is a request to a third party and the container supervisor turns "once
 /// per boot" into "once per crash-loop restart". Nothing it does can fail the
 /// process: every error path is a `warn!` that leaves the previous observation
