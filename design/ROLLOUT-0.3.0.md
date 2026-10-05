@@ -4,6 +4,10 @@
 > over to `rust` (PR #110); the "live" version and digests below are as of
 > that day. Kept as the record of that rollout; the current release is in
 > [`CHANGELOG.md`](../CHANGELOG.md).
+>
+> **Per-item status (audited 2026-10-05).** Stages 1–3 are done: PR #101, the
+> auto_vacuum migration run 2026-09-13 (ops runbook), and PR #110. Both
+> follow-ups are done. Stage 4 checks 1, 2 and 4 have no recorded evidence.
 
 Prod is **0.2.8 on the sidecar backend** (`curl https://feather-reader.com/health`
 → `ok featherreader/0.2.8`, checked 2026-09-13). `main` is 76 commits behind this
@@ -83,6 +87,8 @@ is cleared; see Stage 3.
 
 ## Stage 1 — ship 0.3.0 on the sidecar backend
 
+> Done: PR #101 (v0.3.0, squash `d7d97bf`).
+
 **No OAuth change.** `fly.toml` keeps `FEATHERREADER_REPO_BACKEND = "sidecar"`, so
 this deploy carries the Tier 1–4 and review-round fixes and nothing else. Verified
 safe: `config.rs:672` gates `FEATHERREADER_OAUTH_ENCRYPTION_KEY` on the rust
@@ -131,6 +137,9 @@ additive and 0.2.8 ignores them, so rollback is clean.
 ---
 
 ## Stage 2 — the one-time auto_vacuum migration
+
+> Done 2026-09-13 (ops runbook): prod is `auto_vacuum=INCREMENTAL`, and the file
+> went from 21 MB to about 10 MB.
 
 The prod database predates 0.3.0, so it is in SQLite's default `auto_vacuum=NONE`,
 where freed pages are never returned and the file only grows. Databases created
@@ -185,6 +194,8 @@ fly ssh console -C "ls -l /data/featherreader.db"
 
 ## Stage 3 — the backend cutover (sidecar → rust)
 
+> Done in PR #110. Prod `/health` reports `backend: rust`.
+
 **This is the risky one and it is separately revertible. Do not combine it with
 Stage 1.**
 
@@ -227,6 +238,10 @@ full login. The individual guards are pinned; their *sequencing* is not. A
 follow-up wanting that needs the injectable-resolver work this deliberately
 avoided.
 
+> Partly addressed since, by PR #122 (a TLS test CA) and PR #135. `complete` is
+> driven over TLS to the token endpoint. A full start → session test still does
+> not exist.
+
 ### It logs every user out
 
 Verified, and **not currently documented anywhere**: nothing under `src/` reads
@@ -267,6 +282,11 @@ sidecar path never reads it.
 
 ## Stage 4 — prod tests
 
+> Status (audited 2026-10-05): 3 and 5 have run in practice, since every login
+> and sync has used the rust backend since PR #110. No captured evidence is
+> recorded for 1 (`client_assertion_type`), 2 (revocation response status) or 4
+> (a post-cutover `live_pds` run).
+
 These are the two claims that have been unverifiable from a dev box all along,
 because both require a real PDS to fetch our client metadata at the real
 `client_id` URL. **They can only run after Stage 3.**
@@ -296,5 +316,8 @@ DPoP private keys into logs, notes, or this repo.
 - The wiki runbook's rollback table stops at `v0.2.6` while prod runs `0.2.8`, and
   its release train text calls `v0.2.6` current. Needs `v0.2.7`, `v0.2.8`, `v0.3.0`
   added and the step-5c `Accept` header fixed.
+  > Done (ops runbook): step 5c sends all four media types with an empty-digest
+  > guard. The rollback table now runs through v0.3.6.
 - `fly.toml` should state that the cutover forces a re-login, next to where it
   already says key rotation does.
+  > Done: see the BACKEND CUTOVER block in `fly.toml`.
