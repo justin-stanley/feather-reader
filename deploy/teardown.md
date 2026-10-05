@@ -35,13 +35,47 @@ production. For every row of `oauth_session` it runs the same sign-out that
 `/logout` uses: it discovers the PDS's revocation endpoint, revokes the refresh
 token there (RFC 7009), and deletes the row **whatever the PDS says**, including
 rows that no longer decrypt. Sign-outs run one at a time, and each is
-deadline-bounded. It prints a line per DID and a summary, and exits with:
+deadline-bounded. Each sign-out reads the clock afresh, because its client
+assertion is valid for only 60 s. A long walk therefore never sends an expired
+assertion.
+
+It prints a line per DID, a summary, and, **last**, a sentinel line:
+
+```text
+revoke-all-sessions: revoked=N no_session=M failed=K
+```
+
+It then exits with:
 
 | Exit | Meaning | `teardown.sh` does |
 |---|---|---|
-| `0` | Every session revoked, or none stored. | Continues. |
-| `1` | Some revocations failed; **every row is still deleted**. Those tokens may stay live at their PDS until they expire. | Warns and continues. |
-| `2` | Nothing was done: bad configuration, no database at `FEATHERREADER_DB` (it will not create one and report "0 sessions" about the wrong file), an unreadable store, or the Rust OAuth client cannot be built while sessions are stored. In that last case **nothing is deleted**, so a fixed configuration can try again. | Aborts before the wipe. |
+| `0` + sentinel with `failed=0` | Every session revoked, or none stored. | Continues. |
+| `3` + sentinel with `failed>0` | Some revocations failed. **Every row is still deleted.** Those tokens may stay live at their PDS until they expire. | Warns and continues. |
+| `2`, no sentinel | Nothing was done and **nothing deleted**; fix the cause and run it again. See the list below. | Aborts before the wipe. |
+| anything else, or a missing or contradictory sentinel | Not a completed revoke-all. | Aborts before the wipe. |
+
+What makes it exit `2`:
+
+- bad configuration;
+- no database at `FEATHERREADER_DB` (it will not create one and report "0 sessions" about the wrong file);
+- an unreadable store;
+- a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH` (it will not create one);
+- the Rust OAuth client cannot be built while sessions are stored.
+
+The last two only stop it when sessions are stored. A missing key matters
+because a freshly created key is one no PDS can verify: every revocation would
+fail, and the rows would be deleted anyway.
+
+Partial failure is `3` rather than `1` because `1` is what everything else
+exits with. That includes an **older `featherreader`** (0.4.4 or earlier),
+which ignores this flag, tries to start a server, and exits 1 when the port is
+taken, and wrappers like `docker compose exec` or `fly ssh console` when they
+fail. The sentinel covers what the exit code cannot: only this command, run to
+completion, prints it.
+
+> An older binary on the **sweep**, after the app has stopped, finds the port
+> free and starts serving. The teardown then hangs rather than wiping. Stop it
+> and use a binary that has this flag.
 
 It is safe to run against a **live** app's database, which is what the Fly
 procedure does. The pool uses WAL and the app's 5 s `busy_timeout`, so a
@@ -108,7 +142,9 @@ The script runs, in order:
 5. The wipe: both SQLite volumes with a clean WAL checkpoint, the sidecar JWK,
    and the Rust signing key.
 
-It prompts for confirmation unless `FR_TEARDOWN_YES=1`.
+A Rust pass counts as done only if it ends with the sentinel line and exits
+`0` or `3` (see the table above); anything else aborts before the wipe. It
+prompts for confirmation unless `FR_TEARDOWN_YES=1`.
 
 ```bash
 # rust backend (production). The revoke command needs the app's environment —
@@ -152,8 +188,11 @@ the command has to run inside the machine. By hand:
 # 1. While the machine is RUNNING (the PDSes must be able to fetch our client
 #    metadata to accept the revocations), revoke every session:
 fly ssh console -C "/app/featherreader --revoke-all-sessions"
-#    0 = done; 1 = some failed (rows deleted anyway, listed by DID); 2 = nothing
-#    done — read the message, fix it, run again. Do not go on after a 2.
+#    Go on ONLY if the last line is "revoke-all-sessions: revoked=… failed=…".
+#    Exit 0 = done. Exit 3 = some failed (rows deleted anyway, listed by DID).
+#    Exit 2 = nothing done: read the message, fix it, run again.
+#    Anything else, or no such line (an image older than this flag starts a
+#    server instead), means nothing was revoked: do not go on.
 
 # 2. IMMEDIATELY stop the machine. The gap between step 1 and this is the
 #    residual risk: a user who logs in during it keeps an unrevoked session.
@@ -196,7 +235,7 @@ step 2; it should report `0 revoked`.
    [above](#revoking-the-rust-backends-sessions) for why it must be running):
 
    ```bash
-   featherreader --revoke-all-sessions   # with the app's environment; 2 = stop here
+   featherreader --revoke-all-sessions   # app's env; go on only on exit 0/3 + its last line
    ```
 
 3. **Stop the services** so nothing writes to the DBs mid-wipe:

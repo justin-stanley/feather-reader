@@ -328,10 +328,15 @@ pub async fn revoke_all(
     runtime: &super::runtime::OauthRuntime,
     http: &reqwest::Client,
     pool: &sqlx::SqlitePool,
-    now: i64,
+    mut clock: impl FnMut() -> i64,
 ) -> Result<RevokeAllReport> {
     let mut report = RevokeAllReport::default();
     for sub in super::store::list_session_subs(pool).await? {
+        // Read the clock PER SESSION. `now` becomes the client assertion's
+        // `iat`, and an assertion lives only 60 s: one timestamp taken at the
+        // start would be expired for every session reached after the first
+        // minute, so those revocations would all be rejected.
+        let now = clock();
         match sign_out_discovering(runtime, http, pool, &sub, now).await {
             Revocation::Revoked => report.revoked.push(sub),
             Revocation::NoSession => report.no_session.push(sub),
@@ -877,7 +882,7 @@ mod tests {
             revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
         store_sessions(&pool, &codec, &pds, &issuer).await;
 
-        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
             .await
             .expect("listing the sessions");
 
@@ -917,7 +922,7 @@ mod tests {
         .await;
         store_sessions(&pool, &codec, &pds, &issuer).await;
 
-        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
             .await
             .expect("listing the sessions");
 
@@ -945,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_row_fails_and_is_deleted_and_an_empty_store_is_empty() {
         let (pool, codec) = db().await;
-        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
             .await
             .unwrap();
         assert_eq!(report, RevokeAllReport::default());
@@ -958,7 +963,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
             .await
             .unwrap();
         assert!(report.revoked.is_empty());
@@ -970,5 +975,88 @@ mod tests {
             report.failed[0].1
         );
         assert_eq!(session_rows(&pool).await, 0, "the unreadable row survived");
+    }
+
+    /// A CONFIDENTIAL client runtime (non-loopback public URL), with its
+    /// signing key in a per-test temp file rather than the working directory.
+    fn confidential_runtime(tag: &str) -> super::super::runtime::OauthRuntime {
+        super::super::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: Some(KEY.to_string()),
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-revoke-test-key-{}-{tag}.json",
+                    std::process::id()
+                )),
+                plc_directory: "https://plc.invalid".to_string(),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .expect("the confidential test runtime must build")
+    }
+
+    /// The `iat` of the client assertion in one recorded revocation request.
+    fn assertion_iat(raw: &str) -> i64 {
+        use base64::Engine as _;
+        let body = raw.split("\r\n\r\n").nth(1).expect("no request body");
+        let jwt = body
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("client_assertion="))
+            .unwrap_or_else(|| panic!("no client_assertion in {body}"));
+        let payload = jwt.split('.').nth(1).expect("malformed assertion");
+        let json: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .expect("assertion payload is not base64url"),
+        )
+        .expect("assertion payload is not JSON");
+        json["iat"].as_i64().expect("assertion has no iat")
+    }
+
+    /// **Each revocation's client assertion is minted at ITS OWN time.**
+    ///
+    /// A client assertion lives 60 s (`exp = iat + 60`). Taking one `now` at
+    /// the start of the walk and reusing it meant that once the walk passed a
+    /// minute — a few hundred sessions, or a handful of slow PDSes at the
+    /// five-second deadline — every later assertion was already expired when
+    /// sent. Each of those revocations is rejected as `invalid_client`, the row
+    /// is deleted anyway, and the teardown proceeds over live tokens.
+    ///
+    /// The clock here advances 100 s per reading, so a stale `now` shows up as
+    /// three identical `iat`s.
+    #[tokio::test]
+    async fn each_revocation_takes_the_time_afresh() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let mut tick = 0;
+        let clock = || {
+            let t = NOW + tick * 100;
+            tick += 1;
+            t
+        };
+        let report = revoke_all(
+            &confidential_runtime("clock"),
+            &reqwest::Client::new(),
+            &pool,
+            clock,
+        )
+        .await
+        .expect("listing the sessions");
+        assert_eq!(report.revoked.len(), 3, "{report:?}");
+
+        let iats: Vec<i64> = revoke_requests(&log)
+            .iter()
+            .map(|r| assertion_iat(r))
+            .collect();
+        assert_eq!(
+            iats,
+            vec![NOW, NOW + 100, NOW + 200],
+            "the assertions reused one timestamp — later ones would be expired on arrival"
+        );
     }
 }

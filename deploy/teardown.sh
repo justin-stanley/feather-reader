@@ -30,8 +30,11 @@
 #      a no-op; a session found here may fail to revoke (metadata now offline),
 #      but its row is still deleted and the failure reported.
 #   5. wipe.
-# A revoke exiting 1 (some revocations failed; rows deleted anyway) warns and
-# continues. Any other non-zero exit (2: nothing done) aborts BEFORE the wipe.
+# Each Rust pass must end with the binary's summary line
+# (`revoke-all-sessions: revoked=N no_session=M failed=K`) and exit 0 (all
+# revoked) or 3 (some failed; rows deleted anyway — warns and continues).
+# Anything else — 2 (nothing done), 1 (an older binary that ignored the flag, a
+# failing wrapper), or no summary line — aborts BEFORE the wipe.
 #
 # Required env:
 #   FEATHERREADER_DB          path to the Rust app's SQLite cache
@@ -115,19 +118,39 @@ if [ "${FR_TEARDOWN_YES:-}" != "1" ]; then
   [ "$reply" = "wipe" ] || { echo "aborted."; exit 1; }
 fi
 
-# Run the Rust revoke; abort the teardown unless it exits 0 or 1.
+# Run the Rust revoke. Proceed ONLY on the binary's own proof of completion:
+# its last stdout line is the sentinel
+#   revoke-all-sessions: revoked=N no_session=M failed=K
+# and the exit code agrees with it — 0 with failed=0, or 3 with failed>0 (some
+# revocations failed; rows deleted anyway). Anything else aborts before the
+# wipe: 2 is the binary's "nothing done", and an exit code without the sentinel
+# is not this command at all — an older featherreader ignores the unknown flag,
+# tries to start a server and exits 1 when the port is taken, and a wrapper
+# (docker compose exec, ssh) fails with 1 too.
 rust_revoke() {
   echo "==> Revoking all Rust-backend sessions ($1): $revoke_cmd"
-  local rc=0
-  eval "$revoke_cmd" || rc=$?
-  case "$rc" in
-    0) echo "==> Rust revoke ($1) complete." ;;
-    1) echo "    WARN: some Rust revocations FAILED (rows deleted anyway; those tokens" >&2
-       echo "          may stay live at their PDS until they expire). Continuing." >&2 ;;
-    *) echo "FATAL: the Rust revoke ($1) exited $rc — nothing to show it revoked or" >&2
-       echo "       deleted anything. ABORTING before the wipe; see deploy/teardown.md." >&2
-       exit 2 ;;
-  esac
+  local rc=0 out last failed
+  out="$(mktemp "${TMPDIR:-/tmp}/fr-revoke.XXXXXX")"
+  eval "$revoke_cmd" >"$out" || rc=$?
+  cat "$out"
+  last="$(grep -v '^[[:space:]]*$' "$out" | tail -n 1 || true)"
+  rm -f "$out"
+  failed=""
+  if [[ "$last" =~ ^revoke-all-sessions:\ revoked=[0-9]+\ no_session=[0-9]+\ failed=([0-9]+)$ ]]; then
+    failed="${BASH_REMATCH[1]}"
+  fi
+  if [ "$rc" = 0 ] && [ "$failed" = 0 ]; then
+    echo "==> Rust revoke ($1) complete."
+  elif [ "$rc" = 3 ] && [ -n "$failed" ] && [ "$failed" != 0 ]; then
+    echo "    WARN: $failed Rust revocation(s) FAILED (rows deleted anyway; those" >&2
+    echo "          tokens may stay live at their PDS until they expire). Continuing." >&2
+  else
+    echo "FATAL: the Rust revoke ($1) exited $rc with last line \"$last\" —" >&2
+    echo "       not a completed --revoke-all-sessions (exit 0 or 3 plus its" >&2
+    echo "       summary line). Is the binary older than this script? ABORTING" >&2
+    echo "       before the wipe; see deploy/teardown.md." >&2
+    exit 2
+  fi
 }
 
 # 1. Revoke every sidecar DID at its PDS (needs the sidecar still running).

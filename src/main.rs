@@ -37,8 +37,8 @@ mod scheduler;
 async fn main() -> Result<()> {
     // Maintenance mode: sign every stored session out and exit, without binding
     // a port or starting a scheduler. Checked before anything can fail through
-    // `?`, because an error from `main` exits 1 — which a teardown reads as
-    // "partially revoked, proceed" — when nothing was revoked at all.
+    // `?`, so every failure of this mode is an explicit exit 2 ("nothing done")
+    // rather than whatever an error from `main` happens to exit with.
     if wants_revoke_all(std::env::args()) {
         std::process::exit(run_revoke_all().await);
     }
@@ -235,10 +235,29 @@ const REVOKE_ALL_SESSIONS_FLAG: &str = "--revoke-all-sessions";
 const REVOKE_EXIT_OK: i32 = 0;
 /// Some revocations failed. Every row is still deleted locally, so a teardown
 /// may proceed — but those tokens may stay live at their PDS until they expire.
-const REVOKE_EXIT_SOME_FAILED: i32 = 1;
+///
+/// **Deliberately not 1.** 1 is what everything else exits with: `main`
+/// returning `Err`, a wrapper (`docker compose exec`, `fly ssh`) failing, and —
+/// the case that matters — an OLDER binary that does not know this flag, ignores
+/// it, tries to start a server and fails to bind. A teardown that read 1 as
+/// "partially revoked, proceed" wiped with nothing revoked.
+const REVOKE_EXIT_SOME_FAILED: i32 = 3;
 /// Nothing was revoked and nothing deleted (not configured, unreadable store,
 /// bad configuration). A teardown MUST NOT wipe after this.
 const REVOKE_EXIT_ABORT: i32 = 2;
+
+/// The line a completed revoke-all prints LAST, which `deploy/teardown.sh`
+/// requires before it will wipe. An exit code alone can be produced by
+/// something that is not this command; this line cannot be produced by an
+/// older binary or a wrapper that never ran it.
+fn revoke_all_sentinel(report: &feather_reader::oauth::revoke::RevokeAllReport) -> String {
+    format!(
+        "revoke-all-sessions: revoked={} no_session={} failed={}",
+        report.revoked.len(),
+        report.no_session.len(),
+        report.failed.len()
+    )
+}
 
 /// Whether the invocation asked for the revoke-all. Skips `argv[0]`, like
 /// [`wants_vacuum_migration`]: this signs every user out, so a binary installed
@@ -276,8 +295,9 @@ fn unconfigured_exit_code(stored_sessions: usize) -> i32 {
 
 /// Entry point for `featherreader --revoke-all-sessions`. Returns the process
 /// exit code; every error that means "nothing was done" maps to
-/// [`REVOKE_EXIT_ABORT`], never to 1, because a teardown treats 1 as "proceed
-/// with a warning".
+/// [`REVOKE_EXIT_ABORT`] and prints no sentinel, so a teardown aborts. Only a
+/// completed walk prints the sentinel ([`revoke_all_sentinel`]) and exits 0 or
+/// [`REVOKE_EXIT_SOME_FAILED`].
 ///
 /// **Safe against a LIVE app's database** — on Fly this runs over `fly ssh
 /// console` beside the serving process. The pool is opened with WAL and the
@@ -295,6 +315,12 @@ async fn run_revoke_all() -> i32 {
         }
     };
     init_tracing();
+    run_revoke_all_with(&config).await
+}
+
+/// [`run_revoke_all`] after configuration — split out so the refusals that
+/// depend on files on disk can be tested.
+async fn run_revoke_all_with(config: &Config) -> i32 {
     // `store::init` creates a missing database. Here that would answer "0
     // sessions, all good" about the WRONG file and let a teardown wipe the
     // real one with every token still live.
@@ -305,7 +331,7 @@ async fn run_revoke_all() -> i32 {
         );
         return REVOKE_EXIT_ABORT;
     }
-    let db = match store::init(&config).await {
+    let db = match store::init(config).await {
         Ok(db) => db,
         Err(err) => {
             eprintln!("revoke-all: ABORT — opening the database: {err:#}");
@@ -320,7 +346,10 @@ async fn run_revoke_all() -> i32 {
             return REVOKE_EXIT_ABORT;
         }
     };
-    let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+    // Load-only: this mode must never CREATE a signing key (see
+    // `OauthRuntime::without_creating_key`). A missing key is a runtime that
+    // cannot be built, which refuses if any session is stored.
+    let runtime = feather_reader::oauth::runtime::OauthRuntime::without_creating_key(config);
     let code = revoke_all_sessions(&db, runtime, &http).await;
     db.close().await;
     code
@@ -349,6 +378,10 @@ async fn revoke_all_sessions(
                     "revoke-all: the Rust OAuth client is not configured ({err:#}), and no \
                      sessions are stored — nothing to revoke."
                 );
+                println!(
+                    "{}",
+                    revoke_all_sentinel(&feather_reader::oauth::revoke::RevokeAllReport::default())
+                );
             } else {
                 eprintln!(
                     "revoke-all: ABORT — {stored} session(s) are stored but the Rust OAuth \
@@ -362,8 +395,10 @@ async fn revoke_all_sessions(
         }
     };
 
-    let now = chrono::Utc::now().timestamp();
-    let report = match feather_reader::oauth::revoke::revoke_all(&runtime, http, db, now).await {
+    // A clock, not a timestamp: each sign-out mints a 60-second client
+    // assertion, so the time must be read per session (see `revoke_all`).
+    let clock = || chrono::Utc::now().timestamp();
+    let report = match feather_reader::oauth::revoke::revoke_all(&runtime, http, db, clock).await {
         Ok(report) => report,
         Err(err) => {
             eprintln!("revoke-all: ABORT — listing the sessions: {err:#}");
@@ -385,6 +420,8 @@ async fn revoke_all_sessions(
         report.no_session.len(),
         report.failed.len()
     );
+    // LAST, always: the teardown requires it before it will wipe.
+    println!("{}", revoke_all_sentinel(&report));
     revoke_all_exit_code(&report)
 }
 
@@ -566,7 +603,109 @@ mod tests {
             failed: vec![("did:plc:c".into(), "status 500".into())],
             ..ok
         };
-        assert_eq!(revoke_all_exit_code(&some_failed), 1);
+        assert_eq!(
+            revoke_all_exit_code(&some_failed),
+            3,
+            "partial failure must not share 1 with every generic failure"
+        );
+    }
+
+    /// The sentinel is exact: `deploy/teardown.sh` matches it with a regex and
+    /// cross-checks `failed=` against the exit code.
+    #[test]
+    fn the_sentinel_names_every_count() {
+        let report = RevokeAllReport {
+            revoked: vec!["a".into(), "b".into()],
+            no_session: vec!["c".into()],
+            failed: vec![("d".into(), "x".into())],
+        };
+        assert_eq!(
+            revoke_all_sentinel(&report),
+            "revoke-all-sessions: revoked=2 no_session=1 failed=1"
+        );
+        assert_eq!(
+            revoke_all_sentinel(&RevokeAllReport::default()),
+            "revoke-all-sessions: revoked=0 no_session=0 failed=0"
+        );
+    }
+
+    /// A per-test scratch directory under the system temp dir.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fr-main-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A production-like (confidential client, rust backend) configuration
+    /// whose database and signing key live in `dir`.
+    fn confidential_config(dir: &std::path::Path) -> Config {
+        Config {
+            db_path: dir.join("featherreader.db"),
+            repo_backend: feather_reader::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: feather_reader::config::OauthConfig {
+                encryption_key: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                key_path: dir.join("oauth-signing-key.json"),
+                plc_directory: "https://plc.invalid".into(),
+                ..feather_reader::config::OauthConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// **No database, no answer.** `store::init` would create an empty file and
+    /// report "0 sessions" about it — and a teardown would then wipe the REAL
+    /// database with every token in it still live.
+    #[tokio::test]
+    async fn a_missing_database_is_refused_and_not_created() {
+        let dir = scratch("nodb");
+        let config = confidential_config(&dir);
+        assert_eq!(run_revoke_all_with(&config).await, 2);
+        assert!(
+            !config.db_path.exists(),
+            "the revoke-all created a database at the wrong path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A missing signing key is refused, never created.**
+    ///
+    /// `OauthRuntime::new` creates the key when it is absent. Run from the wrong
+    /// directory (the default path is RELATIVE) that minted a fresh key under
+    /// the same `kid`; the live app still published the old JWKS, so every
+    /// client assertion was rejected — and every row deleted anyway, leaving the
+    /// teardown to proceed over live tokens.
+    #[tokio::test]
+    async fn a_missing_signing_key_is_refused_and_not_created() {
+        let dir = scratch("nokey");
+        let config = confidential_config(&dir);
+        let url = format!("sqlite://{}", config.db_path.display());
+        let pool = store::init_url(&url).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_session (sub, issuer, aud, dpop_key_jwk, access_token, \
+             refresh_token, token_type, granted_scope, expires_at) \
+             VALUES ('did:plc:keyless', 'https://as.invalid', 'https://pds.invalid', \
+             'x', 'x', 'x', 'DPoP', 'atproto', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        assert_eq!(run_revoke_all_with(&config).await, 2);
+        assert!(
+            !config.oauth.key_path.exists(),
+            "the revoke-all CREATED a signing key the PDSes have never seen"
+        );
+        let pool = store::init_url(&url).await.unwrap();
+        assert_eq!(
+            rows(&pool).await,
+            1,
+            "rows were deleted without a revocation"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Without a runtime, stored sessions cannot be revoked: refuse (2) rather

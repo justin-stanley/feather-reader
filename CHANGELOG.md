@@ -31,14 +31,28 @@ deploying is separate.
   `sub` only, so rows that no longer decrypt are listed too. Each row goes
   through `sign_out_discovering`, the same sign-out `/logout` uses: a bounded
   RFC 7009 revocation, then an unconditional delete. A failure does not stop
-  the walk.
+  the walk. The clock is read **per session**, because each sign-out mints a
+  client assertion that is valid for 60 s. A single timestamp taken at the
+  start would have expired every assertion sent after the first minute, so
+  those revocations would have been rejected while their rows were deleted.
 
-  **Exit codes.** `0` means all revoked. `1` means some revocations failed,
-  but every row is deleted anyway. `2` means nothing was done. Every error
-  path is mapped to `2`, never `1`: bad configuration, a missing database (it
-  refuses rather than creating one and reporting "0 sessions" about the wrong
-  file), an unreadable store, or sessions stored with no buildable OAuth
-  runtime. In that last case nothing is deleted.
+  **Exit codes.** `0` means all revoked. `3` means some revocations failed,
+  but every row is deleted anyway. `2` means nothing was done, and in that
+  case nothing is deleted either. The causes of `2`:
+
+  - bad configuration;
+  - a missing database: it refuses rather than creating one and reporting
+    "0 sessions" about the wrong file;
+  - an unreadable store;
+  - a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH`: this mode loads
+    the key and never creates one, since a fresh key is one no PDS can verify;
+  - sessions stored with no buildable OAuth runtime.
+
+  A completed run prints a last line,
+  `revoke-all-sessions: revoked=N no_session=M failed=K`. Partial failure is
+  deliberately not `1`. An older binary that ignores the flag exits 1 when its
+  server fails to bind, and a failing wrapper exits 1 too; neither prints that
+  line.
 
   **Teardown order.** The script runs: the sidecar revoke, then the Rust
   revoke **while the app still serves**, then the stop, then a Rust sweep,
@@ -52,17 +66,24 @@ deploying is separate.
 
   **Refusals and failures.** The script refuses, before anything
   irreversible, when the backend is `rust` (or `FEATHERREADER_DB` holds Rust
-  sessions) and there is no revoke command. A revoke exiting `1` warns and
-  continues; any other non-zero exit aborts before the wipe. The `SIDECAR_*`
-  variables are optional on the `rust` backend when no `SIDECAR_DB` exists.
+  sessions) and there is no revoke command. A Rust pass proceeds only on exit
+  `0` with `failed=0`, or exit `3` with `failed>0` (which warns), and only if
+  the sentinel is the last line of output. Anything else aborts before the
+  wipe. The `SIDECAR_*` variables are optional on the `rust` backend when no
+  `SIDECAR_DB` exists.
 
-  **Tests.** New `scripts/test-teardown.sh`, 30 assertions, runs the real
+  **Tests.** New `scripts/test-teardown.sh`, 51 assertions, runs the real
   script against throwaway SQLite files with stub commands. It is wired into
-  CI (new `teardown` job) and `scripts/ci.sh`; against the old script, 21 of
-  the 30 failed. Tests against a real-TLS fake authorization server cover
-  revoke-all: every session revoked, one server failing, an unreadable row,
-  and an empty store. Each new guard was broken on its own and a test failed
-  every time (16 of 16).
+  CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
+  of the first 30 failed; the sentinel and exit-code cases failed 17 of 51
+  before the script required the sentinel.
+
+  Tests against a real-TLS fake authorization server cover revoke-all: every
+  session revoked, one server failing, an unreadable row, an empty store, and
+  each assertion's `iat` coming from its own clock reading.
+
+  Each new guard was broken on its own and a test failed every time (26 of
+  26).
   `deploy/teardown.md` gains the procedure, including Fly's.
 
 ### Docs
