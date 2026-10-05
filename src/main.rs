@@ -35,6 +35,14 @@ mod scheduler;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Maintenance mode: sign every stored session out and exit, without binding
+    // a port or starting a scheduler. Checked before anything can fail through
+    // `?`, because an error from `main` exits 1 — which a teardown reads as
+    // "partially revoked, proceed" — when nothing was revoked at all.
+    if wants_revoke_all(std::env::args()) {
+        std::process::exit(run_revoke_all().await);
+    }
+
     // 1. Configuration — env-driven, every knob defaulted.
     let config = Config::from_env().context("loading configuration")?;
 
@@ -126,7 +134,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The one CLI flag this binary understands. Everything else is env-driven.
+/// One of the two maintenance flags this binary understands (the other is
+/// [`REVOKE_ALL_SESSIONS_FLAG`]). Everything else is env-driven.
 const MIGRATE_AUTO_VACUUM_FLAG: &str = "--migrate-auto-vacuum";
 
 /// Whether the invocation asked for the maintenance migration.
@@ -217,6 +226,166 @@ async fn run_vacuum_migration(db: &store::Pool, config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The operator's fleet-wide sign-out, run by `deploy/teardown.sh` (#257).
+const REVOKE_ALL_SESSIONS_FLAG: &str = "--revoke-all-sessions";
+
+/// `--revoke-all-sessions` exit code: every session revoked (or none stored).
+const REVOKE_EXIT_OK: i32 = 0;
+/// Some revocations failed. Every row is still deleted locally, so a teardown
+/// may proceed — but those tokens may stay live at their PDS until they expire.
+const REVOKE_EXIT_SOME_FAILED: i32 = 1;
+/// Nothing was revoked and nothing deleted (not configured, unreadable store,
+/// bad configuration). A teardown MUST NOT wipe after this.
+const REVOKE_EXIT_ABORT: i32 = 2;
+
+/// Whether the invocation asked for the revoke-all. Skips `argv[0]`, like
+/// [`wants_vacuum_migration`]: this signs every user out, so a binary installed
+/// at a path containing the flag must not trigger it.
+fn wants_revoke_all<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|a| a == REVOKE_ALL_SESSIONS_FLAG)
+}
+
+/// The exit code for a completed revoke-all: any failure is reported, because
+/// those tokens may still be live at their PDS even though the rows are gone.
+fn revoke_all_exit_code(report: &feather_reader::oauth::revoke::RevokeAllReport) -> i32 {
+    if report.failed.is_empty() {
+        REVOKE_EXIT_OK
+    } else {
+        REVOKE_EXIT_SOME_FAILED
+    }
+}
+
+/// The exit code when the Rust OAuth runtime cannot be built, given how many
+/// sessions are stored.
+///
+/// Without a runtime there is no codec to read the tokens and no client
+/// identity to revoke them with. Stored sessions then cannot be revoked — and
+/// must not be quietly dropped either, so this refuses and the caller deletes
+/// nothing. An empty store has nothing to revoke, which is success.
+fn unconfigured_exit_code(stored_sessions: usize) -> i32 {
+    if stored_sessions == 0 {
+        REVOKE_EXIT_OK
+    } else {
+        REVOKE_EXIT_ABORT
+    }
+}
+
+/// Entry point for `featherreader --revoke-all-sessions`. Returns the process
+/// exit code; every error that means "nothing was done" maps to
+/// [`REVOKE_EXIT_ABORT`], never to 1, because a teardown treats 1 as "proceed
+/// with a warning".
+///
+/// **Safe against a LIVE app's database** — on Fly this runs over `fly ssh
+/// console` beside the serving process. The pool is opened with WAL and the
+/// same 5 s `busy_timeout` the app uses (`store::init_url`), so a concurrent
+/// app write makes a statement wait rather than fail; every sign-out deletes one
+/// row in its own statement, so the lock is never held across a network call;
+/// and a delete that still cannot get the lock is reported as that DID's
+/// failure, not a crash of the whole run.
+async fn run_revoke_all() -> i32 {
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — loading configuration: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    init_tracing();
+    // `store::init` creates a missing database. Here that would answer "0
+    // sessions, all good" about the WRONG file and let a teardown wipe the
+    // real one with every token still live.
+    if !config.db_path.exists() {
+        eprintln!(
+            "revoke-all: ABORT — no database at {} (is FEATHERREADER_DB set as the app sees it?)",
+            config.db_path.display()
+        );
+        return REVOKE_EXIT_ABORT;
+    }
+    let db = match store::init(&config).await {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — opening the database: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    let http = match feather_reader::build_http_client() {
+        Ok(http) => http,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — building the HTTP client: {err:#}");
+            db.close().await;
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+    let code = revoke_all_sessions(&db, runtime, &http).await;
+    db.close().await;
+    code
+}
+
+/// Revoke every stored session with `runtime`, printing a line per DID and a
+/// summary. Returns the process exit code.
+async fn revoke_all_sessions(
+    db: &store::Pool,
+    runtime: Result<feather_reader::oauth::runtime::OauthRuntime>,
+    http: &reqwest::Client,
+) -> i32 {
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let stored = match feather_reader::oauth::store::list_session_subs(db).await {
+                Ok(subs) => subs.len(),
+                Err(err) => {
+                    eprintln!("revoke-all: ABORT — listing the sessions: {err:#}");
+                    return REVOKE_EXIT_ABORT;
+                }
+            };
+            let code = unconfigured_exit_code(stored);
+            if code == REVOKE_EXIT_OK {
+                println!(
+                    "revoke-all: the Rust OAuth client is not configured ({err:#}), and no \
+                     sessions are stored — nothing to revoke."
+                );
+            } else {
+                eprintln!(
+                    "revoke-all: ABORT — {stored} session(s) are stored but the Rust OAuth \
+                     client cannot be built ({err:#}). Nothing was revoked and NOTHING WAS \
+                     DELETED. Run this with the app's own environment (\
+                     FEATHERREADER_OAUTH_ENCRYPTION_KEY, FEATHERREADER_PUBLIC_URL, \
+                     FEATHERREADER_OAUTH_KEY_PATH) and try again."
+                );
+            }
+            return code;
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let report = match feather_reader::oauth::revoke::revoke_all(&runtime, http, db, now).await {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — listing the sessions: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    for did in &report.revoked {
+        println!("    revoked {did}");
+    }
+    for did in &report.no_session {
+        println!("    already signed out {did}");
+    }
+    for (did, reason) in &report.failed {
+        println!("    FAILED  {did}: {reason} (local session deleted anyway)");
+    }
+    println!(
+        "revoke-all: {} revoked, {} already gone, {} failed; every stored session was deleted.",
+        report.revoked.len(),
+        report.no_session.len(),
+        report.failed.len()
+    );
+    revoke_all_exit_code(&report)
 }
 
 /// Startup safety check for the DB-size watermark vs. the actual DB volume.
@@ -356,4 +525,108 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<()>) {
     // The initial value is already "seen"; wait for the next change (the send) or
     // for the sender to drop.
     let _ = rx.changed().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feather_reader::oauth::revoke::RevokeAllReport;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The flag is matched as an ARGUMENT only: a binary whose install path
+    /// contains it (argv[0]) must not sign every user out on an ordinary start.
+    #[test]
+    fn the_revoke_all_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_revoke_all(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_revoke_all(args(&["--revoke-all-sessions"])));
+        assert!(!wants_revoke_all(args(&["/app/featherreader"])));
+        assert!(!wants_revoke_all(args(&[
+            "/app/featherreader",
+            "--migrate-auto-vacuum"
+        ])));
+    }
+
+    /// 0 when nothing failed; 1 when anything did, so a teardown can warn.
+    #[test]
+    fn the_exit_code_reports_any_failure() {
+        assert_eq!(revoke_all_exit_code(&RevokeAllReport::default()), 0);
+        let ok = RevokeAllReport {
+            revoked: vec!["did:plc:a".into()],
+            no_session: vec!["did:plc:b".into()],
+            failed: vec![],
+        };
+        assert_eq!(revoke_all_exit_code(&ok), 0);
+        let some_failed = RevokeAllReport {
+            failed: vec![("did:plc:c".into(), "status 500".into())],
+            ..ok
+        };
+        assert_eq!(revoke_all_exit_code(&some_failed), 1);
+    }
+
+    /// Without a runtime, stored sessions cannot be revoked: refuse (2) rather
+    /// than report success. An empty store has nothing to revoke (0).
+    #[test]
+    fn an_unconfigured_runtime_refuses_only_when_sessions_exist() {
+        assert_eq!(unconfigured_exit_code(0), 0);
+        assert_eq!(unconfigured_exit_code(1), 2);
+        assert_eq!(unconfigured_exit_code(500), 2);
+    }
+
+    async fn db_with_rows(n: usize) -> store::Pool {
+        let pool = store::init_url("sqlite::memory:").await.unwrap();
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO oauth_session (sub, issuer, aud, dpop_key_jwk, access_token, \
+                 refresh_token, token_type, granted_scope, expires_at) \
+                 VALUES (?, 'https://as.example', 'https://pds.example', 'x', 'x', 'x', \
+                 'DPoP', 'atproto', NULL)",
+            )
+            .bind(format!("did:plc:{i:024}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    async fn rows(pool: &store::Pool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// **Rows that cannot be revoked are not silently dropped.** With no
+    /// runtime, the command refuses with 2 and leaves every row in place, so
+    /// the operator can fix the configuration and run it again.
+    #[tokio::test]
+    async fn an_unconfigured_runtime_with_sessions_refuses_and_deletes_nothing() {
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(
+            &db,
+            Err(anyhow::anyhow!("no encryption key")),
+            &reqwest::Client::new(),
+        )
+        .await;
+        assert_eq!(code, 2);
+        assert_eq!(rows(&db).await, 2, "rows were dropped without a revocation");
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_runtime_with_no_sessions_has_nothing_to_do() {
+        let db = db_with_rows(0).await;
+        let code = revoke_all_sessions(
+            &db,
+            Err(anyhow::anyhow!("no encryption key")),
+            &reqwest::Client::new(),
+        )
+        .await;
+        assert_eq!(code, 0);
+    }
 }

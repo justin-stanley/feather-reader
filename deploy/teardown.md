@@ -10,7 +10,7 @@ There are two related but distinct wipes:
 | Layer | What it holds | Wiped by |
 |---|---|---|
 | **Rust app** (`featherreader`) | The SQLite cache: `entry_state`, `read_cursor`, `sub_ref`, `beta_access`, `invite_codes`, the shared `feeds`/`entries` cache, and operational tables (`network_stat`, `repo_timing`, `repo_timing_total`, `ballast`). Signed session cookies are keyed by DID but hold no server secret beyond the cookie HMAC. | Deleting `FEATHERREADER_DB` (+ `-wal`/`-shm`). |
-| **Rust OAuth client** (`FEATHERREADER_REPO_BACKEND=rust`) | Per-DID OAuth tokens (refresh + access) and the session DPoP key, in the app's own SQLite (`FEATHERREADER_DB`, tables `oauth_session` / `oauth_state` / `oauth_nonce`), AEAD-encrypted at rest under `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. | The user's own `POST /logout` or `POST /account/delete` (revokes at the PDS via RFC 7009 **and** drops the row). An operator has no per-DID or fleet-wide revoke here; deleting the DB drops the tokens unrevoked. Revocation is attempted first, because it needs the tokens the delete destroys. |
+| **Rust OAuth client** (`FEATHERREADER_REPO_BACKEND=rust`) | Per-DID OAuth tokens (refresh + access) and the session DPoP key, in the app's own SQLite (`FEATHERREADER_DB`, tables `oauth_session` / `oauth_state` / `oauth_nonce`), AEAD-encrypted at rest under `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. | Per user: their own `POST /logout` or `POST /account/delete`. Fleet-wide: `featherreader --revoke-all-sessions`, which revokes every row at its PDS via RFC 7009 **and** drops it (the script runs it for you). Then deleting `FEATHERREADER_DB` and the signing key at `FEATHERREADER_OAUTH_KEY_PATH`. |
 | **OAuth sidecar** (`oauth-sidecar`) | Per-DID OAuth tokens (refresh + access, DPoP keys) and the `session_id` handoff rows, in its own SQLite (`SIDECAR_DB`), AEAD-encrypted at rest. Plus the confidential-client signing JWK at `${SIDECAR_DB}.jwk.json`. | `POST /internal/revoke` per DID (revokes at the PDS **and** drops the row), then deleting `SIDECAR_DB`. |
 
 A user-initiated `POST /account/delete` already does the per-user version of both
@@ -18,19 +18,53 @@ A user-initiated `POST /account/delete` already does the per-user version of bot
 Rust client, whichever holds tokens). `/logout` does the revoke half. This
 runbook is the **fleet-wide** version.
 
-> **On the `rust` backend (the hosted instance since 2026-09-13),
-> `teardown.sh` revokes nothing.** It enumerates DIDs from `SIDECAR_DB` only,
-> and there is no fleet-wide revoke for the Rust OAuth client. Deleting
-> `FEATHERREADER_DB` destroys the `oauth_session` tokens without revoking them,
-> so they live out their TTL at each PDS. To revoke first, each user must sign
-> out or delete their account (both revoke at the PDS) before the wipe. Also
-> remove the Rust client's signing key at `FEATHERREADER_OAUTH_KEY_PATH`
-> (in a container, on the volume), which the script does not touch. Closing
-> this gap is tracked in issue #257.
+### Revoking the `rust` backend's sessions
 
-> Order matters. Revoke at the PDS *before* deleting the sidecar DB — once the
-> encrypted token rows are gone you can no longer ask the PDS to invalidate them,
-> and stale refresh tokens would live out their natural TTL on the PDS side.
+The hosted instance has run `FEATHERREADER_REPO_BACKEND=rust` since 2026-09-13.
+Its tokens live in `FEATHERREADER_DB`, and the operator command that revokes
+them is the app binary itself:
+
+```bash
+featherreader --revoke-all-sessions
+```
+
+It must run with the **app's own environment**: `FEATHERREADER_DB`,
+`FEATHERREADER_OAUTH_ENCRYPTION_KEY`, `FEATHERREADER_PUBLIC_URL`,
+`FEATHERREADER_OAUTH_KEY_PATH` and the secrets `Config` insists on in
+production. For every row of `oauth_session` it runs the same sign-out that
+`/logout` uses: it discovers the PDS's revocation endpoint, revokes the refresh
+token there (RFC 7009), and deletes the row **whatever the PDS says**, including
+rows that no longer decrypt. Sign-outs run one at a time, and each is
+deadline-bounded. It prints a line per DID and a summary, and exits with:
+
+| Exit | Meaning | `teardown.sh` does |
+|---|---|---|
+| `0` | Every session revoked, or none stored. | Continues. |
+| `1` | Some revocations failed; **every row is still deleted**. Those tokens may stay live at their PDS until they expire. | Warns and continues. |
+| `2` | Nothing was done: bad configuration, no database at `FEATHERREADER_DB` (it will not create one and report "0 sessions" about the wrong file), an unreadable store, or the Rust OAuth client cannot be built while sessions are stored. In that last case **nothing is deleted**, so a fixed configuration can try again. | Aborts before the wipe. |
+
+It is safe to run against a **live** app's database, which is what the Fly
+procedure does. The pool uses WAL and the app's 5 s `busy_timeout`, so a
+concurrent app write makes it wait instead of failing. Each sign-out deletes
+its row in a single statement, so no lock is held across a network call. A
+delete that still cannot get the lock is reported as that DID's failure; it
+does not crash the run.
+
+> **Revoke while the app is still serving.** A PDS authenticates a
+> confidential client before it honours a revocation
+> (`@atproto/oauth-provider` 0.23.1: `revoke()` calls `authenticateClient`
+> first). To do that it needs our `/oauth/client-metadata.json` and
+> `/oauth/jwks.json`, which the app itself serves (`src/web.rs`). PDSes cache
+> those for only 600 s (`clientMetadataCache` / `clientJwksCache`). Revoke
+> after the stop, and every PDS whose cache has expired rejects the
+> revocation, leaving that token live. So the main pass runs **before** the
+> stop, and a second pass after the stop catches the few sessions created in
+> between.
+
+> Order matters. Revoke at the PDS *before* deleting either database. Once the
+> encrypted token rows are gone you can no longer ask the PDS to invalidate
+> them, and stale refresh tokens would live out their natural TTL on the PDS
+> side.
 
 ---
 
@@ -63,11 +97,31 @@ Sessions resume when you start the services again. Nothing is destroyed.
 This is the "pause forever / take it down" path. Run `deploy/teardown.sh`, or do
 the steps by hand below. **This deletes all user data and signs everyone out.**
 
-### One-shot script
+### One-shot script (self-hosted)
+
+The script runs, in order:
+
+1. The sidecar revoke.
+2. The Rust revoke (main pass), while the app is still serving.
+3. `FR_STOP_CMD`.
+4. The Rust revoke again (sweep).
+5. The wipe: both SQLite volumes with a clean WAL checkpoint, the sidecar JWK,
+   and the Rust signing key.
+
+It prompts for confirmation unless `FR_TEARDOWN_YES=1`.
 
 ```bash
-# Revokes every DID at its PDS, then wipes both SQLite volumes with a clean
-# WAL checkpoint. Prompts for confirmation unless FR_TEARDOWN_YES=1.
+# rust backend (production). The revoke command needs the app's environment —
+# here, the same EnvironmentFile the service uses.
+sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
+        FEATHERREADER_REPO_BACKEND=rust \
+        FEATHERREADER_OAUTH_KEY_PATH=/var/lib/featherreader/oauth-signing-key.json \
+        FR_REVOKE_CMD='set -a; . /etc/featherreader/env; set +a; /usr/local/bin/featherreader --revoke-all-sessions' \
+        FR_STOP_CMD="systemctl stop featherreader" \
+        deploy/teardown.sh
+
+# sidecar backend: as before, plus FR_REVOKE_CMD if FEATHERREADER_DB holds any
+# Rust sessions (e.g. from an earlier rust deployment).
 sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
         SIDECAR_DB=/var/lib/featherreader/oauth-sidecar.db \
         SIDECAR_PUBLIC_URL=http://127.0.0.1:8081 \
@@ -76,8 +130,47 @@ sudo -E FEATHERREADER_DB=/var/lib/featherreader/featherreader.db \
         deploy/teardown.sh
 ```
 
-`FR_STOP_CMD` stops the services between the revoke (which needs them running)
-and the wipe. Without it the script assumes they are already stopped.
+- **`FR_REVOKE_CMD`** defaults to `featherreader --revoke-all-sessions` when
+  `featherreader` is on `PATH`. It runs with the script's environment, and
+  `FEATHERREADER_DB` is exported to it, so it revokes the file that is about to
+  be wiped.
+- **The script refuses** (exit 2, before anything irreversible) when the
+  backend is `rust`, or `FEATHERREADER_DB` holds Rust sessions, and there is no
+  revoke command.
+- **The `SIDECAR_*` variables** are optional on the `rust` backend when no
+  `SIDECAR_DB` file exists.
+- **`FR_STOP_CMD`** stops the services between the two Rust passes. Without it
+  the script assumes they are already stopped, and then the "main pass" is
+  really the post-stop sweep, with the metadata-cache caveat above.
+
+### Fly (the hosted instance)
+
+`teardown.sh` does not fit Fly: the database is on the machine's volume, and
+the command has to run inside the machine. By hand:
+
+```bash
+# 1. While the machine is RUNNING (the PDSes must be able to fetch our client
+#    metadata to accept the revocations), revoke every session:
+fly ssh console -C "/app/featherreader --revoke-all-sessions"
+#    0 = done; 1 = some failed (rows deleted anyway, listed by DID); 2 = nothing
+#    done — read the message, fix it, run again. Do not go on after a 2.
+
+# 2. IMMEDIATELY stop the machine. The gap between step 1 and this is the
+#    residual risk: a user who logs in during it keeps an unrevoked session.
+fly machine stop <machine-id>
+
+# 3. Destroy the machine, then its volume (the database, its -wal/-shm, and
+#    the signing key all live on it). A volume still attached to a machine
+#    cannot be destroyed.
+fly machine destroy <machine-id>
+fly volumes destroy <volume-id>
+```
+
+On Fly there is **no post-stop sweep**. A stopped machine cannot run
+`fly ssh console`, and starting it again would serve logins again. Keep the
+gap between steps 1 and 2 short, by running them back to back. If you want to
+check that nothing slipped through, run step 1 a second time just before
+step 2; it should report `0 revoked`.
 
 ### Manual steps (what the script does)
 
@@ -99,13 +192,24 @@ and the wipe. Without it the script assumes they are already stopped.
    Do this **while the sidecar is still running** — `/internal/revoke` needs the
    live process to reach the PDS.
 
-2. **Stop the services** so nothing writes to the DBs mid-wipe:
+2. **Revoke every Rust-backend session, while the app is still serving** (see
+   [above](#revoking-the-rust-backends-sessions) for why it must be running):
+
+   ```bash
+   featherreader --revoke-all-sessions   # with the app's environment; 2 = stop here
+   ```
+
+3. **Stop the services** so nothing writes to the DBs mid-wipe:
 
    ```bash
    sudo systemctl stop featherreader oauth-sidecar   # or: docker compose stop …
    ```
 
-3. **Clean WAL flush, then delete both SQLite volumes.** A `wal_checkpoint(TRUNCATE)`
+4. **Sweep**: run `featherreader --revoke-all-sessions` once more, for any
+   session created between step 2 and the stop. It normally reports
+   `0 revoked`.
+
+5. **Clean WAL flush, then delete both SQLite volumes and the signing keys.** A `wal_checkpoint(TRUNCATE)`
    folds the write-ahead log back into the main file so a snapshot/backup taken
    before this can't be resurrected from a stray `-wal`; then remove every file:
 
@@ -116,15 +220,17 @@ and the wipe. Without it the script assumes they are already stopped.
    done
    # The sidecar's confidential-client signing key lives beside its DB:
    rm -f "$SIDECAR_DB.jwk.json"
+   # The Rust client's signing key:
+   rm -f "$FEATHERREADER_OAUTH_KEY_PATH"
    ```
 
-4. **(If containerised) remove the volume** so a restart can't rehydrate old data:
+6. **(If containerised) remove the volume** so a restart can't rehydrate old data:
 
    ```bash
    docker compose down -v        # -v drops the named volumes
    ```
 
-5. **Take down the edge** (optional but recommended for a real pause): stop the
+7. **Take down the edge** (optional but recommended for a real pause): stop the
    reverse proxy / DNS record for `feather-reader.com` so nobody hits a
    half-torn-down instance. `client-metadata.json` / `jwks.json` no longer need to
    be reachable once every session is revoked.
@@ -132,6 +238,8 @@ and the wipe. Without it the script assumes they are already stopped.
 ### Verify
 
 ```bash
+# Run BEFORE the wipe: the Rust store is empty after the revoke.
+sqlite3 "$FEATHERREADER_DB" 'SELECT COUNT(*) FROM oauth_session;'   # expect 0
 # No sessions remain in the sidecar store (file is gone → this errors, which is fine).
 sqlite3 "$SIDECAR_DB" 'SELECT COUNT(*) FROM oauth_session;' 2>/dev/null || echo "sidecar DB gone ✓"
 # App cache is gone.

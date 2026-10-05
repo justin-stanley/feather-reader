@@ -536,6 +536,19 @@ pub async fn get_session(
     }))
 }
 
+/// Every stored session's subject DID, in a stable order.
+///
+/// Reads the `sub` column only, so a row whose secrets no longer decrypt (a
+/// rotated encryption key, a pre-AAD row) is listed like any other. That is the
+/// point: the operator revoke-all walks this list, and an unreadable row still
+/// needs its sign-out (which deletes it) before the database is wiped.
+pub async fn list_session_subs(pool: &SqlitePool) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT sub FROM oauth_session ORDER BY sub")
+        .fetch_all(pool)
+        .await
+        .context("listing the OAuth sessions")
+}
+
 /// Delete a session. `true` if one existed.
 pub async fn delete_session(pool: &SqlitePool, sub: &str) -> Result<bool> {
     let result = sqlx::query("DELETE FROM oauth_session WHERE sub = ?1")
@@ -1259,6 +1272,49 @@ mod tests {
         assert!(delete_session(&pool, DID).await?);
         assert!(get_session(&pool, &codec, DID).await?.is_none());
         assert!(!delete_session(&pool, DID).await?);
+        Ok(())
+    }
+
+    /// **Every stored session is listed — including one that no longer
+    /// decrypts.** The operator revoke-all walks this list; an unreadable row
+    /// left off it would survive the revoke pass and be dropped by the wipe
+    /// without the sign-out it is owed.
+    #[tokio::test]
+    async fn every_session_subject_is_listed_including_an_unreadable_one() -> anyhow::Result<()> {
+        let (pool, codec) = db().await;
+        assert!(list_session_subs(&pool).await?.is_empty());
+
+        put_session(&pool, &codec, &session()).await?;
+        let other = OAuthSession {
+            sub: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            ..session()
+        };
+        put_session(&pool, &codec, &other).await?;
+        // A row whose ciphertext cannot be decrypted at all.
+        sqlx::query(
+            "INSERT INTO oauth_session (sub, issuer, aud, dpop_key_jwk, access_token, \
+             refresh_token, token_type, granted_scope, expires_at) \
+             VALUES (?, 'https://auth.example.com', 'https://pds.example.com', \
+             'garbage', 'garbage', 'garbage', 'DPoP', 'atproto', NULL)",
+        )
+        .bind("did:plc:cccccccccccccccccccccccc")
+        .execute(&pool)
+        .await?;
+        assert!(
+            get_session(&pool, &codec, "did:plc:cccccccccccccccccccccccc")
+                .await
+                .is_err(),
+            "precondition: the raw row must be unreadable"
+        );
+
+        assert_eq!(
+            list_session_subs(&pool).await?,
+            vec![
+                "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                "did:plc:cccccccccccccccccccccccc".to_string(),
+                DID.to_string(),
+            ]
+        );
         Ok(())
     }
 

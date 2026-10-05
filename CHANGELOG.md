@@ -16,6 +16,55 @@ deploying is separate.
 
 ## Unreleased
 
+### Security
+
+- **A teardown now revokes the `rust` backend's sessions before the wipe
+  (#257).** `deploy/teardown.sh` read DIDs only from `SIDECAR_DB`. On
+  `FEATHERREADER_REPO_BACKEND=rust`, which production runs, it revoked
+  nothing: wiping `FEATHERREADER_DB` dropped every refresh token unrevoked,
+  live at each PDS until it expired.
+
+  **The revoke command.** New operator flag `featherreader
+  --revoke-all-sessions`, built like `--migrate-auto-vacuum`: it exits before
+  binding a port or starting a scheduler, and skips `argv[0]`. It lists every
+  `oauth_session` row with `oauth::store::list_session_subs`, which reads
+  `sub` only, so rows that no longer decrypt are listed too. Each row goes
+  through `sign_out_discovering`, the same sign-out `/logout` uses: a bounded
+  RFC 7009 revocation, then an unconditional delete. A failure does not stop
+  the walk.
+
+  **Exit codes.** `0` means all revoked. `1` means some revocations failed,
+  but every row is deleted anyway. `2` means nothing was done. Every error
+  path is mapped to `2`, never `1`: bad configuration, a missing database (it
+  refuses rather than creating one and reporting "0 sessions" about the wrong
+  file), an unreadable store, or sessions stored with no buildable OAuth
+  runtime. In that last case nothing is deleted.
+
+  **Teardown order.** The script runs: the sidecar revoke, then the Rust
+  revoke **while the app still serves**, then the stop, then a Rust sweep,
+  then the wipe. The wipe now also removes `FEATHERREADER_OAUTH_KEY_PATH`.
+  The main pass runs before the stop for a measured reason. A PDS
+  authenticates a confidential client before revoking
+  (`@atproto/oauth-provider` 0.23.1, `revoke()` → `authenticateClient`),
+  using our `client-metadata.json` and `jwks.json`. The app serves both, and
+  PDSes cache them for only 600 s, so a revocation after the stop would be
+  rejected at most PDSes.
+
+  **Refusals and failures.** The script refuses, before anything
+  irreversible, when the backend is `rust` (or `FEATHERREADER_DB` holds Rust
+  sessions) and there is no revoke command. A revoke exiting `1` warns and
+  continues; any other non-zero exit aborts before the wipe. The `SIDECAR_*`
+  variables are optional on the `rust` backend when no `SIDECAR_DB` exists.
+
+  **Tests.** New `scripts/test-teardown.sh`, 30 assertions, runs the real
+  script against throwaway SQLite files with stub commands. It is wired into
+  CI (new `teardown` job) and `scripts/ci.sh`; against the old script, 21 of
+  the 30 failed. Tests against a real-TLS fake authorization server cover
+  revoke-all: every session revoked, one server failing, an unreadable row,
+  and an empty store. Each new guard was broken on its own and a test failed
+  every time (16 of 16).
+  `deploy/teardown.md` gains the procedure, including Fly's.
+
 ### Docs
 
 - **The GitHub-facing docs describe 0.4.4.** `src/config.rs`'s settings

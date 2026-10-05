@@ -292,6 +292,55 @@ pub async fn sign_out_discovering(
     .await
 }
 
+/// What an operator revoke-all did, per subject DID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokeAllReport {
+    /// Revoked at the authorization server, and the local row deleted.
+    pub revoked: Vec<String>,
+    /// Listed, but gone by the time it was signed out (a concurrent `/logout`).
+    pub no_session: Vec<String>,
+    /// The server could not be told, with the reason. The local row is deleted
+    /// regardless, so these tokens may stay live at the PDS until they expire.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Sign EVERY stored session out — the operator's fleet-wide revoke (#257).
+///
+/// Before this existed, a teardown on the `rust` backend wiped
+/// `FEATHERREADER_DB` and with it every refresh token, unrevoked, leaving each
+/// live at its PDS until it expired. This walks the store and runs each subject
+/// through [`sign_out_discovering`] — the same function `/logout` and
+/// `/account/delete` use, so it inherits that function's contract: a bounded
+/// attempt at the server, then an unconditional local delete, including for a
+/// row that no longer decrypts.
+///
+/// **A failure does not stop the walk.** Every later session would otherwise be
+/// left neither revoked nor deleted. Failures are collected with their reasons
+/// so the operator can see which tokens may still be live.
+///
+/// Sequential on purpose: each sign-out is already deadline-bounded, and this
+/// runs once, at a teardown, where a predictable request rate against each PDS
+/// matters more than finishing a few seconds sooner.
+///
+/// Only listing the sessions can fail as a whole — in which case nothing has
+/// been revoked or deleted, and the caller must not proceed to a wipe.
+pub async fn revoke_all(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    now: i64,
+) -> Result<RevokeAllReport> {
+    let mut report = RevokeAllReport::default();
+    for sub in super::store::list_session_subs(pool).await? {
+        match sign_out_discovering(runtime, http, pool, &sub, now).await {
+            Revocation::Revoked => report.revoked.push(sub),
+            Revocation::NoSession => report.no_session.push(sub),
+            Revocation::Failed(reason) => report.failed.push((sub, reason)),
+        }
+    }
+    Ok(report)
+}
+
 /// Run `attempt` under `deadline`, then delete the local session **whatever
 /// happened** — including when the deadline expired.
 ///
@@ -698,5 +747,228 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Revocation::NoSession);
+    }
+
+    // ── the operator revoke-all ──────────────────────────────────────────────
+
+    /// The three subjects the revoke-all tests store, in the order
+    /// `list_session_subs` returns them (sorted), which is the order the
+    /// revocation requests are made in.
+    const SUBS: [&str; 3] = [
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+        "did:plc:cccccccccccccccccccccccc",
+    ];
+
+    /// A PDS + authorization server on one real-TLS loopback server, whose
+    /// metadata advertises `/revoke`, answering successive revocations with
+    /// `revoke_replies` in turn (the last repeats).
+    async fn revoking_server(
+        revoke_replies: Vec<crate::net::TestResponse>,
+    ) -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (addr, log) = crate::net::spawn_tls(move |addr| {
+            let port = addr.port();
+            let pds = format!("https://pds-e2e.test:{port}");
+            let issuer = format!("https://as-e2e.test:{port}");
+            let mut r = std::collections::HashMap::new();
+            r.insert(
+                "/.well-known/oauth-protected-resource".to_string(),
+                vec![crate::net::TestResponse::json(
+                    200,
+                    serde_json::json!({
+                        "resource": pds,
+                        "authorization_servers": [issuer],
+                    })
+                    .to_string(),
+                )],
+            );
+            r.insert(
+                "/.well-known/oauth-authorization-server".to_string(),
+                vec![crate::net::TestResponse::json(
+                    200,
+                    serde_json::json!({
+                        "issuer": issuer,
+                        "pushed_authorization_request_endpoint": format!("{issuer}/par"),
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "revocation_endpoint": format!("{issuer}/revoke"),
+                        "protected_resources": [pds],
+                        "client_id_metadata_document_supported": true,
+                        "require_pushed_authorization_requests": true,
+                        "authorization_response_iss_parameter_supported": true,
+                        "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+                        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+                        "dpop_signing_alg_values_supported": ["ES256"],
+                        "scopes_supported": ["atproto"],
+                        "response_types_supported": ["code"],
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                        "code_challenge_methods_supported": ["S256"],
+                    })
+                    .to_string(),
+                )],
+            );
+            r.insert("/revoke".to_string(), revoke_replies);
+            r
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+        let port = addr.port();
+        (
+            format!("https://pds-e2e.test:{port}"),
+            format!("https://as-e2e.test:{port}"),
+            log,
+        )
+    }
+
+    /// Store one readable session per subject in [`SUBS`], against `pds`/`issuer`.
+    async fn store_sessions(
+        pool: &sqlx::SqlitePool,
+        codec: &super::super::crypto::Codec,
+        pds: &str,
+        issuer: &str,
+    ) {
+        for sub in SUBS {
+            let key = super::super::keys::SigningKey::generate("session");
+            let session = OAuthSession {
+                sub: sub.into(),
+                issuer: issuer.into(),
+                aud: pds.into(),
+                dpop_key_jwk: key.to_jwk_json().unwrap(),
+                ..session("access-abc", &format!("refresh-{sub}"))
+            };
+            super::super::store::put_session(pool, codec, &session)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn session_rows(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn revoke_requests(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /revoke"))
+            .cloned()
+            .collect()
+    }
+
+    /// **Every stored session is revoked at its server, and every row goes.**
+    ///
+    /// The operator path a teardown runs before wiping the database. Each
+    /// revocation must actually reach the server — a revoke-all that only
+    /// deleted rows would leave every refresh token live at the PDS, which is
+    /// the bug this exists to close (#257).
+    #[tokio::test]
+    async fn revoke_all_revokes_every_session_at_its_server() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+            .await
+            .expect("listing the sessions");
+
+        let requests = revoke_requests(&log);
+        assert_eq!(
+            requests.len(),
+            3,
+            "one revocation request per session:\n{requests:#?}"
+        );
+        for sub in SUBS {
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r.contains(&format!("token=refresh-{}", sub.replace(':', "%3A")))),
+                "{sub}'s refresh token was never presented:\n{requests:#?}"
+            );
+        }
+        assert_eq!(report.revoked, SUBS.map(String::from).to_vec());
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.no_session.is_empty());
+        assert_eq!(session_rows(&pool).await, 0, "rows survived a revoke-all");
+    }
+
+    /// **One server failing does not stop the rest — and its row still goes.**
+    ///
+    /// Aborting at the first failure would leave every later session neither
+    /// revoked nor deleted. The failure is reported with its reason so the
+    /// operator knows which tokens may still be live.
+    #[tokio::test]
+    async fn one_failed_revocation_is_reported_and_the_rest_still_revoked() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) = revoking_server(vec![
+            crate::net::TestResponse::json(200, "{}"),
+            crate::net::TestResponse::json(500, "{}"),
+            crate::net::TestResponse::json(200, "{}"),
+        ])
+        .await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+            .await
+            .expect("listing the sessions");
+
+        assert_eq!(revoke_requests(&log).len(), 3, "a failure stopped the walk");
+        assert_eq!(
+            report.revoked,
+            vec![SUBS[0].to_string(), SUBS[2].to_string()]
+        );
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert_eq!(report.failed[0].0, SUBS[1]);
+        assert!(
+            report.failed[0].1.contains("status 500"),
+            "the reason was lost: {}",
+            report.failed[0].1
+        );
+        assert_eq!(
+            session_rows(&pool).await,
+            0,
+            "the failed session's row survived — the wipe would be the only thing removing it"
+        );
+    }
+
+    /// An unreadable row is reported as a failure AND deleted; an empty store
+    /// is an empty report.
+    #[tokio::test]
+    async fn an_unreadable_row_fails_and_is_deleted_and_an_empty_store_is_empty() {
+        let (pool, codec) = db().await;
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+            .await
+            .unwrap();
+        assert_eq!(report, RevokeAllReport::default());
+
+        stored(&pool, &codec).await;
+        sqlx::query("UPDATE oauth_session SET issuer = ? WHERE sub = ?")
+            .bind("https://evil.example")
+            .bind(DID)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, NOW)
+            .await
+            .unwrap();
+        assert!(report.revoked.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, DID);
+        assert!(
+            report.failed[0].1.contains("reading the session"),
+            "{}",
+            report.failed[0].1
+        );
+        assert_eq!(session_rows(&pool).await, 0, "the unreadable row survived");
     }
 }

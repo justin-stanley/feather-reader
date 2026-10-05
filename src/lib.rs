@@ -187,14 +187,7 @@ impl AppState {
     /// [`crate::config::SidecarConfig`], and starts with an empty session
     /// registry. The binary's `main` calls this after opening the store.
     pub fn new(config: Config, db: Pool) -> anyhow::Result<Self> {
-        // `.no_proxy()` for the same reason as `net::build_pinned_client` and
-        // `feed::build_client`: ambient `HTTP_PROXY` would route this client's
-        // traffic through a proxy that resolves hostnames itself, out from
-        // under the SSRF guard's address checks.
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .no_proxy()
-            .build()?;
+        let http = build_http_client()?;
 
         // Built whatever the backend, so a bad OAuth config is caught on every
         // deploy rather than at the moment the switch is thrown. With the
@@ -231,6 +224,21 @@ impl AppState {
             runtime_health: Arc::new(runtime_health::RuntimeHealth::new()),
         })
     }
+}
+
+/// The shared HTTP client [`AppState`] carries, also used by the binary's
+/// maintenance commands (`--revoke-all-sessions`) so they reach the network
+/// exactly as the serving app does.
+///
+/// `.no_proxy()` for the same reason as `net::build_pinned_client` and
+/// `feed::build_client`: ambient `HTTP_PROXY` would route this client's traffic
+/// through a proxy that resolves hostnames itself, out from under the SSRF
+/// guard's address checks.
+pub fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .no_proxy()
+        .build()
 }
 
 /// The crate version — surfaced for the server's `--version` / health output.
