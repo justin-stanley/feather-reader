@@ -14,6 +14,32 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **The SSRF guard refuses the reserved and documentation ranges it was
+  missing** (closes #217): IPv4 `240.0.0.0/4` (RFC 1112 §4; `is_broadcast()`
+  covered only its top address), `192.0.2.0/24`, `198.51.100.0/24` and
+  `203.0.113.0/24` (RFC 5737), and IPv6 `fec0::/10` (RFC 3879), `100::/64`
+  (RFC 6666) and `2001:db8::/32` (RFC 3849). None can host a public feed. The
+  IPv4 ranges are refused inside every IPv6 form the guard already unwraps,
+  because both paths call the one IPv4 check; a test wraps each in all eight
+  forms so that stays true. The doc comment on `net::is_forbidden_ip` is now
+  the complete list, with RFCs. Each new range was deleted in turn and a test
+  failed every time. The ISATAP fixtures moved from `2001:db8::` to a real
+  global prefix, since under a refused prefix they would pass without the
+  ISATAP decoder.
+
+- **A local `docker build` no longer sends the app's OAuth signing key to the
+  Docker daemon** (#218). `.dockerignore` excluded the sidecar's `*.jwk.json`
+  but not the Rust app's `oauth-signing-key.json`, which is gitignored and
+  present in local checkouts; it now excludes `**/oauth-signing-key*.json`, and
+  `.claude` (local worktree copies). Measured with a probe build that copies the
+  whole context: before, the key and `.claude` were in it (50.8 MB); after,
+  neither (4.0 MB). Shipped images were never affected: the Dockerfile copies
+  named paths only, and release images build from a clean CI checkout.
+
 ## 0.4.3 — 2026-10-05
 
 Two write-path fixes that apply on any PDS: `applyWrites` is sent in calls of
