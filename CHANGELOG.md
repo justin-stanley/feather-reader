@@ -18,6 +18,47 @@ deploying is separate.
 
 ### Fixed
 
+- **A read-state flag that disagreed with the PDS stopped a reader's
+  read-state sync for good (#241).** The flusher picks `#create` or `#update`
+  per feed from `read_cursor.pds_created`, which it learned only from a
+  successful flush, and all of a DID's ops ride one atomic `applyWrites`. A
+  success whose answer was lost, or a fresh or restored database against a
+  repo already holding the records (the rkeys are stable), left the flag false
+  over a record that exists; a record deleted elsewhere left it true over one
+  that does not. One op failed, the batch failed, and every later flush sent
+  the same batch. Now a failure that could be that triggers one listing of the
+  DID's `readState` collection, sets `pds_created` to what is there, and
+  retries once if anything changed — never more, and never when the listing
+  fails or changes nothing. What the reference PDS sends was read from its
+  source: with no `swapRecord`, the collision surfaces in `@atproto/repo`'s MST
+  (`There is already a value at key` / `Could not find a record with key`), a
+  plain `Error` that xrpc-server answers as **500 `InternalServerError`** with
+  the message stripped, so there is no narrower signal; 400
+  `InvalidRequest`/`InvalidSwap`/`RecordNotFound` and 409 are also matched,
+  for a PDS that checks explicitly. Transport failures, 401/403, 429 and
+  502/503/504 are returned as before, without a listing. The match is on the
+  structured error, so the Rust client now attaches
+  `AtProtoError::Xrpc { status, error }` to a rejection as the sidecar client
+  already did; its message is unchanged. Tested end to end on both backends
+  against a stateful fake repo with the reference's create/update semantics,
+  including a batch that landed in part; each added guard was mutated and
+  every mutation failed a test.
+- **A read-state flush split by #240 that failed part-way starved every
+  cursor after the failure.** The calls go in rkey order and stop at the first
+  failure, but `flush_did` settled cursors only on full success, so call 1's
+  committed creates stayed dirty with `pds_created` false, went out again as
+  `#create`, were refused, and stopped the run at the same place every round.
+  On any flush error carrying `ApplyWritesIncomplete`, the landed prefix is now
+  marked created and cleaned (the same conditional `updated_at` clear as a
+  success) before anything else is decided, and the reconcile retries only
+  what did not land; a retry that part-lands is settled the same way. The
+  mismatch match now also walks `ApplyWritesIncomplete`'s own cause, because
+  that error's `source()` skips its cause's top layer — on the sidecar client
+  that layer IS the `AtProtoError`, and every sidecar reconcile test went red
+  on the merge until it did. A retry that fails again now carries the PDS's
+  reason in its message, so the flusher's and sign-out's `%err` log lines say
+  why, not only "failed again".
+
 - **An OPML import of more than 200 feeds failed outright, and a large
   read-state flush could too (#240).** `add_subscriptions_bulk` sent one
   `applyWrites` create per feed in a single call (up to the 500-feed per-DID

@@ -3570,6 +3570,29 @@ pub async fn mark_cursor_pds_created(pool: &SqlitePool, did: &str, feed_url: &st
     Ok(())
 }
 
+/// Set a cursor's `pds_created` flag to what the PDS was just observed to hold.
+///
+/// [`mark_cursor_pds_created`] only ever sets it, because a successful create is
+/// the only event the flusher used to learn from. The read-state reconcile
+/// (#241) learns from a listing, and a listing can say the record is GONE —
+/// deleted by another client or a repo reset — so it needs the other direction
+/// too, or every later flush sends `#update` to a key that does not exist.
+pub async fn set_cursor_pds_created(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    created: bool,
+) -> Result<()> {
+    sqlx::query("UPDATE read_cursor SET pds_created = ?3 WHERE did = ?1 AND feed_url = ?2")
+        .bind(did)
+        .bind(feed_url)
+        .bind(created)
+        .execute(pool)
+        .await
+        .with_context(|| format!("set_cursor_pds_created failed for {did}/{feed_url}"))?;
+    Ok(())
+}
+
 /// Clear the `dirty` flag on a cursor after a successful PDS flush — but ONLY if
 /// the row still carries the exact `flushed_updated_at` snapshot we flushed.
 ///

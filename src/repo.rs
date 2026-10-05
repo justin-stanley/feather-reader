@@ -454,6 +454,15 @@ impl Repo<'_> {
     }
 
     dispatch! {
+        /// Every record in `collection`, unparsed — for asking which rkeys
+        /// EXIST, which the typed listers cannot answer: they skip a record
+        /// this build cannot parse, and a skipped record reads as a missing one.
+        list_all_records(collection: &str) -> Vec<crate::atproto::RecordEntry>,
+        sidecar: list_all_records,
+        rust: list_all_records
+    }
+
+    dispatch! {
         /// Flush dirty cursors via `applyWrites`, chunked — the hottest write path.
         /// A failure part-way leaves a prefix written; see
         /// [`crate::atproto::ApplyWritesIncomplete`].
