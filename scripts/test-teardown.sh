@@ -138,6 +138,16 @@ check "nothing was revoked or stopped (log: $(order))" '[ ! -s "$LOG" ]'
 check "the refusal points at teardown.md" 'grep -q "teardown.md" <<<"$OUT"'
 teardown_sandbox
 
+echo "== backend value with stray whitespace (an EnvironmentFile CR/LF) still reads as rust"
+setup
+run FEATHERREADER_REPO_BACKEND=$' rust\r\n' FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'"
+check "exits non-zero (rust, no revoke command)" '[ "$CODE" != 0 ]'
+check "it is the rust refusal, not a SIDECAR_DB requirement" \
+      'grep -q "teardown.md" <<<"$OUT" && ! grep -q "SIDECAR_DB is required" <<<"$OUT"'
+check "every file is still present" 'all_present'
+teardown_sandbox
+
 echo "== sidecar backend, but Rust sessions stored and no revoke command: refuse"
 setup; sidecar_env
 run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FR_STOP_CMD="echo stop >>'$LOG'"

@@ -97,7 +97,11 @@ export FEATHERREADER_DB
 
 command -v sqlite3 >/dev/null || { echo "FATAL: sqlite3 not found" >&2; exit 2; }
 
-backend="${FEATHERREADER_REPO_BACKEND:-sidecar}"
+# Trimmed like the app's `parse_repo_backend` (src/config.rs): a value sourced
+# from an EnvironmentFile can carry a stray CR/LF, which the app ignores; an
+# exact compare here would misread `rust` as the sidecar backend.
+backend="$(printf '%s' "${FEATHERREADER_REPO_BACKEND:-}" | tr -d '[:space:]')"
+backend="${backend:-sidecar}"
 
 # The sidecar step runs unless this is the rust backend with no sidecar store.
 sidecar_step=1
