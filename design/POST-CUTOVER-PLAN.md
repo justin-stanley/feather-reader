@@ -237,7 +237,8 @@ reader is not silently subscribed to something that will never deliver.
 > Still open (audited 2026-10-05): the sidecar ships in the image, and #17 and
 > #19 have not started. The sidecar's `NodeOAuthClient` still gets no `fetch`
 > override. The code and entrypoint both default `FEATHERREADER_REPO_BACKEND` to
-> `sidecar`, so an unset variable selects the unguarded client.
+> `sidecar`, so an unset variable selects the unguarded client. Tracked in issue
+> #258 (sidecar SSRF) and issue #263 (capacity).
 
 **#18 — decommission the Node sidecar.** It has been dead weight in the image since
 the cutover — `/app/oauth-sidecar` is **72 MB** on the running machine. Deleting it
@@ -270,7 +271,7 @@ the load, which #17 establishes.
   `oauth_nonce` is keyed by **origin** and has no DID column, so there is nothing
   DID-scoped in it to clear.)
   > Still open (audited 2026-10-05): `purge_did_data` does not touch
-  > `oauth_state`. Rows go only through the expiry sweep.
+  > `oauth_state`. Rows go only through the expiry sweep. Tracked in issue #259.
 - **One place in the wiki credits `min_machines_running` for machine recovery**
   while `fly.toml` says it is inert under `auto_stop_machines = "off"`: the
   `container-entrypoint.sh` section of `/runbooks/featherreader-deploy` ("exit

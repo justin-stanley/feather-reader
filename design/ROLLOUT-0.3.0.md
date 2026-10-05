@@ -7,7 +7,7 @@
 >
 > **Per-item status (audited 2026-10-05).** Stages 1–3 are done: PR #101, the
 > auto_vacuum migration run 2026-09-13 (ops runbook), and PR #110. Both
-> follow-ups are done. Stage 4 checks 1, 2 and 4 have no recorded evidence.
+> follow-ups are done. Stage 4 checks 1, 2 and 4 have no recorded evidence (issue #262).
 
 Prod is **0.2.8 on the sidecar backend** (`curl https://feather-reader.com/health`
 → `ok featherreader/0.2.8`, checked 2026-09-13). `main` is 76 commits behind this
@@ -285,7 +285,7 @@ sidecar path never reads it.
 > Status (audited 2026-10-05): 3 and 5 have run in practice, since every login
 > and sync has used the rust backend since PR #110. No captured evidence is
 > recorded for 1 (`client_assertion_type`), 2 (revocation response status) or 4
-> (a post-cutover `live_pds` run).
+> (a post-cutover `live_pds` run); tracked in issue #262.
 
 These are the two claims that have been unverifiable from a dev box all along,
 because both require a real PDS to fetch our client metadata at the real

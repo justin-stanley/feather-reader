@@ -7,7 +7,8 @@
 //! ```text
 //! at://<did>/site.standard.publication/<rkey>
 //!   ├─ resolve <did> → PDS
-//!   ├─ getRecord   site.standard.publication  → name, url
+//!   ├─ listRecords site.standard.publication  → name, url (every publication
+//!   │                                           in the repo, matched on rkey)
 //!   └─ listRecords site.standard.document     → paged, filtered on `site`
 //! ```
 //!

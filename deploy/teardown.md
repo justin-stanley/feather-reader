@@ -25,7 +25,8 @@ runbook is the **fleet-wide** version.
 > so they live out their TTL at each PDS. To revoke first, each user must sign
 > out or delete their account (both revoke at the PDS) before the wipe. Also
 > remove the Rust client's signing key at `FEATHERREADER_OAUTH_KEY_PATH`
-> (in a container, on the volume), which the script does not touch.
+> (in a container, on the volume), which the script does not touch. Closing
+> this gap is tracked in issue #257.
 
 > Order matters. Revoke at the PDS *before* deleting the sidecar DB — once the
 > encrypted token rows are gone you can no longer ask the PDS to invalidate them,

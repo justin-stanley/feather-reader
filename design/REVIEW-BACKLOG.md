@@ -4,10 +4,10 @@
 > in PR #101 (v0.3.0, squash commit `d7d97bf`). The shas cited below (`ba9951a`,
 > `1cfae77`, `1831bba`, `75f1c53`, `5f0b2c1`, `d67e7b9`) are pre-squash commits on
 > `feat/rust-oauth-phase1` and are not on `main`. **Three items are still open:**
-> T4.6 (capacity), and both structural fixes in "The structural theme" (an
-> `upsert_feed` newtype, and inverting `is_rate_limited_path`). The full container
+> T4.6 (capacity, issue #263), and both structural fixes in "The structural theme" (an
+> `upsert_feed` newtype, issue #260, and inverting `is_rate_limited_path`, issue #261). The full container
 > now runs in production. The live `private_key_jwt` and revocation checks have
-> no recorded evidence.
+> no recorded evidence (issue #262).
 >
 > T4.6 calls the capacity work "0.4.0 work"; that was the plan at the time.
 > 0.4.0 shipped as standard.site support
@@ -490,7 +490,7 @@ to a high-water mark and drop the ids below it. That is what the field is for.
 
 ### T4.6 Capacity constants do not match the machine
 
-> Still open (audited 2026-10-05): `max_feeds_global` defaults to 10,000, the poll batch to 50 per tick, and the watermark is 768 MiB. No GitHub issue tracks it.
+> Still open (audited 2026-10-05): `max_feeds_global` defaults to 10,000, the poll batch to 50 per tick, and the watermark is 768 MiB. Tracked in issue #263.
 
 `max_feeds_global = 10_000` against a poller that manages 50 feeds per 60 s tick
 = **3,000 feeds/hour** at `poll_interval = 3600 s`. The global ceiling is 3.3×
@@ -543,14 +543,14 @@ remaining two are worth doing for the same reason:
   there for caller four.
 
   > Still open (audited 2026-10-05): `upsert_feed` takes `&NewFeed`, a struct
-  > with all-public fields, and has about 20 call sites. No GitHub issue tracks it.
+  > with all-public fields, and has about 20 call sites. Tracked in issue #260.
 - **`is_rate_limited_path` should invert** into a per-route opt-out declared at
   the router, so adding a route forces a decision instead of defaulting to
   unguarded. Its current test asserts coverage only for routes already in the
   list, which is why two misses sat there undetected.
 
   > Still open (audited 2026-10-05): `is_rate_limited_path` is still a
-  > hand-maintained allowlist in `web.rs`. No GitHub issue tracks it.
+  > hand-maintained allowlist in `web.rs`. Tracked in issue #261.
 
 Without these, expect a sixth instance. That prediction is the reviewer's, and
 on the evidence it is a good one.
