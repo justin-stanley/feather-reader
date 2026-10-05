@@ -1,6 +1,20 @@
 flowchart LR
-    You(["You"]) -->|"read · star · mark read"| FR["FeatherReader"]
-    FR -->|"fetch + parse"| Feeds[("RSS / Atom feeds")]
-    FR -.->|"disposable"| Cache[("Local SQLite cache")]
-    FR <-->|"subscriptions · folders · stars · read-state<br/>(community.lexicon.rss.*)"| PDS[("Your atproto PDS")]
-    PDS -.->|"same records — portable"| Other["Any other atproto reader"]
+    subgraph PDS["Your atproto PDS — the source of truth"]
+        Sub["community.lexicon.rss.subscription<br/>one per feed or publication"]
+        Fol["community.lexicon.rss.folder"]
+        Sav["community.lexicon.rss.saved<br/>one per star"]
+        RS["community.lexicon.rss.readState<br/>one per feed, batched"]
+    end
+    subgraph Cache["FeatherReader's SQLite — a disposable cache"]
+        Feeds[("feeds + entries<br/>shared across readers, deduped by URL")]
+        Ref[("sub_ref<br/>per-DID subscription projection")]
+        State[("entry_state + read_cursor<br/>per-DID working copy, with a dirty bit")]
+    end
+    UI["You: subscribe · folder · star · mark read"] -->|"createRecord · putRecord · deleteRecord"| Sub
+    UI -->|"createRecord · putRecord · deleteRecord"| Fol
+    UI -->|"createRecord · deleteRecord"| Sav
+    UI -->|"local write, marks the cursor dirty"| State
+    Sub -->|"listRecords on each page load, mirrored into"| Ref
+    Ref -->|"scopes every entry read and mutation"| Feeds
+    State -->|"flusher: one applyWrites per DID<br/>~60 s debounce, once more at shutdown"| RS
+    Other["Any other reader that speaks the lexicon"] -.->|"reads the same records"| Sub
