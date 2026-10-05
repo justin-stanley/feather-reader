@@ -14,7 +14,23 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.3 — 2026-10-05
+
+Two write-path fixes that apply on any PDS: `applyWrites` is sent in calls of
+at most 200 writes and 128 KiB, and a read-state flush whose local
+`pds_created` flag disagrees with the PDS now reconciles instead of failing
+every round. Found while evaluating vlpds.
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.2 is a deploy;
+  rolling back to 0.4.2 is a redeploy.
+- **What to look for after deploying:** a reader whose read-state sync was
+  already stuck recovers on the next flush, with one `readState` listing. An
+  OPML import of more than 200 feeds now succeeds, or reports how many of them
+  landed.
+- **`deploy/upgrade-from` moves to `0.4.2`,** the release deployed before this
+  one, so the upgrade-boot gate tests from it.
 
 ### Fixed
 
@@ -91,12 +107,13 @@ deploying is separate.
   Rewritten against the code: standard.site publications beside RSS, the
   invite-only beta as the templates state it, a configuration table that points
   at `src/config.rs` as the source of truth, the CI gates as `ci.yml` runs them,
-  and the release pipeline. The two PNG architecture diagrams are replaced by
-  four Mermaid diagrams drawn from `fly.toml`, the `Dockerfile`, the Caddyfile,
-  `store.rs`, `scheduler.rs`, `standard_site.rs` and the release workflows —
-  architecture, data ownership, polling, and the release pipeline — each
-  rendered with `@mermaid-js/mermaid-cli` before commit. Every relative link was
-  checked to resolve.
+  and the release pipeline. The two architecture diagrams become four, drawn
+  from `fly.toml`, the `Dockerfile`, the Caddyfile, `store.rs`, `scheduler.rs`,
+  `standard_site.rs` and the release workflows — architecture, data ownership,
+  polling, and the release pipeline (#244). They are light/dark PNGs rendered
+  from `design/architecture/*.mmd` and embedded with `<picture>` (#245), not
+  inline Mermaid: the GitHub mobile app and crates.io show inline Mermaid as
+  raw code. Every relative link was checked to resolve.
 
 ---
 
