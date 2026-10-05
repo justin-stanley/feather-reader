@@ -170,7 +170,9 @@ Subscriptions, folders and stars are written to your PDS as you act. Read
 state is debounced: marking articles read sets a local dirty bit, and the
 flusher coalesces each DID's dirty per-feed cursors into **one**
 `com.atproto.repo.applyWrites` batch about once a minute — and once more on
-shutdown and on sign-out, so nothing is stranded. On every page load the app
+shutdown and on sign-out, so nothing is stranded. A batch past the PDS's
+per-call limits is sent as several calls of at most 200 writes and 128 KiB
+each, and a flush that fails part-way keeps what landed. On every page load the app
 lists your subscription records and mirrors the result into `sub_ref`, which is
 the per-user isolation boundary: every cached-entry read and every read/star
 mutation is scoped through it. If your PDS cannot be reached, the page falls

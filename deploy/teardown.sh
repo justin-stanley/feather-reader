@@ -10,6 +10,10 @@
 # See deploy/teardown.md for the annotated manual steps and the reversible
 # "pause" (no revoke, no delete) path.
 #
+# SIDECAR BACKEND ONLY for the revoke step: DIDs are read from SIDECAR_DB. On
+# FEATHERREADER_REPO_BACKEND=rust nothing is revoked, and wiping
+# FEATHERREADER_DB drops the Rust client's tokens unrevoked — see teardown.md.
+#
 # Required env:
 #   FEATHERREADER_DB          path to the Rust app's SQLite cache
 #   SIDECAR_DB                path to the sidecar's SQLite store

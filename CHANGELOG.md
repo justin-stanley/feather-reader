@@ -14,6 +14,30 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Docs
+
+- **The GitHub-facing docs describe 0.4.4.** `src/config.rs`'s settings
+  table, which the README calls the complete list, was missing ten variables
+  the code reads (`FEATHERREADER_ENV`, `FEATHERREADER_BETA_CAP`, and the eight
+  scheduler knobs in `scheduler.rs`); they are added with the defaults the
+  code uses. `deploy/teardown.md` implied the kill script revokes every
+  session; on the `rust` backend it revokes none, since it reads only
+  `SIDECAR_DB` and the Rust client has no fleet-wide revoke, and it now says
+  so. The OAuth sidecar's README said the Rust server never does OAuth itself,
+  untrue since 0.3.0. `.github/workflows/README.md` gains the three release
+  and gate workflows. `ci.yml` counted five jobs (there are seven), and
+  `release-image.yml`'s header stated a claim about `:latest` and then
+  contradicted it. `dependabot.yml` waited for a Dockerfile under `deploy/`
+  (it is at the root, digest-pinned). The README says a large read-state
+  flush is split into calls of 200 writes / 128 KiB (#242). The design
+  docs get status lines: standard.site shipped in 0.4.0 with the flag on in
+  production, the network spec's adoption probe shipped in 0.2.8, and the
+  older plans that called capacity work and open registration "0.4.0 work" are
+  marked historical. `SECURITY.md` gets a supported-versions table, and
+  `CONTRIBUTING.md` lists the CI gates `scripts/ci.sh` does not run.
+
 ## 0.4.4 — 2026-10-05
 
 The feed parser moves to feed-rs 3.0 with entry ids and permalinks unchanged,

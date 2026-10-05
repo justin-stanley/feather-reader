@@ -8,11 +8,14 @@ no longer needed, and parallel hosted jobs are faster.)
 
 | Workflow | Runner | Triggers | What it does |
 |---|---|---|---|
-| `ci.yml` | **GitHub-hosted** (`ubuntu-latest`, parallel jobs) | push/PR to `main`, manual | The gate. Jobs: **rust** (build/test/clippy `-D warnings`/rustfmt), **cargo-deny** (licenses + bans + advisories + sources via `deny.toml`), **cargo-audit** (RustSec), **sidecar** (npm ci/build/typecheck + **oxlint** + **Prettier `--check`** + `npm audit --omit=dev`), **Invite bot** (the standalone `bot/` crate — its own workspace — build + test + clippy + rustfmt + cargo-deny + cargo-audit), **secrets** (**gitleaks** tree + history via `.gitleaks.toml`). |
+| `ci.yml` | **GitHub-hosted** (`ubuntu-latest`, parallel jobs) | push/PR to `main`, manual | The gate. Jobs: **rust** (build/test/clippy `-D warnings`/rustfmt/rustdoc `-D warnings`), **cargo-deny** (licenses + bans + sources via `deny.toml`; advisories are the cargo-audit job's), **cargo-audit** (RustSec), **sidecar** (npm ci/build/typecheck/**test** + **oxlint** + **Prettier `--check`** + `npm audit --omit=dev`), **Invite bot** (the standalone `bot/` crate — its own workspace — build + test + clippy + rustfmt + cargo-deny + cargo-audit), **secrets** (**gitleaks** tree + history via `.gitleaks.toml`), **caddyfile** (`caddy validate` of `deploy/Caddyfile` with both OAuth routings, against the Caddy digest the `Dockerfile` pins). |
 | `codeql.yml` | **GitHub-hosted** (`ubuntu-latest`) | **PR to `main`** + push to `main` + weekly cron + manual | SAST for `javascript-typescript` (the OAuth sidecar). Runs on **every** PR — no `paths:` filter, so config-only PRs still get a CodeQL check-run (OSSF Scorecard's SAST check needs one on each merged PR). Rust is covered by clippy + cargo-deny + cargo-audit (CodeQL's Rust extractor errored on all files; re-add when GA'd). Results → Security tab. Free once public. |
 | `dependency-review.yml` | **GitHub-hosted** | pull_request to `main` | Blocks PRs that add vulnerable deps or disallowed licenses (aligned with `deny.toml`). Needs the Dependency Graph — free/on for public repos. |
 | `scorecard.yml` | **GitHub-hosted** | branch-protection change + weekly cron + push `main` | OpenSSF supply-chain posture score → Security tab + public badge. Most useful once public. |
-| `../dependabot.yml` | n/a (GitHub-native) | weekly | Grouped minor/patch update PRs for **cargo** (`/`), **npm** (`/oauth-sidecar`), **github-actions** (`/`), and **docker** (`/deploy`, commented until a Dockerfile lands). |
+| `upgrade-boot.yml` | **GitHub-hosted** | PR to `main` touching `src/`, `Cargo.*`, `Dockerfile`, `deploy/` or the script; push to `main`; manual | Builds the candidate image and runs `scripts/upgrade-boot.sh` against the release named in `deploy/upgrade-from`: the previous image creates and seeds a database, the candidate migrates and boots on it, then the previous image boots again (rollback). |
+| `release-image.yml` | **GitHub-hosted** | tag `v*.*.*`, manual | Builds the image **once**, runs the same upgrade-boot gate on it, and only then pushes that exact image to `ghcr.io/justin-stanley/feather-reader` and signs SLSA build provenance for its digest (optional CycloneDX SBOM). Its last job dispatches `release-crate.yml` against the tag. Does not deploy: deploys are manual, by verified digest. |
+| `release-crate.yml` | **GitHub-hosted** | `workflow_dispatch` only (dispatched by `release-image.yml`) | Checks the tag equals `Cargo.toml`'s version, then `cargo publish --locked` via crates.io Trusted Publishing (OIDC, no stored token). Dispatched rather than triggered by `workflow_run`, which Trusted Publishing refuses. |
+| `../dependabot.yml` | n/a (GitHub-native) | weekly | Grouped minor/patch update PRs for **cargo** (`/`), **npm** (`/oauth-sidecar`) and **github-actions** (`/`). The **docker** block is commented out: the root `Dockerfile` pins its base images by digest. |
 
 ## GitHub-hosted, public-repo notes
 
@@ -32,13 +35,15 @@ deliberate choices:
 
 ## Local pre-push parity
 
-`scripts/ci.sh` runs the Rust + sidecar build/test/lint locally (zero Actions
-minutes). To also run the security scanners locally:
+`scripts/ci.sh` runs the Rust fmt/build/test/clippy steps and the sidecar's
+`npm ci` + build + typecheck locally (zero Actions minutes). To also run the
+rest of the gate and the security scanners locally:
 
 ```sh
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 cargo deny check                     # licenses + bans + advisories + sources
 cargo audit                          # RustSec
-( cd oauth-sidecar && npm run lint && npm run format:check && npm audit --omit=dev --audit-level=high )
+( cd oauth-sidecar && npm test && npm run lint && npm run format:check && npm audit --omit=dev --audit-level=high )
 gitleaks dir . --config .gitleaks.toml
 ```
 

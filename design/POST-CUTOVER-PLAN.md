@@ -1,5 +1,13 @@
 # Post-cutover plan
 
+> **Status: historical (2026-09-13).** A snapshot of the plan at the time,
+> kept as written. Where it says "0.4.0" for the capacity work (#17, #19) and
+> opening registration, that was the plan then: 0.4.0 shipped as standard.site
+> support only ([`STANDARD-SITE-0.4.0.md`](STANDARD-SITE-0.4.0.md)), and
+> registration is still invite-only. The sidecar (#18) has not been removed;
+> it still ships in the image for the `sidecar` backend. Current state:
+> [`CHANGELOG.md`](../CHANGELOG.md).
+
 Where things stand after 2026-09-13, and what to do next in what order.
 
 **Shipped today:** v0.3.0 → v0.3.2, the `auto_vacuum` migration, the backend

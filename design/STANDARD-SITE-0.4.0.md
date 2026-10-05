@@ -1,5 +1,11 @@
 # 0.4.0 — standard.site support
 
+> **Status: shipped.** Steps 1–4 were released in 0.4.0 (2026-10-03: #225,
+> #228, #230, #231, #213); step 5, the flag on in production, landed in #236
+> after 0.4.1. The hosted instance runs with `FEATHERREADER_STANDARD_SITE=true`.
+> The plan below is kept as written; the release notes are in
+> [`CHANGELOG.md`](../CHANGELOG.md) (0.4.0).
+
 Subscribing to `at://…/site.standard.publication/…` the way FeatherReader
 already subscribes to an RSS feed.
 
@@ -33,7 +39,7 @@ start of the work and is kept current per row.
 | **One walk per repo per tick** | **built** (step 2b) | `standard_site::fetch_repo`, `feed::poll_publication_group`; up to 16 publications of one repo per read |
 | **Subscribe form** | **built** (step 3) | DID and handle forms, behind the flag; `web::publication_url_from_paste` |
 | **Display** | **checked** (step 4) | a document with no summary renders as title, date and link (`web` test); an empty publication is a healthy poll (`standard_site` test); undated and future dates via #213 |
-| **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
+| **Flag on in production** | **on** (#236, after 0.4.1) | `FEATHERREADER_STANDARD_SITE = "true"` in `fly.toml` |
 
 ### Why it matters, now
 

@@ -1,5 +1,11 @@
 # Review backlog — the findings not yet fixed
 
+> **Status: closed, except T4.6.** Every tier below is done (see "Status").
+> T4.6 calls the capacity work "0.4.0 work"; that was the plan at the time.
+> 0.4.0 shipped as standard.site support
+> ([`STANDARD-SITE-0.4.0.md`](STANDARD-SITE-0.4.0.md)), and T4.6 is still open
+> (`FEATHERREADER_MAX_FEEDS` still defaults to 10,000).
+
 Source: three independent reviewers (security SME, regression, operator) over
 `feat/rust-oauth-phase1` at `af2c4df`, plus leftovers from the preceding round.
 The blockers from that sweep are fixed in `d67e7b9`. This file is what remains.

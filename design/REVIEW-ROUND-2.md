@@ -1,5 +1,10 @@
 # Review round 2 — the tier work, reviewed cold
 
+> **Status: historical.** Where this says "the 0.4.0 capacity work", that was
+> the plan at the time: 0.4.0 shipped as standard.site support
+> ([`STANDARD-SITE-0.4.0.md`](STANDARD-SITE-0.4.0.md)), and the capacity work
+> is still open.
+
 Three independent reviewers (security SME, regression, operator) over
 `efb1d3f..5f0b2c1` — the five commits that closed Tiers 1–3. The
 confirmed-serious half is fixed in `1881b48`. This file is the rest, plus the

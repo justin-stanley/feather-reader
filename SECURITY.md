@@ -42,4 +42,13 @@ documented in the deployment guide.
 ## Supported versions
 
 FeatherReader is pre-1.0 and evolving; security fixes land on `main` and the
-latest published release. Please test against `main` before reporting.
+latest published release. There are no backports to older lines. Please test
+against `main` before reporting.
+
+| Version | Supported |
+|---|---|
+| 0.4.x (latest: 0.4.4) | yes — fixes ship in the next 0.4 patch release |
+| < 0.4 | no — upgrade to the latest release |
+| 0.3.9 | no — yanked; it fails to start on an existing database |
+
+Releases and what each one fixed are in [CHANGELOG.md](CHANGELOG.md).

@@ -14,8 +14,18 @@ There are two related but distinct wipes:
 | **OAuth sidecar** (`oauth-sidecar`) | Per-DID OAuth tokens (refresh + access, DPoP keys) and the `session_id` handoff rows, in its own SQLite (`SIDECAR_DB`), AEAD-encrypted at rest. Plus the confidential-client signing JWK at `${SIDECAR_DB}.jwk.json`. | `POST /internal/revoke` per DID (revokes at the PDS **and** drops the row), then deleting `SIDECAR_DB`. |
 
 A user-initiated `POST /account/delete` already does the per-user version of both
-(purge that DID's app rows + sidecar `/internal/revoke`). `/logout` does the
-sidecar-revoke half. This runbook is the **fleet-wide** version.
+(purge that DID's app rows + revoke at the PDS through the sidecar **and** the
+Rust client, whichever holds tokens). `/logout` does the revoke half. This
+runbook is the **fleet-wide** version.
+
+> **On the `rust` backend (the hosted instance since 2026-09-13),
+> `teardown.sh` revokes nothing.** It enumerates DIDs from `SIDECAR_DB` only,
+> and there is no fleet-wide revoke for the Rust OAuth client. Deleting
+> `FEATHERREADER_DB` destroys the `oauth_session` tokens without revoking them,
+> so they live out their TTL at each PDS. To revoke first, each user must sign
+> out or delete their account (both revoke at the PDS) before the wipe. Also
+> remove the Rust client's signing key at `FEATHERREADER_OAUTH_KEY_PATH`
+> (in a container, on the volume), which the script does not touch.
 
 > Order matters. Revoke at the PDS *before* deleting the sidecar DB — once the
 > encrypted token rows are gone you can no longer ask the PDS to invalidate them,

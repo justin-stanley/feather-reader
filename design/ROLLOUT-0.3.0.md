@@ -1,5 +1,10 @@
 # 0.3.0 rollout plan
 
+> **Status: executed (2026-09-13).** 0.3.0 shipped and the backend was cut
+> over to `rust` (PR #110); the "live" version and digests below are as of
+> that day. Kept as the record of that rollout; the current release is in
+> [`CHANGELOG.md`](../CHANGELOG.md).
+
 Prod is **0.2.8 on the sidecar backend** (`curl https://feather-reader.com/health`
 → `ok featherreader/0.2.8`, checked 2026-09-13). `main` is 76 commits behind this
 branch. `Cargo.toml` and `Cargo.lock` are both already at `0.3.0`.

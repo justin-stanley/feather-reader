@@ -3,11 +3,17 @@
 The small TypeScript/Node component that owns the atproto **OAuth confidential-client**
 handshake (PAR / PKCE / DPoP / token refresh) via
 [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node),
-so the Rust server (`featherreader`) never touches any of it.
+so the Rust server (`featherreader`) never touches any of it **when
+`FEATHERREADER_REPO_BACKEND=sidecar`** (the default).
 
-Per the design (and the gaming-SDK prior art), atproto OAuth is fiddly and is
-**not** hand-rolled in Rust — the Rust server keeps a signed session cookie keyed
-by DID and makes `com.atproto.repo.*` calls *through this sidecar* over a small,
+> **Not the production backend.** Since 0.3.0 the Rust server has its own
+> atproto OAuth client (`FEATHERREADER_REPO_BACKEND=rust`), and the hosted
+> instance has run on it since the 2026-09-13 cutover. On `rust` this sidecar
+> is not started. See the README's
+> [Choosing an OAuth backend](../README.md#choosing-an-oauth-backend).
+
+On the `sidecar` backend the Rust server keeps a signed session cookie keyed by
+DID and makes `com.atproto.repo.*` calls *through this sidecar* over a small,
 shared-secret-guarded internal HTTP API.
 
 ## Run (dev)

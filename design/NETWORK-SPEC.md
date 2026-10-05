@@ -10,7 +10,15 @@
 > architecture diagrams in [`architecture/`](./architecture/). Where the two
 > disagree about a *surface*, `DESIGN.md` wins.
 
-**Status:** proposed. Nothing in this document is implemented as of `v0.2.7`.
+**Status:** partly built. Capability 1's relay adoption probe (§4.1–§4.4)
+shipped in v0.2.8 (PR #83): `FEATHERREADER_RELAY_HOSTS`,
+`FEATHERREADER_ADOPTION_INTERVAL_SECS` and `FEATHERREADER_SHOW_ADOPTION` in
+[`src/config.rs`](../src/config.rs), the probe in
+[`src/network.rs`](../src/network.rs). The portability test (§4.5),
+Capability 2 (§5) and Capability 3 (§7) are not built. §10.1 describes the
+release train as it was when this was written; the current one is in the
+README's [Releasing](../README.md#releasing) section. *(Originally: proposed,
+nothing implemented as of `v0.2.7`.)*
 
 ---
 
@@ -906,6 +914,13 @@ watermark, one prune order (§5.3).
 ## 10. Testing, CI, and the release train
 
 ### 10.1 What the release train actually is
+
+> **Superseded since 0.4.0.** A tag no longer fires two workflows side by
+> side: `release-image.yml` builds the image once, runs the upgrade-boot gate,
+> pushes and attests that image, then dispatches `release-crate.yml` (PR #223,
+> PR #233). `:latest` is emitted for every non-prerelease tag, not only the
+> highest. Current pipeline: the README's [Releasing](../README.md#releasing)
+> section.
 
 Recorded here because the implementation plan must target the real mechanism,
 not the assumed one:
