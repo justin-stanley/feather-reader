@@ -1,0 +1,11 @@
+flowchart TB
+    Sched["scheduler::spawn<br/>distinct first-tick offsets per loop"]
+    Sched --> RSS["RSS poller<br/>first tick 30 s · wakes every 60 s"]
+    Sched --> Pub["Publication poller<br/>first tick 75 s · wakes every 60 s"]
+    Sched --> Flush["Read-state flusher<br/>every ~60 s, and at shutdown"]
+    Sched --> Sweeps["Sweepers<br/>pending logins: 45 s, then every 15 min<br/>invite codes: 60 s, then hourly<br/>retention: 90 s, then daily<br/>adoption probe: 5 min, then daily"]
+    RSS -->|"feeds whose next_poll is due: fetchHint or FEATHERREADER_POLL_INTERVAL (1 h)<br/>50 per tick · 4 concurrent · 250 ms stagger"| Get["Conditional GET<br/>ETag / Last-Modified · SSRF guard · backoff on failure"]
+    Get --> Store[("sanitise · size-bound every field · store<br/>newest 2000 per feed")]
+    Pub -->|"due publications, grouped by publisher DID<br/>one repo walk per publisher per pass"| Resolve["Resolve did:plc at plc.directory<br/>vet the PDS endpoint (SSRF guard)"]
+    Resolve --> List["Anonymous listRecords<br/>site.standard.publication, then site.standard.document filtered on site<br/>up to 16 publications per walk · malformed records skipped and counted · 30 s deadline"]
+    List --> Store

@@ -40,6 +40,25 @@ deploying is separate.
   reference PDS refuses, on all three clients and through `POST /opml`; the
   refusals were confirmed red before the fix, not assumed.
 
+### Docs
+
+- **The README describes 0.4.2.** It still described a reader of RSS feeds
+  alone, said the hosted instance ran the `sidecar` OAuth backend (it has run
+  `rust` since the 2026-09-13 cutover; `fly.toml` says so), promised a manual
+  dark-mode toggle that no template renders, and said nothing about the
+  publication poller, link cards, the upgrade-boot gate or deploying by digest.
+  Rewritten against the code: standard.site publications beside RSS, the
+  invite-only beta as the templates state it, a configuration table that points
+  at `src/config.rs` as the source of truth, the CI gates as `ci.yml` runs them,
+  and the release pipeline. The two PNG architecture diagrams are replaced by
+  four Mermaid diagrams drawn from `fly.toml`, the `Dockerfile`, the Caddyfile,
+  `store.rs`, `scheduler.rs`, `standard_site.rs` and the release workflows —
+  architecture, data ownership, polling, and the release pipeline — each
+  rendered with `@mermaid-js/mermaid-cli` before commit. Every relative link was
+  checked to resolve.
+
+---
+
 ## 0.4.2 — 2026-10-04
 
 A public feature page for standard.site, a latest-releases call-out, and link
