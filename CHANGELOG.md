@@ -14,7 +14,27 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.4 — 2026-10-05
+
+The feed parser moves to feed-rs 3.0 with entry ids and permalinks unchanged,
+real RSS bylines, and a parser panic contained as a parse failure; the SSRF
+guard refuses the reserved and documentation ranges it missed.
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.3 is a deploy;
+  rolling back to 0.4.3 is a redeploy.
+- **What changes on the next poll of each feed:** bylines. RSS items that
+  showed "author" (or an Atom author that showed "unknown") get the real name,
+  or none when only an address is given. Entry ids, titles, links, dates and
+  content do not change: a differential run over 27 live feeds (774 entries)
+  found no difference in any of them.
+- **A feed whose author field makes feed-rs 3.0 panic** (a multi-byte
+  character touching the email address) now fails as a parse error with
+  backoff, until the item leaves the feed. 2.4 parsed it. None of the 27
+  sampled feeds does this.
+- **Dependencies:** tokio-rustls 0.26.6; sidecar `@atproto/api` 0.22 (the
+  sidecar is not the production backend); CI action pins.
 
 ### Security
 

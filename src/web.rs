@@ -1564,6 +1564,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.4.4",
+        date: "2026-10-05",
+        summary: "The feed parser moves to feed-rs 3.0 with entry ids and \
+                  links unchanged and real RSS bylines, and the address guard \
+                  refuses the reserved ranges it missed.",
+    },
+    Release {
         version: "0.4.3",
         date: "2026-10-05",
         summary: "Two write-path fixes for any PDS: large OPML imports and \
@@ -7758,7 +7765,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#043--2026-10-05"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#044--2026-10-05"
         );
     }
 
