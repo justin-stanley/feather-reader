@@ -40,6 +40,39 @@ deploying is separate.
   neither (4.0 MB). Shipped images were never affected: the Dockerfile copies
   named paths only, and release images build from a clean CI checkout.
 
+### Changed
+
+- **feed-rs 2.4 → 3.0, with entry ids and permalinks held to their 2.4
+  values** (#249). 3.0 adds `<comments>` and `wfw:commentRss` URLs to
+  `entry.links`, and its default id generator hashes the *first* link. An
+  id-less item listing its comments link before `<link>` would have got a new
+  guid (stored a second time for every reader) and the comments page as its
+  permalink. Feeds are now parsed through `parse_feed`, whose id generator
+  hashes the first non-comments link with the same feed-rs function 2.4 used,
+  and comments links are never candidates for the permalink or
+  `stable_guid`. An entry with no guid and no permalink used to get a random
+  UUID from feed-rs, so it was a new row on every poll; it now gets the
+  deterministic `stable_guid`.
+  **Bylines are names.** 2.4 named every RSS `<author>` "author" and an Atom
+  author with an empty `<name>` "unknown", and those words were stored as the
+  byline. 3.0 separates the name from the address; FeatherReader strips the
+  parentheses 3.0 leaves on the RSS `address (Name)` form, and an author given
+  only as an address has no byline. Because the entry upsert refreshes
+  `author`, entries still in a feed get the real name on their next poll.
+  **Measured, not assumed:** a throwaway harness parsed the same bytes with
+  both versions through FeatherReader's field choices — the 10 feed fixtures
+  in the tests, 11 edge-case fixtures, and 27 live feeds (RSS 2.0, RSS 1.0,
+  Atom, JSON Feed; 774 entries). On the live feeds: 0 differences in guid,
+  title, permalink, published/updated date, or content; 123 bylines in 6
+  feeds changed, all from "author"/"unknown" to the name (or none). On edge
+  fixtures 3.0 also parses `Jun 05 2020 10:00:00 GMT` dates and RSS
+  `<atom:updated>`, and strips the wrapper `div` from Atom `type="xhtml"`
+  text. **One regression stays:** in invalid RSS with unescaped markup inside
+  `<title>`, `<description>` or `<content:encoded>`, 3.0 keeps only the text
+  before the first child element (2.4 kept the markup), and an id-less item
+  with such a title gets a new generated id. None of the live feeds does this. Five tests pin the above; four failed on 3.0 before the
+  change.
+
 ## 0.4.3 — 2026-10-05
 
 Two write-path fixes that apply on any PDS: `applyWrites` is sent in calls of
