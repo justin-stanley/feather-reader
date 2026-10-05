@@ -1,5 +1,19 @@
 # Review round 2 — the tier work, reviewed cold
 
+> **Status: historical. All 20 findings acted on (audited 2026-10-05).**
+> R1–R14 and R16–R20 are fixed, in PR #101 (v0.3.0, squash `d7d97bf`). The cited
+> `1881b48` is a pre-squash commit on `feat/rust-oauth-phase1`. R15 is partly
+> fixed: the comment is corrected and the `IN` list became one `json_each` bind,
+> but the read path is still not capped by `max_subs_per_did`. R17's open
+> question was later measured (ops runbook): the edge hangs about 40 s, then
+> 503s. Still open: two Machines, which belongs to the capacity work. The etag
+> `COALESCE` in "Adjacent" was kept on purpose.
+>
+> Where this says "the 0.4.0 capacity work", that was the plan at the time: 0.4.0
+> shipped as standard.site support
+> ([`STANDARD-SITE-0.4.0.md`](STANDARD-SITE-0.4.0.md)), and the capacity work is
+> still open.
+
 Three independent reviewers (security SME, regression, operator) over
 `efb1d3f..5f0b2c1` — the five commits that closed Tiers 1–3. The
 confirmed-serious half is fixed in `1881b48`. This file is the rest, plus the
@@ -19,6 +33,8 @@ it did again. That is why this file ends in a loop rather than a list.
 
 ## R1 — `starred_identities` truncation fails OPEN, toward deleting PDS records
 
+> Done in PR #101: `store::StarredIdentities::Truncated` and `ORDER BY e.id`; the handler fails closed.
+
 `store.rs` — `LIMIT ?2` with **no `ORDER BY`**, and `web.rs` checks only
 `!identities.is_empty()`.
 
@@ -37,6 +53,8 @@ hitting it stops pointing at the destructive outcome.
 
 ## R2 — the `total == 0` escape hatch compares a scoped count to an unscoped set
 
+> Done in PR #101: `identities_ok` is now `identities.is_some()`.
+
 `web.rs` — `identities_ok = !identities.is_empty() || total == 0`.
 
 `total` is `count_entries_for_view(…, scope_ids)` — narrowed by `?feed=` /
@@ -53,6 +71,8 @@ any cached starred entry AT ALL, not whether the current scope does.
 
 ## R3 — the starred pager advertises a page the clamp can never reach
 
+> Done in PR #101: cached and uncached rows are paged as one sequence.
+
 `web.rs` — `last_page` and the page clamp come from the CACHED total; `total` is
 then inflated by the uncached PDS rows, and `page_count` / `next_href` are
 computed from the inflated number.
@@ -65,6 +85,8 @@ computed from the inflated number.
 **Fix.** Derive the pager from the same total the clamp uses.
 
 ## R4 — `PRAGMA auto_vacuum` and `VACUUM` can land on different connections
+
+> Done in PR #101: one `pool.acquire()` for both statements.
 
 `store.rs::migrate_to_incremental_vacuum` issues both against `&SqlitePool`.
 `PRAGMA auto_vacuum` on a populated database is connection-scoped INTENT that
@@ -79,6 +101,8 @@ for being under disk pressure.
 
 ## R5 — `reclaim()` hands back the batching it just won
 
+> Done in PR #101: `incremental_vacuum(RECLAIM_BATCH_PAGES)` in a loop.
+
 `store.rs` — `PRAGMA incremental_vacuum` with **no page argument** reclaims the
 entire freelist in ONE transaction, immediately after the retention sweep that
 was carefully batched to avoid exactly that. Confirmed: the call site passes no
@@ -88,6 +112,8 @@ argument.
 deletes use.
 
 ## R6 — every delete batch re-scans `entry_state`
+
+> Done in PR #101: the `NOT EXISTS` form shipped (see MEASURED below).
 
 The operator ran `EXPLAIN QUERY PLAN` on the statement `delete_in_batches`
 builds: the soft-delete's inner subquery does `SCAN entries` (the `COALESCE` is
@@ -167,6 +193,8 @@ semantics, which is the equivalence argument made executable.
 
 ## R7 — `/stats` says "Fetching: running" on an instance where nothing polls
 
+> Done in PR #101: the Fetching row reads running, paused, stale, starting or off.
+
 `web.rs` — `polling_paused` is the only input to that row. With
 `FEATHERREADER_DISABLE_SCHEDULER`, or before the poller's now-delayed first tick,
 the atomic is `false`, so the page the commit added for this exact question
@@ -176,6 +204,8 @@ reports healthy. `/health` distinguishes these; `/stats` does not.
 
 ## R8 — `HEALTH_TICK_STALE_SECS` is hardcoded against a configurable tick
 
+> Done in PR #101: derived from the tick (×5) with a 15-minute floor.
+
 15 minutes, not derived from `FEATHERREADER_POLL_TICK_SECS`. An operator who
 raises the tick above 900 s gets a permanent `poller: stale` in the body the
 deployment docs now tell them to alert on.
@@ -183,6 +213,8 @@ deployment docs now tell them to alert on.
 **Fix.** Derive it from the configured tick with a floor.
 
 ## R9 — the migration reports roughly double the real size
+
+> Done in PR #101: the WAL is checkpointed before measuring.
 
 `db_size_bytes` now adds the WAL, and a `VACUUM` in WAL mode writes the whole
 rebuilt database through the WAL, which keeps that high-water size until a
@@ -195,6 +227,8 @@ database", and it is the only feedback the command gives.
 
 ## R10 — the headroom check measures the wrong filesystem
 
+> Done in PR #101: `temp_store_directory` points at the database volume.
+
 `VACUUM` copies into a temporary database whose location follows
 `temp_store` / `SQLITE_TMPDIR`. Confirmed: neither is set anywhere in `src/`,
 `Dockerfile` or `deploy/`. So the temp copy lands on the container rootfs, while
@@ -206,6 +240,8 @@ space checked is the space used.
 
 ## R11 — `bytes_before` will not match what the operator sees
 
+> Done in PR #101: the file size is reported alongside the live size.
+
 It is freelist-subtracted, and the population this targets is exactly
 `auto_vacuum=NONE` with a large freelist — so the on-disk file is materially
 bigger than the number in the refusal message. An operator comparing it to
@@ -214,6 +250,8 @@ bigger than the number in the refusal message. An operator comparing it to
 **Fix.** Report the file size alongside the live size in the refusal.
 
 ## R12 — `--migrate-auto-vacuum` is matched against all of `argv`
+
+> Done in PR #101: `argv[0]` is skipped and the flag must match exactly.
 
 Including `argv[0]`, with no positional parsing and no `--` handling. Not
 remotely reachable, so not a security defect. The operational hazard is real
@@ -225,6 +263,8 @@ full VACUUM per restart.
 
 ## R13 — the adoption probe ignores the startup-delay override
 
+> Done in PR #101: the adoption probe takes its delay from the shared table.
+
 Its ticker is built raw, so `FEATHERREADER_STARTUP_DELAY_SECS=0` still waits five
 minutes — contradicting the constant's own doc ("scales all of them") and a test
 that asserts over a set including `ADOPTION_STARTUP_DELAY`.
@@ -232,6 +272,8 @@ that asserts over a set including `ADOPTION_STARTUP_DELAY`.
 **Fix.** Route it through `startup_delay` like its siblings.
 
 ## R14 — the one new operator knob is documented nowhere operators look
+
+> Done in PR #101: documented in `README.md` and `fly.toml`, and a clamped override is logged.
 
 `FEATHERREADER_STARTUP_DELAY_SECS` appears only in `scheduler.rs`. Not in
 `README.md`, not in `fly.toml`, not in `deploy/`. It is also a CEILING, which is
@@ -241,6 +283,8 @@ nothing.
 **Fix.** Document it, and log when the override is clamped.
 
 ## R15 — the unbounded `IN` list, and a doc comment that licensed it
+
+> Partly done in PR #101: the doc comment is corrected and the scope filter is one `json_each` bind. The read path is still not capped by `max_subs_per_did`.
 
 `scoped_feed_ids` emits one placeholder per subscribed feed with no cap. The
 count comes from the PDS, bounded only by `MAX_LIST_PAGES` (200) × 100 =
@@ -258,12 +302,16 @@ in a comment is not a bound.
 
 ## R16 — the starred view's uncached rows bypass paging entirely
 
+> Done in PR #101: bounded by `MAX_UNCACHED_SAVED_ROWS` and paged.
+
 `uncached` is built from `list_saved_sorted` (same 20,000 bound) and appended
 whole on the last page. `ENTRIES_PER_PAGE` does not bound that response.
 
 **Fix.** Page them, or bound them explicitly and say so.
 
 ## R17 — the premise the whole `/health` design rests on — **ANSWERED: it was FALSE**
+
+> Done in PR #101: `fly.toml`, `web::health` and `NETWORK-SPEC.md` corrected; `auto_start_machines = true`. The hang-vs-503 question was measured later (ops runbook): the edge hangs about 40 s, then 503s. Two Machines is still open.
 
 `fly.toml`, the handler doc and `NETWORK-SPEC.md` all asserted "Fly restarts the
 machine on a failed check". Researched against primary sources; it is false, and
@@ -319,7 +367,12 @@ change, not a config change, and belongs with the 0.4.0 capacity work.
 **Still unverified, and cheap to measure on a throwaway app:** whether the edge
 hangs or 503s immediately when the only Machine is unhealthy, and for how long.
 
+> Measured since (ops runbook): on a throwaway app with this config, the edge
+> HANGS about 40 s and then 503s. It re-registers about 7 s after the check passes.
+
 ## R18 — a `set_var` data race in the test binary
+
+> Done in PR #101: the override is injected (`startup_delay_from`); `src/` has no `set_var`.
 
 `the_startup_delay_override_is_a_ceiling` is the only `std::env::set_var` in
 `src/`, in a 650-test multithreaded binary where ~39 sites call `std::env::var`.
@@ -330,6 +383,8 @@ another env-reading test lands.
 
 ## R19 — the batch backstop warns on a sweep that finished
 
+> Done in PR #101: the warning fires only when the final batch was full.
+
 `batch + 1 == PRUNE_MAX_BATCHES` is the correct off-by-one, but the warn is
 unconditional on the final iteration: if that batch drains the last rows, it
 still logs "the rest waits for the next run" when nothing is left.
@@ -337,6 +392,8 @@ still logs "the rest waits for the next run" when nothing is left.
 **Fix.** Warn only if the following batch would have had work.
 
 ## R20 — the entrypoint logs an error string on every normal deploy
+
+> Done in PR #101: the entrypoint keys on its own `stopping` flag.
 
 On SIGTERM `wait -n` returns 143 and the script logs "a supervised process exited
 (status 143); shutting down container". Anyone alerting on that string pages on
@@ -364,6 +421,9 @@ can never CLEAR a validator: an origin that once sent an `ETag` and stops keeps
 receiving `If-None-Match` forever. Same for restoring `next_poll` to NULL through
 the upsert. Predates this work, and the lease's correctness argument leans on the
 first one — so it is written down here rather than left implicit.
+
+> Kept on purpose (audited 2026-10-05): `store::upsert_feed`'s doc argues a stale
+> validator is harmless.
 
 ---
 

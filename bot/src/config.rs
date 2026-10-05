@@ -14,7 +14,7 @@
 //! | `FEATHERREADER_BOT_SECRET`   | **yes**  | Shared bearer for `POST /bot/claims` (== the app's Fly secret of the same name). Vaultwarden-injected. |
 //! | `BOT_STATE_DB`               | no (default `invite-bot.db`) | SQLite idempotency store on the bot host. MUST be an ABSOLUTE path on a persistent volume in production (a relative/ephemeral path re-mints on every restart). |
 //! | `BOT_POLL_INTERVAL_SECS`     | no (default `300` = 5 min) | How often to poll `getFollowers`. |
-//! | `BOT_MAX_PER_CYCLE`          | no (default `10`) | Safety cap on how many NEW followers to process per poll (blunts a follow spike). |
+//! | `BOT_MAX_PER_CYCLE`          | no (default `10`) | Safety cap on how many followers to process per poll — new followers and waitlist retries combined (blunts a follow spike). |
 //! | `BOT_MAX_DAILY_MINTS`        | no (default `50`) | Global daily budget on fresh claim mints across ALL cycles — a sybil-farming brake (a flood of throwaway follows can't drain the beta in a day). Idempotent re-posts/waitlist-welcomes don't count. |
 //! | `RUST_LOG`                   | no (default `info`) | Tracing filter. |
 
@@ -48,7 +48,8 @@ pub struct Config {
     pub state_db: String,
     /// Poll interval (seconds).
     pub poll_interval_secs: u64,
-    /// Max new followers processed per poll cycle.
+    /// Max followers processed per poll cycle — new followers plus waitlist
+    /// retries, combined.
     pub max_per_cycle: usize,
     /// Global daily budget on FRESH claim mints across all cycles (sybil brake).
     pub max_daily_mints: usize,

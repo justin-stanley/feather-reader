@@ -14,6 +14,53 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Docs
+
+- **The GitHub-facing docs describe 0.4.4.** `src/config.rs`'s settings
+  table, which the README calls the complete list, was missing ten variables
+  the code reads (`FEATHERREADER_ENV`, `FEATHERREADER_BETA_CAP`, and the eight
+  scheduler knobs in `scheduler.rs`); they are added with the defaults the
+  code uses. `deploy/teardown.md` implied the kill script revokes every
+  session; on the `rust` backend it revokes none, since it reads only
+  `SIDECAR_DB` and the Rust client has no fleet-wide revoke, and it now says
+  so. The OAuth sidecar's README said the Rust server never does OAuth itself,
+  untrue since 0.3.0. `.github/workflows/README.md` gains the three release
+  and gate workflows. `ci.yml` counted five jobs (there are seven), and
+  `release-image.yml`'s header stated a claim about `:latest` and then
+  contradicted it. `dependabot.yml` waited for a Dockerfile under `deploy/`
+  (it is at the root, digest-pinned). The README says a large read-state
+  flush is split into calls of 200 writes / 128 KiB (#242). The design
+  docs get status lines: standard.site shipped in 0.4.0 with the flag on in
+  production, the network spec's adoption probe shipped in 0.2.8, and the
+  older plans that called capacity work and open registration "0.4.0 work" are
+  marked historical. `SECURITY.md` gets a supported-versions table, and
+  `CONTRIBUTING.md` lists the CI gates `scripts/ci.sh` does not run.
+- **Every doc audited against the code, and the open risks tracked.** Four
+  audits went through every Markdown doc. `NETWORK-SPEC.md` now says what is
+  built (the adoption probe, the `PdsClient` guard) and what is not; its §7.2
+  privacy copy, which promised a `/network/opt-out` route that does not exist,
+  is labelled a draft; and §8's claim that `PdsClient` bypasses the SSRF guard,
+  false since v0.2.8, is corrected. `STANDARD-SITE-0.4.0.md` carries its final
+  status and per-step PRs, `DESIGN.md` its shipped state, and every item in the
+  review and rollout docs its state today, with issues #257–#263 filed for the
+  open ones. The operational docs were checked by running them: a local sidecar
+  needs `SIDECAR_DEV=true`; the `rust` backend still requires
+  `SIDECAR_INTERNAL_SECRET` on a production-like instance; teardown needs
+  `FR_STOP_CMD`, and on the `rust` backend it revokes no sessions (#257).
+  `deploy/upgrade-from` is 0.4.4, and the ownership diagram is re-rendered with
+  the chunked `applyWrites` flusher. A final sweep checked the numbers, line
+  references and forward-looking statements in docs and comments: the scheduler
+  and `main` module docs named two background tasks where there are eight; the
+  `web.rs` route list lacked thirteen routes and said OAuth always goes through
+  the sidecar; the `Cargo.toml` base64 note still called the second copy
+  pending, though it landed with reqwest 0.13.5 and the pin is 0.23;
+  `upsert_feed` has eight non-test callers, not "about 20"; the workflow
+  comments still waited for the repo to go public; and stale `file:line`
+  references in the review docs, the Caddy configs and two code comments now
+  name the function instead (comment-only changes in code).
+
 ## 0.4.4 — 2026-10-05
 
 The feed parser moves to feed-rs 3.0 with entry ids and permalinks unchanged,

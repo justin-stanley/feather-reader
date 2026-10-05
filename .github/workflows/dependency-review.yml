@@ -9,7 +9,7 @@ name: Dependency review
 # requires the dependency graph feature. That feature is:
 #   * always on + FREE for PUBLIC repos (the OSS steady state),
 #   * available on private repos only with GitHub Advanced Security.
-# So on this repo the workflow becomes fully effective once PUBLIC. It runs on
+# This repo is public, so the workflow is fully effective. It runs on
 # `ubuntu-latest` (the action ships there); it's a tiny job.
 
 on:
@@ -25,11 +25,12 @@ jobs:
     name: Dependency review
     # The Dependency Graph API this action calls needs GitHub Advanced Security
     # on a PRIVATE repo (it errors "Dependency review is not supported on this
-    # repository" otherwise). Skip while private so it neither fails every PR
-    # nor burns Actions minutes; it auto-activates at the public flip, where the
-    # dependency graph is always-on + free. Mirrors the gate in scorecard.yml.
+    # repository" otherwise). Skipped on a private repo (e.g. a private fork) so
+    # it neither fails every PR nor burns Actions minutes; this repo is public,
+    # where the dependency graph is always-on + free, so it runs here. Mirrors
+    # the gate in scorecard.yml.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted; free once public
+    runs-on: ubuntu-latest  # GitHub-hosted; free for this public repo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

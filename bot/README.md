@@ -33,10 +33,12 @@ dependency tree. Build/test it on its own:
 
 ```sh
 cd bot
-cargo build
-cargo test
+cargo build --all-targets --locked
+cargo test --locked
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+cargo deny check bans licenses sources
+cargo audit -D warnings
 ```
 
 ## The claim flow (app side)

@@ -1,18 +1,20 @@
 name: release-image
 
-# Build + publish the FeatherReader container image on a version tag, then sign
-# SLSA build provenance (and, optionally, a CycloneDX SBOM) for the pushed image
-# DIGEST. This does NOT deploy to Fly — that stays with the deploy runbook.
+# Build the FeatherReader container image on a version tag, run the upgrade-boot
+# gate on it, and only then push that exact image and sign SLSA build provenance
+# (and, optionally, a CycloneDX SBOM) for its DIGEST. The last job dispatches
+# release-crate.yml against the tag, so a failed gate publishes nothing anywhere.
+# This does NOT deploy to Fly — that stays with the deploy runbook.
 #
-# Trigger: pushing a semver tag, e.g.  git tag v0.1.0 && git push origin v0.1.0
+# Trigger: pushing a semver tag, e.g.  git tag v0.4.4 && git push origin v0.4.4
 #
 # Deploy contract: the attestations are bound to the image DIGEST. The runbook
 # resolves the tag to that digest, runs `gh attestation verify` (fail-closed),
 # then `fly deploy -i ghcr.io/...@<digest>`. Deploying a mutable tag defeats the
-# guarantee. `:latest` is published only for the newest semver (flavor latest=auto)
-# -- NOT TRUE: metadata-action has no memory of earlier tags, and latest=auto
-# emits :latest for ANY non-prerelease semver tag. A 0.3.x hotfix pushed after
-# 0.4.0 WOULD move :latest backward. Deploy by digest regardless.
+# guarantee. `:latest` is NOT only the newest release: metadata-action has no
+# memory of earlier tags, and latest=auto emits :latest for ANY non-prerelease
+# semver tag, so a hotfix on an older line pushed after a newer release moves
+# :latest backward. Deploy by digest regardless.
 
 on:
   push:

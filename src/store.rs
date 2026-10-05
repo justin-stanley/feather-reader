@@ -9,7 +9,7 @@
 //!   feed URL / feed-native GUID and **shared across every DID** that follows the
 //!   same feed (many users on one instance don't multiply fetch load), and
 //! * `entry_state` + `read_cursor` — per-DID read/star state and the per-feed
-//!   read cursor that the (v1.1) batched flusher syncs up to the PDS.
+//!   read cursor that the batched read-state flusher syncs up to the PDS.
 //!
 //! All queries here are **runtime** queries (`sqlx::query` / `sqlx::query_as`),
 //! not the compile-time `query!` macros — so the crate builds with no

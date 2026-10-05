@@ -10,7 +10,31 @@
 > architecture diagrams in [`architecture/`](./architecture/). Where the two
 > disagree about a *surface*, `DESIGN.md` wins.
 
-**Status:** proposed. Nothing in this document is implemented as of `v0.2.7`.
+**Status:** partly built.
+
+- **Shipped (v0.2.8, PR #83):** Capability 1's relay adoption probe
+  (§4.1–§4.4). The relay client is in [`src/network.rs`](../src/network.rs) and
+  the `run_adoption_probe` loop in [`src/scheduler.rs`](../src/scheduler.rs),
+  configured by `FEATHERREADER_RELAY_HOSTS`,
+  `FEATHERREADER_ADOPTION_INTERVAL_SECS` and `FEATHERREADER_SHOW_ADOPTION`
+  ([`src/config.rs`](../src/config.rs)). The probe is on by default; the
+  `/about` line is off by default. The same PR delivered the §8 retrofits:
+  every `PdsClient` call goes through the SSRF guard
+  (`net::guarded_get_no_privacy` for reads, `net::guarded_post_json` for
+  writes), and `Auth::Anonymous` exists.
+- **Not built:** the portability test (§4.5), Capability 2 (§5–§6, including
+  the `/network` page, the `/network/opt-out` route and every `net_*` table)
+  and Capability 3 (§7). This instance indexes no one's subscription records,
+  so the consent model in §7.2 describes nothing that runs today.
+- **Overtaken premises:** the Rust OAuth client (v0.3.0, PR #101) has been the
+  production backend since v0.3.3 (PR #110); the Node sidecar is optional and
+  not started on feather-reader.com. Since v0.4.0 the standard.site publication
+  poller reads publishers' PDSes unauthenticated, through the same guard (§8).
+  §10.1's release train is superseded; the current one is in the README's
+  [Releasing](../README.md#releasing) section.
+
+Counts and repo facts below are as of v0.2.7 unless marked otherwise.
+*(Originally: proposed, nothing implemented as of `v0.2.7`.)*
 
 ---
 
@@ -24,15 +48,19 @@ FeatherReader's defining claim is on the tin of every page:
 
 That claim is currently **asserted, not demonstrated**. The code that makes it
 true is real — [`src/lexicon.rs`](../src/lexicon.rs) defines the records,
-[`SidecarClient::add_subscription`](../src/atproto.rs) writes them, and
+[`Repo::add_subscription`](../src/repo.rs) writes them (dispatching to the
+Rust OAuth backend or the sidecar), and
 [`resolve_subscriptions`](../src/web.rs) treats the PDS as the source of truth on
 every request with the local cache as a fail-closed fallback — but nothing in the
 repo ever *reads a subscription record it did not write*. There is no test that
 proves a second implementation could pick these records up, and no number
 anywhere that says how many accounts on the network hold them.
 
-Meanwhile atproto ships four free, no-signup services FeatherReader has never
-touched:
+> Since v0.2.8 the adoption probe produces that number (§4.4). The portability
+> test is still not built.
+
+Meanwhile atproto ships four free, no-signup services FeatherReader had never
+touched as of v0.2.7 (the relay is now queried by the adoption probe):
 
 | Service | Endpoint | What it gives us |
 |---|---|---|
@@ -57,6 +85,10 @@ on `relay1.us-west.bsky.network` returns **exactly one repo network-wide**:
 `did:plc:ohutz6x5acjmpuulp3x7wxxc` — the author's own account. For comparison,
 `community.lexicon.calendar.event` returns 20+ (page limit).
 
+> As of v0.2.7. The same unauthenticated query against
+> `relay1.us-west.bsky.network` on 2026-10-05 returned **4** repos in one page.
+> The argument below still holds at that size.
+
 So the portability claim is **architecturally true and empirically untested**.
 That asymmetry is the single strongest argument for Capability 1 and the single
 strongest argument for *deferring* Capabilities 2 and 3: a discovery projection
@@ -76,7 +108,9 @@ public promises, not aspirations:
 2. **"There are no analytics, no advertising networks, no third-party trackers,
    and no telemetry."** (`privacy.html`)
 3. **"Single binary, self-hostable. Rust + an embedded SQLite cache (no Postgres
-   to run), plus a small Node OAuth sidecar."** (`README.md`)
+   to run). The atproto OAuth client is built in, so a self-host can be one
+   process — or keep the Node sidecar if you prefer."** (`README.md`; at v0.2.7
+   it read "plus a small Node OAuth sidecar")
 4. **"No-JS friendly — server-rendered HTML with a dash of htmx; every action
    also works as a plain form POST."** (`README.md`)
 5. **Public feeds only.** A secret-bearing feed URL is refused at the add
@@ -89,7 +123,8 @@ public promises, not aspirations:
    the 1 GB volume) and `[[vm]] memory = "512mb"`. Above the watermark the
    poller stops fetching new content — see `poll_due_once` in
    [`src/scheduler.rs`](../src/scheduler.rs) and `check_watermark_vs_disk` in
-   [`src/main.rs`](../src/main.rs). Both numbers bind everything in §5.
+   [`src/main.rs`](../src/main.rs). Both numbers bind everything in §5. (The
+   768 MiB is set in `fly.toml`; the code's own default is 2 GiB.)
 7. **The self-hoster must never be forced to run any of this.**
 
 Constraint 1 is not decoration. It is the reason §7 recommends cutting one of
@@ -136,35 +171,44 @@ the three capabilities outright.
 
   *Correction to a premise this spec was drafted against:* there is **no
   automated `/health`-equals-version gate and no auto-rollback** in the repo.
-  `grep -rni rollback` matches exactly one line, `src/store.rs:984
-  tx.rollback().await.ok();` — a SQL transaction. What the release train
+  `grep -rni rollback` matched exactly one line in `src/` at the time,
+  `tx.rollback().await.ok();` in `src/store.rs` — a SQL transaction. What the release train
   actually enforces is **deploy-by-digest with a fail-closed attestation
   check**: `release-image.yml` prints, and the (unversioned, not-in-repo) deploy
   runbook runs, `gh attestation verify oci://…@<digest>` followed by
   `fly deploy -i …@<digest>`. The version check is a human reading `/health`
-  after the deploy. See §10.1.
+  after the deploy. See §10.1. (Since v0.4.0 an upgrade-boot gate in
+  `release-image.yml` also proves, before anything is published, that the
+  candidate can upgrade the last release's database and that the last release
+  still boots after it. Deploy is still manual and there is still no
+  auto-rollback.)
 - **The in-container supervisor kills the container when any child exits.**
   [`deploy/container-entrypoint.sh`](../deploy/container-entrypoint.sh) runs
-  `wait -n` over `featherreader`, the Node sidecar, and Caddy, and on the first
-  child exit tears the whole container down so Fly recreates the machine. That
-  design is correct for three processes that are each individually load-bearing.
-  It is **actively hostile to a fourth process whose upstream is a websocket
+  `wait -n` over `featherreader`, Caddy, and (on the `sidecar` backend only)
+  the Node sidecar — production runs the `rust` backend, so two children — and
+  on the first child exit tears the whole container down so Fly recreates the
+  machine. That design is correct for processes that are each individually
+  load-bearing. It is **actively hostile to an extra process whose upstream is a websocket
   that disconnects routinely.** This single fact decides §6.
 
 ---
 
 ## 3. Locked decisions
 
+> **Built so far:** D1's adoption probe only (v0.2.8, PR #83). D1's
+> portability test and D2, D4, D6, D7, D9 (Capability 2) are not built. D8's
+> guard requirement is already met for every `PdsClient` call (§8).
+
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | Capability 1 (adoption metric + portability test) ships first, and ships **on by default**. | One unauthenticated GET per day. Holds no personal data. Turns the headline claim into a passing test. |
+| D1 | Capability 1 (adoption metric + portability test) ships first, and ships **on by default**. | One paged, unauthenticated walk per configured relay (two by default) per day, plus one about five minutes after each boot. Holds no personal data. Turns the headline claim into a passing test. |
 | D2 | Capability 2 (Jetstream projection) ships **compiled behind a cargo feature and disabled by default**. | Constraint 7. A self-hoster's `cargo build` must not pull a websocket stack or silently make them an aggregator. |
 | D3 | Capability 3 (social join against `app.bsky.graph.follow`) is **not built**. | §7. It is a recommendation engine, it needs a data flow the privacy page forbids, and with N=1 it has nothing to say. |
-| D4 | The Jetstream consumer runs as a **`tokio` task inside the existing Rust process**, registered in `scheduler::spawn` — not a fourth supervised process, not a separate crate. | §2.1 (the `wait -n` supervisor) and §6. |
+| D4 | The Jetstream consumer runs as a **`tokio` task inside the existing Rust process**, registered in `scheduler::spawn` — not an extra supervised process, not a separate crate. | §2.1 (the `wait -n` supervisor) and §6. |
 | D5 | **Nothing derived from the network is a source of truth.** Every network table is a projection, droppable with `DROP TABLE`, rebuildable from the network, and subordinate to the reader cache under disk pressure. | The same rule the local SQLite cache already lives under. |
 | D6 | The network projection **never appears in the reading list, the rail, or any default view.** | Constraint 1. The reader you open every morning must not change at all. |
 | D7 | **Opt-out requires no login; opt-in (attribution) requires a session.** | The only thing an unauthenticated opt-out can do is *remove* data. Making removal harder than inclusion is the wrong asymmetry. |
-| D8 | Backfill reads arbitrary third-party PDS hosts and **must** route through `net::guarded_get_no_privacy`. | §8. The existing `PdsClient::list_records` does not, which is safe only under today's constrained usage. |
+| D8 | Backfill reads arbitrary third-party PDS hosts and **must** route through `net::guarded_get_no_privacy`. | §8. At v0.2.7 `PdsClient::list_records` did not; since v0.2.8 (PR #83) every `PdsClient` read does, and writes use `net::guarded_post_json`. |
 | D9 | Jetstream is used **without** zstd compression. | Avoids a `zstd` dependency for a stream measured in events-per-day. |
 | D10 | We do **not** consume the relay firehose (`com.atproto.sync.subscribeRepos`). | It is DAG-CBOR + CAR blocks + MST validation (and MST validation is about to get stricter). Jetstream gives us the same records as plain JSON. §9.2. |
 
@@ -176,6 +220,9 @@ the three capabilities outright.
 on the network holding `community.lexicon.rss.subscription`, plus a CI job that
 reads a known DID's subscription records *straight off the network* and proves a
 clean FeatherReader instance reconstructs them.
+
+> **Partly built.** The probe (§4.1–§4.4) shipped in v0.2.8 (PR #83). The
+> portability test (§4.5) is not built.
 
 ### 4.1 The call
 
@@ -202,6 +249,12 @@ second between pages, `crate::USER_AGENT` on every request (already
 `featherreader/<ver> (+https://feather-reader.com)`), and honour `429` /
 `Retry-After` by aborting the run — never by retrying tighter. A run that fails
 leaves the previous observation in place.
+
+> *As built:* the jitter is deterministic, seeded from the instance's public
+> URL so a restart never re-rolls it (`jittered` in `src/scheduler.rs`). Each
+> host's walk also has a 120 s wall-clock budget (`DEFAULT_HOST_BUDGET` in
+> `src/network.rs`); running out of it also sets `truncated`. The first run is
+> about five minutes after boot (`ADOPTION_STARTUP_DELAY`).
 
 **The non-archival caveat, stated plainly.** Since sync v1.1 relays are
 **non-archival**: they no longer mirror full repo data, and a relay's index only
@@ -241,6 +294,13 @@ inheriting their shape exactly: `interval` + `MissedTickBehavior::Skip` +
 `tokio::select!` on the shared `watch` shutdown receiver, errors logged and never
 propagated out of the loop.
 
+> *As built:* `count_repos_with_collection` returns an `AdoptionReport`
+> (per-host observations plus per-host failures) and never errors, because one
+> `Result` cannot express one relay succeeding while the other fails. The loop
+> is registered as `Loop::Adoption` in `Loop::ALL` (which now also holds the
+> publication poller and the pending-login sweeper). It differs from its
+> siblings in one way: a five-minute startup delay before the first tick.
+
 ### 4.3 State
 
 One new table, deliberately tiny, in the existing `SCHEMA` const in
@@ -262,11 +322,16 @@ durable, network-wide register of "accounts that use an RSS reader" on our disk
 — the exact thing §7.2 objects to — for a feature whose only output is an
 integer. Capability 2 has a reason to hold DIDs; Capability 1 does not.
 
+> *As built:* the write is an upsert that never lets a truncated observation
+> lower or merely equal a stored count (`record_network_stat` in
+> `src/store.rs`). A complete observation always wins.
+
 ### 4.4 Where the number surfaces
 
 - **Always:** an `info!` log line per run — `adoption.subscription`, `source`,
   `repos`, `truncated`. This is the operator-facing metric. FeatherReader has no
-  `/metrics` endpoint and this spec does not add one.
+  `/metrics` (Prometheus) endpoint and this spec does not add one. (The
+  session-gated `/admin/metrics` reports repo-backend latency, not this.)
 - **Optionally:** one quiet line at the bottom of `GET /about`
   ([`templates/about.html`](../templates/about.html)), rendered only when
   `FEATHERREADER_SHOW_ADOPTION` is truthy — **default off**. Copy: *"N accounts
@@ -280,13 +345,17 @@ is the log.
 
 ### 4.5 The portability test
 
+> **Not built.** There is no `tests/portability.rs`, no `portability.yml`
+> workflow and no `FEATHERREADER_PORTABILITY_DID`.
+
 This is the half of Capability 1 that changes what the project can *claim*.
 
 **Goal:** turn *"your feeds follow you anywhere"* from marketing copy into a
 green check.
 
 **What is provable headlessly, and what is not.** Login identity resolution is
-owned by the sidecar's `@atproto/oauth-client-node`, and the OAuth handshake
+owned by the OAuth client — the Rust one in `src/oauth/` in production since
+v0.3.3, or the optional sidecar's `@atproto/oauth-client-node` — and the OAuth handshake
 requires a browser and a human consent screen. A fully end-to-end "clean
 instance login" is therefore **not** achievable in CI, and this spec does not
 pretend otherwise. What *is* achievable, and is the substance of the claim:
@@ -316,6 +385,11 @@ pretend otherwise. What *is* achievable, and is the substance of the claim:
    by the existing web tests) and assert the rendered HTML contains every feed
    URL from step 2.
 
+   > Step 5 was written against the sidecar backend. Repo reads now go
+   > through the `Repo` dispatch in [`src/repo.rs`](../src/repo.rs), so a
+   > stub on the `rust` backend would have to stand in at that seam (or the
+   > test would pin the `sidecar` backend) instead.
+
 Step 5 is the honest version of "a clean instance login reconstructs them": it
 exercises the real router, the real `resolve_subscriptions`, the real
 `sub_ref` projection and the real templates, with only the OAuth handshake
@@ -326,10 +400,12 @@ count, so a template regression that silently drops feeds fails it.
 `.github/workflows/portability.yml` — `schedule:` nightly plus
 `workflow_dispatch:` — running `cargo test --test portability -- --ignored`.
 
-It does **not** go in `ci.yml`. `grep -rni "bsky\.network"` returns zero hits in
-the repo today, and `ci.yml`'s six jobs (`rust`, `cargo-deny`, `cargo-audit`,
-`sidecar`, `bot`, `secrets`) need only crates.io, npmjs, the gitleaks release
-tarball, and the Actions cache. (One nuance: `cargo test` *can* attempt a single
+It does **not** go in `ci.yml`. As of v0.2.7, `grep -rni "bsky\.network"`
+returned zero hits in the repo (the adoption probe's relay defaults now
+match, but no test reaches them), and `ci.yml`'s jobs — six then, seven
+today (`rust`, `cargo-deny`, `cargo-audit`, `sidecar`, `bot`, `secrets`,
+`caddyfile`) — need only crates.io, npmjs, the gitleaks release
+tarball, the Actions cache and (for `caddyfile`) the digest-pinned Caddy image. (One nuance: `cargo test` *can* attempt a single
 outbound call — `login_without_invite_redirects_to_beta_redeem` exercises
 `may_start_oauth` → `atproto::resolve_handle` against the default
 `https://bsky.social`. The invite gate is fail-closed, so the assertion holds
@@ -346,13 +422,18 @@ want to learn.
 | Relay unreachable / DNS fails | `warn!`, keep the previous `network_stat` row, retry next interval. Never fatal. |
 | Relay returns 429 | Abort the run, `warn!` with `Retry-After` if present. No tighter retry. |
 | Relay returns a malformed body | `warn!` with the parse error; no row written. |
-| Page cap hit | Row written with `truncated = 1`; surfaces as "at least N". |
+| Page cap or 120 s host budget hit | Row written with `truncated = 1` (only if it raises the stored count, §4.3); surfaces as "at least N". |
 | SQLite write fails | `warn!` only; the probe is never allowed to affect the reader. |
-| Nightly portability job fails | Nightly is red; PRs are unaffected. Triage is: did the test DID's records change, did the PDS move, or did the relay stop indexing us? |
+| Nightly portability job fails *(not built)* | Nightly is red; PRs are unaffected. Triage is: did the test DID's records change, did the PDS move, or did the relay stop indexing us? |
 
 ---
 
 ## 5. Capability 2 — a Jetstream consumer for `community.lexicon.rss.subscription`
+
+> **Not built.** Nothing in §5 exists in the code. There is no `jetstream`
+> cargo feature, no websocket dependency, no `net_*` or `network_state` table,
+> no `GET /network` page, and none of the `FEATHERREADER_NET*` /
+> `FEATHERREADER_JETSTREAM_HOSTS` / `FEATHERREADER_NETWORK_*` variables.
 
 **One sentence:** hold a filtered websocket open to Jetstream for exactly one
 collection, project the resulting public records into a bounded, rebuildable
@@ -422,7 +503,7 @@ every 60 s and reconnects when the retention sweep brings the file back under.
 
 ### 5.3 Data model
 
-Three new tables, all in the existing SQLite file, all droppable:
+Four new tables, all in the existing SQLite file, all droppable:
 
 ```sql
 -- One indexed subscription record from the public network.
@@ -468,7 +549,7 @@ is far more revealing than the feed itself.
 index overhead. The hard cap `FEATHERREADER_NET_MAX_ROWS` defaults to
 **200 000** rows (≈ 40–60 MB), which is comfortably inside the headroom between
 a working reader cache and the **768 MiB** production watermark, and is
-~200 000× today's actual network. Over the cap, the oldest `indexed_at` rows are evicted
+~200 000× the network as of v0.2.7 (one repo; four on 2026-10-05). Over the cap, the oldest `indexed_at` rows are evicted
 in the same transaction as the insert. The retention sweeper
 (`run_retention_sweeper`) gains a **prune-network-first** step: under disk
 pressure it deletes from `net_subscription` before it touches `entries`, because
@@ -591,6 +672,9 @@ be removed.
 
 ## 6. Deployment shape
 
+> **Not built** (it is Capability 2's deployment). The reasoning stands; the
+> facts it rests on are updated inline below.
+
 **Decision (D4): a `tokio` task in the existing `featherreader` process,
 registered in `scheduler::spawn`, behind a cargo feature `jetstream` (default
 off) *and* a runtime flag `FEATHERREADER_NETWORK_INDEX` (default off).**
@@ -599,9 +683,9 @@ The three options, weighed:
 
 | Option | Verdict |
 |---|---|
-| **A fourth process in the container** | **Rejected.** `deploy/container-entrypoint.sh` uses `wait -n` and tears the container down when *any* child exits, on the sound reasoning that a dead Caddy / dead sidecar / dead app all mean "broken". A websocket consumer's normal life includes disconnects and, on a bad day, a panic. Wiring it into that supervisor makes an optional, best-effort feature able to bounce the machine and drop every reader's session (`SessionRegistry` is in-memory and cleared on restart). Relaxing `wait -n` to exempt one child would weaken a deliberate safety property for a feature nobody needs. |
+| **An extra process in the container** | **Rejected.** `deploy/container-entrypoint.sh` uses `wait -n` and tears the container down when *any* child exits, on the sound reasoning that a dead Caddy / dead app (or, on the `sidecar` backend, a dead sidecar) all mean "broken". A websocket consumer's normal life includes disconnects and, on a bad day, a panic. Wiring it into that supervisor makes an optional, best-effort feature able to bounce the machine and drop every reader's session (`SessionRegistry` is in-memory and cleared on restart). Relaxing `wait -n` to exempt one child would weaken a deliberate safety property for a feature nobody needs. |
 | **A separate optional crate, like `bot/`** | **Rejected, with regret.** `bot/` is the right pattern for a component that talks to the app over HTTP and owns its own SQLite file. But this projection must be *read* by the web layer, so it would either need a second process writing the reader's SQLite file on a Fly volume — contending with a 5-connection pool that already sets `busy_timeout(5000)` on the reader's hot path — or a new HTTP API and its own storage, which is a second deployable for a page that is off by default. Neither earns its place. |
-| **In-process `tokio` task** | **Chosen.** `scheduler.rs` already runs four long-lived, shutdown-aware, failure-tolerant loops with exactly the required shape. Adding a fifth costs one entry in the `spawn` vector. Crucially the whole module is already gated by `FEATHERREADER_DISABLE_SCHEDULER`, so an operator has a pre-existing kill switch. |
+| **In-process `tokio` task** | **Chosen.** `scheduler.rs` already runs several long-lived, shutdown-aware, failure-tolerant loops with exactly the required shape (four at v0.2.7; eight as of v0.4.4, six of them in `Loop::ALL`). Adding one costs one `Loop` variant. Crucially the whole module is already gated by `FEATHERREADER_DISABLE_SCHEDULER`, so an operator has a pre-existing kill switch. |
 
 The self-hosting story is preserved by the **cargo feature**, not by process
 separation: `cargo install feather-reader` builds no websocket code, links no
@@ -618,8 +702,10 @@ should be a different repo.
 
 ## 7. Capability 3 — social discovery via `app.bsky.graph.follow`
 
-**Recommendation: do not build this. Not in the 0.3.x line, and not until the
-gate in §7.3 is met.**
+**Recommendation: do not build this. Not in the 0.3.x or 0.4.x lines, and not
+until the gate in §7.3 is met.**
+
+> **Not built.**
 
 The idea is genuinely the one thing a conventional RSS reader structurally
 cannot do: join `community.lexicon.rss.subscription` against the Bluesky social
@@ -661,6 +747,12 @@ tuned, or even meaningfully tested until Capability 2 has been running long
 enough for N to be non-trivial. Building it now is building against a fixture.
 
 ### 7.2 Privacy and the consent model
+
+> **Not built.** No `/network/opt-out` route, `net_optout` table or attribution
+> opt-in exists, and this instance indexes no one's subscription records, so
+> there is nothing to opt out of. Everything below is the consent model
+> Capability 2 must ship *before* any indexing. It is not a description of
+> current behaviour.
 
 This section is binding on Capability 2 as well, and it is the part of this spec
 most likely to be got wrong by being reasonable about it.
@@ -719,6 +811,9 @@ becomes false the moment `net_subscription` has rows. A new section, in the
 existing plain-language voice, must be added between "What this server does
 hold" and "Network and logs" — draft copy:
 
+**Draft copy — do not publish until §5 and the opt-out route ship.** The live
+`templates/privacy.html` correctly has no such section today.
+
 > ### Public records from the wider network
 >
 > `community.lexicon.rss.subscription` records are public: anyone on the atproto
@@ -739,10 +834,11 @@ And the "What this server does hold" list gains one bullet for the projection.
 
 **A discoverability problem the opt-out inherits.** `/privacy` and `/terms` are
 linked only from `templates/footer.html`, which is `{% include %}`d by
-`about.html`, `index.html`, `manage.html`, `entry.html`, `privacy.html` and
-`terms.html` — but **not** by `landing.html` (the signed-out `/`) or
-`login.html`. So the two legal pages are unreachable by link from the signed-out
-entry surfaces. Since the opt-out is explicitly for people who have **no account
+`about.html`, `index.html`, `manage.html`, `entry.html`, `privacy.html`,
+`terms.html`, `standard_site.html` and `stats.html` — but **not** by
+`landing.html` (the signed-out `/`) or `login.html`. So the two legal pages are
+not linked from the signed-out entry surfaces; from `landing.html` they are two
+clicks away, through its `/about` link. (Still true as of v0.4.4.) Since the opt-out is explicitly for people who have **no account
 here** (D7), shipping it behind a link that only logged-in users can find would
 make the consent model theatre. `landing.html` must gain the footer include (or
 at minimum the `/privacy` link) in the same release as the first indexing. This
@@ -799,28 +895,43 @@ resolved `serviceEndpoint` before returning it. Reuse all of it — this spec ad
 no new fetch primitive.
 
 But backfill (§5.4) changes the threat model in a way worth stating explicitly.
-Today the only PDS hosts FeatherReader talks to are those of accounts that
-successfully logged in. Backfill talks to the PDS of **any DID the relay names**
+At v0.2.7 the only PDS hosts FeatherReader talked to were those of accounts that
+successfully logged in.
+
+> Since v0.4.0 that is no longer so. The standard.site publication poller
+> resolves any publisher DID a subscriber names and reads that PDS
+> unauthenticated, through `resolve_did_to_pds` and `PdsClient::anonymous`
+> (guarded; `src/standard_site.rs`). Backfill would widen this from "a host
+> named by one of our subscribers" to "a host named by the relay".
+
+Backfill talks to the PDS of **any DID the relay names**
 — i.e. a host chosen by an adversary who need only publish one
 `community.lexicon.rss.subscription` record to get us to fetch their endpoint.
 
-Two consequences:
+Two consequences (both resolved in v0.2.8, PR #83; the reasoning is kept as
+history):
 
-1. **`PdsClient::list_records` bypasses the guard.** It sends via
+1. **`PdsClient::list_records` bypasses the guard.** *Fixed in v0.2.8:*
+   `list_records`, the record writes and `apply_writes` all go through the
+   guard now, and the guard drops `Authorization` if a redirect leaves the
+   PDS's origin (`src/atproto.rs`, `src/net.rs`). At v0.2.7 it sent via
    `self.http.get(&url)` on the shared client, not through
-   `guarded_get_no_privacy`. That is *currently* safe because `pds_base` was
+   `guarded_get_no_privacy`. That was safe at the time because `pds_base` was
    vetted by `assert_public_target` at resolve time — but that vetting is a
    separate DNS resolution from the fetch, which is exactly the rebinding window
    `net.rs` was written to close for feeds. Any backfill path **must** route
    through `net::guarded_get_no_privacy` (D8). Retrofitting the existing
-   `PdsClient` methods is the cleaner fix and is scheduled in §10.
-2. **`Auth` has no unauthenticated variant.** `atproto::Auth` is
-   `Session(SessionAuth) | Oauth(OauthPlaceholder)`, and `PdsClient` requires
+   `PdsClient` methods was the cleaner fix, and is what PR #83 did.
+2. **`Auth` has no unauthenticated variant.** *Done in v0.2.8:*
+   `Auth::Anonymous`, built with `PdsClient::anonymous`. Its `bearer()` errors,
+   so every write fails closed, and `list_records` sends no `Authorization`
+   header. At v0.2.7 `atproto::Auth` was
+   `Session(SessionAuth) | Oauth(OauthPlaceholder)`, and `PdsClient` required
    one. Public reads of a stranger's repo need neither. The enum's own doc
-   anticipates this ("so the match stays exhaustive if a second direct-auth
-   mechanism is added"); add `Auth::Anonymous`, whose `bearer()` returns an
-   error and which causes `list_records` to omit the `Authorization` header
-   entirely.
+   anticipated this ("so the match stays exhaustive if a second direct-auth
+   mechanism is added"); the plan was to add `Auth::Anonymous`, whose `bearer()`
+   returns an error and which causes `list_records` to omit the `Authorization`
+   header entirely.
 
 Additional rules for the network paths:
 
@@ -877,9 +988,13 @@ on churn risk.
 directly over reqwest … Talking raw XRPC — rather than pulling a heavy client
 SDK — keeps the dependency/audit surface small."* Everything in this spec is
 either a plain GET with query parameters (`listReposByCollection`,
-`listRecords`) or a JSON websocket. Neither needs an SDK. The one exception in
-the repo — `@atproto/oauth-client-node` in the sidecar — exists because
-DPoP/PAR/token-refresh is genuinely too subtle to hand-roll. Nothing here is.
+`listRecords`) or a JSON websocket. Neither needs an SDK. When this was written
+the one exception in the repo was `@atproto/oauth-client-node` in the sidecar,
+on the grounds that DPoP/PAR/token-refresh was too subtle to hand-roll. Since
+v0.3.0 (PR #101) the OAuth client is built into the Rust app
+([`src/oauth/`](../src/oauth/)), and it has been the production backend since
+v0.3.3 (PR #110); the sidecar is optional. If even OAuth did not need an SDK,
+nothing here does.
 
 ### 9.4 A `/metrics` endpoint — rejected
 
@@ -906,6 +1021,15 @@ watermark, one prune order (§5.3).
 ## 10. Testing, CI, and the release train
 
 ### 10.1 What the release train actually is
+
+> **Superseded since 0.4.0.** A tag no longer fires two workflows side by
+> side: `release-image.yml` builds the image once, runs the upgrade-boot gate,
+> pushes and attests that image, then dispatches `release-crate.yml` (PR #223,
+> PR #233). `:latest` is emitted for every non-prerelease tag, not only the
+> highest, so step 4's "`latest=auto` preventing a hotfix … repointing
+> `:latest` backward" is also untrue. Release branches are now named
+> `chore/release-X.Y.Z` (e.g. PR #255). Current pipeline: the README's
+> [Releasing](../README.md#releasing) section.
 
 Recorded here because the implementation plan must target the real mechanism,
 not the assumed one:
@@ -940,12 +1064,19 @@ and §5.5 (the reader must not notice).
 
 ### 10.2 Testing strategy
 
-**Unit (in-module `#[cfg(test)]`, matching the repo's convention — there is no
-`tests/` directory today and 190+ unit tests live beside their code):**
+> **Status:** the two Capability 1 bullets (`network` relay parsing and
+> pagination, and `net` anonymous `list_records`) are **built**, in
+> `src/network.rs` and `src/atproto.rs`. Everything else in §10.2 (Jetstream,
+> `net_*` store, network-page web tests, both integration items, and the CI
+> changes) is **not built**.
+
+**Unit (in-module `#[cfg(test)]`, matching the repo's convention — as of v0.2.7
+there was no `tests/` directory and 190+ unit tests lived beside their code; as
+of v0.4.4 `tests/` holds only fixtures and `src/` has about 1,100 tests):**
 
 - `network`: relay response parsing; pagination termination on absent cursor
   **and** on an empty page with a cursor present (the `list_all_records` guard);
-  page-cap → `truncated`; `Retry-After` handling.
+  page-cap → `truncated`; `Retry-After` handling. *(Built.)*
 - `network`: Jetstream frame parsing over fixtures — `commit` create / update /
   delete, plus `identity` and `account` frames which must be ignored without
   error; unknown fields must not fail deserialisation (forward compatibility,
@@ -959,7 +1090,7 @@ and §5.5 (the reader must not notice).
   `is_rate_limited_path`; `/` and `/manage` render identically with the network
   tables full and empty (the D6 assertion).
 - `net`: existing guard tests extended to cover the anonymous `list_records`
-  path.
+  path. *(Built: `list_records_blocks_internal_pds_base` in `src/atproto.rs`.)*
 
 **Integration:**
 
@@ -986,14 +1117,22 @@ and §5.5 (the reader must not notice).
 
 All new knobs follow the existing `FEATHERREADER_*` convention and default to
 the least-surprising value. Defaults are chosen so that **an unmodified
-self-hosted instance behaves exactly as it does today**, except for one
-unauthenticated GET per day.
+self-hosted instance behaves exactly as it did at v0.2.7**, except for the
+adoption probe: one paged, unauthenticated walk per configured relay (two by
+default) per day, plus one about five minutes after each boot.
+
+**Shipped (v0.2.8, PR #83)** — read by [`src/config.rs`](../src/config.rs):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FEATHERREADER_RELAY_HOSTS` | `relay1.us-west.bsky.network,relay1.us-east.bsky.network` | Relays queried for the adoption count. |
+| `FEATHERREADER_RELAY_HOSTS` | `relay1.us-west.bsky.network,relay1.us-east.bsky.network` | Relays queried for the adoption count. Set to the empty string to name no relays, which disables the probe. |
 | `FEATHERREADER_ADOPTION_INTERVAL_SECS` | `86400` | Adoption probe cadence (±10% jitter). `0` disables. |
 | `FEATHERREADER_SHOW_ADOPTION` | `false` | Render the adoption line on `/about`. |
+
+**Proposed — not built, not read by the code:**
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `FEATHERREADER_PORTABILITY_DID` | the known test DID | Subject of the nightly portability test. |
 | `FEATHERREADER_NETWORK_INDEX` | `false` | Master switch: run backfill + Jetstream at all. |
 | `FEATHERREADER_JETSTREAM_HOSTS` | `jetstream.us-east.bsky.network` | Jetstream endpoints, tried in order. |
@@ -1030,6 +1169,10 @@ every background task including these.
    has canonicalisation logic in `feed.rs`; reusing it for the projection is
    probably right, but it changes the primary key semantics of
    `net_feed_rollup` and needs a decision before the first rollup is built.
+   Since v0.4.0 a subscription's `url` can also be a DID-form `at://` URI naming
+   a `site.standard.publication` (`publication_url_from_paste` in
+   `src/web.rs`). The projection, rollup and `net::safe_link` rendering must
+   decide how to treat those too.
 5. **Should the network projection respect private-feed classification?** If a
    stranger writes a secret-bearing URL into their public subscription record
    (which FeatherReader refuses to do but another implementation might not), we

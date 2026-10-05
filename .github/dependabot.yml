@@ -41,12 +41,13 @@ updates:
       actions-minor-patch:
         update-types: [minor, patch]
 
-  # --- Docker (deploy/) ----------------------------------------------------
-  # ENABLE ONCE a Dockerfile lands under deploy/ (there is only teardown.sh
-  # today). Uncomment and point `directory` at the Dockerfile's dir. Left in as
-  # a documented placeholder so the wiring is one uncomment away.
+  # --- Docker ---------------------------------------------------------------
+  # NOT ENABLED. The Dockerfile is at the repo root (directory "/"), and its
+  # base images (rust, node, caddy) are pinned by digest and bumped by hand;
+  # ci.yml's Caddyfile job validates against the caddy digest the Dockerfile
+  # pins. Left in as a placeholder so the wiring is one uncomment away.
   # - package-ecosystem: docker
-  #   directory: "/deploy"
+  #   directory: "/"
   #   schedule:
   #     interval: weekly
   #   open-pull-requests-limit: 3

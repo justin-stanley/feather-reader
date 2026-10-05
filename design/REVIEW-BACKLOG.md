@@ -1,5 +1,19 @@
 # Review backlog — the findings not yet fixed
 
+> **Status (audited 2026-10-05): 15 of the 16 tier items are done**, all shipped
+> in PR #101 (v0.3.0, squash commit `d7d97bf`). The shas cited below (`ba9951a`,
+> `1cfae77`, `1831bba`, `75f1c53`, `5f0b2c1`, `d67e7b9`) are pre-squash commits on
+> `feat/rust-oauth-phase1` and are not on `main`. **Three items are still open:**
+> T4.6 (capacity, issue #263), and both structural fixes in "The structural theme" (an
+> `upsert_feed` newtype, issue #260, and inverting `is_rate_limited_path`, issue #261). The full container
+> now runs in production. The live `private_key_jwt` and revocation checks have
+> no recorded evidence (issue #262).
+>
+> T4.6 calls the capacity work "0.4.0 work"; that was the plan at the time.
+> 0.4.0 shipped as standard.site support
+> ([`STANDARD-SITE-0.4.0.md`](STANDARD-SITE-0.4.0.md)), and T4.6 is still open
+> (`FEATHERREADER_MAX_FEEDS` still defaults to 10,000).
+
 Source: three independent reviewers (security SME, regression, operator) over
 `feat/rust-oauth-phase1` at `af2c4df`, plus leftovers from the preceding round.
 The blockers from that sweep are fixed in `d67e7b9`. This file is what remains.
@@ -29,12 +43,14 @@ having written down next to the tiers that are still open.
 
 ### T1.1 The list queries are unbounded and select the article body — FIXED
 
-`get_unread_for_did` (`store.rs:1571`), `get_starred_for_did` (`:1593`) and
-`entries_for_feed` (`:1210`) all do `SELECT e.*` with **no `LIMIT`**. Verified:
+> Done in PR #101 (pre-squash `1cfae77`): `store::list_entries` takes `limit`/`offset` over the body-free `EntryListRow`.
+
+`get_unread_for_did`, `get_starred_for_did` and `entries_for_feed` in `store.rs`
+(now test-only wrappers over `list_entries`) all did `SELECT e.*` with **no `LIMIT`**. Verified:
 zero `LIMIT` tokens across all three. `e.*` includes `content_html`, which is
 essentially all of the measured 11.9 KB/entry.
 
-`EntryRow` (`web.rs:760`) is `{id, title, feed_title, published, read, starred,
+`EntryRow` in `web.rs` is `{id, title, feed_title, published, read, starred,
 link, cached}` — **it never reads the body**. So the body is loaded, allocated,
 and then dropped, on every page load. `GET /` calls the first two and then
 `.cloned()`s the filtered result, a second full copy. `?view=all` loops every
@@ -71,7 +87,9 @@ keeps `SELECT e.*`, which is what it is for.
 
 ### T1.2 `fly.toml` does not list the secret that gates the cutover — FIXED
 
-`config.rs:629-640` refuses to boot when `FEATHERREADER_REPO_BACKEND=rust` on a
+> Done in PR #101 (pre-squash `ba9951a`): see the REQUIRED and BACKEND CUTOVER blocks in `fly.toml`.
+
+`Config::from_env` in `config.rs` refuses to boot when `FEATHERREADER_REPO_BACKEND=rust` on a
 prod-like instance without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`. Verified:
 `fly.toml` (107 lines) never mentions that variable, in either its REQUIRED or
 OPTIONAL SECRETS block.
@@ -92,6 +110,8 @@ flip and their order, and `FEATHERREADER_REPO_BACKEND` now spelled out in `[env]
 at its existing default so the live backend is visible in the file.
 
 ### T1.3 `retention_days = 0` disables the hard ceiling too — FIXED
+
+> Done in PR #101 (pre-squash `ba9951a`): pinned by `a_disabled_window_does_not_disable_the_ceiling`.
 
 `prune_old_entries` returns on `days <= 0` **before** the ceiling is computed
 (verified at `store.rs`), and `run_retention_sweeper` returns before starting a
@@ -122,6 +142,8 @@ confirming `a_disabled_window_does_not_disable_the_ceiling` fails against it.
 ## Tier 2 — availability, fast follow — **DONE**
 
 ### T2.1 A process-killing feed is a permanent crash loop — FIXED
+
+> Done in PR #101 (pre-squash `1831bba`): `next_poll` is leased before the fetch, and every loop has a startup offset.
 
 Nothing is written to the feed row *before* the fetch: `bump_feed_errors` and
 `set_next_poll` both run only after `poll_feed` returns. `due_feeds` orders by
@@ -159,6 +181,8 @@ stay reproducible in a test.
 
 ### T2.2 The retention sweep holds the single write lock too long — FIXED
 
+> Done in PR #101 (pre-squash `1831bba`): `store::delete_in_batches`, with a hand-off between batches.
+
 `prune_old_entries` opens one transaction and calls `prune_orphan_cursor_ids_tx`,
 which loads every `read_cursor` row and then issues a fresh per-cursor `SELECT
 … JOIN … WHERE f.url = ?` returning up to `max_entries_per_feed` ids — all
@@ -183,7 +207,9 @@ would have landed — each having waited for the entire sweep.
 
 ### T2.3 `reclaim()` runs a full `VACUUM`, and always will — FIXED
 
-`store.rs:731-741` uses `PRAGMA incremental_vacuum` only when `PRAGMA
+> Done in PR #101 (pre-squash `75f1c53`): INCREMENTAL at creation, `--migrate-auto-vacuum`, `journal_size_limit`.
+
+`store::reclaim` used `PRAGMA incremental_vacuum` only when `PRAGMA
 auto_vacuum == 2`. Verified: `auto_vacuum` is **read** there and **never set**
 anywhere in the tree, so SQLite's default (NONE = 0) applies and the
 full-`VACUUM` branch is the one that actually runs — daily, and after a prune.
@@ -222,6 +248,8 @@ too — the only space it can return at all in NONE mode.
 
 ### T2.4 The rate-limit map is unbounded with O(n) eviction per request — FIXED
 
+> Done in PR #101 (pre-squash `1831bba`): `MAX_RATE_BUCKETS` with LRU eviction in `web.rs`.
+
 `web.rs` keeps `HashMap<IpAddr, Bucket>` with a 1-hour idle eviction and **no
 size cap**, and calls `map.retain(…)` across the whole map on every guarded
 request. Contrast `MAX_PINNED_CLIENTS = 256` in `net.rs`, where the same author
@@ -240,6 +268,8 @@ millisecond clock step let the token REFILL hand back a token and masquerade as
 an eviction bypass; it steps in nanoseconds now.
 
 ### T2.5 Pinned clients have unbounded idle connection pools — FIXED
+
+> Done in PR #101 (pre-squash `1831bba`): `pool_max_idle_per_host` and `pool_idle_timeout` in `net.rs`.
 
 `build_pinned_client` sets neither `pool_max_idle_per_host` nor
 `pool_idle_timeout` (verified: neither appears in `net.rs`). With up to 256
@@ -263,6 +293,8 @@ produce no operator-facing signal, so every degraded-but-running state presents
 as a green machine.
 
 ### T3.1 `/health` proves only that the process is alive — FIXED
+
+> Done in PR #101 (pre-squash `5f0b2c1`): `web::health` with the `HEALTH_DB_PROBE_SQL` probe.
 
 It returns a constant string, touching no DB, no pool and no scheduler state —
 and it is the only automated signal in `fly.toml`. The supervisor's only other
@@ -293,6 +325,8 @@ explicitly BOUNDS what the body may contain, which is why the measured database
 size was dropped from it.
 
 ### T3.2 Nothing surfaces the two states that stop polling — FIXED
+
+> Done in PR #101 (pre-squash `5f0b2c1`): the backoff count and the Fetching row on `/stats`.
 
 `feeds.consecutive_errors` is written and read by nothing outside the backoff
 calculation — it appears on no page and no endpoint. The watermark pause emits a
@@ -328,6 +362,8 @@ runtime built — reachable with `curl` at exactly the moment the session-gated
 
 ### T4.1 `starred` is scoped by subscription, so the unsave desync survives — FIXED
 
+> Done in PR #101: `unsave_record` clears the local star (`store::clear_star_by_identity`). The render path is still `sub_ref`-scoped on purpose; see the note below.
+
 **Done** at the DESTRUCTIVE end rather than the rendering end. `unsave_record`
 now reads the record's identity before deleting it and clears any local star for
 the same article (`store::clear_star_by_identity`, which deliberately omits the
@@ -340,10 +376,11 @@ article in a feed you no longer follow genuinely is "held by the PDS record, not
 by any feed you read" — that rendering is correct, and what needed fixing was
 that removing it only removed half of it.
 
-**Still open after T1.1** — the identity lookup moved to
+**Note after T1.1 (not an open item).** The identity lookup moved to
 `store::starred_identities`, but it shares `list_query_sql`, which carries the
 same `sub_ref` predicate. Unchanged in substance; only the function name below
-is now stale.
+is now stale. The predicate is deliberate (see above); the desync it caused
+is closed at the unsave end, which is why this entry is FIXED.
 
 `get_starred_for_did` requires `EXISTS (SELECT 1 FROM sub_ref …)`. An entry that
 is cached *and* starred, in a feed the reader has since unsubscribed from, is
@@ -354,6 +391,8 @@ narrowed this case rather than closing it, and its comment ("match against ALL
 cached starred entries") is inaccurate as written.
 
 ### T4.2 The `safe_link` skip is silent and in the wrong order — FIXED
+
+> Done in PR #101: the row renders with an "unusable link" badge instead of vanishing.
 
 **Done**, with one correction to the finding. The ordering was not exploitable:
 the nudge keys on `feed_url`, not on the `item.url` being rejected, and is
@@ -376,6 +415,8 @@ anchor rather than dropping it, so it stays unsave-able.
 
 ### T4.3 Server-controlled `error_description` is logged verbatim — FIXED
 
+> Done in PR #101: the log and page carry only a `known_error_slug` and the description's length.
+
 **Done**, and the finding understated it: the raw `error` also went into the
 RENDERED login page (`login_error(&format!("Login failed: {err}"))`), so an
 attacker who could make a browser fetch the callback chose copy shown in the
@@ -383,7 +424,8 @@ product's own voice. `known_error_slug` is now `pub(crate)` and both the log and
 the page carry only a `&'static str` from the fixed list; the description is
 dropped, keeping only its length.
 
-`web.rs:2839` logs it at `warn!`. `oauth/flow.rs:186-199` deliberately reduces
+The OAuth callback handler in `web.rs` logged it at `warn!`. `oauth/flow.rs`'s
+`known_error_slug` deliberately reduces
 the callback `error` to a known slug and drops the description for precisely
 this reason; the older arm in `web.rs` never got the same treatment.
 Attacker-controlled free text, including newlines, into the log stream.
@@ -391,6 +433,8 @@ Attacker-controlled free text, including newlines, into the log stream.
 **Fix.** Apply the same reduction `flow.rs` already implements.
 
 ### T4.4 Six swallowed errors that change what the user sees — FIXED
+
+> Done in PR #101.
 
 **Done.** Three now log with context (both `upsert_feed` sites, the
 `feeds_for_did` sidebar fallback), and three stopped reporting success for work
@@ -407,7 +451,7 @@ asserts the property it was actually written for (not refused by the feed cap).
 
 `unwrap_or_default()` / `let _ =` on paths where failure is silent and
 user-visible. Two are literal support tickets: `let _ = store::upsert_feed(…)`
-(verified at `web.rs:1219`, `:2411`, `:3956`) means a subscription can exist in
+(verified at three call sites in `web.rs`) means a subscription can exist in
 the PDS and never be polled — "I added a feed and it never updates" — and
 `feeds_for_did(…).unwrap_or_default()` renders an empty sidebar on a DB error:
 "all my feeds vanished". Also: a failed PDS `update_subscription` is a `warn!`
@@ -418,6 +462,8 @@ reported to the user as "No feeds found in that OPML".
 for work that did not happen.
 
 ### T4.5 Read-state above 1000 ids per feed is silently discarded — FIXED
+
+> Done in PR #101: `store::compact_cursor`.
 
 **Done** as the finding prescribed: `store::compact_cursor` computes the
 water-mark `read_through` always lacked. The rule is that it may only advance to
@@ -444,6 +490,8 @@ cap"; against a 2000-entry per-feed ceiling that does not hold.
 to a high-water mark and drop the ids below it. That is what the field is for.
 
 ### T4.6 Capacity constants do not match the machine
+
+> Still open (audited 2026-10-05): `max_feeds_global` defaults to 10,000, the poll batch to 50 per tick, and the watermark is 768 MiB. Tracked in issue #263.
 
 `max_feeds_global = 10_000` against a poller that manages 50 feeds per 60 s tick
 = **3,000 feeds/hour** at `poll_interval = 3600 s`. The global ceiling is 3.3×
@@ -494,10 +542,17 @@ remaining two are worth doing for the same reason:
   `classify_feed_privacy` + a URL check can mint. Two of its three non-test
   callers were fixed in `d67e7b9` by adding checks; the trap itself is still
   there for caller four.
+
+  > Still open (audited 2026-10-05): `upsert_feed` takes `&NewFeed`, a struct
+  > with all-public fields, and has eight non-test call sites (`web.rs` four,
+  > `feed.rs` two, `store.rs` and `standard_site.rs` one each). Tracked in issue #260.
 - **`is_rate_limited_path` should invert** into a per-route opt-out declared at
   the router, so adding a route forces a decision instead of defaulting to
   unguarded. Its current test asserts coverage only for routes already in the
   list, which is why two misses sat there undetected.
+
+  > Still open (audited 2026-10-05): `is_rate_limited_path` is still a
+  > hand-maintained allowlist in `web.rs`. Tracked in issue #261.
 
 Without these, expect a sixth instance. That prediction is the reviewer's, and
 on the evidence it is a good one.
@@ -507,5 +562,9 @@ on the evidence it is a good one.
 ## Still unverified for 0.3.0 (not code — validation)
 
 - `private_key_jwt` against production.
+  > Unverified (audited 2026-10-05): prod has used the rust backend since PR #110,
+  > but no captured `client_assertion_type` is recorded anywhere.
 - Revocation against a live PDS.
+  > Unverified: no recorded revocation-endpoint response.
 - The full container has never been started.
+  > Done: the container has run in production since v0.3.0.

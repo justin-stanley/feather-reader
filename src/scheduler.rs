@@ -1,10 +1,14 @@
-//! Background schedulers — the **poll scheduler** and the **read-state flusher**.
+//! Background schedulers — the **poll schedulers**, the **read-state flusher**,
+//! and the sweeps and probe that ride alongside them.
 //!
-//! These are the two long-lived `tokio` tasks that turn FeatherReader from a
-//! request/response web app into a live reader. Both are spawned from `main`
-//! after the [`AppState`] is built, behind a config flag so tests and local
-//! dev can disable them, and both are **graceful-shutdown-aware**: they select
-//! on a shutdown signal and drain before returning.
+//! These are the long-lived `tokio` tasks that turn FeatherReader from a
+//! request/response web app into a live reader: eight in all — the six
+//! offset-bearing loops in `Loop::ALL` (RSS poller, publication poller, three
+//! sweepers, adoption probe) plus the read-state flusher and the metrics
+//! flusher. All are spawned from `main` after the [`AppState`] is built, behind
+//! a config flag so tests and local dev can disable them, and all are
+//! **graceful-shutdown-aware**: they select on a shutdown signal and drain
+//! before returning.
 //!
 //! ## Poll scheduler ([`run_poller`])
 //!
@@ -118,7 +122,7 @@ const ADOPTION_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
 ///
 /// The values are deliberately DISTINCT rather than jittered. There is exactly
 /// one machine, so there is no fleet to de-synchronise; what matters is that the
-/// four loops do not land together, and fixed offsets give that property while
+/// loops do not land together, and fixed offsets give that property while
 /// staying reproducible in a test. They are also short enough to be irrelevant
 /// to an hourly poller and a daily sweep.
 ///
@@ -1100,10 +1104,12 @@ pub async fn run_retention_sweeper(
 ///
 /// Two kill switches: `FEATHERREADER_ADOPTION_INTERVAL_SECS=0` (or an empty
 /// `FEATHERREADER_RELAY_HOSTS`) stops just this loop, and the pre-existing
-/// `FEATHERREADER_DISABLE_SCHEDULER` stops it with the other four.
+/// `FEATHERREADER_DISABLE_SCHEDULER` stops it with every other background task
+/// (the five other offset loops in [`Loop::ALL`], the read-state flusher and the
+/// metrics flusher).
 ///
-/// It deviates from its four siblings in exactly one way: `interval_at` with an
-/// [`ADOPTION_STARTUP_DELAY`] instead of an immediate first tick, because this
+/// It deviates from the other offset loops in exactly one way: `interval_at` with
+/// an [`ADOPTION_STARTUP_DELAY`] (5 min) instead of a seconds-scale offset, because this
 /// tick is a request to a third party and the container supervisor turns "once
 /// per boot" into "once per crash-loop restart". Nothing it does can fail the
 /// process: every error path is a `warn!` that leaves the previous observation
@@ -1119,7 +1125,7 @@ pub async fn run_adoption_probe(
         return;
     }
     // Rejected entries are surfaced HERE rather than at parse time: config is
-    // read before `init_tracing` (main.rs:38 vs :41), so a warning emitted during
+    // read before `init_tracing` (steps 1 and 2 in `main`), so a warning emitted during
     // parsing would go nowhere. Warn whether or not any usable host survived —
     // a typo the operator never hears about is the failure mode this replaced a
     // boot abort with, and it must not be silent as well as non-fatal.

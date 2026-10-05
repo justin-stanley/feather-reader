@@ -170,7 +170,9 @@ Subscriptions, folders and stars are written to your PDS as you act. Read
 state is debounced: marking articles read sets a local dirty bit, and the
 flusher coalesces each DID's dirty per-feed cursors into **one**
 `com.atproto.repo.applyWrites` batch about once a minute — and once more on
-shutdown and on sign-out, so nothing is stranded. On every page load the app
+shutdown and on sign-out, so nothing is stranded. A batch past the PDS's
+per-call limits is sent as several calls of at most 200 writes and 128 KiB
+each, and a flush that fails part-way keeps what landed. On every page load the app
 lists your subscription records and mirrors the result into `sub_ref`, which is
 the per-user isolation boundary: every cached-entry read and every read/star
 mutation is scoped through it. If your PDS cannot be reached, the page falls
@@ -240,15 +242,16 @@ npm run build
   [`src/config.rs`](src/config.rs) is the complete, authoritative list**, with
   defaults and meanings; the ones you will set first are below.
 - The **sidecar** reads `SIDECAR_*` variables — see
-  [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). Not used on the
-  `rust` backend.
+  [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). On the `rust`
+  backend the sidecar is not run, but the server still requires
+  `SIDECAR_INTERNAL_SECRET` (≥32 bytes) on a production-like instance.
 
 | Variable | Default | What it does |
 |---|---|---|
 | `FEATHERREADER_BIND` | `127.0.0.1:8080` | `host:port` the HTTP server binds. |
 | `FEATHERREADER_DB` | `featherreader.db` | Path to the SQLite cache. Put it on persistent storage. |
 | `FEATHERREADER_PUBLIC_URL` | `http://localhost:8080` | The public origin. Used for the OAuth callback and client metadata, and for the absolute URLs in link cards. |
-| `FEATHERREADER_COOKIE_SECRET` | *(dev fallback)* | HMAC key for the session cookie. Required, and at least 32 bytes, on a non-loopback instance. |
+| `FEATHERREADER_COOKIE_SECRET` | *(dev fallback)* | HMAC key for the session cookie. Required, and at least 32 bytes, on a production-like instance (non-loopback bind or public URL, or `FEATHERREADER_ENV=prod`). |
 | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)* | Login allow-list of DIDs. Also the admin seed for the invite gate: these DIDs get a beta seat and can mint invite codes. |
 | `FEATHERREADER_REPO_BACKEND` | `sidecar` | `sidecar` or `rust`. Which implementation owns `/oauth/*` and `com.atproto.repo.*`. An unrecognised value fails startup. |
 | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for OAuth sessions and the signing key on the `rust` backend. Generate it: `openssl rand -hex 32`. Required there on a production-like instance. |
@@ -258,7 +261,8 @@ npm run build
 | `FEATHERREADER_TRUSTED_IP_HEADER` | *(unset)* | The reverse-proxy header to trust for the client IP (`CF-Connecting-IP`, `Fly-Client-IP`). Only safe when every request provably transits that proxy. |
 | `FEATHERREADER_DB_SIZE_WATERMARK_BYTES` | 2 GiB | Above this the pollers stop fetching. Set it below your volume size; startup warns if it cannot protect the disk. |
 
-On a non-loopback bind the server **refuses to start** with missing or weak
+On a production-like instance (non-loopback bind or public URL, or
+`FEATHERREADER_ENV=prod`) the server **refuses to start** with missing or weak
 production secrets rather than running with the published dev defaults.
 
 ### Choosing an OAuth backend
@@ -271,12 +275,12 @@ OAuth handshake and every `com.atproto.repo.*` call:
 | Processes | Rust server + Node sidecar | Rust server only |
 | OAuth client | `@atproto/oauth-client-node` | built in |
 | Runtime deps | Node.js | none |
-| Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` |
+| Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY`, plus `SIDECAR_INTERNAL_SECRET` in production |
 
 The default stays `sidecar` so an existing deployment keeps its topology until
 you choose otherwise. **The hosted instance has run `rust` since the 2026-09-13
 cutover** ([`fly.toml`](fly.toml) sets it explicitly), and a measured latency
-comparison of the two is in the [CHANGELOG](CHANGELOG.md) (0.3.7). The intent
+comparison of the two is in the [0.3.7 README](https://github.com/justin-stanley/feather-reader/blob/v0.3.7/README.md#choosing-an-oauth-backend). The intent
 is to remove the sidecar in a later release once the Rust path has enough
 production time; `sidecar` will be announced as deprecated before it is removed.
 
@@ -298,7 +302,8 @@ What switching costs, in either direction:
 ### The container image
 
 `ghcr.io/justin-stanley/feather-reader` is the image the hosted instance runs:
-Caddy + the Rust app + the Node sidecar under tini, non-root, with the Rust app
+Caddy + the Rust app (+ the Node sidecar, started only on
+`FEATHERREADER_REPO_BACKEND=sidecar`) under tini, non-root, with the Rust app
 on `127.0.0.1:8082` and Caddy on `:8080` as the only public listener. Build it
 yourself with `docker build -t feather-reader .`. Two things to know before
 running it:
@@ -345,7 +350,7 @@ cargo audit -D warnings                   # RustSec, unmaintained advisories inc
 cd oauth-sidecar && npm ci && npm run build && npm run typecheck && npm test \
   && npm run lint && npm run format:check && npm audit --omit=dev --audit-level=high
 
-# Invite bot (its own workspace): the same Rust and supply-chain gates, run in bot/
+# Invite bot (its own workspace): build/test/clippy/fmt plus cargo deny + cargo audit, run in bot/
 ```
 
 Two more jobs: **gitleaks** scans the tree and the full history with
@@ -401,6 +406,7 @@ which can be a yanked one. The upgrade-boot script needs only Docker and runs
 locally too:
 
 ```sh
+docker build -t feather-reader:candidate .
 ./scripts/upgrade-boot.sh ghcr.io/justin-stanley/feather-reader:"$(cat deploy/upgrade-from)" feather-reader:candidate
 ```
 

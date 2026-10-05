@@ -40,7 +40,7 @@ own and see [`bot/README.md`](bot/README.md).
 
 ## Before you open a pull request
 
-Run the full local CI — it mirrors the GitHub Actions workflow and uses zero
+Run the local CI — it covers the core of the GitHub Actions gate and uses zero
 hosted minutes:
 
 ```sh
@@ -49,7 +49,12 @@ hosted minutes:
 
 This runs `rustfmt --check`, a locked build, the Rust test suite, `clippy` with
 `-D warnings`, and the sidecar's `npm ci` + build + typecheck. **Please make sure
-it passes before pushing.** You can wire it up as a pre-push gate with:
+it passes before pushing.** CI also runs gates the script does not: rustdoc with
+`-D warnings`, `cargo deny`, `cargo audit`, the sidecar's tests, lint, format
+check and `npm audit`, the invite bot's gates, gitleaks, the Caddyfile
+validation and, for changes to the app, the upgrade-boot gate. The commands are
+in the README's [Development](README.md#development) section. You can wire the
+script up as a pre-push gate with:
 
 ```sh
 git config core.hooksPath .githooks

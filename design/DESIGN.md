@@ -4,6 +4,14 @@
 > The living prototype is in [`mockups/`](./mockups/) — real HTML + one CSS file,
 > directly liftable into the askama templates. Rendered reference images are in
 > [`screenshots/`](./screenshots/).
+>
+> **Status: implemented; checked against 0.4.4 (2026-10-05).** The `:root`
+> tokens in `static/style.css` match `mockups/feather.css` exactly, and the §6
+> handoff has landed (`templates/rail.html`, `entry_actionbar.html`,
+> `manage.html`). Two things were never built: a manual theme toggle
+> (`data-theme` is always `auto`) and the two-step Find → discovered-card add
+> flow. This is the UI design system only; architecture is in
+> [`architecture/`](./architecture/) and the [README](../README.md).
 
 ---
 
@@ -22,8 +30,9 @@ scarce resource, so the interface must cost as little of it as possible.
   links, unread marks, primary buttons, focus rings, selection. The lone exception
   is **starred** (a muted gold), because "kept" deserves its own warmth.
 - **Quietly principled** — the atproto story ("your subscriptions live in *your*
-  PDS") is surfaced in copy at exactly two moments: sign-in and subscribe. It is a
-  promise, not a banner.
+  PDS") is surfaced in the app's copy at two moments: sign-in and subscribe
+  (plus the identity chip's one-line reminder, §4.1; the about and terms pages
+  explain it at length). It is a promise, not a banner.
 
 Anti-goals: dashboards, density toggles, colored feed icons, unread-count anxiety
 mechanics, decorative illustration, webfonts.
@@ -41,7 +50,8 @@ real stylesheet. No build step, no preprocessor.
 Light is the default; dark ships as a first-class equal via
 `@media (prefers-color-scheme: dark)` **and** a forced `html[data-theme="dark|light"]`
 override (for the manual toggle the product spec promises, and for deterministic
-screenshots). `color-scheme: light dark` is declared so form controls and scrollbars
+screenshots). *(The manual toggle is not built: the app always renders
+`data-theme="auto"` and follows `prefers-color-scheme`.)* `color-scheme: light dark` is declared so form controls and scrollbars
 follow.
 
 | Token | Light | Dark | Role |
@@ -189,15 +199,15 @@ Every component below exists in the mockups; class names are the spec.
   *"Nothing unread. The quiet is the point."* No confetti. Ever.
 - **Loading**: htmx-native — `.htmx-indicator` + `.spinner` (a 1em border spinner)
   inside the triggering button; `.skeleton` rows (pulsing `.bone` bars) for initial
-  list loads. htmx's `.htmx-added` gives swapped-in rows a brief accent-soft wash
+  list loads (`.skeleton` is styled but no template uses it yet). htmx's `.htmx-added` gives swapped-in rows a brief accent-soft wash
   that fades over 600ms.
 - **Flash** (`.flash`, `.flash.error`): a single quiet strip above the list,
   `role="status"` / `role="alert"`.
 - **Shortcuts overlay** (`.kbd-overlay`): scrim + card, `role="dialog"
   aria-modal`, opened with `?`, closed by Esc / scrim / button. `<kbd>` styling has
   a 2px bottom border — the only skeuomorphism in the app.
-- **keyboard.js** (~90 lines, progressive enhancement only): drawer toggle, overlay,
-  and j/k/o/m/s/A. Ignores keystrokes in form fields and with modifiers. In the
+- **keyboard.js** (~110 lines in `static/`, progressive enhancement only): drawer
+  toggle, overlay, and j/k/o/m/s/A (`Enter` works like `o`). Ignores keystrokes in form fields and with modifiers. In the
   real app, m/s/A trigger the htmx endpoints (`htmx.trigger(...)` or `.click()` on
   the row's existing controls) instead of toggling classes.
 
@@ -207,6 +217,13 @@ Every component below exists in the mockups; class names are the spec.
   (mono), a folder `<select>`, primary "Subscribe" — and the PDS note: *"Saved to
   **your PDS** as a `community.lexicon.rss.subscription` record — portable to any
   reader."* This is one of the two places the architecture speaks.
+  *As shipped, adding is one step:* the URL (or a site URL) and an optional folder
+  are posted to `/subscriptions` with a primary **Subscribe** button; discovery
+  happens server-side, and there is no Find step or discovered card
+  (`templates/manage.html`). The PDS note sits under the form. With
+  `FEATHERREADER_STANDARD_SITE` on (0.4.0), the same field also accepts a
+  standard.site publication, `at://did:plc:…/site.standard.publication/…` or the
+  handle form, which is resolved to its DID before saving.
 - **Your feeds**: folder sections (`.manage-folder`) with Rename / Delete-folder
   quiet buttons; feed rows (`.manage-row`) with title + mono URL, Rename +
   Unsubscribe (danger-on-hover quiet button; htmx `hx-delete` removes the row).
@@ -245,6 +262,10 @@ Every component below exists in the mockups; class names are the spec.
 
 ## 6. Implementer handoff — mapping onto askama + htmx
 
+*Historical: this handoff has been implemented. The templates under
+`templates/` are the source of truth; where they differ from the steps below,
+the templates win.*
+
 The mockups intentionally mirror the existing template structure
 (`base.html` / `index.html` / `entry_row.html` / `entry.html` / `login.html`):
 
@@ -255,7 +276,8 @@ The mockups intentionally mirror the existing template structure
 2. **`base.html`**: adopt the mockup shell — skip-link, `.topbar` (mobile),
    `.scrim`, `.rail` (the current sidebar content moves in here), `.content` as the
    `{% block %}` target. Keep `data-theme` on `<html>`; server renders
-   `auto|light|dark` — `feather.css` already honors it. The head inline-script in
+   `auto|light|dark` — `feather.css` already honors it. *(Shipped: the server
+   always renders `auto`; there is no per-user theme yet.)* The head inline-script in
    the mockups is screenshot plumbing; the real app sets `data-theme` server-side.
 3. **`entry_row.html`** → `.entry` markup from `list.html`: swap the current
    text "Mark read" form for the star button + unread-dot treatment; keep
@@ -269,8 +291,8 @@ The mockups intentionally mirror the existing template structure
    (`hx-post`→ discovered card) matches §4.5.
 6. **`login.html`** → `signin.html` structure; the existing OAuth copy shortens to
    the `.auth-why` paragraph.
-7. **Filters** (All/Unread/Starred) are routes (`/`, `/?filter=all`, `/starred`
-   or similar) rendering the same list template — the segmented control is links,
+7. **Filters** (All/Unread/Starred) are routes (`/` for unread, `/?view=all`,
+   `/?view=starred`) rendering the same list template — the segmented control is links,
    not client state.
 8. **Unread counts** in the rail: wrap the rail in an htmx OOB target (or
    `hx-swap-oob` on a `.feed-count` span) so mark-read swaps can update counts
@@ -287,12 +309,17 @@ content only; nothing in them is a claim about real posts.
 - `mockups/reader.html` — reader view + action bar
 - `mockups/add-feed.html` — feed management + OPML
 - `mockups/signin.html` — auth
+- `mockups/landing.html` — public landing page
 - `mockups/feather.css` — the entire design system (tokens → components)
 - `mockups/keyboard.js` — drawer + shortcuts (progressive enhancement)
 
 All pages accept `?theme=light|dark` for deterministic theming. `screenshots/`
 holds 18 rendered PNGs: the four views × {mobile 390×844, desktop 1280×900} ×
 {light, dark}, plus the empty state and the shortcuts overlay.
+
+**Link cards** (PR #238, 0.4.2): every page carries Open Graph / Twitter card
+meta (`templates/base.html`), and the share image is
+`static/social-card.png` (1200×630, from `static/social-card.svg`).
 
 Regenerate (headless Chrome; macOS clamps windows to ≥500px wide, hence the
 iframe harness for mobile):

@@ -16,5 +16,5 @@ flowchart LR
     UI -->|"local write, marks the cursor dirty"| State
     Sub -->|"listRecords on each page load, mirrored into"| Ref
     Ref -->|"scopes every entry read and mutation"| Feeds
-    State -->|"flusher: one applyWrites per DID<br/>~60 s debounce, once more at shutdown"| RS
+    State -->|"flusher: applyWrites per DID, at most 200 writes / 128 KiB a call<br/>~60 s debounce, once more at shutdown"| RS
     Other["Any other reader that speaks the lexicon"] -.->|"reads the same records"| Sub

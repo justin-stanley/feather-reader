@@ -11,9 +11,19 @@
 //! | `FEATHERREADER_DB`           | `featherreader.db`       | Path to the SQLite cache file. |
 //! | `FEATHERREADER_PUBLIC_URL`   | `http://localhost:8080`  | Externally-reachable base URL (OAuth callback + client metadata). |
 //! | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)*         | Comma-separated login allow-list of atproto DIDs. |
+//! | `FEATHERREADER_ENV`          | *(unset)*                | `prod` (or `production`) makes the instance production-like, so the secret checks apply even on a loopback bind. The container image sets `prod`. |
+//! | `FEATHERREADER_BETA_CAP`     | `100`                    | Closed-beta seat cap: how many DIDs may hold beta access at once. |
 //! | `FEATHERREADER_POLL_INTERVAL`| `3600` (1h)              | Default per-feed poll interval, in seconds. At least 1; 0 is refused at startup. |
 //! | `FEATHERREADER_PUBLICATION_READ_DEADLINE_SECS` | `30` | The longest one standard.site publication read may take before it is a failure. Under Fly's 45 s `kill_timeout`, so the read in flight at shutdown can finish. Must be at least 1. |
 //! | `FEATHERREADER_STARTUP_DELAY_SECS` | unset | Shortens every background loop's delay before its FIRST tick (30/45/60/75/90 s, and 5 min for the relay probe). A **ceiling**: a larger value changes nothing and says so in the log. For dev loops and integration runs; production wants the built-in values. Read in `scheduler.rs`, listed here because this table is where an operator looks. |
+//! | `FEATHERREADER_DISABLE_SCHEDULER` | unset | `1`/`true`/`yes`/`on` starts none of the background loops (pollers, flusher, sweeps, adoption probe). For tests and pure-web local runs. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_POLL_TICK_SECS` | `60` | How often the pollers wake to look for due feeds (the loop cadence, not the per-feed interval). Read in `scheduler.rs`; `0` or an unparsable value falls back to the default, as it does for the three `*_SECS` rows below. |
+//! | `FEATHERREADER_POLL_BATCH` | `50` | Most due RSS feeds taken per tick. At least 1. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_POLL_CONCURRENCY` | `4` | Most RSS feeds fetched at once. At least 1. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_POLL_STAGGER_MS` | `250` | Delay between launching each RSS fetch of a batch, in milliseconds. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_FLUSH_DEBOUNCE_SECS` | `60` | Read-state flush debounce: a DID's dirty cursors are sent at most once per this interval. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_CODE_SWEEP_SECS` | `3600` | How often expired invite codes are swept. Read in `scheduler.rs`. |
+//! | `FEATHERREADER_RETENTION_SWEEP_SECS` | `86400` (24h) | How often the retention sweep runs. Read in `scheduler.rs`. |
 //! | `FEATHERREADER_RETENTION_HARD_DAYS` | `180` | Absolute ceiling: entries older than this go regardless of starred/unread. The bound that keeps one reader's pins from filling a shared cache and stalling the poller. `0` removes the ceiling — the ONLY bound on pinned entries, so `0` here means the cache is unbounded. Must be STRICTLY GREATER than the window below, or `0`: a ceiling inside the window would delete the rows the window spares, so it cannot be applied, and startup REFUSES the pair rather than silently running unbounded. |
 //! | `FEATHERREADER_RETENTION_DAYS`| `14`                    | Evict READ, UNSTARRED entries older than this. Starred and unread entries survive this window but not the hard ceiling above. `0` disables this rolling window ONLY; the ceiling still applies. Set BOTH to `0` for no eviction at all. |
 //! | `FEATHERREADER_PUBLICATION_RETENTION_DAYS` | `3650` | Absolute ceiling for entries of a kind the rolling window does not apply to — a standard.site publication. Publications are bounded by COUNT (`max_entries_per_feed`) instead of by age, because measurement says a 14-day window stores NOTHING from a real publication: the newest documents on three of them were 109 to 241 days old. This is the "not immortal" backstop, not the space bound. `0` disables it. |
@@ -378,9 +388,8 @@ impl Default for Config {
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
             // The sidecar stays the live path until the switch is thrown.
             repo_backend: crate::metrics::Backend::Sidecar,
-            // Off by default. The flag gates STORING an at:// feed; polling is
-            // excluded by scheme in `due_feeds` regardless, until the
-            // standard.site reader is wired to the scheduler.
+            // Off by default. The flag gates STORING an at:// feed; a stored
+            // publication is polled whatever it says (see `feed::FeedKind`).
             standard_site: false,
             dev_did: None,
             resolver_base: crate::atproto::DEFAULT_RESOLVER_HOST.to_string(),
@@ -901,7 +910,7 @@ fn env_opt(key: &str) -> Option<String> {
 ///
 /// This deliberately breaks the "a present-but-bad var fails loud" rule, because
 /// here that rule had a worse failure mode than the thing it was guarding:
-/// `Config::from_env` runs before `init_tracing` (`main.rs:38` vs `:41`), so a
+/// `Config::from_env` runs before `init_tracing` (steps 1 and 2 in `main`), so a
 /// hard error is an unexplained non-zero exit, and `deploy/container-entrypoint.sh`
 /// turns that into a restart loop. A typo in an **optional metric's** host list
 /// would have taken the whole reader offline. `run_adoption_probe` already

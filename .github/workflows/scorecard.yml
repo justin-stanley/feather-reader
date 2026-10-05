@@ -9,9 +9,8 @@ name: OSSF Scorecard
 # Scorecard is built for GitHub-hosted runners and is most useful on a PUBLIC
 # repo (many checks — e.g. branch-protection introspection, the public results
 # badge — assume public + a repo `read` token). It runs on `ubuntu-latest`.
-# `publish_results: true` only takes effect once the repo is public. While
-# private this consumes a small amount of Actions minutes weekly; disable the
-# schedule if that matters until the public flip.
+# The repo is public, so `publish_results: true` takes effect and the runs are
+# free.
 
 on:
   branch_protection_rule:  # re-score when branch protection changes
@@ -26,10 +25,10 @@ jobs:
   analysis:
     name: Scorecard analysis
     # Scorecard is only meaningful on a PUBLIC repo (publish + branch-protection
-    # checks). Skip while private so it neither burns Actions minutes nor fails;
-    # it auto-activates at the public flip.
+    # checks). Skipped on a private repo (e.g. a private fork) so it neither
+    # burns Actions minutes nor fails; this repo is public, so it runs here.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted; free once public
+    runs-on: ubuntu-latest  # GitHub-hosted; free for this public repo
     permissions:
       security-events: write  # upload SARIF to the Security tab
       id-token: write         # publish results to the Scorecard API (public)
@@ -45,7 +44,7 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           # Publishes to the public OSSF Scorecard API + enables the badge.
-          # No-op while private; effective once public.
+          # A no-op on a private repo; effective here.
           publish_results: true
 
       - name: Upload SARIF to code scanning

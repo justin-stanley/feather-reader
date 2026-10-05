@@ -37,9 +37,17 @@ SSRF, injection, secret handling, per-user data isolation.
 Out of scope: vulnerabilities in third-party dependencies (report those
 upstream; we track them via Dependabot, `cargo audit`, and dependency review),
 and issues that require a pre-compromised host or a self-hosted misconfiguration
-documented in the deployment guide.
+the README's [Self-hosting](README.md#self-hosting) section or `fly.toml` warns against.
 
 ## Supported versions
 
 FeatherReader is pre-1.0 and evolving; security fixes land on `main` and the
-latest published release. Please test against `main` before reporting.
+latest published release. There are no backports to older lines. Please test
+against `main` before reporting.
+
+| Version | Supported |
+|---|---|
+| 0.4.x (latest: 0.4.4) | yes — fixes ship in the next 0.4 patch release |
+| < 0.4 | no — upgrade to the latest release (0.3.9 is also yanked: it fails to start on an existing database) |
+
+Releases and what each one fixed are in [CHANGELOG.md](CHANGELOG.md).

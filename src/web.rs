@@ -11,6 +11,9 @@
 //! ## HTTP surface
 //!
 //! * `GET  /health` — liveness + version, as `text/plain`.
+//! * `GET  /about`, `/standard-site`, `/stats`, `/privacy`, `/terms` — static
+//!   and status pages.
+//! * `GET  /manage` — feed and folder management.
 //! * `GET  /` — the reader: a folders/feeds sidebar (from the PDS records layer)
 //!   plus the main article list. Query params pick the scope (`?feed=…` /
 //!   `?folder=…` / all) and the view (`?view=unread|all|starred`).
@@ -19,6 +22,7 @@
 //! * `POST /entries/{id}/read` — mark an entry read/unread (htmx row swap).
 //! * `POST /entries/{id}/star` — star/unstar; writes a
 //!   `community.lexicon.rss.saved` record to the user's PDS.
+//! * `POST /saved/{rkey}/delete` — unsave a `saved` record.
 //! * `POST /read-all` — mark-all-read (per feed via `?feed=…`, else everything).
 //! * `POST /subscriptions` — subscribe by URL (autodiscover → PDS record).
 //! * `POST /subscriptions/{rkey}/delete` — unsubscribe (delete the PDS record).
@@ -30,12 +34,18 @@
 //!   subscription records in the PDS.
 //! * `GET  /opml/export` — OPML export (records → a downloadable document).
 //! * `GET /login` + `POST /login` + `/oauth/callback` + `/logout` — the atproto
-//!   OAuth sign-in flow (routed through the sidecar).
+//!   OAuth sign-in flow, on whichever backend `FEATHERREADER_REPO_BACKEND`
+//!   selects. `GET /oauth/client-metadata.json` and `/oauth/jwks.json` publish
+//!   the Rust client's identity.
+//! * `POST /account/delete` — revoke the session and drop this DID's local state.
+//! * `GET|POST /beta/redeem` — closed-beta invite redemption.
 //! * `GET /claim?t=<token>` — the follow→invite bot's claim link: an opaque token
 //!   reserving a pre-minted invite code; behaves like a successful `/beta/redeem`
 //!   (sets the reserving cookie → `/login`).
 //! * `POST /bot/claims` — headless, shared-secret (`X-Bot-Secret`) mint of a claim
 //!   code + token/url for the bot to post. Cap-aware (409 when full).
+//! * `POST /admin/invites`, `GET /admin/metrics` — admin-only invite minting and
+//!   the backend metrics view.
 //!
 //! ## Identity — a cookie-resolved atproto session
 //!
@@ -43,9 +53,8 @@
 //! keyed by the logged-in DID, set by `oauth_callback` and read by
 //! `current_session` / `current_did`. For local runs without the sidecar,
 //! [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a fallback identity.
-//! All PDS writes route through the [`crate::atproto::SidecarClient`]; a live-PDS
-//! write needs a real OAuth session, but the full write path is built and unit-
-//! tested to the sidecar boundary.
+//! All PDS reads and writes route through [`AppState::repo`], which dispatches to
+//! the sidecar or the Rust OAuth client by `FEATHERREADER_REPO_BACKEND`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -4506,8 +4515,9 @@ const DELETE_CONFIRM_PHRASE: &str = "DELETE";
 ///   1. purges **every** local row owned by the caller DID (`entry_state`,
 ///      `read_cursor`, `sub_ref`, `beta_access` seat, and any invite codes the
 ///      DID created) via [`store::purge_did_data`], then
-///   2. calls the sidecar `POST /internal/revoke {did}` so the OAuth tokens are
-///      revoked at the PDS and the sidecar's session rows are dropped, then
+///   2. revokes the OAuth session at the PDS via `revoke_everywhere` — the
+///      sidecar's `POST /internal/revoke {did}` and, when the Rust OAuth runtime
+///      is configured, its RFC 7009 revocation too — then
 ///   3. drops the in-memory session and clears the cookie, signing the user out.
 ///
 /// The subscription/folder/saved *records* in the user's own PDS are

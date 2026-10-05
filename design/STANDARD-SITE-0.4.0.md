@@ -1,5 +1,15 @@
 # 0.4.0 — standard.site support
 
+> **Status: shipped.** Steps 0–4 were released in 0.4.0 (CHANGELOG date
+> 2026-10-03): the upgrade-boot gate (PR #223), input bounds (PR #224), polling
+> (PR #225, PR #228), the subscribe form (PR #230), display (PR #231, PR #213),
+> and the acceptance test (PR #222). Step 5, the flag on in production
+> (PR #236), merged after the 0.4.1 tag and first shipped in 0.4.2; `fly.toml`
+> sets `FEATHERREADER_STANDARD_SITE = "true"`. Known and still open: issue #226,
+> issue #227, issue #229 (see "Known, not fixed in 0.4.0" below). The plan
+> below is kept as written, with "Done" notes per step; the release notes are
+> in [`CHANGELOG.md`](../CHANGELOG.md) (0.4.0).
+
 Subscribing to `at://…/site.standard.publication/…` the way FeatherReader
 already subscribes to an RSS feed.
 
@@ -8,34 +18,35 @@ drafts that framed 0.4.0 that way (PR #158, closed) are superseded.
 
 **Every number here was measured against the 17 real publishers already
 subscribed in production on 2026-09-13, not estimated.** Where something was not
-measured, it says so. The status sections were revised against `main` and
-production on 2026-10-03, after 0.3.10.
+measured, it says so. The status sections were last revised against `main`
+on 2026-10-04, after PR #236.
 
 ---
 
-## Status, 2026-10-03
+## Status (final, 2026-10-04)
 
-**Status as of step 3: publications are read, polled, and subscribable from
-the form.** What remains is step 4 (display edge cases, #213) and step 5
-(turning the flag on in production). The status table below was written at the
-start of the work and is kept current per row.
+**All steps are done: publications are read, polled, subscribable from the
+form, and on in production.** The status table below was written at the start
+of the work and was kept current per row.
 
 | Piece | State | Where |
 |---|---|---|
 | Unauthenticated fetch, paged to an empty page, real `User-Agent` | **built** | `standard_site::fetch`, `atproto::PdsClient::anonymous` |
-| Read `textContent` / `description` only, escaped; ignore `content` | **built** | `standard_site.rs` (module doc, `entries_from_documents`) |
+| Read `textContent` / `description` only, escaped; ignore `content` | **built** | `standard_site.rs` (module doc, `entries_from_records`) |
 | Store a read, with the poll semantics review found | **built** (#202) | `standard_site::store_publication` |
 | Retention by count, not age | **built** (#206) | `FeedKind::AGED`, `Config::retention_for` |
 | Stable dates from the record key; future dates discarded | **built** (#186) | `standard_site.rs` |
 | `feeds.kind`, re-derived from the URL on every start | **built** (#184, #189), upgrade-safe since 0.3.10 (#219) | `feed::FeedKind`, `store.rs` |
-| `at://` storable, as an allowlist entry behind a flag | **built** (#183) | `feed::is_storable_feed_url(url, allow_at_uri)` |
+| `at://` storable, as an allowlist entry behind a flag | **built** (#183) | `feed::is_storable_feed_url(url, allow_at_uri)`. The flag gates **storing** only: a stored publication is polled whatever it says (`config.rs`, `FEATHERREADER_STANDARD_SITE`) |
 | **Polling** | **built** (#225) | its own loop, `scheduler::run_publication_poller`, one repo read at a time; a subscribe from the form reads once more, inline, alongside it; `publication_read_deadline` 30 s |
 | **One walk per repo per tick** | **built** (step 2b) | `standard_site::fetch_repo`, `feed::poll_publication_group`; up to 16 publications of one repo per read |
 | **Subscribe form** | **built** (step 3) | DID and handle forms, behind the flag; `web::publication_url_from_paste` |
 | **Display** | **checked** (step 4) | a document with no summary renders as title, date and link (`web` test); an empty publication is a healthy poll (`standard_site` test); undated and future dates via #213 |
-| **Flag on in production** | **off** | `FEATHERREADER_STANDARD_SITE` unset |
+| **Flag on in production** | **on** (#236, after 0.4.1) | `FEATHERREADER_STANDARD_SITE = "true"` in `fly.toml` |
 
 ### Why it matters, now
+
+*(As of 2026-10-03, before step 5. Since PR #236 these rows are polled.)*
 
 19 feed rows are `at://did:plc:…/site.standard.publication/…`, across **17
 distinct publishers**, all belonging to **one** of the instance's readers. None
@@ -139,6 +150,9 @@ at://<did>/site.standard.publication/<rkey>
   │
   ├─ resolve <did> → PDS            (oauth::resolve / identity, already exists)
   ├─ getRecord  publication         → name, url
+  │    (as shipped: listRecords site.standard.publication, every
+  │     publication in the repo, matched on rkey; one byte budget
+  │     shared with the document walk)
   └─ listRecords site.standard.document, paged
        └─ keep documents whose `site` == this publication's at:// URI
             └─ entry { title, published: publishedAt,
@@ -164,7 +178,7 @@ re-measurement below).
 | median per publisher | **13** |
 | largest publisher | **152** |
 | full payload, everything | **~3.7 MB** |
-| requests for a full sweep | ~35 (1–3 pages each at `limit=100`) |
+| requests for a full sweep | ~35 (1–3 pages each at `limit=100`; the shipped reader pages documents at 25, `DOCUMENT_PAGE_SIZE`) |
 
 The existing poller already handles 92 HTTP feeds — 111 total minus the 19
 `at://` rows it cannot poll, which are the subject of this document. This is
@@ -198,6 +212,8 @@ window. Implemented; see `FeedKind::AGED` and `Config::retention_for`.
 **Peak is bounded by page size, not by archive size.** 4.8 MB peak against 63 kB
 retained is `DOCUMENT_PAGE_SIZE = 25` at a ~15 kB median with ~7x wire-to-`Value`
 amplification. At poll concurrency 4 that is ~19 MB — safe on a 512 MB box.
+(As shipped, publications are read one repo group at a time, alongside the RSS
+poller rather than within its concurrency of 4.)
 
 **Cost scales with the REPO, not the publication.** "minus listens" retains 0 kB
 and peaks 4.6 MB to deliver one article, because the walk reads all 38 documents in
@@ -253,6 +269,11 @@ again, so first:
   moves `:latest` before anything boots the image. A failed boot must publish
   nothing.
 
+**Done in PR #223:** `scripts/upgrade-boot.sh` runs in `release-image.yml`
+before anything is pushed, and `release-crate.yml` is dispatched only after the
+gated image is pushed (a dispatch since PR #233, because crates.io refuses
+`workflow_run`).
+
 ### 1. Bound foreign input (before it arrives on a schedule)
 
 Polling makes other people's records an hourly input. Two open issues become
@@ -269,6 +290,11 @@ Also from the 0.3.9 notes: **the walk budget is per walk, and walks nest.**
 Polling runs walks concurrently; check the peak against the measured ~4.8 MB
 per walk at concurrency 4 before relying on it.
 
+**Done in PR #224** (closes issue #205 and issue #177): every stored field has a
+size bound, and a malformed record in a publisher's repo is skipped, counted,
+and charged to the walk's byte budget. The two walks of one read share a single
+budget (`standard_site::fetch_repo`).
+
 ### 2. Polling
 
 - Add `FeedKind::Publication` to `POLLABLE`. The scheduler calls
@@ -284,6 +310,12 @@ per walk at concurrency 4 before relying on it.
   Group due publications by DID, walk the repo's documents once, and split by
   `site`. This is the cheapest cadence win measured; a `rev`-based "has anything
   changed" check is still not measured and stays out of scope.
+
+**Done in PR #225 and PR #228.** As shipped, the publication poller
+(`scheduler::run_publication_poller`) groups due rows by repo, up to 16 per
+read, and calls `feed::poll_publication_group` → `standard_site::fetch_repo`;
+outcomes settle through `feed::settle_poll`. Never-polled publications are
+staggered across one interval at poller start (`store::stagger_unscheduled`).
 
 **Decided in review of #225: a publication read has a 30 s deadline, and a read
 that misses it stores nothing.** That keeps the read in flight at shutdown
@@ -312,6 +344,9 @@ handle is a mutable name, and only the DID form is stored (README, "standard.sit
 publications"). A non-canonical spelling is refused, as #183 already does for
 storage.
 
+**Done in PR #230** (`web::publication_url_from_paste`). The first read runs
+inline on subscribe.
+
 ### 4. Display and edge cases
 
 Entries render through the existing entry views, and the summary is already
@@ -324,6 +359,8 @@ escaped at ingest. What needs checking rather than building:
   which reworks entry dating and carries its own index change, so it lands
   through step 0's gate.
 
+**Done in PR #231 and PR #213** (PR #213 closes issue #187 and issue #188).
+
 ### 5. Turn it on
 
 Set `FEATHERREADER_STANDARD_SITE=true` in production with the release that
@@ -333,6 +370,23 @@ schedule. That answers open question 3 by fixing it rather than explaining it.
 **Exit:** the 19 production subscriptions deliver entries, `/stats` counts them
 as pollable and healthy, and a reader can subscribe to a new publication from the
 form.
+
+**Done in PR #236**, one release later than planned: it merged after the 0.4.1
+tag and first shipped in 0.4.2. Whether the exit criteria hold in production is
+not recorded in this repository.
+
+## Known, not fixed in 0.4.0
+
+All three are open, and listed in the 0.4.0 CHANGELOG entry.
+
+- **Issue #226:** ammonia's time is quadratic in some inputs (`&`, deep
+  nesting, U+00A0), and sanitising runs on the poller's async task. Predates
+  0.4.0.
+- **Issue #227:** some answered-but-bad publication reads (an empty body, a 200
+  error envelope, running out of pages) are still filed as `fetch`.
+- **Issue #229:** a one-repo group shares one byte budget, so in principle big
+  siblings can starve a quiet publication of bytes. Not reachable at measured
+  scale; kept as an ignored test in `standard_site.rs`.
 
 ## Out of scope, on purpose
 
@@ -357,6 +411,7 @@ form.
    win, and is step 2. Whether a cheap "has anything changed" check exists
    (repo `rev`, `listRecords` ordering) is **still not measured**, and not
    needed for 0.4.0.
-3. **What the affected reader sees today**: 19 silent subscriptions, and since
+3. ~~**What the affected reader sees today**: 19 silent subscriptions, and since
    0.3.9 not even a failure count. Resolved by step 5 rather than by a message;
-   if step 5 slips, a one-line notice on the subscription list is the stopgap.
+   if step 5 slips, a one-line notice on the subscription list is the stopgap.~~
+   **Resolved by step 5** (PR #236).

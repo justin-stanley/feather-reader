@@ -7,8 +7,9 @@
 #   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021 / rust 1.94
 #     (MSRV bumped from 1.82 to track current stable: sqlx 0.9 requires rustc
 #     1.94 and askama 0.16 requires 1.88 — a 1.82 builder can't even parse
-#     askama's `edition2024` manifest. CI stays green on 1.82's tag only because
-#     ci.yml builds on `@stable`; this pin must move with the dep floor).
+#     askama's `edition2024` manifest. ci.yml builds on `@stable`, not on this
+#     pin, so CI cannot notice it falling behind; it must move with the dep
+#     floor).
 #     sqlx `sqlite-bundled` + `tls-rustls-ring` and reqwest `rustls` mean NO
 #     system libsqlite3 / OpenSSL are needed at runtime.
 #   * The DB schema is EMBEDDED in the binary (src/store.rs) — there is no

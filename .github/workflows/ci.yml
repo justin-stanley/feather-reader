@@ -1,11 +1,12 @@
 name: CI
 
 # Build / test / lint / audit gate. Runs on GitHub-hosted `ubuntu-latest` — free
-# and unlimited for this public repo, with the 5 jobs running in parallel. (They
+# and unlimited for this public repo, with the 7 jobs running in parallel. (They
 # used to be pinned to the single self-hosted ci-VM runner to save private-repo
 # minutes; that rationale went away when the repo went public.)
 # CodeQL, dependency-review, and OSSF Scorecard live in their own workflows
 # (they are designed for GitHub-hosted runners — see those files + the README).
+# The upgrade-boot gate is upgrade-boot.yml (and, on a tag, release-image.yml).
 
 on:
   push:
@@ -16,7 +17,7 @@ on:
 
 concurrency:
   # One in-flight CI run per ref: a new push to a PR cancels that PR's own
-  # in-progress run rather than letting a superseded 5-job build finish. Keyed on
+  # in-progress run rather than letting a superseded 7-job build finish. Keyed on
   # the PR number (falling back to the ref for push/dispatch). On GitHub-hosted
   # runners the jobs also run in parallel — so this is purely about not wasting a
   # run on outdated commits.
