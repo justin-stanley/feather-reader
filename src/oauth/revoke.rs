@@ -263,6 +263,16 @@ async fn try_revoke(
 ///
 /// A discovery failure is not fatal. It means the server cannot be told, which
 /// is exactly the case [`sign_out`] already handles by deleting locally anyway.
+///
+/// **Discovery follows the row, not the first read.** The sign-out re-reads a
+/// row that changed under it (see `sign_out_with`), and the re-read can be a
+/// DIFFERENT grant — a re-login after a PDS migration, at another issuer.
+/// Presenting its refresh token to the endpoint discovered for the old issuer
+/// would hand it to a different authorization server (the leak the
+/// issuer-checked discovery exists to prevent), which answers 200 for a token
+/// it does not know: reported revoked, row deleted, grant live. So every
+/// token goes only to the endpoint discovered for ITS OWN `(aud, issuer)`
+/// (`revoke_at_own_issuer`).
 pub async fn sign_out_discovering(
     runtime: &super::runtime::OauthRuntime,
     http: &reqwest::Client,
@@ -270,42 +280,88 @@ pub async fn sign_out_discovering(
     sub: &str,
     now: i64,
 ) -> Revocation {
-    let session = match super::store::get_session(pool, &runtime.codec, sub).await {
-        Ok(Some(session)) => session,
-        Ok(None) => return Revocation::NoSession,
-        Err(err) => {
-            // **Delete it anyway.** This early return used to skip the delete,
-            // and `sign_out` was fixed for exactly that while this sibling was
-            // not — the same one-instance-fixed, sibling-missed pattern twice
-            // over.
-            //
-            // An unreadable row is not hypothetical: it is what every row
-            // written before this branch's AAD change now is, and what rotating
-            // `FEATHERREADER_OAUTH_ENCRYPTION_KEY` produces. Leaving it wedges
-            // the account — every repo call reads the same row — and because
-            // `purge_did_data` does not touch the OAuth tables, `POST
-            // /account/delete` relies on this path to clear it. Returning early
-            // here made "delete my account" leave the tokens behind.
-            let _ = super::store::delete_session(pool, sub).await;
-            return Revocation::Failed(format!("reading the session: {err:#}"));
+    let cache = EndpointCache::default();
+    let cache = &cache;
+    // Unreadable rows, absent rows, the bounded attempt and the
+    // compare-and-delete are all `sign_out_with`'s — the same contract
+    // `sign_out` runs, tested there. The deadline covers discovery AND the
+    // revocation (each bounded on its own to REVOKE_DEADLINE inside), the same
+    // worst case as when the two were bounded one after the other.
+    sign_out_with(
+        pool,
+        &runtime.codec,
+        sub,
+        2 * REVOKE_DEADLINE,
+        |session| async move {
+            revoke_at_own_issuer(runtime, http, pool, cache, &session, now).await
+        },
+    )
+    .await
+}
+
+/// The revocation endpoint last discovered, and the `(aud, issuer)` it was
+/// discovered FOR. A token is only ever presented to the endpoint of its own
+/// pair.
+type EndpointCache = std::sync::Mutex<Option<((String, String), Option<String>)>>;
+
+/// Revoke `session`'s tokens at the revocation endpoint of ITS OWN issuer —
+/// discovering it (issuer-checked) unless `cache` already holds the endpoint
+/// for exactly this `(aud, issuer)`.
+async fn revoke_at_own_issuer(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    cache: &EndpointCache,
+    session: &OAuthSession,
+    now: i64,
+) -> Revocation {
+    let key = (session.aud.clone(), session.issuer.clone());
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        // ONLY an endpoint discovered for this very (aud, issuer). A row
+        // re-read at another issuer is re-discovered, never sent here.
+        .filter(|(for_pair, _)| *for_pair == key)
+        .map(|(_, endpoint)| endpoint.clone());
+    let endpoint = match cached {
+        Some(endpoint) => endpoint,
+        None => {
+            let endpoint = discover_revocation_endpoint(runtime, http, session).await;
+            *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, endpoint.clone()));
+            endpoint
         }
     };
+    revoke_tokens(
+        pool,
+        http,
+        &RevokeContext {
+            revocation_endpoint: endpoint.as_deref(),
+            client_id: &runtime.client_id,
+            auth_method: runtime.auth_method,
+            client_key: runtime.client_key.as_ref(),
+            deadline: REVOKE_DEADLINE,
+        },
+        session,
+        now,
+    )
+    .await
+}
 
-    // **Discovery is bounded too**, and separately.
-    //
-    // Bounding only the revocation request left the real wait unbounded:
-    // `discover` makes two guarded fetches, each with its own 30-second timeout,
-    // so an unreachable PDS held a user's sign-out for a minute before the
-    // five-second deadline even began.
-    //
-    // Bounded HERE rather than by wrapping the whole operation, so this function
-    // still ENDS in a call to `sign_out` — which owns the contract that matters
-    // (a bounded attempt, then a local delete whatever the server said) and is
-    // where that contract is tested. Wrapping instead meant production stopped going
-    // through `sign_out` at all, leaving three invariant tests aimed at a
-    // function nothing called. Worst case is two deadlines, one per phase, which
-    // is what independently bounding each phase costs.
-    let endpoint = match tokio::time::timeout(
+/// Discover `session`'s revocation endpoint, issuer-checked and bounded.
+/// `None` when it cannot be (which the caller treats as "cannot tell the
+/// server", and signs out locally anyway).
+async fn discover_revocation_endpoint(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    session: &OAuthSession,
+) -> Option<String> {
+    let sub = &session.sub;
+    // **Discovery is bounded too**, and separately: `discover` makes two
+    // guarded fetches, each with its own 30-second timeout, so an unreachable
+    // PDS held a user's sign-out for a minute before the revocation's own
+    // deadline even began.
+    match tokio::time::timeout(
         REVOKE_DEADLINE,
         // **The missed sibling.** This posts the REFRESH TOKEN to whatever
         // `revocation_endpoint` comes back, and had no issuer check at all —
@@ -331,23 +387,7 @@ pub async fn sign_out_discovering(
             tracing::warn!(%sub, "discovering the revocation endpoint timed out");
             None
         }
-    };
-
-    sign_out(
-        pool,
-        &runtime.codec,
-        http,
-        &RevokeContext {
-            revocation_endpoint: endpoint.as_deref(),
-            client_id: &runtime.client_id,
-            auth_method: runtime.auth_method,
-            client_key: runtime.client_key.as_ref(),
-            deadline: REVOKE_DEADLINE,
-        },
-        sub,
-        now,
-    )
-    .await
+    }
 }
 
 /// What an operator revoke-all did, per subject DID.
@@ -441,6 +481,74 @@ pub fn fit_to_revoke(runtime: &super::runtime::OauthRuntime) -> Result<()> {
     }
 }
 
+/// Longest the pre-flight waits for the app's own JWKS.
+const OWN_JWKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest JWKS document the pre-flight will read. Ours is one key, < 1 KiB.
+const OWN_JWKS_MAX_BYTES: usize = 64 * 1024;
+
+/// Fetch the app's OWN JWKS for the pre-flight.
+///
+/// **A plain client, not the SSRF guard.** The URL is the operator's own
+/// configuration (`FEATHERREADER_PUBLIC_URL`), not attacker input, and a
+/// self-host with split-horizon DNS serves it on a LAN or loopback address —
+/// exactly what the guard refuses, so the main pass could never pass. What
+/// the guard is for is still kept where it matters here: https only (the key
+/// comparison means nothing over a rewritable channel), no redirects, no
+/// proxy, a timeout, and a size cap.
+async fn fetch_own_jwks(url: &str) -> Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let parsed = url::Url::parse(url).with_context(|| format!("parsing {url}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("the app's JWKS URL {url} must be https");
+    }
+    let builder = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(OWN_JWKS_TIMEOUT);
+    // The test CA, so a loopback TLS test server can stand in for the app.
+    // `#[cfg(test)]`: absent from release builds.
+    #[cfg(test)]
+    let builder = builder.add_root_certificate(
+        reqwest::Certificate::from_pem(crate::net::test_pki().ca_pem.as_bytes())
+            .context("parsing the test CA")?,
+    );
+    let client = builder.build().context("building the JWKS client")?;
+    let mut resp = client
+        .get(parsed)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("{url} answered {}", resp.status());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading {url}"))?
+    {
+        if body.len() + chunk.len() > OWN_JWKS_MAX_BYTES {
+            anyhow::bail!("{url} is larger than {OWN_JWKS_MAX_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).with_context(|| format!("{url} is not JSON"))
+}
+
+/// Operator choices for [`preflight`], from the command line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreflightOptions {
+    /// `--sweep`: the post-stop pass. The app is stopped, so its JWKS cannot
+    /// be fetched; that is tolerated. A fetched MISMATCH still refuses.
+    pub sweep: bool,
+    /// `--accept-unreadable`: proceed when NO stored row decrypts. Relaxes
+    /// that one check only; the client and signing-key checks still apply.
+    /// The unreadable rows are deleted and reported failed — their tokens
+    /// cannot be revoked by anyone and live until they expire.
+    pub accept_unreadable: bool,
+}
+
 /// Prove, BEFORE anything is signed out, that this process holds the
 /// production client's real secrets — not merely a codec and a key file.
 ///
@@ -462,11 +570,14 @@ pub fn fit_to_revoke(runtime: &super::runtime::OauthRuntime) -> Result<()> {
 /// network request) is made.
 pub async fn preflight(
     runtime: &super::runtime::OauthRuntime,
-    http: &reqwest::Client,
     pool: &sqlx::SqlitePool,
     jwks_url: &str,
-    sweep: bool,
+    opts: PreflightOptions,
 ) -> Result<()> {
+    let PreflightOptions {
+        sweep,
+        accept_unreadable,
+    } = opts;
     let subs = super::store::list_session_subs(pool).await?;
     if subs.is_empty() {
         return Ok(());
@@ -486,11 +597,23 @@ pub async fn preflight(
         }
     }
     if readable == 0 {
-        anyhow::bail!(
-            "none of the {} stored session(s) decrypts with this \
-             FEATHERREADER_OAUTH_ENCRYPTION_KEY — it is not the key the app wrote them \
-             with (wrong, or rotated). Signing out would delete every row unrevoked",
-            subs.len()
+        if !accept_unreadable {
+            anyhow::bail!(
+                "none of the {} stored session(s) decrypts with this \
+                 FEATHERREADER_OAUTH_ENCRYPTION_KEY — it is not the key the app wrote them \
+                 with (wrong, or rotated). Signing out would delete every row unrevoked. \
+                 If you KNOW every row is unreadable for a legitimate reason (only pre-AAD \
+                 rows; the key was rotated with no logins since), re-run with \
+                 --accept-unreadable: those tokens cannot be revoked by anyone and stay live \
+                 until they expire",
+                subs.len()
+            );
+        }
+        tracing::warn!(
+            stored = subs.len(),
+            "--accept-unreadable: NO stored session decrypts. Every row will be deleted \
+             UNREVOKED and reported failed — those tokens stay live at their PDS until they \
+             expire. The client and signing-key checks still apply."
         );
     }
 
@@ -500,7 +623,7 @@ pub async fn preflight(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no client signing key is loaded"))?;
     let ours = key.thumbprint()?;
-    let served = match super::fetch::get_json(http, jwks_url, super::fetch::JSON).await {
+    let served = match fetch_own_jwks(jwks_url).await {
         Ok(doc) => doc,
         Err(err) if sweep => {
             tracing::warn!(
@@ -1758,8 +1881,9 @@ mod tests {
             r
         })
         .await;
-        crate::net::test_host_override("pds-e2e.test", addr);
-        format!("https://pds-e2e.test:{}/oauth/jwks.json", addr.port())
+        // `localhost`: the pre-flight's own-JWKS client does plain DNS (no
+        // test override), and the leaf certificate covers this name.
+        format!("https://localhost:{}/oauth/jwks.json", addr.port())
     }
 
     async fn pool_with_readable_session(codec_key: &str) -> sqlx::SqlitePool {
@@ -1788,9 +1912,17 @@ mod tests {
         ))
         .await;
 
-        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
-            .await
-            .expect_err("a key that decrypts nothing was accepted");
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("a key that decrypts nothing was accepted");
         assert!(format!("{err:#}").contains("ENCRYPTION_KEY"), "{err:#}");
         assert_eq!(
             session_rows(&pool).await,
@@ -1815,9 +1947,17 @@ mod tests {
                 .to_string(),
         ))
         .await;
-        preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
-            .await
-            .expect("one readable row proves the key");
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("one readable row proves the key");
     }
 
     /// The loaded signing key must be the one the app SERVES. A different
@@ -1832,10 +1972,21 @@ mod tests {
         let url = jwks_server(Some(stranger.jwks_document().unwrap().to_string())).await;
 
         for sweep in [false, true] {
-            let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, sweep)
-                .await
-                .expect_err("a signing key the PDSes have never seen was accepted");
-            assert!(format!("{err:#}").contains("not the key"), "{err:#}");
+            let err = preflight(
+                &rt,
+                &pool,
+                &url,
+                PreflightOptions {
+                    sweep,
+                    accept_unreadable: false,
+                },
+            )
+            .await
+            .expect_err("a signing key the PDSes have never seen was accepted");
+            assert!(
+                format!("{err:#}").contains("is not the key the app serves"),
+                "{err:#}"
+            );
         }
         assert_eq!(session_rows(&pool).await, 1);
     }
@@ -1854,9 +2005,17 @@ mod tests {
                 .to_string(),
         ))
         .await;
-        preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
-            .await
-            .expect("the served key was refused");
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("the served key was refused");
     }
 
     /// An unreachable JWKS refuses the main pass (the app is meant to be up)
@@ -1867,13 +2026,29 @@ mod tests {
         let pool = pool_with_readable_session(KEY).await;
         let url = jwks_server(None).await;
 
-        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
-            .await
-            .expect_err("an unverifiable signing key was accepted on the main pass");
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("an unverifiable signing key was accepted on the main pass");
         assert!(format!("{err:#}").contains("could not fetch"), "{err:#}");
-        preflight(&rt, &reqwest::Client::new(), &pool, &url, true)
-            .await
-            .expect("the sweep cannot reach a stopped app's JWKS, and must not need to");
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: true,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("the sweep cannot reach a stopped app's JWKS, and must not need to");
     }
 
     /// **The `Null` codec is refused even though everything else passes.** It
@@ -1910,9 +2085,17 @@ mod tests {
         ))
         .await;
 
-        let err = preflight(&rt, &reqwest::Client::new(), &pool, &url, false)
-            .await
-            .expect_err("the Null codec was accepted");
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("the Null codec was accepted");
         assert!(format!("{err:#}").contains("encryption key"), "{err:#}");
     }
 
@@ -1923,12 +2106,224 @@ mod tests {
         let (pool, _) = db().await;
         preflight(
             &rt,
-            &reqwest::Client::new(),
             &pool,
             "https://unreachable.invalid/oauth/jwks.json",
-            false,
+            PreflightOptions::default(),
         )
         .await
         .expect("an empty store was refused");
+    }
+
+    /// **A session that moves to another issuer mid sign-out has its new
+    /// token presented ONLY to the new issuer.**
+    ///
+    /// The re-read after a compare-and-delete mismatch can be a different
+    /// grant (a re-login after a PDS migration). Reusing the endpoint
+    /// discovered for the first read posted the new refresh token to the OLD
+    /// authorization server — a credential leak to a server that never issued
+    /// it — which answers 200 for an unknown token: reported revoked, row
+    /// deleted, the real grant left live. Two fake authorization servers; the
+    /// old one must never see the new token.
+    #[tokio::test]
+    async fn a_session_that_moves_issuer_mid_sign_out_is_revoked_at_its_own_issuer() {
+        let (pool, codec) = db().await;
+        let ok = || vec![crate::net::TestResponse::json(200, "{}")];
+        let (pds_a, iss_a, log_a) = revoking_server(ok()).await;
+        let (pds_b, iss_b, log_b) = revoking_server(ok()).await;
+        assert_ne!(iss_a, iss_b, "precondition: two distinct issuers");
+
+        let at = |pds: &str, iss: &str, refresh: &str| OAuthSession {
+            sub: DID.into(),
+            issuer: iss.into(),
+            aud: pds.into(),
+            dpop_key_jwk: super::super::keys::SigningKey::generate("session")
+                .to_jwk_json()
+                .unwrap(),
+            ..session("access", refresh)
+        };
+        super::super::store::put_session(&pool, &codec, &at(&pds_a, &iss_a, "refresh-A"))
+            .await
+            .unwrap();
+        let moved = at(&pds_b, &iss_b, "refresh-B");
+
+        let (rt, http, cache) = (runtime(), reqwest::Client::new(), EndpointCache::default());
+        let (rt, http, cache, pool_ref) = (&rt, &http, &cache, &pool);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let (first, moved) = (&first, &moved);
+        let outcome = sign_out_with(
+            &pool,
+            &codec,
+            DID,
+            std::time::Duration::from_secs(10),
+            |s| async move {
+                let r = revoke_at_own_issuer(rt, http, pool_ref, cache, &s, NOW).await;
+                if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // A re-login at the new PDS lands between read and delete.
+                    let codec = super::super::crypto::Codec::new(Some(KEY)).unwrap();
+                    super::super::store::put_session(pool_ref, &codec, moved)
+                        .await
+                        .unwrap();
+                }
+                r
+            },
+        )
+        .await;
+
+        let a = revoke_requests(&log_a).join("\n");
+        let b = revoke_requests(&log_b).join("\n");
+        assert!(
+            a.contains("token=refresh-A"),
+            "the first grant was never revoked:\n{a}"
+        );
+        assert!(
+            !a.contains("refresh-B"),
+            "the NEW grant's refresh token was sent to the OLD authorization server:\n{a}"
+        );
+        assert!(
+            b.contains("token=refresh-B"),
+            "the new grant was never revoked at its own issuer:\n{b}"
+        );
+        assert_eq!(outcome, Revocation::Revoked);
+        assert_eq!(session_rows(&pool).await, 0);
+    }
+
+    /// The app's JWKS served on `https://localhost:PORT` — loopback, which the
+    /// SSRF guard refuses. Returns the URL.
+    async fn local_jwks(doc: String) -> String {
+        let (addr, _log) = crate::net::spawn_tls(move |_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert(
+                "/oauth/jwks.json".to_string(),
+                vec![crate::net::TestResponse::json(200, doc)],
+            );
+            r
+        })
+        .await;
+        format!("https://localhost:{}/oauth/jwks.json", addr.port())
+    }
+
+    /// **The app's own JWKS is operator config, not attacker input.** A
+    /// self-host with split-horizon DNS (its hostname resolving to a LAN or
+    /// loopback address from inside) serves it on exactly the addresses the
+    /// SSRF guard refuses — so with the guarded fetcher the main pass could
+    /// never pass. It is fetched with a plain, bounded, https-only client.
+    #[tokio::test]
+    async fn a_jwks_on_a_loopback_address_passes_the_preflight() {
+        let rt = confidential_runtime("loopjwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = local_jwks(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        )
+        .await;
+        preflight(&rt, &pool, &url, PreflightOptions::default())
+            .await
+            .expect("the app's own JWKS on loopback was refused");
+    }
+
+    /// https only: the key check is worthless over a channel anyone on the
+    /// path can rewrite.
+    #[tokio::test]
+    async fn a_plain_http_jwks_url_is_refused() {
+        let rt = confidential_runtime("httpjwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let err = preflight(
+            &rt,
+            &pool,
+            "http://localhost:9/oauth/jwks.json",
+            PreflightOptions::default(),
+        )
+        .await
+        .expect_err("an http JWKS was accepted");
+        assert!(format!("{err:#}").contains("https"), "{err:#}");
+    }
+
+    /// **`--accept-unreadable` proceeds past "no row decrypts" — and only
+    /// that.** The operator's way out for a store that is legitimately all
+    /// unreadable (only pre-AAD rows; the key rotated with no logins since).
+    #[tokio::test]
+    async fn accept_unreadable_passes_an_all_unreadable_store() {
+        let rt = confidential_runtime("acceptok");
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        insert_raw(&pool, SUBS[1]).await;
+        let url = local_jwks(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        )
+        .await;
+
+        let refused = preflight(&rt, &pool, &url, PreflightOptions::default())
+            .await
+            .expect_err("without the flag an all-unreadable store must be refused");
+        assert!(
+            format!("{refused:#}").contains("--accept-unreadable"),
+            "{refused:#}"
+        );
+
+        let accept = PreflightOptions {
+            sweep: false,
+            accept_unreadable: true,
+        };
+        preflight(&rt, &pool, &url, accept)
+            .await
+            .expect("the override did not override");
+        assert_eq!(
+            session_rows(&pool).await,
+            2,
+            "the preflight deleted something"
+        );
+    }
+
+    /// The override does NOT relax the signing-key check …
+    #[tokio::test]
+    async fn accept_unreadable_does_not_bypass_the_signing_key_check() {
+        let rt = confidential_runtime("acceptsig");
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let stranger = super::super::keys::SigningKey::generate(super::super::runtime::CLIENT_KID);
+        let url = local_jwks(stranger.jwks_document().unwrap().to_string()).await;
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: true,
+            },
+        )
+        .await
+        .expect_err("--accept-unreadable bypassed the signing-key check");
+        assert!(
+            format!("{err:#}").contains("is not the key the app serves"),
+            "{err:#}"
+        );
+    }
+
+    /// … nor the production-client check.
+    #[tokio::test]
+    async fn accept_unreadable_does_not_bypass_the_client_check() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let err = preflight(
+            &runtime(),
+            &pool,
+            "https://localhost:9/oauth/jwks.json",
+            PreflightOptions {
+                sweep: true,
+                accept_unreadable: true,
+            },
+        )
+        .await
+        .expect_err("--accept-unreadable bypassed the client check");
+        assert!(format!("{err:#}").contains("public dev client"), "{err:#}");
     }
 }

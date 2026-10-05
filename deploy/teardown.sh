@@ -81,6 +81,11 @@
 #                             The script APPENDS ` --sweep` (the app's JWKS is
 #                             unreachable once it is stopped), so the command
 #                             must end with the featherreader invocation.
+#   FR_ACCEPT_UNREADABLE=1    pass --accept-unreadable to both Rust passes: go
+#                             on when NO stored Rust session decrypts (only
+#                             pre-AAD rows; key rotated with no logins since).
+#                             Those tokens cannot be revoked by anyone. See
+#                             teardown.md before using it.
 #   FR_TEARDOWN_YES=1         skip the interactive confirmation
 #   FR_STOP_CMD="..."         command to stop the services before the wipe
 #                             (e.g. "systemctl stop featherreader oauth-sidecar")
@@ -152,6 +157,15 @@ if [ "$sidecar_step" = 1 ]; then
   echo "  sidecar URL : $SIDECAR_PUBLIC_URL"
 fi
 if [ "$rust_step" = 1 ]; then echo "  rust revoke : $revoke_cmd"; fi
+# FR_ACCEPT_UNREADABLE=1: pass --accept-unreadable to both Rust passes. Only
+# for a store that is legitimately ALL unreadable (see teardown.md).
+accept_flag=""
+if [ "${FR_ACCEPT_UNREADABLE:-}" = "1" ]; then
+  accept_flag=" --accept-unreadable"
+  echo "  WARNING     : FR_ACCEPT_UNREADABLE=1 — if NO stored Rust session decrypts," >&2
+  echo "                every row is deleted UNREVOKED: those tokens cannot be revoked" >&2
+  echo "                by anyone and stay live at their PDS until they expire." >&2
+fi
 if [ "${FR_TEARDOWN_YES:-}" != "1" ]; then
   printf 'Type EXACTLY "wipe" to proceed: '
   read -r reply
@@ -234,7 +248,7 @@ if [ "$sidecar_step" = 1 ]; then
 fi
 
 # 2. Rust revoke, main pass — while the app still serves its client metadata.
-if [ "$rust_step" = 1 ]; then rust_revoke "main pass" "$revoke_cmd"; fi
+if [ "$rust_step" = 1 ]; then rust_revoke "main pass" "$revoke_cmd$accept_flag"; fi
 
 # 3. Stop the services so nothing writes mid-wipe.
 if [ -n "${FR_STOP_CMD:-}" ]; then
@@ -259,7 +273,7 @@ if [ "$rust_step" = 1 ]; then
     # invocation): the app is stopped, so its /oauth/jwks.json cannot be
     # fetched for the signing-key check — expected here, and only here. A
     # key that is fetched and does not match still refuses.
-    rust_revoke "sweep" "${FR_SWEEP_CMD:-$revoke_cmd} --sweep"
+    rust_revoke "sweep" "${FR_SWEEP_CMD:-$revoke_cmd}$accept_flag --sweep"
   fi
 fi
 

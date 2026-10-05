@@ -732,6 +732,14 @@ pub(crate) const TEST_TLS_HOSTS: &[&str] = &[
     "feed-tls.test",
     "hop-tls.test",
     "as-evil.test",
+    // A second authorization server, for a session that moves issuer mid
+    // sign-out (its token must never reach the first one).
+    "as-other.test",
+    // The app's OWN JWKS, which the revoke-all pre-flight fetches with a
+    // plain client (operator config, not attacker input): `localhost`
+    // resolves to loopback by itself, which is exactly the address the SSRF
+    // guard refuses and a split-horizon self-host serves its JWKS on.
+    "localhost",
 ];
 
 /// Point `host` at `addr` for the rest of the process, bypassing DNS **and** the

@@ -61,7 +61,16 @@ deploying is separate.
       in the wrong directory;
     - that JWKS cannot be fetched on the main pass. The post-stop
       `--revoke-all-sessions --sweep`, which `teardown.sh` appends, tolerates
-      an unreachable JWKS but not a mismatch.
+      an unreachable JWKS but not a mismatch. The JWKS is the operator's own
+      configuration, so it is fetched with a plain bounded client: https only,
+      no redirects, 10 s, 64 KiB. Going through the SSRF guard made a
+      split-horizon or LAN self-host fail the main pass every time.
+
+    `--accept-unreadable` (`FR_ACCEPT_UNREADABLE=1` in `teardown.sh`)
+    overrides only the "no row decrypts" refusal, for a store that is
+    legitimately all unreadable: only pre-AAD rows, or a deliberate key
+    rotation with no logins since. The unreadable rows are deleted and
+    reported as failed (exit 3). Their tokens cannot be revoked by anyone.
 
   A completed run prints a last line,
   `revoke-all-sessions: revoked=N no_session=M failed=K`. Partial failure is
@@ -109,6 +118,12 @@ deploying is separate.
     ciphertexts match what was read). On a mismatch it re-reads and revokes
     the new tokens, up to 3 attempts. Past that it reports a failure and
     **leaves** the newest tokens on record rather than deleting them unrevoked.
+    Discovery follows the row: every read is revoked at the endpoint
+    discovered, issuer-checked, for **its own** `(aud, issuer)`. A row
+    re-read at another issuer (a re-login after a PDS migration) used to have
+    its new refresh token posted to the old authorization server. That server
+    answered 200 for an unknown token, so the session was reported revoked
+    and its row deleted while the grant stayed live.
   - **Delete, then rotate (resurrection).** The refresh's write was an upsert,
     so a refresh in flight across a sign-out re-created the deleted session
     with fresh tokens. It is now a conditional `UPDATE` against the version
@@ -124,13 +139,13 @@ deploying is separate.
   DID that failed and was then revoked by the re-list is reported revoked.
   `late` lists only DIDs absent from the first listing.
 
-  **Tests.** New `scripts/test-teardown.sh`, 79 assertions, runs the real
+  **Tests.** New `scripts/test-teardown.sh`, 83 assertions, runs the real
   script against throwaway SQLite files with stub commands. It is wired into
   CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
   of the first 30 failed. Each later round's cases failed first against the
   script before that round's fix: the sentinel cases (17), the sidecar-backend
   cases (6), the CRLF cases (5), the post-stop sweep cases (6), the
-  unreadable-DB cases (4) and `--sweep` (2).
+  unreadable-DB cases (4), `--sweep` (2) and `FR_ACCEPT_UNREADABLE` (3).
 
   Tests against a real-TLS fake authorization server cover:
 
@@ -142,18 +157,23 @@ deploying is separate.
     revoked, theirs not);
   - the pre-flight against a fake JWKS: matching, mismatching (main pass and
     sweep), and unreachable (main pass refused, sweep allowed). Also a wrong
-    encryption key, a Null codec that passes everything else, and a partly
-    unreadable store.
+    encryption key, a Null codec that passes everything else, a partly
+    unreadable store, a JWKS on loopback (passes), an http JWKS URL (refused),
+    and `--accept-unreadable` (passes an all-unreadable store, does not
+    bypass the client or signing-key checks);
+  - a session that moves issuer mid sign-out, against two fake authorization
+    servers: the old one never receives the new token.
 
   Injected-hook tests cover a rotation between read and delete, a row that
   keeps rotating, a row deleted concurrently, sessions created during the
   walk, the bounded re-list, and one final outcome per DID (fail then succeed
   is revoked only; failing every pass is one entry). Main-binary tests cover
-  the dev-client, Null-codec, keyless and wrong-encryption-key refusals, and
-  `--sweep` parsing.
+  the dev-client, Null-codec, keyless and wrong-encryption-key refusals,
+  `--sweep` and `--accept-unreadable` parsing, and `--accept-unreadable` end
+  to end (2 without it, 3 with every row deleted).
 
-  Each new guard was broken on its own and a test failed every time (58 of
-  58).
+  Each new guard was broken on its own and a test failed every time (66 of
+  66).
   `deploy/teardown.md` gains the procedure, including Fly's.
 
 ### Docs

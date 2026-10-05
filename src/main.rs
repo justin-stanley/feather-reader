@@ -40,8 +40,11 @@ async fn main() -> Result<()> {
     // `?`, so every failure of this mode is an explicit exit 2 ("nothing done")
     // rather than whatever an error from `main` happens to exit with.
     if wants_revoke_all(std::env::args()) {
-        let sweep = wants_sweep(std::env::args());
-        std::process::exit(run_revoke_all(sweep).await);
+        let opts = feather_reader::oauth::revoke::PreflightOptions {
+            sweep: wants_sweep(std::env::args()),
+            accept_unreadable: wants_accept_unreadable(std::env::args()),
+        };
+        std::process::exit(run_revoke_all(opts).await);
     }
 
     // 1. Configuration — env-driven, every knob defaulted.
@@ -281,6 +284,19 @@ fn wants_sweep<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().skip(1).any(|a| a == SWEEP_FLAG)
 }
 
+/// `--revoke-all-sessions --accept-unreadable`: the operator's explicit "none
+/// of these rows can be read, and I know why" (only pre-AAD rows; the
+/// encryption key legitimately rotated with no logins since).
+const ACCEPT_UNREADABLE_FLAG: &str = "--accept-unreadable";
+
+/// Whether the operator overrode the "no stored row decrypts" refusal. Skips
+/// `argv[0]`, like the other flags.
+fn wants_accept_unreadable<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|a| a == ACCEPT_UNREADABLE_FLAG)
+}
+
 /// The exit code for a completed revoke-all: any failure is reported, because
 /// those tokens may still be live at their PDS even though the rows are gone.
 fn revoke_all_exit_code(report: &feather_reader::oauth::revoke::RevokeAllReport) -> i32 {
@@ -319,7 +335,7 @@ fn unconfigured_exit_code(stored_sessions: usize) -> i32 {
 /// row in its own statement, so the lock is never held across a network call;
 /// and a delete that still cannot get the lock is reported as that DID's
 /// failure, not a crash of the whole run.
-async fn run_revoke_all(sweep: bool) -> i32 {
+async fn run_revoke_all(opts: feather_reader::oauth::revoke::PreflightOptions) -> i32 {
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -328,12 +344,15 @@ async fn run_revoke_all(sweep: bool) -> i32 {
         }
     };
     init_tracing();
-    run_revoke_all_with(&config, sweep).await
+    run_revoke_all_with(&config, opts).await
 }
 
 /// [`run_revoke_all`] after configuration — split out so the refusals that
 /// depend on files on disk can be tested.
-async fn run_revoke_all_with(config: &Config, sweep: bool) -> i32 {
+async fn run_revoke_all_with(
+    config: &Config,
+    opts: feather_reader::oauth::revoke::PreflightOptions,
+) -> i32 {
     // `store::init` creates a missing database. Here that would answer "0
     // sessions, all good" about the WRONG file and let a teardown wipe the
     // real one with every token still live.
@@ -363,7 +382,7 @@ async fn run_revoke_all_with(config: &Config, sweep: bool) -> i32 {
     // `OauthRuntime::without_creating_key`). A missing key is a runtime that
     // cannot be built, which refuses if any session is stored.
     let runtime = feather_reader::oauth::runtime::OauthRuntime::without_creating_key(config);
-    let code = revoke_all_sessions(&db, runtime, &http, sweep).await;
+    let code = revoke_all_sessions(&db, runtime, &http, opts).await;
     db.close().await;
     code
 }
@@ -379,7 +398,7 @@ async fn revoke_all_sessions(
     db: &store::Pool,
     runtime: Result<feather_reader::oauth::runtime::OauthRuntime>,
     http: &reqwest::Client,
-    sweep: bool,
+    opts: feather_reader::oauth::revoke::PreflightOptions,
 ) -> i32 {
     let runtime = match runtime {
         Ok(runtime) => runtime,
@@ -418,8 +437,7 @@ async fn revoke_all_sessions(
     // encryption key or signing key "works" — every sign-out fails and
     // deletes its row. Checked before the first sign-out. Nothing deleted.
     let jwks_url = feather_reader::oauth::metadata::jwks_uri(&runtime.client);
-    if let Err(err) =
-        feather_reader::oauth::revoke::preflight(&runtime, http, db, &jwks_url, sweep).await
+    if let Err(err) = feather_reader::oauth::revoke::preflight(&runtime, db, &jwks_url, opts).await
     {
         eprintln!(
             "revoke-all: ABORT — {err:#}. Nothing was revoked and NOTHING WAS DELETED. Run \
@@ -606,7 +624,7 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feather_reader::oauth::revoke::{fit_to_revoke, RevokeAllReport};
+    use feather_reader::oauth::revoke::{fit_to_revoke, PreflightOptions, RevokeAllReport};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -626,6 +644,63 @@ mod tests {
             "--revoke-all-sessions"
         ])));
         assert!(!wants_sweep(args(&["--sweep", "--revoke-all-sessions"])));
+    }
+
+    #[test]
+    fn the_accept_unreadable_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_accept_unreadable(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions",
+            "--accept-unreadable"
+        ])));
+        assert!(!wants_accept_unreadable(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_accept_unreadable(args(&[
+            "--accept-unreadable",
+            "--revoke-all-sessions"
+        ])));
+    }
+
+    /// **`--accept-unreadable` end to end:** a store that is ALL unreadable
+    /// is refused (2, rows intact) without it, and with it every row is
+    /// deleted and reported failed (3) — loudly, because those tokens cannot
+    /// be revoked by anyone. Offline: a `.invalid` public URL makes the JWKS
+    /// unfetchable, which the `--sweep` here tolerates.
+    #[tokio::test]
+    async fn accept_unreadable_proceeds_past_an_all_unreadable_store() {
+        let dir = scratch("acceptbin");
+        let mut config = confidential_config(&dir);
+        config.public_url = "https://feather-reader.invalid".into();
+        let sweep = PreflightOptions {
+            sweep: true,
+            accept_unreadable: false,
+        };
+
+        let db = db_with_rows(2).await;
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        let code = revoke_all_sessions(&db, Ok(rt), &reqwest::Client::new(), sweep).await;
+        assert_eq!(
+            code, 2,
+            "an all-unreadable store passed without the override"
+        );
+        assert_eq!(rows(&db).await, 2);
+
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        let code = revoke_all_sessions(
+            &db,
+            Ok(rt),
+            &reqwest::Client::new(),
+            PreflightOptions {
+                accept_unreadable: true,
+                ..sweep
+            },
+        )
+        .await;
+        assert_eq!(code, 3, "the unrevocable rows must be reported as failures");
+        assert_eq!(rows(&db).await, 0, "the override did not proceed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **A store no row of which decrypts is refused before anything is
@@ -665,7 +740,13 @@ mod tests {
             .unwrap();
         }
 
-        let code = revoke_all_sessions(&db, Ok(runtime), &reqwest::Client::new(), false).await;
+        let code = revoke_all_sessions(
+            &db,
+            Ok(runtime),
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
         assert_eq!(
             code, 2,
             "a key that decrypts nothing was allowed to sign out"
@@ -764,7 +845,10 @@ mod tests {
     async fn a_missing_database_is_refused_and_not_created() {
         let dir = scratch("nodb");
         let config = confidential_config(&dir);
-        assert_eq!(run_revoke_all_with(&config, false).await, 2);
+        assert_eq!(
+            run_revoke_all_with(&config, PreflightOptions::default()).await,
+            2
+        );
         assert!(
             !config.db_path.exists(),
             "the revoke-all created a database at the wrong path"
@@ -796,7 +880,10 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        assert_eq!(run_revoke_all_with(&config, false).await, 2);
+        assert_eq!(
+            run_revoke_all_with(&config, PreflightOptions::default()).await,
+            2
+        );
         assert!(
             !config.oauth.key_path.exists(),
             "the revoke-all CREATED a signing key the PDSes have never seen"
@@ -835,7 +922,13 @@ mod tests {
         assert!(why.contains("public dev client"), "{why}");
 
         let db = db_with_rows(2).await;
-        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new(), false).await;
+        let code = revoke_all_sessions(
+            &db,
+            runtime,
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
         assert_eq!(code, 2, "revoked as the public dev client");
         assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
         let _ = std::fs::remove_dir_all(&dir);
@@ -859,7 +952,13 @@ mod tests {
         );
 
         let db = db_with_rows(2).await;
-        let code = revoke_all_sessions(&db, runtime, &reqwest::Client::new(), false).await;
+        let code = revoke_all_sessions(
+            &db,
+            runtime,
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
         assert_eq!(code, 2, "revoked with the Null codec");
         assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
         let _ = std::fs::remove_dir_all(&dir);
@@ -934,7 +1033,7 @@ mod tests {
             &db,
             Err(anyhow::anyhow!("no encryption key")),
             &reqwest::Client::new(),
-            false,
+            PreflightOptions::default(),
         )
         .await;
         assert_eq!(code, 2);
@@ -948,7 +1047,7 @@ mod tests {
             &db,
             Err(anyhow::anyhow!("no encryption key")),
             &reqwest::Client::new(),
-            false,
+            PreflightOptions::default(),
         )
         .await;
         assert_eq!(code, 0);

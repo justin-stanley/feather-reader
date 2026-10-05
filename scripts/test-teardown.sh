@@ -348,6 +348,27 @@ check "the sweep ran it with --sweep" \
       '[ "$(grep -c "args=--revoke-all-sessions --sweep\$" "$LOG")" = 1 ]'
 teardown_sandbox
 
+# The operator's override for a store that is legitimately ALL unreadable:
+# passed to BOTH passes, and announced, because those tokens cannot be
+# revoked by anyone.
+echo "== FR_ACCEPT_UNREADABLE=1 passes --accept-unreadable to both passes, loudly"
+setup
+rm -f "$SC_DB" "$SC_DB.jwk.json"
+cat >"$T/bin/featherreader" <<EOF
+#!/usr/bin/env bash
+echo "rust-revoke db-present args=\$*" >>"$LOG"
+echo "revoke-all-sessions: revoked=0 no_session=0 failed=0"
+EOF
+chmod +x "$T/bin/featherreader"
+run FEATHERREADER_REPO_BACKEND=rust FR_STOP_CMD="echo stop >>'$LOG'" FR_ACCEPT_UNREADABLE=1
+check "exits 0" '[ "$CODE" = 0 ]'
+check "the main pass got --accept-unreadable" \
+      '[ "$(grep -c "args=--revoke-all-sessions --accept-unreadable\$" "$LOG")" = 1 ]'
+check "the sweep got --accept-unreadable and --sweep" \
+      '[ "$(grep -c "args=--revoke-all-sessions --accept-unreadable --sweep\$" "$LOG")" = 1 ]'
+check "warns that those tokens cannot be revoked" 'grep -qi "cannot be revoked" <<<"$OUT"'
+teardown_sandbox
+
 echo
 echo "teardown tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

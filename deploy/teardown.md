@@ -67,6 +67,10 @@ deadline-bounded.
   live app rotated the session's tokens while it was being revoked, the row is
   read again and the new tokens are revoked too. After 3 such attempts it gives
   up: the newest tokens are left on record and the DID is reported as failed.
+  Each token goes **only** to the revocation endpoint discovered for its own
+  `(aud, issuer)`. A row that comes back at a different issuer (a re-login
+  after a PDS migration) is re-discovered first. Its token is never posted to
+  the old authorization server.
 - **No resurrection.** The app's own refresh no longer writes back a session
   that was signed out while it ran. It revokes the tokens it just obtained
   instead. It does the same when another writer (a re-login) replaced the row
@@ -102,13 +106,29 @@ What makes it exit `2`:
   or unset public URL, no encryption key, or no signing key;
 - **the encryption key is the wrong one**: rows are stored and *none* of them
   decrypts. Some readable and some not passes; the unreadable ones are
-  reported as failed;
+  reported as failed. See `--accept-unreadable` below for a store that is
+  legitimately all unreadable;
 - **the signing key is not the one the app serves**: its public half is not in
-  `{FEATHERREADER_PUBLIC_URL}/oauth/jwks.json`;
+  `{FEATHERREADER_PUBLIC_URL}/oauth/jwks.json`. That URL is fetched with a
+  plain client, not the SSRF guard, because it is your own configuration: a
+  split-horizon or LAN address works. It must be https, with no redirects, a
+  10 s timeout and a 64 KiB cap;
 - **that JWKS could not be fetched**, on the main pass only. The app is meant
   to be up then. The post-stop sweep (`--revoke-all-sessions --sweep`, which
   `teardown.sh` passes) tolerates an unreachable JWKS, but still refuses a key
   it fetches and that does not match.
+
+**`--accept-unreadable`** (in `teardown.sh`: `FR_ACCEPT_UNREADABLE=1`) is the
+way out when *no* stored row decrypts and you know why. Two legitimate cases:
+
+- the only rows are from before the AAD change;
+- the encryption key was rotated on purpose and nobody has logged in since.
+
+It relaxes **only** that check; the client and signing-key checks still apply.
+The unreadable rows are deleted and reported as failed, and the run exits 3.
+**Their tokens cannot be revoked by anyone**, since nothing can read them, and
+stay live at their PDS until they expire. Don't use it to get past a key you
+merely *think* is right: a wrong key looks exactly the same.
 
 All but the first three only stop it when sessions are stored, and all of
 them are checked **before the first sign-out**, so nothing is deleted.
