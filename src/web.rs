@@ -1573,6 +1573,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.4.6",
+        date: "2026-10-06",
+        summary: "Renaming a subscription or a folder no longer overwrites \
+                  what another app changed at the same moment, and a folder \
+                  rename keeps everything but the name.",
+    },
+    Release {
         version: "0.4.5",
         date: "2026-10-06",
         summary: "An operator teardown now signs every user out at their own \
@@ -8235,7 +8242,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#045--2026-10-06"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#046--2026-10-06"
         );
     }
 
