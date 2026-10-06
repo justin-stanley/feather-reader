@@ -14,7 +14,28 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.5 — 2026-10-06
+
+A teardown can now revoke the `rust` backend's sessions (#257): a new
+`featherreader --revoke-all-sessions` signs every stored session out at its
+PDS, and `deploy/teardown.sh` runs it before the wipe. Closing the races that
+work exposed also changes how a token refresh and a sign-out write the session
+row. Plus the documentation refresh.
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.4 is a deploy;
+  rolling back to 0.4.4 is a redeploy.
+- **Session writes are now conditional.** A token refresh updates the session
+  row only if it still holds the tokens the refresh started from, and never
+  re-creates a row that a sign-out deleted. A sign-out deletes the row only if
+  it is unchanged since it was read. Login still writes unconditionally. Users
+  see no difference. A refresh that loses such a race revokes the tokens it
+  could not store; if that revocation fails, a `warn` line says so ("a session
+  changed or was signed out during its refresh").
+- **`--revoke-all-sessions` is an operator tool, not a routine operation:**
+  it signs every user out. See `deploy/teardown.md` for when and how to run
+  it, its exit codes and its pre-flight checks.
 
 ### Security
 
