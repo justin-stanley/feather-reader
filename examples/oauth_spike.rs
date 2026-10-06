@@ -409,7 +409,7 @@ async fn run_writes(
         "note": "feather-reader OAuth spike; updated",
         "createdAt": chrono::Utc::now().to_rfc3339(),
     });
-    repo.put_record(collection, &rkey, &SpikeRecord(updated))
+    repo.put_record(collection, &rkey, &SpikeRecord(updated), None)
         .await?;
     println!("  put        OK (same rkey)");
 

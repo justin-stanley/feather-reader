@@ -303,6 +303,16 @@ impl Repo<'_> {
     }
 
     dispatch! {
+        /// The reader's feed list with the CID each record was listed at,
+        /// unsorted — for a read-modify-write that puts with `swapRecord`
+        /// (#149). `list_subscriptions_sorted` is unchanged for every caller
+        /// that only displays the list.
+        list_subscriptions_with_cids() -> Vec<(String, Option<String>, Subscription)>,
+        sidecar: list_subscriptions_with_cids,
+        rust: list_subscriptions_with_cids
+    }
+
+    dispatch! {
         /// Raw subscribe. Private: reach it through [`Repo::add_subscription`].
         add_subscription_unvetted(sub: &crate::vetted::VettedSubscription) -> String,
         label: "add_subscription",
@@ -327,8 +337,11 @@ impl Repo<'_> {
 
     dispatch! {
         /// Raw update. Private: reach it through [`Repo::update_subscription`].
-        update_subscription_unvetted(rkey: &str, sub: &crate::vetted::VettedSubscription)
-            -> crate::atproto::WriteResult,
+        update_subscription_unvetted(
+            rkey: &str,
+            sub: &crate::vetted::VettedSubscription,
+            swap_record: Option<&str>
+        ) -> crate::atproto::WriteResult,
         label: "update_subscription",
         sidecar: update_subscription,
         rust: update_subscription
@@ -342,8 +355,9 @@ impl Repo<'_> {
         did: &str,
         rkey: &str,
         sub: &Subscription,
+        swap_record: Option<&str>,
     ) -> Result<crate::atproto::WriteResult> {
-        self.update_subscription_unvetted(did, rkey, &VettedSubscription::new(sub))
+        self.update_subscription_unvetted(did, rkey, &VettedSubscription::new(sub), swap_record)
             .await
     }
 
@@ -618,7 +632,10 @@ mod tests {
             let sub = sub_with_site(hostile);
 
             let _ = state.repo().add_subscription(DID, &sub).await;
-            let _ = state.repo().update_subscription(DID, "rk1", &sub).await;
+            let _ = state
+                .repo()
+                .update_subscription(DID, "rk1", &sub, None)
+                .await;
             let _ = state
                 .repo()
                 .add_subscriptions_bulk(DID, std::slice::from_ref(&sub))
@@ -776,7 +793,10 @@ mod tests {
         let sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
 
         let _ = state.repo().add_subscription(DID, &sub).await;
-        let _ = state.repo().update_subscription(DID, "rk1", &sub).await;
+        let _ = state
+            .repo()
+            .update_subscription(DID, "rk1", &sub, None)
+            .await;
         let _ = state
             .repo()
             .add_subscriptions_bulk(DID, std::slice::from_ref(&sub))

@@ -3587,6 +3587,60 @@ async fn rename_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
+    // **A compare-and-swap, retried once (#149).** Each attempt reads the
+    // record with its CID and writes with `swapRecord` set to it, so another
+    // atproto client's write between the two is refused by the PDS rather than
+    // erased by our whole-record put. A refused attempt reads again and
+    // re-applies the form's fields — and only those — to the FRESH record,
+    // re-running every gate against it. A second refusal is reported as a
+    // conflict, never as success: a record that keeps moving is being edited
+    // somewhere, and the reader is the one to decide which edit wins.
+    for attempt in 1..=RENAME_ATTEMPTS {
+        match rename_subscription_once(&state, &did, &rkey, &feed_url, &form).await? {
+            RenameAttempt::Done(resp) => return Ok(resp),
+            RenameAttempt::Raced => {
+                info!(%did, %rkey, attempt, "subscription changed between read and write; re-reading");
+            }
+        }
+    }
+    warn!(%did, %rkey, attempts = RENAME_ATTEMPTS, "refused rename: the subscription kept changing elsewhere");
+    Ok(Redirect::to(&format!(
+        "/?flash={}",
+        qenc(
+            "This subscription was changed elsewhere while you were editing it — \
+             nothing was renamed or moved. Reload and try again."
+        )
+    ))
+    .into_response())
+}
+
+/// How many times [`rename_subscription`] reads and writes before giving up on
+/// a record that keeps changing: the first try and one retry.
+const RENAME_ATTEMPTS: u32 = 2;
+
+/// The outcome of one read-then-write of a rename.
+enum RenameAttempt {
+    /// Answered: renamed, refused by a gate, or failed for a reason a re-read
+    /// cannot fix.
+    Done(Response),
+    /// The PDS refused the write with `InvalidSwap`: the record moved after
+    /// this attempt read it. Nothing was written.
+    Raced,
+}
+
+/// One attempt at [`rename_subscription`]: read the record and its CID, apply
+/// the form to it, and write it back on the condition that it is still at
+/// that CID.
+async fn rename_subscription_once(
+    state: &AppState,
+    did: &str,
+    rkey: &str,
+    feed_url: &str,
+    form: &RenameSubForm,
+) -> Result<RenameAttempt, WebError> {
+    use RenameAttempt::Done;
+    let feed_url = feed_url.to_string();
+
     // **Read before write — `update_subscription` is a `putRecord`, and a
     // putRecord replaces the WHOLE record** (see its doc on `atproto.rs`).
     //
@@ -3603,35 +3657,47 @@ async fn rename_subscription(
     //
     // There is no single-record read on `Repo` (no `getRecord`), so this lists
     // and filters. That is one extra round trip on an action that is already
-    // doing a PDS write, and it is bounded; a `get_subscription` would be
-    // strictly better if this ever measures badly.
+    // doing a PDS write, and it is bounded. A `get_subscription` was weighed
+    // for #149 and not added: the sidecar has no `get` action, so it would be
+    // new surface on the backend being retired, and the listing already
+    // carries each record's CID.
     //
     // **A failed read refuses the rename.** Falling back to the old
     // rebuild-from-scratch here would reinstate the data loss on exactly the
     // flaky path, which is the worst place to have it. The write below already
     // takes this stance — "a failure here means nothing was renamed or moved" —
     // and the read gets the same one.
-    let existing = match state.repo().list_subscriptions_sorted(&did).await {
-        Ok(subs) => subs.into_iter().find(|(k, _)| *k == rkey).map(|(_, s)| s),
+    //
+    // **The CID comes with the record**, and the write below names it: that is
+    // the whole compare-and-swap (#149).
+    let found = match state.repo().list_subscriptions_with_cids(did).await {
+        Ok(subs) => subs
+            .into_iter()
+            .find(|(k, _, _)| k == rkey)
+            .map(|(_, cid, s)| (cid, s)),
         Err(err) => {
             warn!(%err, %did, %rkey, "could not read the subscription before renaming it");
-            return Ok(Redirect::to(&format!(
-                "/?flash={}",
-                qenc("Could not reach your PDS — nothing was renamed or moved.")
-            ))
-            .into_response());
+            return Ok(Done(
+                Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc("Could not reach your PDS — nothing was renamed or moved.")
+                ))
+                .into_response(),
+            ));
         }
     };
-    let Some(existing) = existing else {
+    let Some((read_cid, existing)) = found else {
         // The rkey is not in the reader's repo. Renaming a record that is not
         // there would CREATE one, which is not what "rename" means and would
         // give it a fresh `createdAt` — the bug this read exists to prevent.
         warn!(%did, %rkey, "refused rename: no such subscription in the repo");
-        return Ok(Redirect::to(&format!(
-            "/?flash={}",
-            qenc("That subscription is no longer in your repo — nothing was renamed or moved.")
-        ))
-        .into_response());
+        return Ok(Done(
+            Redirect::to(&format!(
+                "/?flash={}",
+                qenc("That subscription is no longer in your repo — nothing was renamed or moved.")
+            ))
+            .into_response(),
+        ));
     };
 
     // The subscription can be repointed at a different feed URL. **Every gate
@@ -3669,10 +3735,10 @@ async fn rename_subscription(
     let storable = feed::is_storable_feed_url(&feed_url, state.config.standard_site);
     if url_changed && !storable {
         info!(url = %feed_url, %did, %rkey, "refused a repoint to a non-storable feed URL");
-        return Ok(
+        return Ok(Done(
             Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
                 .into_response(),
-        );
+        ));
     }
 
     // Block private/paid feeds on a repoint. `url` is attacker-controllable,
@@ -3683,9 +3749,9 @@ async fn rename_subscription(
     if url_changed {
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
             info!(url = %feed_url, %reason, %did, %rkey, "refused private/paid feed at rename (not stored or written)");
-            return Ok(
+            return Ok(Done(
                 Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
-            );
+            ));
         }
     }
 
@@ -3703,13 +3769,15 @@ async fn rename_subscription(
         match store::count_feeds(&state.db).await {
             Ok(n) if n >= feeds_cap => {
                 warn!(%did, %rkey, feeds = n, cap = feeds_cap, feed = %feed_url, "refused rename: global feeds ceiling reached");
-                return Ok(Redirect::to(&format!(
-                    "/?flash={}",
-                    qenc(
-                        "This instance is at its feed capacity right now. Please try again later."
-                    )
-                ))
-                .into_response());
+                return Ok(Done(
+                    Redirect::to(&format!(
+                        "/?flash={}",
+                        qenc(
+                            "This instance is at its feed capacity right now. Please try again later."
+                        )
+                    ))
+                    .into_response(),
+                ));
             }
             Ok(_) => {}
             Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
@@ -3720,10 +3788,12 @@ async fn rename_subscription(
     sub.url = feed_url;
     sub.title = form
         .title
+        .as_deref()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     sub.folder = form
         .folder
+        .as_deref()
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
     // `createdAt` and `private` carry over untouched — neither is a property of
@@ -3735,6 +3805,7 @@ async fn rename_subscription(
     // ever starts carrying one.
     match form
         .site_url
+        .as_deref()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     {
@@ -3787,18 +3858,34 @@ async fn rename_subscription(
     // that did — the reader saw their old title come back and had no reason to
     // think anything had gone wrong. The PDS record IS the subscription; a
     // failure here means nothing was renamed or moved.
-    match state.repo().update_subscription(&did, &rkey, &sub).await {
+    //
+    // **Conditional on the CID read above (#149).** A listing with no CID is
+    // a PDS outside the lexicon (`listRecords` requires one); the write then
+    // goes unconditionally, as every write did before this, and says so.
+    if read_cid.is_none() {
+        warn!(%did, %rkey, "the PDS listed this subscription without a CID; renaming without a compare-and-swap");
+    }
+    match state
+        .repo()
+        .update_subscription(did, rkey, &sub, read_cid.as_deref())
+        .await
+    {
         Ok(res) => {
             info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription");
-            Ok(Redirect::to("/").into_response())
+            Ok(Done(Redirect::to("/").into_response()))
         }
+        // Another client wrote the record after the read above: nothing was
+        // written, and the caller decides whether to read again.
+        Err(err) if crate::atproto::is_invalid_swap(&err) => Ok(RenameAttempt::Raced),
         Err(err) => {
             warn!(%err, %did, %rkey, "PDS subscription update failed");
-            Ok(Redirect::to(&format!(
-                "/?flash={}",
-                qenc("Could not save that change to your PDS — nothing was renamed or moved.")
+            Ok(Done(
+                Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc("Could not save that change to your PDS — nothing was renamed or moved.")
+                ))
+                .into_response(),
             ))
-            .into_response())
         }
     }
 }
@@ -11295,6 +11382,349 @@ mod tests {
             "expected the unsupported flash: {loc}"
         );
         assert!(!loc.contains("Private"), "reported as a paid feed: {loc}");
+    }
+
+    // -- #149: a rename that races another client's write -------------------
+
+    /// One subscription record behind a fake repo that ENFORCES `swapRecord`
+    /// the way the reference PDS does: a put naming a CID the record is no
+    /// longer at is refused `400 InvalidSwap`; a put with no swap always lands.
+    #[derive(Default)]
+    struct SwapRepo {
+        /// The record's current value.
+        value: serde_json::Value,
+        /// Bumped on every write, so each version has its own CID.
+        version: u32,
+        /// Every put request body received, in order, landed or not.
+        puts: Vec<serde_json::Value>,
+        /// Another client's write, landed the moment our FIRST put arrives —
+        /// i.e. between our read and our write.
+        concurrent: Option<serde_json::Value>,
+        /// Refuse every put that carries a swap, whatever CID it names.
+        refuse_every_swap: bool,
+        /// Refuse every put with this (status, error) — a non-swap failure.
+        fail_puts: Option<(u16, &'static str)>,
+    }
+
+    impl SwapRepo {
+        fn cid(&self) -> String {
+            format!("bafyreiversion{}", self.version)
+        }
+
+        fn page(&self) -> serde_json::Value {
+            serde_json::json!({ "records": [{
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "cid": self.cid(),
+                "value": self.value,
+            }] })
+        }
+
+        /// A put: `Ok(strong ref)` or `Err((status, error name))`.
+        fn put(&mut self, body: &serde_json::Value) -> Result<serde_json::Value, (u16, String)> {
+            self.puts.push(body.clone());
+            if let Some(theirs) = self.concurrent.take() {
+                self.value = theirs;
+                self.version += 1;
+            }
+            if let Some((status, error)) = self.fail_puts {
+                return Err((status, error.to_string()));
+            }
+            if let Some(swap) = body.get("swapRecord").and_then(|v| v.as_str()) {
+                if self.refuse_every_swap || swap != self.cid() {
+                    return Err((400, "InvalidSwap".to_string()));
+                }
+            }
+            self.value = body["record"].clone();
+            self.version += 1;
+            Ok(serde_json::json!({
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "cid": self.cid(),
+            }))
+        }
+    }
+
+    const RACE_DID: &str = "did:plc:racer149";
+
+    /// Serve `repo` as both a sidecar (`/internal/repo`) and a PDS (`/xrpc/*`),
+    /// so one fixture drives either backend. Returns the sidecar base URL and
+    /// the PDS audience a Rust-backend session should carry.
+    async fn serve_swap_repo(repo: std::sync::Arc<std::sync::Mutex<SwapRepo>>) -> (String, String) {
+        use axum::response::IntoResponse as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = format!("pds-{}.race.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let repo = std::sync::Arc::clone(&repo);
+            async move {
+                let (parts, body) = req.into_parts();
+                let raw = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                let reply = |status: u16, body: serde_json::Value| {
+                    (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response()
+                };
+                let mut repo = repo.lock().unwrap();
+                match (parts.uri.path(), body["action"].as_str()) {
+                    ("/internal/repo", Some("list")) => {
+                        reply(200, serde_json::json!({ "ok": true, "data": repo.page() }))
+                    }
+                    ("/internal/repo", Some("put")) => match repo.put(&body) {
+                        Ok(data) => reply(200, serde_json::json!({ "ok": true, "data": data })),
+                        Err((status, error)) => reply(
+                            status,
+                            serde_json::json!({
+                                "ok": false, "error": error, "message": "refused", "status": status,
+                            }),
+                        ),
+                    },
+                    ("/xrpc/com.atproto.repo.listRecords", _) => reply(200, repo.page()),
+                    ("/xrpc/com.atproto.repo.putRecord", _) => match repo.put(&body) {
+                        Ok(data) => reply(200, data),
+                        Err((status, error)) => reply(
+                            status,
+                            serde_json::json!({ "error": error, "message": "refused" }),
+                        ),
+                    },
+                    other => panic!("unexpected request {other:?}"),
+                }
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            format!("http://{addr}"),
+            format!("http://{host}:{}", addr.port()),
+        )
+    }
+
+    /// An `AppState` on `backend`, pointed at `repo` — the sidecar through its
+    /// internal URL, the Rust client through a live OAuth session whose `aud`
+    /// is the fake.
+    async fn race_state(
+        backend: crate::metrics::Backend,
+        repo: &std::sync::Arc<std::sync::Mutex<SwapRepo>>,
+    ) -> AppState {
+        let (sidecar, aud) = serve_swap_repo(std::sync::Arc::clone(repo)).await;
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &[RACE_DID.to_string()])
+            .await
+            .unwrap();
+        let mut config = Config {
+            allowed_dids: vec![RACE_DID.to_string()],
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            repo_backend: backend,
+            oauth: crate::config::OauthConfig {
+                // Per test, never the relative default — see `repo::tests`.
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-race-oauth-key-{}-{:p}.json",
+                    std::process::id(),
+                    &db as *const _
+                )),
+                encryption_key: Some("a".repeat(43)),
+                ..crate::config::OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        config.sidecar.public_url = sidecar.clone();
+        config.sidecar.internal_url = sidecar;
+        let state = AppState::new(config, db).unwrap();
+        if backend == crate::metrics::Backend::Rust {
+            let runtime = state.oauth.as_deref().expect("oauth runtime");
+            crate::oauth::store::put_session(
+                &state.db,
+                &runtime.codec,
+                &crate::oauth::store::OAuthSession {
+                    sub: RACE_DID.into(),
+                    issuer: "https://auth.invalid".into(),
+                    aud,
+                    dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                        .to_jwk_json()
+                        .unwrap(),
+                    access_token: "at".into(),
+                    refresh_token: "rt".into(),
+                    token_type: "DPoP".into(),
+                    granted_scope: "atproto".into(),
+                    expires_at: Some(store::now_unix() + 3600),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state
+    }
+
+    /// The record before anyone touches it — the seeded one, as a value.
+    fn race_seed() -> serde_json::Value {
+        seeded_subscription()["value"].clone()
+    }
+
+    /// Post the manage row's rename (url unchanged, a new title and folder) and
+    /// return the redirect location.
+    async fn post_race_rename(state: &AppState) -> String {
+        let cookie = session_cookie(state, RACE_DID, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&folder=Tech",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    const RACE_BACKENDS: [crate::metrics::Backend; 2] = [
+        crate::metrics::Backend::Sidecar,
+        crate::metrics::Backend::Rust,
+    ];
+
+    /// **The key test of #149: a rename that loses a race keeps the other
+    /// client's change AND lands its own.**
+    ///
+    /// The fake lands another client's edit (a new `siteUrl` and `fetchHint`)
+    /// between the handler's read and its write. The write names the CID it
+    /// read, so the PDS refuses it; the handler re-reads, re-applies the form's
+    /// fields to the FRESH record, and writes again under the new CID.
+    ///
+    /// With `swapRecord` dropped anywhere on the way out, the first put lands
+    /// unconditionally and the other client's edit is gone — which is what
+    /// the final-record assertions catch. Run on both backends: production is
+    /// on `rust`, and a backend whose put ignores the swap is the exact gap.
+    #[tokio::test]
+    async fn a_rename_that_loses_a_race_keeps_the_concurrent_edit_and_lands() {
+        for backend in RACE_BACKENDS {
+            let mut theirs = race_seed();
+            theirs["siteUrl"] = serde_json::json!("https://elsewhere.example/blog");
+            theirs["fetchHint"] = serde_json::json!("daily");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(theirs),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: a rename that converged was not reported as done"
+            );
+            assert_eq!(
+                repo.puts.len(),
+                2,
+                "{backend:?}: expected the refused put and one retry: {:?}",
+                repo.puts
+            );
+            assert_eq!(
+                repo.puts[0]["swapRecord"], "bafyreiversion0",
+                "{backend:?}: the first put did not name the CID it read: {}",
+                repo.puts[0]
+            );
+            assert_eq!(
+                repo.puts[1]["swapRecord"], "bafyreiversion1",
+                "{backend:?}: the retry did not name the RE-READ CID: {}",
+                repo.puts[1]
+            );
+            let landed = &repo.value;
+            // The reader's change landed...
+            assert_eq!(landed["title"], "New title", "{backend:?}: {landed}");
+            assert_eq!(landed["folder"], "Tech", "{backend:?}: {landed}");
+            // ...on top of the other client's, not over it.
+            assert_eq!(
+                landed["siteUrl"], "https://elsewhere.example/blog",
+                "{backend:?}: the concurrent edit was lost: {landed}"
+            );
+            assert_eq!(
+                landed["fetchHint"], "daily",
+                "{backend:?}: the concurrent edit was lost: {landed}"
+            );
+            // And #147's preservation still holds on the retried record.
+            assert_eq!(
+                landed["createdAt"], "2024-03-01T00:00:00.000Z",
+                "{backend:?}: {landed}"
+            );
+        }
+    }
+
+    /// **A rename the PDS refuses on every attempt is reported as a conflict,
+    /// never as done — and is not retried forever.** One retry, so at most two
+    /// puts; then the reader is told the subscription changed elsewhere.
+    #[tokio::test]
+    async fn a_rename_refused_on_every_swap_reports_the_conflict() {
+        for backend in RACE_BACKENDS {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                refuse_every_swap: true,
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_ne!(loc, "/", "{backend:?}: a refused rename reported success");
+            assert!(
+                loc.contains("changed%20elsewhere"),
+                "{backend:?}: expected the conflict flash, got {loc}"
+            );
+            assert!(
+                (1..=2).contains(&repo.puts.len()),
+                "{backend:?}: expected at most two put attempts, got {}",
+                repo.puts.len()
+            );
+            assert_eq!(
+                repo.value,
+                race_seed(),
+                "{backend:?}: the record changed though every put was refused"
+            );
+        }
+    }
+
+    /// **A put refused for any OTHER reason is not retried**, and keeps the
+    /// message it had: a re-read cannot fix a rejected record or an outage,
+    /// and calling it a conflict would send the reader looking for an edit
+    /// nobody made.
+    #[tokio::test]
+    async fn a_rename_refused_for_another_reason_is_not_retried() {
+        for backend in RACE_BACKENDS {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                fail_puts: Some((400, "InvalidRequest")),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: a non-swap refusal was retried"
+            );
+            assert!(
+                loc.contains("Could%20not%20save"),
+                "{backend:?}: expected the save-failed flash, got {loc}"
+            );
+            assert!(
+                !loc.contains("changed%20elsewhere"),
+                "{backend:?}: a non-swap refusal was reported as a conflict: {loc}"
+            );
+        }
     }
 
     /// **A rename must not destroy the fields the form never carries.**

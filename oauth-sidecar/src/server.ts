@@ -55,6 +55,7 @@
  *      collection?: string,                // required for list/create/put/delete
  *      rkey?:      string,                 // required for put/delete
  *      record?:    object,                 // required for create/put; the record body
+ *      swapRecord?: string,                // put only: CID compare-and-swap (#149)
  *      cursor?:    string,                 // list pagination
  *      limit?:     number,                 // list page size (default 100)
  *      writes?:    Array<{                 // required for applyWrites
@@ -104,6 +105,7 @@ import { clientIpKeyGenerator } from './client-ip.js';
 import { buildOAuthClient } from './oauth.js';
 import { Aead, NullCodec, type Codec } from './crypto.js';
 import { isAllowedCollection, ALLOWED_COLLECTION_ROOT } from './collections.js';
+import { putRecordOp, repoErrorReply } from './repo-ops.js';
 
 const cfg = loadConfig();
 // At-rest AEAD for stored tokens/state/JWK. In dev with no key set we use the
@@ -376,6 +378,8 @@ interface RepoBody {
   collection?: string;
   rkey?: string;
   record?: Record<string, unknown>;
+  /** put only: compare-and-swap on the record's current CID (#149). */
+  swapRecord?: string;
   cursor?: string;
   limit?: number;
   writes?: Array<{
@@ -463,19 +467,14 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         return { ok: true, data: res.data };
       }
       case 'put': {
-        if (!body.collection)
-          return badReq(reply, 'collection required for put');
-        if (!isAllowedCollection(body.collection))
-          return collectionDenied(reply, body.collection);
-        if (!body.rkey) return badReq(reply, 'rkey required for put');
-        if (!body.record) return badReq(reply, 'record required for put');
-        const res = await agent.com.atproto.repo.putRecord({
-          repo: did,
-          collection: body.collection,
-          rkey: body.rkey,
-          record: body.record,
-        });
-        return { ok: true, data: res.data };
+        // Validation and the call live in `repo-ops.ts`, where the
+        // `swapRecord` pass-through (#149) is tested.
+        const out = await putRecordOp(agent.com.atproto.repo, did, body);
+        if (!out.ok) {
+          reply.code(out.code);
+          return { ok: false, error: out.error, message: out.message };
+        }
+        return { ok: true, data: out.data };
       }
       case 'delete': {
         if (!body.collection)
@@ -539,17 +538,12 @@ app.post('/internal/repo', async (req: FastifyRequest, reply: FastifyReply) => {
         return badReq(reply, `unknown action ${String(action)}`);
     }
   } catch (err) {
-    // Surface the atproto XRPC error shape where possible.
-    const anyErr = err as { status?: number; error?: string; message?: string };
-    const status = typeof anyErr.status === 'number' ? anyErr.status : 502;
+    // Surface the atproto XRPC error shape where possible — status and error
+    // name both, so the Rust side can recognise `InvalidSwap` (#149).
+    const { status, body: errBody } = repoErrorReply(err);
     req.log.error({ err, did, action }, 'repo op failed');
     reply.code(status);
-    return {
-      ok: false,
-      error: anyErr.error ?? 'RepoOpFailed',
-      message: anyErr.message ?? String(err),
-      status,
-    };
+    return errBody;
   }
 });
 

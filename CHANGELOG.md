@@ -14,6 +14,53 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Renaming a subscription could erase another client's concurrent edit to
+  it (#149).** Since #147 the rename handler reads the subscription record,
+  applies the form's fields, and `putRecord`s the whole record back. Nothing
+  tied the write to the read, so if another atproto client wrote the same
+  record in between, our put replaced theirs and their change was gone with
+  nothing to say so.
+
+  **Mechanism.** `putRecord` now takes an optional `swap_record` on all three
+  write paths — the Rust OAuth client, the app-password `PdsClient`, and the
+  sidecar client — sent as `swapRecord` (the CID the caller read) and omitted
+  when `None`. The sidecar's `put` action validates it as a CID string and
+  passes it to `agent.com.atproto.repo.putRecord`. The PDS refuses a stale
+  swap with `400 InvalidSwap`; `atproto::is_invalid_swap` recognises that from
+  each client's structured `AtProtoError::Xrpc` by error name, including under
+  a context and under `ApplyWritesIncomplete`. A new
+  `list_subscriptions_with_cids` returns each record's CID, on both backends
+  and through `dispatch!`; `list_subscriptions_sorted` and its callers are
+  unchanged.
+
+  **The rename.** It reads with the CID and writes with `swapRecord` set to
+  it. On `InvalidSwap` it reads again, re-applies the form's fields — only
+  those, with #147's preservation of the rest — to the fresh record, re-runs
+  every gate against it, and writes once more under the new CID. A second
+  refusal is reported as "This subscription was changed elsewhere … Reload and
+  try again", never as success. Any other failure behaves as before: no
+  retry, same message. A PDS that lists a record without a CID (outside the
+  lexicon) gets the old unconditional write and a `warn` line.
+
+  **Other writers audited.** Folder rename and the read-state writes are
+  blind writes, not read-modify-writes, so they have no CID to compare and
+  are unchanged. The other read-then-write paths — unstar, OPML folder
+  creation, and the read-state reconcile — delete, create, or read existence
+  only.
+
+  Tested on both backends, end to end through the handler, against a fake
+  repo that enforces `swapRecord` the way the reference PDS does. One case
+  lands another client's edit between the read and the write: the edit
+  survives and the rename lands. One refuses every swap: at most two puts,
+  then the conflict message. The wire tests show `swapRecord` present when
+  given and absent otherwise on each client and on the sidecar. Each guard
+  was mutated, including the swap hardcoded to `None` on each backend, and
+  every mutation failed a test.
+
 ## 0.4.5 — 2026-10-06
 
 A teardown can now revoke the `rust` backend's sessions (#257): a new

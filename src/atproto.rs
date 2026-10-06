@@ -504,6 +504,34 @@ pub enum DidResolutionCause {
     NotAPublicTarget,
 }
 
+/// Whether a write failed because its `swapRecord` no longer matched — the
+/// record moved between the caller's read and its write (#149).
+///
+/// **Matched on the structured rejection, by error name.** Every client
+/// surfaces a PDS refusal as [`AtProtoError::Xrpc`]: the direct client at the
+/// root, the Rust OAuth client under a context, the sidecar client with the
+/// PDS's name carried through `/internal/repo`. `InvalidSwap` is the reference
+/// PDS's own name for a compare-and-swap mismatch and is answered 400; the
+/// name is the signal rather than the status, because the name is what says
+/// "someone else wrote this" and a 400 alone says nothing of the kind. A
+/// transport failure, or a message that merely contains the word, is not one.
+///
+/// The cause of an [`ApplyWritesIncomplete`] is walked explicitly, as
+/// `readstate::may_be_existence_mismatch` does: that wrapper's `source()`
+/// continues from its cause's SOURCE, so on the sidecar client — whose cause
+/// IS the `AtProtoError` — `err.chain()` alone would step over it.
+pub fn is_invalid_swap(err: &anyhow::Error) -> bool {
+    let wrapped = ApplyWritesIncomplete::of(err).map(|p| p.cause().chain());
+    err.chain()
+        .chain(wrapped.into_iter().flatten())
+        .any(|cause| {
+            matches!(
+                cause.downcast_ref::<AtProtoError>(),
+                Some(AtProtoError::Xrpc { error, .. }) if error == "InvalidSwap"
+            )
+        })
+}
+
 impl AtProtoError {
     /// True when the XRPC error is a "record not found" — handy for upsert paths
     /// that treat a missing record as "create instead of update".
@@ -1414,18 +1442,29 @@ impl PdsClient {
     /// handler in `web.rs` is in this crate. Private is what makes the wrappers
     /// a fact rather than a convention, and it costs nothing: nothing outside
     /// this module ever called it.
+    ///
+    /// `swap_record` is the CID the caller read the record at, sent as
+    /// `swapRecord`: the PDS then refuses the write with `InvalidSwap` (see
+    /// [`is_invalid_swap`]) if the record has moved since, rather than
+    /// silently overwriting another client's change (#149). `None` omits the
+    /// field — an unconditional write, which is what a write that read nothing
+    /// means.
     async fn put_record<T: Serialize>(
         &self,
         collection: &str,
         rkey: &str,
         record: &T,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        let body = json!({
+        let mut body = json!({
             "repo": self.did.as_ref(),
             "collection": collection,
             "rkey": rkey,
             "record": record,
         });
+        if let Some(cid) = swap_record {
+            body["swapRecord"] = json!(cid);
+        }
         self.repo_write("com.atproto.repo.putRecord", body).await
     }
 
@@ -1522,6 +1561,13 @@ impl PdsClient {
         self.list_typed(lexicon::nsid::SUBSCRIPTION).await
     }
 
+    /// Every [`Subscription`] with the CID it was listed at (#149).
+    pub async fn list_subscriptions_with_cids(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Subscription)>> {
+        self.list_typed_with_cids(lexicon::nsid::SUBSCRIPTION).await
+    }
+
     /// Create a [`Subscription`] record (subscribe to a feed).
     pub async fn create_subscription(
         &self,
@@ -1559,7 +1605,7 @@ impl PdsClient {
     /// Upsert a single [`ReadState`] cursor at its feed-derived rkey. For a
     /// batch of dirty cursors prefer [`flush_read_states`](Self::flush_read_states).
     pub async fn put_read_state(&self, rkey: &str, state: &ReadState) -> Result<WriteResult> {
-        self.put_record(lexicon::nsid::READ_STATE, rkey, state)
+        self.put_record(lexicon::nsid::READ_STATE, rkey, state, None)
             .await
     }
 
@@ -1582,12 +1628,25 @@ impl PdsClient {
     /// its rkey. Records that fail to deserialize are skipped with a warning
     /// (forward-compat: a future writer's extra fields shouldn't break login).
     async fn list_typed<T: DeserializeOwned>(&self, collection: &str) -> Result<Vec<(String, T)>> {
+        Ok(self
+            .list_typed_with_cids(collection)
+            .await?
+            .into_iter()
+            .map(|(rkey, _cid, value)| (rkey, value))
+            .collect())
+    }
+
+    /// [`list_typed`](Self::list_typed), keeping each record's CID (#149).
+    async fn list_typed_with_cids<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, Option<String>, T)>> {
         let records = self.list_all_records(collection).await?;
         let mut out = Vec::with_capacity(records.len());
         for rec in records {
             let rkey = rec.rkey().unwrap_or_default().to_string();
             match rec.parse::<T>() {
-                Ok(value) => out.push((rkey, value)),
+                Ok(value) => out.push((rkey, rec.cid, value)),
                 Err(e) => tracing::warn!(
                     collection,
                     uri = %rec.uri,
@@ -2045,14 +2104,21 @@ impl SidecarClient {
         collection: &str,
         rkey: &str,
         record: &T,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        let body = json!({
+        let mut body = json!({
             "did": did,
             "action": RepoAction::Put.as_str(),
             "collection": collection,
             "rkey": rkey,
             "record": record,
         });
+        // The sidecar validates it as a CID and passes it to `putRecord`; its
+        // `InvalidSwap` comes back through `repo`'s error envelope with the
+        // PDS's status and name intact (#149).
+        if let Some(cid) = swap_record {
+            body["swapRecord"] = json!(cid);
+        }
         let data = self.repo(body).await?;
         serde_json::from_value(data).context("parsing sidecar putRecord data")
     }
@@ -2116,6 +2182,16 @@ impl SidecarClient {
         self.list_typed(did, lexicon::nsid::SUBSCRIPTION).await
     }
 
+    /// Every [`Subscription`] with the CID it was listed at, unsorted — the
+    /// read half of a read-modify-write that puts with `swapRecord` (#149).
+    pub async fn list_subscriptions_with_cids(
+        &self,
+        did: &str,
+    ) -> Result<Vec<(String, Option<String>, Subscription)>> {
+        self.list_typed_with_cids(did, lexicon::nsid::SUBSCRIPTION)
+            .await
+    }
+
     /// Create a [`Subscription`] record (subscribe to a feed).
     pub async fn create_subscription(
         &self,
@@ -2155,7 +2231,7 @@ impl SidecarClient {
         rkey: &str,
         state: &ReadState,
     ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state)
+        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state, None)
             .await
     }
 
@@ -2219,8 +2295,9 @@ impl SidecarClient {
         did: &str,
         rkey: &str,
         sub: &crate::vetted::VettedSubscription,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::SUBSCRIPTION, rkey, sub)
+        self.put_record(did, lexicon::nsid::SUBSCRIPTION, rkey, sub, swap_record)
             .await
     }
 
@@ -2296,7 +2373,7 @@ impl SidecarClient {
         rkey: &str,
         folder: &Folder,
     ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder)
+        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder, None)
             .await
     }
 
@@ -2342,12 +2419,26 @@ impl SidecarClient {
         did: &str,
         collection: &str,
     ) -> Result<Vec<(String, T)>> {
+        Ok(self
+            .list_typed_with_cids(did, collection)
+            .await?
+            .into_iter()
+            .map(|(rkey, _cid, value)| (rkey, value))
+            .collect())
+    }
+
+    /// [`list_typed`](Self::list_typed), keeping each record's CID (#149).
+    async fn list_typed_with_cids<T: DeserializeOwned>(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<(String, Option<String>, T)>> {
         let records = self.list_all_records(did, collection).await?;
         let mut out = Vec::with_capacity(records.len());
         for rec in records {
             let rkey = rec.rkey().unwrap_or_default().to_string();
             match rec.parse::<T>() {
-                Ok(value) => out.push((rkey, value)),
+                Ok(value) => out.push((rkey, rec.cid, value)),
                 Err(e) => tracing::warn!(
                     collection,
                     uri = %rec.uri,
@@ -4047,7 +4138,7 @@ pub(crate) mod tests {
                     .unwrap_err()
                     .to_string(),
                 client
-                    .put_record(lexicon::nsid::SUBSCRIPTION, "rkey", &sub)
+                    .put_record(lexicon::nsid::SUBSCRIPTION, "rkey", &sub, None)
                     .await
                     .unwrap_err()
                     .to_string(),
@@ -6633,5 +6724,320 @@ pub(crate) mod tests {
         assert_eq!(call_sizes(&log), vec![200, 1]);
         let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
         assert_eq!(sent_rkeys(&log), want);
+    }
+
+    // -- #149: compare-and-swap putRecord ------------------------------------
+
+    pub(crate) const SWAP_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    pub(crate) const OLD_CID: &str = "bafyreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+
+    /// A server answering every request with `status` and `body`, logging each
+    /// request's JSON body (`Null` for a GET). Returns its loopback base URL,
+    /// a hostname routed to it (the guarded clients refuse loopback), and the
+    /// log.
+    pub(crate) async fn serve_status_json(
+        status: u16,
+        body: Value,
+    ) -> (String, String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = format!("swap-{}.atproto.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let log: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let sink = Arc::clone(&log);
+        let app = axum::Router::new().fallback(move |raw: axum::body::Bytes| {
+            let sink = Arc::clone(&sink);
+            let body = body.clone();
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&raw).unwrap_or(Value::Null));
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(body),
+                )
+                    .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            format!("http://{addr}"),
+            format!("http://{host}:{}", addr.port()),
+            log,
+        )
+    }
+
+    fn swap_direct_client(pds: &str) -> PdsClient {
+        PdsClient::new(
+            ssrf_test_client(),
+            pds,
+            SWAP_DID,
+            Auth::Session(SessionAuth {
+                did: SWAP_DID.to_string(),
+                handle: None,
+                access_jwt: "jwt".to_string(),
+                refresh_jwt: None,
+            }),
+        )
+    }
+
+    pub(crate) fn swap_sub() -> crate::vetted::VettedSubscription {
+        crate::vetted::VettedSubscription::new(&Subscription::new(
+            "https://example.com/feed.xml",
+            "2024-03-01T00:00:00.000Z",
+        ))
+    }
+
+    pub(crate) fn write_ok() -> Value {
+        json!({
+            "uri": format!("at://{SWAP_DID}/{}/rk", lexicon::nsid::SUBSCRIPTION),
+            "cid": "bafyreiafter",
+        })
+    }
+
+    /// **The direct client puts `swapRecord` on the wire when given one, and
+    /// leaves the key out entirely when not.** Asserted on the request the PDS
+    /// received: a value accepted by the method and dropped on the way out is
+    /// the failure mode, and only the bytes can show it.
+    #[tokio::test]
+    async fn direct_put_record_sends_swap_record_only_when_given() {
+        let (_, pds, log) = serve_status_json(200, write_ok()).await;
+        let client = swap_direct_client(&pds);
+
+        client
+            .put_record(
+                lexicon::nsid::SUBSCRIPTION,
+                "rk",
+                &swap_sub(),
+                Some(OLD_CID),
+            )
+            .await
+            .expect("put with a swap");
+        client
+            .put_record(lexicon::nsid::SUBSCRIPTION, "rk", &swap_sub(), None)
+            .await
+            .expect("put without a swap");
+
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["rkey"], "rk", "captured no usable body: {sent:?}");
+        assert_eq!(
+            sent[0]["swapRecord"], OLD_CID,
+            "the CID the caller read never reached the PDS: {}",
+            sent[0]
+        );
+        assert_eq!(sent[1]["rkey"], "rk");
+        assert!(
+            sent[1].get("swapRecord").is_none(),
+            "no swap was asked for, so none may be sent: {}",
+            sent[1]
+        );
+    }
+
+    /// The same, for the sidecar client — whose body is the sidecar's own
+    /// `/internal/repo` shape, not XRPC's.
+    #[tokio::test]
+    async fn sidecar_put_sends_swap_record_only_when_given() {
+        let (base, _, log) =
+            serve_status_json(200, json!({ "ok": true, "data": write_ok() })).await;
+        let client = SidecarClient::new(Client::new(), &base, &base, "secret");
+
+        client
+            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect("put with a swap");
+        client
+            .update_subscription(SWAP_DID, "rk", &swap_sub(), None)
+            .await
+            .expect("put without a swap");
+
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(
+            sent[0]["action"], "put",
+            "captured no usable body: {sent:?}"
+        );
+        assert_eq!(sent[0]["swapRecord"], OLD_CID, "{}", sent[0]);
+        assert_eq!(sent[1]["action"], "put");
+        assert!(sent[1].get("swapRecord").is_none(), "{}", sent[1]);
+    }
+
+    /// What the reference PDS answers a stale `swapRecord` with.
+    pub(crate) fn invalid_swap_xrpc() -> Value {
+        json!({ "error": "InvalidSwap", "message": format!("Record was at {OLD_CID}") })
+    }
+
+    /// The same refusal, after the sidecar has wrapped it.
+    pub(crate) fn invalid_swap_sidecar() -> Value {
+        json!({
+            "ok": false,
+            "error": "InvalidSwap",
+            "message": format!("Record was at {OLD_CID}"),
+            "status": 400,
+        })
+    }
+
+    /// **A refused swap is recognised from each client's real error.** Driven
+    /// through the clients against a server answering what the PDS answers,
+    /// not built by hand, so a client that changes how it wraps a rejection
+    /// breaks this rather than the rename that depends on it.
+    #[tokio::test]
+    async fn an_invalid_swap_is_recognised_from_both_clients_errors() {
+        let (_, pds, _) = serve_status_json(400, invalid_swap_xrpc()).await;
+        let err = swap_direct_client(&pds)
+            .put_record(
+                lexicon::nsid::SUBSCRIPTION,
+                "rk",
+                &swap_sub(),
+                Some(OLD_CID),
+            )
+            .await
+            .expect_err("the PDS refused the swap");
+        assert!(is_invalid_swap(&err), "direct client: {err:#}");
+
+        let (base, _, _) = serve_status_json(400, invalid_swap_sidecar()).await;
+        let err = SidecarClient::new(Client::new(), &base, &base, "secret")
+            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect_err("the PDS refused the swap");
+        assert!(is_invalid_swap(&err), "sidecar client: {err:#}");
+    }
+
+    /// **Every other failure is NOT a lost race.** Reading one of these as
+    /// `InvalidSwap` would re-read and retry a write the PDS refused for a
+    /// reason a retry cannot fix — or tell the reader someone else edited a
+    /// record nobody touched.
+    #[tokio::test]
+    async fn other_failures_are_not_an_invalid_swap() {
+        for (status, body) in [
+            (
+                400,
+                json!({ "error": "InvalidRequest", "message": "bad record" }),
+            ),
+            (400, json!({ "error": "RecordNotFound" })),
+            (500, json!({ "error": "InternalServerError" })),
+            (401, json!({ "error": "AuthRequired" })),
+            // The name in the MESSAGE, not the error field, is not the signal.
+            (
+                400,
+                json!({ "error": "InvalidRequest", "message": "InvalidSwap" }),
+            ),
+        ] {
+            let (_, pds, _) = serve_status_json(status, body.clone()).await;
+            let err = swap_direct_client(&pds)
+                .put_record(
+                    lexicon::nsid::SUBSCRIPTION,
+                    "rk",
+                    &swap_sub(),
+                    Some(OLD_CID),
+                )
+                .await
+                .expect_err("refused");
+            assert!(!is_invalid_swap(&err), "{status} {body}: {err:#}");
+        }
+
+        // A transport failure: nothing listening.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let err = SidecarClient::new(Client::new(), &dead, &dead, "secret")
+            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect_err("nothing is listening");
+        assert!(!is_invalid_swap(&err), "transport: {err:#}");
+
+        // A string that merely SAYS it is not a typed refusal.
+        assert!(!is_invalid_swap(&anyhow::anyhow!("InvalidSwap")));
+    }
+
+    /// The typed refusal is found wherever it sits in the chain: under a
+    /// context, and under [`ApplyWritesIncomplete`], whose `source()` skips its
+    /// cause's top error — the trap `readstate::may_be_existence_mismatch` fell
+    /// into on the merge with #240.
+    #[tokio::test]
+    async fn an_invalid_swap_is_found_under_context_and_a_split_batch() {
+        let refusal = || AtProtoError::Xrpc {
+            status: StatusCode::BAD_REQUEST,
+            error: "InvalidSwap".to_string(),
+            message: None,
+        };
+        assert!(is_invalid_swap(&anyhow::Error::new(refusal())));
+        assert!(is_invalid_swap(
+            &anyhow::Error::new(refusal()).context("com.atproto.repo.putRecord failed")
+        ));
+
+        let writes: Vec<WriteOp> = (0..3)
+            .map(|i| WriteOp::Delete {
+                collection: lexicon::nsid::SUBSCRIPTION.to_string(),
+                rkey: format!("rk{i}"),
+            })
+            .collect();
+        let err = apply_writes_chunked(&writes, |_| async { Err(refusal().into()) })
+            .await
+            .expect_err("the only call failed");
+        assert!(ApplyWritesIncomplete::of(&err).is_some(), "{err:#}");
+        assert!(is_invalid_swap(&err), "{err:#}");
+    }
+
+    /// Two subscription records with distinct CIDs, as `listRecords` returns.
+    pub(crate) fn two_subs_page() -> Value {
+        let rec = |rkey: &str, cid: &str, url: &str| {
+            json!({
+                "uri": format!("at://{SWAP_DID}/{}/{rkey}", lexicon::nsid::SUBSCRIPTION),
+                "cid": cid,
+                "value": {
+                    "$type": lexicon::nsid::SUBSCRIPTION,
+                    "url": url,
+                    "createdAt": "2024-03-01T00:00:00.000Z",
+                },
+            })
+        };
+        json!({ "records": [
+            rec("rk-a", "bafyreiaaaaaaaaaa", "https://a.example/feed.xml"),
+            rec("rk-b", "bafyreibbbbbbbbbb", "https://b.example/feed.xml"),
+        ] })
+    }
+
+    /// Asserts a CID listing paired each record with ITS CID.
+    pub(crate) fn assert_listed_with_cids(listed: &[(String, Option<String>, Subscription)]) {
+        let got: Vec<(&str, Option<&str>, &str)> = listed
+            .iter()
+            .map(|(rkey, cid, sub)| (rkey.as_str(), cid.as_deref(), sub.url.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "rk-a",
+                    Some("bafyreiaaaaaaaaaa"),
+                    "https://a.example/feed.xml"
+                ),
+                (
+                    "rk-b",
+                    Some("bafyreibbbbbbbbbb"),
+                    "https://b.example/feed.xml"
+                ),
+            ],
+            "each record must come back with the CID it was listed at"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_clients_list_subscriptions_with_the_cid_each_was_read_at() {
+        let (_, pds, _) = serve_status_json(200, two_subs_page()).await;
+        let listed = swap_direct_client(&pds)
+            .list_subscriptions_with_cids()
+            .await
+            .expect("direct listing");
+        assert_listed_with_cids(&listed);
+
+        let (base, _, _) =
+            serve_status_json(200, json!({ "ok": true, "data": two_subs_page() })).await;
+        let listed = SidecarClient::new(Client::new(), &base, &base, "secret")
+            .list_subscriptions_with_cids(SWAP_DID)
+            .await
+            .expect("sidecar listing");
+        assert_listed_with_cids(&listed);
     }
 }
