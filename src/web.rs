@@ -80,7 +80,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::lexicon::{self, Folder, Saved, Subscription};
 use crate::safe_link::SafeLink;
-use crate::sanitized_html::SanitizedHtml;
+use crate::sanitized_html::{BodyRender, BodyRenderer};
 use crate::{feed, store, AppState, Session, VERSION};
 
 // The OPML import/export module lives at `src/opml.rs` but isn't declared in the
@@ -1735,15 +1735,18 @@ struct EntryTemplate {
     /// all 679 tests still green. `None` is the refusal: the template's
     /// no-URL branch already renders a disabled open-original button.
     url: Option<SafeLink>,
-    /// The article body, **re-sanitized for this render** (#151).
+    /// The article body, **re-sanitized for this render** (#151), or the
+    /// reason it is not shown.
     ///
     /// Not the stored `String`: that reached the page through `|safe` and was
     /// safe only because `feed.rs` had sanitized it at ingest — the same
     /// every-writer-remembers guard `url` above used to rest on, and the more
-    /// dangerous of the two. A [`SanitizedHtml`] can only be built by running
+    /// dangerous of the two. A `SanitizedHtml` can only be built by running
     /// the ingest sanitizer, so the template renders it unescaped without a
-    /// `|safe` on a raw string anywhere.
-    content_html: Option<SanitizedHtml>,
+    /// `|safe` on a raw string anywhere. The other two variants are the
+    /// renderer's bounds: a body over the stored size cap, or no sanitizer
+    /// permit in time; the template shows a note and the original's link.
+    content_html: Option<BodyRender>,
     read: bool,
     starred: bool,
     /// The query string to carry the reading context back to the list.
@@ -2937,10 +2940,11 @@ async fn entry_view(
 
     let back_qs = scope_query(&q);
 
-    // Re-sanitize the stored body for this render, off the async runtime: the
-    // sanitizer can take seconds on a hostile body (#226).
+    // Re-sanitize the stored body for this render, through the process-wide
+    // renderer: size-capped, at most two cleans at once, cached by content
+    // hash, all off the async runtime (#151).
     let content_html = match entry.content_html.clone() {
-        Some(raw) => Some(SanitizedHtml::clean_off_runtime(raw).await?),
+        Some(raw) => Some(BodyRenderer::shared().render(raw).await?),
         None => None,
     };
 
@@ -9884,8 +9888,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Hostile attributes on tags the sanitizer keeps first, so they reach
-        // it; then tags it removes, where the render-cost scan stops.
+        // Hostile attributes on tags the sanitizer keeps, and tags it removes.
         let hostile_body = concat!(
             "<p>kept <b>bold</b></p>",
             r#"<img src="x" onerror="alert(2)">"#,
@@ -9920,13 +9923,15 @@ mod tests {
                     content_html: Some(clean_body.to_string()),
                     ..Default::default()
                 },
+                // One byte over the bound ingest enforces on what it stores:
+                // only a writer that skipped `feed.rs` can produce this row.
                 store::NewEntry {
-                    guid: "deep-body".to_string(),
-                    title: Some("Deep body".to_string()),
+                    guid: "oversize-body".to_string(),
+                    title: Some("Oversize body".to_string()),
                     published: Some("2026-07-09T00:00:00Z".to_string()),
                     content_html: Some(format!(
-                        "<p>start</p>{}DEEP",
-                        "<div>".repeat(crate::sanitized_html::MAX_RENDER_DEPTH + 1)
+                        "<p>{}OVERSIZE</p>",
+                        "a".repeat(crate::sanitized_html::MAX_RENDER_HTML_BYTES)
                     )),
                     ..Default::default()
                 },
@@ -10016,21 +10021,83 @@ mod tests {
             "an already-clean stored body did not render byte-identically: {clean}",
         );
         assert!(
-            !clean.contains("truncated-note"),
-            "a whole body was marked as cut: {clean}",
+            !clean.contains("body-too-large") && !clean.contains("body-unavailable"),
+            "a whole, ordinary body was shown as refused: {clean}",
         );
 
-        // Past the render budget: cut before the sanitizer, and the reader is
-        // told the rest is at the original rather than left at a silent stop.
-        let deep = prose(id_of("deep-body")).await;
+        // Over the stored size cap: not given to the sanitizer, and the reader
+        // is told why rather than shown a silently empty body.
+        let over = prose(id_of("oversize-body")).await;
         assert!(
-            !deep.contains("DEEP"),
-            "nesting past the depth budget was rendered: {deep}",
+            !over.contains("OVERSIZE") && !over.contains(&"a".repeat(64)),
+            "an over-size stored body was rendered: {}…",
+            &over[..over.len().min(300)],
         );
         assert!(
-            deep.contains("truncated-note"),
-            "a cut body did not say so: {deep}",
+            over.contains("body-too-large"),
+            "an over-size body did not say so: {over}",
         );
+    }
+
+    /// **Each of the renderer's three outcomes has its own branch in
+    /// `entry.html`.** The handler test above drives the first two through the
+    /// real path; `Unavailable` cannot be forced there without starving the
+    /// process-wide permits that every other test shares, so the template is
+    /// rendered directly for all three.
+    #[test]
+    fn the_reader_template_renders_each_body_outcome() {
+        let config = Config::default();
+        let user = CurrentUser {
+            did: "did:plc:bodyoutcomes".to_string(),
+            handle: None,
+            sid: None,
+        };
+        let page = |content_html: Option<BodyRender>| {
+            EntryTemplate {
+                card: Card::private(&config),
+                version: VERSION,
+                repo_url: REPO_URL,
+                kofi_url: KOFI_URL,
+                nav: build_nav(&user, "unread", String::new(), vec![], vec![], false),
+                id: 1,
+                title: "T".to_string(),
+                feed_title: "F".to_string(),
+                author: None,
+                published: String::new(),
+                url: SafeLink::external_opt("https://orig.example/a"),
+                content_html,
+                read: false,
+                starred: false,
+                back_qs: String::new(),
+                prev_id: None,
+                next_id: None,
+                oob: false,
+            }
+            .render()
+            .unwrap()
+        };
+
+        let html = page(Some(BodyRender::Html(
+            crate::sanitized_html::SanitizedHtml::clean("<p>body <b>here</b></p>"),
+        )));
+        assert!(html.contains("<p>body <b>here</b></p>"), "{html}");
+        assert!(!html.contains("body-too-large") && !html.contains("body-unavailable"));
+
+        let too_large = page(Some(BodyRender::TooLarge));
+        assert!(too_large.contains("body-too-large"), "{too_large}");
+        assert!(too_large.contains("too large to display"), "{too_large}");
+        assert!(!too_large.contains("body-unavailable"));
+
+        let unavailable = page(Some(BodyRender::Unavailable));
+        assert!(unavailable.contains("body-unavailable"), "{unavailable}");
+        assert!(
+            unavailable.contains("temporarily unavailable"),
+            "{unavailable}"
+        );
+        assert!(!unavailable.contains("body-too-large"));
+
+        let none = page(None);
+        assert!(none.contains("has no stored content"), "{none}");
     }
 
     /// **The outage fallback must not widen what the caller can READ — and the

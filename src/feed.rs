@@ -1574,15 +1574,6 @@ pub(crate) fn sanitize_html(raw: &str) -> String {
     ammonia::clean(raw)
 }
 
-/// The element names [`sanitize_html`]'s policy keeps, read from the same
-/// `ammonia` builder `ammonia::clean` uses, so it cannot drift from it.
-/// `sanitized_html`'s render-cost scanner accepts only these.
-pub(crate) fn sanitizer_tags() -> &'static std::collections::HashSet<&'static str> {
-    static TAGS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
-        std::sync::LazyLock::new(|| ammonia::Builder::default().clone_tags());
-    &TAGS
-}
-
 /// Render **plain text** into the HTML the `content_html` column holds.
 ///
 /// **Not [`sanitize_html`].** `ammonia::clean` parses its input as markup, so a
@@ -3562,7 +3553,8 @@ mod tests {
     }
 
     /// **What re-cleaning a stored body at render costs (#151).** Not a test: a
-    /// measurement, kept so the numbers in the PR can be reproduced.
+    /// measurement, kept so the numbers in the PR and CHANGELOG can be
+    /// reproduced.
     ///
     /// ```text
     /// FEATHER_BENCH_FEEDS=/path/to/dir/of/feed/files \
@@ -3571,18 +3563,18 @@ mod tests {
     ///
     /// 1. Typical bodies: real feed documents from that directory, put through
     ///    `normalize_entry` so each is exactly what ingest would store, then
-    ///    re-cleaned. Also counts bodies the re-clean changed or cut.
-    /// 2. Unbudgeted: #226's quadratic inputs in their stored (fixed-point)
-    ///    form, up to the 2 MiB stored bound, through the bare sanitizer — what
-    ///    a page view would cost with no render budgets.
+    ///    re-cleaned with `SanitizedHtml::clean`. Also counts bodies the
+    ///    re-clean changed.
+    /// 2. Pathological bodies: #226's quadratic inputs in their stored
+    ///    (fixed-point) form, up to the 2 MiB stored bound, through the bare
+    ///    sanitizer. Ingest never writes these; they are what the renderer's
+    ///    size cap, permits and cache are sized against.
     ///    `FEATHER_BENCH_UNCAPPED_MAX=<bytes>` skips the larger sizes (2 MiB of
-    ///    nesting takes ~40 s).
-    /// 3. Budgeted: the worst shapes found, each ~2 MiB, through
-    ///    `SanitizedHtml::clean` — what a page view costs now.
+    ///    nesting takes ~37 s).
     #[test]
     #[ignore = "benchmark; see the doc comment"]
     fn render_reclean_cost() {
-        use crate::sanitized_html::{SanitizedHtml, MAX_RENDER_DEPTH};
+        use crate::sanitized_html::SanitizedHtml;
         use std::time::{Duration, Instant};
 
         fn pct(sorted: &[Duration], p: f64) -> Duration {
@@ -3592,7 +3584,7 @@ mod tests {
         if let Ok(dir) = std::env::var("FEATHER_BENCH_FEEDS") {
             let mut times = Vec::new();
             let mut sizes = Vec::new();
-            let (mut changed, mut cut, mut files) = (0usize, 0usize, 0usize);
+            let (mut changed, mut files) = (0usize, 0usize);
             for path in std::fs::read_dir(&dir).unwrap() {
                 let bytes = std::fs::read(path.unwrap().path()).unwrap();
                 let Ok(parsed) = parse_feed(&bytes) else {
@@ -3613,7 +3605,6 @@ mod tests {
                     }
                     let out = out.unwrap();
                     changed += usize::from(out.as_str() != stored);
-                    cut += usize::from(out.is_truncated());
                     times.push(best);
                     sizes.push(stored.len());
                 }
@@ -3628,7 +3619,7 @@ mod tests {
                 sizes[sizes.len() - 1],
             );
             println!(
-                "  re-clean p50 {:?}, p99 {:?}, max {:?}; changed by re-cleaning: {changed}; cut by the budgets: {cut}",
+                "  re-clean p50 {:?}, p99 {:?}, max {:?}; changed by re-cleaning: {changed}",
                 pct(&times, 0.5),
                 pct(&times, 0.99),
                 times[times.len() - 1],
@@ -3663,187 +3654,12 @@ mod tests {
                 let t = Instant::now();
                 let out = sanitize_html(&stored);
                 println!(
-                    "unbudgeted {name:>13} {:>8} B: {:?} (fixed point: {})",
+                    "pathological {name:>13} {:>8} B: {:?} (fixed point: {})",
                     stored.len(),
                     t.elapsed(),
                     out == stored
                 );
             }
-        }
-
-        let fill = |unit: &str| unit.repeat(bound / unit.len());
-        let at_depth = |open: &str, close: &str| {
-            format!(
-                "{}x{}",
-                open.repeat(MAX_RENDER_DEPTH),
-                close.repeat(MAX_RENDER_DEPTH)
-            )
-        };
-        let worst = [
-            ("open <div> run", fill("<div>")),
-            ("open <ul><li> run", fill("<ul><li>")),
-            ("open <blockquote> run", fill("<blockquote>")),
-            (
-                "<div> at depth bound, repeated",
-                fill(&at_depth("<div>", "</div>")),
-            ),
-            (
-                "<li> at depth bound, repeated",
-                fill(&format!(
-                    "{}x{}",
-                    "<ul><li>".repeat(MAX_RENDER_DEPTH / 2),
-                    "</li></ul>".repeat(MAX_RENDER_DEPTH / 2)
-                )),
-            ),
-            (
-                "<blockquote> at depth bound, rep.",
-                fill(&at_depth("<blockquote>", "</blockquote>")),
-            ),
-            (
-                "misnested formatting (not ingest)",
-                format!(
-                    "<p>{}</p>{}",
-                    (0..MAX_RENDER_DEPTH - 2)
-                        .map(|i| format!(r#"<b title="{i}">"#))
-                        .collect::<String>(),
-                    "<p>x</p>".repeat(bound / 64 / 8)
-                ),
-            ),
-            (
-                "&amp; then text",
-                format!(
-                    "<p>{}{}",
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_010)
-                ),
-            ),
-            (
-                "&amp; + 95 a, interleaved",
-                format!("<p>{}", fill(&format!("&amp;{}", "a".repeat(95)))),
-            ),
-            (
-                "U+00A0 then text",
-                format!(
-                    "<p>{}{}",
-                    "\u{a0}".repeat(20_000),
-                    "a".repeat(bound - 40_010)
-                ),
-            ),
-            ("dense &amp;", format!("<p>{}", fill("&amp;"))),
-            ("dense U+00A0", format!("<p>{}", fill("\u{a0}"))),
-            ("plain text", format!("<p>{}", fill("a"))),
-            // Review of #273: tokens the parser ignores, between the `&`s and
-            // the text that follows them.
-            (
-                "&amp; <!DOCTYPE x> text",
-                format!(
-                    "<p>{}<!DOCTYPE x>{}",
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_020)
-                ),
-            ),
-            (
-                "&amp; <body> text",
-                format!(
-                    "<p>{}<body>{}",
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_020)
-                ),
-            ),
-            (
-                "&amp; <html> text",
-                format!(
-                    "<p>{}<html>{}",
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_020)
-                ),
-            ),
-            (
-                "U+00A0 <body> text",
-                format!(
-                    "<p>{}<body>{}",
-                    "\u{a0}".repeat(20_000),
-                    "a".repeat(bound - 40_020)
-                ),
-            ),
-            (
-                "&amp; <font> text",
-                format!(
-                    "<p>{}<font>{}",
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_020)
-                ),
-            ),
-            (
-                "li in li, formatting re-opened",
-                format!(
-                    "<ul><li>{}{}",
-                    (0..200)
-                        .map(|i| format!(r#"<b title="{i}">"#))
-                        .collect::<String>(),
-                    "<li>x</li>".repeat(bound / 12)
-                ),
-            ),
-            (
-                "one tag, many attributes",
-                format!(
-                    "<p{}>x</p>",
-                    (0..bound / 10)
-                        .map(|i| format!(" a{i:07}"))
-                        .collect::<String>()
-                ),
-            ),
-            (
-                "32 attributes per tag, repeated",
-                fill(&format!(
-                    "<b{}>x</b>",
-                    (0..crate::sanitized_html::MAX_RENDER_ATTRIBUTES)
-                        .map(|i| format!(" a{i}"))
-                        .collect::<String>()
-                )),
-            ),
-            (
-                "one tag, one attribute repeated",
-                format!("<p{}>x</p>", " title".repeat(bound / 7)),
-            ),
-            (
-                "&amp; then text, in an attribute",
-                format!(
-                    r#"<p title="{}{}">x</p>"#,
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound - 100_100)
-                ),
-            ),
-            (
-                "U+00A0 then text, in an attribute",
-                format!(
-                    r#"<p title="{}{}">x</p>"#,
-                    "\u{a0}".repeat(20_000),
-                    "a".repeat(bound - 40_100)
-                ),
-            ),
-            // Both budgets spent in one body: depth-bound nesting, then a text
-            // node at the cost budget.
-            (
-                "depth bound + text budget",
-                format!(
-                    "{}<p>{}{}",
-                    at_depth("<div>", "</div>").repeat(bound / 2 / (11 * MAX_RENDER_DEPTH)),
-                    "&amp;".repeat(20_000),
-                    "a".repeat(bound / 2 - 100_100)
-                ),
-            ),
-        ];
-        for (name, input) in &worst {
-            let t = Instant::now();
-            let out = SanitizedHtml::clean(input);
-            println!(
-                "budgeted {name:>32} ({:>7} B in, {:>7} B out, cut {}): {:?}",
-                input.len(),
-                out.as_str().len(),
-                out.is_truncated(),
-                t.elapsed()
-            );
         }
     }
 }

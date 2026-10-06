@@ -1,12 +1,41 @@
 //! The reader view's article body.
 //!
-//! **This is its own module because of the private fields**, for the reason
+//! **This is its own module because of the private field**, for the reason
 //! `safe_link.rs` gives: a private field is private to the MODULE, so a type
 //! declared in `web.rs` could be built beside its own constructor there and the
 //! guarantee would be a convention again.
+//!
+//! Two things live here. [`SanitizedHtml`] is the type: markup that has been
+//! through the ingest sanitizer in this process. [`BodyRenderer`] is the path a
+//! stored body takes to become one at render, with the three bounds that keep
+//! a pathological row from costing more than its own page view: a size cap, a
+//! concurrency limit and a cache.
+//!
+//! **Why bounds, and why these.** Ingest's output re-cleans cheaply: on 545
+//! real bodies from 20 public feeds, p50 31 µs, p99 1.1 ms, max 3.5 ms (a
+//! 561 KB body). A body that is expensive to clean cannot come from ingest,
+//! which sanitizes everything it stores: it can only come from a bug or from
+//! someone already able to write the database. For such a row the sanitizer
+//! can be quadratic — measured, a 2 MiB body of nested `<div>`s takes ~37 s,
+//! a 2 MiB `&` run 2.4 s. An earlier version of this module tried to *predict*
+//! that cost with a scan that re-implemented html5ever's tree-construction
+//! rules in front of html5ever; three review rounds each found a mismatch,
+//! and the last found the scan cutting real articles (`li` in `li` after a
+//! stripped `<section>`, a 245 KB `<pre>` XML listing, `<rt>` inside a
+//! `<span>` in `<ruby>`). The bounds here do not predict anything: they cap
+//! what one body can cost everyone else, and leave the worst case where it
+//! belongs, on the slow row's own page.
 
-/// Article-body HTML that has been through the sanitizer **in this process,
-/// for this render** — and so can be emitted into a page without escaping.
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
+use tracing::warn;
+
+/// Article-body HTML that has been through the sanitizer **in this process**
+/// — and so can be emitted into a page without escaping.
 ///
 /// **Why it exists (#151).** `entries.content_html` reached `entry.html` as a
 /// raw `Option<String>` rendered with `|safe` — the one expression in the
@@ -17,7 +46,7 @@
 ///
 /// **The guarantee cannot ride through storage.** The column is SQLite `TEXT`,
 /// so a type set at ingest means nothing by the time a row is read back. It is
-/// re-established at render instead: the only constructors run the ingest
+/// re-established at render instead: the only constructor runs the ingest
 /// sanitizer, `feed::sanitize_html`, over whatever the row holds. A newtype
 /// that wrapped the stored string without cleaning it was rejected in the
 /// issue as a guarantee in name only.
@@ -31,21 +60,15 @@
 ///   browser: a literal U+00A0 in a standard.site plain-text summary comes
 ///   back as `&nbsp;`, and a table whose `<tfoot>` the policy stripped gains
 ///   the `<tbody>` a browser would build around those rows anyway.
-/// - **Bounded cost.** The sanitizer is quadratic on inputs a hostile feed can
-///   store within ingest's 2 MiB bound (#226): measured, a stored 2 MiB of
-///   nested `<div>`s took ~40 s to re-clean. So render cleans only the prefix
-///   of the stored body within [`MAX_RENDER_HTML_BYTES`], [`MAX_RENDER_DEPTH`],
-///   [`MAX_RENDER_TEXT_COST`] and [`MAX_RENDER_ATTRIBUTES`], in a shape the
-///   sanitizer itself writes — worst measured case ~140 ms — and marks a body
-///   it cut so the reader can point at the original. No real article measured
-///   was cut.
+/// - **Bounded blast radius.** Not here: in [`BodyRenderer`], which is how the
+///   reader's handler gets one of these from a stored row.
 ///
 /// There is no `From<String>`, no `Deref`, and no public field. A raw string
 /// does not become one — not by struct literal (E0451, private field):
 ///
 /// ```compile_fail,E0451
 /// use feather_reader::sanitized_html::SanitizedHtml;
-/// let _ = SanitizedHtml { html: String::from("<script>alert(1)</script>"), truncated: false };
+/// let _ = SanitizedHtml { html: String::from("<script>alert(1)</script>") };
 /// ```
 ///
 /// and not by conversion (E0277, no `From`):
@@ -64,583 +87,23 @@
 /// ```
 pub struct SanitizedHtml {
     html: String,
-    truncated: bool,
-}
-
-/// The most of a stored body one page view will sanitize: ingest's own stored
-/// bound, so no body ingest wrote is cut for size.
-///
-/// **Size alone does not bound the cost**, which is why the two budgets below
-/// exist. Measured in release (`feed::tests::render_reclean_cost`): re-cleaning
-/// 545 real bodies from 20 real feeds took p50 31 µs, p99 1.1 ms, max 3.5 ms
-/// (a 561 KB body), none of them cut. But the sanitizer is quadratic on some inputs a hostile
-/// feed can store within 2 MiB (#226) — a stored 2 MiB of nested `<div>`s
-/// took ~40 s to re-clean, a 2 MiB `&` run 2.4 s, a U+00A0 run 3.4 s — and
-/// even a 256 KiB cap still left 3–4.7 s for runs of opening tags. Those costs
-/// come from nesting depth and from `&` inside long text, not from size.
-pub const MAX_RENDER_HTML_BYTES: usize = crate::feed::MAX_CONTENT_HTML_BYTES;
-
-/// The deepest element nesting one page view will sanitize.
-///
-/// The parser's work per element grows with how many elements are open around
-/// it, so nesting is quadratic: 13 K nested `<div>`s took 189 ms, 52 K took
-/// 3 s. Real articles nest a few dozen deep at most; this is several times
-/// that. The worst case it leaves — 2 MiB of elements all nested this deep —
-/// measured 70–140 ms, against 4.7 s for 256 KiB of open tags unbounded.
-pub const MAX_RENDER_DEPTH: usize = 256;
-
-/// The most text-node work one page view will sanitize, in the units below.
-///
-/// **Measured, the cost of a `&` (so every entity: `&amp;`, `&lt;`,
-/// `&nbsp;`, `&#160;`) or a literal U+00A0 is proportional to the bytes that
-/// follow it in the same text node.** 20 K `&amp;` followed by 1.9 MB of text
-/// took 1.07 s; the same text followed by the same `&amp;`s took 9.7 ms; and
-/// the same `&amp;`s each wrapped in their own `<p>` before the text took
-/// 9.3 ms — a tag ends the text node, and with it the cost. So the cost of a
-/// body is counted as, for every such character, the bytes after it up to the
-/// end of its text node, summed. 3.8 × 10¹⁰ of those units took ~1.07 s; this
-/// budget is ~60 ms of them. A real 100 KB article with 2,000 entities is
-/// around 10⁸ — twenty times under it.
-///
-/// An attribute value is a run of the same kind (20 K `&amp;` then 2 MB of
-/// text in one `title` took 1.1 s), so its cost counts against the same
-/// budget. Only tags that really end a text node end a run — see
-/// `render_cut` for why that is an allowlist.
-pub const MAX_RENDER_TEXT_COST: u64 = 1 << 31;
-
-/// The most attributes one tag may carry into the sanitizer.
-///
-/// The parser checks each attribute name against every one before it on the
-/// same tag, so a tag's cost is quadratic in its attribute count: one `<p>`
-/// with ~190 K distinct attributes took 6.6 s. The sanitizer's policy keeps
-/// at most six attributes on any element (`img`: `src`, `alt`, `width`,
-/// `height`, `lang`, `title`) plus the `rel` it adds to links, so nothing
-/// ingest stores comes near this.
-pub const MAX_RENDER_ATTRIBUTES: usize = 32;
-
-/// Elements the serializer writes without a closing tag, so they never stay
-/// open — the HTML serializer's own list.
-fn is_void(name: &str) -> bool {
-    matches!(
-        name,
-        "area"
-            | "base"
-            | "basefont"
-            | "bgsound"
-            | "br"
-            | "col"
-            | "embed"
-            | "frame"
-            | "hr"
-            | "img"
-            | "input"
-            | "keygen"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    )
-}
-
-/// The tree builder's "special" elements, less `address`, `div` and `p`: what
-/// stops its search for an open `li`, `dd` or `dt` that a new one would close.
-fn stops_list_item_search(name: &str) -> bool {
-    matches!(
-        name,
-        "applet"
-            | "area"
-            | "article"
-            | "aside"
-            | "base"
-            | "basefont"
-            | "bgsound"
-            | "blockquote"
-            | "body"
-            | "br"
-            | "button"
-            | "caption"
-            | "center"
-            | "col"
-            | "colgroup"
-            | "dd"
-            | "details"
-            | "dir"
-            | "dl"
-            | "dt"
-            | "embed"
-            | "fieldset"
-            | "figcaption"
-            | "figure"
-            | "footer"
-            | "form"
-            | "frame"
-            | "frameset"
-            | "h1"
-            | "h2"
-            | "h3"
-            | "h4"
-            | "h5"
-            | "h6"
-            | "head"
-            | "header"
-            | "hgroup"
-            | "hr"
-            | "html"
-            | "iframe"
-            | "img"
-            | "input"
-            | "keygen"
-            | "li"
-            | "link"
-            | "listing"
-            | "main"
-            | "marquee"
-            | "menu"
-            | "meta"
-            | "nav"
-            | "noembed"
-            | "noframes"
-            | "noscript"
-            | "object"
-            | "ol"
-            | "param"
-            | "plaintext"
-            | "pre"
-            | "script"
-            | "search"
-            | "section"
-            | "select"
-            | "source"
-            | "style"
-            | "summary"
-            | "table"
-            | "tbody"
-            | "td"
-            | "template"
-            | "textarea"
-            | "tfoot"
-            | "th"
-            | "thead"
-            | "title"
-            | "tr"
-            | "track"
-            | "ul"
-            | "wbr"
-            | "xmp"
-    )
-}
-
-/// Start tags that close an open `<p>` "in button scope" — implicitly,
-/// popping whatever is open inside it.
-fn closes_p(name: &str) -> bool {
-    matches!(
-        name,
-        "address"
-            | "article"
-            | "aside"
-            | "blockquote"
-            | "center"
-            | "details"
-            | "dialog"
-            | "dir"
-            | "div"
-            | "dl"
-            | "fieldset"
-            | "figcaption"
-            | "figure"
-            | "footer"
-            | "header"
-            | "hgroup"
-            | "main"
-            | "menu"
-            | "nav"
-            | "ol"
-            | "p"
-            | "search"
-            | "section"
-            | "summary"
-            | "ul"
-            | "h1"
-            | "h2"
-            | "h3"
-            | "h4"
-            | "h5"
-            | "h6"
-            | "pre"
-            | "listing"
-            | "form"
-            | "table"
-            | "hr"
-            | "xmp"
-            | "plaintext"
-            | "li"
-            | "dd"
-            | "dt"
-    )
-}
-
-/// Elements that end the "button scope" search for an open `<p>`.
-fn ends_button_scope(name: &str) -> bool {
-    matches!(
-        name,
-        "applet"
-            | "caption"
-            | "html"
-            | "table"
-            | "td"
-            | "th"
-            | "marquee"
-            | "object"
-            | "template"
-            | "button"
-    )
-}
-
-/// Where the parser moves text and non-table elements OUT of the table
-/// ("foster parenting"), onto whatever precedes it.
-fn is_table_context(name: &str) -> bool {
-    matches!(
-        name,
-        "table" | "tbody" | "thead" | "tfoot" | "tr" | "colgroup"
-    )
-}
-
-fn is_heading(name: &str) -> bool {
-    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
-}
-
-/// The parent an element must be directly inside for the parser to insert
-/// it where it stands; `None` for an element with no such rule. Table parts
-/// anywhere else are dropped or moved, and ruby parts close what is open.
-///
-/// `<tr>` directly in `<table>` is allowed although the parser wraps it in an
-/// implied `<tbody>`: the sanitizer's policy keeps `tr` but not `tfoot`, so
-/// its own output has that shape (found by a fixture). The wrapper is one
-/// element the scanner does not count, per table — it closes and moves
-/// nothing.
-fn required_parent(name: &str) -> Option<&'static [&'static str]> {
-    Some(match name {
-        "caption" | "colgroup" | "thead" | "tbody" | "tfoot" => &["table"],
-        "tr" => &["table", "tbody", "thead", "tfoot"],
-        "td" | "th" => &["tr"],
-        "col" => &["colgroup"],
-        "rt" | "rp" => &["ruby", "rtc"],
-        "rtc" => &["ruby"],
-        _ => return None,
-    })
-}
-
-/// One open element, with what the tree builder's scope searches would find
-/// from it downward — kept per level so each search is O(1), not a walk.
-#[derive(Clone, Copy, Default)]
-struct Open {
-    name: &'static str,
-    /// A `<p>` is open "in button scope".
-    p_in_scope: bool,
-    /// An open `<li>` a new `<li>` would close.
-    li_open: bool,
-    /// An open `<dd>` or `<dt>` a new one would close.
-    dd_open: bool,
-    /// An open `<a>` since the last table cell or caption.
-    a_open: bool,
-}
-
-impl Open {
-    fn child(self, name: &'static str) -> Self {
-        let lists = !stops_list_item_search(name);
-        Self {
-            name,
-            p_in_scope: name == "p" || (!ends_button_scope(name) && self.p_in_scope),
-            li_open: name == "li" || (lists && self.li_open),
-            dd_open: matches!(name, "dd" | "dt") || (lists && self.dd_open),
-            a_open: name == "a" || (!matches!(name, "td" | "th" | "caption") && self.a_open),
-        }
-    }
-
-    /// Whether the parser, with this element on top of its stack, inserts
-    /// `name` as a new element exactly here — closing nothing, moving
-    /// nothing, dropping nothing. Only then does the scanner's model of the
-    /// parser's stack and text nodes stay exact.
-    fn inserts_in_place(self, name: &str) -> bool {
-        match required_parent(name) {
-            Some(parents) => return parents.contains(&self.name),
-            None if is_table_context(self.name) => return false,
-            None => {}
-        }
-        if closes_p(name) && self.p_in_scope {
-            return false;
-        }
-        match name {
-            "li" => !self.li_open,
-            "dd" | "dt" => !self.dd_open,
-            "a" => !self.a_open,
-            h if is_heading(h) => !is_heading(self.name),
-            _ => true,
-        }
-    }
-}
-
-/// The longest prefix of `raw` (a byte index on a character boundary) that
-/// stays within [`MAX_RENDER_HTML_BYTES`], [`MAX_RENDER_DEPTH`] and
-/// [`MAX_RENDER_TEXT_COST`], and that the scanner can model exactly.
-///
-/// **A cost estimate, not a security control.** It decides how much of `raw`
-/// the sanitizer is given; the sanitizer decides what is safe, on every byte
-/// it is given.
-///
-/// **It accepts only what ingest stores — the sanitizer's own serialized
-/// output — and cuts at the first thing that is not.** The cost model needs
-/// the parser's open-element stack and text nodes, and those are only
-/// predictable when every tag is one the parser inserts exactly where it
-/// stands. A first version reset its text-node count at any `<letter` or
-/// `<!`, and review found the parser ignores some of those in body
-/// (`<!DOCTYPE>`, `<body>`, `<html>`: 1.1 s uncut). Listing what the parser
-/// ignores is a denylist, and the next missed entry reopens the hole. So
-/// this is an allowlist:
-///
-/// - a tag must be one the sanitizer's policy keeps (`feed::sanitizer_tags`,
-///   read from the same `ammonia` builder) — no comments, doctypes,
-///   processing instructions, `<body>`, `<font>`, or bare `<`, none of which
-///   the sanitizer ever writes;
-/// - a start tag must not make the parser close, move or drop anything:
-///   no table part outside its table part, no text or other element directly
-///   in a table, no `<li>` in an open `<li>`, no block in an open `<p>`, no
-///   `<a>` in an open `<a>`, no heading directly in a heading;
-/// - an end tag must close the innermost open element.
-///
-/// Within that, every accepted tag starts or ends an element, so it ends the
-/// current text node: the count resets there and nowhere else. A cut never
-/// splits a tag, and never an entity. Measured on 545 real bodies, nothing
-/// ingest stored was cut.
-fn render_cut(raw: &str) -> usize {
-    let b = raw.as_bytes();
-    let limit = raw.floor_char_boundary(MAX_RENDER_HTML_BYTES);
-    let allowed = crate::feed::sanitizer_tags();
-    // The fragment's context element, the `<div>` the sanitizer parses into.
-    let root = Open {
-        name: "div",
-        ..Open::default()
-    };
-    let mut open: Vec<Open> = Vec::new();
-    // Text-node accounting: the current node's cost at byte `i` is
-    // `specials * i - positions`; `done` is every finished node's.
-    let (mut done, mut specials, mut positions) = (0u64, 0u64, 0u64);
-    let mut node_start = 0;
-    let mut i = 0;
-    while i < limit {
-        let current = specials * i as u64 - positions;
-        if done + current > MAX_RENDER_TEXT_COST {
-            return outside_entity(b, node_start, raw.floor_char_boundary(i));
-        }
-        let top = open.last().copied().unwrap_or(root);
-        let c = b[i];
-        if c != b'<' {
-            if is_table_context(top.name) && !c.is_ascii_whitespace() {
-                // Text directly in a table is fostered out of it.
-                return i;
-            }
-            if c == b'&' || (c == 0xC2 && b.get(i + 1) == Some(&0xA0)) {
-                specials += 1;
-                positions += i as u64;
-            }
-            i += 1;
-            continue;
-        }
-        let closing = b.get(i + 1) == Some(&b'/');
-        let name_at = i + 1 + usize::from(closing);
-        let raw_name = tag_name(b, name_at);
-        // Every name the policy keeps is short; a longer one is not kept.
-        let mut buf = [0u8; 16];
-        let Some(lower) = buf.get_mut(..raw_name.len()) else {
-            return i;
-        };
-        lower.copy_from_slice(raw_name);
-        lower.make_ascii_lowercase();
-        let Some(&name) = std::str::from_utf8(lower).ok().and_then(|n| allowed.get(n)) else {
-            return i;
-        };
-        let Some(tag) = scan_tag(b, name_at + raw_name.len()) else {
-            return i;
-        };
-        if tag.end > limit
-            || tag.attributes > MAX_RENDER_ATTRIBUTES
-            || done + current + tag.cost > MAX_RENDER_TEXT_COST
-        {
-            return i;
-        }
-        let end = tag.end;
-        if closing {
-            if open.last().map(|o| o.name) != Some(name) {
-                // Well-formed nesting only: anything else makes the parser
-                // close or re-open elements implicitly — measured, 36 KB of
-                // misnested formatting expanded to 19 MB.
-                return i;
-            }
-            open.pop();
-        } else {
-            if !top.inserts_in_place(name) {
-                return i;
-            }
-            if !is_void(name) {
-                if open.len() == MAX_RENDER_DEPTH {
-                    return i;
-                }
-                open.push(top.child(name));
-            }
-        }
-        // An element began or ended here: so did a text node.
-        done += current + tag.cost;
-        specials = 0;
-        positions = 0;
-        i = end;
-        node_start = end;
-    }
-    outside_entity(b, node_start, limit)
-}
-
-/// `cut`, moved back to before a character reference it would split.
-///
-/// Cutting `&amp;` after `&am` leaves `&am`, which the sanitizer re-escapes
-/// as visible text, `&amp;am`. A reference is `&`, then letters, digits or
-/// `#`, then `;`, so the cut moves to the `&` of an unterminated one. The
-/// longest named reference is 33 bytes, so the search is bounded.
-fn outside_entity(b: &[u8], node_start: usize, cut: usize) -> usize {
-    let from = cut.saturating_sub(40).max(node_start);
-    match b[from..cut].iter().rposition(|&x| x == b'&') {
-        Some(at)
-            if b[from + at + 1..cut]
-                .iter()
-                .all(|x| x.is_ascii_alphanumeric() || *x == b'#') =>
-        {
-            from + at
-        }
-        _ => cut,
-    }
-}
-
-/// The tag name starting at `at`: ASCII alphanumerics, `-` and `:`.
-fn tag_name(b: &[u8], at: usize) -> &[u8] {
-    let end = b[at..]
-        .iter()
-        .position(|c| !(c.is_ascii_alphanumeric() || *c == b'-' || *c == b':'))
-        .map_or(b.len(), |p| at + p);
-    &b[at..end]
-}
-
-/// What a tag costs the parser beyond its name.
-struct Tag {
-    /// The index just past its `>`.
-    end: usize,
-    attributes: usize,
-    /// Its attribute values' cost, in [`MAX_RENDER_TEXT_COST`]'s units: each
-    /// value is a run of its own, like a text node.
-    cost: u64,
-}
-
-/// The tag whose attributes start at `at`, read the way the HTML tokenizer
-/// reads them: a name runs to whitespace, `/`, `>` or `=`; a value is quoted
-/// (to the matching quote, `>` and `<` included) or runs to whitespace or
-/// `>`. `None` if the input ends inside it.
-fn scan_tag(b: &[u8], mut at: usize) -> Option<Tag> {
-    let skip_space = |at: &mut usize| {
-        while b.get(*at).is_some_and(u8::is_ascii_whitespace) {
-            *at += 1;
-        }
-    };
-    let (mut attributes, mut cost) = (0, 0);
-    loop {
-        while b
-            .get(at)
-            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'/')
-        {
-            at += 1;
-        }
-        match b.get(at)? {
-            b'>' => {
-                return Some(Tag {
-                    end: at + 1,
-                    attributes,
-                    cost,
-                })
-            }
-            _ => attributes += 1,
-        }
-        // The first character is part of the name even if it is `=`.
-        at += 1;
-        while b
-            .get(at)
-            .is_some_and(|c| !(c.is_ascii_whitespace() || matches!(c, b'/' | b'>' | b'=')))
-        {
-            at += 1;
-        }
-        skip_space(&mut at);
-        if b.get(at) != Some(&b'=') {
-            continue;
-        }
-        at += 1;
-        skip_space(&mut at);
-        let value = match *b.get(at)? {
-            q @ (b'"' | b'\'') => {
-                let start = at + 1;
-                let stop = start + b[start..].iter().position(|&c| c == q)?;
-                at = stop + 1;
-                &b[start..stop]
-            }
-            b'>' => continue,
-            _ => {
-                let start = at;
-                while b
-                    .get(at)
-                    .is_some_and(|c| !(c.is_ascii_whitespace() || *c == b'>'))
-                {
-                    at += 1;
-                }
-                &b[start..at]
-            }
-        };
-        cost += run_cost(value);
-    }
-}
-
-/// One run's cost: for every `&` or U+00A0, the bytes from it to the run's
-/// end — see [`MAX_RENDER_TEXT_COST`].
-fn run_cost(run: &[u8]) -> u64 {
-    run.iter()
-        .enumerate()
-        .filter(|&(k, &c)| c == b'&' || (c == 0xC2 && run.get(k + 1) == Some(&0xA0)))
-        .map(|(k, _)| (run.len() - k) as u64)
-        .sum()
 }
 
 impl SanitizedHtml {
     /// Sanitize `raw` with the ingest policy. The only way to make one.
     ///
-    /// Only the prefix of `raw` within the render budgets —
-    /// [`MAX_RENDER_HTML_BYTES`], [`MAX_RENDER_DEPTH`],
-    /// [`MAX_RENDER_TEXT_COST`], [`MAX_RENDER_ATTRIBUTES`] — and in the shape
-    /// the sanitizer writes is cleaned. The cut is made BEFORE the
-    /// sanitizer runs, because that is what bounds its cost; the sanitizer
-    /// closes whatever the cut leaves open; and a cut body says so through
-    /// [`SanitizedHtml::is_truncated`].
-    ///
-    /// Blocks for as long as the sanitizer runs: on an async task, use
-    /// [`SanitizedHtml::clean_off_runtime`].
+    /// Blocks for as long as the sanitizer runs, on the whole of `raw`: on an
+    /// async task use [`SanitizedHtml::clean_off_runtime`], and for a stored
+    /// body use [`BodyRenderer`], which also applies the bounds.
     pub fn clean(raw: &str) -> Self {
-        let cut = render_cut(raw);
         Self {
-            html: crate::feed::sanitize_html(&raw[..cut]),
-            truncated: cut < raw.len(),
+            html: crate::feed::sanitize_html(raw),
         }
     }
 
-    /// [`SanitizedHtml::clean`] on tokio's blocking pool.
-    ///
-    /// Even within the budgets a hostile body can take ~140 ms to clean (and a
-    /// real 561 KB one ~3.5 ms); off the runtime, that does not stall other
-    /// requests sharing the worker. This does not make the clean cheaper — the
-    /// budgets in [`SanitizedHtml::clean`] are what cap that.
+    /// [`SanitizedHtml::clean`] on tokio's blocking pool, so a slow clean
+    /// stalls no other request sharing the async worker. This does not make
+    /// the clean cheaper or bound it; [`BodyRenderer`] does that.
     pub async fn clean_off_runtime(raw: String) -> anyhow::Result<Self> {
         tokio::task::spawn_blocking(move || Self::clean(&raw))
             .await
@@ -651,12 +114,6 @@ impl SanitizedHtml {
     pub fn as_str(&self) -> &str {
         &self.html
     }
-
-    /// Whether the stored body was longer than [`MAX_RENDER_HTML_BYTES`] and
-    /// only its first part is here.
-    pub fn is_truncated(&self) -> bool {
-        self.truncated
-    }
 }
 
 impl std::fmt::Display for SanitizedHtml {
@@ -666,6 +123,311 @@ impl std::fmt::Display for SanitizedHtml {
 }
 
 impl askama::filters::HtmlSafe for SanitizedHtml {}
+
+/// What the reader gets back for a stored body: the markup, or one of two
+/// reasons it is not shown. Both reasons are notes in `entry.html` pointing
+/// at the original; neither ever happens for a body ingest stored.
+pub enum BodyRender {
+    /// Cleaned and ready to emit.
+    Html(SanitizedHtml),
+    /// The stored body is longer than [`MAX_RENDER_HTML_BYTES`], which ingest
+    /// never writes. It was not given to the sanitizer at all.
+    TooLarge,
+    /// Every sanitizer permit stayed busy for [`RENDER_WAIT`] — only possible
+    /// while [`RENDER_PERMITS`] pathological bodies are being cleaned at once.
+    Unavailable,
+}
+
+/// The longest stored body render will sanitize: ingest's own stored bound
+/// (`feed::MAX_CONTENT_HTML_BYTES`), so no body ingest wrote is ever refused.
+/// Only a row that skipped `feed.rs`, or one from before the bound existed
+/// (#224), can be longer, and such a row is not given to the sanitizer at all.
+pub const MAX_RENDER_HTML_BYTES: usize = crate::feed::MAX_CONTENT_HTML_BYTES;
+
+/// How many stored bodies may be in the sanitizer at once, process-wide.
+///
+/// Normal content never contends for these: a real clean takes microseconds
+/// to a few milliseconds. The limit exists for the pathological row (~37 s
+/// for 2 MiB of nested `<div>`s), which can occupy at most one permit per
+/// page view of it, and so at most this many blocking-pool threads and CPU
+/// cores in total. One would let a single slow row stall every other uncached
+/// view for its whole duration; two keeps one lane open past one slow row,
+/// which is the most this path should ever spend.
+pub const RENDER_PERMITS: usize = 2;
+
+/// How long a page view waits for a sanitizer permit before showing the
+/// "temporarily unavailable" note instead of the body.
+///
+/// Real cleans finish in ≤ 3.5 ms, so a queue of real work drains in well
+/// under this; a wait this long means every permit is held by a pathological
+/// body, and the reader is better served by the note and the link to the
+/// original than by a page that hangs for the rest of a 37 s clean. The wait
+/// itself is async (`Semaphore::acquire`) and never occupies a worker thread.
+pub const RENDER_WAIT: Duration = Duration::from_secs(2);
+
+/// The most cleaned markup the render cache holds, in bytes of output.
+///
+/// Typical bodies are small (p50 4.4 KB, p99 132 KB), so [`CACHE_MAX_ENTRIES`]
+/// usually binds first and this is a ceiling on memory for a reader of large
+/// articles: at least four bodies of the maximum stored size fit, and a body
+/// whose cleaned form alone exceeds it is simply not cached.
+pub const CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most bodies the render cache holds. A reader paging through a list
+/// re-views far fewer than this before anything is evicted.
+pub const CACHE_MAX_ENTRIES: usize = 256;
+
+/// A pathological row is a bug or a hostile writer; a clean slower than this
+/// is logged with the body's size and hash so the row can be found.
+const SLOW_CLEAN: Duration = Duration::from_millis(500);
+
+/// SHA-256 of the stored body: the cache key.
+///
+/// **A strong hash, not a fast one.** A collision here would serve one
+/// entry's markup for another's, so a fast non-cryptographic hash (whose
+/// collisions a hostile feed can manufacture) is not an option. `ring` is
+/// already a direct dependency.
+type Key = [u8; 32];
+
+fn key_of(raw: &str) -> Key {
+    let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(digest.as_ref());
+    key
+}
+
+/// Cleaned output, keyed by the hash of the stored body, least recently
+/// used out first, bounded in entries and in bytes of output.
+///
+/// Small enough (≤ [`CACHE_MAX_ENTRIES`]) that eviction is a scan for the
+/// oldest, which costs less than hashing the key did.
+struct Cache {
+    max_bytes: usize,
+    max_entries: usize,
+    bytes: usize,
+    tick: u64,
+    slots: HashMap<Key, Slot>,
+}
+
+struct Slot {
+    html: Arc<str>,
+    last_used: u64,
+}
+
+impl Cache {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            max_bytes,
+            max_entries,
+            bytes: 0,
+            tick: 0,
+            slots: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &Key) -> Option<Arc<str>> {
+        self.tick += 1;
+        let slot = self.slots.get_mut(key)?;
+        slot.last_used = self.tick;
+        Some(Arc::clone(&slot.html))
+    }
+
+    fn insert(&mut self, key: Key, html: Arc<str>) {
+        if html.len() > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        if let Some(old) = self.slots.remove(&key) {
+            self.bytes -= old.html.len();
+        }
+        while !self.slots.is_empty()
+            && (self.slots.len() >= self.max_entries || self.bytes + html.len() > self.max_bytes)
+        {
+            let Some(oldest) = self
+                .slots
+                .iter()
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some(gone) = self.slots.remove(&oldest) {
+                self.bytes -= gone.html.len();
+            }
+        }
+        self.tick += 1;
+        self.bytes += html.len();
+        self.slots.insert(
+            key,
+            Slot {
+                html,
+                last_used: self.tick,
+            },
+        );
+    }
+}
+
+struct Inner {
+    permits: Arc<Semaphore>,
+    wait: Duration,
+    cache: Mutex<Cache>,
+    /// How many times the sanitizer has run through this renderer. Tests use
+    /// it to show the cap and the cache keep it from running at all.
+    cleans: AtomicUsize,
+}
+
+/// The path from a stored `content_html` row to a [`BodyRender`], with the
+/// three bounds. One process-wide instance, [`BodyRenderer::shared`], serves
+/// the reader; tests build their own with smaller parameters.
+///
+/// For a body of `n` bytes a render costs, in order:
+/// 1. nothing but a length check if `n` > [`MAX_RENDER_HTML_BYTES`]
+///    ([`BodyRender::TooLarge`]);
+/// 2. a SHA-256 of the body and a cache lookup, on the blocking pool;
+/// 3. on a miss, an async wait of up to [`RENDER_WAIT`] for one of
+///    [`RENDER_PERMITS`] permits ([`BodyRender::Unavailable`] if none comes);
+/// 4. the clean itself on the blocking pool, holding the permit, after a
+///    second cache check in case an identical body was cleaned meanwhile.
+///
+/// So each distinct body is cleaned once per process while it stays cached,
+/// and a body that is slow to clean is slow on its own page view, holding one
+/// permit, and nowhere else. The async worker is never blocked: the hash, the
+/// lookup and the clean run on the blocking pool, and the permit wait is
+/// `Semaphore::acquire`.
+#[derive(Clone)]
+pub struct BodyRenderer(Arc<Inner>);
+
+impl BodyRenderer {
+    /// A renderer with its own permits and cache. The reader uses
+    /// [`BodyRenderer::shared`]; this is for tests and for the shared
+    /// instance's construction.
+    pub fn new(permits: usize, wait: Duration, cache_bytes: usize, cache_entries: usize) -> Self {
+        Self(Arc::new(Inner {
+            permits: Arc::new(Semaphore::new(permits)),
+            wait,
+            cache: Mutex::new(Cache::new(cache_bytes, cache_entries)),
+            cleans: AtomicUsize::new(0),
+        }))
+    }
+
+    /// The process-wide renderer, with [`RENDER_PERMITS`], [`RENDER_WAIT`],
+    /// [`CACHE_MAX_BYTES`] and [`CACHE_MAX_ENTRIES`].
+    pub fn shared() -> &'static BodyRenderer {
+        static SHARED: LazyLock<BodyRenderer> = LazyLock::new(|| {
+            BodyRenderer::new(
+                RENDER_PERMITS,
+                RENDER_WAIT,
+                CACHE_MAX_BYTES,
+                CACHE_MAX_ENTRIES,
+            )
+        });
+        &SHARED
+    }
+
+    /// A stored body, cleaned for this render — or the reason it is not.
+    ///
+    /// `Err` only if the blocking pool failed to run the task (a panic in the
+    /// sanitizer, or runtime shutdown); the two bounded outcomes are values.
+    pub async fn render(&self, raw: String) -> anyhow::Result<BodyRender> {
+        if raw.len() > MAX_RENDER_HTML_BYTES {
+            warn!(
+                bytes = raw.len(),
+                bound = MAX_RENDER_HTML_BYTES,
+                "stored entry body is over the ingest bound; not rendering it"
+            );
+            return Ok(BodyRender::TooLarge);
+        }
+
+        // Hash and look up off the runtime: SHA-256 of a 2 MiB body is
+        // milliseconds, which is more than an async worker should spend.
+        let inner = Arc::clone(&self.0);
+        let (raw, key, hit) = tokio::task::spawn_blocking(move || {
+            let key = key_of(&raw);
+            let hit = inner.cache().get(&key);
+            (raw, key, hit)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("looking up an entry body failed: {e}"))?;
+        if let Some(html) = hit {
+            return Ok(BodyRender::Html(SanitizedHtml {
+                html: html.to_string(),
+            }));
+        }
+
+        let permit =
+            match tokio::time::timeout(self.0.wait, Arc::clone(&self.0.permits).acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(closed)) => anyhow::bail!("the sanitizer permits were closed: {closed}"),
+                Err(_elapsed) => {
+                    warn!(
+                        bytes = raw.len(),
+                        waited_ms = self.0.wait.as_millis() as u64,
+                        "no sanitizer permit became free; not rendering this entry body now"
+                    );
+                    return Ok(BodyRender::Unavailable);
+                }
+            };
+
+        let inner = Arc::clone(&self.0);
+        let html = tokio::task::spawn_blocking(move || {
+            // The permit is held for exactly as long as this closure runs.
+            let _permit = permit;
+            if let Some(html) = inner.cache().get(&key) {
+                return html.to_string();
+            }
+            inner.cleans.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let html = SanitizedHtml::clean(&raw).html;
+            let took = started.elapsed();
+            if took > SLOW_CLEAN {
+                warn!(
+                    bytes = raw.len(),
+                    out_bytes = html.len(),
+                    took_ms = took.as_millis() as u64,
+                    sha256 = %hex_prefix(&key),
+                    "a stored entry body was slow to sanitize; ingest never writes such a body"
+                );
+            }
+            inner.cache().insert(key, Arc::from(html.as_str()));
+            html
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("sanitizing an entry body failed: {e}"))?;
+        Ok(BodyRender::Html(SanitizedHtml { html }))
+    }
+
+    /// How many times this renderer has run the sanitizer.
+    pub fn cleans(&self) -> usize {
+        self.0.cleans.load(Ordering::Relaxed)
+    }
+
+    /// Bodies in the cache, and the bytes of cleaned markup they hold.
+    pub fn cache_size(&self) -> (usize, usize) {
+        let cache = self.0.cache();
+        (cache.slots.len(), cache.bytes)
+    }
+
+    /// The permit pool, so a test can hold permits and show what a render
+    /// does without one.
+    #[cfg(test)]
+    fn permits(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.0.permits)
+    }
+}
+
+impl Inner {
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        // Nothing here panics while holding the lock; recovering a poisoned
+        // lock rather than propagating is the right call for a cache.
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The first eight bytes of a key as hex, enough to find a row by.
+fn hex_prefix(key: &Key) -> String {
+    key[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -687,8 +449,6 @@ mod tests {
         r#"<object data="javascript:alert(1)"></object><embed src="x.swf">"#,
         r#"<meta http-equiv="refresh" content="0;url=javascript:alert(1)">"#,
         "<base href=\"https://evil.example/\"><a href=\"/x\">x</a>",
-        // Hostile attributes on tags the policy keeps, which the scanner
-        // passes through to the sanitizer.
         r#"<p><img src=x onerror=alert(1)//><a href="java&#115;cript:alert(1)">x</a></p>"#,
         r#"<div onclick="alert(1)"><a href=" javascript:alert(1)" onerror="x">y</a></div>"#,
     ];
@@ -696,61 +456,15 @@ mod tests {
     /// **Same policy as ingest, byte for byte.** The render-time clean is not a
     /// second, independently maintained allow-list: if it were, the two would
     /// drift, and a body ingest would refuse could render, or the reverse.
-    ///
-    /// Whatever the scanner keeps is sanitized — a hostile raw body is usually
-    /// cut at its first tag the policy does not keep, and the prefix still goes
-    /// through the sanitizer. Every stored (ingest-shaped) body is kept whole.
     #[test]
     fn clean_is_the_ingest_sanitizer() {
         for raw in HOSTILE.iter().chain(ARTICLES) {
-            let kept = &raw[..render_cut(raw)];
             assert_eq!(
                 SanitizedHtml::clean(raw).as_str(),
-                sanitize_html(kept),
+                sanitize_html(raw),
                 "render-time clean diverged from ingest on {raw:?}",
             );
         }
-        for raw in HOSTILE.iter().chain(ARTICLES) {
-            let stored = sanitize_html(raw);
-            let out = SanitizedHtml::clean(&stored);
-            let cut = render_cut(&stored);
-            assert!(
-                !out.is_truncated(),
-                "an ingest-shaped body was cut at …{:?}",
-                &stored[cut.saturating_sub(60)..]
-            );
-            assert_eq!(out.as_str(), sanitize_html(&stored));
-        }
-    }
-
-    /// **Only well-formed nesting is given to the sanitizer.** Ingest stores
-    /// the sanitizer's serialized output, in which every closer closes the
-    /// innermost open element. A closer that does not makes the parser close
-    /// and re-open elements implicitly — where its other super-linear paths
-    /// are: measured, 36 KB of misnested formatting expanded to 19 MB. So the
-    /// body is cut at that closer, and what precedes it is still sanitized.
-    #[test]
-    fn malformed_nesting_is_cut_at_the_first_misnested_closer() {
-        let out = SanitizedHtml::clean("<p>a <b>b</p><script>alert(1)</script>LATER");
-        assert!(out.is_truncated());
-        assert_eq!(out.as_str(), "<p>a <b>b</b></p>");
-
-        // The expansion itself: formatting elements left open inside a closed
-        // `<p>` are re-opened in every later paragraph.
-        let bomb = format!(
-            "<p>{}</p>{}",
-            (0..200)
-                .map(|i| format!(r#"<b title="{i}">"#))
-                .collect::<String>(),
-            "<p>x</p>".repeat(1_000)
-        );
-        assert!(
-            sanitize_html(&bomb).len() > 1_000_000,
-            "the shape no longer expands; this test no longer tests anything"
-        );
-        let out = SanitizedHtml::clean(&bomb);
-        assert!(out.is_truncated());
-        assert!(out.as_str().len() < 2 * bomb.len(), "it still expanded");
     }
 
     #[test]
@@ -855,8 +569,8 @@ mod tests {
     /// not `tfoot`, so a feed table with a footer is stored with its footer
     /// rows directly in `<table>`; parsing that again wraps them in a
     /// `<tbody>` — which is what a browser builds from the stored form too, so
-    /// the page is the same. The body is not cut, and a second re-clean is a
-    /// fixed point. (None of the 545 real bodies measured has a `<tfoot>`.)
+    /// the page is the same. A second re-clean is a fixed point. (None of the
+    /// 545 real bodies measured has a `<tfoot>`.)
     #[test]
     fn a_stripped_tfoot_gains_a_tbody_and_nothing_else() {
         let stored = sanitize_html(
@@ -867,7 +581,6 @@ mod tests {
             "<table><tbody><tr><td>a</td></tr></tbody><tr><td>f</td></tr></table>"
         );
         let out = SanitizedHtml::clean(&stored);
-        assert!(!out.is_truncated());
         assert_eq!(
             out.as_str(),
             "<table><tbody><tr><td>a</td></tr></tbody><tbody><tr><td>f</td></tr></tbody></table>"
@@ -875,361 +588,91 @@ mod tests {
         assert_eq!(SanitizedHtml::clean(out.as_str()).as_str(), out.as_str());
     }
 
-    /// **The size bound.** A body longer than [`MAX_RENDER_HTML_BYTES`] —
-    /// ingest's own stored bound, so only a row from before it existed (#224)
-    /// or a writer that skipped `feed.rs` — is cut to it BEFORE the sanitizer
-    /// sees it, and marked. A body exactly at the bound is untouched.
+    /// **Review of #273, third round: shapes ingest legitimately stores must
+    /// render in full.** Each `raw` here is ordinary feed markup; `stored` is
+    /// exactly what ingest writes for it (`sanitize_html`), and the article
+    /// continues after the shape. The render-time clean must carry the whole
+    /// stored body through, with nothing cut and nothing noted:
+    ///
+    /// 1. ammonia strips a wrapper (`section`, `form`, `object`) that html5ever
+    ///    had treated as a nesting boundary, so the stored form has `li` in
+    ///    `li`, `p` in `p`, `a` in `a`, `h2` in `h1` with every closer matching;
+    /// 2. an unhighlighted `<pre><code>` XML listing of ~245 KB — every `<`
+    ///    stored as `&lt;` — followed by more article;
+    /// 3. `<rt>` inside an inline wrapper inside `<ruby>`.
+    ///
+    /// Red against the pre-scan this module used to have: five of the six
+    /// were cut before the sanitizer saw them.
     #[test]
-    fn input_past_the_size_bound_is_cut_before_cleaning() {
-        assert_eq!(MAX_RENDER_HTML_BYTES, crate::feed::MAX_CONTENT_HTML_BYTES);
-        let fits = format!("<p>{}</p>", "a".repeat(MAX_RENDER_HTML_BYTES - 7));
-        assert_eq!(fits.len(), MAX_RENDER_HTML_BYTES);
-        let whole = SanitizedHtml::clean(&fits);
-        assert_eq!(whole.as_str(), fits);
-        assert!(!whole.is_truncated());
-
-        let over = format!("{fits}<p>PAST-THE-BOUND</p>");
-        let out = SanitizedHtml::clean(&over);
-        assert!(
-            !out.as_str().contains("PAST-THE-BOUND"),
-            "input past the size bound reached the sanitizer"
-        );
-        assert!(out.is_truncated(), "a cut body was not marked as cut");
-        assert!(
-            out.as_str().starts_with("<p>aaa"),
-            "the part that fits was lost"
-        );
-    }
-
-    /// The size cut lands on a character boundary, never inside one.
-    #[test]
-    fn the_cut_respects_utf8() {
-        // One byte of padding pushes the bound into the middle of a 3-byte
-        // character.
-        let s = format!("x{}", "\u{6f22}".repeat(MAX_RENDER_HTML_BYTES / 3 + 1));
-        assert!(!s.is_char_boundary(MAX_RENDER_HTML_BYTES));
-        let out = SanitizedHtml::clean(&s);
-        assert!(out.as_str().len() <= MAX_RENDER_HTML_BYTES);
-        assert!(out.as_str().ends_with('\u{6f22}'));
-        assert!(out.is_truncated());
-    }
-
-    /// **The depth bound** — #226's worst case: nesting deeper than
-    /// [`MAX_RENDER_DEPTH`] is cut where it crosses the bound, before the
-    /// sanitizer runs, and the cut is marked.
-    #[test]
-    fn nesting_past_the_depth_bound_is_cut() {
-        for open in ["<div>", "<ul><li>", "<blockquote>", r#"<b title="t">"#] {
-            let raw = format!("{}DEEP", open.repeat(MAX_RENDER_DEPTH + 8));
-            let out = SanitizedHtml::clean(&raw);
-            assert!(out.is_truncated(), "{open} nesting was not cut");
-            assert!(
-                !out.as_str().contains("DEEP"),
-                "{open}: past the depth bound was kept"
-            );
+    fn bodies_ingest_stores_render_in_full() {
+        const REST: &str = "<p>REST-OF-ARTICLE</p>";
+        let mut listing = String::new();
+        let mut i = 0;
+        while listing.len() < 245_000 {
+            listing.push_str(&format!("&lt;item id=\"{i}\"&gt;value {i}&lt;/item&gt;\n"));
+            i += 1;
         }
-        // Exactly at the bound: kept whole.
-        let at = format!(
-            "{}AT{}",
-            "<div>".repeat(MAX_RENDER_DEPTH),
-            "</div>".repeat(MAX_RENDER_DEPTH)
-        );
-        let out = SanitizedHtml::clean(&at);
-        assert!(!out.is_truncated());
-        assert_eq!(out.as_str(), at);
-    }
-
-    /// Depth is nesting, not tag count: closed elements leave it, and void
-    /// elements never enter it — so a long ordinary article is never cut.
-    #[test]
-    fn closed_and_void_elements_do_not_accumulate_depth() {
-        let deep_then_closed = format!(
-            "{}{}",
-            "<div>".repeat(MAX_RENDER_DEPTH - 1),
-            "</div>".repeat(MAX_RENDER_DEPTH - 1)
-        );
-        let siblings = format!(
-            "{}<div>{}</div>",
-            deep_then_closed.repeat(4),
-            r#"<img src="x"><br><hr>"#.repeat(MAX_RENDER_DEPTH * 4)
-        );
-        let out = SanitizedHtml::clean(&siblings);
-        assert!(!out.is_truncated(), "an ordinary shape was cut");
-        assert_eq!(out.as_str(), sanitize_html(&siblings));
-    }
-
-    /// **The scanner cannot be talked out of the depth it sees.** A closing tag
-    /// the parser would ignore (no matching open element), or one inside a
-    /// quoted attribute value — which the sanitizer's own output can carry,
-    /// since it does not escape `<` or `>` in attributes — must not reduce it.
-    #[test]
-    fn unmatched_or_quoted_closers_do_not_reduce_depth() {
-        for open in [
-            "<div></x>",
-            r#"<div title="</div>">"#,
-            "<div title='</div>'>",
-            r#"<div title="a>b</div>">"#,
-        ] {
-            let raw = format!("{}DEEP", open.repeat(MAX_RENDER_DEPTH + 8));
-            let out = SanitizedHtml::clean(&raw);
-            assert!(out.is_truncated(), "{open:?} hid the nesting");
-            assert!(
-                !out.as_str().contains("DEEP"),
-                "{open:?}: past the depth bound was kept"
-            );
-        }
-    }
-
-    /// **The text-node budget** — #226's other cases. Every entity starts with
-    /// `&`, so this covers stored `&amp;`, `&lt;`, `&nbsp;` and numeric
-    /// references, plus a literal U+00A0. 20 K of them followed by 200 KB of
-    /// text in the same node is ~4 × 10⁹ units, over
-    /// [`MAX_RENDER_TEXT_COST`]: cut in the text, before the sanitizer runs.
-    #[test]
-    fn a_text_node_over_the_cost_budget_is_cut() {
-        for unit in ["&amp;", "&nbsp;", "&#160;", "&", "\u{a0}"] {
-            let raw = format!("<p>{}{}DEEP</p>", unit.repeat(20_000), "a".repeat(200_000));
-            let out = SanitizedHtml::clean(&raw);
-            assert!(out.is_truncated(), "{unit:?} then text was not cut");
-            assert!(
-                !out.as_str().contains("DEEP"),
-                "{unit:?}: past the budget was kept"
-            );
-            assert!(
-                out.as_str().len() > 100_000,
-                "{unit:?}: far less than the budget allows was kept"
-            );
-        }
-    }
-
-    /// The budget is per text node, as the cost is: the same characters and
-    /// the same text, with a tag between them, are cheap and are not cut. And
-    /// text BEFORE the characters costs nothing — it is what follows them.
-    #[test]
-    fn a_tag_ends_the_text_node_and_its_cost() {
-        for unit in ["&amp;", "&nbsp;", "&#160;", "&", "\u{a0}"] {
-            for raw in [
+        let shapes = [
+            (
+                "li in li after a stripped section",
+                format!("<ul><li>one<section><li>two</li></section></li></ul>{REST}"),
+            ),
+            (
+                "p in p after a stripped form",
+                format!("<p>a<form><p>b</p></form></p>{REST}"),
+            ),
+            (
+                "a in a after a stripped object",
                 format!(
-                    "<p>{}</p><p>{}END</p>",
-                    unit.repeat(20_000),
-                    "a".repeat(200_000)
+                    r#"<a href="https://x.example/">a<object><a href="https://y.example/">b</a></object></a>{REST}"#
                 ),
-                format!("<p>{}{}END</p>", "a".repeat(200_000), unit.repeat(20_000)),
-            ] {
-                let out = SanitizedHtml::clean(&raw);
-                assert!(!out.is_truncated(), "{unit:?}: a cheap shape was cut");
-                assert_eq!(out.as_str(), sanitize_html(&raw));
-            }
-        }
-    }
-
-    /// **Review of #273: a token the parser ignores does not end a text node.**
-    /// In body, html5ever drops `<!DOCTYPE>`, a second `<body>`, `<html>`,
-    /// `<head>`, table parts outside a table and more — so the text either
-    /// side of one is ONE node, and its `&` cost keeps growing. The scanner
-    /// reset its count at every `<letter` or `<!`, so each of these bodies
-    /// (the reviewer's exact three first) ran the full quadratic: ~1.1 s
-    /// in release, uncut. Ingest's output contains none of them.
-    #[test]
-    fn separators_the_parser_ignores_do_not_reset_the_text_cost() {
-        let tail = "a".repeat(2_000_000);
-        for sep in ["<!DOCTYPE x>", "<body>", "<html>"] {
-            for unit in ["&amp;", "\u{a0}"] {
-                let raw = format!("<p>{}{sep}{tail}", unit.repeat(20_000));
-                let out = SanitizedHtml::clean(&raw);
-                assert!(out.is_truncated(), "{sep:?} / {unit:?} reset the text cost");
-                assert!(
-                    out.as_str().len() < 1_000_000,
-                    "{sep:?} / {unit:?}: most of it kept"
-                );
-            }
-        }
-        // The wider set, smaller so it runs quickly in debug — and still over
-        // the budget if the separator were taken as the end of the node:
-        // 5,000 × 500 KB = 2.5 × 10⁹ units.
-        let tail = "a".repeat(500_000);
-        for sep in [
-            "<!DOCTYPE x>",
-            "<body>",
-            "<html>",
-            "<head>",
-            "<!-- c -->",
-            "<?pi?>",
-            "<font>",
-            "<frame>",
-            "<frameset>",
-            "<tr>",
-            "<td>",
-            "<th>",
-            "<tbody>",
-            "<caption>",
-            "<col>",
-            "<colgroup>",
-            "<textarea>",
-            "<title>",
-            "<select>",
-            "<svg>",
-            "<math>",
-            "<noscript>",
-            "<image>",
-            "</ x>",
-            "</br>",
-        ] {
-            for unit in ["&amp;", "&nbsp;", "&#160;", "\u{a0}", "&"] {
-                let raw = format!("<p>{}{sep}{tail}END", unit.repeat(5_000));
-                let out = SanitizedHtml::clean(&raw);
-                assert!(out.is_truncated(), "{sep:?} / {unit:?} was not cut");
-                assert!(
-                    !out.as_str().contains("END"),
-                    "{sep:?} / {unit:?}: the whole body was kept"
-                );
-            }
-        }
-    }
-
-    /// **A start tag the parser answers by closing elements implicitly** pops
-    /// formatting elements off the stack without a closer the scanner can see
-    /// — and the parser re-opens all of them in front of the next text. The
-    /// first round's guard caught that only through a misnested CLOSER; each
-    /// shape here has none, every closer matching. Ingest's serialized output
-    /// never asks the parser to close anything implicitly.
-    #[test]
-    fn start_tags_that_close_elements_implicitly_are_cut() {
-        let fmt: String = (0..200).map(|i| format!(r#"<b title="{i}">"#)).collect();
-        for (name, bomb) in [
-            (
-                "li in li",
-                format!("<ul><li>{fmt}{}", "<li>x</li>".repeat(1_000)),
             ),
             (
-                "dd in dd",
-                format!("<dl><dd>{fmt}{}", "<dd>x</dd>".repeat(1_000)),
-            ),
-            ("p in p", format!("<p>{fmt}{}", "<p>x</p>".repeat(1_000))),
-            (
-                "div in p",
-                format!("<p>{fmt}{}", "<div>x</div>".repeat(1_000)),
+                "heading in heading after a stripped form",
+                format!("<h1>a<form><h2>b</h2></form></h1>{REST}"),
             ),
             (
-                "a in a",
-                format!(r#"<a href="x">{fmt}{}"#, "<a>x</a>".repeat(1_000)),
+                "245 KB unhighlighted XML listing",
+                format!("<pre><code>{listing}</code></pre>{REST}"),
             ),
-        ] {
-            let expanded = sanitize_html(&bomb).len();
-            let out = SanitizedHtml::clean(&bomb);
+            (
+                "rt in a span in ruby",
+                format!("<p>A<ruby><span>\u{6f22}<rt>kan</rt></span></ruby> B</p>{REST}"),
+            ),
+        ];
+        let mut cut = Vec::new();
+        for (name, raw) in &shapes {
+            let stored = sanitize_html(raw);
             assert!(
-                out.is_truncated(),
-                "{name} ({expanded} B expanded) was not cut"
+                stored.contains("REST-OF-ARTICLE"),
+                "{name}: ingest itself dropped the rest; this shape tests nothing"
             );
-            assert!(
-                out.as_str().len() < 2 * bomb.len(),
-                "{name}: it still expanded ({} B from {} B)",
-                out.as_str().len(),
-                bomb.len()
+            let out = SanitizedHtml::clean(&stored);
+            if !out.as_str().contains("REST-OF-ARTICLE") {
+                cut.push(format!(
+                    "{name} (stored tail …{:?})",
+                    &stored[stored.len().saturating_sub(60)..]
+                ));
+                continue;
+            }
+            assert_eq!(
+                out.as_str(),
+                sanitize_html(&stored),
+                "{name}: render diverged from the ingest sanitizer on the stored body"
             );
         }
-    }
-
-    /// **Text directly inside a table is moved out of it** ("foster
-    /// parenting"), onto the end of whatever text node precedes the table —
-    /// so the node before the table keeps growing through it. Ingest's output
-    /// never has text there.
-    #[test]
-    fn text_fostered_out_of_a_table_is_cut() {
-        let raw = format!(
-            "{}<table>{}END",
-            "&amp;".repeat(20_000),
-            "a".repeat(500_000)
+        assert!(
+            cut.is_empty(),
+            "the rest of the article was cut at render for: {cut:#?}"
         );
-        let out = SanitizedHtml::clean(&raw);
-        assert!(out.is_truncated());
-        assert!(!out.as_str().contains("END"));
-    }
-
-    /// **Found while re-measuring for #273: attributes are the same two
-    /// quadratics.** One `<p>` with ~190 K distinct attributes took 6.6 s
-    /// (the parser checks each new name against all before it); 20 K `&amp;`
-    /// followed by 2 MB of text inside one attribute value took 1.1 s, the
-    /// text-node cost in another place. The scanner passed both: `<p>` is a
-    /// tag the policy keeps. The sanitizer's own output carries at most a
-    /// handful of attributes per tag.
-    #[test]
-    fn attribute_count_and_attribute_text_are_budgeted() {
-        let many = format!(
-            "<p{}>x</p><p>END</p>",
-            (0..20_000).map(|i| format!(" a{i}")).collect::<String>()
-        );
-        let out = SanitizedHtml::clean(&many);
-        assert!(out.is_truncated(), "20 K attributes on one tag were passed");
-        assert!(!out.as_str().contains("END"));
-
-        let at_bound = format!(
-            "<p{}>x</p>",
-            (0..MAX_RENDER_ATTRIBUTES)
-                .map(|i| format!(" a{i}=\"v\""))
-                .collect::<String>()
-        );
-        assert!(!SanitizedHtml::clean(&at_bound).is_truncated());
-
-        for unit in ["&amp;", "&nbsp;", "\u{a0}", "&"] {
-            for quote in ["\"", "'", ""] {
-                let raw = format!(
-                    "<p title={quote}{}{}{quote}>x</p><p>END</p>",
-                    unit.repeat(20_000),
-                    "a".repeat(500_000)
-                );
-                let out = SanitizedHtml::clean(&raw);
-                assert!(
-                    out.is_truncated(),
-                    "{unit:?} in a {quote:?} value was passed"
-                );
-                assert!(!out.as_str().contains("END"));
-            }
-        }
-    }
-
-    /// **Review of #273: a cut never lands inside an entity or a tag.** A cut
-    /// in `&am|p;` re-serializes as `&amp;am`, visible text in front of the
-    /// truncation note. Every alignment of the cost cut against a dense run
-    /// of `&amp;` is tried, and every alignment of the size cut against an
-    /// entity and against a tag.
-    #[test]
-    fn a_cut_never_splits_an_entity_or_a_tag() {
-        // The cost cut, inside a dense run.
-        for pad in 0..5 {
-            let raw = format!("<p>{}{}</p>", "a".repeat(pad), "&amp;".repeat(40_000));
-            let cut = render_cut(&raw);
-            assert!(cut < raw.len(), "pad {pad}: the run was not cut");
-            let body = &raw[3 + pad..cut];
-            assert!(
-                body.len() % 5 == 0 && body.replace("&amp;", "").is_empty(),
-                "pad {pad}: the cost cut split an entity: {:?}",
-                &raw[cut.saturating_sub(8)..cut]
+        // The shapes without a stripped wrapper are fixed points: byte-identical.
+        for (name, raw) in &shapes[4..] {
+            let stored = sanitize_html(raw);
+            assert_eq!(
+                SanitizedHtml::clean(&stored).as_str(),
+                stored,
+                "{name}: re-cleaning changed the stored body"
             );
-            let out = SanitizedHtml::clean(&raw);
-            assert!(
-                !out.as_str().contains("&amp;a"),
-                "pad {pad}: a partial entity rendered"
-            );
-        }
-        // The size cut, against an entity and against a tag.
-        for pad in 0..12 {
-            for tail in ["&amp;zzzz", r#"<b title="t">zz</b>"#] {
-                let raw = format!("<p>{}{tail}", "a".repeat(MAX_RENDER_HTML_BYTES - 3 - pad));
-                let cut = render_cut(&raw);
-                let kept = &raw[..cut];
-                assert!(
-                    kept.rfind('&').is_none_or(|a| kept[a..].contains(';')),
-                    "pad {pad}: the size cut split an entity: {:?}",
-                    &kept[kept.len().saturating_sub(8)..]
-                );
-                let lt = kept.rfind('<').unwrap();
-                assert!(
-                    kept[lt..].contains('>'),
-                    "pad {pad}: the size cut split a tag: {:?}",
-                    &kept[lt..]
-                );
-            }
         }
     }
 
@@ -1255,5 +698,254 @@ mod tests {
             !squashed.contains("|safe"),
             "templates/entry.html uses `|safe` again"
         );
+    }
+
+    // ----- the three bounds ------------------------------------------------
+
+    fn renderer() -> BodyRenderer {
+        BodyRenderer::new(
+            RENDER_PERMITS,
+            Duration::from_millis(200),
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRIES,
+        )
+    }
+
+    fn html(render: BodyRender) -> String {
+        match render {
+            BodyRender::Html(h) => h.as_str().to_string(),
+            BodyRender::TooLarge => panic!("the body was refused as too large"),
+            BodyRender::Unavailable => panic!("the body was refused as unavailable"),
+        }
+    }
+
+    /// **The size cap.** A body over [`MAX_RENDER_HTML_BYTES`] — which ingest
+    /// never writes — is refused without the sanitizer running. The body here
+    /// is the measured worst shape (nested `<div>`s, ~37 s at 2 MiB in
+    /// release, far longer in debug), so a render that reached the sanitizer
+    /// would also blow the time bound. A body exactly at the cap is cleaned.
+    #[tokio::test]
+    async fn a_body_over_the_stored_bound_is_refused_without_cleaning() {
+        assert_eq!(MAX_RENDER_HTML_BYTES, crate::feed::MAX_CONTENT_HTML_BYTES);
+        let r = renderer();
+        let depth = MAX_RENDER_HTML_BYTES / 11 + 1;
+        let over = format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        assert!(over.len() > MAX_RENDER_HTML_BYTES);
+        let started = Instant::now();
+        let out = r.render(over).await.unwrap();
+        assert!(
+            matches!(out, BodyRender::TooLarge),
+            "an over-size body was not refused"
+        );
+        assert_eq!(r.cleans(), 0, "the sanitizer ran on an over-size body");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refusing an over-size body took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(r.cache_size(), (0, 0), "a refused body was cached");
+
+        let at = format!("<p>{}</p>", "a".repeat(MAX_RENDER_HTML_BYTES - 7));
+        assert_eq!(at.len(), MAX_RENDER_HTML_BYTES);
+        let out = html(r.render(at.clone()).await.unwrap());
+        assert_eq!(
+            out, at,
+            "a body exactly at the bound was not rendered whole"
+        );
+        assert_eq!(r.cleans(), 1);
+    }
+
+    /// **The concurrency limit, and that waiting for it never blocks the
+    /// runtime.** With every permit held, an uncached body waits the renderer's
+    /// wait and comes back [`BodyRender::Unavailable`] with the sanitizer never
+    /// run; a cached body still renders at once; and a cheap task joined
+    /// beside the waiting render completes long before it — on a
+    /// current-thread runtime, which is where a blocking wait would show.
+    /// When the permits come back, the same body renders.
+    #[tokio::test]
+    async fn exhausted_permits_mean_a_note_not_a_blocked_worker() {
+        let r = BodyRenderer::new(
+            2,
+            Duration::from_millis(300),
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRIES,
+        );
+        let cached = "<p>already seen</p>".to_string();
+        assert_eq!(html(r.render(cached.clone()).await.unwrap()), cached);
+        assert_eq!(r.cleans(), 1);
+
+        let held = r.permits().acquire_many_owned(2).await.unwrap();
+        assert_eq!(r.permits().available_permits(), 0);
+
+        let fresh = "<p>never seen</p>".to_string();
+        let started = Instant::now();
+        let (render, timer_done) = tokio::join!(r.render(fresh.clone()), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Instant::now()
+        });
+        let render_done = Instant::now();
+        assert!(
+            matches!(render.unwrap(), BodyRender::Unavailable),
+            "an uncached body rendered with no permit free"
+        );
+        assert_eq!(r.cleans(), 1, "the sanitizer ran with no permit free");
+        assert!(
+            render_done.duration_since(started) >= Duration::from_millis(300),
+            "the render did not wait for a permit"
+        );
+        assert!(
+            timer_done < render_done
+                && timer_done.duration_since(started) < Duration::from_millis(250),
+            "a concurrent task was held up by the waiting render: timer at {:?}, render at {:?}",
+            timer_done.duration_since(started),
+            render_done.duration_since(started)
+        );
+        // A cached body does not need a permit.
+        assert_eq!(html(r.render(cached.clone()).await.unwrap()), cached);
+        assert_eq!(r.cleans(), 1);
+
+        drop(held);
+        assert_eq!(html(r.render(fresh.clone()).await.unwrap()), fresh);
+        assert_eq!(r.cleans(), 2);
+    }
+
+    /// **The cache.** A body is cleaned once per process: the second render of
+    /// the same bytes does not run the sanitizer and returns the same markup.
+    #[tokio::test]
+    async fn a_body_is_cleaned_once_and_then_served_from_the_cache() {
+        let r = renderer();
+        for raw in HOSTILE.iter().chain(ARTICLES) {
+            let first = html(r.render(raw.to_string()).await.unwrap());
+            let cleans = r.cleans();
+            let second = html(r.render(raw.to_string()).await.unwrap());
+            assert_eq!(
+                r.cleans(),
+                cleans,
+                "the second render of {raw:?} ran the sanitizer"
+            );
+            assert_eq!(first, second);
+            assert_eq!(first, sanitize_html(raw));
+        }
+        // Distinct bodies were each cleaned exactly once.
+        let distinct: std::collections::HashSet<_> = HOSTILE.iter().chain(ARTICLES).collect();
+        assert_eq!(r.cleans(), distinct.len());
+    }
+
+    /// **The key is the content, all of it.** Two bodies of the same length,
+    /// or differing only far from the start or the end, or in a single byte,
+    /// must each get their own markup — a collision would show one entry's
+    /// body on another's page. (Entry ids are not part of the key: the same
+    /// bytes clean to the same markup whichever row holds them.)
+    #[tokio::test]
+    async fn bodies_that_differ_anywhere_do_not_share_a_cache_slot() {
+        let r = renderer();
+        let filler = "x".repeat(50_000);
+        let pairs = [
+            ("<p>aaaa</p>".to_string(), "<p>bbbb</p>".to_string()),
+            (
+                format!("<p>{filler}A{filler}</p>"),
+                format!("<p>{filler}B{filler}</p>"),
+            ),
+            (
+                format!("<p>{filler}</p><p>tail one</p>"),
+                format!("<p>{filler}</p><p>tail two</p>"),
+            ),
+            (
+                format!("<p>head one</p><p>{filler}</p>"),
+                format!("<p>head two</p><p>{filler}</p>"),
+            ),
+            (
+                r#"<a href="https://a.example/">x</a>"#.to_string(),
+                r#"<a href="https://b.example/">x</a>"#.to_string(),
+            ),
+        ];
+        for (a, b) in &pairs {
+            assert_eq!(a.len(), b.len(), "the pair must have the same length");
+            let out_a = html(r.render(a.clone()).await.unwrap());
+            let out_b = html(r.render(b.clone()).await.unwrap());
+            assert_eq!(out_a, sanitize_html(a));
+            assert_eq!(out_b, sanitize_html(b));
+            assert_ne!(
+                out_a, out_b,
+                "two different bodies rendered the same markup"
+            );
+            // And again, from the cache this time.
+            let cleans = r.cleans();
+            assert_eq!(html(r.render(a.clone()).await.unwrap()), out_a);
+            assert_eq!(html(r.render(b.clone()).await.unwrap()), out_b);
+            assert_eq!(r.cleans(), cleans);
+        }
+    }
+
+    /// **The cache stays within its bounds**, in bytes and in entries, evicting
+    /// the least recently used first; a body whose cleaned form alone is over
+    /// the byte bound is rendered but not cached.
+    #[tokio::test]
+    async fn the_cache_stays_within_its_byte_and_entry_bounds() {
+        let body = |i: usize| format!("<p>{i:04} {}</p>", "b".repeat(20_000));
+        // Byte-bound first: 100 KB holds four 20 KB bodies.
+        let r = BodyRenderer::new(2, Duration::from_millis(200), 100_000, 1_000);
+        for i in 0..50 {
+            html(r.render(body(i)).await.unwrap());
+            let (entries, bytes) = r.cache_size();
+            assert!(bytes <= 100_000, "cache held {bytes} B after body {i}");
+            assert!(
+                (1..=4).contains(&entries),
+                "cache held {entries} entries after body {i}"
+            );
+        }
+        // The most recent bodies are the ones kept; the first is long gone.
+        let cleans = r.cleans();
+        html(r.render(body(49)).await.unwrap());
+        assert_eq!(r.cleans(), cleans, "the most recent body was evicted");
+        html(r.render(body(0)).await.unwrap());
+        assert_eq!(r.cleans(), cleans + 1, "the oldest body was still cached");
+
+        // A hit refreshes recency: 3 slots, touch the oldest, then insert.
+        let r = BodyRenderer::new(2, Duration::from_millis(200), 1_000_000, 3);
+        for i in 0..3 {
+            html(r.render(body(i)).await.unwrap());
+        }
+        html(r.render(body(0)).await.unwrap()); // 0 is now the most recent
+        html(r.render(body(3)).await.unwrap()); // evicts 1
+        let cleans = r.cleans();
+        html(r.render(body(0)).await.unwrap());
+        assert_eq!(r.cleans(), cleans, "a recently hit body was evicted");
+        html(r.render(body(1)).await.unwrap());
+        assert_eq!(
+            r.cleans(),
+            cleans + 1,
+            "the least recently used body was kept"
+        );
+        assert_eq!(r.cache_size().0, 3);
+
+        // Entry-bound: 256 entries, 50 KB bodies, 8 MiB — entries bind.
+        let r = renderer();
+        for i in 0..CACHE_MAX_ENTRIES + 20 {
+            html(r.render(body(i)).await.unwrap());
+        }
+        let (entries, bytes) = r.cache_size();
+        assert_eq!(entries, CACHE_MAX_ENTRIES);
+        assert!(bytes <= CACHE_MAX_BYTES);
+
+        // Over the byte bound on its own: rendered, not cached, cleaned again.
+        let r = BodyRenderer::new(2, Duration::from_millis(200), 10_000, 10);
+        let big = body(0);
+        assert!(big.len() > 10_000);
+        assert_eq!(html(r.render(big.clone()).await.unwrap()), big);
+        assert_eq!(r.cache_size(), (0, 0));
+        html(r.render(big.clone()).await.unwrap());
+        assert_eq!(r.cleans(), 2);
+    }
+
+    /// The shared instance carries the documented parameters.
+    #[test]
+    fn the_shared_renderer_has_the_documented_parameters() {
+        let shared = BodyRenderer::shared();
+        assert_eq!(shared.0.permits.available_permits(), RENDER_PERMITS);
+        assert_eq!(shared.0.wait, RENDER_WAIT);
+        let cache = shared.0.cache();
+        assert_eq!(cache.max_bytes, CACHE_MAX_BYTES);
+        assert_eq!(cache.max_entries, CACHE_MAX_ENTRIES);
     }
 }

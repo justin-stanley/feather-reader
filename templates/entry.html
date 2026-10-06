@@ -45,13 +45,17 @@
       </header>
 
       <div class="prose">
-        {% if let Some(html) = content_html %}
-          {# A `SanitizedHtml`, re-cleaned at render: askama emits it unescaped
-             through its `HtmlSafe` impl, not the safe filter (#151). #}
-          {{ html }}
-          {% if html.is_truncated() %}
-            <p class="muted truncated-note">This entry is too long or too deeply nested to show in full here. Open the original above for the rest.</p>
-          {% endif %}
+        {% if let Some(body) = content_html %}
+          {% match body %}
+            {% when BodyRender::Html(html) %}
+              {# A `SanitizedHtml`, re-cleaned at render: askama emits it unescaped
+                 through its `HtmlSafe` impl, not the safe filter (#151). #}
+              {{ html }}
+            {% when BodyRender::TooLarge %}
+              <p class="muted body-too-large">This article's stored body is too large to display. Open the original above.</p>
+            {% when BodyRender::Unavailable %}
+              <p class="muted body-unavailable">This article's body is temporarily unavailable. Open the original above, or try again in a moment.</p>
+          {% endmatch %}
         {% else %}
           <p class="muted">This entry has no stored content. Open the original above.</p>
         {% endif %}
