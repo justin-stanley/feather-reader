@@ -3810,8 +3810,9 @@ fn merge_rename(
     })
 }
 
-/// How many times [`rename_subscription`] reads and writes before giving up on
-/// a record that keeps changing: the first try and one retry.
+/// How many times [`rename_subscription`] and [`rename_folder`] read and
+/// write before giving up on a record that keeps changing: the first try and
+/// one retry.
 const RENAME_ATTEMPTS: u32 = 2;
 
 /// The outcome of one read-then-write of a rename.
@@ -4127,27 +4128,187 @@ async fn create_folder(
     Ok(Redirect::to("/").into_response())
 }
 
-/// `POST /folders/:rkey/rename` — rename a folder record.
+/// Form body for `POST /folders/:rkey/rename`.
+#[derive(Debug, Deserialize)]
+struct RenameFolderForm {
+    name: String,
+    /// The name the input was pre-filled with — the record's own name, so it
+    /// is the common ancestor of the reader's edit and any other client's
+    /// (#268). Absent (a hand-made POST, or a page from an older build), the
+    /// handler's first read stands in for it.
+    #[serde(default)]
+    seen_name: Option<String>,
+}
+
+/// `POST /folders/:rkey/rename` — rename a folder record, changing its `name`
+/// and nothing else.
+///
+/// **An edit of the record, not a replacement (#268).** This used to put
+/// `Folder::new(name, now)` over the record, which reset `position`, replaced
+/// `createdAt` with the rename time and dropped every field another
+/// `community.lexicon.rss` client had added — and reported success whether or
+/// not the write landed. It now reads the record with its CID, changes only
+/// the name ([`Folder::extra`] carries the fields this build does not know),
+/// and writes it back with `swapRecord` set to that CID, retried once on
+/// `InvalidSwap` with a three-way merge — the same compare-and-swap as
+/// [`rename_subscription`] (#149).
 async fn rename_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(rkey): Path<String>,
-    Form(form): Form<FolderForm>,
+    Form(form): Form<RenameFolderForm>,
 ) -> Result<Response, WebError> {
     let did = match current_did(&state, &headers).await {
         Some(d) => d,
         None => return Ok(Redirect::to("/login").into_response()),
     };
-    let name = form.name.trim();
-    if name.is_empty() {
+    if form.name.trim().is_empty() {
         return Ok(Redirect::to("/").into_response());
     }
-    let folder = Folder::new(name.to_string(), now_rfc3339());
-    match state.repo().rename_folder(&did, &rkey, &folder).await {
-        Ok(res) => info!(%did, %rkey, uri = %res.uri, "renamed folder"),
-        Err(err) => warn!(%err, %did, %rkey, "PDS folder rename failed"),
+    let mut base: Option<Folder> = None;
+    for attempt in 1..=RENAME_ATTEMPTS {
+        match rename_folder_once(&state, &did, &rkey, &form, &mut base).await {
+            RenameAttempt::Done(resp) => return Ok(resp),
+            RenameAttempt::Raced => {
+                info!(%did, %rkey, attempt, "folder changed between read and write; re-reading");
+            }
+        }
     }
-    Ok(Redirect::to("/").into_response())
+    warn!(%did, %rkey, attempts = RENAME_ATTEMPTS, "refused folder rename: the folder kept changing elsewhere");
+    Ok(folder_flash(FOLDER_RENAME_CONFLICT))
+}
+
+/// The answer to a folder rename that conflicts with another client's write.
+const FOLDER_RENAME_CONFLICT: &str = "This folder was changed elsewhere while you were renaming \
+     it — it was not renamed. Reload and try again.";
+
+/// Redirect home with `message` as the flash.
+fn folder_flash(message: &str) -> Response {
+    Redirect::to(&format!("/?flash={}", qenc(message))).into_response()
+}
+
+/// What a folder rename should do, from [`merge_folder_rename`].
+#[derive(Debug, PartialEq, Eq)]
+enum FolderMerge {
+    /// Write this record: the fresh one, renamed.
+    Write(Folder),
+    /// The record already has the reader's name — a double-submitted Save
+    /// whose first request landed, or the same rename made elsewhere.
+    AlreadySaved,
+    /// The reader did not change the name. Nothing to write.
+    Unchanged,
+}
+
+/// A three-way merge of the reader's rename against `fresh`, the record as
+/// just read (#268).
+///
+/// The ancestor is `seen` — the name the input showed — or, without it,
+/// `base`, the record as the handler first read it. The name is the folder's
+/// only field the form edits; everything else comes from `fresh` untouched.
+///
+/// - the reader left the name as it was shown → [`FolderMerge::Unchanged`],
+///   whatever `fresh` holds;
+/// - `fresh` already has the reader's name → [`FolderMerge::AlreadySaved`];
+/// - `fresh` still has the ancestor's name → write `fresh` renamed;
+/// - otherwise someone else renamed it differently → a conflict.
+///
+/// Compared trimmed: the posted name is trimmed, and a record another client
+/// wrote may carry padding.
+fn merge_folder_rename(
+    posted: &str,
+    seen: Option<&str>,
+    base: &Folder,
+    fresh: Folder,
+) -> Result<FolderMerge, RenameConflict> {
+    let posted = posted.trim();
+    let ancestor = seen.unwrap_or(&base.name).trim();
+    if posted == ancestor {
+        return Ok(FolderMerge::Unchanged);
+    }
+    let current = fresh.name.trim();
+    if current == posted {
+        return Ok(FolderMerge::AlreadySaved);
+    }
+    if current != ancestor {
+        return Err(RenameConflict("name"));
+    }
+    let mut folder = fresh;
+    folder.name = posted.to_string();
+    Ok(FolderMerge::Write(folder))
+}
+
+/// One attempt at [`rename_folder`]: read the folder and its CID, merge the
+/// reader's rename into it, and write it back on the condition that it is
+/// still at that CID. `base` is set by the first attempt's read.
+async fn rename_folder_once(
+    state: &AppState,
+    did: &str,
+    rkey: &str,
+    form: &RenameFolderForm,
+    base: &mut Option<Folder>,
+) -> RenameAttempt {
+    use RenameAttempt::Done;
+
+    // No single-record read on `Repo`, as for subscriptions: the sidecar has
+    // no `get` action, and the listing already carries each record's CID.
+    // A failed read refuses the rename — rebuilding the record from the form
+    // is the loss this read exists to prevent.
+    let found = match state.repo().list_folders_with_cids(did).await {
+        Ok(folders) => folders
+            .into_iter()
+            .find(|(k, _, _)| k == rkey)
+            .map(|(_, cid, f)| (cid, f)),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "could not read the folder before renaming it");
+            return Done(folder_flash(
+                "Could not reach your PDS — the folder was not renamed.",
+            ));
+        }
+    };
+    let Some((read_cid, fresh)) = found else {
+        // Deleted elsewhere (or never there). A put at a missing rkey would
+        // CREATE the folder, which is not what "rename" means.
+        warn!(%did, %rkey, "refused folder rename: no such folder in the repo");
+        return Done(folder_flash(
+            "That folder no longer exists — it may have been deleted elsewhere. \
+             Nothing was renamed.",
+        ));
+    };
+
+    let base = base.get_or_insert_with(|| fresh.clone());
+    let folder = match merge_folder_rename(&form.name, form.seen_name.as_deref(), base, fresh) {
+        Ok(FolderMerge::Write(folder)) => folder,
+        Ok(FolderMerge::AlreadySaved) => {
+            info!(%did, %rkey, "folder already has this name; nothing to write");
+            return Done(Redirect::to("/").into_response());
+        }
+        Ok(FolderMerge::Unchanged) => return Done(Redirect::to("/").into_response()),
+        Err(RenameConflict(field)) => {
+            warn!(%did, %rkey, field, "refused folder rename: the reader and another client both renamed it");
+            return Done(folder_flash(FOLDER_RENAME_CONFLICT));
+        }
+    };
+
+    if read_cid.is_none() {
+        warn!(%did, %rkey, "the PDS listed this folder without a CID; renaming without a compare-and-swap");
+    }
+    match state
+        .repo()
+        .rename_folder(did, rkey, &folder, read_cid.as_deref())
+        .await
+    {
+        Ok(res) => {
+            info!(%did, %rkey, uri = %res.uri, "renamed folder");
+            Done(Redirect::to("/").into_response())
+        }
+        Err(err) if crate::atproto::is_invalid_swap(&err) => RenameAttempt::Raced,
+        Err(err) => {
+            warn!(%err, %did, %rkey, "PDS folder rename failed");
+            Done(folder_flash(
+                "Could not save that change to your PDS — the folder was not renamed.",
+            ))
+        }
+    }
 }
 
 /// `POST /folders/:rkey/delete` — delete a folder record (feeds referencing it
@@ -11609,6 +11770,12 @@ mod tests {
         refuse_every_swap: bool,
         /// Refuse every put with this (status, error) — a non-swap failure.
         fail_puts: Option<(u16, &'static str)>,
+        /// The collection the record lives in; the subscription one when unset.
+        collection: Option<&'static str>,
+        /// The record is not in the repo: the listing comes back empty.
+        missing: bool,
+        /// Every listing fails `502`.
+        fail_list: bool,
     }
 
     impl SwapRepo {
@@ -11616,9 +11783,17 @@ mod tests {
             format!("bafyreiversion{}", self.version)
         }
 
+        fn nsid(&self) -> &'static str {
+            self.collection
+                .unwrap_or(crate::lexicon::nsid::SUBSCRIPTION)
+        }
+
         fn page(&self) -> serde_json::Value {
+            if self.missing {
+                return serde_json::json!({ "records": [] });
+            }
             serde_json::json!({ "records": [{
-                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", self.nsid()),
                 "cid": self.cid(),
                 "value": self.value,
             }] })
@@ -11642,7 +11817,7 @@ mod tests {
             self.value = body["record"].clone();
             self.version += 1;
             Ok(serde_json::json!({
-                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", self.nsid()),
                 "cid": self.cid(),
             }))
         }
@@ -11671,6 +11846,12 @@ mod tests {
                 };
                 let mut repo = repo.lock().unwrap();
                 match (parts.uri.path(), body["action"].as_str()) {
+                    ("/internal/repo", Some("list")) if repo.fail_list => reply(
+                        502,
+                        serde_json::json!({
+                            "ok": false, "error": "UpstreamFailure", "message": "down", "status": 502,
+                        }),
+                    ),
                     ("/internal/repo", Some("list")) => {
                         reply(200, serde_json::json!({ "ok": true, "data": repo.page() }))
                     }
@@ -11683,6 +11864,10 @@ mod tests {
                             }),
                         ),
                     },
+                    ("/xrpc/com.atproto.repo.listRecords", _) if repo.fail_list => reply(
+                        502,
+                        serde_json::json!({ "error": "UpstreamFailure", "message": "down" }),
+                    ),
                     ("/xrpc/com.atproto.repo.listRecords", _) => reply(200, repo.page()),
                     ("/xrpc/com.atproto.repo.putRecord", _) => match repo.put(&body) {
                         Ok(data) => reply(200, data),
@@ -12269,6 +12454,384 @@ mod tests {
         }
     }
 
+    // -- #268: renaming a folder edits the record, it does not replace it ----
+
+    /// A folder record as another `community.lexicon.rss` client might have
+    /// left it: a sort position, an old `createdAt`, and a field this build
+    /// does not know.
+    fn folder_seed() -> serde_json::Value {
+        serde_json::json!({
+            "$type": crate::lexicon::nsid::FOLDER,
+            "name": "Old name",
+            "position": 3,
+            "createdAt": "2024-01-01T00:00:00.000Z",
+            "color": "#abc",
+        })
+    }
+
+    /// A [`SwapRepo`] holding `value` as the folder `rk-keep`.
+    fn folder_repo(value: serde_json::Value) -> SwapRepo {
+        SwapRepo {
+            value,
+            collection: Some(crate::lexicon::nsid::FOLDER),
+            ..SwapRepo::default()
+        }
+    }
+
+    /// Post `body` as the rename of folder `rk-keep`; returns the redirect.
+    async fn post_folder_rename(state: &AppState, body: &str) -> String {
+        let cookie = session_cookie(state, RACE_DID, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/folders/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `value` with its name set to `name`.
+    fn renamed(mut value: serde_json::Value, name: &str) -> serde_json::Value {
+        value["name"] = serde_json::json!(name);
+        value
+    }
+
+    /// **The key test of #268: a rename changes the name and nothing else.**
+    /// The handler used to put `Folder::new(name, now)` over the record, which
+    /// reset `position`, replaced `createdAt` with the rename time and dropped
+    /// every field another client had added. The exact body put is asserted,
+    /// so any field lost or invented on the way fails it — on both backends.
+    #[tokio::test]
+    async fn renaming_a_folder_changes_only_its_name() {
+        for backend in RACE_BACKENDS {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(folder_repo(folder_seed())));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: a landed rename was not reported as done"
+            );
+            assert_eq!(repo.puts.len(), 1, "{backend:?}: {:?}", repo.puts);
+            assert_eq!(
+                repo.puts[0]["record"],
+                renamed(folder_seed(), "New name"),
+                "{backend:?}: the put did not keep the record whole: {}",
+                repo.puts[0]
+            );
+            assert_eq!(
+                repo.puts[0]["collection"],
+                crate::lexicon::nsid::FOLDER,
+                "{backend:?}"
+            );
+            assert_eq!(
+                repo.puts[0]["swapRecord"], "bafyreiversion0",
+                "{backend:?}: the put did not name the CID it read: {}",
+                repo.puts[0]
+            );
+        }
+    }
+
+    /// **A rename that loses a race keeps the other client's change and
+    /// lands.** Another client moves the folder (and adds a field) between the
+    /// read and the write; the swap is refused, the handler re-reads and
+    /// renames the FRESH record.
+    #[tokio::test]
+    async fn a_folder_rename_that_loses_a_race_keeps_the_concurrent_edit() {
+        for backend in RACE_BACKENDS {
+            for with_seen in [true, false] {
+                let mut theirs = folder_seed();
+                theirs["position"] = serde_json::json!(7);
+                theirs["icon"] = serde_json::json!("star");
+                let mut fake = folder_repo(folder_seed());
+                fake.concurrent = Some(theirs.clone());
+                let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+                let state = race_state(backend, &repo).await;
+
+                let body = if with_seen {
+                    "name=New+name&seen_name=Old+name"
+                } else {
+                    "name=New+name"
+                };
+                let loc = post_folder_rename(&state, body).await;
+
+                let repo = repo.lock().unwrap();
+                let ctx = format!("{backend:?} with_seen={with_seen}");
+                assert_eq!(
+                    loc, "/",
+                    "{ctx}: a converged rename was not reported as done"
+                );
+                assert_eq!(repo.puts.len(), 2, "{ctx}: {:?}", repo.puts);
+                assert_eq!(repo.puts[0]["swapRecord"], "bafyreiversion0", "{ctx}");
+                assert_eq!(
+                    repo.puts[1]["swapRecord"], "bafyreiversion1",
+                    "{ctx}: the retry did not name the RE-READ CID"
+                );
+                assert_eq!(
+                    repo.value,
+                    renamed(theirs, "New name"),
+                    "{ctx}: the concurrent edit was lost"
+                );
+            }
+        }
+    }
+
+    /// **Both renaming the folder, differently, is a conflict that writes
+    /// nothing** — the reader is told, and the other client's name stands.
+    /// With and without `seen_name`: without it, the first read is the
+    /// ancestor.
+    #[tokio::test]
+    async fn both_renaming_a_folder_differently_is_a_conflict() {
+        for backend in RACE_BACKENDS {
+            for body in ["name=New+name&seen_name=Old+name", "name=New+name"] {
+                let theirs = renamed(folder_seed(), "Their name");
+                let mut fake = folder_repo(folder_seed());
+                fake.concurrent = Some(theirs.clone());
+                let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+                let state = race_state(backend, &repo).await;
+
+                let loc = post_folder_rename(&state, body).await;
+
+                let repo = repo.lock().unwrap();
+                assert!(
+                    loc.contains("changed%20elsewhere"),
+                    "{backend:?} {body}: expected the conflict flash, got {loc}"
+                );
+                assert_eq!(
+                    repo.puts.len(),
+                    1,
+                    "{backend:?} {body}: only the refused put: {:?}",
+                    repo.puts
+                );
+                assert_eq!(
+                    repo.value, theirs,
+                    "{backend:?} {body}: the other client's name was overwritten"
+                );
+            }
+        }
+    }
+
+    /// **Both renaming it to the SAME name is agreement** — a double-submitted
+    /// Save whose first request landed. Success, and no second write.
+    #[tokio::test]
+    async fn both_renaming_a_folder_the_same_is_success_without_a_write() {
+        for backend in RACE_BACKENDS {
+            let theirs = renamed(folder_seed(), "New name");
+            let mut fake = folder_repo(folder_seed());
+            fake.concurrent = Some(theirs.clone());
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name&seen_name=Old+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: agreement reported as a failure: {loc}"
+            );
+            assert_eq!(repo.puts.len(), 1, "{backend:?}: {:?}", repo.puts);
+            assert_eq!(repo.value, theirs, "{backend:?}");
+        }
+    }
+
+    /// **A folder that keeps moving is a conflict after one retry**, never
+    /// reported as renamed and never retried forever.
+    #[tokio::test]
+    async fn a_folder_rename_refused_on_every_swap_reports_the_conflict() {
+        for backend in RACE_BACKENDS {
+            let mut fake = folder_repo(folder_seed());
+            fake.refuse_every_swap = true;
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert!(
+                loc.contains("changed%20elsewhere"),
+                "{backend:?}: expected the conflict flash, got {loc}"
+            );
+            assert_eq!(repo.puts.len(), 2, "{backend:?}: one try and one retry");
+            assert_eq!(repo.value, folder_seed(), "{backend:?}");
+        }
+    }
+
+    /// **A failed rename tells the reader**, instead of redirecting as if it
+    /// had worked — and a failure a re-read cannot fix is not retried.
+    #[tokio::test]
+    async fn a_failed_folder_rename_shows_an_error() {
+        for backend in RACE_BACKENDS {
+            let mut fake = folder_repo(folder_seed());
+            fake.fail_puts = Some((502, "UpstreamFailure"));
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert_ne!(loc, "/", "{backend:?}: a failed rename reported success");
+            assert!(
+                loc.contains("Could%20not%20save"),
+                "{backend:?}: expected the save-failed flash, got {loc}"
+            );
+            assert!(!loc.contains("changed%20elsewhere"), "{backend:?}: {loc}");
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: a non-swap failure was retried"
+            );
+        }
+    }
+
+    /// **A folder deleted elsewhere is not recreated.** A put at a missing
+    /// rkey creates the record, which a rename must not do.
+    #[tokio::test]
+    async fn renaming_a_folder_that_no_longer_exists_writes_nothing() {
+        for backend in RACE_BACKENDS {
+            let mut fake = folder_repo(folder_seed());
+            fake.missing = true;
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert!(
+                loc.contains("no%20longer%20exists"),
+                "{backend:?}: expected the missing-folder flash, got {loc}"
+            );
+            assert!(repo.puts.is_empty(), "{backend:?}: {:?}", repo.puts);
+        }
+    }
+
+    /// **A folder that cannot be read is not renamed** — rebuilding it from
+    /// the form instead is the record loss this read exists to prevent.
+    #[tokio::test]
+    async fn a_folder_rename_whose_read_fails_writes_nothing() {
+        for backend in RACE_BACKENDS {
+            let mut fake = folder_repo(folder_seed());
+            fake.fail_list = true;
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(fake));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert!(
+                loc.contains("Could%20not%20reach"),
+                "{backend:?}: expected the read-failed flash, got {loc}"
+            );
+            assert!(repo.puts.is_empty(), "{backend:?}: {:?}", repo.puts);
+        }
+    }
+
+    /// **`seen_name` closes the page-load window.** Another client renamed the
+    /// folder after the page was rendered but before the handler read it, so
+    /// no swap fails; the form still says what the reader saw, and their
+    /// different rename is a conflict rather than a silent overwrite.
+    #[tokio::test]
+    async fn a_rename_elsewhere_after_page_load_is_a_conflict_with_seen_name() {
+        for backend in RACE_BACKENDS {
+            let theirs = renamed(folder_seed(), "Their name");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(folder_repo(theirs.clone())));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=New+name&seen_name=Old+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert!(
+                loc.contains("changed%20elsewhere"),
+                "{backend:?}: expected the conflict flash, got {loc}"
+            );
+            assert!(repo.puts.is_empty(), "{backend:?}: {:?}", repo.puts);
+            assert_eq!(repo.value, theirs, "{backend:?}");
+        }
+    }
+
+    /// A form whose name is the one it showed changes nothing: no write, and
+    /// a rename another client made since stands.
+    #[tokio::test]
+    async fn an_unchanged_folder_name_writes_nothing() {
+        for backend in RACE_BACKENDS {
+            let theirs = renamed(folder_seed(), "Their name");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(folder_repo(theirs.clone())));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_folder_rename(&state, "name=Old+name&seen_name=Old+name").await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(loc, "/", "{backend:?}");
+            assert!(repo.puts.is_empty(), "{backend:?}: {:?}", repo.puts);
+            assert_eq!(repo.value, theirs, "{backend:?}");
+        }
+    }
+
+    /// The folder merge, case by case (#268).
+    #[test]
+    fn merge_folder_rename_is_a_three_way_merge_on_the_name() {
+        let base = Folder::new("Old", "2024-01-01T00:00:00.000Z");
+        let with = |name: &str| {
+            let mut f = base.clone();
+            f.name = name.to_string();
+            f.position = Some(3);
+            f.extra
+                .insert("color".to_string(), serde_json::json!("#abc"));
+            f
+        };
+        // The reader left the name as shown: nothing to write.
+        assert_eq!(
+            merge_folder_rename("Old", Some("Old"), &base, with("Other")),
+            Ok(FolderMerge::Unchanged)
+        );
+        // Only the reader changed it: the FRESH record, renamed.
+        assert_eq!(
+            merge_folder_rename("New", Some("Old"), &base, with("Old")),
+            Ok(FolderMerge::Write(with("New")))
+        );
+        // Fresh already holds the reader's name: agreement.
+        assert_eq!(
+            merge_folder_rename("New", Some("Old"), &base, with("New")),
+            Ok(FolderMerge::AlreadySaved)
+        );
+        // Both changed it, differently: a conflict.
+        assert_eq!(
+            merge_folder_rename("New", Some("Old"), &base, with("Other")),
+            Err(RenameConflict("name"))
+        );
+        // Without seen_name the first read is the ancestor.
+        assert_eq!(
+            merge_folder_rename("New", None, &with("Other"), with("Other")),
+            Ok(FolderMerge::Write(with("New")))
+        );
+        assert_eq!(
+            merge_folder_rename("New", None, &base, with("Other")),
+            Err(RenameConflict("name"))
+        );
+        // Padding is not a change.
+        assert_eq!(
+            merge_folder_rename(" Old ", Some("Old "), &base, with("Other")),
+            Ok(FolderMerge::Unchanged)
+        );
+        assert_eq!(
+            merge_folder_rename("New ", Some("Old"), &base, with(" Old ")),
+            Ok(FolderMerge::Write(with("New")))
+        );
+    }
+
     /// Both sides changing a field to the SAME value is agreement, not a
     /// conflict — for every field the merge handles. Alongside a field still
     /// to apply, the write goes ahead with it; alone, there is nothing to
@@ -12805,6 +13368,8 @@ mod tests {
             r#"<input type="hidden" name="seen_title" value="Work Feed" />"#,
             r#"<input type="hidden" name="seen_folder" value="at://did:plc:x/app.folder/work" />"#,
             r#"<input type="hidden" name="seen_folder" value="" />"#,
+            // #268: the folder rename form says which name it showed.
+            r#"<input type="hidden" name="seen_name" value="Work" />"#,
         ] {
             assert!(html.contains(want), "missing {want}: {html}");
         }

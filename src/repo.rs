@@ -394,6 +394,14 @@ impl Repo<'_> {
     }
 
     dispatch! {
+        /// Folders with the CID each record was listed at, unsorted — the read
+        /// half of a rename that puts with `swapRecord` (#268).
+        list_folders_with_cids() -> Vec<(String, Option<String>, Folder)>,
+        sidecar: list_folders_with_cids,
+        rust: list_folders_with_cids
+    }
+
+    dispatch! {
         /// Create a folder. Returns its rkey.
         add_folder(folder: &Folder) -> String,
         sidecar: add_folder,
@@ -401,8 +409,13 @@ impl Repo<'_> {
     }
 
     dispatch! {
-        /// Rename a folder in place.
-        rename_folder(rkey: &str, folder: &Folder) -> crate::atproto::WriteResult,
+        /// Rename a folder in place, on the condition that it is still at
+        /// `swap_record` when that is given (#268).
+        rename_folder(
+            rkey: &str,
+            folder: &Folder,
+            swap_record: Option<&str>
+        ) -> crate::atproto::WriteResult,
         sidecar: rename_folder,
         rust: rename_folder
     }

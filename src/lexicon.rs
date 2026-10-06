@@ -229,6 +229,19 @@ pub struct Folder {
     /// Record creation time (ISO-8601 datetime). Required.
     #[serde(rename = "createdAt")]
     pub created_at: String,
+
+    /// Every field of the record this build does not know, kept as it was
+    /// read so a put of the record writes them back (#268).
+    ///
+    /// The collection is shared with every other `community.lexicon.rss`
+    /// client, and a rename is a `putRecord` of the WHOLE record: without
+    /// this, a field another client added was erased by every rename here.
+    /// The known fields above are consumed by name before anything lands in
+    /// this map, so it never holds `$type`, `name`, `position` or `createdAt`
+    /// and a serialized record never carries a key twice. Empty for a folder
+    /// this build creates, so it adds nothing to that record.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn folder_type() -> String {
@@ -243,6 +256,7 @@ impl Folder {
             name: name.into(),
             position: None,
             created_at: created_at.into(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -546,6 +560,50 @@ mod tests {
         assert_eq!(folder.name, "Tech");
         assert_eq!(folder.position, Some(2));
         assert_eq!(serde_json::to_value(&folder).expect("serialize"), value);
+    }
+
+    /// **A folder record keeps the fields this build does not know (#268).**
+    /// Other `community.lexicon.rss` clients write the same collection, and a
+    /// rename puts the whole record back: a field dropped on the way through
+    /// is erased from the reader's repo.
+    #[test]
+    fn folder_round_trips_fields_it_does_not_know() {
+        let value = json!({
+            "$type": "community.lexicon.rss.folder",
+            "name": "Tech",
+            "position": 3,
+            "createdAt": "2024-01-01T00:00:00.000Z",
+            "color": "#abc",
+            "nested": { "icon": "star", "tags": [1, "two", null] }
+        });
+        let folder: Folder = serde_json::from_value(value.clone()).expect("deserialize");
+        assert_eq!(folder.name, "Tech");
+        assert_eq!(folder.position, Some(3));
+        assert_eq!(serde_json::to_value(&folder).expect("serialize"), value);
+        // Serialized as text too: one key per field, never a duplicate.
+        let text = serde_json::to_string(&folder).expect("serialize");
+        for key in ["$type", "name", "position", "createdAt", "color", "nested"] {
+            assert_eq!(
+                text.matches(&format!("\"{key}\":")).count(),
+                1,
+                "{key} not emitted exactly once: {text}"
+            );
+        }
+    }
+
+    /// A folder this build creates carries the lexicon's fields and nothing
+    /// else — no empty catch-all key, no nulls.
+    #[test]
+    fn a_new_folder_serializes_only_its_own_fields() {
+        let folder = Folder::new("Tech", "2026-07-12T00:00:00.000Z");
+        assert_eq!(
+            serde_json::to_value(&folder).expect("serialize"),
+            json!({
+                "$type": "community.lexicon.rss.folder",
+                "name": "Tech",
+                "createdAt": "2026-07-12T00:00:00.000Z"
+            })
+        );
     }
 
     #[test]

@@ -122,6 +122,7 @@
                 <summary class="btn-quiet">Rename</summary>
                 <form method="post" action="/folders/{{ folder.rkey }}/rename" class="inline-form">
                   <input class="input" type="text" name="name" value="{{ folder.name }}" required />
+                  <input type="hidden" name="seen_name" value="{{ folder.name }}" />
                   <button class="btn-quiet" type="submit">Save</button>
                 </form>
               </details>
