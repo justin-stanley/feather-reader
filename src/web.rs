@@ -9884,13 +9884,15 @@ mod tests {
         )
         .await
         .unwrap();
+        // Hostile attributes on tags the sanitizer keeps first, so they reach
+        // it; then tags it removes, where the render-cost scan stops.
         let hostile_body = concat!(
             "<p>kept <b>bold</b></p>",
-            "<script>alert(1)</script>",
             r#"<img src="x" onerror="alert(2)">"#,
             r#"<a href="javascript:alert(3)">click</a>"#,
-            r#"<iframe src="https://evil.example/"></iframe>"#,
             r#"<p onclick="alert(4)" style="color:red">tail</p>"#,
+            "<script>alert(1)</script>",
+            r#"<iframe src="https://evil.example/"></iframe>"#,
         );
         // Already-clean: the shape ingest stores. It must render unchanged.
         let clean_body = concat!(

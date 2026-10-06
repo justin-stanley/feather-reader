@@ -37,33 +37,72 @@ deploying is separate.
   before the change: all three reached the page.
 
   **Measured cost.** On 545 real bodies from 20 public feeds (release build),
-  re-cleaning took p50 25 µs, p99 0.8 ms, max 2.9 ms (a 561 KB body).
+  re-cleaning took p50 31 µs, p99 1.1 ms, max 3.5 ms (a 561 KB body).
   Re-cleaning is idempotent on all 545: identical bytes, so readers see no
-  change. The one known exception: a literal U+00A0 in a standard.site
-  plain-text summary comes back as `&nbsp;`, the same character; a test pins
-  that.
+  change. Two known exceptions, both the same page to a browser, each pinned
+  by a test: a literal U+00A0 in a standard.site plain-text summary comes back
+  as `&nbsp;`, and a table whose `<tfoot>` the policy stripped gains the
+  `<tbody>` a browser builds around those rows anyway.
 
   **Bounded worst case.** The sanitizer is quadratic on inputs a hostile feed
   can store within the 2 MiB bound (#226). Unbounded, re-cleaning a stored
   2 MiB body took 2.4 s for a `&` run, 3.4 s for a U+00A0 run and ~37 s for
   nested `<div>`s. A size cap does not fix this: 256 KiB of open `<ul><li>`
-  still took 4.7 s. Render therefore cleans only the prefix within three
-  budgets, found by a linear scan: 2 MiB, nesting depth 256, and a text-node
-  cost. Measured, the cost of each `&` or U+00A0 is the bytes after it in the
-  same text node. The scan accepts only well-formed nesting, which is all
-  ingest stores, because misnesting is where the parser re-opens formatting
-  elements: 36 KB of that expanded to 19 MB. Worst budgeted case measured is
-  ~130 ms. No real body was cut. A body that is cut says so, and the page
-  points to the original. Reproduce with
+  still took 4.7 s. So render cleans only a prefix of the stored body, found
+  by a linear scan. The prefix must fit four budgets: 2 MiB, nesting depth
+  256, a text cost and 32 attributes per tag. Measured, the cost of each `&`
+  or U+00A0 is the bytes after it in the same text node or attribute value.
+  The worst budgeted case measured is ~140 ms. No real body was cut. A body
+  that is cut says so, and the page points to the original. Reproduce with
   `feed::tests::render_reclean_cost` (ignored).
+
+  **The scan accepts only what the sanitizer itself writes.** The text cost
+  depends on where the parser's text nodes end. Review found that the first
+  version reset its count at any `<letter` or `<!`. The parser ignores some of
+  those in body (`<!DOCTYPE x>`, `<body>`, `<html>`), so the text node kept
+  growing: 1.1 s, uncut. A list of what the parser ignores would be a
+  denylist. The scan is an allowlist instead, and it cuts at the first thing
+  ingest never stores:
+  - a tag the policy does not keep, read from the same `ammonia` builder
+    (`feed::sanitizer_tags`);
+  - a comment, doctype, processing instruction or bare `<`;
+  - a start tag the parser would answer by closing, moving or dropping
+    elements: a table part outside its parent, text or other elements
+    directly in a table, `<li>` in an open `<li>`, a block in an open `<p>`,
+    `<a>` in an open `<a>`;
+  - a closer that does not close the innermost element.
+
+  Every tag the scan accepts starts or ends an element, so the text count
+  resets there and nowhere else. Re-measuring turned up three more bypasses
+  of the first version, each now cut:
+  - `<li>` inside an open `<li>`, with every closer matching: 47 KB expanded
+    to 3.7 MB, because the parser re-opened 200 formatting elements per item;
+  - one `<p>` with ~190 K attributes: 6.6 s;
+  - `&`s followed by text inside one attribute value: 1.1 s.
+
+  A cut also no longer lands inside an entity (`&am|p;` used to render as
+  visible `&amp;am`) or inside a tag.
 
   The other `|safe` in the templates, in `manage.html`, renders the
   compile-time constant `FEED_URL_PATTERN`, not content, and is unchanged.
 
-  Mutations, each caught: skipping the clean; a weaker policy at render;
-  `|safe` kept in the template, on the type or on the raw string; no
-  `HtmlSafe` impl; each budget removed in turn; a lenient closer; quotes not
-  skipped; public fields; a `From<String>`.
+  22 mutations, each caught:
+  - skipping the clean;
+  - a weaker policy at render;
+  - `|safe` kept in the template, on the type or on the raw string;
+  - no `HtmlSafe` impl;
+  - each budget removed in turn;
+  - no text-node reset;
+  - a lenient closer;
+  - quotes not honoured;
+  - unknown tags accepted (the denylist);
+  - no implicit-close check;
+  - no table-text check;
+  - no entity back-off;
+  - no attribute limit or attribute cost;
+  - a tag past the size bound accepted;
+  - public fields;
+  - a `From<String>`.
 
 ---
 

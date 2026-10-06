@@ -1574,6 +1574,15 @@ pub(crate) fn sanitize_html(raw: &str) -> String {
     ammonia::clean(raw)
 }
 
+/// The element names [`sanitize_html`]'s policy keeps, read from the same
+/// `ammonia` builder `ammonia::clean` uses, so it cannot drift from it.
+/// `sanitized_html`'s render-cost scanner accepts only these.
+pub(crate) fn sanitizer_tags() -> &'static std::collections::HashSet<&'static str> {
+    static TAGS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+        std::sync::LazyLock::new(|| ammonia::Builder::default().clone_tags());
+    &TAGS
+}
+
 /// Render **plain text** into the HTML the `content_html` column holds.
 ///
 /// **Not [`sanitize_html`].** `ammonia::clean` parses its input as markup, so a
@@ -3723,6 +3732,107 @@ mod tests {
             ("dense &amp;", format!("<p>{}", fill("&amp;"))),
             ("dense U+00A0", format!("<p>{}", fill("\u{a0}"))),
             ("plain text", format!("<p>{}", fill("a"))),
+            // Review of #273: tokens the parser ignores, between the `&`s and
+            // the text that follows them.
+            (
+                "&amp; <!DOCTYPE x> text",
+                format!(
+                    "<p>{}<!DOCTYPE x>{}",
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_020)
+                ),
+            ),
+            (
+                "&amp; <body> text",
+                format!(
+                    "<p>{}<body>{}",
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_020)
+                ),
+            ),
+            (
+                "&amp; <html> text",
+                format!(
+                    "<p>{}<html>{}",
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_020)
+                ),
+            ),
+            (
+                "U+00A0 <body> text",
+                format!(
+                    "<p>{}<body>{}",
+                    "\u{a0}".repeat(20_000),
+                    "a".repeat(bound - 40_020)
+                ),
+            ),
+            (
+                "&amp; <font> text",
+                format!(
+                    "<p>{}<font>{}",
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_020)
+                ),
+            ),
+            (
+                "li in li, formatting re-opened",
+                format!(
+                    "<ul><li>{}{}",
+                    (0..200)
+                        .map(|i| format!(r#"<b title="{i}">"#))
+                        .collect::<String>(),
+                    "<li>x</li>".repeat(bound / 12)
+                ),
+            ),
+            (
+                "one tag, many attributes",
+                format!(
+                    "<p{}>x</p>",
+                    (0..bound / 10)
+                        .map(|i| format!(" a{i:07}"))
+                        .collect::<String>()
+                ),
+            ),
+            (
+                "32 attributes per tag, repeated",
+                fill(&format!(
+                    "<b{}>x</b>",
+                    (0..crate::sanitized_html::MAX_RENDER_ATTRIBUTES)
+                        .map(|i| format!(" a{i}"))
+                        .collect::<String>()
+                )),
+            ),
+            (
+                "one tag, one attribute repeated",
+                format!("<p{}>x</p>", " title".repeat(bound / 7)),
+            ),
+            (
+                "&amp; then text, in an attribute",
+                format!(
+                    r#"<p title="{}{}">x</p>"#,
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_100)
+                ),
+            ),
+            (
+                "U+00A0 then text, in an attribute",
+                format!(
+                    r#"<p title="{}{}">x</p>"#,
+                    "\u{a0}".repeat(20_000),
+                    "a".repeat(bound - 40_100)
+                ),
+            ),
+            // Both budgets spent in one body: depth-bound nesting, then a text
+            // node at the cost budget.
+            (
+                "depth bound + text budget",
+                format!(
+                    "{}<p>{}{}",
+                    at_depth("<div>", "</div>").repeat(bound / 2 / (11 * MAX_RENDER_DEPTH)),
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound / 2 - 100_100)
+                ),
+            ),
         ];
         for (name, input) in &worst {
             let t = Instant::now();
