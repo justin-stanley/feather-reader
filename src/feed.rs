@@ -1284,19 +1284,7 @@ pub async fn poll_feed(
         next_poll: None, // the scheduler owns cadence; leave it to set next_poll.
     };
 
-    // Bodies are sanitized on the blocking pool, within the stored-body budget,
-    // one poll-wide batch: see `BodySanitizer` (#226).
-    let mut entries: Vec<NewEntry> = Vec::with_capacity(parsed.entries.len());
-    {
-        let mut batch = BodySanitizer::shared().batch(&feed.url);
-        for e in &parsed.entries {
-            let (mut entry, raw) = normalize_entry_parts(e);
-            if let Some(raw) = raw {
-                entry.content_html = Some(batch.html(raw).await);
-            }
-            entries.push(entry);
-        }
-    }
+    let entries: Vec<NewEntry> = parsed.entries.iter().map(normalize_entry).collect();
 
     // --- store (a store failure IS a real error) -----------------------------
     let feed_id = store::upsert_feed(pool, &new_feed)
@@ -1424,33 +1412,20 @@ fn is_primary_link(l: &RawLink) -> bool {
     l.target.is_none()
 }
 
-/// Turn a parsed [`RawEntry`] into the store's [`NewEntry`], sanitizing HTML
-/// inline. **Test and benchmark use only**: the poller goes through
-/// [`normalize_entry_parts`] and [`IngestBatch::html`], which sanitize on the
-/// blocking pool under the stored-body budget (#226).
-#[cfg(test)]
-fn normalize_entry(e: &RawEntry) -> NewEntry {
-    let (mut entry, raw) = normalize_entry_parts(e);
-    entry.content_html = raw.map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES));
-    entry
-}
-
-/// Everything of a [`NewEntry`] but its body, plus the raw body to sanitize.
+/// Turn a parsed [`RawEntry`] into the store's [`NewEntry`], sanitizing HTML.
 ///
 /// Content preference: full `content` body, else `summary`. Whichever is chosen
-/// is **always** sanitized before storage — by the caller, through
-/// [`IngestBatch::html`], so that the sanitizer runs off the async task and
-/// within the budget; `content_html` here is `None`. GUID falls back to the
-/// entry link, then to a stable hash of title+link, so an entry missing an
-/// `id` still deduplicates instead of being re-inserted forever.
-fn normalize_entry_parts(e: &RawEntry) -> (NewEntry, Option<&str>) {
+/// is **always** passed through [`sanitize_html`] before storage. GUID falls
+/// back to the entry link, then to a stable hash of title+link, so an entry
+/// missing an `id` still deduplicates instead of being re-inserted forever.
+fn normalize_entry(e: &RawEntry) -> NewEntry {
     let url = entry_link(e);
-    let raw_body = e
+    let content_html = e
         .content
         .as_ref()
         .and_then(|c| c.body.as_deref())
-        .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()));
-    let content_html = None;
+        .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
+        .map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES));
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
@@ -1463,7 +1438,7 @@ fn normalize_entry_parts(e: &RawEntry) -> (NewEntry, Option<&str>) {
         stable_guid(e)
     };
 
-    let entry = NewEntry {
+    NewEntry {
         guid: bound_guid(guid),
         url: url.map(|u| bound_text(u, MAX_URL_BYTES)),
         title: e
@@ -1474,8 +1449,7 @@ fn normalize_entry_parts(e: &RawEntry) -> (NewEntry, Option<&str>) {
         published: entry_time(e),
         content_html,
         fetched_at: None, // store defaults to "now".
-    };
-    (entry, raw_body)
+    }
 }
 
 /// The raw best-permalink URL for an entry (no scheme filtering) — used only as
@@ -1646,31 +1620,6 @@ pub(crate) const MAX_CONTENT_HTML_BYTES: usize = 2 * 1024 * 1024;
 /// (see [`bound_guid`]): it is the dedup key, under a UNIQUE index.
 pub(crate) const MAX_GUID_BYTES: usize = 2_048;
 
-/// **The stored-body invariant (#226, #151): everything stored in
-/// `content_html` sanitizes within this budget**, measured at ingest on the
-/// blocking pool. A body that does not is stored degraded instead (see
-/// [`degraded_body`]).
-///
-/// Real content is nowhere near it: on 545 real bodies from 20 public feeds
-/// (release build) a clean took p50 31 µs, p99 1.1 ms, max 3.5 ms for a
-/// 561 KB body; a 2 MiB plain-text body takes 0.6 ms. The quadratic shapes a
-/// feed can serve are far over it: 512 KiB of `&` 165 ms, of U+00A0 226 ms,
-/// 128 KiB of nested `<div>`s ~150 ms, 2 MiB of nested `<div>`s 37 s. So the
-/// budget is ~30x the slowest real body and under the cheapest pathological
-/// one at a fraction of the stored bound. A debug build runs the sanitizer
-/// 10-20x slower; the budget is not scaled for it, which only degrades larger
-/// bodies there than in release.
-pub(crate) const INGEST_SANITIZE_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(100);
-
-/// The most a degraded body ([`degraded_body`]) may be: a short escaped
-/// excerpt, so its own re-clean is bounded by construction, far under
-/// [`INGEST_SANITIZE_BUDGET`].
-pub(crate) const DEGRADED_BODY_MAX_BYTES: usize = 4_096;
-
-/// What a degraded body ends with, so a reader can see it is an excerpt.
-pub(crate) const DEGRADED_MARK: &str = "[…]";
-
 /// The largest index `<= at` that is a character boundary of `s`.
 fn floor_char_boundary(s: &str, at: usize) -> usize {
     if at >= s.len() {
@@ -1785,328 +1734,6 @@ fn ceil_char_boundary(s: &str, at: usize) -> usize {
 /// The most bisection passes [`sanitize_html_bounded`] spends after its first
 /// cut: enough to resolve a 2 MiB bound to about 1/1024 of it.
 const SANITIZE_BOUND_ATTEMPTS: usize = 14;
-
-// ---------------------------------------------------------------------------
-// The stored-body budget (#226)
-// ---------------------------------------------------------------------------
-
-/// How many ingest sanitizes may run at once, process-wide: the poller's own
-/// default concurrency (`scheduler::DEFAULT_POLL_CONCURRENCY`), so ordinary
-/// polling never waits for one. The limit exists because a sanitize that blows
-/// [`INGEST_SANITIZE_BUDGET`] cannot be cancelled — ammonia has no yield point —
-/// so its thread keeps running until it finishes (up to ~37 s for the worst
-/// 2 MiB shape measured). This is the most of those a hostile set of feeds can
-/// keep on the blocking pool.
-pub(crate) const INGEST_SANITIZE_PERMITS: usize = 4;
-
-/// How long a poll waits for a sanitize permit before storing the rest of its
-/// bodies degraded. Only reached while [`INGEST_SANITIZE_PERMITS`] abandoned
-/// sanitizes are running at once — that many hostile feeds polled within the
-/// same ~37 s — and the degraded rows are overwritten by the next poll
-/// (`insert_entries` updates `content_html` on conflict).
-pub(crate) const INGEST_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The most raw feed HTML one body hands the sanitizer: the stored bound
-/// itself. The output bound ([`MAX_CONTENT_HTML_BYTES`]) caps what is kept;
-/// this caps what an abandoned sanitize can be chewing on, and so how long it
-/// runs (2 MiB of nested `<div>`s: ~37 s; 8 MiB of `&`, the most a feed
-/// document can carry, did not finish in ten minutes). A real article is far
-/// smaller (max 561 KB of 545 measured); one whose raw form is over 2 MiB but
-/// cleans to less keeps its first 2 MiB.
-pub(crate) const MAX_SANITIZE_INPUT_BYTES: usize = MAX_CONTENT_HTML_BYTES;
-
-/// Runs ingest sanitizes on the blocking pool, within the stored-body budget
-/// and the permit limit. One process-wide instance, [`BodySanitizer::shared`];
-/// tests build their own.
-///
-/// **What it guarantees:** every `String` it hands back either sanitizes within
-/// [`INGEST_SANITIZE_BUDGET`] — measured, on this machine, on the exact bytes
-/// stored — or is a [`degraded_body`], whose re-clean is bounded by its size.
-/// The reader's render-time re-clean ([`crate::sanitized_html`]) therefore
-/// never meets a slow body that came through ingest; its own bounds cover only
-/// rows written some other way.
-pub(crate) struct BodySanitizer {
-    permits: std::sync::Arc<tokio::sync::Semaphore>,
-    budget: std::time::Duration,
-    wait: std::time::Duration,
-    /// Bodies stored degraded, for tests and for the log.
-    degraded: std::sync::atomic::AtomicUsize,
-}
-
-impl BodySanitizer {
-    pub(crate) fn new(
-        permits: usize,
-        budget: std::time::Duration,
-        wait: std::time::Duration,
-    ) -> Self {
-        Self {
-            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
-            budget,
-            wait,
-            degraded: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// The process-wide instance, with [`INGEST_SANITIZE_PERMITS`],
-    /// [`INGEST_SANITIZE_BUDGET`] and [`INGEST_PERMIT_WAIT`].
-    pub(crate) fn shared() -> &'static BodySanitizer {
-        static SHARED: std::sync::LazyLock<BodySanitizer> = std::sync::LazyLock::new(|| {
-            BodySanitizer::new(
-                INGEST_SANITIZE_PERMITS,
-                INGEST_SANITIZE_BUDGET,
-                INGEST_PERMIT_WAIT,
-            )
-        });
-        &SHARED
-    }
-
-    /// The bodies of one poll of `feed`.
-    pub(crate) fn batch<'a>(&'a self, feed: &'a str) -> IngestBatch<'a> {
-        IngestBatch {
-            sanitizer: self,
-            feed,
-            blown: None,
-            total: 0,
-            degraded: 0,
-        }
-    }
-
-    /// How many bodies this instance has stored degraded.
-    #[cfg(test)]
-    pub(crate) fn degraded(&self) -> usize {
-        self.degraded.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-/// The bodies of one poll, sanitized in turn.
-///
-/// **One abandoned sanitize per poll, at most.** After the first body of a
-/// poll blows the budget (or no permit comes), every later body of the same
-/// poll is stored degraded without being sanitized at all. A feed with fifty
-/// pathological entries then costs one thread for one sanitize, not fifty; a
-/// feed with one pathological entry and ordinary neighbours has those
-/// neighbours stored as excerpts for that poll — and there is no such real
-/// feed: the budget is 30x the slowest real body measured.
-pub(crate) struct IngestBatch<'a> {
-    sanitizer: &'a BodySanitizer,
-    feed: &'a str,
-    /// Why this poll stopped sanitizing, once it has.
-    blown: Option<&'static str>,
-    total: usize,
-    degraded: usize,
-}
-
-/// What a batch is handed.
-enum Body {
-    /// Feed HTML: sanitized and bounded, then its stored form is re-cleaned
-    /// to time it.
-    Html,
-    /// Plain text already escaped by [`plain_text_to_html`]: stored as given
-    /// if its re-clean fits the budget. Escaping is linear, but the reader's
-    /// re-clean of the result is not (a 2 MiB `&amp;` run takes 2.4 s).
-    Escaped,
-}
-
-impl IngestBatch<'_> {
-    /// Feed HTML, as the sanitizer's bounded output — or an excerpt.
-    pub(crate) async fn html(&mut self, raw: &str) -> String {
-        let cut = floor_char_boundary(raw, MAX_SANITIZE_INPUT_BYTES);
-        self.admit(&raw[..cut], Body::Html).await
-    }
-
-    /// Plain text already escaped into HTML, unchanged — or an excerpt.
-    pub(crate) async fn escaped(&mut self, html: &str) -> String {
-        self.admit(html, Body::Escaped).await
-    }
-
-    async fn admit(&mut self, input: &str, kind: Body) -> String {
-        self.total += 1;
-        if self.blown.is_some() {
-            return self.degrade(input, &kind);
-        }
-        let permit = match tokio::time::timeout(
-            self.sanitizer.wait,
-            std::sync::Arc::clone(&self.sanitizer.permits).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            _ => {
-                self.blow("no sanitizer permit became free", input.len());
-                return self.degrade(input, &kind);
-            }
-        };
-        // The input is shared with the blocking task rather than cloned: on a
-        // blown budget the task keeps it (and keeps running) while the excerpt
-        // is made from the same bytes here.
-        let shared: std::sync::Arc<str> = std::sync::Arc::from(input);
-        let task_input = std::sync::Arc::clone(&shared);
-        let is_html = matches!(kind, Body::Html);
-        let work = tokio::task::spawn_blocking(move || {
-            // Held for exactly as long as the sanitizer runs — past the
-            // budget too, which is the point of the permit.
-            let _permit = permit;
-            let stored = if is_html {
-                sanitize_html_bounded(&task_input, MAX_CONTENT_HTML_BYTES)
-            } else {
-                task_input.to_string()
-            };
-            // The invariant itself, measured on the bytes that will be
-            // stored: the raw form can be cheap where the stored form is not
-            // (`< ` in text is linear to parse and quadratic as `&lt;`).
-            let _ = sanitize_html(&stored);
-            stored
-        });
-        match tokio::time::timeout(self.sanitizer.budget, work).await {
-            Ok(Ok(stored)) => stored,
-            Ok(Err(join)) => {
-                self.blow("the sanitizer panicked", input.len());
-                tracing::warn!(feed = %self.feed, error = %join, "sanitizer task failed");
-                self.degrade(&shared, &kind)
-            }
-            Err(_elapsed) => {
-                // `work` is dropped, not cancelled: the thread runs on with
-                // its permit until the sanitizer returns.
-                self.blow("sanitizing exceeded the budget", input.len());
-                self.degrade(&shared, &kind)
-            }
-        }
-    }
-
-    fn blow(&mut self, why: &'static str, bytes: usize) {
-        self.blown = Some(why);
-        tracing::warn!(
-            feed = %self.feed,
-            bytes,
-            budget_ms = self.sanitizer.budget.as_millis() as u64,
-            why,
-            "storing this poll's remaining bodies as excerpts (#226)"
-        );
-    }
-
-    fn degrade(&mut self, input: &str, kind: &Body) -> String {
-        self.degraded += 1;
-        self.sanitizer
-            .degraded
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match kind {
-            Body::Html => degraded_body(&text_of_html(input)),
-            Body::Escaped => degraded_body(&unescape_plain(input)),
-        }
-    }
-}
-
-impl Drop for IngestBatch<'_> {
-    fn drop(&mut self) {
-        if let Some(why) = self.blown {
-            tracing::warn!(
-                feed = %self.feed,
-                degraded = self.degraded,
-                bodies = self.total,
-                why,
-                "poll stored bodies degraded"
-            );
-        }
-    }
-}
-
-/// The stored form of a body that could not be sanitized within the budget: a
-/// short escaped excerpt of its text, ending in [`DEGRADED_MARK`], at most
-/// [`DEGRADED_BODY_MAX_BYTES`].
-///
-/// Its own re-clean is bounded by construction — a few KB of escaped text —
-/// so it satisfies the invariant the budget enforces without being measured.
-/// The reader's page already links to the original above the body.
-pub(crate) fn degraded_body(text: &str) -> String {
-    const WRAP: &str = "<p></p>";
-    let room = DEGRADED_BODY_MAX_BYTES - WRAP.len() - DEGRADED_MARK.len() - 1;
-    let excerpt = plain_text_to_html_bounded(text, room);
-    let excerpt = excerpt.trim_end_matches("<br>").trim_end();
-    if excerpt.is_empty() {
-        format!("<p>{DEGRADED_MARK}</p>")
-    } else {
-        format!("<p>{excerpt} {DEGRADED_MARK}</p>")
-    }
-}
-
-/// The text of some HTML, roughly: tags dropped, `<script>`/`<style>` bodies
-/// dropped, the entities [`plain_text_to_html`] writes undone, whitespace
-/// collapsed. Linear, and **not a sanitizer** — its output is escaped again by
-/// [`degraded_body`] before it is stored.
-fn text_of_html(html: &str) -> String {
-    let mut text = String::with_capacity(html.len().min(DEGRADED_BODY_MAX_BYTES * 4));
-    let mut rest = html;
-    while let Some(lt) = rest.find('<') {
-        text.push_str(&rest[..lt]);
-        let tag = &rest[lt..];
-        let lower = tag
-            .get(..8)
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        let skip_to = if lower.starts_with("<script") {
-            Some("</script")
-        } else if lower.starts_with("<style") {
-            Some("</style")
-        } else {
-            None
-        };
-        let after = match skip_to {
-            Some(close) => {
-                let lower_tag = tag.to_ascii_lowercase();
-                match lower_tag.find(close) {
-                    Some(c) => tag[c..].find('>').map(|g| c + g + 1),
-                    None => None,
-                }
-            }
-            None => tag.find('>').map(|g| g + 1),
-        };
-        match after {
-            Some(n) => rest = &tag[n..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-        text.push(' ');
-        // Enough text for the excerpt; the rest of a 2 MiB body is not needed.
-        if text.len() > DEGRADED_BODY_MAX_BYTES * 4 {
-            rest = "";
-            break;
-        }
-    }
-    text.push_str(rest);
-    collapse_whitespace(&unescape_plain(&text))
-}
-
-/// Undo the escaping [`plain_text_to_html`] applies (and the few other common
-/// entities), so an excerpt is not double-escaped. `&amp;` last, so `&amp;lt;`
-/// becomes `&lt;` and not `<`.
-fn unescape_plain(s: &str) -> String {
-    s.replace("<br>", "\n")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-}
-
-fn collapse_whitespace(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_space = true;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !in_space {
-                out.push(' ');
-                in_space = true;
-            }
-        } else {
-            out.push(c);
-            in_space = false;
-        }
-    }
-    out.trim_end().to_string()
-}
 
 /// An entry id, or a stable stand-in for one too long to index.
 ///
@@ -3248,241 +2875,6 @@ mod tests {
         }
     }
 
-    /// Bodies the sanitizer is quadratic on (#226), each sized so that a clean
-    /// takes well over [`INGEST_SANITIZE_BUDGET`] in a release build too: a
-    /// 512 KiB `&` run (~165 ms), a 512 KiB U+00A0 run (~226 ms), 128 KiB of
-    /// nested `<div>`s (~150 ms).
-    fn pathological_bodies() -> Vec<(&'static str, String)> {
-        let depth = 128 * 1024 / 11;
-        vec![
-            (
-                "amp-run",
-                format!("<p>{}</p>", "&amp;".repeat(512 * 1024 / 5)),
-            ),
-            (
-                "nbsp-run",
-                format!("<p>{}</p>", "\u{a0}".repeat(512 * 1024 / 2)),
-            ),
-            (
-                "nested-div",
-                format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth)),
-            ),
-        ]
-    }
-
-    fn rss_with_items(items: &[(&str, &str)]) -> String {
-        let mut doc =
-            String::from(r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>"#);
-        for (guid, body) in items {
-            doc.push_str(&format!(
-                "<item><guid>{guid}</guid><title>{guid}</title><description><![CDATA[{body}]]></description></item>"
-            ));
-        }
-        doc.push_str("</channel></rss>");
-        doc
-    }
-
-    /// Poll `doc` as an RSS feed from a loopback server; returns the feed's url.
-    async fn poll_doc(pool: &sqlx::SqlitePool, host: &str, doc: String) -> (String, PollOutcome) {
-        let base = crate::net::tests::serve_body(doc.into_bytes()).await;
-        let port: u16 = base
-            .trim_end_matches('/')
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-        let url = format!("http://{host}:{port}/feed.xml");
-        crate::store::upsert_feed(
-            pool,
-            &crate::store::NewFeed {
-                url: url.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let feed = crate::store::get_feed_by_url(pool, &url)
-            .await
-            .unwrap()
-            .unwrap();
-        let client = build_client().unwrap();
-        let outcome = poll_feed(pool, &client, &feed, 0).await.unwrap();
-        (url, outcome)
-    }
-
-    async fn stored_body(pool: &sqlx::SqlitePool, guid: &str) -> String {
-        sqlx::query_scalar("SELECT content_html FROM entries WHERE guid = ?")
-            .bind(guid)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
-
-    /// **#226, at ingest.** A feed serving bodies the sanitizer is quadratic on
-    /// is polled to completion, quickly, with those bodies stored in their
-    /// DEGRADED form (a short escaped excerpt, never the slow HTML); an
-    /// ordinary item in the same feed, and an ordinary feed polled in the same
-    /// pass, are stored exactly as before; and the sanitizing runs off the
-    /// async runtime — a 50 ms timer started beside the poll fires on time on
-    /// this current-thread runtime, where an inline clean would hold it for
-    /// seconds.
-    #[tokio::test]
-    async fn pathological_bodies_are_stored_degraded_and_the_poll_completes() {
-        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
-        let bodies = pathological_bodies();
-        let mut items: Vec<(&str, &str)> = bodies.iter().map(|(g, b)| (*g, b.as_str())).collect();
-        items.push(("ordinary", "<p>Hello <b>world</b></p>"));
-        let hostile = rss_with_items(&items);
-        let ordinary = rss_with_items(&[("plain", "<p>An ordinary <em>article</em>.</p>")]);
-
-        let started = std::time::Instant::now();
-        let (hostile_outcome, ordinary_outcome, timer_fired) = tokio::join!(
-            poll_doc(&pool, "hostile-bodies.test", hostile),
-            poll_doc(&pool, "ordinary-feed.test", ordinary),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                started.elapsed()
-            }
-        );
-        let polled = started.elapsed();
-        assert!(
-            matches!(hostile_outcome.1, PollOutcome::Updated { new_entries: 4 }),
-            "{:?}",
-            hostile_outcome.1
-        );
-        assert!(
-            matches!(ordinary_outcome.1, PollOutcome::Updated { new_entries: 1 }),
-            "{:?}",
-            ordinary_outcome.1
-        );
-        assert!(
-            timer_fired < std::time::Duration::from_secs(1),
-            "a timer beside the poll fired after {timer_fired:?}: the sanitizer ran on the async task"
-        );
-        assert!(
-            polled < std::time::Duration::from_secs(3),
-            "the poll took {polled:?}; the budget did not bound it"
-        );
-
-        for (guid, raw) in &bodies {
-            let stored = stored_body(&pool, guid).await;
-            // The slow HTML is ≥ 128 KiB; an excerpt is a few KB at most.
-            assert!(
-                stored.len() <= DEGRADED_BODY_MAX_BYTES,
-                "{guid}: the degraded body is {} B (raw {} B)",
-                stored.len(),
-                raw.len()
-            );
-            assert!(
-                stored.starts_with("<p>") && stored.ends_with(&format!("{DEGRADED_MARK}</p>")),
-                "{guid}: not the degraded form: {stored:?}"
-            );
-            assert_eq!(
-                sanitize_html(&stored),
-                stored,
-                "{guid}: the degraded body is not a sanitizer fixed point"
-            );
-        }
-        // One abandoned sanitize per poll: once a body has blown the budget,
-        // the rest of THAT poll is stored as excerpts without sanitizing, so a
-        // feed of fifty such bodies costs one thread, not fifty. The ordinary
-        // item that followed them in the hostile feed is an excerpt too.
-        assert_eq!(
-            stored_body(&pool, "ordinary").await,
-            format!("<p>Hello world {DEGRADED_MARK}</p>")
-        );
-        // The ordinary feed polled beside it is untouched.
-        assert_eq!(
-            stored_body(&pool, "plain").await,
-            "<p>An ordinary <em>article</em>.</p>"
-        );
-    }
-
-    /// **No false degradation.** Every fixture body — the hostile ones, the
-    /// representative articles, the review's stored shapes, a plain-text
-    /// summary — is stored exactly as the bare bounded sanitizer would store
-    /// it, and none counts as degraded.
-    ///
-    /// The budget is a RELEASE measurement (the 245 KB listing cleans in ~6 ms
-    /// there); a debug build runs the sanitizer roughly 100x slower and put
-    /// that listing over 100 ms. So this test uses the real budget in release
-    /// and 20x it in debug — the pathological shapes are 100x over even that.
-    #[tokio::test]
-    async fn ordinary_bodies_are_stored_exactly_as_before() {
-        let budget = if cfg!(debug_assertions) {
-            INGEST_SANITIZE_BUDGET * 20
-        } else {
-            INGEST_SANITIZE_BUDGET
-        };
-        let sanitizer = BodySanitizer::new(INGEST_SANITIZE_PERMITS, budget, INGEST_PERMIT_WAIT);
-        let mut listing = String::new();
-        let mut i = 0;
-        while listing.len() < 245_000 {
-            listing.push_str(&format!("&lt;item id=\"{i}\"&gt;value {i}&lt;/item&gt;\n"));
-            i += 1;
-        }
-        let bodies = [
-            "<p>a</p><script>alert(1)</script>".to_string(),
-            r#"<img src="x" onerror="alert(1)"><a href="javascript:alert(1)">x</a>"#.to_string(),
-            "<ul><li>one<section><li>two</li></section></li></ul><p>rest</p>".to_string(),
-            format!("<pre><code>{listing}</code></pre><p>rest</p>"),
-            "<p>A<ruby><span>\u{6f22}<rt>kan</rt></span></ruby> B</p>".to_string(),
-            format!("<p>{}</p>", "a".repeat(MAX_CONTENT_HTML_BYTES + 100)),
-            "plain text with a bare < and an & and a >".to_string(),
-            String::new(),
-        ];
-        let mut batch = sanitizer.batch("https://ordinary.example/feed.xml");
-        for raw in &bodies {
-            let stored = batch.html(raw).await;
-            let cut = floor_char_boundary(raw, MAX_SANITIZE_INPUT_BYTES);
-            assert_eq!(
-                stored,
-                sanitize_html_bounded(&raw[..cut], MAX_CONTENT_HTML_BYTES),
-                "a body was not stored as the sanitizer's output: {:?}…",
-                &raw[..raw.len().min(60)]
-            );
-        }
-        for text in ["a < b && c > d\n\"q\"", "non\u{a0}breaking", ""] {
-            let escaped = plain_text_to_html(text);
-            assert_eq!(batch.escaped(&escaped).await, escaped);
-        }
-        drop(batch);
-        assert_eq!(sanitizer.degraded(), 0, "an ordinary body was degraded");
-    }
-
-    /// The degraded form is a short escaped excerpt of the body's text, never
-    /// markup from it, and always a sanitizer fixed point within its bound.
-    #[test]
-    fn a_degraded_body_is_a_short_escaped_excerpt() {
-        let raw = format!(
-            "<h1>Title</h1><script>evil()</script><style>p{{}}</style><p>Tom &amp; Jerry &lt;3 {}</p>{}",
-            "word ".repeat(2_000),
-            "<div>".repeat(10_000)
-        );
-        let out = degraded_body(&text_of_html(&raw));
-        assert!(out.len() <= DEGRADED_BODY_MAX_BYTES, "{} B", out.len());
-        assert!(
-            out.starts_with("<p>Title Tom &amp; Jerry &lt;3 word word"),
-            "{out}"
-        );
-        assert!(out.ends_with(&format!(" {DEGRADED_MARK}</p>")), "{out}");
-        assert!(!out.contains("evil") && !out.contains("p{}") && !out.contains("<div>"));
-        assert_eq!(sanitize_html(&out), out);
-        // Nothing but tags: the mark alone.
-        assert_eq!(
-            degraded_body(&text_of_html(&"<div>".repeat(1_000))),
-            format!("<p>{DEGRADED_MARK}</p>")
-        );
-        // An escaped summary is unescaped first, so it is not double-escaped.
-        let escaped = plain_text_to_html("a & b < c\nnext");
-        assert_eq!(
-            degraded_body(&unescape_plain(&escaped)),
-            format!("<p>a &amp; b &lt; c<br>next {DEGRADED_MARK}</p>")
-        );
-    }
-
     // ---- dedup-key hashes are fixed across toolchains -------------------
     //
     // `stable_guid` and `bound_guid` are stored dedup keys. They were built on
@@ -4175,8 +3567,9 @@ mod tests {
     ///    re-clean changed.
     /// 2. Pathological bodies: #226's quadratic inputs in their stored
     ///    (fixed-point) form, up to the 2 MiB stored bound, through the bare
-    ///    sanitizer. Ingest never writes these; they are what the renderer's
-    ///    size cap, permits and cache are sized against.
+    ///    sanitizer. A hostile feed can make ingest store these (#226); they
+    ///    are what the renderer's permits, single flight and cache are sized
+    ///    against.
     ///    `FEATHER_BENCH_UNCAPPED_MAX=<bytes>` skips the larger sizes (2 MiB of
     ///    nesting takes ~37 s).
     #[test]

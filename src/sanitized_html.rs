@@ -13,16 +13,19 @@
 //!
 //! **Why bounds, and why these.** Real bodies re-clean cheaply: on 545 real
 //! bodies from 20 public feeds, p50 31 µs, p99 1.1 ms, max 3.5 ms (a 561 KB
-//! body). But the sanitizer is quadratic on shapes any feed can serve (#226):
-//! a 2 MiB body of nested `<div>`s takes ~37 s, a 2 MiB `&` run 2.4 s. So
-//! **ingest enforces an invariant** (`feed::BodySanitizer`): everything it
-//! stores in `content_html` was measured to sanitize within
-//! `feed::INGEST_SANITIZE_BUDGET` (100 ms), or is a short escaped excerpt
-//! whose re-clean is bounded by its size. A slow stored body can therefore
-//! only come from a writer that skipped ingest — a bug, or someone already
-//! able to write the database — and the bounds here are for that row: they
-//! cap what it can cost everyone else, and leave its worst case (~37 s, once
-//! per process, holding one of two permits) on its own page views.
+//! body). But the sanitizer is quadratic on shapes any feed can serve, and
+//! **ingest can store them** (#226, fixed separately): a stored 2 MiB body of
+//! nested `<div>`s takes ~37 s to re-clean, a 2 MiB `&` run 2.4 s, a U+00A0
+//! run 3.4 s. Such rows may already exist in databases upgraded from ≤ 0.4.6,
+//! and until #226's fix lands any feed can add one; after it, bodies that
+//! sanitize under its timeout can still be slow here. So nothing here assumes
+//! a stored body is fast. The bounds cap what one slow body can cost
+//! everyone else: it is cleaned at most once per process (cache + single
+//! flight), holding one of two permits, so a second such body can be in the
+//! sanitizer at the same time and no more; other readers' uncached bodies
+//! wait up to two seconds for a permit and then get a "temporarily
+//! unavailable" note instead of a hung page. The slow body's own readers pay
+//! its full cost, once.
 //!
 //! An earlier version of this module tried to *predict* the cost with a scan
 //! that re-implemented html5ever's tree-construction rules in front of
@@ -131,15 +134,17 @@ impl askama::filters::HtmlSafe for SanitizedHtml {}
 
 /// What the reader gets back for a stored body: the markup, or one of two
 /// reasons it is not shown. Both reasons are notes in `entry.html` pointing
-/// at the original; neither ever happens for a body ingest stored.
+/// at the original.
 pub enum BodyRender {
     /// Cleaned and ready to emit.
     Html(SanitizedHtml),
     /// The stored body is longer than [`MAX_RENDER_HTML_BYTES`], which ingest
     /// never writes. It was not given to the sanitizer at all.
     TooLarge,
-    /// Every sanitizer permit stayed busy for [`RENDER_WAIT`] — only possible
-    /// while [`RENDER_PERMITS`] pathological bodies are being cleaned at once.
+    /// Every sanitizer permit stayed busy for [`RENDER_WAIT`] — only while
+    /// [`RENDER_PERMITS`] slow bodies are being cleaned at once, each for the
+    /// first time this process. The reader can retry; by then the slow ones
+    /// are cached.
     Unavailable,
 }
 
@@ -182,8 +187,9 @@ pub const CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// re-views far fewer than this before anything is evicted.
 pub const CACHE_MAX_ENTRIES: usize = 256;
 
-/// A pathological row is a bug or a hostile writer; a clean slower than this
-/// is logged with the body's size and hash so the row can be found.
+/// A clean slower than this is logged with the body's size and hash, so the
+/// row — a hostile feed's body (#226), or one written some other way — can be
+/// found.
 const SLOW_CLEAN: Duration = Duration::from_millis(500);
 
 /// SHA-256 of the stored body: the cache key.
@@ -317,12 +323,14 @@ struct Inner {
 /// async worker is never blocked: the hash, the lookup and the clean run on
 /// the blocking pool, and every wait is an async one.
 ///
-/// **What these bounds are for.** Ingest guarantees that everything it stores
-/// re-cleans within `feed::INGEST_SANITIZE_BUDGET` (100 ms; real bodies
-/// p50 31 µs, max 3.5 ms), so a slow stored body can only come from a writer
-/// that skipped ingest: a bug, or someone already able to write the database.
-/// The bounds here cap what such a row can cost other readers; they do not
-/// predict its cost, which for a 2 MiB body of nested `<div>`s is ~37 s, once.
+/// **What these bounds are for.** A stored body may be slow to re-clean:
+/// ingest can store one (#226; real bodies p50 31 µs, max 3.5 ms, but a
+/// hostile feed's 2 MiB of nested `<div>`s re-cleans in ~37 s, a `&` run in
+/// 2.4 s), and such rows may already exist in databases upgraded from
+/// ≤ 0.4.6. The bounds here cap what such a row can cost other readers: it is
+/// cleaned once per process, holding one of two permits, and everyone else's
+/// uncached body waits at most [`RENDER_WAIT`] before a note. They do not
+/// predict or reduce its own cost.
 #[derive(Clone)]
 pub struct BodyRenderer(Arc<Inner>);
 
@@ -470,7 +478,7 @@ impl BodyRenderer {
                     out_bytes = html.len(),
                     took_ms = took.as_millis() as u64,
                     sha256 = %hex_prefix(&key),
-                    "a stored entry body was slow to sanitize; ingest never stores such a body"
+                    "a stored entry body was slow to sanitize (#226); cached now, so once per process"
                 );
             }
             work.cache().insert(key, Arc::clone(&html));

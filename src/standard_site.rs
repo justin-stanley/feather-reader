@@ -435,7 +435,7 @@ pub async fn store_publication(
 
     // See [`ingest_floor`] for which of the two windows this is, and why.
     let floor = ingest_floor(retention_days, retention_hard_days, chrono::Utc::now());
-    let mut rows: Vec<crate::store::NewEntry> = read
+    let rows: Vec<crate::store::NewEntry> = read
         .entries
         .into_iter()
         .filter(|e| match (&floor, &e.published) {
@@ -449,20 +449,6 @@ pub async fn store_publication(
         })
         .map(Into::into)
         .collect();
-
-    // **Summaries go through the stored-body budget too (#226).** They are
-    // escaped, not sanitized, so ingest never ran ammonia over them — but the
-    // reader re-cleans every stored body at render, and a long `&amp;` run
-    // re-cleans quadratically. `IngestBatch::escaped` times that re-clean on
-    // the blocking pool and stores an excerpt instead when it is slow.
-    {
-        let mut batch = crate::feed::BodySanitizer::shared().batch(url);
-        for row in &mut rows {
-            if let Some(html) = row.content_html.take() {
-                row.content_html = Some(batch.escaped(&html).await);
-            }
-        }
-    }
 
     // **Say when the floor emptied the read.** A complete read of three
     // year-old posts and a complete read of an empty publication both return
@@ -958,77 +944,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(n, 2, "the entries were not stored");
-    }
-
-    /// **A publication summary goes through the same stored-body budget as a
-    /// feed body (#226).** Summaries are escaped, not sanitized, so ingest ran
-    /// no sanitizer over them — but the reader re-cleans every stored body at
-    /// render, and a 550 KB run of `&amp;` re-cleans in ~190 ms (release), a
-    /// 2 MiB one in 2.4 s. Such a summary is stored in its degraded form; an
-    /// ordinary one is stored byte for byte as before.
-    #[tokio::test]
-    async fn a_summary_slow_to_reclean_is_stored_degraded() {
-        let pool = pool().await;
-        let slow_text = "&".repeat(110_000);
-        let slow = crate::feed::plain_text_to_html_bounded(
-            &slow_text,
-            crate::feed::MAX_CONTENT_HTML_BYTES,
-        );
-        let fine = crate::feed::plain_text_to_html("An ordinary summary, with an & and a <tag>.");
-        // Fine first, so it is sanitized before the batch stops sanitizing;
-        // then the slow one; then one that follows it in the same batch.
-        let mut a = entry_dated("at://d/c/fine", Some(&days_ago(1)));
-        a.summary = Some(fine.clone());
-        let mut b = entry_dated("at://d/c/slow", Some(&days_ago(2)));
-        b.summary = Some(slow.clone());
-        let mut c = entry_dated("at://d/c/after", Some(&days_ago(3)));
-        c.summary = Some(crate::feed::plain_text_to_html("Came after the slow one."));
-        let started = std::time::Instant::now();
-        let outcome = store_publication(&pool, PUB_URL, read_of(vec![a, b, c], true), 0, 14, 180)
-            .await
-            .unwrap();
-        let took = started.elapsed();
-        assert!(
-            matches!(
-                outcome,
-                crate::feed::PollOutcome::Updated { new_entries: 3 }
-            ),
-            "{outcome:?}"
-        );
-        assert!(
-            took < std::time::Duration::from_secs(2),
-            "storing took {took:?}"
-        );
-        let body = |guid: &str| {
-            let pool = pool.clone();
-            let guid = guid.to_string();
-            async move {
-                sqlx::query_scalar::<_, String>("SELECT content_html FROM entries WHERE guid = ?")
-                    .bind(guid)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
-            }
-        };
-        let stored_slow = body("at://d/c/slow").await;
-        assert_ne!(stored_slow, slow, "the slow summary was stored as is");
-        assert!(
-            stored_slow.len() <= crate::feed::DEGRADED_BODY_MAX_BYTES
-                && stored_slow.contains(crate::feed::DEGRADED_MARK),
-            "not the degraded form: {} B, {:?}…",
-            stored_slow.len(),
-            &stored_slow[..stored_slow.len().min(80)]
-        );
-        assert_eq!(body("at://d/c/fine").await, fine);
-        // One abandoned sanitize per batch: what follows the slow summary in
-        // the same read is stored as an excerpt without being measured.
-        assert_eq!(
-            body("at://d/c/after").await,
-            format!(
-                "<p>Came after the slow one. {}</p>",
-                crate::feed::DEGRADED_MARK
-            )
-        );
     }
 
     /// **Starvation is keyed on what was OFFERED, not on what was stored.**

@@ -18,9 +18,7 @@ deploying is separate.
 
 ### Security
 
-- **The reader no longer renders a stored article body with `|safe` (#151), and
-  ingest no longer stores a body the sanitizer is slow on, nor sanitizes on the
-  poller's async task (#226).**
+- **The reader no longer renders a stored article body with `|safe` (#151).**
   `EntryTemplate.content_html` was the stored `entries.content_html` string,
   emitted into `entry.html` unescaped. It was safe only because ingest had
   run `ammonia` over it in `feed.rs` — a procedural guard on another code
@@ -46,52 +44,22 @@ deploying is separate.
   `&nbsp;`, and a table whose `<tfoot>` the policy stripped gains the
   `<tbody>` a browser builds around those rows anyway.
 
-  **Ingest now guarantees what render relies on (#226).** The sanitizer is
-  quadratic on shapes any feed can serve: measured as stored, 2 MiB of
-  nested `<div>`s ~37 s, a 2 MiB `&` run 2.4 s, a U+00A0 run 3.4 s; and it
-  ran inline on the poller's async task, stalling a tokio worker for the
-  duration (#226). Both are fixed at ingest (`feed::BodySanitizer`):
-  - every body is sanitized on the blocking pool, never on the poller's
-    task, under a process-wide limit of 4 concurrent sanitizes (the poller's
-    own concurrency);
-  - the sanitize of the exact bytes to be stored is timed against a budget
-    of 100 ms. Real bodies are nowhere near it (545 measured: max 3.5 ms;
-    the 245 KB `<pre>` XML listing from review ~6 ms; 2 MiB of plain text
-    0.6 ms); the cheapest pathological shape is over it at a quarter of the
-    stored bound (512 KiB of `&`: 165 ms). A body over the budget is
-    **not stored**: a short escaped excerpt of its text ending in `[…]` is
-    stored instead (at most 4 KB, so its own re-clean is bounded by size),
-    and the poll logs the feed and the size;
-  - a sanitize that blows the budget cannot be cancelled, so its thread runs
-    on holding its permit (≤ ~37 s: raw input is capped at the 2 MiB stored
-    bound before sanitizing). To keep a hostile feed to one such thread per
-    poll, every later body of the same poll is stored as an excerpt without
-    being sanitized; and a poll that finds no permit free within 5 s does
-    the same, which the next poll overwrites;
-  - standard.site publication summaries, which are escaped rather than
-    sanitized, go through the same budget, because their render-time
-    re-clean is the same quadratic (a 550 KB `&amp;` run re-cleans in
-    ~190 ms).
-
-  **The stored invariant:** everything in `content_html` was measured to
-  sanitize within 100 ms on the bytes stored, or is an excerpt bounded by
-  construction. Pinned by tests: a feed serving each #226 shape at over the
-  budget is polled to completion in well under a second, its bodies stored
-  as excerpts, an ordinary feed polled beside it untouched, and a timer
-  started beside the poll on a current-thread runtime fires on time (it
-  fired after 155 s before the change); every fixture body is stored byte
-  for byte as before.
-
-  **Render bounds, for rows that did not come through ingest.** A slow
-  stored body can now only come from a bug or from someone already able to
-  write the database. The render path (`BodyRenderer`) caps what such a row
-  can cost other readers; it does not predict its cost:
+  **Threat model, stated plainly.** The sanitizer is quadratic on shapes
+  any feed can serve, and ingest can store them (#226, which is fixed
+  separately): measured as stored, 2 MiB of nested `<div>`s re-cleans in
+  ~37 s, a 2 MiB `&` run in 2.4 s, a U+00A0 run in 3.4 s. Such rows may
+  already exist in databases upgraded from 0.4.6 or earlier, and after
+  #226's fix a body that sanitizes under its timeout can still be slow here.
+  So render assumes nothing about a stored body's cost. It bounds what one
+  slow body can cost everyone else (`BodyRenderer`):
   - **Size cap.** A stored body over the bound ingest enforces
     (`MAX_CONTENT_HTML_BYTES`, 2 MiB) is not given to the sanitizer; the
     page shows a short note and the link to the original.
   - **Concurrency limit.** A process-wide semaphore of 2 permits around the
     clean. A request waits up to 2 s for a permit (asynchronously; no worker
-    thread is blocked), then shows a "temporarily unavailable" note.
+    thread is blocked), then shows a "temporarily unavailable" note. Real
+    cleans take microseconds, so the wait is only reached while two slow
+    bodies are being cleaned at once — each for the first time.
   - **Single flight.** Concurrent views of the same uncached body share one
     clean: the first leads it as its own task (so a client that disconnects
     neither cancels it nor strands anyone), the rest wait for its result and
@@ -99,11 +67,13 @@ deploying is separate.
   - **Cache.** Cleaned output is cached in memory, keyed by the SHA-256 of
     the stored body (`ring`, already a dependency; a fast hash's collisions
     would show one entry's body on another's page), least recently used
-    out first, bounded at 256 bodies and 8 MiB of output. Each body is
-    cleaned once per process, not once per view.
+    out first, bounded at 256 bodies and 8 MiB of output.
 
-  The worst case is therefore a non-ingest row's own page view: up to
-  ~37 s, once, holding one of two permits, with every other page unaffected.
+  Together: each distinct body is cleaned at most once per process, holding
+  one of two permits; a slow body's own readers wait its full cost once
+  (~37 s worst measured), other readers' uncached bodies wait at most 2 s
+  and then see the note, and cached bodies render regardless. Two slow
+  bodies at once is the worst case for everyone else; a third is queued.
 
   **Why not a pre-scan.** Earlier revisions of this change bounded the cost
   with a linear scan in front of the sanitizer that modelled html5ever's
