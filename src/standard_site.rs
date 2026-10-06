@@ -149,6 +149,7 @@ impl From<Entry> for crate::store::NewEntry {
             published: e.published,
             content_html: e.summary,
             fetched_at: None,
+            keep_stored_content: false,
         }
     }
 }

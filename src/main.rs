@@ -33,8 +33,34 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[path = "scheduler.rs"]
 mod scheduler;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// How long the runtime waits, once [`run`] has returned, for work still on
+/// tokio's blocking pool before the process exits anyway.
+///
+/// **Why not `#[tokio::main]`:** dropping a runtime waits for every blocking
+/// task with no limit. An ingest sanitize the poller gave up on (#226,
+/// `feed::SANITIZE_TIMEOUT`) cannot be cancelled and keeps running on that
+/// pool — ~37 s for a 2 MiB nest of `<div>`s, and an 8 MiB run of `&` did not
+/// finish in ten minutes — so one hostile feed could hold a shutdown past Fly's
+/// 45 s `kill_timeout` and turn it into a SIGKILL. By the time this applies,
+/// the HTTP server has drained and the schedulers (the final read-state flush
+/// included) have returned, so what is left is abandoned work. 5 s is ample
+/// for anything else that uses the pool (a DNS lookup), and leaves the rest of
+/// Fly's budget to the drain before it.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn main() -> Result<()> {
+    // What `#[tokio::main]` builds, but shut down with a bound; see
+    // `RUNTIME_SHUTDOWN_TIMEOUT`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn run() -> Result<()> {
     // Maintenance mode: sign every stored session out and exit, without binding
     // a port or starting a scheduler. Checked before anything can fail through
     // `?`, so every failure of this mode is an explicit exit 2 ("nothing done")

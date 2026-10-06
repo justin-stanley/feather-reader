@@ -1170,6 +1170,144 @@ pub async fn poll_publication_group(
     out
 }
 
+/// How long one entry's sanitize may run before the poll gives up on it (#226).
+///
+/// **Seconds, not milliseconds, on purpose.** Real bodies sanitize in about
+/// 3.5 ms at most on an M-series Mac (production's largest body is 87 KB), so
+/// 5 s is over 1,000x that: a much slower shared Fly vCPU, or one busy with
+/// four polls at once, still never trips it on a real article. What it does
+/// catch is the super-linear inputs ammonia has — 2 MiB of `&` runs take
+/// ~2.4 s in release on that Mac, U+00A0 runs ~3.4 s, nested `<div>`s ~37 s,
+/// and 8 MiB of `&` never finished in ten minutes — where the choice is
+/// between waiting and giving up, and a timeout is a false positive only for
+/// a body that is already nearly pathological.
+pub(crate) const SANITIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many ingest sanitizes may run at once, process-wide (#226).
+///
+/// The poller's default `FEATHERREADER_POLL_CONCURRENCY` (4): in ordinary
+/// operation every poll in flight gets a permit and none ever waits. What it
+/// bounds is the bad case. A timed-out sanitize cannot be cancelled — ammonia
+/// runs to completion on its blocking thread — and its permit is held until it
+/// does, so hostile feeds can tie up at most this many blocking threads (and
+/// CPUs) however many of them there are. Beyond that a poll waits for a permit
+/// **asynchronously**, and for at most [`SANITIZE_TIMEOUT`] — see
+/// [`sanitize_off_runtime`] for why that wait is bounded too.
+pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
+
+/// The permits behind [`SANITIZE_CONCURRENCY`].
+static SANITIZE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SANITIZE_CONCURRENCY);
+
+/// Where and for how long [`normalize_entries`] sanitizes. Production uses
+/// [`SanitizeLimits::PRODUCTION`]; tests inject a short timeout and their own
+/// permits so an abandoned sanitize in one test cannot hold up another.
+#[derive(Clone, Copy)]
+pub(crate) struct SanitizeLimits {
+    pub(crate) permits: &'static tokio::sync::Semaphore,
+    pub(crate) timeout: Duration,
+}
+
+impl SanitizeLimits {
+    /// [`SANITIZE_PERMITS`] and [`SANITIZE_TIMEOUT`].
+    pub(crate) const PRODUCTION: SanitizeLimits = SanitizeLimits {
+        permits: &SANITIZE_PERMITS,
+        timeout: SANITIZE_TIMEOUT,
+    };
+}
+
+/// Why [`sanitize_off_runtime`] produced no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SanitizeGaveUp {
+    /// Every permit stayed taken for the whole timeout.
+    NoPermit,
+    /// The sanitize did not finish within the timeout (or the runtime is
+    /// shutting down and cancelled it before it started).
+    TimedOut,
+}
+
+/// [`sanitize_html_bounded`] on the blocking pool, under a permit and a
+/// timeout.
+///
+/// **Never on an async worker**: ammonia is super-linear on some inputs (#226),
+/// and inline it stalled a tokio worker — and the poller with it — for as long
+/// as it ran. The permit is acquired asynchronously and moved INTO the blocking
+/// closure, so a sanitize the caller has given up on keeps it until ammonia
+/// returns: the bound counts threads actually busy, not polls still waiting.
+///
+/// **The wait for a permit is bounded by the same timeout**, separately from
+/// the sanitize. Permits held by abandoned sanitizes can stay taken for
+/// minutes, and an unbounded wait would stall every poll behind them — and a
+/// graceful shutdown, which drains the polls in flight, past Fly's
+/// `kill_timeout`. So one entry costs a poll at most two timeouts.
+async fn sanitize_off_runtime(
+    raw: String,
+    limits: SanitizeLimits,
+) -> Result<String, SanitizeGaveUp> {
+    let permit = match tokio::time::timeout(limits.timeout, limits.permits.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        // `Ok(Err(_))` is a closed semaphore, which this never does.
+        Ok(Err(_)) | Err(_) => return Err(SanitizeGaveUp::NoPermit),
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        sanitize_html_bounded(&raw, MAX_CONTENT_HTML_BYTES)
+    });
+    match tokio::time::timeout(limits.timeout, task).await {
+        Ok(Ok(html)) => Ok(html),
+        // A panic in the sanitizer propagates as it did when this ran inline.
+        Ok(Err(err)) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Ok(Err(_)) | Err(_) => Err(SanitizeGaveUp::TimedOut),
+    }
+}
+
+/// Normalize a poll's entries, sanitizing each body off the async runtime
+/// ([`sanitize_off_runtime`]). Returns the entries and whether a sanitize
+/// timed out.
+///
+/// **After the first timeout no further body is sanitized in this poll**, so
+/// one hostile feed costs at most one abandoned blocking thread per poll. The
+/// timed-out entry and every later entry with a body are returned with
+/// `content_html: None` and `keep_stored_content: true`: an entry already
+/// stored keeps the body it has, and a new one is stored without a body (the
+/// reader shows its title and a link to the original). Nothing degraded is
+/// ever built or stored in its place — no excerpt, no cut of the raw input.
+async fn normalize_entries(
+    feed_url: &str,
+    raw: &[RawEntry],
+    limits: SanitizeLimits,
+) -> (Vec<NewEntry>, bool) {
+    let mut timed_out = false;
+    let mut out = Vec::with_capacity(raw.len());
+    for e in raw {
+        let mut entry = entry_without_body(e);
+        if let Some(body) = entry_raw_body(e) {
+            if timed_out {
+                entry.keep_stored_content = true;
+            } else {
+                match sanitize_off_runtime(body.to_owned(), limits).await {
+                    Ok(html) => entry.content_html = Some(html),
+                    Err(why) => {
+                        tracing::warn!(
+                            feed = %feed_url,
+                            entry = %entry.guid,
+                            raw_bytes = body.len(),
+                            timeout = ?limits.timeout,
+                            ?why,
+                            "an entry body was not sanitized in time; this poll stores no \
+                             further bodies for the feed and keeps any already stored"
+                        );
+                        timed_out = true;
+                        entry.keep_stored_content = true;
+                    }
+                }
+            }
+        }
+        out.push(entry);
+    }
+    (out, timed_out)
+}
+
 /// Fetch, parse, sanitize, normalize, and store a single feed.
 ///
 /// Performs a conditional GET using the feed's stored `ETag` / `Last-Modified`.
@@ -1185,11 +1323,38 @@ pub async fn poll_publication_group(
 ///
 /// `max_entries_per_feed` caps how many entries this feed retains after insert
 /// (newest N by published date); `<= 0` disables the per-feed trim.
+///
+/// Bodies are sanitized off the async runtime with a per-entry timeout
+/// (`SANITIZE_TIMEOUT`; see `normalize_entries`). **A poll in which a sanitize
+/// timed out does not save the response's `ETag` / `Last-Modified`** — the
+/// next poll must get a full
+/// `200` to store the bodies this one could not, and a saved validator would
+/// answer it with `304`s until the feed next changed. Such a poll is reported
+/// as a [`FailureKind::Body`] failure, after storing what it has, so the feed
+/// backs off and shows why in `/stats`.
 pub async fn poll_feed(
     pool: &SqlitePool,
     client: &Client,
     feed: &Feed,
     max_entries_per_feed: i64,
+) -> Result<PollOutcome> {
+    poll_feed_with(
+        pool,
+        client,
+        feed,
+        max_entries_per_feed,
+        SanitizeLimits::PRODUCTION,
+    )
+    .await
+}
+
+/// [`poll_feed`] with the sanitize limits injected.
+async fn poll_feed_with(
+    pool: &SqlitePool,
+    client: &Client,
+    feed: &Feed,
+    max_entries_per_feed: i64,
+    limits: SanitizeLimits,
 ) -> Result<PollOutcome> {
     // --- conditional GET (through the SSRF guard) ----------------------------
     // The guard re-validates the scheme + resolved IP of the target and of every
@@ -1271,18 +1436,25 @@ pub async fn poll_feed(
     };
 
     // --- normalize + sanitize ------------------------------------------------
+    let (entries, sanitize_timed_out) = normalize_entries(&feed.url, &parsed.entries, limits).await;
+
     let (title, site_url) = feed_metadata(&parsed);
+    // A timed-out poll keeps the validators already stored (`None` is "keep
+    // current" to the upsert), so the next poll is a full fetch.
+    let (etag, last_modified) = if sanitize_timed_out {
+        (None, None)
+    } else {
+        (new_etag, new_last_modified)
+    };
     let new_feed = NewFeed {
         url: feed.url.clone(),
         title,
         site_url,
-        etag: new_etag,
-        last_modified: new_last_modified,
+        etag,
+        last_modified,
         last_polled: Some(now_rfc3339()),
         next_poll: None, // the scheduler owns cadence; leave it to set next_poll.
     };
-
-    let entries: Vec<NewEntry> = parsed.entries.iter().map(normalize_entry).collect();
 
     // --- store (a store failure IS a real error) -----------------------------
     let feed_id = store::upsert_feed(pool, &new_feed)
@@ -1293,6 +1465,17 @@ pub async fn poll_feed(
         .with_context(|| format!("insert_entries for {}", feed.url))?;
 
     tracing::info!(feed = %feed.url, entries = n, "feed polled");
+    if sanitize_timed_out {
+        return Ok(PollOutcome::Failed {
+            backoff: backoff_for(1),
+            kind: FailureKind::Body,
+            detail: failure_detail(format!(
+                "an entry body was not sanitized within {:?}; entries were stored \
+                 without new bodies",
+                limits.timeout
+            )),
+        });
+    }
     Ok(PollOutcome::Updated { new_entries: n })
 }
 
@@ -1410,20 +1593,35 @@ fn is_primary_link(l: &RawLink) -> bool {
     l.target.is_none()
 }
 
-/// Turn a parsed [`RawEntry`] into the store's [`NewEntry`], sanitizing HTML.
-///
-/// Content preference: full `content` body, else `summary`. Whichever is chosen
-/// is **always** passed through [`sanitize_html`] before storage. GUID falls
-/// back to the entry link, then to a stable hash of title+link, so an entry
-/// missing an `id` still deduplicates instead of being re-inserted forever.
+/// Turn a parsed [`RawEntry`] into the store's [`NewEntry`], sanitizing HTML
+/// inline. **Tests only**: the poller sanitizes off the async runtime, through
+/// [`normalize_entries`]. Both are [`entry_without_body`] plus
+/// [`sanitize_html_bounded`] of [`entry_raw_body`], so they store the same bytes.
+#[cfg(test)]
 fn normalize_entry(e: &RawEntry) -> NewEntry {
-    let url = entry_link(e);
-    let content_html = e
-        .content
+    NewEntry {
+        content_html: entry_raw_body(e)
+            .map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES)),
+        ..entry_without_body(e)
+    }
+}
+
+/// The markup an entry's stored body is sanitized from: the full `content`
+/// body, else the `summary`. Whichever is chosen is **always** passed through
+/// [`sanitize_html_bounded`] before storage.
+fn entry_raw_body(e: &RawEntry) -> Option<&str> {
+    e.content
         .as_ref()
         .and_then(|c| c.body.as_deref())
         .or_else(|| e.summary.as_ref().map(|t| t.content.as_str()))
-        .map(|raw| sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES));
+}
+
+/// Everything about a [`RawEntry`] except its body, which is left `None` for
+/// the caller to sanitize. GUID falls back to the entry link, then to a stable
+/// hash of title+link, so an entry missing an `id` still deduplicates instead
+/// of being re-inserted forever.
+fn entry_without_body(e: &RawEntry) -> NewEntry {
+    let url = entry_link(e);
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
@@ -1445,8 +1643,9 @@ fn normalize_entry(e: &RawEntry) -> NewEntry {
             .map(|t| bound_text(text_plain(t), MAX_TITLE_BYTES)),
         author: entry_author(e).map(|a| bound_text(a, MAX_AUTHOR_BYTES)),
         published: entry_time(e),
-        content_html,
+        content_html: None,
         fetched_at: None, // store defaults to "now".
+        keep_stored_content: false,
     }
 }
 
@@ -3548,5 +3747,408 @@ mod tests {
         }
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
         assert!(is_storable_feed_url("http://example.com/feed.xml", true));
+    }
+}
+
+/// #226: ingest sanitizing runs off the async runtime, under a permit and a
+/// per-entry timeout, and a timed-out poll neither loses a stored body nor
+/// saves the validators that would turn the next poll into a `304`.
+#[cfg(test)]
+mod sanitize_off_runtime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use tokio::sync::Semaphore;
+
+    /// A body ammonia is super-linear on: one text node of `&`. 48 Ki of them
+    /// take ~2.5 s to sanitize in a debug build on an M-series Mac (32 Ki
+    /// measured 1.1 s, 64 Ki 4.5 s) — far past [`SHORT`], short enough that the
+    /// abandoned thread finishes soon after the test.
+    fn slow_body() -> String {
+        format!("<p>{}</p>", "&".repeat(48 * 1024))
+    }
+
+    /// The injected timeout for a poll that must give up on [`slow_body`].
+    const SHORT: Duration = Duration::from_millis(100);
+
+    /// Generous enough that [`slow_body`] always finishes in a debug build.
+    const GENEROUS: Duration = Duration::from_secs(120);
+
+    const ETAG_V1: &str = "\"v1\"";
+    const LAST_MODIFIED_V1: &str = "Tue, 06 Oct 2026 08:00:00 GMT";
+
+    /// Permits of the test's own, so an abandoned sanitize here never holds up
+    /// another test's poll (the production semaphore is process-wide).
+    fn permits(n: usize) -> &'static Semaphore {
+        Box::leak(Box::new(Semaphore::new(n)))
+    }
+
+    fn limits(permits: &'static Semaphore, timeout: Duration) -> SanitizeLimits {
+        SanitizeLimits { permits, timeout }
+    }
+
+    const ORDINARY_A: &str = "<p>Before the slow one <script>x()</script><em>kept</em>.</p>";
+    const ORDINARY_B: &str = "<p>After the slow one, <b>bold</b>.</p>";
+
+    /// An RSS document: `a` (ordinary), `slow` (the given body), `b` (ordinary),
+    /// `bare` (no body at all).
+    fn rss(slow: &str) -> String {
+        let item = |guid: &str, body: Option<&str>| {
+            let desc = body
+                .map(|b| format!("<description><![CDATA[{b}]]></description>"))
+                .unwrap_or_default();
+            format!(
+                "<item><title>{guid}</title><link>https://slow.example/{guid}</link>\
+                 <guid>urn:{guid}</guid>{desc}</item>"
+            )
+        };
+        format!(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Slow</title>
+<link>https://slow.example/</link>{}{}{}{}</channel></rss>"#,
+            item("a", Some(ORDINARY_A)),
+            item("slow", Some(slow)),
+            item("b", Some(ORDINARY_B)),
+            item("bare", None),
+        )
+    }
+
+    /// Serve `body` with `ETag` / `Last-Modified`, and answer `304` to a
+    /// request that presents the `ETag` — as a real server would, which is what
+    /// makes a wrongly saved validator visible: the next poll gets no bodies.
+    async fn serve_with_validators(body: Arc<Mutex<Vec<u8>>>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let body = body.lock().unwrap().clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    let not_modified =
+                        head.contains(&format!("if-none-match: {}", ETAG_V1.to_lowercase()));
+                    let reply = if not_modified {
+                        format!("HTTP/1.1 304 Not Modified\r\nETag: {ETAG_V1}\r\nConnection: close\r\n\r\n")
+                            .into_bytes()
+                    } else {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nETag: {ETAG_V1}\r\n\
+                             Last-Modified: {LAST_MODIFIED_V1}\r\nContent-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&body);
+                        r
+                    };
+                    let _ = sock.write_all(&reply).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    /// A store with one feed row for `host`, served by a fixture with `body`.
+    async fn fixture(host: &str, body: String) -> (SqlitePool, Feed, Arc<Mutex<Vec<u8>>>) {
+        let body = Arc::new(Mutex::new(body.into_bytes()));
+        let port = serve_with_validators(Arc::clone(&body)).await;
+        crate::net::test_host_override(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let url = format!("http://{host}:{port}/feed.xml");
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::upsert_feed(
+            &pool,
+            &NewFeed {
+                url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let feed = crate::store::get_feed_by_url(&pool, &url)
+            .await
+            .unwrap()
+            .unwrap();
+        (pool, feed, body)
+    }
+
+    async fn bodies(pool: &SqlitePool) -> Vec<(String, Option<String>)> {
+        sqlx::query_as("SELECT guid, content_html FROM entries ORDER BY guid")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn validators(pool: &SqlitePool, url: &str) -> (Option<String>, Option<String>) {
+        let f = crate::store::get_feed_by_url(pool, url)
+            .await
+            .unwrap()
+            .unwrap();
+        (f.etag, f.last_modified)
+    }
+
+    fn clean(raw: &str) -> Option<String> {
+        Some(sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES))
+    }
+
+    /// The red test for #226. On a current-thread runtime a sanitize run
+    /// inline stops every timer until it returns; off the runtime, a ticker
+    /// keeps firing throughout the poll, and the poll ends at the timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_body_is_sanitized_off_the_runtime_and_the_poll_gives_up_on_it() {
+        let (pool, feed, _) = fixture("slow-body.test", rss(&slow_body())).await;
+
+        // The largest gap between consecutive ticks while the poll runs.
+        let done = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                let mut worst = Duration::ZERO;
+                while !done.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    worst = worst.max(last.elapsed());
+                    last = Instant::now();
+                }
+                worst
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let client = build_client().unwrap();
+        let started = Instant::now();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(permits(4), SHORT))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let worst_gap = ticker.await.unwrap();
+
+        assert!(
+            worst_gap < Duration::from_millis(700),
+            "the runtime stalled for {worst_gap:?} during the poll: the sanitize ran on it"
+        );
+        assert!(
+            took < Duration::from_millis(1_000),
+            "the poll took {took:?}; it should end at the {SHORT:?} timeout"
+        );
+        assert!(
+            matches!(
+                outcome,
+                PollOutcome::Failed {
+                    kind: FailureKind::Body,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            bodies(&pool).await,
+            vec![
+                // Before the slow entry: sanitized and stored as always.
+                ("urn:a".to_string(), clean(ORDINARY_A)),
+                // After it: not sanitized this poll, so stored without a body.
+                ("urn:b".to_string(), None),
+                ("urn:bare".to_string(), None),
+                // The slow entry itself: no body, and nothing degraded instead.
+                ("urn:slow".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            validators(&pool, &feed.url).await,
+            (None, None),
+            "a timed-out poll saved its validators: the next poll would be a 304"
+        );
+    }
+
+    /// A re-poll that times out keeps every body already stored, and saves no
+    /// validator; the next poll that can sanitize stores the real bodies
+    /// (rather than being answered `304` forever).
+    #[tokio::test]
+    async fn a_timed_out_repoll_keeps_stored_bodies_and_the_next_poll_stores_real_ones() {
+        let slow = slow_body();
+        let (pool, feed, _) = fixture("slow-repoll.test", rss(&slow)).await;
+        let feed_id = feed.id;
+        let stored = |guid: &str, body: &str| NewEntry {
+            guid: guid.to_string(),
+            content_html: Some(body.to_string()),
+            ..Default::default()
+        };
+        crate::store::insert_entries(
+            &pool,
+            feed_id,
+            &[
+                stored("urn:slow", "<p>old slow</p>"),
+                stored("urn:b", "<p>old b</p>"),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let sem = permits(2);
+        poll_feed_with(&pool, &client, &feed, 0, limits(sem, SHORT))
+            .await
+            .unwrap();
+        assert_eq!(
+            bodies(&pool).await,
+            vec![
+                ("urn:a".to_string(), clean(ORDINARY_A)),
+                ("urn:b".to_string(), Some("<p>old b</p>".to_string())),
+                ("urn:bare".to_string(), None),
+                ("urn:slow".to_string(), Some("<p>old slow</p>".to_string())),
+            ],
+            "a timed-out poll changed a stored body"
+        );
+        assert_eq!(validators(&pool, &feed.url).await, (None, None));
+
+        // The next poll — same server, same document — with time to finish.
+        let feed = crate::store::get_feed_by_url(&pool, &feed.url)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(sem, GENEROUS))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Updated { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            bodies(&pool).await,
+            vec![
+                ("urn:a".to_string(), clean(ORDINARY_A)),
+                ("urn:b".to_string(), clean(ORDINARY_B)),
+                ("urn:bare".to_string(), None),
+                ("urn:slow".to_string(), clean(&slow)),
+            ]
+        );
+        assert_eq!(
+            validators(&pool, &feed.url).await,
+            (
+                Some(ETAG_V1.to_string()),
+                Some(LAST_MODIFIED_V1.to_string())
+            )
+        );
+
+        // And the fixture does honour them, so the check above is meaningful.
+        let feed = crate::store::get_feed_by_url(&pool, &feed.url)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(sem, GENEROUS))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PollOutcome::NotModified), "{outcome:?}");
+    }
+
+    /// Ordinary bodies are stored exactly as the inline path (#224's
+    /// `sanitize_html_bounded`, which `normalize_entry` and its tests pin)
+    /// produces them.
+    #[tokio::test]
+    async fn ordinary_bodies_are_stored_byte_identical_to_the_inline_path() {
+        let big = format!("<p>{}</p>", "word ".repeat(18_000));
+        let doc = rss(&big);
+        let (pool, feed, _) = fixture("ordinary-bodies.test", doc.clone()).await;
+        let client = build_client().unwrap();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(permits(4), GENEROUS))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Updated { .. }),
+            "{outcome:?}"
+        );
+
+        let mut inline: Vec<(String, Option<String>)> = parse_feed(doc.as_bytes())
+            .unwrap()
+            .entries
+            .iter()
+            .map(normalize_entry)
+            .map(|e| (e.guid, e.content_html))
+            .collect();
+        inline.sort();
+        assert_eq!(bodies(&pool).await, inline);
+        assert_eq!(
+            validators(&pool, &feed.url).await,
+            (
+                Some(ETAG_V1.to_string()),
+                Some(LAST_MODIFIED_V1.to_string())
+            )
+        );
+    }
+
+    /// With every permit held, a poll waits for one **asynchronously**: other
+    /// work on the same current-thread runtime goes on, and the poll finishes
+    /// once a permit is free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_poll_waits_for_a_permit_without_blocking_the_runtime() {
+        let (pool, feed, _) = fixture("permit-wait.test", rss(ORDINARY_B)).await;
+        let sem = permits(1);
+        let held = sem.acquire().await.unwrap();
+
+        let poll = tokio::spawn(async move {
+            let client = build_client().unwrap();
+            let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(sem, GENEROUS))
+                .await
+                .unwrap();
+            (outcome, bodies(&pool).await)
+        });
+        // Timers still fire on this runtime while the poll waits.
+        let started = Instant::now();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!poll.is_finished(), "the poll did not wait for a permit");
+
+        drop(held);
+        let (outcome, stored) = poll.await.unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Updated { .. }),
+            "{outcome:?}"
+        );
+        assert!(stored.contains(&("urn:slow".to_string(), clean(ORDINARY_B))));
+    }
+
+    /// The wait for a permit is bounded too: permits held by abandoned
+    /// sanitizes must not stall a poll — or the shutdown that drains it —
+    /// for as long as ammonia runs. Such a poll is treated as timed out.
+    #[tokio::test]
+    async fn a_poll_that_never_gets_a_permit_gives_up_at_the_timeout() {
+        let (pool, feed, _) = fixture("permit-starved.test", rss(ORDINARY_B)).await;
+        let sem = permits(1);
+        let _held = sem.acquire().await.unwrap();
+
+        let client = build_client().unwrap();
+        let started = Instant::now();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(sem, SHORT))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                outcome,
+                PollOutcome::Failed {
+                    kind: FailureKind::Body,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(bodies(&pool).await.iter().all(|(_, body)| body.is_none()));
+        assert_eq!(validators(&pool, &feed.url).await, (None, None));
     }
 }

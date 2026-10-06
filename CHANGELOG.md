@@ -14,6 +14,36 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **A feed body could stall the poller for minutes (#226).** Ingest
+  sanitizing (ammonia, via `feed::sanitize_html_bounded`) ran on the poll's
+  async task, and ammonia is super-linear on some inputs — measured in release
+  on an M-series Mac, 2 MiB of `&` runs took ~2.4 s, U+00A0 runs ~3.4 s,
+  nested `<div>`s ~37 s, and 8 MiB of `&` did not finish in ten minutes. Any
+  feed author could serve such a body and hold a tokio worker, and the
+  poller, for that long. Each entry body is now sanitized on tokio's blocking
+  pool (`spawn_blocking`), under a process-wide semaphore of 4 permits (the
+  default poll concurrency) that the blocking closure holds until ammonia
+  returns, with a 5 s timeout on the permit wait and on the sanitize (real
+  bodies take ≤ ~3.5 ms). On a timeout the poll sanitizes no further bodies
+  for that feed: the entry and those after it keep the body already stored,
+  or are stored without one if new (the reader shows the title and a link to
+  the original); nothing degraded is built in its place. The poll does not
+  save its `ETag` / `Last-Modified`, so the next poll is a full fetch rather
+  than a `304`, and it is reported as a `Body` failure so the feed backs off
+  and `/stats` says why. Ordinary bodies are stored byte-for-byte as before
+  (#224's sanitize-then-bound order is unchanged). The server now builds its
+  runtime itself and shuts it down with a 5 s bound, because a dropped tokio
+  runtime waits without limit for blocking work such as an abandoned
+  sanitize, which could outlast Fly's 45 s `kill_timeout`. Tested with a
+  loopback feed serving a slow body: a timer on a current-thread runtime
+  stalled 2.9 s during the poll before this change; the stored-body,
+  validator and permit behaviours each have a test that fails when that part
+  is removed.
+
 ## 0.4.6 — 2026-10-06
 
 Renames no longer lose data. Renaming a subscription is a compare-and-swap
