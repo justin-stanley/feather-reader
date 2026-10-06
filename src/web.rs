@@ -3576,7 +3576,8 @@ struct RenameSubForm {
     #[serde(default)]
     seen_title: Option<String>,
     /// The folder the select was pre-selected with (`""` for none). Posted
-    /// only when the select is, so the two are present or absent together.
+    /// only when the select is, so the two are present or absent together —
+    /// and both absent means the reader never saw a folder to change.
     #[serde(default)]
     seen_folder: Option<String>,
 }
@@ -3651,6 +3652,18 @@ fn form_value(v: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The record a rename should write, from [`merge_rename`].
+#[derive(Debug, PartialEq, Eq)]
+struct MergedRename {
+    /// The record to write.
+    sub: Subscription,
+    /// Whether THIS write repoints the subscription to a different feed URL.
+    repoint: bool,
+    /// Every field the reader changed already holds the reader's value — a
+    /// double-submitted Save whose first request landed. Nothing to write.
+    already_saved: bool,
+}
+
 /// Which field the reader and another client both changed, differently.
 #[derive(Debug, PartialEq, Eq)]
 struct RenameConflict(&'static str);
@@ -3666,8 +3679,14 @@ struct RenameConflict(&'static str);
 ///   so `fresh`'s value stands, whoever wrote it;
 /// - **the reader changed it, and `fresh` still has `base`'s value** — the
 ///   reader's value is applied;
-/// - **the reader changed it, and so did someone else** — a conflict; nothing
-///   is written.
+/// - **the reader changed it, and `fresh` already holds the reader's value** —
+///   both made the same edit (or a double-submitted Save landed first): no
+///   conflict, nothing to write for that field;
+/// - **the reader changed it, and so did someone else, differently** — a
+///   conflict; nothing is written.
+///
+/// A field whose input the page did not render (the folder select, without
+/// folders to list) is untouched by the reader.
 ///
 /// On the first attempt `fresh` IS `base`, so the only question is what the
 /// reader changed. The repoint semantics — dropping `siteUrl` and `fetchHint`
@@ -3685,21 +3704,32 @@ fn merge_rename(
     form: &RenameSubForm,
     base: &Subscription,
     fresh: Subscription,
-) -> Result<(Subscription, bool), RenameConflict> {
+) -> Result<MergedRename, RenameConflict> {
     let mut sub = fresh;
+    // Fields the reader changed, and how many of those still need writing:
+    // a change `fresh` already holds — both sides made the same edit, or this
+    // is a double-submitted Save whose first request landed — is agreement,
+    // not a conflict, and there is nothing to write for it.
+    let mut edited = 0;
+    let mut to_write = 0;
 
     let posted_url = form.url.trim();
     let seen_url = form.seen_url.as_deref().unwrap_or(&base.url).trim();
-    let url_changed = posted_url != seen_url;
-    if url_changed {
-        if sub.url.trim() != base.url.trim() {
+    let mut repoint = false;
+    if posted_url != seen_url {
+        edited += 1;
+        if sub.url.trim() == posted_url {
+            // Already there. Not a repoint by THIS write, so the fresh
+            // record's siteUrl and fetchHint — perhaps the new feed's — stay.
+        } else if sub.url.trim() != base.url.trim() {
             return Err(RenameConflict("url"));
+        } else {
+            to_write += 1;
+            repoint = true;
         }
-        sub.url = posted_url.to_string();
-    } else {
-        // Like for like: a record another client wrote may carry padding.
-        sub.url = sub.url.trim().to_string();
     }
+    // Like for like: a record another client wrote may carry padding.
+    sub.url = if repoint { posted_url } else { sub.url.trim() }.to_string();
 
     let posted_title = form_value(form.title.as_deref());
     let seen_title = match form.seen_title.as_deref() {
@@ -3707,22 +3737,41 @@ fn merge_rename(
         None => base.title.clone(),
     };
     if posted_title != seen_title {
-        if sub.title != base.title {
+        edited += 1;
+        if sub.title == posted_title {
+            // Already there.
+        } else if sub.title != base.title {
             return Err(RenameConflict("title"));
+        } else {
+            to_write += 1;
+            sub.title = posted_title;
         }
-        sub.title = posted_title;
     }
 
-    let posted_folder = form_value(form.folder.as_deref());
-    let seen_folder = match form.seen_folder.as_deref() {
-        Some(seen) => form_value(Some(seen)),
-        None => base.folder.clone(),
-    };
-    if posted_folder != seen_folder {
-        if sub.folder != base.folder {
-            return Err(RenameConflict("folder"));
+    // **The folder select is conditional; absent, the reader never saw a
+    // folder.** The manage row renders it — and `seen_folder` with it — only
+    // when it has folders to list, which a reader without folders, or a page
+    // whose folder listing failed, does not. Posted with neither, the folder
+    // is untouched; reading the absence as "no folder" un-foldered every
+    // subscription retitled from such a page. (The title input is always
+    // rendered, so an absent title keeps its old meaning.)
+    if form.folder.is_some() || form.seen_folder.is_some() {
+        let posted_folder = form_value(form.folder.as_deref());
+        let seen_folder = match form.seen_folder.as_deref() {
+            Some(seen) => form_value(Some(seen)),
+            None => base.folder.clone(),
+        };
+        if posted_folder != seen_folder {
+            edited += 1;
+            if sub.folder == posted_folder {
+                // Already there.
+            } else if sub.folder != base.folder {
+                return Err(RenameConflict("folder"));
+            } else {
+                to_write += 1;
+                sub.folder = posted_folder;
+            }
         }
-        sub.folder = posted_folder;
     }
 
     // `createdAt` and `private` carry over untouched — neither is a property
@@ -3735,19 +3784,30 @@ fn merge_rename(
     // other.
     match form_value(form.site_url.as_deref()) {
         Some(site) if Some(&site) != base.site_url.as_ref() => {
-            if sub.site_url != base.site_url {
+            edited += 1;
+            if sub.site_url.as_ref() == Some(&site) {
+                // Already there.
+            } else if sub.site_url != base.site_url {
                 return Err(RenameConflict("siteUrl"));
+            } else {
+                to_write += 1;
+                sub.site_url = Some(site);
             }
-            sub.site_url = Some(site);
         }
         Some(_) => {}
-        None if url_changed => sub.site_url = None,
+        None if repoint => sub.site_url = None,
         None => {}
     }
-    if url_changed {
+    if repoint {
         sub.fetch_hint = None;
     }
-    Ok((sub, url_changed))
+    Ok(MergedRename {
+        sub,
+        repoint,
+        // A form with no edits is not "already saved": it writes, as it always
+        // has — it is the reader asking for exactly this record.
+        already_saved: edited > 0 && to_write == 0,
+    })
 }
 
 /// How many times [`rename_subscription`] reads and writes before giving up on
@@ -3860,13 +3920,24 @@ async fn rename_subscription_once(
     // Whether this IS a repoint is the reader's change, from the merge — not
     // the form against a record another client may have moved (#149).
     let base = base.get_or_insert_with(|| fresh.clone());
-    let (sub, url_changed) = match merge_rename(form, base, fresh) {
+    let MergedRename {
+        sub,
+        repoint: url_changed,
+        already_saved,
+    } = match merge_rename(form, base, fresh) {
         Ok(merged) => merged,
         Err(RenameConflict(field)) => {
             warn!(%did, %rkey, field, "refused rename: the reader and another client both changed the same field");
             return Ok(Done(rename_conflict_response()));
         }
     };
+    // Every change the reader made is already in the record: a Save submitted
+    // twice, whose first request landed. Success, with nothing to write — and
+    // no cache write either, since the request that wrote it made that too.
+    if already_saved {
+        info!(%did, %rkey, "rename already in the record; nothing to write");
+        return Ok(Done(Redirect::to("/").into_response()));
+    }
     let feed_url = sub.url.clone();
 
     // **Storability, on the same terms as the add and OPML paths — for a
@@ -12107,6 +12178,157 @@ mod tests {
         }
     }
 
+    /// **A page with no folder dropdown does not un-folder.** The select (and
+    /// its `seen_folder`) render only when the reader has folders the page
+    /// could list — none, or a failed folder listing, and neither is posted.
+    /// That is "the reader never saw a folder", not "the reader chose none":
+    /// a retitle from such a page used to un-folder the subscription, and on
+    /// a retry could report a conflict on a field the reader never saw.
+    #[tokio::test]
+    async fn a_rename_from_a_page_without_a_folder_select_keeps_the_folder() {
+        for backend in RACE_BACKENDS {
+            for raced in [false, true] {
+                let mut seed = race_seed();
+                seed["folder"] = serde_json::json!("at://did:plc:racer149/folder/kept");
+                let concurrent = raced.then(|| {
+                    let mut theirs = seed.clone();
+                    theirs["folder"] = serde_json::json!("at://did:plc:racer149/folder/theirs");
+                    theirs
+                });
+                let want_folder = concurrent
+                    .as_ref()
+                    .map_or(seed["folder"].clone(), |t| t["folder"].clone());
+                let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                    value: seed,
+                    concurrent,
+                    ..SwapRepo::default()
+                }));
+                let state = race_state(backend, &repo).await;
+
+                // Exactly what the manage row posts with no folder select.
+                let loc = post_race_rename_body(
+                    &state,
+                    "url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+                     &seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+                     &seen_title=Old+title&title=New+title",
+                )
+                .await;
+
+                let repo = repo.lock().unwrap();
+                let ctx = format!("{backend:?} raced={raced}");
+                assert_eq!(loc, "/", "{ctx}: {loc}");
+                assert_eq!(repo.value["title"], "New title", "{ctx}");
+                assert_eq!(
+                    repo.value["folder"], want_folder,
+                    "{ctx}: a page that never showed a folder changed it: {}",
+                    repo.value
+                );
+            }
+        }
+    }
+
+    /// **A double-clicked Save is not a conflict.** Both POSTs read the same
+    /// CID; the first lands; the second's swap fails, and its re-read finds
+    /// the record already saying exactly what the reader asked for. That is
+    /// success, with nothing left to write — not "nothing was renamed".
+    #[tokio::test]
+    async fn a_double_submitted_rename_reports_success_and_writes_once() {
+        for backend in RACE_BACKENDS {
+            // The first submission's write, landing between the second's read
+            // and its put.
+            let mut first = race_seed();
+            first["title"] = serde_json::json!("New title");
+            first["folder"] = serde_json::json!("Tech");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(first.clone()),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename_body(
+                &state,
+                &format!(
+                    "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&folder=Tech&{SEEN_SEED}"
+                ),
+            )
+            .await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: a save that landed was reported as a conflict: {loc}"
+            );
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: only the refused put; the re-read has nothing left to write: {:?}",
+                repo.puts
+            );
+            assert_eq!(repo.value, first, "{backend:?}");
+        }
+    }
+
+    /// Both sides changing a field to the SAME value is agreement, not a
+    /// conflict — for every field the merge handles. Alongside a field still
+    /// to apply, the write goes ahead with it; alone, there is nothing to
+    /// write and the save is already done.
+    #[test]
+    fn the_same_change_on_both_sides_is_not_a_conflict() {
+        let base = merge_base();
+        let url = "https://a.example/feed.xml";
+        let new_url = "https://c.example/feed.xml";
+
+        // title: both "New".
+        let mut fresh = base.clone();
+        fresh.title = Some("New".to_string());
+        let merged = merge_rename(&merge_form(url, "New", Some("at://f/old")), &base, fresh)
+            .expect("same title is no conflict");
+        assert!(merged.already_saved, "nothing left to write");
+
+        // folder: both moved to the same folder, while the reader also retitles.
+        let mut fresh = base.clone();
+        fresh.folder = Some("at://f/new".to_string());
+        let merged = merge_rename(&merge_form(url, "Mine", Some("at://f/new")), &base, fresh)
+            .expect("same folder is no conflict");
+        assert!(!merged.already_saved, "the title is still to write");
+        assert_eq!(merged.sub.title.as_deref(), Some("Mine"));
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/new"));
+
+        // url: both repointed to the same URL. Not a repoint by THIS write, so
+        // the fresh record's siteUrl (which may be for the new feed) stays.
+        let mut fresh = base.clone();
+        fresh.url = new_url.to_string();
+        fresh.site_url = Some("https://c.example/".to_string());
+        let merged = merge_rename(
+            &merge_form(new_url, "Old", Some("at://f/old")),
+            &base,
+            fresh,
+        )
+        .expect("same url is no conflict");
+        assert!(merged.already_saved);
+        assert!(!merged.repoint);
+        assert_eq!(merged.sub.site_url.as_deref(), Some("https://c.example/"));
+
+        // siteUrl: both set it the same.
+        let mut fresh = base.clone();
+        fresh.site_url = Some("https://same.example/".to_string());
+        let mut form = merge_form(url, "Old", Some("at://f/old"));
+        form.site_url = Some("https://same.example/".to_string());
+        let merged = merge_rename(&form, &base, fresh).expect("same siteUrl is no conflict");
+        assert!(merged.already_saved);
+
+        // A form with no edits at all is NOT "already saved": it writes, as
+        // it always has.
+        let merged = merge_rename(
+            &merge_form(url, "Old", Some("at://f/old")),
+            &base,
+            base.clone(),
+        )
+        .unwrap();
+        assert!(!merged.already_saved);
+    }
+
     fn merge_form(url: &str, title: &str, folder: Option<&str>) -> RenameSubForm {
         RenameSubForm {
             url: url.to_string(),
@@ -12146,18 +12368,18 @@ mod tests {
             ),
             Err(RenameConflict("folder"))
         );
-        let (merged, repoint) = merge_rename(
+        let merged = merge_rename(
             &merge_form(url, "Old", Some("at://f/mine")),
             &base,
             base.clone(),
         )
         .unwrap();
-        assert_eq!(merged.folder.as_deref(), Some("at://f/mine"));
-        assert!(!repoint);
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/mine"));
+        assert!(!merged.repoint);
         // Only they moved it: theirs stands.
-        let (merged, _) =
+        let merged =
             merge_rename(&merge_form(url, "Old", Some("at://f/old")), &base, theirs).unwrap();
-        assert_eq!(merged.folder.as_deref(), Some("at://f/theirs"));
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/theirs"));
 
         // URL: both repointed -> conflict.
         let mut moved = base.clone();
@@ -12182,15 +12404,15 @@ mod tests {
         );
 
         // A reader's repoint drops the old feed's properties.
-        let (merged, repoint) = merge_rename(
+        let merged = merge_rename(
             &merge_form("https://c.example/feed.xml", "Old", Some("at://f/old")),
             &base,
             base.clone(),
         )
         .unwrap();
-        assert!(repoint);
-        assert_eq!(merged.url, "https://c.example/feed.xml");
-        assert_eq!(merged.site_url, None);
+        assert!(merged.repoint);
+        assert_eq!(merged.sub.url, "https://c.example/feed.xml");
+        assert_eq!(merged.sub.site_url, None);
 
         // seen_* wins over base for "did the reader change it": the input was
         // pre-filled with a display title, and posting it back is no edit.
@@ -12198,8 +12420,11 @@ mod tests {
         untitled.title = None;
         let mut form = merge_form(url, "A display fallback", Some("at://f/old"));
         form.seen_title = Some("A display fallback".to_string());
-        let (merged, _) = merge_rename(&form, &untitled, untitled.clone()).unwrap();
-        assert_eq!(merged.title, None, "an untouched display title was written");
+        let merged = merge_rename(&form, &untitled, untitled.clone()).unwrap();
+        assert_eq!(
+            merged.sub.title, None,
+            "an untouched display title was written"
+        );
     }
 
     /// **A rename must not destroy the fields the form never carries.**

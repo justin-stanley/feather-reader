@@ -46,7 +46,16 @@ deploying is separate.
   per field (`url`, `title`, `folder`, and a posted `site_url`):
   - untouched by the reader: the fresh value stands;
   - changed by the reader only: their value is applied;
-  - changed by both: nothing is written and the reader is told.
+  - changed by both to the same value: agreement, not a conflict. When every
+    change the reader made is already in the record, as with a
+    double-clicked Save whose first request landed, the rename reports
+    success and writes nothing;
+  - changed by both, differently: nothing is written and the reader is told.
+
+  The folder select renders only when the page has folders to list, so a
+  rename posted with neither `folder` nor `seen_folder` leaves the folder
+  alone. Reading that as "no folder" un-foldered every subscription retitled
+  from such a page.
 
   #147's preservation of the other fields still holds. Whether a rename is a
   repoint, which drops the old feed's `siteUrl` and `fetchHint`, follows the
@@ -87,9 +96,10 @@ deploying is separate.
   survives and the rename lands. One refuses every swap: at most two puts,
   then the conflict message. Others cover a concurrent repoint or retitle the
   reader did not make, a title both sides changed, a repoint before the first
-  read, and a rename that did not land leaving the cache alone. The wire tests
-  show `swapRecord` present when given and absent otherwise on each client and
-  on the sidecar. Each guard was mutated (31 mutants, including the swap
+  read, a rename that did not land leaving the cache alone, a double-submitted
+  Save, the same edit on both sides, and a page with no folder select. The
+  wire tests show `swapRecord` present when given and absent otherwise on
+  each client and on the sidecar. Each guard was mutated (39 mutants, including the swap
   hardcoded to `None` on each backend, the merge measured against the fresh
   record, and the cache written before the put), and every mutation failed a
   test.
