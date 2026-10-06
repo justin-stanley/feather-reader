@@ -339,22 +339,28 @@ impl Repo<'_> {
     }
 
     /// Create or replace a record at a known key.
+    ///
+    /// `swap_record` is the CID the caller read the record at, sent as
+    /// `swapRecord`, so a record another client wrote in between is refused
+    /// with `InvalidSwap` instead of overwritten (#149); recognise that with
+    /// [`crate::atproto::is_invalid_swap`]. `None` omits the field.
     pub async fn put_record<T: crate::vetted::WritableRecord>(
         &self,
         collection: &str,
         rkey: &str,
         record: &T,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        self.write(
-            "com.atproto.repo.putRecord",
-            json!({
-                "repo": self.session.sub,
-                "collection": collection,
-                "rkey": rkey,
-                "record": record,
-            }),
-        )
-        .await
+        let mut body = json!({
+            "repo": self.session.sub,
+            "collection": collection,
+            "rkey": rkey,
+            "record": record,
+        });
+        if let Some(cid) = swap_record {
+            body["swapRecord"] = json!(cid);
+        }
+        self.write("com.atproto.repo.putRecord", body).await
     }
 
     pub async fn delete_record(&self, collection: &str, rkey: &str) -> Result<()> {
@@ -431,12 +437,27 @@ impl Repo<'_> {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, T)>> {
+        Ok(self
+            .list_typed_with_cids(collection)
+            .await?
+            .into_iter()
+            .map(|(rkey, _cid, value)| (rkey, value))
+            .collect())
+    }
+
+    /// [`list_typed`](Self::list_typed), keeping the CID each record was
+    /// listed at — the value a compare-and-swap write names (#149). One parse
+    /// path for both, so the CID listing skips exactly what the plain one does.
+    async fn list_typed_with_cids<T: serde::de::DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, Option<String>, T)>> {
         let records = self.list_all_records(collection).await?;
         let mut out = Vec::with_capacity(records.len());
         for record in records {
             let rkey = record.rkey().unwrap_or_default().to_string();
             match record.parse::<T>() {
-                Ok(value) => out.push((rkey, value)),
+                Ok(value) => out.push((rkey, record.cid, value)),
                 Err(err) => tracing::warn!(
                     collection,
                     uri = %record.uri,
@@ -452,6 +473,15 @@ impl Repo<'_> {
 
     pub async fn list_subscriptions(&self) -> Result<Vec<(String, crate::lexicon::Subscription)>> {
         self.list_typed(crate::lexicon::nsid::SUBSCRIPTION).await
+    }
+
+    /// Every subscription with the CID it was listed at, unsorted — the read
+    /// half of a read-modify-write that puts with `swapRecord` (#149).
+    pub async fn list_subscriptions_with_cids(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, crate::lexicon::Subscription)>> {
+        self.list_typed_with_cids(crate::lexicon::nsid::SUBSCRIPTION)
+            .await
     }
 
     /// Every subscription, in the reader's deterministic order.
@@ -488,8 +518,9 @@ impl Repo<'_> {
         &self,
         rkey: &str,
         sub: &crate::vetted::VettedSubscription,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        self.put_record(crate::lexicon::nsid::SUBSCRIPTION, rkey, sub)
+        self.put_record(crate::lexicon::nsid::SUBSCRIPTION, rkey, sub, swap_record)
             .await
     }
 
@@ -560,7 +591,7 @@ impl Repo<'_> {
         rkey: &str,
         folder: &crate::lexicon::Folder,
     ) -> Result<WriteResult> {
-        self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder)
+        self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder, None)
             .await
     }
 
@@ -600,7 +631,7 @@ impl Repo<'_> {
         rkey: &str,
         state: &crate::lexicon::ReadState,
     ) -> Result<()> {
-        self.put_record(crate::lexicon::nsid::READ_STATE, rkey, state)
+        self.put_record(crate::lexicon::nsid::READ_STATE, rkey, state, None)
             .await?;
         Ok(())
     }
@@ -1529,5 +1560,101 @@ mod tests {
         assert!(sizes.len() > 1, "one call for ~500 KB: {sizes:?}");
         let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
         assert_eq!(crate::atproto::tests::sent_rkeys(&log), want);
+    }
+
+    // -- #149: compare-and-swap putRecord ------------------------------------
+
+    /// A session whose audience is `pds` — the one place this client takes
+    /// its host from.
+    fn session_at(pds: &str) -> OAuthSession {
+        let mut s = session();
+        s.aud = pds.to_string();
+        s
+    }
+
+    /// **`swapRecord` is on the wire when given, and absent when not** — the
+    /// live backend's half of the CAS. Asserted on the request body the PDS
+    /// received, since a parameter accepted and then dropped is exactly what
+    /// a happy-path test cannot see.
+    #[tokio::test]
+    async fn put_record_sends_swap_record_only_when_given() {
+        use crate::atproto::tests::{serve_status_json, swap_sub, write_ok, OLD_CID};
+        let (_, pds, log) = serve_status_json(200, write_ok()).await;
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let s = session_at(&pds);
+        let repo = repo(&http, &pool, &s, &key);
+
+        repo.update_subscription("rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect("put with a swap");
+        repo.update_subscription("rk", &swap_sub(), None)
+            .await
+            .expect("put without a swap");
+
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["rkey"], "rk", "captured no usable body: {sent:?}");
+        assert_eq!(
+            sent[0]["swapRecord"], OLD_CID,
+            "the CID the caller read never reached the PDS: {}",
+            sent[0]
+        );
+        assert_eq!(sent[1]["rkey"], "rk");
+        assert!(
+            sent[1].get("swapRecord").is_none(),
+            "no swap was asked for, so none may be sent: {}",
+            sent[1]
+        );
+    }
+
+    /// The PDS's `InvalidSwap`, as this client reports it, is recognised —
+    /// and a different 400 from the same client is not.
+    #[tokio::test]
+    async fn an_invalid_swap_from_the_pds_is_recognised() {
+        use crate::atproto::tests::{invalid_swap_xrpc, serve_status_json, swap_sub, OLD_CID};
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+
+        let (_, pds, _) = serve_status_json(400, invalid_swap_xrpc()).await;
+        let s = session_at(&pds);
+        let err = repo(&http, &pool, &s, &key)
+            .update_subscription("rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect_err("the PDS refused the swap");
+        assert!(crate::atproto::is_invalid_swap(&err), "{err:#}");
+
+        let (_, pds, _) = serve_status_json(
+            400,
+            serde_json::json!({ "error": "InvalidRequest", "message": "bad record" }),
+        )
+        .await;
+        let s = session_at(&pds);
+        let err = repo(&http, &pool, &s, &key)
+            .update_subscription("rk", &swap_sub(), Some(OLD_CID))
+            .await
+            .expect_err("refused");
+        assert!(!crate::atproto::is_invalid_swap(&err), "{err:#}");
+    }
+
+    /// The CID listing pairs each record with the CID it was listed at.
+    #[tokio::test]
+    async fn list_subscriptions_with_cids_keeps_each_records_cid() {
+        use crate::atproto::tests::{assert_listed_with_cids, serve_status_json, two_subs_page};
+        let (_, pds, _) = serve_status_json(200, two_subs_page()).await;
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let s = session_at(&pds);
+        let listed = repo(&http, &pool, &s, &key)
+            .list_subscriptions_with_cids()
+            .await
+            .expect("listing");
+        assert_listed_with_cids(&listed);
     }
 }

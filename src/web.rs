@@ -3564,6 +3564,22 @@ struct RenameSubForm {
     site_url: Option<String>,
     #[serde(default)]
     folder: Option<String>,
+    /// What the `url` input held when the page was rendered. With the `seen_*`
+    /// fields the handler tells what the reader CHANGED from what they merely
+    /// saw: every input is always posted, so its value alone cannot (#149).
+    /// Absent (a hand-made POST, or a page from an older build), the handler's
+    /// first read stands in for it.
+    #[serde(default)]
+    seen_url: Option<String>,
+    /// What the title input was pre-filled with — the DISPLAY title, which
+    /// falls back to the cached feed title or the URL for an untitled record.
+    #[serde(default)]
+    seen_title: Option<String>,
+    /// The folder the select was pre-selected with (`""` for none). Posted
+    /// only when the select is, so the two are present or absent together —
+    /// and both absent means the reader never saw a folder to change.
+    #[serde(default)]
+    seen_folder: Option<String>,
 }
 
 /// `POST /subscriptions/:rkey/rename` — retitle a feed and/or move it to a
@@ -3587,6 +3603,242 @@ async fn rename_subscription(
         return Ok(Redirect::to("/").into_response());
     }
 
+    // **A compare-and-swap, retried once (#149).** Each attempt reads the
+    // record with its CID and writes with `swapRecord` set to it, so another
+    // atproto client's write between the two is refused by the PDS rather than
+    // erased by our whole-record put. A refused attempt reads again and
+    // re-applies the form's fields — and only those — to the FRESH record,
+    // re-running every gate against it. A second refusal is reported as a
+    // conflict, never as success: a record that keeps moving is being edited
+    // somewhere, and the reader is the one to decide which edit wins.
+    //
+    // **A retry MERGES; it does not replay the form.** Every input is always
+    // posted, so replaying the form on the fresh record would put back each
+    // field the reader never touched — a URL another client repointed, a title
+    // another client changed. `base` is the record as first read, and each
+    // attempt applies only what the reader changed relative to it; see
+    // [`merge_rename`].
+    let mut base: Option<Subscription> = None;
+    for attempt in 1..=RENAME_ATTEMPTS {
+        match rename_subscription_once(&state, &did, &rkey, &form, &mut base).await? {
+            RenameAttempt::Done(resp) => return Ok(resp),
+            RenameAttempt::Raced => {
+                info!(%did, %rkey, attempt, "subscription changed between read and write; re-reading");
+            }
+        }
+    }
+    warn!(%did, %rkey, attempts = RENAME_ATTEMPTS, "refused rename: the subscription kept changing elsewhere");
+    Ok(rename_conflict_response())
+}
+
+/// The answer to a rename that conflicts with another client's write: nothing
+/// was written, and the reader decides which edit wins.
+fn rename_conflict_response() -> Response {
+    Redirect::to(&format!(
+        "/?flash={}",
+        qenc(
+            "This subscription was changed elsewhere while you were editing it — \
+             nothing was renamed or moved. Reload and try again."
+        )
+    ))
+    .into_response()
+}
+
+/// Trim, and read an empty value as absent — how the form's optional fields
+/// have always been taken.
+fn form_value(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// The record a rename should write, from [`merge_rename`].
+#[derive(Debug, PartialEq, Eq)]
+struct MergedRename {
+    /// The record to write.
+    sub: Subscription,
+    /// Whether THIS write repoints the subscription to a different feed URL.
+    repoint: bool,
+    /// Every field the reader changed already holds the reader's value — a
+    /// double-submitted Save whose first request landed. Nothing to write.
+    already_saved: bool,
+}
+
+/// Which field the reader and another client both changed, differently.
+#[derive(Debug, PartialEq, Eq)]
+struct RenameConflict(&'static str);
+
+/// Apply the reader's edits to `fresh`: a three-way merge of the form against
+/// `base`, the record as the handler FIRST read it (#149). Returns the record
+/// to write and whether the reader repointed it to a different URL.
+///
+/// For each field the form carries (`url`, `title`, `folder`, `site_url`):
+///
+/// - **the reader did not change it** — the posted value equals the value the
+///   input was pre-filled with (`seen_*`, or `base` when the form lacks it) —
+///   so `fresh`'s value stands, whoever wrote it;
+/// - **the reader changed it, and `fresh` still has `base`'s value** — the
+///   reader's value is applied;
+/// - **the reader changed it, and `fresh` already holds the reader's value** —
+///   both made the same edit (or a double-submitted Save landed first): no
+///   conflict, nothing to write for that field;
+/// - **the reader changed it, and so did someone else, differently** — a
+///   conflict; nothing is written.
+///
+/// A field whose input the page did not render (the folder select, without
+/// folders to list) is untouched by the reader.
+///
+/// On the first attempt `fresh` IS `base`, so the only question is what the
+/// reader changed. The repoint semantics — dropping `siteUrl` and `fetchHint`
+/// as properties of the old feed — follow the READER's change, never the
+/// difference between the form and a record another client moved.
+///
+/// **What `seen_*` closes, and what it leaves.** Without it, a field another
+/// client changed between page load and the first read (so no swap fails)
+/// read as the reader's change — the stale hidden URL repointed the record
+/// back. With it, an untouched field is never written. A field BOTH changed
+/// in that window is still last-writer-wins: the conflict check compares
+/// against the first read, not the page-load record, because `seen_title` is
+/// the display title (a fallback for an untitled record), not the record's.
+fn merge_rename(
+    form: &RenameSubForm,
+    base: &Subscription,
+    fresh: Subscription,
+) -> Result<MergedRename, RenameConflict> {
+    let mut sub = fresh;
+    // Fields the reader changed, and how many of those still need writing:
+    // a change `fresh` already holds — both sides made the same edit, or this
+    // is a double-submitted Save whose first request landed — is agreement,
+    // not a conflict, and there is nothing to write for it.
+    let mut edited = 0;
+    let mut to_write = 0;
+
+    let posted_url = form.url.trim();
+    let seen_url = form.seen_url.as_deref().unwrap_or(&base.url).trim();
+    let mut repoint = false;
+    if posted_url != seen_url {
+        edited += 1;
+        if sub.url.trim() == posted_url {
+            // Already there. Not a repoint by THIS write, so the fresh
+            // record's siteUrl and fetchHint — perhaps the new feed's — stay.
+        } else if sub.url.trim() != base.url.trim() {
+            return Err(RenameConflict("url"));
+        } else {
+            to_write += 1;
+            repoint = true;
+        }
+    }
+    // Like for like: a record another client wrote may carry padding.
+    sub.url = if repoint { posted_url } else { sub.url.trim() }.to_string();
+
+    let posted_title = form_value(form.title.as_deref());
+    let seen_title = match form.seen_title.as_deref() {
+        Some(seen) => form_value(Some(seen)),
+        None => base.title.clone(),
+    };
+    if posted_title != seen_title {
+        edited += 1;
+        if sub.title == posted_title {
+            // Already there.
+        } else if sub.title != base.title {
+            return Err(RenameConflict("title"));
+        } else {
+            to_write += 1;
+            sub.title = posted_title;
+        }
+    }
+
+    // **The folder select is conditional; absent, the reader never saw a
+    // folder.** The manage row renders it — and `seen_folder` with it — only
+    // when it has folders to list, which a reader without folders, or a page
+    // whose folder listing failed, does not. Posted with neither, the folder
+    // is untouched; reading the absence as "no folder" un-foldered every
+    // subscription retitled from such a page. (The title input is always
+    // rendered, so an absent title keeps its old meaning.)
+    if form.folder.is_some() || form.seen_folder.is_some() {
+        let posted_folder = form_value(form.folder.as_deref());
+        let seen_folder = match form.seen_folder.as_deref() {
+            Some(seen) => form_value(Some(seen)),
+            None => base.folder.clone(),
+        };
+        if posted_folder != seen_folder {
+            edited += 1;
+            if sub.folder == posted_folder {
+                // Already there.
+            } else if sub.folder != base.folder {
+                return Err(RenameConflict("folder"));
+            } else {
+                to_write += 1;
+                sub.folder = posted_folder;
+            }
+        }
+    }
+
+    // `createdAt` and `private` carry over untouched — neither is a property
+    // of which feed URL the subscription points at.
+    //
+    // `siteUrl` and `fetchHint` ARE properties of the specific feed, so a
+    // repoint drops them rather than leaving a site link for the old feed
+    // hanging off the new one. The manage row does not post `site_url`; a
+    // value that is posted and differs from the base is an edit like any
+    // other.
+    match form_value(form.site_url.as_deref()) {
+        Some(site) if Some(&site) != base.site_url.as_ref() => {
+            edited += 1;
+            if sub.site_url.as_ref() == Some(&site) {
+                // Already there.
+            } else if sub.site_url != base.site_url {
+                return Err(RenameConflict("siteUrl"));
+            } else {
+                to_write += 1;
+                sub.site_url = Some(site);
+            }
+        }
+        Some(_) => {}
+        None if repoint => sub.site_url = None,
+        None => {}
+    }
+    if repoint {
+        sub.fetch_hint = None;
+    }
+    Ok(MergedRename {
+        sub,
+        repoint,
+        // A form with no edits is not "already saved": it writes, as it always
+        // has — it is the reader asking for exactly this record.
+        already_saved: edited > 0 && to_write == 0,
+    })
+}
+
+/// How many times [`rename_subscription`] reads and writes before giving up on
+/// a record that keeps changing: the first try and one retry.
+const RENAME_ATTEMPTS: u32 = 2;
+
+/// The outcome of one read-then-write of a rename.
+enum RenameAttempt {
+    /// Answered: renamed, refused by a gate, or failed for a reason a re-read
+    /// cannot fix.
+    Done(Response),
+    /// The PDS refused the write with `InvalidSwap`: the record moved after
+    /// this attempt read it. Nothing was written.
+    Raced,
+}
+
+/// One attempt at [`rename_subscription`]: read the record and its CID, apply
+/// the form to it, and write it back on the condition that it is still at
+/// that CID.
+///
+/// `base` is the record as the FIRST attempt read it; this sets it on that
+/// attempt, and every attempt merges against it — see [`merge_rename`].
+async fn rename_subscription_once(
+    state: &AppState,
+    did: &str,
+    rkey: &str,
+    form: &RenameSubForm,
+    base: &mut Option<Subscription>,
+) -> Result<RenameAttempt, WebError> {
+    use RenameAttempt::Done;
+
     // **Read before write — `update_subscription` is a `putRecord`, and a
     // putRecord replaces the WHOLE record** (see its doc on `atproto.rs`).
     //
@@ -3603,35 +3855,47 @@ async fn rename_subscription(
     //
     // There is no single-record read on `Repo` (no `getRecord`), so this lists
     // and filters. That is one extra round trip on an action that is already
-    // doing a PDS write, and it is bounded; a `get_subscription` would be
-    // strictly better if this ever measures badly.
+    // doing a PDS write, and it is bounded. A `get_subscription` was weighed
+    // for #149 and not added: the sidecar has no `get` action, so it would be
+    // new surface on the backend being retired, and the listing already
+    // carries each record's CID.
     //
     // **A failed read refuses the rename.** Falling back to the old
     // rebuild-from-scratch here would reinstate the data loss on exactly the
     // flaky path, which is the worst place to have it. The write below already
     // takes this stance — "a failure here means nothing was renamed or moved" —
     // and the read gets the same one.
-    let existing = match state.repo().list_subscriptions_sorted(&did).await {
-        Ok(subs) => subs.into_iter().find(|(k, _)| *k == rkey).map(|(_, s)| s),
+    //
+    // **The CID comes with the record**, and the write below names it: that is
+    // the whole compare-and-swap (#149).
+    let found = match state.repo().list_subscriptions_with_cids(did).await {
+        Ok(subs) => subs
+            .into_iter()
+            .find(|(k, _, _)| k == rkey)
+            .map(|(_, cid, s)| (cid, s)),
         Err(err) => {
             warn!(%err, %did, %rkey, "could not read the subscription before renaming it");
-            return Ok(Redirect::to(&format!(
-                "/?flash={}",
-                qenc("Could not reach your PDS — nothing was renamed or moved.")
-            ))
-            .into_response());
+            return Ok(Done(
+                Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc("Could not reach your PDS — nothing was renamed or moved.")
+                ))
+                .into_response(),
+            ));
         }
     };
-    let Some(existing) = existing else {
+    let Some((read_cid, fresh)) = found else {
         // The rkey is not in the reader's repo. Renaming a record that is not
         // there would CREATE one, which is not what "rename" means and would
         // give it a fresh `createdAt` — the bug this read exists to prevent.
         warn!(%did, %rkey, "refused rename: no such subscription in the repo");
-        return Ok(Redirect::to(&format!(
-            "/?flash={}",
-            qenc("That subscription is no longer in your repo — nothing was renamed or moved.")
-        ))
-        .into_response());
+        return Ok(Done(
+            Redirect::to(&format!(
+                "/?flash={}",
+                qenc("That subscription is no longer in your repo — nothing was renamed or moved.")
+            ))
+            .into_response(),
+        ));
     };
 
     // The subscription can be repointed at a different feed URL. **Every gate
@@ -3652,7 +3916,29 @@ async fn rename_subscription(
     // it protects nothing and takes their own record away from them.
     // Like for like: the form value is trimmed, and a record another client
     // wrote may carry padding — compared raw, every retitle of it was a repoint.
-    let url_changed = existing.url.trim() != feed_url;
+    //
+    // Whether this IS a repoint is the reader's change, from the merge — not
+    // the form against a record another client may have moved (#149).
+    let base = base.get_or_insert_with(|| fresh.clone());
+    let MergedRename {
+        sub,
+        repoint: url_changed,
+        already_saved,
+    } = match merge_rename(form, base, fresh) {
+        Ok(merged) => merged,
+        Err(RenameConflict(field)) => {
+            warn!(%did, %rkey, field, "refused rename: the reader and another client both changed the same field");
+            return Ok(Done(rename_conflict_response()));
+        }
+    };
+    // Every change the reader made is already in the record: a Save submitted
+    // twice, whose first request landed. Success, with nothing to write — and
+    // no cache write either, since the request that wrote it made that too.
+    if already_saved {
+        info!(%did, %rkey, "rename already in the record; nothing to write");
+        return Ok(Done(Redirect::to("/").into_response()));
+    }
+    let feed_url = sub.url.clone();
 
     // **Storability, on the same terms as the add and OPML paths — for a
     // REPOINT, and FIRST.** A target this instance cannot store gets that
@@ -3669,10 +3955,10 @@ async fn rename_subscription(
     let storable = feed::is_storable_feed_url(&feed_url, state.config.standard_site);
     if url_changed && !storable {
         info!(url = %feed_url, %did, %rkey, "refused a repoint to a non-storable feed URL");
-        return Ok(
+        return Ok(Done(
             Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
                 .into_response(),
-        );
+        ));
     }
 
     // Block private/paid feeds on a repoint. `url` is attacker-controllable,
@@ -3683,9 +3969,9 @@ async fn rename_subscription(
     if url_changed {
         if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
             info!(url = %feed_url, %reason, %did, %rkey, "refused private/paid feed at rename (not stored or written)");
-            return Ok(
+            return Ok(Done(
                 Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
-            );
+            ));
         }
     }
 
@@ -3703,49 +3989,65 @@ async fn rename_subscription(
         match store::count_feeds(&state.db).await {
             Ok(n) if n >= feeds_cap => {
                 warn!(%did, %rkey, feeds = n, cap = feeds_cap, feed = %feed_url, "refused rename: global feeds ceiling reached");
-                return Ok(Redirect::to(&format!(
-                    "/?flash={}",
-                    qenc(
-                        "This instance is at its feed capacity right now. Please try again later."
-                    )
-                ))
-                .into_response());
+                return Ok(Done(
+                    Redirect::to(&format!(
+                        "/?flash={}",
+                        qenc(
+                            "This instance is at its feed capacity right now. Please try again later."
+                        )
+                    ))
+                    .into_response(),
+                ));
             }
             Ok(_) => {}
             Err(err) => warn!(%err, "could not count feeds for global-cap check; allowing"),
         }
     }
 
-    let mut sub = existing;
-    sub.url = feed_url;
-    sub.title = form
-        .title
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
-    sub.folder = form
-        .folder
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty());
-    // `createdAt` and `private` carry over untouched — neither is a property of
-    // which feed URL the subscription points at.
+    // **The PDS write decides what the reader is told.**
     //
-    // `siteUrl` and `fetchHint` ARE properties of the specific feed, so a
-    // repoint drops them rather than leaving a site link for the old feed
-    // hanging off the new one. An explicit form value still wins if the form
-    // ever starts carrying one.
-    match form
-        .site_url
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    // This used to `warn!` on failure and then redirect exactly as it does on
+    // success, so a rename that did not happen was indistinguishable from one
+    // that did — the reader saw their old title come back and had no reason to
+    // think anything had gone wrong. The PDS record IS the subscription; a
+    // failure here means nothing was renamed or moved.
+    //
+    // **Conditional on the CID read above (#149).** A listing with no CID is
+    // a PDS outside the lexicon (`listRecords` requires one); the write then
+    // goes unconditionally, as every write did before this, and says so.
+    if read_cid.is_none() {
+        warn!(%did, %rkey, "the PDS listed this subscription without a CID; renaming without a compare-and-swap");
+    }
+    let res = match state
+        .repo()
+        .update_subscription(did, rkey, &sub, read_cid.as_deref())
+        .await
     {
-        Some(site) => sub.site_url = Some(site),
-        None if url_changed => sub.site_url = None,
-        None => {}
-    }
-    if url_changed {
-        sub.fetch_hint = None;
-    }
+        Ok(res) => res,
+        // Another client wrote the record after the read above: nothing was
+        // written, and the caller decides whether to read again.
+        Err(err) if crate::atproto::is_invalid_swap(&err) => return Ok(RenameAttempt::Raced),
+        Err(err) => {
+            warn!(%err, %did, %rkey, "PDS subscription update failed");
+            return Ok(Done(
+                Redirect::to(&format!(
+                    "/?flash={}",
+                    qenc("Could not save that change to your PDS — nothing was renamed or moved.")
+                ))
+                .into_response(),
+            ));
+        }
+    };
+    info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription");
 
+    // **The cache follows the PDS, so it is written only now** — after the
+    // write landed. It used to be written before the put, so a rename the PDS
+    // refused (a failed save, or both attempts of a lost race, #149) still
+    // left the new title on the cached row, or a fresh `feeds` row for a
+    // repoint's URL that the poller then fetched for nobody. Every gate on
+    // that URL (storability, privacy, the ceiling) ran above, before the put;
+    // only the write itself moved.
+    //
     // Keep the local cache title in step for the loose-feed fallback path —
     // for a row this instance would have. Two cases write nothing:
     //
@@ -3760,8 +4062,18 @@ async fn rename_subscription(
     //   polled, fail, and be printed on the admin page. A privacy re-check on
     //   this write was the first draft; mutation showed it dead — the row
     //   rule already refused every case it would have.
-    let cache_write =
-        storable && (url_changed || store::get_feed_by_url(&state.db, &sub.url).await?.is_some());
+    //
+    // A failed lookup skips the cache rather than failing the request: the
+    // rename has already landed, and the reader must be told so.
+    let cache_write = storable
+        && (url_changed
+            || match store::get_feed_by_url(&state.db, &sub.url).await {
+                Ok(row) => row.is_some(),
+                Err(err) => {
+                    warn!(%err, %did, url = %sub.url, "could not look up the cached feed row after a rename");
+                    false
+                }
+            });
     if !cache_write {
         info!(%did, %rkey, url = %sub.url, "renamed a subscription without touching the cache");
     } else if let Err(err) = store::upsert_feed(
@@ -3775,32 +4087,12 @@ async fn rename_subscription(
     )
     .await
     {
-        // Not fatal to the rename — the PDS record below is the source of truth
-        // — but a missing `feeds` row means this subscription is never polled.
+        // Not fatal to the rename — the PDS record is the source of truth —
+        // but a missing `feeds` row means this subscription is never polled.
         warn!(%err, %did, url = %sub.url, "could not update the cached feed row on rename");
     }
 
-    // **The PDS write decides what the reader is told.**
-    //
-    // This used to `warn!` on failure and then redirect exactly as it does on
-    // success, so a rename that did not happen was indistinguishable from one
-    // that did — the reader saw their old title come back and had no reason to
-    // think anything had gone wrong. The PDS record IS the subscription; a
-    // failure here means nothing was renamed or moved.
-    match state.repo().update_subscription(&did, &rkey, &sub).await {
-        Ok(res) => {
-            info!(%did, %rkey, uri = %res.uri, "renamed/moved subscription");
-            Ok(Redirect::to("/").into_response())
-        }
-        Err(err) => {
-            warn!(%err, %did, %rkey, "PDS subscription update failed");
-            Ok(Redirect::to(&format!(
-                "/?flash={}",
-                qenc("Could not save that change to your PDS — nothing was renamed or moved.")
-            ))
-            .into_response())
-        }
-    }
+    Ok(Done(Redirect::to("/").into_response()))
 }
 
 // ---------------------------------------------------------------------------
@@ -11297,6 +11589,844 @@ mod tests {
         assert!(!loc.contains("Private"), "reported as a paid feed: {loc}");
     }
 
+    // -- #149: a rename that races another client's write -------------------
+
+    /// One subscription record behind a fake repo that ENFORCES `swapRecord`
+    /// the way the reference PDS does: a put naming a CID the record is no
+    /// longer at is refused `400 InvalidSwap`; a put with no swap always lands.
+    #[derive(Default)]
+    struct SwapRepo {
+        /// The record's current value.
+        value: serde_json::Value,
+        /// Bumped on every write, so each version has its own CID.
+        version: u32,
+        /// Every put request body received, in order, landed or not.
+        puts: Vec<serde_json::Value>,
+        /// Another client's write, landed the moment our FIRST put arrives —
+        /// i.e. between our read and our write.
+        concurrent: Option<serde_json::Value>,
+        /// Refuse every put that carries a swap, whatever CID it names.
+        refuse_every_swap: bool,
+        /// Refuse every put with this (status, error) — a non-swap failure.
+        fail_puts: Option<(u16, &'static str)>,
+    }
+
+    impl SwapRepo {
+        fn cid(&self) -> String {
+            format!("bafyreiversion{}", self.version)
+        }
+
+        fn page(&self) -> serde_json::Value {
+            serde_json::json!({ "records": [{
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "cid": self.cid(),
+                "value": self.value,
+            }] })
+        }
+
+        /// A put: `Ok(strong ref)` or `Err((status, error name))`.
+        fn put(&mut self, body: &serde_json::Value) -> Result<serde_json::Value, (u16, String)> {
+            self.puts.push(body.clone());
+            if let Some(theirs) = self.concurrent.take() {
+                self.value = theirs;
+                self.version += 1;
+            }
+            if let Some((status, error)) = self.fail_puts {
+                return Err((status, error.to_string()));
+            }
+            if let Some(swap) = body.get("swapRecord").and_then(|v| v.as_str()) {
+                if self.refuse_every_swap || swap != self.cid() {
+                    return Err((400, "InvalidSwap".to_string()));
+                }
+            }
+            self.value = body["record"].clone();
+            self.version += 1;
+            Ok(serde_json::json!({
+                "uri": format!("at://{RACE_DID}/{}/rk-keep", crate::lexicon::nsid::SUBSCRIPTION),
+                "cid": self.cid(),
+            }))
+        }
+    }
+
+    const RACE_DID: &str = "did:plc:racer149";
+
+    /// Serve `repo` as both a sidecar (`/internal/repo`) and a PDS (`/xrpc/*`),
+    /// so one fixture drives either backend. Returns the sidecar base URL and
+    /// the PDS audience a Rust-backend session should carry.
+    async fn serve_swap_repo(repo: std::sync::Arc<std::sync::Mutex<SwapRepo>>) -> (String, String) {
+        use axum::response::IntoResponse as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = format!("pds-{}.race.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let repo = std::sync::Arc::clone(&repo);
+            async move {
+                let (parts, body) = req.into_parts();
+                let raw = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                let reply = |status: u16, body: serde_json::Value| {
+                    (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response()
+                };
+                let mut repo = repo.lock().unwrap();
+                match (parts.uri.path(), body["action"].as_str()) {
+                    ("/internal/repo", Some("list")) => {
+                        reply(200, serde_json::json!({ "ok": true, "data": repo.page() }))
+                    }
+                    ("/internal/repo", Some("put")) => match repo.put(&body) {
+                        Ok(data) => reply(200, serde_json::json!({ "ok": true, "data": data })),
+                        Err((status, error)) => reply(
+                            status,
+                            serde_json::json!({
+                                "ok": false, "error": error, "message": "refused", "status": status,
+                            }),
+                        ),
+                    },
+                    ("/xrpc/com.atproto.repo.listRecords", _) => reply(200, repo.page()),
+                    ("/xrpc/com.atproto.repo.putRecord", _) => match repo.put(&body) {
+                        Ok(data) => reply(200, data),
+                        Err((status, error)) => reply(
+                            status,
+                            serde_json::json!({ "error": error, "message": "refused" }),
+                        ),
+                    },
+                    other => panic!("unexpected request {other:?}"),
+                }
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            format!("http://{addr}"),
+            format!("http://{host}:{}", addr.port()),
+        )
+    }
+
+    /// An `AppState` on `backend`, pointed at `repo` — the sidecar through its
+    /// internal URL, the Rust client through a live OAuth session whose `aud`
+    /// is the fake.
+    async fn race_state(
+        backend: crate::metrics::Backend,
+        repo: &std::sync::Arc<std::sync::Mutex<SwapRepo>>,
+    ) -> AppState {
+        let (sidecar, aud) = serve_swap_repo(std::sync::Arc::clone(repo)).await;
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        store::ensure_seed(&db, &[RACE_DID.to_string()])
+            .await
+            .unwrap();
+        let mut config = Config {
+            allowed_dids: vec![RACE_DID.to_string()],
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            repo_backend: backend,
+            oauth: crate::config::OauthConfig {
+                // Per test, never the relative default — see `repo::tests`.
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-race-oauth-key-{}-{:p}.json",
+                    std::process::id(),
+                    &db as *const _
+                )),
+                encryption_key: Some("a".repeat(43)),
+                ..crate::config::OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        config.sidecar.public_url = sidecar.clone();
+        config.sidecar.internal_url = sidecar;
+        let state = AppState::new(config, db).unwrap();
+        if backend == crate::metrics::Backend::Rust {
+            let runtime = state.oauth.as_deref().expect("oauth runtime");
+            crate::oauth::store::put_session(
+                &state.db,
+                &runtime.codec,
+                &crate::oauth::store::OAuthSession {
+                    sub: RACE_DID.into(),
+                    issuer: "https://auth.invalid".into(),
+                    aud,
+                    dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                        .to_jwk_json()
+                        .unwrap(),
+                    access_token: "at".into(),
+                    refresh_token: "rt".into(),
+                    token_type: "DPoP".into(),
+                    granted_scope: "atproto".into(),
+                    expires_at: Some(store::now_unix() + 3600),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state
+    }
+
+    /// The record before anyone touches it — the seeded one, as a value.
+    fn race_seed() -> serde_json::Value {
+        seeded_subscription()["value"].clone()
+    }
+
+    /// Post the manage row's rename (url unchanged, a new title and folder) and
+    /// return the redirect location.
+    async fn post_race_rename(state: &AppState) -> String {
+        post_race_rename_body(
+            state,
+            "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&folder=Tech",
+        )
+        .await
+    }
+
+    /// Post `body` as the rename of `rk-keep`; returns the redirect location.
+    async fn post_race_rename_body(state: &AppState, body: &str) -> String {
+        let cookie = session_cookie(state, RACE_DID, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/subscriptions/rk-keep/rename")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    const RACE_BACKENDS: [crate::metrics::Backend; 2] = [
+        crate::metrics::Backend::Sidecar,
+        crate::metrics::Backend::Rust,
+    ];
+
+    /// **The key test of #149: a rename that loses a race keeps the other
+    /// client's change AND lands its own.**
+    ///
+    /// The fake lands another client's edit (a new `siteUrl` and `fetchHint`)
+    /// between the handler's read and its write. The write names the CID it
+    /// read, so the PDS refuses it; the handler re-reads, re-applies the form's
+    /// fields to the FRESH record, and writes again under the new CID.
+    ///
+    /// With `swapRecord` dropped anywhere on the way out, the first put lands
+    /// unconditionally and the other client's edit is gone — which is what
+    /// the final-record assertions catch. Run on both backends: production is
+    /// on `rust`, and a backend whose put ignores the swap is the exact gap.
+    #[tokio::test]
+    async fn a_rename_that_loses_a_race_keeps_the_concurrent_edit_and_lands() {
+        for backend in RACE_BACKENDS {
+            let mut theirs = race_seed();
+            theirs["siteUrl"] = serde_json::json!("https://elsewhere.example/blog");
+            theirs["fetchHint"] = serde_json::json!("daily");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(theirs),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: a rename that converged was not reported as done"
+            );
+            assert_eq!(
+                repo.puts.len(),
+                2,
+                "{backend:?}: expected the refused put and one retry: {:?}",
+                repo.puts
+            );
+            assert_eq!(
+                repo.puts[0]["swapRecord"], "bafyreiversion0",
+                "{backend:?}: the first put did not name the CID it read: {}",
+                repo.puts[0]
+            );
+            assert_eq!(
+                repo.puts[1]["swapRecord"], "bafyreiversion1",
+                "{backend:?}: the retry did not name the RE-READ CID: {}",
+                repo.puts[1]
+            );
+            let landed = &repo.value;
+            // The reader's change landed...
+            assert_eq!(landed["title"], "New title", "{backend:?}: {landed}");
+            assert_eq!(landed["folder"], "Tech", "{backend:?}: {landed}");
+            // ...on top of the other client's, not over it.
+            assert_eq!(
+                landed["siteUrl"], "https://elsewhere.example/blog",
+                "{backend:?}: the concurrent edit was lost: {landed}"
+            );
+            assert_eq!(
+                landed["fetchHint"], "daily",
+                "{backend:?}: the concurrent edit was lost: {landed}"
+            );
+            // And #147's preservation still holds on the retried record.
+            assert_eq!(
+                landed["createdAt"], "2024-03-01T00:00:00.000Z",
+                "{backend:?}: {landed}"
+            );
+        }
+    }
+
+    /// **A rename the PDS refuses on every attempt is reported as a conflict,
+    /// never as done — and is not retried forever.** One retry, so at most two
+    /// puts; then the reader is told the subscription changed elsewhere.
+    #[tokio::test]
+    async fn a_rename_refused_on_every_swap_reports_the_conflict() {
+        for backend in RACE_BACKENDS {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                refuse_every_swap: true,
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_ne!(loc, "/", "{backend:?}: a refused rename reported success");
+            assert!(
+                loc.contains("changed%20elsewhere"),
+                "{backend:?}: expected the conflict flash, got {loc}"
+            );
+            assert!(
+                (1..=2).contains(&repo.puts.len()),
+                "{backend:?}: expected at most two put attempts, got {}",
+                repo.puts.len()
+            );
+            assert_eq!(
+                repo.value,
+                race_seed(),
+                "{backend:?}: the record changed though every put was refused"
+            );
+        }
+    }
+
+    /// **A put refused for any OTHER reason is not retried**, and keeps the
+    /// message it had: a re-read cannot fix a rejected record or an outage,
+    /// and calling it a conflict would send the reader looking for an edit
+    /// nobody made.
+    #[tokio::test]
+    async fn a_rename_refused_for_another_reason_is_not_retried() {
+        for backend in RACE_BACKENDS {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                fail_puts: Some((400, "InvalidRequest")),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename(&state).await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: a non-swap refusal was retried"
+            );
+            assert!(
+                loc.contains("Could%20not%20save"),
+                "{backend:?}: expected the save-failed flash, got {loc}"
+            );
+            assert!(
+                !loc.contains("changed%20elsewhere"),
+                "{backend:?}: a non-swap refusal was reported as a conflict: {loc}"
+            );
+        }
+    }
+
+    /// What the manage row posts for a reader who changed only the title: the
+    /// url and folder as they were, plus the `seen_*` values the inputs were
+    /// pre-filled with.
+    const SEEN_SEED: &str = "seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+                             &seen_title=Old+title&seen_folder=";
+
+    /// **A retry merges; it does not replay the whole form.** Another client
+    /// repoints the record (A -> B, with B's own siteUrl and fetchHint) while
+    /// the reader only retitles it. The form still carries URL A — it is a
+    /// hidden input — so replaying it on the fresh record "repointed" back to
+    /// A, cleared the other client's siteUrl and fetchHint, and reported
+    /// success. The reader changed the title and nothing else, so the title is
+    /// all that may move. Run with and without the `seen_*` inputs: without
+    /// them the base is the handler's first read.
+    #[tokio::test]
+    async fn a_retry_keeps_a_concurrent_repoint_the_reader_did_not_make() {
+        for backend in RACE_BACKENDS {
+            for with_seen in [true, false] {
+                let mut theirs = race_seed();
+                theirs["url"] = serde_json::json!("https://moved.example/feed.xml");
+                theirs["siteUrl"] = serde_json::json!("https://moved.example/");
+                theirs["fetchHint"] = serde_json::json!("daily");
+                let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                    value: race_seed(),
+                    concurrent: Some(theirs),
+                    ..SwapRepo::default()
+                }));
+                let state = race_state(backend, &repo).await;
+                let mut body =
+                    "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title".to_string();
+                if with_seen {
+                    body.push_str(
+                        "&seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml&seen_title=Old+title",
+                    );
+                }
+
+                let loc = post_race_rename_body(&state, &body).await;
+
+                let repo = repo.lock().unwrap();
+                let ctx = format!("{backend:?} seen={with_seen}");
+                assert_eq!(loc, "/", "{ctx}: the rename did not land: {loc}");
+                assert_eq!(repo.puts.len(), 2, "{ctx}: {:?}", repo.puts);
+                let landed = &repo.value;
+                assert_eq!(landed["title"], "New title", "{ctx}: {landed}");
+                assert_eq!(
+                    landed["url"], "https://moved.example/feed.xml",
+                    "{ctx}: the retry repointed the record back to the stale URL: {landed}"
+                );
+                assert_eq!(
+                    landed["siteUrl"], "https://moved.example/",
+                    "{ctx}: {landed}"
+                );
+                assert_eq!(landed["fetchHint"], "daily", "{ctx}: {landed}");
+            }
+        }
+    }
+
+    /// The other client retitles; the reader only moves the folder. Their
+    /// title is kept and the folder applied — the reader's stale copy of the
+    /// title (posted because the input is always submitted) is not a change.
+    #[tokio::test]
+    async fn a_retry_keeps_a_concurrent_retitle_when_the_reader_only_moved_it() {
+        for backend in RACE_BACKENDS {
+            let mut theirs = race_seed();
+            theirs["title"] = serde_json::json!("Their title");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(theirs),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename_body(
+                &state,
+                &format!("url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=Old+title&folder=Tech&{SEEN_SEED}"),
+            )
+            .await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(loc, "/", "{backend:?}: {loc}");
+            let landed = &repo.value;
+            assert_eq!(
+                landed["title"], "Their title",
+                "{backend:?}: the reader's untouched title overwrote the other client's: {landed}"
+            );
+            assert_eq!(landed["folder"], "Tech", "{backend:?}: {landed}");
+        }
+    }
+
+    /// **Both changed the same field: a conflict, and nothing is written.**
+    /// Neither edit can be chosen for the reader, so they are told, and the
+    /// other client's title stays.
+    #[tokio::test]
+    async fn both_retitling_is_a_conflict_that_writes_nothing() {
+        for backend in RACE_BACKENDS {
+            let mut theirs = race_seed();
+            theirs["title"] = serde_json::json!("Their title");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(theirs.clone()),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename_body(
+                &state,
+                &format!("url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&{SEEN_SEED}"),
+            )
+            .await;
+
+            let repo = repo.lock().unwrap();
+            assert!(
+                loc.contains("changed%20elsewhere"),
+                "{backend:?}: expected the conflict flash, got {loc}"
+            );
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: a conflicting retry was written: {:?}",
+                repo.puts
+            );
+            assert_eq!(
+                repo.value, theirs,
+                "{backend:?}: their title was overwritten"
+            );
+        }
+    }
+
+    /// **The page-load window: an edit that landed BEFORE the handler's first
+    /// read.** The manage page showed URL A; another client repointed to B
+    /// before the reader pressed Save, so the first read already sees B and
+    /// no swap fails. The `seen_url` the page was rendered with is what says
+    /// the reader never touched the URL — without it, the stale hidden `url`
+    /// reads as a repoint back to A.
+    #[tokio::test]
+    async fn a_repoint_before_the_first_read_is_kept_when_the_reader_only_retitled() {
+        for backend in RACE_BACKENDS {
+            let mut moved = race_seed();
+            moved["url"] = serde_json::json!("https://moved.example/feed.xml");
+            moved["siteUrl"] = serde_json::json!("https://moved.example/");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: moved,
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename_body(
+                &state,
+                &format!("url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&{SEEN_SEED}"),
+            )
+            .await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(loc, "/", "{backend:?}: {loc}");
+            assert_eq!(repo.puts.len(), 1, "{backend:?}");
+            let landed = &repo.value;
+            assert_eq!(
+                landed["url"], "https://moved.example/feed.xml",
+                "{backend:?}: the stale hidden url repointed the record: {landed}"
+            );
+            assert_eq!(landed["siteUrl"], "https://moved.example/", "{backend:?}");
+            assert_eq!(landed["title"], "New title", "{backend:?}");
+        }
+    }
+
+    /// **The cache follows the PDS, never leads it.** A rename that did not
+    /// land — every swap refused, or the put failed for another reason — must
+    /// leave the local `feeds` cache as it was: no row for a repoint's new URL
+    /// (the poller would fetch a feed nobody subscribes to), and no new title
+    /// on the existing row. One that landed updates it as before.
+    #[tokio::test]
+    async fn a_rename_that_did_not_land_leaves_the_cache_alone() {
+        const NEW_URL: &str = "https://other.example/feed.xml";
+        const OLD_URL: &str = "https://example.com/feed.xml";
+        // (refuse every swap, fail every put, expect the write to land)
+        for (refuse_every_swap, fail_puts, lands) in [
+            (true, None, false),
+            (false, Some((400, "InvalidRequest")), false),
+            (false, Some((502, "UpstreamFailure")), false),
+            (false, None, true),
+        ] {
+            for backend in RACE_BACKENDS {
+                let ctx = format!("{backend:?} refuse={refuse_every_swap} fail={fail_puts:?}");
+                for repoint in [false, true] {
+                    let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                        value: race_seed(),
+                        refuse_every_swap,
+                        fail_puts,
+                        ..SwapRepo::default()
+                    }));
+                    let state = race_state(backend, &repo).await;
+                    store::upsert_feed(
+                        &state.db,
+                        &store::NewFeed {
+                            url: OLD_URL.to_string(),
+                            title: Some("Cached title".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let url = if repoint { NEW_URL } else { OLD_URL };
+                    let body = format!("url={}&title=New+title&{SEEN_SEED}", qenc(url));
+
+                    let loc = post_race_rename_body(&state, &body).await;
+
+                    let new_row = store::get_feed_by_url(&state.db, NEW_URL).await.unwrap();
+                    let old_row = store::get_feed_by_url(&state.db, OLD_URL)
+                        .await
+                        .unwrap()
+                        .expect("the old row");
+                    let ctx = format!("{ctx} repoint={repoint} -> {loc}");
+                    if lands {
+                        assert_eq!(loc, "/", "{ctx}");
+                        if repoint {
+                            assert!(
+                                new_row.is_some(),
+                                "{ctx}: a landed repoint got no cache row"
+                            );
+                        } else {
+                            assert_eq!(old_row.title.as_deref(), Some("New title"), "{ctx}");
+                        }
+                    } else {
+                        assert_ne!(loc, "/", "{ctx}");
+                        assert!(
+                            new_row.is_none(),
+                            "{ctx}: a repoint that did not land left a feeds row for its URL"
+                        );
+                        assert_eq!(
+                            old_row.title.as_deref(),
+                            Some("Cached title"),
+                            "{ctx}: a rename that did not land changed the cached title"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **A page with no folder dropdown does not un-folder.** The select (and
+    /// its `seen_folder`) render only when the reader has folders the page
+    /// could list — none, or a failed folder listing, and neither is posted.
+    /// That is "the reader never saw a folder", not "the reader chose none":
+    /// a retitle from such a page used to un-folder the subscription, and on
+    /// a retry could report a conflict on a field the reader never saw.
+    #[tokio::test]
+    async fn a_rename_from_a_page_without_a_folder_select_keeps_the_folder() {
+        for backend in RACE_BACKENDS {
+            for raced in [false, true] {
+                let mut seed = race_seed();
+                seed["folder"] = serde_json::json!("at://did:plc:racer149/folder/kept");
+                let concurrent = raced.then(|| {
+                    let mut theirs = seed.clone();
+                    theirs["folder"] = serde_json::json!("at://did:plc:racer149/folder/theirs");
+                    theirs
+                });
+                let want_folder = concurrent
+                    .as_ref()
+                    .map_or(seed["folder"].clone(), |t| t["folder"].clone());
+                let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                    value: seed,
+                    concurrent,
+                    ..SwapRepo::default()
+                }));
+                let state = race_state(backend, &repo).await;
+
+                // Exactly what the manage row posts with no folder select.
+                let loc = post_race_rename_body(
+                    &state,
+                    "url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+                     &seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+                     &seen_title=Old+title&title=New+title",
+                )
+                .await;
+
+                let repo = repo.lock().unwrap();
+                let ctx = format!("{backend:?} raced={raced}");
+                assert_eq!(loc, "/", "{ctx}: {loc}");
+                assert_eq!(repo.value["title"], "New title", "{ctx}");
+                assert_eq!(
+                    repo.value["folder"], want_folder,
+                    "{ctx}: a page that never showed a folder changed it: {}",
+                    repo.value
+                );
+            }
+        }
+    }
+
+    /// **A double-clicked Save is not a conflict.** Both POSTs read the same
+    /// CID; the first lands; the second's swap fails, and its re-read finds
+    /// the record already saying exactly what the reader asked for. That is
+    /// success, with nothing left to write — not "nothing was renamed".
+    #[tokio::test]
+    async fn a_double_submitted_rename_reports_success_and_writes_once() {
+        for backend in RACE_BACKENDS {
+            // The first submission's write, landing between the second's read
+            // and its put.
+            let mut first = race_seed();
+            first["title"] = serde_json::json!("New title");
+            first["folder"] = serde_json::json!("Tech");
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+                value: race_seed(),
+                concurrent: Some(first.clone()),
+                ..SwapRepo::default()
+            }));
+            let state = race_state(backend, &repo).await;
+
+            let loc = post_race_rename_body(
+                &state,
+                &format!(
+                    "url=https%3A%2F%2Fexample.com%2Ffeed.xml&title=New+title&folder=Tech&{SEEN_SEED}"
+                ),
+            )
+            .await;
+
+            let repo = repo.lock().unwrap();
+            assert_eq!(
+                loc, "/",
+                "{backend:?}: a save that landed was reported as a conflict: {loc}"
+            );
+            assert_eq!(
+                repo.puts.len(),
+                1,
+                "{backend:?}: only the refused put; the re-read has nothing left to write: {:?}",
+                repo.puts
+            );
+            assert_eq!(repo.value, first, "{backend:?}");
+        }
+    }
+
+    /// Both sides changing a field to the SAME value is agreement, not a
+    /// conflict — for every field the merge handles. Alongside a field still
+    /// to apply, the write goes ahead with it; alone, there is nothing to
+    /// write and the save is already done.
+    #[test]
+    fn the_same_change_on_both_sides_is_not_a_conflict() {
+        let base = merge_base();
+        let url = "https://a.example/feed.xml";
+        let new_url = "https://c.example/feed.xml";
+
+        // title: both "New".
+        let mut fresh = base.clone();
+        fresh.title = Some("New".to_string());
+        let merged = merge_rename(&merge_form(url, "New", Some("at://f/old")), &base, fresh)
+            .expect("same title is no conflict");
+        assert!(merged.already_saved, "nothing left to write");
+
+        // folder: both moved to the same folder, while the reader also retitles.
+        let mut fresh = base.clone();
+        fresh.folder = Some("at://f/new".to_string());
+        let merged = merge_rename(&merge_form(url, "Mine", Some("at://f/new")), &base, fresh)
+            .expect("same folder is no conflict");
+        assert!(!merged.already_saved, "the title is still to write");
+        assert_eq!(merged.sub.title.as_deref(), Some("Mine"));
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/new"));
+
+        // url: both repointed to the same URL. Not a repoint by THIS write, so
+        // the fresh record's siteUrl (which may be for the new feed) stays.
+        let mut fresh = base.clone();
+        fresh.url = new_url.to_string();
+        fresh.site_url = Some("https://c.example/".to_string());
+        let merged = merge_rename(
+            &merge_form(new_url, "Old", Some("at://f/old")),
+            &base,
+            fresh,
+        )
+        .expect("same url is no conflict");
+        assert!(merged.already_saved);
+        assert!(!merged.repoint);
+        assert_eq!(merged.sub.site_url.as_deref(), Some("https://c.example/"));
+
+        // siteUrl: both set it the same.
+        let mut fresh = base.clone();
+        fresh.site_url = Some("https://same.example/".to_string());
+        let mut form = merge_form(url, "Old", Some("at://f/old"));
+        form.site_url = Some("https://same.example/".to_string());
+        let merged = merge_rename(&form, &base, fresh).expect("same siteUrl is no conflict");
+        assert!(merged.already_saved);
+
+        // A form with no edits at all is NOT "already saved": it writes, as
+        // it always has.
+        let merged = merge_rename(
+            &merge_form(url, "Old", Some("at://f/old")),
+            &base,
+            base.clone(),
+        )
+        .unwrap();
+        assert!(!merged.already_saved);
+    }
+
+    fn merge_form(url: &str, title: &str, folder: Option<&str>) -> RenameSubForm {
+        RenameSubForm {
+            url: url.to_string(),
+            title: Some(title.to_string()),
+            site_url: None,
+            folder: folder.map(str::to_string),
+            seen_url: None,
+            seen_title: None,
+            seen_folder: None,
+        }
+    }
+
+    fn merge_base() -> Subscription {
+        let mut s = Subscription::new("https://a.example/feed.xml", "2024-03-01T00:00:00.000Z");
+        s.title = Some("Old".to_string());
+        s.folder = Some("at://f/old".to_string());
+        s.site_url = Some("https://a.example/".to_string());
+        s
+    }
+
+    /// The merge, field by field, for the branches the handler tests do not
+    /// each reach: every field the reader changed that someone else also
+    /// changed is a conflict; every field only one side changed merges.
+    #[test]
+    fn merge_rename_is_a_three_way_merge_per_field() {
+        let base = merge_base();
+        let url = "https://a.example/feed.xml";
+
+        // Folder: both moved it -> conflict; only the reader -> applied.
+        let mut theirs = base.clone();
+        theirs.folder = Some("at://f/theirs".to_string());
+        assert_eq!(
+            merge_rename(
+                &merge_form(url, "Old", Some("at://f/mine")),
+                &base,
+                theirs.clone()
+            ),
+            Err(RenameConflict("folder"))
+        );
+        let merged = merge_rename(
+            &merge_form(url, "Old", Some("at://f/mine")),
+            &base,
+            base.clone(),
+        )
+        .unwrap();
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/mine"));
+        assert!(!merged.repoint);
+        // Only they moved it: theirs stands.
+        let merged =
+            merge_rename(&merge_form(url, "Old", Some("at://f/old")), &base, theirs).unwrap();
+        assert_eq!(merged.sub.folder.as_deref(), Some("at://f/theirs"));
+
+        // URL: both repointed -> conflict.
+        let mut moved = base.clone();
+        moved.url = "https://b.example/feed.xml".to_string();
+        assert_eq!(
+            merge_rename(
+                &merge_form("https://c.example/feed.xml", "Old", Some("at://f/old")),
+                &base,
+                moved
+            ),
+            Err(RenameConflict("url"))
+        );
+
+        // siteUrl: a posted value both sides changed -> conflict.
+        let mut resited = base.clone();
+        resited.site_url = Some("https://theirs.example/".to_string());
+        let mut form = merge_form(url, "Old", Some("at://f/old"));
+        form.site_url = Some("https://mine.example/".to_string());
+        assert_eq!(
+            merge_rename(&form, &base, resited),
+            Err(RenameConflict("siteUrl"))
+        );
+
+        // A reader's repoint drops the old feed's properties.
+        let merged = merge_rename(
+            &merge_form("https://c.example/feed.xml", "Old", Some("at://f/old")),
+            &base,
+            base.clone(),
+        )
+        .unwrap();
+        assert!(merged.repoint);
+        assert_eq!(merged.sub.url, "https://c.example/feed.xml");
+        assert_eq!(merged.sub.site_url, None);
+
+        // seen_* wins over base for "did the reader change it": the input was
+        // pre-filled with a display title, and posting it back is no edit.
+        let mut untitled = base.clone();
+        untitled.title = None;
+        let mut form = merge_form(url, "A display fallback", Some("at://f/old"));
+        form.seen_title = Some("A display fallback".to_string());
+        let merged = merge_rename(&form, &untitled, untitled.clone()).unwrap();
+        assert_eq!(
+            merged.sub.title, None,
+            "an untouched display title was written"
+        );
+    }
+
     /// **A rename must not destroy the fields the form never carries.**
     ///
     /// `update_subscription` is a `putRecord` — the WHOLE record is replaced, per
@@ -11667,6 +12797,17 @@ mod tests {
             html.contains(r#"<option value="" selected>No folder</option>"#),
             "loose feed must pre-select 'No folder': {html}"
         );
+
+        // #149: the values each input was pre-filled with ride along, so the
+        // handler can tell what the reader changed from what they merely saw.
+        for want in [
+            r#"<input type="hidden" name="seen_url" value="https://work.example/feed.xml" />"#,
+            r#"<input type="hidden" name="seen_title" value="Work Feed" />"#,
+            r#"<input type="hidden" name="seen_folder" value="at://did:plc:x/app.folder/work" />"#,
+            r#"<input type="hidden" name="seen_folder" value="" />"#,
+        ] {
+            assert!(html.contains(want), "missing {want}: {html}");
+        }
     }
 
     /// **The public stats page carries no user data.**

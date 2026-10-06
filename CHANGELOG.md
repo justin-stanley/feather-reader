@@ -14,6 +14,96 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Renaming a subscription could erase another client's concurrent edit to
+  it (#149).** Since #147 the rename handler reads the subscription record,
+  applies the form's fields, and `putRecord`s the whole record back. Nothing
+  tied the write to the read, so if another atproto client wrote the same
+  record in between, our put replaced theirs and their change was gone with
+  nothing to say so.
+
+  **Mechanism.** `putRecord` now takes an optional `swap_record` on all three
+  write paths — the Rust OAuth client, the app-password `PdsClient`, and the
+  sidecar client — sent as `swapRecord` (the CID the caller read) and omitted
+  when `None`. The sidecar's `put` action validates it as a CID string and
+  passes it to `agent.com.atproto.repo.putRecord`. The PDS refuses a stale
+  swap with `400 InvalidSwap`; `atproto::is_invalid_swap` recognises that from
+  each client's structured `AtProtoError::Xrpc` by error name, including under
+  a context and under `ApplyWritesIncomplete`. A new
+  `list_subscriptions_with_cids` returns each record's CID, on both backends
+  and through `dispatch!`; `list_subscriptions_sorted` and its callers are
+  unchanged.
+
+  **The rename.** It reads with the CID and writes with `swapRecord` set to
+  it. On `InvalidSwap` it reads again and **merges**: a three-way merge of the
+  form against the record as first read. The manage row always posts every
+  input, so replaying the form would have put back fields the reader never
+  touched — a review caught the retry repointing a record another client had
+  just moved back to its old URL, and clearing that client's `siteUrl`. Now,
+  per field (`url`, `title`, `folder`, and a posted `site_url`):
+  - untouched by the reader: the fresh value stands;
+  - changed by the reader only: their value is applied;
+  - changed by both to the same value: agreement, not a conflict. When every
+    change the reader made is already in the record, as with a
+    double-clicked Save whose first request landed, the rename reports
+    success and writes nothing;
+  - changed by both, differently: nothing is written and the reader is told.
+
+  The folder select renders only when the page has folders to list, so a
+  rename posted with neither `folder` nor `seen_folder` leaves the folder
+  alone. Reading that as "no folder" un-foldered every subscription retitled
+  from such a page.
+
+  #147's preservation of the other fields still holds. Whether a rename is a
+  repoint, which drops the old feed's `siteUrl` and `fetchHint`, follows the
+  reader's change. The gates re-run against the merged record, and the write
+  goes under the new CID. A second refusal, or a field both sides changed, is
+  reported as "This subscription was changed elsewhere … Reload and try
+  again", never as success. Any other failure behaves as before: no retry,
+  same message. A PDS that lists a record without a CID (outside the lexicon)
+  gets the old unconditional write and a `warn` line.
+
+  **What the reader changed.** The manage row now posts `seen_url`,
+  `seen_title` and `seen_folder`: the values its inputs were pre-filled with.
+  The title input shows a display fallback for an untitled record, so the
+  record alone cannot say whether the reader edited it. With them, a field
+  another client changed between page load and the first read is no longer
+  mistaken for the reader's edit. Without them (a hand-made POST, or a page
+  from an older build), the first read stands in. What remains: a field
+  changed by both the reader and another client, where the other change
+  landed before the first read, is last-writer-wins on that field. The
+  conflict check compares against the first read, not the page-load record.
+
+  **The cache follows the PDS.** The rename wrote the local `feeds` cache
+  (the new title, or a new row for a repoint's URL) before the PDS write. A
+  rename the PDS refused, whether a failed save or both attempts of a lost
+  race, still left that behind, including a row the poller would fetch for
+  no subscriber. The cache is now written only after the PDS write lands.
+  Every gate on the URL still runs before it.
+
+  **Other writers audited.** Folder rename and the read-state writes are
+  blind writes, not read-modify-writes, so they have no CID to compare and
+  are unchanged. The other read-then-write paths — unstar, OPML folder
+  creation, and the read-state reconcile — delete, create, or read existence
+  only.
+
+  Tested on both backends, end to end through the handler, against a fake
+  repo that enforces `swapRecord` the way the reference PDS does. One case
+  lands another client's edit between the read and the write: the edit
+  survives and the rename lands. One refuses every swap: at most two puts,
+  then the conflict message. Others cover a concurrent repoint or retitle the
+  reader did not make, a title both sides changed, a repoint before the first
+  read, a rename that did not land leaving the cache alone, a double-submitted
+  Save, the same edit on both sides, and a page with no folder select. The
+  wire tests show `swapRecord` present when given and absent otherwise on
+  each client and on the sidecar. Each guard was mutated (39 mutants, including the swap
+  hardcoded to `None` on each backend, the merge measured against the fresh
+  record, and the cache written before the put), and every mutation failed a
+  test.
+
 ## 0.4.5 — 2026-10-06
 
 A teardown can now revoke the `rust` backend's sessions (#257): a new
