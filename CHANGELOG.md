@@ -34,7 +34,15 @@ deploying is separate.
   the original); nothing degraded is built in its place. The poll does not
   save its `ETag` / `Last-Modified`, so the next poll is a full fetch rather
   than a `304`, and it is reported as a `Body` failure so the feed backs off
-  and `/stats` says why. Ordinary bodies are stored byte-for-byte as before
+  and `/stats` says why. A body a poll has given up on is tracked by its
+  SHA-256 until its one sanitize returns, and a re-fetch of the same bytes
+  is refused at once without a permit, so one hostile body holds at most one
+  thread however often it is retried (found in review: retries otherwise
+  piled up until one feed held all four permits). A poll that cannot get a
+  permit at all — every one held by other feeds' abandoned sanitizes — is
+  not that feed's fault: it stores nothing (no bodiless entries, no
+  validators), records no failure and keeps its cadence
+  (`PollOutcome::Deferred`). Ordinary bodies are stored byte-for-byte as before
   (#224's sanitize-then-bound order is unchanged). The server now builds its
   runtime itself and shuts it down with a 5 s bound, because a dropped tokio
   runtime waits without limit for blocking work such as an abandoned
