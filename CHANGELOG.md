@@ -14,7 +14,25 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.6 — 2026-10-06
+
+Renames no longer lose data. Renaming a subscription is a compare-and-swap
+write that cannot erase another atproto client's concurrent edit (#149), and
+renaming a folder changes only its name instead of rebuilding the record
+(#268).
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.5 is a deploy;
+  rolling back to 0.4.5 is a redeploy.
+- **Rename writes carry `swapRecord`.** A rename that races another client's
+  edit is retried once against the fresh record, keeping that client's
+  change, and otherwise shows "changed elsewhere … Reload and try again"
+  instead of reporting success. A folder rename that fails now shows an
+  error; it used to redirect as if it had worked.
+- **The manage page posts the values it showed** (`seen_url`, `seen_title`,
+  `seen_folder`, `seen_name`), so a change made elsewhere after the page
+  loaded is detected too. A form posted without them still works.
 
 ### Fixed
 
@@ -142,9 +160,10 @@ deploying is separate.
   no subscriber. The cache is now written only after the PDS write lands.
   Every gate on the URL still runs before it.
 
-  **Other writers audited.** Folder rename and the read-state writes are
-  blind writes, not read-modify-writes, so they have no CID to compare and
-  are unchanged. The other read-then-write paths — unstar, OPML folder
+  **Other writers audited.** The read-state writes are blind writes, not
+  read-modify-writes, so they have no CID to compare and are unchanged.
+  Folder rename was a blind write too, one that rebuilt the record; the
+  entry above (#268) makes it a compare-and-swap edit of the stored record. The other read-then-write paths — unstar, OPML folder
   creation, and the read-state reconcile — delete, create, or read existence
   only.
 
