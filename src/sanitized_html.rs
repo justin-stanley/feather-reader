@@ -11,27 +11,32 @@
 //! a pathological row from costing more than its own page view: a size cap, a
 //! concurrency limit and a cache.
 //!
-//! **Why bounds, and why these.** Ingest's output re-cleans cheaply: on 545
-//! real bodies from 20 public feeds, p50 31 µs, p99 1.1 ms, max 3.5 ms (a
-//! 561 KB body). A body that is expensive to clean cannot come from ingest,
-//! which sanitizes everything it stores: it can only come from a bug or from
-//! someone already able to write the database. For such a row the sanitizer
-//! can be quadratic — measured, a 2 MiB body of nested `<div>`s takes ~37 s,
-//! a 2 MiB `&` run 2.4 s. An earlier version of this module tried to *predict*
-//! that cost with a scan that re-implemented html5ever's tree-construction
-//! rules in front of html5ever; three review rounds each found a mismatch,
-//! and the last found the scan cutting real articles (`li` in `li` after a
-//! stripped `<section>`, a 245 KB `<pre>` XML listing, `<rt>` inside a
-//! `<span>` in `<ruby>`). The bounds here do not predict anything: they cap
-//! what one body can cost everyone else, and leave the worst case where it
-//! belongs, on the slow row's own page.
+//! **Why bounds, and why these.** Real bodies re-clean cheaply: on 545 real
+//! bodies from 20 public feeds, p50 31 µs, p99 1.1 ms, max 3.5 ms (a 561 KB
+//! body). But the sanitizer is quadratic on shapes any feed can serve (#226):
+//! a 2 MiB body of nested `<div>`s takes ~37 s, a 2 MiB `&` run 2.4 s. So
+//! **ingest enforces an invariant** (`feed::BodySanitizer`): everything it
+//! stores in `content_html` was measured to sanitize within
+//! `feed::INGEST_SANITIZE_BUDGET` (100 ms), or is a short escaped excerpt
+//! whose re-clean is bounded by its size. A slow stored body can therefore
+//! only come from a writer that skipped ingest — a bug, or someone already
+//! able to write the database — and the bounds here are for that row: they
+//! cap what it can cost everyone else, and leave its worst case (~37 s, once
+//! per process, holding one of two permits) on its own page views.
+//!
+//! An earlier version of this module tried to *predict* the cost with a scan
+//! that re-implemented html5ever's tree-construction rules in front of
+//! html5ever; three review rounds each found a mismatch, and the last found
+//! the scan cutting real articles (`li` in `li` after a stripped `<section>`,
+//! a 245 KB `<pre>` XML listing, `<rt>` inside a `<span>` in `<ruby>`). The
+//! bounds here predict nothing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tracing::warn;
 
 /// Article-body HTML that has been through the sanitizer **in this process**
@@ -266,12 +271,25 @@ impl Cache {
     }
 }
 
+/// What one in-flight clean produced, broadcast to everyone who asked for the
+/// same body while it ran.
+#[derive(Clone)]
+enum Outcome {
+    Html(Arc<str>),
+    Unavailable,
+}
+
+/// The in-flight cleans, by body hash: a receiver that resolves when the
+/// leader finishes. Joiners clone the receiver and wait; they take no permit.
+type InFlight = HashMap<Key, watch::Receiver<Option<Outcome>>>;
+
 struct Inner {
     permits: Arc<Semaphore>,
     wait: Duration,
     cache: Mutex<Cache>,
+    in_flight: Mutex<InFlight>,
     /// How many times the sanitizer has run through this renderer. Tests use
-    /// it to show the cap and the cache keep it from running at all.
+    /// it to show the cap, the cache and single flight keep it from running.
     cleans: AtomicUsize,
 }
 
@@ -283,18 +301,44 @@ struct Inner {
 /// 1. nothing but a length check if `n` > [`MAX_RENDER_HTML_BYTES`]
 ///    ([`BodyRender::TooLarge`]);
 /// 2. a SHA-256 of the body and a cache lookup, on the blocking pool;
-/// 3. on a miss, an async wait of up to [`RENDER_WAIT`] for one of
-///    [`RENDER_PERMITS`] permits ([`BodyRender::Unavailable`] if none comes);
-/// 4. the clean itself on the blocking pool, holding the permit, after a
-///    second cache check in case an identical body was cleaned meanwhile.
+/// 3. on a miss, **single flight**: if the same body is already being
+///    cleaned, this request waits for that result and takes no permit;
+///    otherwise it becomes the leader and spawns the clean as its own task,
+///    so a requester that disconnects neither cancels the clean nor leaves
+///    anyone waiting on a leader that is gone;
+/// 4. the leader waits up to [`RENDER_WAIT`] for one of [`RENDER_PERMITS`]
+///    permits ([`BodyRender::Unavailable`] for everyone waiting if none
+///    comes), then cleans on the blocking pool holding the permit, caches the
+///    result and publishes it.
 ///
 /// So each distinct body is cleaned once per process while it stays cached,
-/// and a body that is slow to clean is slow on its own page view, holding one
-/// permit, and nowhere else. The async worker is never blocked: the hash, the
-/// lookup and the clean run on the blocking pool, and the permit wait is
-/// `Semaphore::acquire`.
+/// at most once at a time while it does not, and a body that is slow to clean
+/// is slow on its own page views, holding one permit, and nowhere else. The
+/// async worker is never blocked: the hash, the lookup and the clean run on
+/// the blocking pool, and every wait is an async one.
+///
+/// **What these bounds are for.** Ingest guarantees that everything it stores
+/// re-cleans within `feed::INGEST_SANITIZE_BUDGET` (100 ms; real bodies
+/// p50 31 µs, max 3.5 ms), so a slow stored body can only come from a writer
+/// that skipped ingest: a bug, or someone already able to write the database.
+/// The bounds here cap what such a row can cost other readers; they do not
+/// predict its cost, which for a 2 MiB body of nested `<div>`s is ~37 s, once.
 #[derive(Clone)]
 pub struct BodyRenderer(Arc<Inner>);
+
+/// Removes an in-flight entry when the leader's task ends, however it ends —
+/// result published, `Unavailable`, or a panic in the sanitizer — so a key
+/// can never stay in flight with no one working on it.
+struct InFlightGuard {
+    inner: Arc<Inner>,
+    key: Key,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.inner.in_flight().remove(&self.key);
+    }
+}
 
 impl BodyRenderer {
     /// A renderer with its own permits and cache. The reader uses
@@ -305,6 +349,7 @@ impl BodyRenderer {
             permits: Arc::new(Semaphore::new(permits)),
             wait,
             cache: Mutex::new(Cache::new(cache_bytes, cache_entries)),
+            in_flight: Mutex::new(HashMap::new()),
             cleans: AtomicUsize::new(0),
         }))
     }
@@ -353,32 +398,71 @@ impl BodyRenderer {
             }));
         }
 
-        let permit =
-            match tokio::time::timeout(self.0.wait, Arc::clone(&self.0.permits).acquire_owned())
-                .await
-            {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(closed)) => anyhow::bail!("the sanitizer permits were closed: {closed}"),
-                Err(_elapsed) => {
-                    warn!(
-                        bytes = raw.len(),
-                        waited_ms = self.0.wait.as_millis() as u64,
-                        "no sanitizer permit became free; not rendering this entry body now"
-                    );
-                    return Ok(BodyRender::Unavailable);
+        // Join the clean already in flight for this body, or lead one. The
+        // map is checked and the entry inserted under one lock, so two misses
+        // for the same key cannot both lead.
+        let mut rx = {
+            let mut in_flight = self.0.in_flight();
+            match in_flight.get(&key) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = watch::channel(None);
+                    in_flight.insert(key, rx.clone());
+                    // The leader's work is its own task: a requester that goes
+                    // away (client disconnect) does not cancel it, and the
+                    // guard inside removes the entry however the task ends.
+                    tokio::spawn(Self::lead(Arc::clone(&self.0), key, raw, tx));
+                    rx
                 }
-            };
+            }
+        };
+        let outcome = match rx.wait_for(|v| v.is_some()).await {
+            Ok(v) => v.clone(),
+            // The leader's task ended without publishing: the sanitizer
+            // panicked or the runtime is shutting down.
+            Err(_gone) => anyhow::bail!("sanitizing an entry body failed"),
+        };
+        match outcome {
+            Some(Outcome::Html(html)) => Ok(BodyRender::Html(SanitizedHtml {
+                html: html.to_string(),
+            })),
+            Some(Outcome::Unavailable) | None => Ok(BodyRender::Unavailable),
+        }
+    }
 
-        let inner = Arc::clone(&self.0);
-        let html = tokio::task::spawn_blocking(move || {
+    /// The leader of one in-flight clean: take a permit (or give up), clean on
+    /// the blocking pool, cache, publish to every joiner.
+    async fn lead(inner: Arc<Inner>, key: Key, raw: String, tx: watch::Sender<Option<Outcome>>) {
+        let _guard = InFlightGuard {
+            inner: Arc::clone(&inner),
+            key,
+        };
+        let permit = match tokio::time::timeout(
+            inner.wait,
+            Arc::clone(&inner.permits).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            // The permits closed (never: they live in a static) or the
+            // wait elapsed.
+            Ok(Err(_)) | Err(_) => {
+                warn!(
+                    bytes = raw.len(),
+                    waited_ms = inner.wait.as_millis() as u64,
+                    "no sanitizer permit became free; not rendering this entry body now"
+                );
+                let _ = tx.send(Some(Outcome::Unavailable));
+                return;
+            }
+        };
+        let work = Arc::clone(&inner);
+        let cleaned = tokio::task::spawn_blocking(move || {
             // The permit is held for exactly as long as this closure runs.
             let _permit = permit;
-            if let Some(html) = inner.cache().get(&key) {
-                return html.to_string();
-            }
-            inner.cleans.fetch_add(1, Ordering::Relaxed);
+            work.cleans.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let html = SanitizedHtml::clean(&raw).html;
+            let html: Arc<str> = Arc::from(SanitizedHtml::clean(&raw).html.as_str());
             let took = started.elapsed();
             if took > SLOW_CLEAN {
                 warn!(
@@ -386,20 +470,28 @@ impl BodyRenderer {
                     out_bytes = html.len(),
                     took_ms = took.as_millis() as u64,
                     sha256 = %hex_prefix(&key),
-                    "a stored entry body was slow to sanitize; ingest never writes such a body"
+                    "a stored entry body was slow to sanitize; ingest never stores such a body"
                 );
             }
-            inner.cache().insert(key, Arc::from(html.as_str()));
+            work.cache().insert(key, Arc::clone(&html));
             html
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("sanitizing an entry body failed: {e}"))?;
-        Ok(BodyRender::Html(SanitizedHtml { html }))
+        .await;
+        // A join error (the sanitizer panicked) publishes nothing: the sender
+        // drops with this task, and joiners see the channel close.
+        if let Ok(html) = cleaned {
+            let _ = tx.send(Some(Outcome::Html(html)));
+        }
     }
 
     /// How many times this renderer has run the sanitizer.
     pub fn cleans(&self) -> usize {
         self.0.cleans.load(Ordering::Relaxed)
+    }
+
+    /// How many bodies are being cleaned right now.
+    pub fn in_flight(&self) -> usize {
+        self.0.in_flight().len()
     }
 
     /// Bodies in the cache, and the bytes of cleaned markup they hold.
@@ -421,6 +513,12 @@ impl Inner {
         // Nothing here panics while holding the lock; recovering a poisoned
         // lock rather than propagating is the right call for a cache.
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -936,6 +1034,86 @@ mod tests {
         assert_eq!(r.cache_size(), (0, 0));
         html(r.render(big.clone()).await.unwrap());
         assert_eq!(r.cleans(), 2);
+    }
+
+    /// A body slow enough to clean (~2 s in a debug build, ~20 ms in release)
+    /// that two renders of it overlap: 48 KiB of nested `<div>`s.
+    fn slow_body() -> String {
+        let depth = 48 * 1024 / 11;
+        format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth))
+    }
+
+    /// **Single flight.** Two concurrent renders of the same uncached body run
+    /// the sanitizer once and both get its result; the second does not take a
+    /// permit, so with two permits a third, different body still renders at
+    /// once — it finishes before either of the slow pair.
+    #[tokio::test]
+    async fn concurrent_renders_of_one_body_clean_it_once() {
+        let r = BodyRenderer::new(
+            2,
+            Duration::from_secs(10),
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRIES,
+        );
+        let slow = slow_body();
+        let other = "<p>a different, cheap body</p>".to_string();
+        let (a, b, (c, c_done)) =
+            tokio::join!(r.render(slow.clone()), r.render(slow.clone()), async {
+                // Let the slow pair start first.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                (r.render(other.clone()).await, Instant::now())
+            });
+        let pair_done = Instant::now();
+        let (a, b) = (html(a.unwrap()), html(b.unwrap()));
+        assert_eq!(a, b);
+        assert_eq!(a, sanitize_html(&slow));
+        assert_eq!(html(c.unwrap()), other);
+        assert_eq!(
+            r.cleans(),
+            2,
+            "the slow body was cleaned more than once, or the cheap one was not"
+        );
+        assert!(
+            c_done < pair_done,
+            "the cheap body waited behind the slow pair: no permit was free"
+        );
+    }
+
+    /// **A requester that goes away leaves nothing behind.** The first render
+    /// of a slow body is dropped a few milliseconds in (a client disconnect);
+    /// the clean it led goes on as its own task. A second render of the same
+    /// body joins that clean rather than starting another — one clean in all —
+    /// and when it is done the in-flight table is empty again.
+    #[tokio::test]
+    async fn a_dropped_requester_leaves_no_stale_in_flight_entry() {
+        let r = BodyRenderer::new(
+            2,
+            Duration::from_secs(10),
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRIES,
+        );
+        let slow = slow_body();
+        tokio::select! {
+            _ = r.render(slow.clone()) => panic!("the slow body rendered within 5 ms"),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+        assert_eq!(
+            r.in_flight(),
+            1,
+            "the dropped requester's clean is not in flight"
+        );
+        let again = html(r.render(slow.clone()).await.unwrap());
+        assert_eq!(again, sanitize_html(&slow));
+        assert_eq!(
+            r.cleans(),
+            1,
+            "the dropped requester's clean was not joined"
+        );
+        assert_eq!(r.in_flight(), 0, "a finished clean stayed in flight");
+        // Nothing in flight after a plain render either, cached or not.
+        html(r.render("<p>x</p>".to_string()).await.unwrap());
+        html(r.render("<p>x</p>".to_string()).await.unwrap());
+        assert_eq!(r.in_flight(), 0);
     }
 
     /// The shared instance carries the documented parameters.
