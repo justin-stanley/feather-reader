@@ -16,6 +16,166 @@ deploying is separate.
 
 ## Unreleased
 
+### Security
+
+- **A teardown now revokes the `rust` backend's sessions before the wipe
+  (#257).** `deploy/teardown.sh` read DIDs only from `SIDECAR_DB`. On
+  `FEATHERREADER_REPO_BACKEND=rust`, which production runs, it revoked
+  nothing: wiping `FEATHERREADER_DB` dropped every refresh token unrevoked,
+  live at each PDS until it expired.
+
+  **The revoke command.** New operator flag `featherreader
+  --revoke-all-sessions`, built like `--migrate-auto-vacuum`: it exits before
+  binding a port or starting a scheduler, and skips `argv[0]`. It lists every
+  `oauth_session` row with `oauth::store::list_session_subs`, which reads
+  `sub` only, so rows that no longer decrypt are listed too. Each row goes
+  through `sign_out_discovering`, the same sign-out `/logout` uses: a bounded
+  RFC 7009 revocation, then a delete whatever the PDS said. A failure does not stop
+  the walk. The clock is read **per session**, because each sign-out mints a
+  client assertion that is valid for 60 s. A single timestamp taken at the
+  start would have expired every assertion sent after the first minute, so
+  those revocations would have been rejected while their rows were deleted.
+
+  **Exit codes.** `0` means all revoked. `3` means some revocations failed;
+  their rows are deleted anyway, except one that kept rotating or reappearing.
+  `2` means nothing was done, and in that
+  case nothing is deleted either. The causes of `2`:
+
+  - bad configuration;
+  - a missing database: it refuses rather than creating one and reporting
+    "0 sessions" about the wrong file;
+  - an unreadable store;
+  - a missing signing key at `FEATHERREADER_OAUTH_KEY_PATH`: this mode loads
+    the key and never creates one, since a fresh key is one no PDS can verify;
+  - sessions stored with no buildable OAuth runtime;
+  - sessions stored while the client is not the production one: a loopback
+    or unset public URL, no encryption key, or no signing key. An incomplete
+    environment does not fail to start; it starts as atproto's public dev
+    client, or with a codec that cannot read a row. Every revocation would
+    then fail while every row was deleted;
+  - sessions stored while the secrets are present but **not the production
+    ones**, checked in a pre-flight before the first sign-out:
+    - no stored row decrypts with the encryption key (wrong or rotated);
+    - the loaded signing key's thumbprint and `kid` are not in the JWKS the
+      app serves at `/oauth/jwks.json`, as with a relative key path resolved
+      in the wrong directory;
+    - that JWKS cannot be fetched on the main pass. The post-stop
+      `--revoke-all-sessions --sweep`, which `teardown.sh` appends, tolerates
+      an unreachable JWKS but not a mismatch. The JWKS is the operator's own
+      configuration, so it is fetched with a plain bounded client: https only,
+      no redirects, 10 s, 64 KiB. Going through the SSRF guard made a
+      split-horizon or LAN self-host fail the main pass every time.
+
+    `--accept-unreadable` (`FR_ACCEPT_UNREADABLE=1` in `teardown.sh`)
+    overrides only the "no row decrypts" refusal, for a store that is
+    legitimately all unreadable: only pre-AAD rows, or a deliberate key
+    rotation with no logins since. The unreadable rows are deleted and
+    reported as failed (exit 3). Their tokens cannot be revoked by anyone.
+
+  A completed run prints a last line,
+  `revoke-all-sessions: revoked=N no_session=M failed=K`. Partial failure is
+  deliberately not `1`. An older binary that ignores the flag exits 1 when its
+  server fails to bind, and a failing wrapper exits 1 too; neither prints that
+  line.
+
+  **Teardown order.** The script runs: the sidecar revoke, then the Rust
+  revoke **while the app still serves**, then the stop, then a Rust sweep,
+  then the wipe. The wipe now also removes `FEATHERREADER_OAUTH_KEY_PATH`.
+  The sweep runs only if `FEATHERREADER_DB` still holds Rust sessions, counted
+  directly with `sqlite3`. It uses `FR_SWEEP_CMD` when set. A main-pass
+  command that needs the running service (`docker compose exec`) cannot run
+  after the stop, and used to abort every container teardown at this step;
+  for Docker the sweep is `docker compose run --rm`.
+  The main pass runs before the stop for a measured reason. A PDS
+  authenticates a confidential client before revoking
+  (`@atproto/oauth-provider` 0.23.1, `revoke()` → `authenticateClient`),
+  using our `client-metadata.json` and `jwks.json`. The app serves both, and
+  PDSes cache them for only 600 s, so a revocation after the stop would be
+  rejected at most PDSes.
+
+  **Refusals and failures.** The script refuses, before anything
+  irreversible, when the backend is `rust` (or `FEATHERREADER_DB` holds Rust
+  sessions) and there is no revoke command. A Rust pass proceeds only on exit
+  `0` with `failed=0`, or exit `3` with `failed>0` (which warns), and only if
+  the sentinel is the last line of output. Anything else aborts before the
+  wipe. `\r` is stripped first, so a TTY wrapper's CRLF output still matches.
+  The `SIDECAR_*` variables are optional on the `rust` backend when no
+  `SIDECAR_DB` exists. On the `sidecar` backend the Rust step runs only if
+  `FEATHERREADER_DB` holds Rust sessions, not merely because a revoke command
+  is available. A DB `sqlite3` cannot read (corrupt, locked, unreadable) is
+  counted as "unknown", never 0. The Rust step then runs, or the script
+  refuses if there is no revoke command, instead of being silently skipped.
+
+  **Sign-out vs. a concurrent refresh.** This changes `/logout` and
+  `/account/delete` too. The app refreshes a session under an in-process lock;
+  a sign-out does not take it, and the operator's revoke-all runs in another
+  process. Two interleavings left a live token behind:
+
+  - **Rotate, then delete.** The sign-out read R1. The refresh rotated the row
+    to R2. The PDS answered 200 for the stale R1, and the sign-out then deleted
+    the row holding R2, which was reported revoked and never revoked. The
+    sign-out's delete is now a compare-and-delete (`DELETE … WHERE` the stored
+    ciphertexts match what was read). On a mismatch it re-reads and revokes
+    the new tokens, up to 3 attempts. Past that it reports a failure and
+    **leaves** the newest tokens on record rather than deleting them unrevoked.
+    Discovery follows the row: every read is revoked at the endpoint
+    discovered, issuer-checked, for **its own** `(aud, issuer)`. A row
+    re-read at another issuer (a re-login after a PDS migration) used to have
+    its new refresh token posted to the old authorization server. That server
+    answered 200 for an unknown token, so the session was reported revoked
+    and its row deleted while the grant stayed live.
+  - **Delete, then rotate (resurrection).** The refresh's write was an upsert,
+    so a refresh in flight across a sign-out re-created the deleted session
+    with fresh tokens. It is now a conditional `UPDATE` against the version
+    the refresh started from. If the row is gone, the fresh tokens are revoked
+    (best-effort, bounded) and the caller gets "no session". If another writer
+    (a re-login: a new grant) replaced the row, theirs is kept and returned,
+    so no update is lost. Our fresh tokens, from the old grant and stored
+    nowhere, are revoked too. Login's write is still an upsert.
+
+  As defence in depth, `revoke_all` lists the store again after its walk and
+  walks anything new, up to 2 extra passes. Anything still stored after that
+  is reported as failed. The report holds one **final** outcome per DID, so a
+  DID that failed and was then revoked by the re-list is reported revoked.
+  `late` lists only DIDs absent from the first listing.
+
+  **Tests.** New `scripts/test-teardown.sh`, 83 assertions, runs the real
+  script against throwaway SQLite files with stub commands. It is wired into
+  CI (new `teardown` job) and `scripts/ci.sh`. Against the original script, 21
+  of the first 30 failed. Each later round's cases failed first against the
+  script before that round's fix: the sentinel cases (17), the sidecar-backend
+  cases (6), the CRLF cases (5), the post-stop sweep cases (6), the
+  unreadable-DB cases (4), `--sweep` (2) and `FR_ACCEPT_UNREADABLE` (3).
+
+  Tests against a real-TLS fake authorization server cover:
+
+  - revoke-all: every session revoked, one server failing, an unreadable row,
+    an empty store;
+  - each assertion's `iat` coming from its own clock reading;
+  - a refresh against a deleted row (no resurrection, fresh token revoked) and
+    against another writer's replacement (no lost update, our fresh token
+    revoked, theirs not);
+  - the pre-flight against a fake JWKS: matching, mismatching (main pass and
+    sweep), and unreachable (main pass refused, sweep allowed). Also a wrong
+    encryption key, a Null codec that passes everything else, a partly
+    unreadable store, a JWKS on loopback (passes), an http JWKS URL (refused),
+    and `--accept-unreadable` (passes an all-unreadable store, does not
+    bypass the client or signing-key checks);
+  - a session that moves issuer mid sign-out, against two fake authorization
+    servers: the old one never receives the new token.
+
+  Injected-hook tests cover a rotation between read and delete, a row that
+  keeps rotating, a row deleted concurrently, sessions created during the
+  walk, the bounded re-list, and one final outcome per DID (fail then succeed
+  is revoked only; failing every pass is one entry). Main-binary tests cover
+  the dev-client, Null-codec, keyless and wrong-encryption-key refusals,
+  `--sweep` and `--accept-unreadable` parsing, and `--accept-unreadable` end
+  to end (2 without it, 3 with every row deleted).
+
+  Each new guard was broken on its own and a test failed every time (66 of
+  66).
+  `deploy/teardown.md` gains the procedure, including Fly's.
+
 ### Docs
 
 - **The GitHub-facing docs describe 0.4.4.** `src/config.rs`'s settings

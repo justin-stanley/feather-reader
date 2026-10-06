@@ -18,6 +18,13 @@ cargo test --locked
 echo "== clippy (-D warnings) =="
 cargo clippy --all-targets -- -D warnings
 
+if command -v sqlite3 >/dev/null 2>&1; then
+  echo "== teardown script =="
+  bash scripts/test-teardown.sh
+else
+  echo "== teardown script: skipped (no sqlite3) =="
+fi
+
 if [ -d oauth-sidecar ] && command -v npm >/dev/null 2>&1; then
   echo "== oauth-sidecar (npm ci + build + typecheck) =="
   ( cd oauth-sidecar && npm ci && npm run build && npm run typecheck )

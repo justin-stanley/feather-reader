@@ -353,10 +353,12 @@ cd oauth-sidecar && npm ci && npm run build && npm run typecheck && npm test \
 # Invite bot (its own workspace): build/test/clippy/fmt plus cargo deny + cargo audit, run in bot/
 ```
 
-Two more jobs: **gitleaks** scans the tree and the full history with
-[`.gitleaks.toml`](.gitleaks.toml), and **Caddyfile** validates
+Three more jobs: **gitleaks** scans the tree and the full history with
+[`.gitleaks.toml`](.gitleaks.toml), **Caddyfile** validates
 [`deploy/Caddyfile`](deploy/Caddyfile) with both OAuth routings, in Docker,
-against the exact Caddy digest the Dockerfile pins. A pull request that touches `src/`,
+against the exact Caddy digest the Dockerfile pins, and **teardown** runs
+`bash scripts/test-teardown.sh` — [`deploy/teardown.sh`](deploy/teardown.sh)
+against throwaway SQLite files, pinning its revoke order and refusals. A pull request that touches `src/`,
 `Cargo.*`, the `Dockerfile`, `deploy/` or the script also runs the
 **upgrade-boot** gate ([`.github/workflows/upgrade-boot.yml`](.github/workflows/upgrade-boot.yml));
 see [Releasing](#releasing) for what it proves.

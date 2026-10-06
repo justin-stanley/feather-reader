@@ -120,6 +120,35 @@ impl OauthRuntime {
     }
 }
 
+impl OauthRuntime {
+    /// [`OauthRuntime::new`], refusing instead of CREATING a missing signing
+    /// key. For the operator's `--revoke-all-sessions`.
+    ///
+    /// `new` creates the key when a confidential client has none — right for
+    /// the app's first boot, wrong here. Run from the wrong directory (the
+    /// default `FEATHERREADER_OAUTH_KEY_PATH` is relative) or with the wrong
+    /// environment, it minted a fresh key under the same `kid` while the live
+    /// app kept publishing the old JWKS. Every client assertion was then
+    /// rejected, every row deleted anyway, and the teardown proceeded over
+    /// live tokens. Revocation can only work with the key the PDSes know, so a
+    /// missing one is an error.
+    ///
+    /// App startup is unchanged: it still calls `new`.
+    pub fn without_creating_key(cfg: &crate::config::Config) -> Result<Self> {
+        let confidential =
+            AuthMethod::negotiate(is_loopback_url(&cfg.public_url)) == AuthMethod::PrivateKeyJwt;
+        if confidential && !cfg.oauth.key_path.exists() {
+            anyhow::bail!(
+                "the OAuth signing key {} does not exist, and this mode will not create one \
+                 (a new key is one no PDS can verify). Point FEATHERREADER_OAUTH_KEY_PATH at the \
+                 key the running app uses",
+                cfg.oauth.key_path.display()
+            );
+        }
+        Self::new(cfg)
+    }
+}
+
 /// Whether a public URL names the local machine.
 ///
 /// The sidecar infers its dev mode the same way (`SIDECAR_DEV` defaults to "the

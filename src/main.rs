@@ -35,6 +35,18 @@ mod scheduler;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Maintenance mode: sign every stored session out and exit, without binding
+    // a port or starting a scheduler. Checked before anything can fail through
+    // `?`, so every failure of this mode is an explicit exit 2 ("nothing done")
+    // rather than whatever an error from `main` happens to exit with.
+    if wants_revoke_all(std::env::args()) {
+        let opts = feather_reader::oauth::revoke::PreflightOptions {
+            sweep: wants_sweep(std::env::args()),
+            accept_unreadable: wants_accept_unreadable(std::env::args()),
+        };
+        std::process::exit(run_revoke_all(opts).await);
+    }
+
     // 1. Configuration — env-driven, every knob defaulted.
     let config = Config::from_env().context("loading configuration")?;
 
@@ -126,7 +138,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The one CLI flag this binary understands. Everything else is env-driven.
+/// One of the two maintenance flags this binary understands (the other is
+/// [`REVOKE_ALL_SESSIONS_FLAG`]). Everything else is env-driven.
 const MIGRATE_AUTO_VACUUM_FLAG: &str = "--migrate-auto-vacuum";
 
 /// Whether the invocation asked for the maintenance migration.
@@ -217,6 +230,256 @@ async fn run_vacuum_migration(db: &store::Pool, config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The operator's fleet-wide sign-out, run by `deploy/teardown.sh` (#257).
+const REVOKE_ALL_SESSIONS_FLAG: &str = "--revoke-all-sessions";
+
+/// `--revoke-all-sessions` exit code: every session revoked (or none stored).
+const REVOKE_EXIT_OK: i32 = 0;
+/// Some revocations failed. Every row is still deleted locally, so a teardown
+/// may proceed — but those tokens may stay live at their PDS until they expire.
+///
+/// **Deliberately not 1.** 1 is what everything else exits with: `main`
+/// returning `Err`, a wrapper (`docker compose exec`, `fly ssh`) failing, and —
+/// the case that matters — an OLDER binary that does not know this flag, ignores
+/// it, tries to start a server and fails to bind. A teardown that read 1 as
+/// "partially revoked, proceed" wiped with nothing revoked.
+const REVOKE_EXIT_SOME_FAILED: i32 = 3;
+/// Nothing was revoked and nothing deleted (not configured, unreadable store,
+/// bad configuration). A teardown MUST NOT wipe after this.
+const REVOKE_EXIT_ABORT: i32 = 2;
+
+/// The line a completed revoke-all prints LAST, which `deploy/teardown.sh`
+/// requires before it will wipe. An exit code alone can be produced by
+/// something that is not this command; this line cannot be produced by an
+/// older binary or a wrapper that never ran it.
+fn revoke_all_sentinel(report: &feather_reader::oauth::revoke::RevokeAllReport) -> String {
+    format!(
+        "revoke-all-sessions: revoked={} no_session={} failed={}",
+        report.revoked.len(),
+        report.no_session.len(),
+        report.failed.len()
+    )
+}
+
+/// Whether the invocation asked for the revoke-all. Skips `argv[0]`, like
+/// [`wants_vacuum_migration`]: this signs every user out, so a binary installed
+/// at a path containing the flag must not trigger it.
+fn wants_revoke_all<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|a| a == REVOKE_ALL_SESSIONS_FLAG)
+}
+
+/// `--revoke-all-sessions --sweep`: the post-stop pass `deploy/teardown.sh`
+/// makes after stopping the app.
+const SWEEP_FLAG: &str = "--sweep";
+
+/// Whether this is the post-stop sweep. Only relaxes ONE check: that the app's
+/// `/oauth/jwks.json` can be fetched to confirm the signing key — impossible
+/// once the app is stopped. A fetched key that does not match still refuses.
+/// Skips `argv[0]`, like the other flags.
+fn wants_sweep<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().skip(1).any(|a| a == SWEEP_FLAG)
+}
+
+/// `--revoke-all-sessions --accept-unreadable`: the operator's explicit "none
+/// of these rows can be read, and I know why" (only pre-AAD rows; the
+/// encryption key legitimately rotated with no logins since).
+const ACCEPT_UNREADABLE_FLAG: &str = "--accept-unreadable";
+
+/// Whether the operator overrode the "no stored row decrypts" refusal. Skips
+/// `argv[0]`, like the other flags.
+fn wants_accept_unreadable<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|a| a == ACCEPT_UNREADABLE_FLAG)
+}
+
+/// The exit code for a completed revoke-all: any failure is reported, because
+/// those tokens may still be live at their PDS even though the rows are gone.
+fn revoke_all_exit_code(report: &feather_reader::oauth::revoke::RevokeAllReport) -> i32 {
+    if report.failed.is_empty() {
+        REVOKE_EXIT_OK
+    } else {
+        REVOKE_EXIT_SOME_FAILED
+    }
+}
+
+/// The exit code when the Rust OAuth runtime cannot be built, given how many
+/// sessions are stored.
+///
+/// Without a runtime there is no codec to read the tokens and no client
+/// identity to revoke them with. Stored sessions then cannot be revoked — and
+/// must not be quietly dropped either, so this refuses and the caller deletes
+/// nothing. An empty store has nothing to revoke, which is success.
+fn unconfigured_exit_code(stored_sessions: usize) -> i32 {
+    if stored_sessions == 0 {
+        REVOKE_EXIT_OK
+    } else {
+        REVOKE_EXIT_ABORT
+    }
+}
+
+/// Entry point for `featherreader --revoke-all-sessions`. Returns the process
+/// exit code; every error that means "nothing was done" maps to
+/// [`REVOKE_EXIT_ABORT`] and prints no sentinel, so a teardown aborts. Only a
+/// completed walk prints the sentinel ([`revoke_all_sentinel`]) and exits 0 or
+/// [`REVOKE_EXIT_SOME_FAILED`].
+///
+/// **Safe against a LIVE app's database** — on Fly this runs over `fly ssh
+/// console` beside the serving process. The pool is opened with WAL and the
+/// same 5 s `busy_timeout` the app uses (`store::init_url`), so a concurrent
+/// app write makes a statement wait rather than fail; every sign-out deletes one
+/// row in its own statement, so the lock is never held across a network call;
+/// and a delete that still cannot get the lock is reported as that DID's
+/// failure, not a crash of the whole run.
+async fn run_revoke_all(opts: feather_reader::oauth::revoke::PreflightOptions) -> i32 {
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — loading configuration: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    init_tracing();
+    run_revoke_all_with(&config, opts).await
+}
+
+/// [`run_revoke_all`] after configuration — split out so the refusals that
+/// depend on files on disk can be tested.
+async fn run_revoke_all_with(
+    config: &Config,
+    opts: feather_reader::oauth::revoke::PreflightOptions,
+) -> i32 {
+    // `store::init` creates a missing database. Here that would answer "0
+    // sessions, all good" about the WRONG file and let a teardown wipe the
+    // real one with every token still live.
+    if !config.db_path.exists() {
+        eprintln!(
+            "revoke-all: ABORT — no database at {} (is FEATHERREADER_DB set as the app sees it?)",
+            config.db_path.display()
+        );
+        return REVOKE_EXIT_ABORT;
+    }
+    let db = match store::init(config).await {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — opening the database: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    let http = match feather_reader::build_http_client() {
+        Ok(http) => http,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — building the HTTP client: {err:#}");
+            db.close().await;
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    // Load-only: this mode must never CREATE a signing key (see
+    // `OauthRuntime::without_creating_key`). A missing key is a runtime that
+    // cannot be built, which refuses if any session is stored.
+    let runtime = feather_reader::oauth::runtime::OauthRuntime::without_creating_key(config);
+    let code = revoke_all_sessions(&db, runtime, &http, opts).await;
+    db.close().await;
+    code
+}
+
+/// Revoke every stored session with `runtime`, printing a line per DID and a
+/// summary. Returns the process exit code.
+///
+/// Whether the runtime is the PRODUCTION client (confidential, a real codec,
+/// the served signing key) is the pre-flight's job
+/// ([`feather_reader::oauth::revoke::preflight`]), which runs before the first
+/// sign-out whenever sessions are stored.
+async fn revoke_all_sessions(
+    db: &store::Pool,
+    runtime: Result<feather_reader::oauth::runtime::OauthRuntime>,
+    http: &reqwest::Client,
+    opts: feather_reader::oauth::revoke::PreflightOptions,
+) -> i32 {
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let stored = match feather_reader::oauth::store::list_session_subs(db).await {
+                Ok(subs) => subs.len(),
+                Err(err) => {
+                    eprintln!("revoke-all: ABORT — listing the sessions: {err:#}");
+                    return REVOKE_EXIT_ABORT;
+                }
+            };
+            let code = unconfigured_exit_code(stored);
+            if code == REVOKE_EXIT_OK {
+                println!(
+                    "revoke-all: the Rust OAuth client is not configured ({err:#}), and no \
+                     sessions are stored — nothing to revoke."
+                );
+                println!(
+                    "{}",
+                    revoke_all_sentinel(&feather_reader::oauth::revoke::RevokeAllReport::default())
+                );
+            } else {
+                eprintln!(
+                    "revoke-all: ABORT — {stored} session(s) are stored but the Rust OAuth \
+                     client cannot be built ({err:#}). Nothing was revoked and NOTHING WAS \
+                     DELETED. Run this with the app's own environment (\
+                     FEATHERREADER_OAUTH_ENCRYPTION_KEY, FEATHERREADER_PUBLIC_URL, \
+                     FEATHERREADER_OAUTH_KEY_PATH) and try again."
+                );
+            }
+            return code;
+        }
+    };
+
+    // The secrets must be the production ones, not merely present: a wrong
+    // encryption key or signing key "works" — every sign-out fails and
+    // deletes its row. Checked before the first sign-out. Nothing deleted.
+    let jwks_url = feather_reader::oauth::metadata::jwks_uri(&runtime.client);
+    if let Err(err) = feather_reader::oauth::revoke::preflight(&runtime, db, &jwks_url, opts).await
+    {
+        eprintln!(
+            "revoke-all: ABORT — {err:#}. Nothing was revoked and NOTHING WAS DELETED. Run \
+             this inside the app's own environment."
+        );
+        return REVOKE_EXIT_ABORT;
+    }
+
+    // A clock, not a timestamp: each sign-out mints a 60-second client
+    // assertion, so the time must be read per session (see `revoke_all`).
+    let clock = || chrono::Utc::now().timestamp();
+    let report = match feather_reader::oauth::revoke::revoke_all(&runtime, http, db, clock).await {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("revoke-all: ABORT — listing the sessions: {err:#}");
+            return REVOKE_EXIT_ABORT;
+        }
+    };
+    for did in &report.revoked {
+        println!("    revoked {did}");
+    }
+    for did in &report.no_session {
+        println!("    already signed out {did}");
+    }
+    for did in &report.late {
+        println!("    appeared during the walk (signed out by a re-list) {did}");
+    }
+    for (did, reason) in &report.failed {
+        println!("    FAILED  {did}: {reason}");
+    }
+    // A failed revocation still deletes its row, EXCEPT a session that kept
+    // rotating or kept reappearing: that one is left on record, possibly live.
+    println!(
+        "revoke-all: {} revoked, {} already gone, {} failed ({} appeared during the walk).",
+        report.revoked.len(),
+        report.no_session.len(),
+        report.failed.len(),
+        report.late.len()
+    );
+    // LAST, always: the teardown requires it before it will wipe.
+    println!("{}", revoke_all_sentinel(&report));
+    revoke_all_exit_code(&report)
 }
 
 /// Startup safety check for the DB-size watermark vs. the actual DB volume.
@@ -356,4 +619,437 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<()>) {
     // The initial value is already "seen"; wait for the next change (the send) or
     // for the sender to drop.
     let _ = rx.changed().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feather_reader::oauth::revoke::{fit_to_revoke, PreflightOptions, RevokeAllReport};
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--sweep` is an argument too, and only ever relaxes the sweep's JWKS
+    /// reachability check — so it must not be read off argv[0] either.
+    #[test]
+    fn the_sweep_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_sweep(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions",
+            "--sweep"
+        ])));
+        assert!(!wants_sweep(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_sweep(args(&["--sweep", "--revoke-all-sessions"])));
+    }
+
+    #[test]
+    fn the_accept_unreadable_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_accept_unreadable(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions",
+            "--accept-unreadable"
+        ])));
+        assert!(!wants_accept_unreadable(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_accept_unreadable(args(&[
+            "--accept-unreadable",
+            "--revoke-all-sessions"
+        ])));
+    }
+
+    /// **`--accept-unreadable` end to end:** a store that is ALL unreadable
+    /// is refused (2, rows intact) without it, and with it every row is
+    /// deleted and reported failed (3) — loudly, because those tokens cannot
+    /// be revoked by anyone. Offline: a `.invalid` public URL makes the JWKS
+    /// unfetchable, which the `--sweep` here tolerates.
+    #[tokio::test]
+    async fn accept_unreadable_proceeds_past_an_all_unreadable_store() {
+        let dir = scratch("acceptbin");
+        let mut config = confidential_config(&dir);
+        config.public_url = "https://feather-reader.invalid".into();
+        let sweep = PreflightOptions {
+            sweep: true,
+            accept_unreadable: false,
+        };
+
+        let db = db_with_rows(2).await;
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        let code = revoke_all_sessions(&db, Ok(rt), &reqwest::Client::new(), sweep).await;
+        assert_eq!(
+            code, 2,
+            "an all-unreadable store passed without the override"
+        );
+        assert_eq!(rows(&db).await, 2);
+
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        let code = revoke_all_sessions(
+            &db,
+            Ok(rt),
+            &reqwest::Client::new(),
+            PreflightOptions {
+                accept_unreadable: true,
+                ..sweep
+            },
+        )
+        .await;
+        assert_eq!(code, 3, "the unrevocable rows must be reported as failures");
+        assert_eq!(rows(&db).await, 0, "the override did not proceed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A store no row of which decrypts is refused before anything is
+    /// signed out**: a wrong or rotated encryption key. The production client
+    /// is otherwise intact (confidential, real codec, the existing key), so
+    /// only the pre-flight stands between this and deleting every row
+    /// unrevoked. Offline: the decrypt check runs before the JWKS fetch.
+    #[tokio::test]
+    async fn a_wrong_encryption_key_is_refused_and_deletes_nothing() {
+        let dir = scratch("wrongenc");
+        let config = confidential_config(&dir);
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(fit_to_revoke(&runtime).is_ok(), "precondition: fit");
+
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let other = feather_reader::oauth::crypto::Codec::new(Some(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ))
+        .unwrap();
+        for i in 0..2 {
+            feather_reader::oauth::store::put_session(
+                &db,
+                &other,
+                &feather_reader::oauth::store::OAuthSession {
+                    sub: format!("did:plc:{i:024}"),
+                    issuer: "https://as.invalid".into(),
+                    aud: "https://pds.invalid".into(),
+                    dpop_key_jwk: "{}".into(),
+                    access_token: "a".into(),
+                    refresh_token: "r".into(),
+                    token_type: "DPoP".into(),
+                    granted_scope: "atproto".into(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let code = revoke_all_sessions(
+            &db,
+            Ok(runtime),
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
+        assert_eq!(
+            code, 2,
+            "a key that decrypts nothing was allowed to sign out"
+        );
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The flag is matched as an ARGUMENT only: a binary whose install path
+    /// contains it (argv[0]) must not sign every user out on an ordinary start.
+    #[test]
+    fn the_revoke_all_flag_is_an_argument_not_the_program_path() {
+        assert!(wants_revoke_all(args(&[
+            "/app/featherreader",
+            "--revoke-all-sessions"
+        ])));
+        assert!(!wants_revoke_all(args(&["--revoke-all-sessions"])));
+        assert!(!wants_revoke_all(args(&["/app/featherreader"])));
+        assert!(!wants_revoke_all(args(&[
+            "/app/featherreader",
+            "--migrate-auto-vacuum"
+        ])));
+    }
+
+    /// 0 when nothing failed; 1 when anything did, so a teardown can warn.
+    #[test]
+    fn the_exit_code_reports_any_failure() {
+        assert_eq!(revoke_all_exit_code(&RevokeAllReport::default()), 0);
+        let ok = RevokeAllReport {
+            revoked: vec!["did:plc:a".into()],
+            no_session: vec!["did:plc:b".into()],
+            failed: vec![],
+            late: vec![],
+        };
+        assert_eq!(revoke_all_exit_code(&ok), 0);
+        let some_failed = RevokeAllReport {
+            failed: vec![("did:plc:c".into(), "status 500".into())],
+            ..ok
+        };
+        assert_eq!(
+            revoke_all_exit_code(&some_failed),
+            3,
+            "partial failure must not share 1 with every generic failure"
+        );
+    }
+
+    /// The sentinel is exact: `deploy/teardown.sh` matches it with a regex and
+    /// cross-checks `failed=` against the exit code.
+    #[test]
+    fn the_sentinel_names_every_count() {
+        let report = RevokeAllReport {
+            revoked: vec!["a".into(), "b".into()],
+            no_session: vec!["c".into()],
+            failed: vec![("d".into(), "x".into())],
+            late: vec![],
+        };
+        assert_eq!(
+            revoke_all_sentinel(&report),
+            "revoke-all-sessions: revoked=2 no_session=1 failed=1"
+        );
+        assert_eq!(
+            revoke_all_sentinel(&RevokeAllReport::default()),
+            "revoke-all-sessions: revoked=0 no_session=0 failed=0"
+        );
+    }
+
+    /// A per-test scratch directory under the system temp dir.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fr-main-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A production-like (confidential client, rust backend) configuration
+    /// whose database and signing key live in `dir`.
+    fn confidential_config(dir: &std::path::Path) -> Config {
+        Config {
+            db_path: dir.join("featherreader.db"),
+            repo_backend: feather_reader::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: feather_reader::config::OauthConfig {
+                encryption_key: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                key_path: dir.join("oauth-signing-key.json"),
+                plc_directory: "https://plc.invalid".into(),
+                ..feather_reader::config::OauthConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// **No database, no answer.** `store::init` would create an empty file and
+    /// report "0 sessions" about it — and a teardown would then wipe the REAL
+    /// database with every token in it still live.
+    #[tokio::test]
+    async fn a_missing_database_is_refused_and_not_created() {
+        let dir = scratch("nodb");
+        let config = confidential_config(&dir);
+        assert_eq!(
+            run_revoke_all_with(&config, PreflightOptions::default()).await,
+            2
+        );
+        assert!(
+            !config.db_path.exists(),
+            "the revoke-all created a database at the wrong path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A missing signing key is refused, never created.**
+    ///
+    /// `OauthRuntime::new` creates the key when it is absent. Run from the wrong
+    /// directory (the default path is RELATIVE) that minted a fresh key under
+    /// the same `kid`; the live app still published the old JWKS, so every
+    /// client assertion was rejected — and every row deleted anyway, leaving the
+    /// teardown to proceed over live tokens.
+    #[tokio::test]
+    async fn a_missing_signing_key_is_refused_and_not_created() {
+        let dir = scratch("nokey");
+        let config = confidential_config(&dir);
+        let url = format!("sqlite://{}", config.db_path.display());
+        let pool = store::init_url(&url).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_session (sub, issuer, aud, dpop_key_jwk, access_token, \
+             refresh_token, token_type, granted_scope, expires_at) \
+             VALUES ('did:plc:keyless', 'https://as.invalid', 'https://pds.invalid', \
+             'x', 'x', 'x', 'DPoP', 'atproto', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        assert_eq!(
+            run_revoke_all_with(&config, PreflightOptions::default()).await,
+            2
+        );
+        assert!(
+            !config.oauth.key_path.exists(),
+            "the revoke-all CREATED a signing key the PDSes have never seen"
+        );
+        let pool = store::init_url(&url).await.unwrap();
+        assert_eq!(
+            rows(&pool).await,
+            1,
+            "rows were deleted without a revocation"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **An incomplete environment must not revoke as the wrong client.**
+    ///
+    /// Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to localhost:
+    /// not production-like, so the production checks are skipped and the
+    /// runtime builds as atproto's PUBLIC dev client. Every revocation is then
+    /// sent under the wrong `client_id` (or the rows fail to decrypt), the
+    /// sign-out deletes each row anyway, and a teardown proceeds over live
+    /// tokens. With sessions stored, that runtime is refused and nothing goes.
+    #[tokio::test]
+    async fn a_public_dev_client_runtime_is_refused_while_sessions_are_stored() {
+        let dir = scratch("devclient");
+        let mut config = confidential_config(&dir);
+        config.public_url = "http://127.0.0.1:8080".into();
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+        assert!(runtime.is_ok(), "precondition: the dev runtime builds");
+        // Named as what it is, so the operator knows WHICH variable is missing
+        // (the keyless check alone would also refuse, for a misleading reason).
+        let why = format!(
+            "{:#}",
+            fit_to_revoke(runtime.as_ref().unwrap()).expect_err("the dev client was accepted")
+        );
+        assert!(why.contains("public dev client"), "{why}");
+
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(
+            &db,
+            runtime,
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
+        assert_eq!(code, 2, "revoked as the public dev client");
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a confidential client with NO encryption key: the `Null`
+    /// codec cannot read a single production row, so every sign-out would
+    /// fail and delete.
+    #[tokio::test]
+    async fn a_null_codec_runtime_is_refused_while_sessions_are_stored() {
+        let dir = scratch("nullcodec");
+        let mut config = confidential_config(&dir);
+        config.oauth.encryption_key = None;
+        let runtime = feather_reader::oauth::runtime::OauthRuntime::new(&config);
+        assert!(
+            matches!(
+                runtime.as_ref().map(|rt| &rt.codec),
+                Ok(feather_reader::oauth::crypto::Codec::Null)
+            ),
+            "precondition: a confidential runtime with the Null codec"
+        );
+
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(
+            &db,
+            runtime,
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
+        assert_eq!(code, 2, "revoked with the Null codec");
+        assert_eq!(rows(&db).await, 2, "rows were deleted unrevoked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fitness check accepts exactly the production client: confidential,
+    /// a real codec, and a loaded key.
+    #[test]
+    fn only_the_production_client_is_fit_to_revoke() {
+        let dir = scratch("fit");
+        let config = confidential_config(&dir);
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(fit_to_revoke(&rt).is_ok(), "{:?}", fit_to_revoke(&rt).err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A confidential client WITHOUT its key (the sidecar backend, no key file
+    /// on disk — `new` then neither loads nor creates one) cannot sign a single
+    /// client assertion, so it is not fit either.
+    #[test]
+    fn a_confidential_client_without_its_key_is_not_fit() {
+        let dir = scratch("nokeyfit");
+        let mut config = confidential_config(&dir);
+        config.repo_backend = feather_reader::metrics::Backend::Sidecar;
+        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        assert!(rt.client_key.is_none(), "precondition: no key loaded");
+        let err = fit_to_revoke(&rt).expect_err("a keyless confidential client was accepted");
+        assert!(format!("{err:#}").contains("signing key"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a runtime, stored sessions cannot be revoked: refuse (2) rather
+    /// than report success. An empty store has nothing to revoke (0).
+    #[test]
+    fn an_unconfigured_runtime_refuses_only_when_sessions_exist() {
+        assert_eq!(unconfigured_exit_code(0), 0);
+        assert_eq!(unconfigured_exit_code(1), 2);
+        assert_eq!(unconfigured_exit_code(500), 2);
+    }
+
+    async fn db_with_rows(n: usize) -> store::Pool {
+        let pool = store::init_url("sqlite::memory:").await.unwrap();
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO oauth_session (sub, issuer, aud, dpop_key_jwk, access_token, \
+                 refresh_token, token_type, granted_scope, expires_at) \
+                 VALUES (?, 'https://as.example', 'https://pds.example', 'x', 'x', 'x', \
+                 'DPoP', 'atproto', NULL)",
+            )
+            .bind(format!("did:plc:{i:024}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    async fn rows(pool: &store::Pool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// **Rows that cannot be revoked are not silently dropped.** With no
+    /// runtime, the command refuses with 2 and leaves every row in place, so
+    /// the operator can fix the configuration and run it again.
+    #[tokio::test]
+    async fn an_unconfigured_runtime_with_sessions_refuses_and_deletes_nothing() {
+        let db = db_with_rows(2).await;
+        let code = revoke_all_sessions(
+            &db,
+            Err(anyhow::anyhow!("no encryption key")),
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
+        assert_eq!(code, 2);
+        assert_eq!(rows(&db).await, 2, "rows were dropped without a revocation");
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_runtime_with_no_sessions_has_nothing_to_do() {
+        let db = db_with_rows(0).await;
+        let code = revoke_all_sessions(
+            &db,
+            Err(anyhow::anyhow!("no encryption key")),
+            &reqwest::Client::new(),
+            PreflightOptions::default(),
+        )
+        .await;
+        assert_eq!(code, 0);
+    }
 }

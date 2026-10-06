@@ -106,25 +106,83 @@ pub async fn sign_out(
     sub: &str,
     now: i64,
 ) -> Revocation {
-    let session = match super::store::get_session(pool, codec, sub).await {
-        Ok(Some(session)) => session,
-        Ok(None) => return Revocation::NoSession,
-        Err(err) => {
-            // Still delete: an unreadable row is exactly the state a sign-out
-            // should clear, and leaving it wedges every later request.
-            let _ = super::store::delete_session(pool, sub).await;
-            return Revocation::Failed(format!("reading the session: {err:#}"));
-        }
-    };
-
-    bounded_then_delete(
-        pool,
-        sub,
-        ctx.deadline,
-        revoke_tokens(pool, http, ctx, &session, now),
-    )
+    sign_out_with(pool, codec, sub, ctx.deadline, |session| async move {
+        revoke_tokens(pool, http, ctx, &session, now).await
+    })
     .await
 }
+
+/// [`sign_out`] with the revocation injected, so a row rotated mid-sign-out
+/// can be simulated deterministically.
+async fn sign_out_with<F, Fut>(
+    pool: &sqlx::SqlitePool,
+    codec: &super::crypto::Codec,
+    sub: &str,
+    deadline: std::time::Duration,
+    mut revoke: F,
+) -> Revocation
+where
+    F: FnMut(OAuthSession) -> Fut,
+    Fut: std::future::Future<Output = Revocation>,
+{
+    // The outcome of the last attempt whose row then changed under it.
+    let mut previous: Option<Revocation> = None;
+    for _ in 0..MAX_SIGN_OUT_ATTEMPTS {
+        let (session, version) = match super::store::get_session_versioned(pool, codec, sub).await {
+            Ok(Some(read)) => read,
+            // Gone — first time round, there was nothing to sign out; after
+            // a `Changed`, someone else (a concurrent `/logout`) deleted it
+            // once we had revoked what we read, so report that revocation.
+            Ok(None) => return previous.unwrap_or(Revocation::NoSession),
+            Err(err) => {
+                // Still delete: an unreadable row is exactly the state a
+                // sign-out should clear, and leaving it wedges every later
+                // request. No refresh can rotate a row nothing can read.
+                let _ = super::store::delete_session(pool, sub).await;
+                return Revocation::Failed(format!("reading the session: {err:#}"));
+            }
+        };
+
+        match bounded_then_delete(pool, sub, &version, deadline, revoke(session)).await {
+            Attempt::Done(outcome) => return outcome,
+            // Rotated (or removed) while we revoked: read again and revoke the
+            // tokens that are actually on record now.
+            Attempt::Changed(outcome) => previous = Some(outcome),
+        }
+    }
+    // Still rotating. Leave the newest tokens IN PLACE — deleting them would
+    // drop a live token unrevoked with no record left to retry from — and say
+    // so, so the operator's sweep (or the user's next sign-out) can finish it.
+    Revocation::Failed(format!(
+        "the session kept changing while it was being signed out ({MAX_SIGN_OUT_ATTEMPTS} \
+         attempts, each overtaken by a refresh); its newest tokens were left in place"
+    ))
+}
+
+/// Revoke a token set that has NO local row to delete — bounded by
+/// `ctx.deadline`, best-effort, never touching the store's sessions.
+///
+/// For tokens obtained for a session that was signed out while they were being
+/// obtained: a refresh that finds its row deleted holds a live grant nobody
+/// will ever use, and dropping it would leave it live at the PDS until expiry.
+pub(crate) async fn revoke_orphaned(
+    pool: &sqlx::SqlitePool,
+    http: &reqwest::Client,
+    ctx: &RevokeContext<'_>,
+    session: &OAuthSession,
+    now: i64,
+) -> Revocation {
+    match tokio::time::timeout(ctx.deadline, revoke_tokens(pool, http, ctx, session, now)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Revocation::Failed(format!(
+            "revocation did not finish within {:?}",
+            ctx.deadline
+        )),
+    }
+}
+
+/// The deadline a background revocation (not a user's sign-out) waits for.
+pub(crate) const ORPHAN_REVOKE_DEADLINE: std::time::Duration = REVOKE_DEADLINE;
 
 /// The revocation request itself. Errors become [`Revocation::Failed`] rather
 /// than propagating: every caller has already committed to signing out.
@@ -205,6 +263,16 @@ async fn try_revoke(
 ///
 /// A discovery failure is not fatal. It means the server cannot be told, which
 /// is exactly the case [`sign_out`] already handles by deleting locally anyway.
+///
+/// **Discovery follows the row, not the first read.** The sign-out re-reads a
+/// row that changed under it (see `sign_out_with`), and the re-read can be a
+/// DIFFERENT grant — a re-login after a PDS migration, at another issuer.
+/// Presenting its refresh token to the endpoint discovered for the old issuer
+/// would hand it to a different authorization server (the leak the
+/// issuer-checked discovery exists to prevent), which answers 200 for a token
+/// it does not know: reported revoked, row deleted, grant live. So every
+/// token goes only to the endpoint discovered for ITS OWN `(aud, issuer)`
+/// (`revoke_at_own_issuer`).
 pub async fn sign_out_discovering(
     runtime: &super::runtime::OauthRuntime,
     http: &reqwest::Client,
@@ -212,42 +280,88 @@ pub async fn sign_out_discovering(
     sub: &str,
     now: i64,
 ) -> Revocation {
-    let session = match super::store::get_session(pool, &runtime.codec, sub).await {
-        Ok(Some(session)) => session,
-        Ok(None) => return Revocation::NoSession,
-        Err(err) => {
-            // **Delete it anyway.** This early return used to skip the delete,
-            // and `sign_out` was fixed for exactly that while this sibling was
-            // not — the same one-instance-fixed, sibling-missed pattern twice
-            // over.
-            //
-            // An unreadable row is not hypothetical: it is what every row
-            // written before this branch's AAD change now is, and what rotating
-            // `FEATHERREADER_OAUTH_ENCRYPTION_KEY` produces. Leaving it wedges
-            // the account — every repo call reads the same row — and because
-            // `purge_did_data` does not touch the OAuth tables, `POST
-            // /account/delete` relies on this path to clear it. Returning early
-            // here made "delete my account" leave the tokens behind.
-            let _ = super::store::delete_session(pool, sub).await;
-            return Revocation::Failed(format!("reading the session: {err:#}"));
+    let cache = EndpointCache::default();
+    let cache = &cache;
+    // Unreadable rows, absent rows, the bounded attempt and the
+    // compare-and-delete are all `sign_out_with`'s — the same contract
+    // `sign_out` runs, tested there. The deadline covers discovery AND the
+    // revocation (each bounded on its own to REVOKE_DEADLINE inside), the same
+    // worst case as when the two were bounded one after the other.
+    sign_out_with(
+        pool,
+        &runtime.codec,
+        sub,
+        2 * REVOKE_DEADLINE,
+        |session| async move {
+            revoke_at_own_issuer(runtime, http, pool, cache, &session, now).await
+        },
+    )
+    .await
+}
+
+/// The revocation endpoint last discovered, and the `(aud, issuer)` it was
+/// discovered FOR. A token is only ever presented to the endpoint of its own
+/// pair.
+type EndpointCache = std::sync::Mutex<Option<((String, String), Option<String>)>>;
+
+/// Revoke `session`'s tokens at the revocation endpoint of ITS OWN issuer —
+/// discovering it (issuer-checked) unless `cache` already holds the endpoint
+/// for exactly this `(aud, issuer)`.
+async fn revoke_at_own_issuer(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    cache: &EndpointCache,
+    session: &OAuthSession,
+    now: i64,
+) -> Revocation {
+    let key = (session.aud.clone(), session.issuer.clone());
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        // ONLY an endpoint discovered for this very (aud, issuer). A row
+        // re-read at another issuer is re-discovered, never sent here.
+        .filter(|(for_pair, _)| *for_pair == key)
+        .map(|(_, endpoint)| endpoint.clone());
+    let endpoint = match cached {
+        Some(endpoint) => endpoint,
+        None => {
+            let endpoint = discover_revocation_endpoint(runtime, http, session).await;
+            *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, endpoint.clone()));
+            endpoint
         }
     };
+    revoke_tokens(
+        pool,
+        http,
+        &RevokeContext {
+            revocation_endpoint: endpoint.as_deref(),
+            client_id: &runtime.client_id,
+            auth_method: runtime.auth_method,
+            client_key: runtime.client_key.as_ref(),
+            deadline: REVOKE_DEADLINE,
+        },
+        session,
+        now,
+    )
+    .await
+}
 
-    // **Discovery is bounded too**, and separately.
-    //
-    // Bounding only the revocation request left the real wait unbounded:
-    // `discover` makes two guarded fetches, each with its own 30-second timeout,
-    // so an unreachable PDS held a user's sign-out for a minute before the
-    // five-second deadline even began.
-    //
-    // Bounded HERE rather than by wrapping the whole operation, so this function
-    // still ENDS in a call to `sign_out` — which owns the contract that matters
-    // (a bounded attempt, then an unconditional local delete) and is where that
-    // contract is tested. Wrapping instead meant production stopped going
-    // through `sign_out` at all, leaving three invariant tests aimed at a
-    // function nothing called. Worst case is two deadlines, one per phase, which
-    // is what independently bounding each phase costs.
-    let endpoint = match tokio::time::timeout(
+/// Discover `session`'s revocation endpoint, issuer-checked and bounded.
+/// `None` when it cannot be (which the caller treats as "cannot tell the
+/// server", and signs out locally anyway).
+async fn discover_revocation_endpoint(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    session: &OAuthSession,
+) -> Option<String> {
+    let sub = &session.sub;
+    // **Discovery is bounded too**, and separately: `discover` makes two
+    // guarded fetches, each with its own 30-second timeout, so an unreachable
+    // PDS held a user's sign-out for a minute before the revocation's own
+    // deadline even began.
+    match tokio::time::timeout(
         REVOKE_DEADLINE,
         // **The missed sibling.** This posts the REFRESH TOKEN to whatever
         // `revocation_endpoint` comes back, and had no issuer check at all —
@@ -273,38 +387,403 @@ pub async fn sign_out_discovering(
             tracing::warn!(%sub, "discovering the revocation endpoint timed out");
             None
         }
-    };
+    }
+}
 
-    sign_out(
-        pool,
-        &runtime.codec,
-        http,
-        &RevokeContext {
-            revocation_endpoint: endpoint.as_deref(),
-            client_id: &runtime.client_id,
-            auth_method: runtime.auth_method,
-            client_key: runtime.client_key.as_ref(),
-            deadline: REVOKE_DEADLINE,
-        },
-        sub,
-        now,
-    )
+/// What an operator revoke-all did, per subject DID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokeAllReport {
+    /// Revoked at the authorization server, and the local row deleted.
+    pub revoked: Vec<String>,
+    /// Listed, but gone by the time it was signed out (a concurrent `/logout`).
+    pub no_session: Vec<String>,
+    /// The server could not be told, with the reason. The local row is deleted
+    /// regardless, so these tokens may stay live at the PDS until they expire.
+    pub failed: Vec<(String, String)>,
+    /// Subjects ABSENT from the first listing and found by a re-list — sessions
+    /// created while the walk ran (a login on the still-serving app). A row
+    /// that was there from the start and merely retried is not one of these.
+    /// Each was signed out too; its outcome is in the lists above, which hold
+    /// ONE final outcome per DID (a later pass overwrites an earlier one).
+    pub late: Vec<String>,
+}
+
+/// Sign EVERY stored session out — the operator's fleet-wide revoke (#257).
+///
+/// Before this existed, a teardown on the `rust` backend wiped
+/// `FEATHERREADER_DB` and with it every refresh token, unrevoked, leaving each
+/// live at its PDS until it expired. This walks the store and runs each subject
+/// through [`sign_out_discovering`] — the same function `/logout` and
+/// `/account/delete` use, so it inherits that function's contract: a bounded
+/// attempt at the server, then a local delete (of the version it revoked)
+/// whatever the server said, including for a row that no longer decrypts.
+///
+/// **A failure does not stop the walk.** Every later session would otherwise be
+/// left neither revoked nor deleted. Failures are collected with their reasons
+/// so the operator can see which tokens may still be live.
+///
+/// Sequential on purpose: each sign-out is already deadline-bounded, and this
+/// runs once, at a teardown, where a predictable request rate against each PDS
+/// matters more than finishing a few seconds sooner.
+///
+/// Only listing the sessions can fail as a whole — in which case nothing has
+/// been revoked or deleted, and the caller must not proceed to a wipe.
+pub async fn revoke_all(
+    runtime: &super::runtime::OauthRuntime,
+    http: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    clock: impl FnMut() -> i64,
+) -> Result<RevokeAllReport> {
+    revoke_all_with(pool, clock, |sub, now| async move {
+        sign_out_discovering(runtime, http, pool, &sub, now).await
+    })
     .await
 }
 
-/// Run `attempt` under `deadline`, then delete the local session **whatever
-/// happened** — including when the deadline expired.
+/// Whether `runtime` is the production client — the only one that can revoke
+/// production's sessions. The first check [`preflight`] makes.
+///
+/// An incomplete environment does not fail to build a runtime; it builds the
+/// WRONG one. Without `FEATHERREADER_PUBLIC_URL`, `Config` falls back to
+/// localhost, which is not production-like, so the production checks
+/// (encryption key included) never run and the runtime comes up as atproto's
+/// public dev client — possibly with the pass-through `Null` codec. Revoking
+/// with that sends every token under the wrong `client_id` or fails to decrypt
+/// every row, and each sign-out deletes its row anyway. So a run that will
+/// touch stored sessions requires all three: the confidential client (a
+/// non-loopback public URL), a real encryption codec, and the loaded key.
+///
+/// The `Null` codec needs its own check: it "decrypts" a ciphertext by
+/// returning it unchanged, so the decrypt pre-flight would count production's
+/// encrypted rows as readable.
+pub fn fit_to_revoke(runtime: &super::runtime::OauthRuntime) -> Result<()> {
+    let mut missing = Vec::new();
+    if runtime.auth_method != AuthMethod::PrivateKeyJwt {
+        missing.push(
+            "the confidential client (FEATHERREADER_PUBLIC_URL is loopback or unset, so this \
+             would revoke as the public dev client)",
+        );
+    }
+    if matches!(runtime.codec, super::crypto::Codec::Null) {
+        missing.push("an encryption key (FEATHERREADER_OAUTH_ENCRYPTION_KEY is unset)");
+    }
+    if runtime.client_key.is_none() {
+        missing.push("the signing key (FEATHERREADER_OAUTH_KEY_PATH)");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "not the production OAuth client — missing {}. Run this inside the app's own \
+             environment",
+            missing.join("; ")
+        )
+    }
+}
+
+/// Longest the pre-flight waits for the app's own JWKS.
+const OWN_JWKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest JWKS document the pre-flight will read. Ours is one key, < 1 KiB.
+const OWN_JWKS_MAX_BYTES: usize = 64 * 1024;
+
+/// Fetch the app's OWN JWKS for the pre-flight.
+///
+/// **A plain client, not the SSRF guard.** The URL is the operator's own
+/// configuration (`FEATHERREADER_PUBLIC_URL`), not attacker input, and a
+/// self-host with split-horizon DNS serves it on a LAN or loopback address —
+/// exactly what the guard refuses, so the main pass could never pass. What
+/// the guard is for is still kept where it matters here: https only (the key
+/// comparison means nothing over a rewritable channel), no redirects, no
+/// proxy, a timeout, and a size cap.
+async fn fetch_own_jwks(url: &str) -> Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let parsed = url::Url::parse(url).with_context(|| format!("parsing {url}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("the app's JWKS URL {url} must be https");
+    }
+    let builder = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(OWN_JWKS_TIMEOUT);
+    // The test CA, so a loopback TLS test server can stand in for the app.
+    // `#[cfg(test)]`: absent from release builds.
+    #[cfg(test)]
+    let builder = builder.add_root_certificate(
+        reqwest::Certificate::from_pem(crate::net::test_pki().ca_pem.as_bytes())
+            .context("parsing the test CA")?,
+    );
+    let client = builder.build().context("building the JWKS client")?;
+    let mut resp = client
+        .get(parsed)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("{url} answered {}", resp.status());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading {url}"))?
+    {
+        if body.len() + chunk.len() > OWN_JWKS_MAX_BYTES {
+            anyhow::bail!("{url} is larger than {OWN_JWKS_MAX_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).with_context(|| format!("{url} is not JSON"))
+}
+
+/// Operator choices for [`preflight`], from the command line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreflightOptions {
+    /// `--sweep`: the post-stop pass. The app is stopped, so its JWKS cannot
+    /// be fetched; that is tolerated. A fetched MISMATCH still refuses.
+    pub sweep: bool,
+    /// `--accept-unreadable`: proceed when NO stored row decrypts. Relaxes
+    /// that one check only; the client and signing-key checks still apply.
+    /// The unreadable rows are deleted and reported failed — their tokens
+    /// cannot be revoked by anyone and live until they expire.
+    pub accept_unreadable: bool,
+}
+
+/// Prove, BEFORE anything is signed out, that this process holds the
+/// production client's real secrets — not merely a codec and a key file.
+///
+/// Every sign-out deletes its row whatever the PDS says, so a run with the
+/// wrong secrets does not fail safe: it deletes every row unrevoked.
+///
+/// * **The encryption key.** A wrong or rotated
+///   `FEATHERREADER_OAUTH_ENCRYPTION_KEY` decrypts nothing. If there are rows
+///   and NONE decrypts, refuse. (Some readable and some not is a real store
+///   with some unreadable rows; those cannot be revoked by anyone, and are
+///   reported as failed by the walk.)
+/// * **The signing key.** A relative `FEATHERREADER_OAUTH_KEY_PATH` run from
+///   the wrong directory can load SOME key — one no PDS has. Its public half
+///   must be in the JWKS the app actually serves at `jwks_url`. A mismatch
+///   always refuses. A JWKS that cannot be fetched refuses too, except on the
+///   post-stop `sweep`, where the app is stopped and cannot serve it.
+///
+/// With no sessions stored there is nothing to protect, and no check (or
+/// network request) is made.
+pub async fn preflight(
+    runtime: &super::runtime::OauthRuntime,
+    pool: &sqlx::SqlitePool,
+    jwks_url: &str,
+    opts: PreflightOptions,
+) -> Result<()> {
+    let PreflightOptions {
+        sweep,
+        accept_unreadable,
+    } = opts;
+    let subs = super::store::list_session_subs(pool).await?;
+    if subs.is_empty() {
+        return Ok(());
+    }
+
+    // The client: confidential, a real codec, a loaded key.
+    fit_to_revoke(runtime)?;
+
+    // The encryption key: at least one row must decrypt.
+    let mut readable = 0usize;
+    for sub in &subs {
+        if matches!(
+            super::store::get_session(pool, &runtime.codec, sub).await,
+            Ok(Some(_))
+        ) {
+            readable += 1;
+        }
+    }
+    if readable == 0 {
+        if !accept_unreadable {
+            anyhow::bail!(
+                "none of the {} stored session(s) decrypts with this \
+                 FEATHERREADER_OAUTH_ENCRYPTION_KEY — it is not the key the app wrote them \
+                 with (wrong, or rotated). Signing out would delete every row unrevoked. \
+                 If you KNOW every row is unreadable for a legitimate reason (only pre-AAD \
+                 rows; the key was rotated with no logins since), re-run with \
+                 --accept-unreadable: those tokens cannot be revoked by anyone and stay live \
+                 until they expire",
+                subs.len()
+            );
+        }
+        tracing::warn!(
+            stored = subs.len(),
+            "--accept-unreadable: NO stored session decrypts. Every row will be deleted \
+             UNREVOKED and reported failed — those tokens stay live at their PDS until they \
+             expire. The client and signing-key checks still apply."
+        );
+    }
+
+    // The signing key: its public half must be what the app serves.
+    let key = runtime
+        .client_key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no client signing key is loaded"))?;
+    let ours = key.thumbprint()?;
+    let served = match fetch_own_jwks(jwks_url).await {
+        Ok(doc) => doc,
+        Err(err) if sweep => {
+            tracing::warn!(
+                %err,
+                "sweep: the app's JWKS is unreachable (expected once the app is stopped); \
+                 the signing key was checked on the main pass"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err.context(format!(
+                "could not fetch the app's JWKS at {jwks_url} to confirm the signing key. \
+                 The main pass runs while the app is serving, so this should be reachable; \
+                 refusing rather than signing with a key no PDS may know"
+            )));
+        }
+    };
+    let matches = served
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|jwk| {
+            jwk.get("kid").and_then(serde_json::Value::as_str) == Some(key.kid())
+                && super::keys::SigningKey::public_thumbprint_of(&jwk.to_string()).ok()
+                    == Some(ours.clone())
+        });
+    if !matches {
+        anyhow::bail!(
+            "the loaded signing key (FEATHERREADER_OAUTH_KEY_PATH, kid {:?}) is not the key \
+             the app serves at {jwks_url}. Every client assertion would be rejected and every \
+             row deleted unrevoked. Point FEATHERREADER_OAUTH_KEY_PATH at the app's own key",
+            key.kid()
+        );
+    }
+    Ok(())
+}
+
+/// [`revoke_all`] with the per-session sign-out injected, so sessions that
+/// appear DURING the walk can be simulated.
+async fn revoke_all_with<S, Fut>(
+    pool: &sqlx::SqlitePool,
+    mut clock: impl FnMut() -> i64,
+    mut sign_out: S,
+) -> Result<RevokeAllReport>
+where
+    S: FnMut(String, i64) -> Fut,
+    Fut: std::future::Future<Output = Revocation>,
+{
+    // The FINAL outcome per DID, in first-seen order: a later pass overwrites
+    // an earlier one, so a DID that failed (left in place) and was then revoked
+    // by the re-list is reported revoked — once — and not also failed.
+    let mut order: Vec<String> = Vec::new();
+    let mut outcomes: std::collections::HashMap<String, Revocation> = Default::default();
+    // DIDs absent from the first listing: these appeared DURING the walk.
+    let mut late: Vec<String> = Vec::new();
+
+    let mut subs = super::store::list_session_subs(pool).await?;
+    let initial: std::collections::HashSet<String> = subs.iter().cloned().collect();
+    // The first walk, then up to RE_LIST_PASSES more over whatever is stored
+    // AFTER it: sessions created (a login on the still-serving app) or left in
+    // place (one that kept rotating) while the walk ran. Defence in depth — the
+    // refresh no longer resurrects a deleted row, but a login legitimately
+    // creates one.
+    for pass in 0..=RE_LIST_PASSES {
+        for sub in subs {
+            if !outcomes.contains_key(&sub) {
+                order.push(sub.clone());
+                if !initial.contains(&sub) {
+                    late.push(sub.clone());
+                }
+            }
+            // Read the clock PER SESSION. `now` becomes the client assertion's
+            // `iat`, and an assertion lives only 60 s: one timestamp taken at
+            // the start would be expired for every session reached after the
+            // first minute, so those revocations would all be rejected.
+            let now = clock();
+            let outcome = sign_out(sub.clone(), now).await;
+            outcomes.insert(sub, outcome);
+        }
+        subs = super::store::list_session_subs(pool).await?;
+        if subs.is_empty() {
+            break;
+        }
+        if pass == RE_LIST_PASSES {
+            // Out of passes and the store is still not empty: these sessions
+            // are still on record, and possibly live, whatever the last
+            // attempt said. A failure keeps its own reason.
+            for sub in subs {
+                if !outcomes.contains_key(&sub) {
+                    order.push(sub.clone());
+                }
+                let entry = outcomes.entry(sub).or_insert(Revocation::NoSession);
+                if !matches!(entry, Revocation::Failed(_)) {
+                    *entry = Revocation::Failed(format!(
+                        "still stored after {} passes (a login or refresh keeps \
+                         re-creating it); not signed out",
+                        RE_LIST_PASSES + 1
+                    ));
+                }
+            }
+            break;
+        }
+    }
+
+    let mut report = RevokeAllReport {
+        late,
+        ..RevokeAllReport::default()
+    };
+    for sub in order {
+        match outcomes.remove(&sub) {
+            Some(Revocation::Revoked) => report.revoked.push(sub),
+            Some(Revocation::NoSession) | None => report.no_session.push(sub),
+            Some(Revocation::Failed(reason)) => report.failed.push((sub, reason)),
+        }
+    }
+    Ok(report)
+}
+
+/// Extra walks [`revoke_all`] makes over sessions that appeared during the
+/// previous one.
+const RE_LIST_PASSES: usize = 2;
+
+/// How many times a sign-out re-reads and re-revokes a session that a
+/// concurrent refresh keeps rotating, before giving up and leaving the newest
+/// tokens on record.
+const MAX_SIGN_OUT_ATTEMPTS: usize = 3;
+
+/// What one bounded attempt ended in.
+#[derive(Debug)]
+enum Attempt {
+    /// The row that was revoked has been deleted (or the delete failed, which
+    /// is reported in the outcome). Final.
+    Done(Revocation),
+    /// The row was rewritten or removed after it was read, so the revoked token
+    /// was not the one on record. Nothing was deleted.
+    Changed(Revocation),
+}
+
+/// Run `attempt` under `deadline`, then delete the local session — **whatever
+/// the server said**, including when the deadline expired — provided the row
+/// still holds the `version` that was revoked.
 ///
 /// The single implementation of the sign-out contract, so there is no second
 /// copy to drift. Separated out from [`sign_out`] so the bound can be tested
 /// against a future that never resolves, rather than against a network address
 /// that may be refused instantly in one environment and hang in another.
+///
+/// **Compare-and-delete, not delete.** A refresh can rotate the row between
+/// the read and here (the live app refreshes under an in-process lock that
+/// neither the operator's revoke-all nor a racing `/logout` holds). An
+/// unconditional delete then removed the ROTATED token, which was never
+/// revoked; the caller now re-reads and revokes that one instead.
 async fn bounded_then_delete<F>(
     pool: &sqlx::SqlitePool,
     sub: &str,
+    version: &super::store::SessionVersion,
     deadline: std::time::Duration,
     attempt: F,
-) -> Revocation
+) -> Attempt
 where
     F: std::future::Future<Output = Revocation>,
 {
@@ -315,11 +794,15 @@ where
         )),
     };
 
-    // Unconditional, exactly as in `sign_out`: the user asked to be logged out.
-    if let Err(err) = super::store::delete_session(pool, sub).await {
-        return Revocation::Failed(format!("deleting the local session: {err:#}"));
+    // Unconditional on the OUTCOME — the user asked to be logged out — but
+    // conditional on the row being the one whose tokens were just revoked.
+    match super::store::delete_session_if_unchanged(pool, sub, version).await {
+        Ok(true) => Attempt::Done(outcome),
+        Ok(false) => Attempt::Changed(outcome),
+        Err(err) => Attempt::Done(Revocation::Failed(format!(
+            "deleting the local session: {err:#}"
+        ))),
     }
-    outcome
 }
 
 #[cfg(test)]
@@ -527,10 +1010,15 @@ mod tests {
         let (pool, codec) = db().await;
         stored(&pool, &codec).await;
 
+        let (_, version) = super::super::store::get_session_versioned(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .unwrap();
         let started = std::time::Instant::now();
-        let outcome = super::bounded_then_delete(
+        let attempt = super::bounded_then_delete(
             &pool,
             DID,
+            &version,
             std::time::Duration::from_millis(50),
             std::future::pending::<Revocation>(),
         )
@@ -540,6 +1028,9 @@ mod tests {
             "the bound did not fire"
         );
 
+        let Attempt::Done(outcome) = attempt else {
+            panic!("the unchanged row was not deleted: {attempt:?}");
+        };
         match &outcome {
             Revocation::Failed(reason) => assert!(
                 reason.contains("did not finish within"),
@@ -698,5 +1189,1141 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Revocation::NoSession);
+    }
+
+    // ── the operator revoke-all ──────────────────────────────────────────────
+
+    /// The three subjects the revoke-all tests store, in the order
+    /// `list_session_subs` returns them (sorted), which is the order the
+    /// revocation requests are made in.
+    const SUBS: [&str; 3] = [
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+        "did:plc:cccccccccccccccccccccccc",
+    ];
+
+    /// A PDS + authorization server on one real-TLS loopback server, whose
+    /// metadata advertises `/revoke`, answering successive revocations with
+    /// `revoke_replies` in turn (the last repeats).
+    async fn revoking_server(
+        revoke_replies: Vec<crate::net::TestResponse>,
+    ) -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (addr, log) = crate::net::spawn_tls(move |addr| {
+            let port = addr.port();
+            let pds = format!("https://pds-e2e.test:{port}");
+            let issuer = format!("https://as-e2e.test:{port}");
+            let mut r = std::collections::HashMap::new();
+            r.insert(
+                "/.well-known/oauth-protected-resource".to_string(),
+                vec![crate::net::TestResponse::json(
+                    200,
+                    serde_json::json!({
+                        "resource": pds,
+                        "authorization_servers": [issuer],
+                    })
+                    .to_string(),
+                )],
+            );
+            r.insert(
+                "/.well-known/oauth-authorization-server".to_string(),
+                vec![crate::net::TestResponse::json(
+                    200,
+                    serde_json::json!({
+                        "issuer": issuer,
+                        "pushed_authorization_request_endpoint": format!("{issuer}/par"),
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "revocation_endpoint": format!("{issuer}/revoke"),
+                        "protected_resources": [pds],
+                        "client_id_metadata_document_supported": true,
+                        "require_pushed_authorization_requests": true,
+                        "authorization_response_iss_parameter_supported": true,
+                        "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+                        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+                        "dpop_signing_alg_values_supported": ["ES256"],
+                        "scopes_supported": ["atproto"],
+                        "response_types_supported": ["code"],
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                        "code_challenge_methods_supported": ["S256"],
+                    })
+                    .to_string(),
+                )],
+            );
+            r.insert("/revoke".to_string(), revoke_replies);
+            r
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+        let port = addr.port();
+        (
+            format!("https://pds-e2e.test:{port}"),
+            format!("https://as-e2e.test:{port}"),
+            log,
+        )
+    }
+
+    /// Store one readable session per subject in [`SUBS`], against `pds`/`issuer`.
+    async fn store_sessions(
+        pool: &sqlx::SqlitePool,
+        codec: &super::super::crypto::Codec,
+        pds: &str,
+        issuer: &str,
+    ) {
+        for sub in SUBS {
+            let key = super::super::keys::SigningKey::generate("session");
+            let session = OAuthSession {
+                sub: sub.into(),
+                issuer: issuer.into(),
+                aud: pds.into(),
+                dpop_key_jwk: key.to_jwk_json().unwrap(),
+                ..session("access-abc", &format!("refresh-{sub}"))
+            };
+            super::super::store::put_session(pool, codec, &session)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn session_rows(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_session")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn revoke_requests(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /revoke"))
+            .cloned()
+            .collect()
+    }
+
+    /// **Every stored session is revoked at its server, and every row goes.**
+    ///
+    /// The operator path a teardown runs before wiping the database. Each
+    /// revocation must actually reach the server — a revoke-all that only
+    /// deleted rows would leave every refresh token live at the PDS, which is
+    /// the bug this exists to close (#257).
+    #[tokio::test]
+    async fn revoke_all_revokes_every_session_at_its_server() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
+            .await
+            .expect("listing the sessions");
+
+        let requests = revoke_requests(&log);
+        assert_eq!(
+            requests.len(),
+            3,
+            "one revocation request per session:\n{requests:#?}"
+        );
+        for sub in SUBS {
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r.contains(&format!("token=refresh-{}", sub.replace(':', "%3A")))),
+                "{sub}'s refresh token was never presented:\n{requests:#?}"
+            );
+        }
+        assert_eq!(report.revoked, SUBS.map(String::from).to_vec());
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.no_session.is_empty());
+        assert_eq!(session_rows(&pool).await, 0, "rows survived a revoke-all");
+    }
+
+    /// **One server failing does not stop the rest — and its row still goes.**
+    ///
+    /// Aborting at the first failure would leave every later session neither
+    /// revoked nor deleted. The failure is reported with its reason so the
+    /// operator knows which tokens may still be live.
+    #[tokio::test]
+    async fn one_failed_revocation_is_reported_and_the_rest_still_revoked() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) = revoking_server(vec![
+            crate::net::TestResponse::json(200, "{}"),
+            crate::net::TestResponse::json(500, "{}"),
+            crate::net::TestResponse::json(200, "{}"),
+        ])
+        .await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
+            .await
+            .expect("listing the sessions");
+
+        assert_eq!(revoke_requests(&log).len(), 3, "a failure stopped the walk");
+        assert!(
+            report.late.is_empty(),
+            "the first walk missed sessions a re-list had to find: {:?}",
+            report.late
+        );
+        assert_eq!(
+            report.revoked,
+            vec![SUBS[0].to_string(), SUBS[2].to_string()]
+        );
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert_eq!(report.failed[0].0, SUBS[1]);
+        assert!(
+            report.failed[0].1.contains("status 500"),
+            "the reason was lost: {}",
+            report.failed[0].1
+        );
+        assert_eq!(
+            session_rows(&pool).await,
+            0,
+            "the failed session's row survived — the wipe would be the only thing removing it"
+        );
+    }
+
+    /// An unreadable row is reported as a failure AND deleted; an empty store
+    /// is an empty report.
+    #[tokio::test]
+    async fn an_unreadable_row_fails_and_is_deleted_and_an_empty_store_is_empty() {
+        let (pool, codec) = db().await;
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
+            .await
+            .unwrap();
+        assert_eq!(report, RevokeAllReport::default());
+
+        stored(&pool, &codec).await;
+        sqlx::query("UPDATE oauth_session SET issuer = ? WHERE sub = ?")
+            .bind("https://evil.example")
+            .bind(DID)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let report = revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
+            .await
+            .unwrap();
+        assert!(report.revoked.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, DID);
+        assert!(
+            report.failed[0].1.contains("reading the session"),
+            "{}",
+            report.failed[0].1
+        );
+        assert_eq!(session_rows(&pool).await, 0, "the unreadable row survived");
+    }
+
+    /// A CONFIDENTIAL client runtime (non-loopback public URL), with its
+    /// signing key in a per-test temp file rather than the working directory.
+    fn confidential_runtime(tag: &str) -> super::super::runtime::OauthRuntime {
+        super::super::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: Some(KEY.to_string()),
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-revoke-test-key-{}-{tag}.json",
+                    std::process::id()
+                )),
+                plc_directory: "https://plc.invalid".to_string(),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .expect("the confidential test runtime must build")
+    }
+
+    /// The `iat` of the client assertion in one recorded revocation request.
+    fn assertion_iat(raw: &str) -> i64 {
+        use base64::Engine as _;
+        let body = raw.split("\r\n\r\n").nth(1).expect("no request body");
+        let jwt = body
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("client_assertion="))
+            .unwrap_or_else(|| panic!("no client_assertion in {body}"));
+        let payload = jwt.split('.').nth(1).expect("malformed assertion");
+        let json: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .expect("assertion payload is not base64url"),
+        )
+        .expect("assertion payload is not JSON");
+        json["iat"].as_i64().expect("assertion has no iat")
+    }
+
+    /// **Each revocation's client assertion is minted at ITS OWN time.**
+    ///
+    /// A client assertion lives 60 s (`exp = iat + 60`). Taking one `now` at
+    /// the start of the walk and reusing it meant that once the walk passed a
+    /// minute — a few hundred sessions, or a handful of slow PDSes at the
+    /// five-second deadline — every later assertion was already expired when
+    /// sent. Each of those revocations is rejected as `invalid_client`, the row
+    /// is deleted anyway, and the teardown proceeds over live tokens.
+    ///
+    /// The clock here advances 100 s per reading, so a stale `now` shows up as
+    /// three identical `iat`s.
+    #[tokio::test]
+    async fn each_revocation_takes_the_time_afresh() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+
+        let mut tick = 0;
+        let clock = || {
+            let t = NOW + tick * 100;
+            tick += 1;
+            t
+        };
+        let report = revoke_all(
+            &confidential_runtime("clock"),
+            &reqwest::Client::new(),
+            &pool,
+            clock,
+        )
+        .await
+        .expect("listing the sessions");
+        assert_eq!(report.revoked.len(), 3, "{report:?}");
+
+        let iats: Vec<i64> = revoke_requests(&log)
+            .iter()
+            .map(|r| assertion_iat(r))
+            .collect();
+        assert_eq!(
+            iats,
+            vec![NOW, NOW + 100, NOW + 200],
+            "the assertions reused one timestamp — later ones would be expired on arrival"
+        );
+    }
+
+    // ── a refresh racing the sign-out ────────────────────────────────────────
+
+    /// Store a session with refresh token `refresh` under a fresh codec — what
+    /// the live app's refresh does, from its own process, with the same key.
+    async fn rotate_to(pool: &sqlx::SqlitePool, refresh: &str) {
+        let codec = super::super::crypto::Codec::new(Some(KEY)).unwrap();
+        let key = super::super::keys::SigningKey::generate("session");
+        let session = OAuthSession {
+            dpop_key_jwk: key.to_jwk_json().unwrap(),
+            ..session("access-rotated", refresh)
+        };
+        super::super::store::put_session(pool, &codec, &session)
+            .await
+            .unwrap();
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// **A refresh that rotates the row mid-sign-out gets ITS token revoked
+    /// too — and the new token's row is never deleted unrevoked.**
+    ///
+    /// The live app refreshes under an in-process lock the operator's
+    /// revoke-all (a separate process) cannot take. The sign-out read R1; the
+    /// app rotated to R2; the PDS answers 200 for the already-rotated R1; and
+    /// an unconditional delete then removed the row holding R2 — reported as
+    /// revoked, never revoked, and gone from the record the post-stop sweep
+    /// reads. The same interleaving reaches `/logout` against a request's
+    /// background refresh, which takes that lock while `/logout` does not.
+    #[tokio::test]
+    async fn a_session_rotated_mid_sign_out_has_the_new_token_revoked_too() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                let first = {
+                    let mut v = seen.lock().unwrap();
+                    v.push(s.refresh_token.clone());
+                    v.len() == 1
+                };
+                if first {
+                    // The app's refresh lands between our read and our delete.
+                    rotate_to(&pool, "refresh-R2").await;
+                }
+                Revocation::Revoked
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["refresh-xyz".to_string(), "refresh-R2".to_string()],
+            "the rotated token was never presented for revocation"
+        );
+        assert_eq!(outcome, Revocation::Revoked);
+        assert!(
+            super::super::store::get_session(&pool, &codec, DID)
+                .await
+                .unwrap()
+                .is_none(),
+            "the session survived a sign-out that revoked every version of it"
+        );
+    }
+
+    /// A row that keeps rotating is given up on after a bounded number of
+    /// attempts — reported as a failure, and the LATEST token left on record
+    /// (so a later pass can revoke it) rather than deleted unrevoked.
+    #[tokio::test]
+    async fn a_session_that_keeps_rotating_is_reported_and_left_in_place() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                let n = {
+                    let mut v = seen.lock().unwrap();
+                    v.push(s.refresh_token.clone());
+                    v.len()
+                };
+                rotate_to(&pool, &format!("refresh-R{}", n + 1)).await;
+                Revocation::Revoked
+            }
+        })
+        .await;
+
+        let attempts = seen.lock().unwrap().len();
+        assert_eq!(attempts, 3, "the retries were not bounded at 3");
+        match &outcome {
+            Revocation::Failed(reason) => assert!(
+                reason.contains("kept changing"),
+                "failed for the wrong reason: {reason}"
+            ),
+            other => panic!("a still-rotating session must not report success: {other:?}"),
+        }
+        let left = super::super::store::get_session(&pool, &codec, DID)
+            .await
+            .unwrap()
+            .expect("the newest token was deleted unrevoked");
+        assert_eq!(left.refresh_token, "refresh-R4");
+    }
+
+    // ── sessions that appear during the walk ─────────────────────────────────
+
+    async fn insert_raw(pool: &sqlx::SqlitePool, sub: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO oauth_session (sub, issuer, aud, dpop_key_jwk, \
+             access_token, refresh_token, token_type, granted_scope, expires_at) \
+             VALUES (?, 'https://as.invalid', 'https://pds.invalid', 'x', 'x', 'x', \
+             'DPoP', 'atproto', NULL)",
+        )
+        .bind(sub)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// **A session created during the walk is found and signed out too.**
+    ///
+    /// The main pass runs while the app still serves (it must — the PDSes
+    /// fetch our client metadata to authenticate the revocation), so a login
+    /// can land behind the walk's cursor. Defence in depth: after the walk the
+    /// store is listed again, and anything new is walked as well.
+    #[tokio::test]
+    async fn a_session_created_during_the_walk_is_signed_out_by_a_re_list() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                async move {
+                    let first = {
+                        let mut c = calls.lock().unwrap();
+                        c.push(sub.clone());
+                        c.len() == 1
+                    };
+                    if first {
+                        // A user logs in while the first session is revoked.
+                        insert_raw(&pool, SUBS[1]).await;
+                    }
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![SUBS[0].to_string(), SUBS[1].to_string()],
+            "the session created mid-walk was never signed out"
+        );
+        assert_eq!(report.late, vec![SUBS[1].to_string()]);
+        assert_eq!(report.revoked.len(), 2);
+        assert_eq!(session_rows(&pool).await, 0);
+    }
+
+    /// The re-list is bounded: a store that keeps refilling is walked at most
+    /// twice more, and what remains is reported as FAILED (so the exit code
+    /// and the teardown say so) rather than looping forever.
+    #[tokio::test]
+    async fn the_re_list_is_bounded_and_reports_what_remains() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push(sub);
+                    // Never removed: it keeps coming back.
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "not bounded at 1 + 2 passes"
+        );
+        let still = report
+            .failed
+            .iter()
+            .find(|(sub, _)| sub == SUBS[0])
+            .expect("a session still stored after every pass was not reported");
+        assert!(still.1.contains("still stored"), "{}", still.1);
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "one entry per DID: {:?}",
+            report.failed
+        );
+        assert!(
+            report.revoked.is_empty(),
+            "a DID still stored at the end was ALSO reported revoked: {:?}",
+            report.revoked
+        );
+        assert!(
+            report.late.is_empty(),
+            "a row present from the start is not one that appeared during the walk"
+        );
+    }
+
+    /// **The report is the FINAL outcome per DID.** A session that fails in
+    /// the first pass (left in place — it kept rotating) and is revoked by the
+    /// re-list is revoked: reporting it as failed too made the run exit 3 and
+    /// warn that its tokens "may stay live" when they had been revoked. And a
+    /// row there from the start is not "late".
+    #[tokio::test]
+    async fn a_did_that_fails_then_succeeds_is_reported_revoked_only() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let calls: Seen = Default::default();
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                async move {
+                    let n = {
+                        let mut c = calls.lock().unwrap();
+                        c.push(sub.clone());
+                        c.len()
+                    };
+                    if n == 1 {
+                        // Kept rotating: left in place, reported failed.
+                        return Revocation::Failed("kept changing".into());
+                    }
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Revoked
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(report.revoked, vec![SUBS[0].to_string()]);
+        assert!(
+            report.failed.is_empty(),
+            "a DID revoked by the re-list is still reported failed: {:?}",
+            report.failed
+        );
+        assert!(
+            report.late.is_empty(),
+            "mislabelled as late: {:?}",
+            report.late
+        );
+    }
+
+    /// **One failure does not end the first walk.** Each failing session here
+    /// is still deleted (as a real sign-out does), so a walk that stopped at
+    /// the first failure and left the rest to the re-list would get through
+    /// only three of four sessions before running out of passes — and report
+    /// the fourth "still stored", never attempted.
+    #[tokio::test]
+    async fn every_session_is_attempted_in_the_first_walk_despite_failures() {
+        let (pool, _) = db().await;
+        let subs = [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "did:plc:cccccccccccccccccccccccc",
+            "did:plc:dddddddddddddddddddddddd",
+        ];
+        for sub in subs {
+            insert_raw(&pool, sub).await;
+        }
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |sub, _| {
+                let pool = pool.clone();
+                async move {
+                    super::super::store::delete_session(&pool, &sub)
+                        .await
+                        .unwrap();
+                    Revocation::Failed("the PDS said no".into())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.failed.len(), 4, "{:?}", report.failed);
+        assert!(
+            report
+                .failed
+                .iter()
+                .all(|(_, reason)| reason == "the PDS said no"),
+            "a session was never attempted: {:?}",
+            report.failed
+        );
+    }
+
+    /// A DID that fails in every pass is ONE failed entry, with the last
+    /// reason — not one per pass.
+    #[tokio::test]
+    async fn a_did_that_fails_every_pass_is_one_failed_entry() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+
+        let report = revoke_all_with(
+            &pool,
+            || NOW,
+            |_, _| async { Revocation::Failed("kept changing".into()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "the same DID was counted once per pass: {:?}",
+            report.failed
+        );
+        assert_eq!(report.failed[0].0, SUBS[0]);
+        assert!(report.revoked.is_empty() && report.late.is_empty());
+    }
+
+    /// A row that disappears mid-sign-out (a concurrent `/logout`) is not an
+    /// error and not retried: the token that was read has been revoked, and
+    /// there is nothing left to delete.
+    #[tokio::test]
+    async fn a_session_deleted_mid_sign_out_reports_the_revocation() {
+        let (pool, codec) = db().await;
+        stored(&pool, &codec).await;
+        let seen: Seen = Default::default();
+
+        let outcome = sign_out_with(&pool, &codec, DID, TEST_DEADLINE, |s| {
+            let (pool, seen) = (pool.clone(), seen.clone());
+            async move {
+                seen.lock().unwrap().push(s.refresh_token.clone());
+                super::super::store::delete_session(&pool, DID)
+                    .await
+                    .unwrap();
+                Revocation::Revoked
+            }
+        })
+        .await;
+        assert_eq!(outcome, Revocation::Revoked);
+        assert_eq!(seen.lock().unwrap().len(), 1, "retried a row that was gone");
+    }
+
+    // ── the pre-flight: the secrets are the production ones ──────────────────
+
+    /// A JWKS server over real TLS serving `doc` at `/oauth/jwks.json` (or
+    /// nothing, when `doc` is `None`). Returns the URL to check.
+    async fn jwks_server(doc: Option<String>) -> String {
+        let (addr, _log) = crate::net::spawn_tls(move |_| {
+            let mut r = std::collections::HashMap::new();
+            if let Some(doc) = doc {
+                r.insert(
+                    "/oauth/jwks.json".to_string(),
+                    vec![crate::net::TestResponse::json(200, doc)],
+                );
+            }
+            r
+        })
+        .await;
+        // `localhost`: the pre-flight's own-JWKS client does plain DNS (no
+        // test override), and the leaf certificate covers this name.
+        format!("https://localhost:{}/oauth/jwks.json", addr.port())
+    }
+
+    async fn pool_with_readable_session(codec_key: &str) -> sqlx::SqlitePool {
+        let (pool, _) = db().await;
+        let codec = super::super::crypto::Codec::new(Some(codec_key)).unwrap();
+        stored(&pool, &codec).await;
+        pool
+    }
+
+    /// **A wrong (or rotated) encryption key is refused before anything is
+    /// signed out.** It decrypts nothing, so every sign-out would hit an
+    /// unreadable row — and delete it. The run "completed", the teardown
+    /// wiped, and every token was dropped unrevoked.
+    #[tokio::test]
+    async fn a_wrong_encryption_key_is_refused_by_the_preflight() {
+        let rt = confidential_runtime("wrongenc");
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let pool = pool_with_readable_session(other).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("a key that decrypts nothing was accepted");
+        assert!(format!("{err:#}").contains("ENCRYPTION_KEY"), "{err:#}");
+        assert_eq!(
+            session_rows(&pool).await,
+            1,
+            "the preflight deleted something"
+        );
+    }
+
+    /// Some rows readable and some not is a real store with a few unreadable
+    /// rows (which the walk reports as failed) — not a wrong key.
+    #[tokio::test]
+    async fn some_unreadable_rows_do_not_fail_the_preflight() {
+        let rt = confidential_runtime("someunread");
+        let pool = pool_with_readable_session(KEY).await;
+        insert_raw(&pool, SUBS[1]).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("one readable row proves the key");
+    }
+
+    /// The loaded signing key must be the one the app SERVES. A different
+    /// key — a relative key path resolved in the wrong directory — signs
+    /// assertions no PDS can verify, and every row would be deleted unrevoked.
+    /// Refused on the sweep too: a fetched mismatch is never "expected".
+    #[tokio::test]
+    async fn a_signing_key_the_app_does_not_serve_is_refused() {
+        let rt = confidential_runtime("wrongsig");
+        let pool = pool_with_readable_session(KEY).await;
+        let stranger = super::super::keys::SigningKey::generate(super::super::runtime::CLIENT_KID);
+        let url = jwks_server(Some(stranger.jwks_document().unwrap().to_string())).await;
+
+        for sweep in [false, true] {
+            let err = preflight(
+                &rt,
+                &pool,
+                &url,
+                PreflightOptions {
+                    sweep,
+                    accept_unreadable: false,
+                },
+            )
+            .await
+            .expect_err("a signing key the PDSes have never seen was accepted");
+            assert!(
+                format!("{err:#}").contains("is not the key the app serves"),
+                "{err:#}"
+            );
+        }
+        assert_eq!(session_rows(&pool).await, 1);
+    }
+
+    /// The matching key passes.
+    #[tokio::test]
+    async fn the_served_signing_key_passes_the_preflight() {
+        let rt = confidential_runtime("rightsig");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("the served key was refused");
+    }
+
+    /// An unreachable JWKS refuses the main pass (the app is meant to be up)
+    /// but not the post-stop sweep (it is meant to be down).
+    #[tokio::test]
+    async fn an_unreachable_jwks_refuses_the_main_pass_but_not_the_sweep() {
+        let rt = confidential_runtime("nojwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = jwks_server(None).await;
+
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("an unverifiable signing key was accepted on the main pass");
+        assert!(format!("{err:#}").contains("could not fetch"), "{err:#}");
+        preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: true,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect("the sweep cannot reach a stopped app's JWKS, and must not need to");
+    }
+
+    /// **The `Null` codec is refused even though everything else passes.** It
+    /// "decrypts" by returning the stored value unchanged, so every row looks
+    /// readable to the decrypt check; the served key matches. Only the fitness
+    /// check stands between it and revoking with ciphertext for tokens.
+    #[tokio::test]
+    async fn a_null_codec_runtime_is_refused_even_when_the_rest_passes() {
+        let rt = super::super::runtime::OauthRuntime::new(&crate::config::Config {
+            repo_backend: crate::metrics::Backend::Rust,
+            public_url: "https://feather-reader.com".into(),
+            oauth: crate::config::OauthConfig {
+                encryption_key: None,
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-revoke-test-key-{}-nullcodec.json",
+                    std::process::id()
+                )),
+                plc_directory: "https://plc.invalid".to_string(),
+                ..crate::config::OauthConfig::default()
+            },
+            ..crate::config::Config::default()
+        })
+        .unwrap();
+        assert!(matches!(rt.codec, super::super::crypto::Codec::Null));
+        let (pool, _) = db().await;
+        stored(&pool, &rt.codec).await;
+        let url = jwks_server(Some(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        ))
+        .await;
+
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: false,
+            },
+        )
+        .await
+        .expect_err("the Null codec was accepted");
+        assert!(format!("{err:#}").contains("encryption key"), "{err:#}");
+    }
+
+    /// With nothing stored there is nothing to protect: no check, no request.
+    #[tokio::test]
+    async fn an_empty_store_needs_no_preflight() {
+        let rt = confidential_runtime("emptypre");
+        let (pool, _) = db().await;
+        preflight(
+            &rt,
+            &pool,
+            "https://unreachable.invalid/oauth/jwks.json",
+            PreflightOptions::default(),
+        )
+        .await
+        .expect("an empty store was refused");
+    }
+
+    /// **A session that moves to another issuer mid sign-out has its new
+    /// token presented ONLY to the new issuer.**
+    ///
+    /// The re-read after a compare-and-delete mismatch can be a different
+    /// grant (a re-login after a PDS migration). Reusing the endpoint
+    /// discovered for the first read posted the new refresh token to the OLD
+    /// authorization server — a credential leak to a server that never issued
+    /// it — which answers 200 for an unknown token: reported revoked, row
+    /// deleted, the real grant left live. Two fake authorization servers; the
+    /// old one must never see the new token.
+    #[tokio::test]
+    async fn a_session_that_moves_issuer_mid_sign_out_is_revoked_at_its_own_issuer() {
+        let (pool, codec) = db().await;
+        let ok = || vec![crate::net::TestResponse::json(200, "{}")];
+        let (pds_a, iss_a, log_a) = revoking_server(ok()).await;
+        let (pds_b, iss_b, log_b) = revoking_server(ok()).await;
+        assert_ne!(iss_a, iss_b, "precondition: two distinct issuers");
+
+        let at = |pds: &str, iss: &str, refresh: &str| OAuthSession {
+            sub: DID.into(),
+            issuer: iss.into(),
+            aud: pds.into(),
+            dpop_key_jwk: super::super::keys::SigningKey::generate("session")
+                .to_jwk_json()
+                .unwrap(),
+            ..session("access", refresh)
+        };
+        super::super::store::put_session(&pool, &codec, &at(&pds_a, &iss_a, "refresh-A"))
+            .await
+            .unwrap();
+        let moved = at(&pds_b, &iss_b, "refresh-B");
+
+        let (rt, http, cache) = (runtime(), reqwest::Client::new(), EndpointCache::default());
+        let (rt, http, cache, pool_ref) = (&rt, &http, &cache, &pool);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let (first, moved) = (&first, &moved);
+        let outcome = sign_out_with(
+            &pool,
+            &codec,
+            DID,
+            std::time::Duration::from_secs(10),
+            |s| async move {
+                let r = revoke_at_own_issuer(rt, http, pool_ref, cache, &s, NOW).await;
+                if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // A re-login at the new PDS lands between read and delete.
+                    let codec = super::super::crypto::Codec::new(Some(KEY)).unwrap();
+                    super::super::store::put_session(pool_ref, &codec, moved)
+                        .await
+                        .unwrap();
+                }
+                r
+            },
+        )
+        .await;
+
+        let a = revoke_requests(&log_a).join("\n");
+        let b = revoke_requests(&log_b).join("\n");
+        assert!(
+            a.contains("token=refresh-A"),
+            "the first grant was never revoked:\n{a}"
+        );
+        assert!(
+            !a.contains("refresh-B"),
+            "the NEW grant's refresh token was sent to the OLD authorization server:\n{a}"
+        );
+        assert!(
+            b.contains("token=refresh-B"),
+            "the new grant was never revoked at its own issuer:\n{b}"
+        );
+        assert_eq!(outcome, Revocation::Revoked);
+        assert_eq!(session_rows(&pool).await, 0);
+    }
+
+    /// The app's JWKS served on `https://localhost:PORT` — loopback, which the
+    /// SSRF guard refuses. Returns the URL.
+    async fn local_jwks(doc: String) -> String {
+        let (addr, _log) = crate::net::spawn_tls(move |_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert(
+                "/oauth/jwks.json".to_string(),
+                vec![crate::net::TestResponse::json(200, doc)],
+            );
+            r
+        })
+        .await;
+        format!("https://localhost:{}/oauth/jwks.json", addr.port())
+    }
+
+    /// **The app's own JWKS is operator config, not attacker input.** A
+    /// self-host with split-horizon DNS (its hostname resolving to a LAN or
+    /// loopback address from inside) serves it on exactly the addresses the
+    /// SSRF guard refuses — so with the guarded fetcher the main pass could
+    /// never pass. It is fetched with a plain, bounded, https-only client.
+    #[tokio::test]
+    async fn a_jwks_on_a_loopback_address_passes_the_preflight() {
+        let rt = confidential_runtime("loopjwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let url = local_jwks(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        )
+        .await;
+        preflight(&rt, &pool, &url, PreflightOptions::default())
+            .await
+            .expect("the app's own JWKS on loopback was refused");
+    }
+
+    /// https only: the key check is worthless over a channel anyone on the
+    /// path can rewrite.
+    #[tokio::test]
+    async fn a_plain_http_jwks_url_is_refused() {
+        let rt = confidential_runtime("httpjwks");
+        let pool = pool_with_readable_session(KEY).await;
+        let err = preflight(
+            &rt,
+            &pool,
+            "http://localhost:9/oauth/jwks.json",
+            PreflightOptions::default(),
+        )
+        .await
+        .expect_err("an http JWKS was accepted");
+        assert!(format!("{err:#}").contains("https"), "{err:#}");
+    }
+
+    /// **`--accept-unreadable` proceeds past "no row decrypts" — and only
+    /// that.** The operator's way out for a store that is legitimately all
+    /// unreadable (only pre-AAD rows; the key rotated with no logins since).
+    #[tokio::test]
+    async fn accept_unreadable_passes_an_all_unreadable_store() {
+        let rt = confidential_runtime("acceptok");
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        insert_raw(&pool, SUBS[1]).await;
+        let url = local_jwks(
+            rt.client_key
+                .as_ref()
+                .unwrap()
+                .jwks_document()
+                .unwrap()
+                .to_string(),
+        )
+        .await;
+
+        let refused = preflight(&rt, &pool, &url, PreflightOptions::default())
+            .await
+            .expect_err("without the flag an all-unreadable store must be refused");
+        assert!(
+            format!("{refused:#}").contains("--accept-unreadable"),
+            "{refused:#}"
+        );
+
+        let accept = PreflightOptions {
+            sweep: false,
+            accept_unreadable: true,
+        };
+        preflight(&rt, &pool, &url, accept)
+            .await
+            .expect("the override did not override");
+        assert_eq!(
+            session_rows(&pool).await,
+            2,
+            "the preflight deleted something"
+        );
+    }
+
+    /// The override does NOT relax the signing-key check …
+    #[tokio::test]
+    async fn accept_unreadable_does_not_bypass_the_signing_key_check() {
+        let rt = confidential_runtime("acceptsig");
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let stranger = super::super::keys::SigningKey::generate(super::super::runtime::CLIENT_KID);
+        let url = local_jwks(stranger.jwks_document().unwrap().to_string()).await;
+        let err = preflight(
+            &rt,
+            &pool,
+            &url,
+            PreflightOptions {
+                sweep: false,
+                accept_unreadable: true,
+            },
+        )
+        .await
+        .expect_err("--accept-unreadable bypassed the signing-key check");
+        assert!(
+            format!("{err:#}").contains("is not the key the app serves"),
+            "{err:#}"
+        );
+    }
+
+    /// … nor the production-client check.
+    #[tokio::test]
+    async fn accept_unreadable_does_not_bypass_the_client_check() {
+        let (pool, _) = db().await;
+        insert_raw(&pool, SUBS[0]).await;
+        let err = preflight(
+            &runtime(),
+            &pool,
+            "https://localhost:9/oauth/jwks.json",
+            PreflightOptions {
+                sweep: true,
+                accept_unreadable: true,
+            },
+        )
+        .await
+        .expect_err("--accept-unreadable bypassed the client check");
+        assert!(format!("{err:#}").contains("public dev client"), "{err:#}");
     }
 }

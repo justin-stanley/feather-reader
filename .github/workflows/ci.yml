@@ -383,3 +383,18 @@ jobs:
               validate --adapter caddyfile --config /etc/caddy/Caddyfile
             echo "::endgroup::"
           done
+
+  teardown:
+    name: Teardown script (revoke order + refusals)
+    # deploy/teardown.sh is the one script that deletes every user's data, and
+    # nothing exercised it: on the rust backend it revoked no sessions at all
+    # (#257) and no check noticed. This runs it against throwaway SQLite files
+    # with stubbed revoke/stop commands and pins the order and the refusals.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Ensure sqlite3
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+      - name: Test deploy/teardown.sh
+        run: bash scripts/test-teardown.sh
