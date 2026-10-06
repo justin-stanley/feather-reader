@@ -10,10 +10,12 @@
 //!    exponential backoff hint on error. A `304 Not Modified` is a no-op:
 //!    the feed is untouched apart from bumping its next-poll time.
 //! 2. **Safety** — every entry's HTML is run through `ammonia` before it is
-//!    ever stored (and therefore before it is ever rendered). Scripts, event
-//!    handlers, `javascript:` URLs, tracking pixels' dangerous attributes, and
-//!    other XSS vectors are stripped. Feeds carrying `<script>` is not
-//!    hypothetical; treat all feed HTML as untrusted.
+//!    ever stored. Scripts, event handlers, `javascript:` URLs, tracking
+//!    pixels' dangerous attributes, and other XSS vectors are stripped. Feeds
+//!    carrying `<script>` is not hypothetical; treat all feed HTML as
+//!    untrusted. The reader does not rely on this alone: it re-cleans the
+//!    stored body with the same `sanitize_html` at render, through
+//!    [`crate::sanitized_html::SanitizedHtml`] (#151).
 //! 3. **Robustness** — a malformed feed is **logged and skipped**, never a
 //!    panic. One bad publisher must not take down the poller. All non-test
 //!    paths use `Result`/`anyhow`; there are no `unwrap`/`expect`s.
@@ -3548,5 +3550,190 @@ mod tests {
         }
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
         assert!(is_storable_feed_url("http://example.com/feed.xml", true));
+    }
+
+    /// **What re-cleaning a stored body at render costs (#151).** Not a test: a
+    /// measurement, kept so the numbers in the PR can be reproduced.
+    ///
+    /// ```text
+    /// FEATHER_BENCH_FEEDS=/path/to/dir/of/feed/files \
+    ///   cargo test --release --lib render_reclean_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// 1. Typical bodies: real feed documents from that directory, put through
+    ///    `normalize_entry` so each is exactly what ingest would store, then
+    ///    re-cleaned. Also counts bodies the re-clean changed or cut.
+    /// 2. Unbudgeted: #226's quadratic inputs in their stored (fixed-point)
+    ///    form, up to the 2 MiB stored bound, through the bare sanitizer — what
+    ///    a page view would cost with no render budgets.
+    ///    `FEATHER_BENCH_UNCAPPED_MAX=<bytes>` skips the larger sizes (2 MiB of
+    ///    nesting takes ~40 s).
+    /// 3. Budgeted: the worst shapes found, each ~2 MiB, through
+    ///    `SanitizedHtml::clean` — what a page view costs now.
+    #[test]
+    #[ignore = "benchmark; see the doc comment"]
+    fn render_reclean_cost() {
+        use crate::sanitized_html::{SanitizedHtml, MAX_RENDER_DEPTH};
+        use std::time::{Duration, Instant};
+
+        fn pct(sorted: &[Duration], p: f64) -> Duration {
+            sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
+        }
+
+        if let Ok(dir) = std::env::var("FEATHER_BENCH_FEEDS") {
+            let mut times = Vec::new();
+            let mut sizes = Vec::new();
+            let (mut changed, mut cut, mut files) = (0usize, 0usize, 0usize);
+            for path in std::fs::read_dir(&dir).unwrap() {
+                let bytes = std::fs::read(path.unwrap().path()).unwrap();
+                let Ok(parsed) = parse_feed(&bytes) else {
+                    continue;
+                };
+                files += 1;
+                for e in &parsed.entries {
+                    let Some(stored) = normalize_entry(e).content_html else {
+                        continue;
+                    };
+                    // Best of three, to take scheduler noise out of a small body.
+                    let mut best = Duration::MAX;
+                    let mut out = None;
+                    for _ in 0..3 {
+                        let t = Instant::now();
+                        out = Some(SanitizedHtml::clean(&stored));
+                        best = best.min(t.elapsed());
+                    }
+                    let out = out.unwrap();
+                    changed += usize::from(out.as_str() != stored);
+                    cut += usize::from(out.is_truncated());
+                    times.push(best);
+                    sizes.push(stored.len());
+                }
+            }
+            times.sort();
+            sizes.sort();
+            println!(
+                "real feeds: {files} files, {} bodies; size p50 {} B, p99 {} B, max {} B",
+                times.len(),
+                sizes[sizes.len() / 2],
+                sizes[((sizes.len() - 1) as f64 * 0.99).round() as usize],
+                sizes[sizes.len() - 1],
+            );
+            println!(
+                "  re-clean p50 {:?}, p99 {:?}, max {:?}; changed by re-cleaning: {changed}; cut by the budgets: {cut}",
+                pct(&times, 0.5),
+                pct(&times, 0.99),
+                times[times.len() - 1],
+            );
+        }
+
+        let bound = MAX_CONTENT_HTML_BYTES;
+        let uncapped_max = std::env::var("FEATHER_BENCH_UNCAPPED_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(bound);
+        for size in [bound / 8, bound / 4, bound / 2, bound] {
+            if size > uncapped_max {
+                continue;
+            }
+            let depth = size / 11;
+            for (name, stored) in [
+                (
+                    "'&' run",
+                    format!("<p>{}</p>", "&amp;".repeat((size - 7) / 5)),
+                ),
+                (
+                    "U+00A0 run",
+                    format!("<p>{}</p>", "&nbsp;".repeat((size - 7) / 6)),
+                ),
+                (
+                    "nested <div>",
+                    format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth)),
+                ),
+                ("plain text", format!("<p>{}</p>", "a".repeat(size - 7))),
+            ] {
+                let t = Instant::now();
+                let out = sanitize_html(&stored);
+                println!(
+                    "unbudgeted {name:>13} {:>8} B: {:?} (fixed point: {})",
+                    stored.len(),
+                    t.elapsed(),
+                    out == stored
+                );
+            }
+        }
+
+        let fill = |unit: &str| unit.repeat(bound / unit.len());
+        let at_depth = |open: &str, close: &str| {
+            format!(
+                "{}x{}",
+                open.repeat(MAX_RENDER_DEPTH),
+                close.repeat(MAX_RENDER_DEPTH)
+            )
+        };
+        let worst = [
+            ("open <div> run", fill("<div>")),
+            ("open <ul><li> run", fill("<ul><li>")),
+            ("open <blockquote> run", fill("<blockquote>")),
+            (
+                "<div> at depth bound, repeated",
+                fill(&at_depth("<div>", "</div>")),
+            ),
+            (
+                "<li> at depth bound, repeated",
+                fill(&format!(
+                    "{}x{}",
+                    "<ul><li>".repeat(MAX_RENDER_DEPTH / 2),
+                    "</li></ul>".repeat(MAX_RENDER_DEPTH / 2)
+                )),
+            ),
+            (
+                "<blockquote> at depth bound, rep.",
+                fill(&at_depth("<blockquote>", "</blockquote>")),
+            ),
+            (
+                "misnested formatting (not ingest)",
+                format!(
+                    "<p>{}</p>{}",
+                    (0..MAX_RENDER_DEPTH - 2)
+                        .map(|i| format!(r#"<b title="{i}">"#))
+                        .collect::<String>(),
+                    "<p>x</p>".repeat(bound / 64 / 8)
+                ),
+            ),
+            (
+                "&amp; then text",
+                format!(
+                    "<p>{}{}",
+                    "&amp;".repeat(20_000),
+                    "a".repeat(bound - 100_010)
+                ),
+            ),
+            (
+                "&amp; + 95 a, interleaved",
+                format!("<p>{}", fill(&format!("&amp;{}", "a".repeat(95)))),
+            ),
+            (
+                "U+00A0 then text",
+                format!(
+                    "<p>{}{}",
+                    "\u{a0}".repeat(20_000),
+                    "a".repeat(bound - 40_010)
+                ),
+            ),
+            ("dense &amp;", format!("<p>{}", fill("&amp;"))),
+            ("dense U+00A0", format!("<p>{}", fill("\u{a0}"))),
+            ("plain text", format!("<p>{}", fill("a"))),
+        ];
+        for (name, input) in &worst {
+            let t = Instant::now();
+            let out = SanitizedHtml::clean(input);
+            println!(
+                "budgeted {name:>32} ({:>7} B in, {:>7} B out, cut {}): {:?}",
+                input.len(),
+                out.as_str().len(),
+                out.is_truncated(),
+                t.elapsed()
+            );
+        }
     }
 }

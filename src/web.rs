@@ -80,6 +80,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::lexicon::{self, Folder, Saved, Subscription};
 use crate::safe_link::SafeLink;
+use crate::sanitized_html::SanitizedHtml;
 use crate::{feed, store, AppState, Session, VERSION};
 
 // The OPML import/export module lives at `src/opml.rs` but isn't declared in the
@@ -1734,7 +1735,15 @@ struct EntryTemplate {
     /// all 679 tests still green. `None` is the refusal: the template's
     /// no-URL branch already renders a disabled open-original button.
     url: Option<SafeLink>,
-    content_html: Option<String>,
+    /// The article body, **re-sanitized for this render** (#151).
+    ///
+    /// Not the stored `String`: that reached the page through `|safe` and was
+    /// safe only because `feed.rs` had sanitized it at ingest — the same
+    /// every-writer-remembers guard `url` above used to rest on, and the more
+    /// dangerous of the two. A [`SanitizedHtml`] can only be built by running
+    /// the ingest sanitizer, so the template renders it unescaped without a
+    /// `|safe` on a raw string anywhere.
+    content_html: Option<SanitizedHtml>,
     read: bool,
     starred: bool,
     /// The query string to carry the reading context back to the list.
@@ -2928,6 +2937,13 @@ async fn entry_view(
 
     let back_qs = scope_query(&q);
 
+    // Re-sanitize the stored body for this render, off the async runtime: the
+    // sanitizer can take seconds on a hostile body (#226).
+    let content_html = match entry.content_html.clone() {
+        Some(raw) => Some(SanitizedHtml::clean_off_runtime(raw).await?),
+        None => None,
+    };
+
     let (folder_views, loose_feeds, _) =
         build_sidebar(&state, &did, &subs, q.feed.as_deref(), q.folder.as_deref()).await;
     let nav_view = match q.view.as_deref() {
@@ -2960,7 +2976,7 @@ async fn entry_view(
         author: entry.author.clone().filter(|a| !a.trim().is_empty()),
         published: display_date(entry.published.as_deref()),
         url: entry.url.as_deref().and_then(SafeLink::external_opt),
-        content_html: entry.content_html.clone(),
+        content_html,
         read,
         starred,
         back_qs,
@@ -9836,6 +9852,182 @@ mod tests {
         assert!(
             benign.contains("Original \u{2197}"),
             "a legitimate entry lost its byline link: {benign}",
+        );
+    }
+
+    /// **The reader view's body, through the actual handler (#151).**
+    ///
+    /// `entry.html` used to emit `content_html` with `|safe`, trusting that
+    /// `feed.rs` had run `ammonia` at ingest. This writes hostile markup into
+    /// the column DIRECTLY — `store::insert_entries` does not sanitize — which
+    /// is the state the ingest guard cannot speak for, and asserts that none of
+    /// it is live on the page.
+    ///
+    /// **Both directions.** A fix that escapes the whole body (or drops it)
+    /// passes every negative below and breaks every real article, so the same
+    /// render must also carry the benign markup through as markup, and an
+    /// already-clean body must come out byte-identical.
+    #[tokio::test]
+    async fn a_hostile_stored_body_renders_inert_on_the_reader_page() {
+        let did = "did:plc:readerbody";
+        let state = test_state(&[]).await;
+        store::grant_access(&state.db, did, None, "test", None)
+            .await
+            .unwrap();
+        let feed = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: "https://body.example/feed.xml".to_string(),
+                title: Some("Body".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hostile_body = concat!(
+            "<p>kept <b>bold</b></p>",
+            "<script>alert(1)</script>",
+            r#"<img src="x" onerror="alert(2)">"#,
+            r#"<a href="javascript:alert(3)">click</a>"#,
+            r#"<iframe src="https://evil.example/"></iframe>"#,
+            r#"<p onclick="alert(4)" style="color:red">tail</p>"#,
+        );
+        // Already-clean: the shape ingest stores. It must render unchanged.
+        let clean_body = concat!(
+            "<h2>Heading</h2>",
+            r#"<p>Text with <a href="https://body.example/x" rel="noopener noreferrer">a link</a>, "#,
+            "<em>emphasis</em> &amp; an entity, &lt;angle&gt; brackets.</p>",
+            "<pre><code>if a &lt; b &amp;&amp; c { }</code></pre>",
+            r#"<ul><li>one</li><li>two</li></ul><img src="https://body.example/i.png" alt="i">"#,
+        );
+        store::insert_entries(
+            &state.db,
+            feed,
+            &[
+                store::NewEntry {
+                    guid: "hostile-body".to_string(),
+                    title: Some("Hostile body".to_string()),
+                    published: Some("2026-07-11T00:00:00Z".to_string()),
+                    content_html: Some(hostile_body.to_string()),
+                    ..Default::default()
+                },
+                store::NewEntry {
+                    guid: "clean-body".to_string(),
+                    title: Some("Clean body".to_string()),
+                    published: Some("2026-07-10T00:00:00Z".to_string()),
+                    content_html: Some(clean_body.to_string()),
+                    ..Default::default()
+                },
+                store::NewEntry {
+                    guid: "deep-body".to_string(),
+                    title: Some("Deep body".to_string()),
+                    published: Some("2026-07-09T00:00:00Z".to_string()),
+                    content_html: Some(format!(
+                        "<p>start</p>{}DEEP",
+                        "<div>".repeat(crate::sanitized_html::MAX_RENDER_DEPTH + 1)
+                    )),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, did, &[feed])
+            .await
+            .unwrap();
+        let rows = store::entries_for_feed(&state.db, did, feed).await.unwrap();
+        let id_of = |guid: &str| {
+            rows.iter()
+                .find(|r| r.guid == guid)
+                .unwrap_or_else(|| panic!("{guid} was not inserted"))
+                .id
+        };
+
+        let cookie = session_cookie(&state, did, None);
+        let app = router(state.clone());
+        // The article body only: `base.html` carries the app's own `<script>`
+        // tags, which are not what this is about.
+        let prose = |id: i64| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/entries/{id}"))
+                            .header(header::COOKIE, cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let page = String::from_utf8(
+                    axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                let start = page
+                    .find(r#"<div class="prose">"#)
+                    .unwrap_or_else(|| panic!("no prose block: {page}"));
+                let end = page[start..]
+                    .find("</article>")
+                    .map(|e| start + e)
+                    .unwrap_or_else(|| panic!("no </article>: {page}"));
+                page[start..end].to_string()
+            }
+        };
+
+        let hostile = prose(id_of("hostile-body")).await;
+        let lower = hostile.to_ascii_lowercase();
+        for needle in [
+            "<script",
+            "alert(1)",
+            "onerror",
+            "javascript:",
+            "<iframe",
+            "onclick",
+        ] {
+            assert!(
+                !lower.contains(needle),
+                "`{needle}` from a stored body reached the reader page: {hostile}",
+            );
+        }
+        // Rendered as markup, not escaped: the benign parts survive as tags.
+        assert!(
+            hostile.contains("<p>kept <b>bold</b></p>"),
+            "the benign markup did not render as markup: {hostile}",
+        );
+        assert!(
+            hostile.contains(r#"<img src="x">"#)
+                && hostile.contains(r#"<a rel="noopener noreferrer">click</a>"#),
+            "the sanitizer's output did not reach the page: {hostile}",
+        );
+
+        let clean = prose(id_of("clean-body")).await;
+        assert!(
+            clean.contains(clean_body),
+            "an already-clean stored body did not render byte-identically: {clean}",
+        );
+        assert!(
+            !clean.contains("truncated-note"),
+            "a whole body was marked as cut: {clean}",
+        );
+
+        // Past the render budget: cut before the sanitizer, and the reader is
+        // told the rest is at the original rather than left at a silent stop.
+        let deep = prose(id_of("deep-body")).await;
+        assert!(
+            !deep.contains("DEEP"),
+            "nesting past the depth budget was rendered: {deep}",
+        );
+        assert!(
+            deep.contains("truncated-note"),
+            "a cut body did not say so: {deep}",
         );
     }
 

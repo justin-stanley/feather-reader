@@ -30,6 +30,8 @@
 //!   relay adoption probe). A projection, never a source of truth, and never on
 //!   a reader path.
 //! - [`web`]     — the axum router + askama server-rendered views.
+//! - [`sanitized_html`] — the reader's article body, re-sanitized at render
+//!   so the template never emits a stored string unescaped.
 //!
 //! **Status:** experimental / pre-1.0. See <https://feather-reader.com>.
 
@@ -46,6 +48,7 @@ pub mod readstate;
 pub mod repo;
 pub mod runtime_health;
 pub mod safe_link;
+pub mod sanitized_html;
 pub mod standard_site;
 pub mod store;
 pub mod vetted;

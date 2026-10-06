@@ -14,6 +14,59 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **The reader no longer renders a stored article body with `|safe` (#151).**
+  `EntryTemplate.content_html` was the stored `entries.content_html` string,
+  emitted into `entry.html` unescaped. It was safe only because ingest had
+  run `ammonia` over it in `feed.rs` — a procedural guard on another code
+  path, the same shape `SafeLink` replaced for the entry's links. Not a live
+  hole: ingest is the only writer and its sanitizing is tested.
+
+  **The mechanism.** New module `sanitized_html` with `SanitizedHtml`:
+  private fields, no `From<String>`, no `Deref`. Its only constructors run
+  ingest's own `feed::sanitize_html` (one policy, pinned byte for byte by a
+  test), and it implements askama's `HtmlSafe`, so `entry.html` renders it
+  with no `|safe` at all. The guarantee cannot ride through SQLite `TEXT`, so
+  the handler re-cleans the stored body on every view, on tokio's blocking
+  pool. Two `compile_fail` doctests, pinned to E0451 and E0277, show a raw
+  string cannot become one. A test that writes `<script>`, `onerror` and a
+  `javascript:` link straight into the column, bypassing ingest, failed
+  before the change: all three reached the page.
+
+  **Measured cost.** On 545 real bodies from 20 public feeds (release build),
+  re-cleaning took p50 25 µs, p99 0.8 ms, max 2.9 ms (a 561 KB body).
+  Re-cleaning is idempotent on all 545: identical bytes, so readers see no
+  change. The one known exception: a literal U+00A0 in a standard.site
+  plain-text summary comes back as `&nbsp;`, the same character; a test pins
+  that.
+
+  **Bounded worst case.** The sanitizer is quadratic on inputs a hostile feed
+  can store within the 2 MiB bound (#226). Unbounded, re-cleaning a stored
+  2 MiB body took 2.4 s for a `&` run, 3.4 s for a U+00A0 run and ~37 s for
+  nested `<div>`s. A size cap does not fix this: 256 KiB of open `<ul><li>`
+  still took 4.7 s. Render therefore cleans only the prefix within three
+  budgets, found by a linear scan: 2 MiB, nesting depth 256, and a text-node
+  cost. Measured, the cost of each `&` or U+00A0 is the bytes after it in the
+  same text node. The scan accepts only well-formed nesting, which is all
+  ingest stores, because misnesting is where the parser re-opens formatting
+  elements: 36 KB of that expanded to 19 MB. Worst budgeted case measured is
+  ~130 ms. No real body was cut. A body that is cut says so, and the page
+  points to the original. Reproduce with
+  `feed::tests::render_reclean_cost` (ignored).
+
+  The other `|safe` in the templates, in `manage.html`, renders the
+  compile-time constant `FEED_URL_PATTERN`, not content, and is unchanged.
+
+  Mutations, each caught: skipping the clean; a weaker policy at render;
+  `|safe` kept in the template, on the type or on the raw string; no
+  `HtmlSafe` impl; each budget removed in turn; a lenient closer; quotes not
+  skipped; public fields; a `From<String>`.
+
+---
+
 ## 0.4.6 — 2026-10-06
 
 Renames no longer lose data. Renaming a subscription is a compare-and-swap
