@@ -38,13 +38,42 @@ deploying is separate.
   unchanged.
 
   **The rename.** It reads with the CID and writes with `swapRecord` set to
-  it. On `InvalidSwap` it reads again, re-applies the form's fields — only
-  those, with #147's preservation of the rest — to the fresh record, re-runs
-  every gate against it, and writes once more under the new CID. A second
-  refusal is reported as "This subscription was changed elsewhere … Reload and
-  try again", never as success. Any other failure behaves as before: no
-  retry, same message. A PDS that lists a record without a CID (outside the
-  lexicon) gets the old unconditional write and a `warn` line.
+  it. On `InvalidSwap` it reads again and **merges**: a three-way merge of the
+  form against the record as first read. The manage row always posts every
+  input, so replaying the form would have put back fields the reader never
+  touched — a review caught the retry repointing a record another client had
+  just moved back to its old URL, and clearing that client's `siteUrl`. Now,
+  per field (`url`, `title`, `folder`, and a posted `site_url`):
+  - untouched by the reader: the fresh value stands;
+  - changed by the reader only: their value is applied;
+  - changed by both: nothing is written and the reader is told.
+
+  #147's preservation of the other fields still holds. Whether a rename is a
+  repoint, which drops the old feed's `siteUrl` and `fetchHint`, follows the
+  reader's change. The gates re-run against the merged record, and the write
+  goes under the new CID. A second refusal, or a field both sides changed, is
+  reported as "This subscription was changed elsewhere … Reload and try
+  again", never as success. Any other failure behaves as before: no retry,
+  same message. A PDS that lists a record without a CID (outside the lexicon)
+  gets the old unconditional write and a `warn` line.
+
+  **What the reader changed.** The manage row now posts `seen_url`,
+  `seen_title` and `seen_folder`: the values its inputs were pre-filled with.
+  The title input shows a display fallback for an untitled record, so the
+  record alone cannot say whether the reader edited it. With them, a field
+  another client changed between page load and the first read is no longer
+  mistaken for the reader's edit. Without them (a hand-made POST, or a page
+  from an older build), the first read stands in. What remains: a field
+  changed by both the reader and another client, where the other change
+  landed before the first read, is last-writer-wins on that field. The
+  conflict check compares against the first read, not the page-load record.
+
+  **The cache follows the PDS.** The rename wrote the local `feeds` cache
+  (the new title, or a new row for a repoint's URL) before the PDS write. A
+  rename the PDS refused, whether a failed save or both attempts of a lost
+  race, still left that behind, including a row the poller would fetch for
+  no subscriber. The cache is now written only after the PDS write lands.
+  Every gate on the URL still runs before it.
 
   **Other writers audited.** Folder rename and the read-state writes are
   blind writes, not read-modify-writes, so they have no CID to compare and
@@ -56,10 +85,14 @@ deploying is separate.
   repo that enforces `swapRecord` the way the reference PDS does. One case
   lands another client's edit between the read and the write: the edit
   survives and the rename lands. One refuses every swap: at most two puts,
-  then the conflict message. The wire tests show `swapRecord` present when
-  given and absent otherwise on each client and on the sidecar. Each guard
-  was mutated, including the swap hardcoded to `None` on each backend, and
-  every mutation failed a test.
+  then the conflict message. Others cover a concurrent repoint or retitle the
+  reader did not make, a title both sides changed, a repoint before the first
+  read, and a rename that did not land leaving the cache alone. The wire tests
+  show `swapRecord` present when given and absent otherwise on each client and
+  on the sidecar. Each guard was mutated (31 mutants, including the swap
+  hardcoded to `None` on each backend, the merge measured against the fresh
+  record, and the cache written before the put), and every mutation failed a
+  test.
 
 ## 0.4.5 — 2026-10-06
 

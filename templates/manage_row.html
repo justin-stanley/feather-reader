@@ -8,9 +8,14 @@
       <summary class="btn-quiet">Rename</summary>
       <form method="post" action="/subscriptions/{{ feed.rkey }}/rename" class="inline-form feed-edit">
         <input type="hidden" name="url" value="{{ feed.url }}" />
+        {#- What each input was pre-filled with, so the handler can tell what the
+            reader changed from what they only saw (#149). -#}
+        <input type="hidden" name="seen_url" value="{{ feed.url }}" />
+        <input type="hidden" name="seen_title" value="{{ feed.title }}" />
         <label class="visually-hidden" for="title-{{ feed.rkey }}">Title</label>
         <input class="input" id="title-{{ feed.rkey }}" type="text" name="title" value="{{ feed.title }}" />
         {% if !folder_options.is_empty() %}
+          <input type="hidden" name="seen_folder" value="{% if let Some(f) = feed.folder %}{{ f }}{% endif %}" />
           <label class="visually-hidden" for="folder-{{ feed.rkey }}">Folder</label>
           <select class="select" id="folder-{{ feed.rkey }}" name="folder">
             <option value=""{% if feed.folder.is_none() %} selected{% endif %}>No folder</option>
