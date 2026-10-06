@@ -1581,6 +1581,11 @@ impl PdsClient {
         self.list_typed(lexicon::nsid::FOLDER).await
     }
 
+    /// Every [`Folder`] with the CID it was listed at (#268).
+    pub async fn list_folders_with_cids(&self) -> Result<Vec<(String, Option<String>, Folder)>> {
+        self.list_typed_with_cids(lexicon::nsid::FOLDER).await
+    }
+
     /// Create a [`Folder`] record.
     pub async fn create_folder(&self, folder: &Folder) -> Result<WriteResult> {
         self.create_record(lexicon::nsid::FOLDER, folder).await
@@ -2213,6 +2218,14 @@ impl SidecarClient {
         self.list_typed(did, lexicon::nsid::FOLDER).await
     }
 
+    /// Every [`Folder`] with the CID it was listed at, unsorted (#268).
+    pub async fn list_folders_with_cids(
+        &self,
+        did: &str,
+    ) -> Result<Vec<(String, Option<String>, Folder)>> {
+        self.list_typed_with_cids(did, lexicon::nsid::FOLDER).await
+    }
+
     /// List every [`Saved`] record in `did`'s repo.
     pub async fn list_saved(&self, did: &str) -> Result<Vec<(String, Saved)>> {
         self.list_typed(did, lexicon::nsid::SAVED).await
@@ -2367,13 +2380,19 @@ impl SidecarClient {
 
     /// Rename / update a folder in place at a known rkey — `putRecord`
     /// (rename, or change its `position` sort hint).
+    ///
+    /// Replaces the WHOLE record, so `folder` must be the record as read with
+    /// only the intended change. `swap_record` is the CID it was read at: the
+    /// PDS refuses the write with `InvalidSwap` if the record has moved since
+    /// (#268). `None` writes unconditionally.
     pub async fn rename_folder(
         &self,
         did: &str,
         rkey: &str,
         folder: &Folder,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder, None)
+        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder, swap_record)
             .await
     }
 
@@ -7021,6 +7040,68 @@ pub(crate) mod tests {
             ],
             "each record must come back with the CID it was listed at"
         );
+    }
+
+    /// Two folder records at distinct CIDs, each carrying a field this build
+    /// does not know (#268).
+    pub(crate) fn two_folders_page() -> Value {
+        let rec = |rkey: &str, cid: &str, name: &str| {
+            json!({
+                "uri": format!("at://{SWAP_DID}/{}/{rkey}", lexicon::nsid::FOLDER),
+                "cid": cid,
+                "value": {
+                    "$type": lexicon::nsid::FOLDER,
+                    "name": name,
+                    "position": 3,
+                    "createdAt": "2024-01-01T00:00:00.000Z",
+                    "color": "#abc",
+                },
+            })
+        };
+        json!({ "records": [
+            rec("fk-a", "bafyreifolderaaaa", "Tech"),
+            rec("fk-b", "bafyreifolderbbbb", "News"),
+        ] })
+    }
+
+    /// Asserts a folder CID listing paired each record with ITS CID, and kept
+    /// the record whole.
+    pub(crate) fn assert_folders_listed_with_cids(listed: &[(String, Option<String>, Folder)]) {
+        let got: Vec<(&str, Option<&str>, &str)> = listed
+            .iter()
+            .map(|(rkey, cid, f)| (rkey.as_str(), cid.as_deref(), f.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("fk-a", Some("bafyreifolderaaaa"), "Tech"),
+                ("fk-b", Some("bafyreifolderbbbb"), "News"),
+            ],
+            "each folder must come back with the CID it was listed at"
+        );
+        for (_, _, folder) in listed {
+            assert_eq!(folder.position, Some(3));
+            assert_eq!(folder.created_at, "2024-01-01T00:00:00.000Z");
+            assert_eq!(folder.extra.get("color"), Some(&json!("#abc")));
+        }
+    }
+
+    #[tokio::test]
+    async fn both_clients_list_folders_with_the_cid_each_was_read_at() {
+        let (_, pds, _) = serve_status_json(200, two_folders_page()).await;
+        let listed = swap_direct_client(&pds)
+            .list_folders_with_cids()
+            .await
+            .expect("direct listing");
+        assert_folders_listed_with_cids(&listed);
+
+        let (base, _, _) =
+            serve_status_json(200, json!({ "ok": true, "data": two_folders_page() })).await;
+        let listed = SidecarClient::new(Client::new(), &base, &base, "secret")
+            .list_folders_with_cids(SWAP_DID)
+            .await
+            .expect("sidecar listing");
+        assert_folders_listed_with_cids(&listed);
     }
 
     #[tokio::test]

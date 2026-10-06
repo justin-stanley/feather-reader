@@ -503,6 +503,7 @@ mod tests {
                     name: "Tech".to_string(),
                     position: Some(0),
                     created_at: "2026-07-12T00:00:00.000Z".to_string(),
+                    extra: Default::default(),
                 },
             ),
             (
@@ -512,6 +513,7 @@ mod tests {
                     name: "News".to_string(),
                     position: Some(1),
                     created_at: "2026-07-12T00:00:00.000Z".to_string(),
+                    extra: Default::default(),
                 },
             ),
         ];
@@ -578,6 +580,7 @@ mod tests {
                 name: r#"R&D "x" <y>"#.to_string(),
                 position: Some(0),
                 created_at: "2026-07-12T00:00:00.000Z".to_string(),
+                extra: Default::default(),
             },
         )];
         let mut a = Subscription::new(
@@ -618,6 +621,7 @@ mod tests {
                 name: "Tech".to_string(),
                 position: Some(0),
                 created_at: "2026-07-12T00:00:00.000Z".to_string(),
+                extra: Default::default(),
             },
         )];
         let mut a = Subscription::new("https://lobste.rs/rss", "2026-07-12T00:00:00.000Z");

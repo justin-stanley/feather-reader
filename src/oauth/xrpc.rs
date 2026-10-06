@@ -564,6 +564,14 @@ impl Repo<'_> {
         self.list_typed(crate::lexicon::nsid::FOLDER).await
     }
 
+    /// Every folder with the CID it was listed at, unsorted (#268).
+    pub async fn list_folders_with_cids(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, crate::lexicon::Folder)>> {
+        self.list_typed_with_cids(crate::lexicon::nsid::FOLDER)
+            .await
+    }
+
     pub async fn list_folders_sorted(&self) -> Result<Vec<(String, crate::lexicon::Folder)>> {
         let mut folders = self.list_folders().await?;
         folders.sort_by(crate::lexicon::sort::folders);
@@ -585,13 +593,16 @@ impl Repo<'_> {
     }
 
     /// Returns the [`WriteResult`], matching the sidecar client — the caller
-    /// logs the record URI from it.
+    /// logs the record URI from it. `swap_record` is the CID the folder was
+    /// read at, so a write by another client since is refused rather than
+    /// overwritten (#268).
     pub async fn rename_folder(
         &self,
         rkey: &str,
         folder: &crate::lexicon::Folder,
+        swap_record: Option<&str>,
     ) -> Result<WriteResult> {
-        self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder, None)
+        self.put_record(crate::lexicon::nsid::FOLDER, rkey, folder, swap_record)
             .await
     }
 
@@ -1639,6 +1650,26 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(!crate::atproto::is_invalid_swap(&err), "{err:#}");
+    }
+
+    /// The folder CID listing pairs each folder with the CID it was listed at
+    /// (#268).
+    #[tokio::test]
+    async fn list_folders_with_cids_keeps_each_records_cid() {
+        use crate::atproto::tests::{
+            assert_folders_listed_with_cids, serve_status_json, two_folders_page,
+        };
+        let (_, pds, _) = serve_status_json(200, two_folders_page()).await;
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let s = session_at(&pds);
+        let listed = repo(&http, &pool, &s, &key)
+            .list_folders_with_cids()
+            .await
+            .expect("listing");
+        assert_folders_listed_with_cids(&listed);
     }
 
     /// The CID listing pairs each record with the CID it was listed at.

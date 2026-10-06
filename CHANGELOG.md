@@ -18,6 +18,64 @@ deploying is separate.
 
 ### Fixed
 
+- **Renaming a folder overwrote the folder record (#268).** `POST
+  /folders/:rkey/rename` put `Folder::new(name, now)` over the existing
+  record. Every rename reset `position` (the sort hint another
+  `community.lexicon.rss` client may have set), replaced `createdAt` with the
+  rename time, and dropped any field another client had added, because
+  `lexicon::Folder` had no catch-all. A failed rename only logged a warning
+  and redirected as if it had worked.
+
+  **Mechanism.** `Folder` gains `extra`, a `#[serde(flatten)]` map of every
+  field it does not name. The named fields are consumed first, so the map
+  never holds `$type`, `name`, `position` or `createdAt`, and a serialized
+  record never has a duplicate key. It is empty for a folder this build
+  creates (`POST /folders`, OPML import), so those records are unchanged. A
+  new `list_folders_with_cids` on the Rust client, the app-password client
+  and the sidecar client, through `dispatch!`, returns each folder's CID, as
+  `list_subscriptions_with_cids` does. There is no single-record `get`,
+  because the sidecar has no `get` action. `rename_folder` takes
+  `swap_record` on every backend.
+
+  **The rename.** The handler reads the folder and its CID, changes only
+  `name`, and writes it back with `swapRecord` set to that CID. On
+  `InvalidSwap` it reads again and does a three-way merge on the name, using
+  #149's retry bound. The ancestor is `seen_name`, which the manage page now
+  posts and which holds the record's own name, or the first read when the
+  form has no `seen_name`:
+  - the reader left the name as shown: success, nothing written;
+  - the record already has the reader's name (a double-submitted Save):
+    success, nothing written;
+  - the record still has the ancestor's name: the fresh record is renamed,
+    so another client's concurrent change to `position` or anything else
+    is kept;
+  - someone else renamed it differently: nothing is written, and the
+    reader sees "This folder was changed elsewhere … Reload and try again".
+
+  Because `seen_name` is the exact record name, unlike a subscription's
+  display title, it also catches a rename made elsewhere between page load
+  and the first read. A second refusal is reported as the conflict. A folder
+  that is no longer in the repo is reported as such and is not recreated:
+  a put at a missing rkey would create it. A failed read or a failed write
+  shows an error flash and writes nothing.
+
+  Tested on both backends through the handler, against the swap-enforcing
+  fake repo from #149: the exact record put on a rename, a concurrent
+  `position` change kept across the retry, both renaming differently, both
+  renaming the same, every swap refused, a 502, a missing folder, a failed
+  read, the page-load window with `seen_name`, an unchanged name, the folder
+  CID listing on each client, the catch-all round trip, and a new folder
+  carrying no extra keys. Each test failed before the fix. All 20 mutants
+  were killed, among them the record rebuilt with `Folder::new`, the
+  catch-all dropped, the swap hardcoded to `None` on each backend, no retry,
+  a conflict reported as success, agreement reported as a conflict, the
+  error swallowed, a missing folder recreated, and the CID dropped from each
+  listing.
+
+  `Subscription` has no such catch-all either. A subscription rename keeps
+  every field `Subscription` names (#147), but drops fields it does not
+  name. That is left as a follow-up.
+
 - **Renaming a subscription could erase another client's concurrent edit to
   it (#149).** Since #147 the rename handler reads the subscription record,
   applies the form's fields, and `putRecord`s the whole record back. Nothing
