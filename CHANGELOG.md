@@ -138,7 +138,7 @@ deploying is separate.
   visible rather than prevented: `/stats` gains a row counting polls deferred
   for want of a permit and, while none has come free, "stalled" and since
   when; after 5 minutes each deferral logs at error level. A structural fix
-  is tracked separately. Ordinary bodies are stored byte-for-byte as before
+  is tracked in #275. Ordinary bodies are stored byte-for-byte as before
   (#224's sanitize-then-bound order is unchanged). The server now builds its
   runtime itself and shuts it down with a 5 s bound, because a dropped tokio
   runtime waits without limit for blocking work such as an abandoned
