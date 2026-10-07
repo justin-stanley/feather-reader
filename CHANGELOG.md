@@ -14,7 +14,31 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.7 — 2026-10-07
+
+Hostile feed bodies are contained. The reader renders stored article bodies
+through a type that can only be built by sanitizing, not through `|safe`
+(#151), and ingest sanitizes off the async runtime under a timeout, so a body
+the sanitizer is slow on can no longer stall the poller (#226).
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.6 is a deploy;
+  rolling back to 0.4.6 is a redeploy.
+- **Rendering an article re-sanitizes its stored body**, cached in memory
+  (256 bodies / 8 MiB). Ordinary bodies cost microseconds and render
+  identically. A body over 2 MiB, one that cannot get one of 2 render
+  permits within 2 s, or one already found slow to clean shows a short
+  note and the link to the original instead.
+- **A feed whose body times out sanitizing (5 s)** keeps any bodies already
+  stored, stores new entries without one, does not save its `ETag` /
+  `Last-Modified`, and backs off as a `Body` failure.
+- **`/stats` gains a row** when polls are deferred for want of a sanitize
+  permit — the sign that slow bodies' sanitizes hold all four (#275 tracks
+  preventing it).
+- **Shutdown waits at most 5 s** for blocking work after the server and
+  schedulers drain, so an abandoned sanitize cannot hold a deploy past
+  Fly's `kill_timeout`.
 
 ### Security
 
