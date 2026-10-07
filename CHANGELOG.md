@@ -70,8 +70,9 @@ deploying is separate.
     out first, bounded at 256 bodies and 8 MiB of output. A clean that
     finishes between a request's cache miss and its turn at the in-flight
     table is found by a second lookup under that table's lock, not repeated.
-  - **Slow set.** A body whose clean took over 500 ms is remembered by hash
-    (up to 4,096, oldest out first), apart from the cache. The cache evicts
+  - **Slow set.** A body whose clean used over 500 ms of CPU time (the
+    thread's own, so a clean merely stalled by a busy host does not count) is
+    remembered by hash (up to 4,096, oldest out first), apart from the cache. The cache evicts
     by size, so a few slow ~2 MiB bodies viewed in turn would push each
     other out and pay ~37 s per view; instead, once a slow body's output has
     left the cache, its page shows "too complex to display" and the link to

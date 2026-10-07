@@ -200,8 +200,33 @@ const SLOW_CLEAN: Duration = Duration::from_millis(500);
 /// 128 KiB at most; far more slow bodies than any instance should ever hold.
 pub const SLOW_KEYS_MAX: usize = 4096;
 
-/// The bodies whose clean took longer than [`SLOW_CLEAN`], by hash, oldest
-/// out first. **Separate from the output cache on purpose:** the cache evicts
+/// CPU time the calling thread has used, where the platform reports it.
+///
+/// What marks a body slow ([`SlowSet`]), rather than the clock: a clean
+/// stalled behind other work — a hostile body's clean on the other permit,
+/// ingest, a CPU quota — takes long by the clock but not in work done, and a
+/// clock reading would mark an ordinary article "too complex" for the rest
+/// of the process. `None` off unix; the caller then falls back to the clock.
+fn thread_cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes one `timespec` through a valid,
+        // exclusively borrowed pointer and keeps nothing.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The bodies whose clean used more than [`SLOW_CLEAN`] of CPU time
+/// ([`thread_cpu_time`]), by hash, oldest out first. **Separate from the output cache on purpose:** the cache evicts
 /// by bytes and age, so a handful of slow ~2 MiB bodies viewed in turn would
 /// push each other out and re-run a ~37 s clean on every view. A body in this
 /// set is cleaned at most once per process however the cache churns; after
@@ -350,6 +375,9 @@ struct Inner {
     /// Test-only: runs between the cache lookup and the in-flight check.
     #[cfg(test)]
     after_lookup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only: runs inside the timed clean, on the blocking thread.
+    #[cfg(test)]
+    during_clean: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// How many times the sanitizer has run through this renderer. Tests use
     /// it to show the cap, the cache and single flight keep it from running.
     cleans: AtomicUsize,
@@ -422,6 +450,8 @@ impl BodyRenderer {
             slow: SLOW_CLEAN,
             #[cfg(test)]
             after_lookup: Mutex::new(None),
+            #[cfg(test)]
+            during_clean: Mutex::new(None),
             cleans: AtomicUsize::new(0),
         }))
     }
@@ -442,6 +472,15 @@ impl BodyRenderer {
         *self
             .0
             .after_lookup
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_during_clean(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .0
+            .during_clean
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -584,9 +623,25 @@ impl BodyRenderer {
             let _permit = permit;
             work.cleans.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
+            let started_cpu = thread_cpu_time();
+            #[cfg(test)]
+            if let Some(hook) = work
+                .during_clean
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                hook();
+            }
             let html: Arc<str> = Arc::from(SanitizedHtml::clean(&raw).html.as_str());
             let took = started.elapsed();
-            if took > work.slow {
+            // Slow by the work done, not by the clock: a clean stalled by a
+            // busy host is not a slow body (see `thread_cpu_time`).
+            let worked = match (started_cpu, thread_cpu_time()) {
+                (Some(before), Some(after)) => after.saturating_sub(before),
+                _ => took,
+            };
+            if worked > work.slow {
                 work.slow_keys().insert(key);
             }
             if took > SLOW_CLEAN {
@@ -594,6 +649,7 @@ impl BodyRenderer {
                     bytes = raw.len(),
                     out_bytes = html.len(),
                     took_ms = took.as_millis() as u64,
+                    cpu_ms = worked.as_millis() as u64,
                     sha256 = %hex_prefix(&key),
                     "a stored entry body was slow to sanitize (#226); cached now, so once per process"
                 );
@@ -1307,6 +1363,31 @@ mod tests {
     /// a second time — a hostile feed's handful of slow bodies, viewed in
     /// turn, would otherwise re-run a ~37 s clean on every view and keep both
     /// permits busy. It is shown as too slow to display instead.
+    /// **A busy host does not make a body slow** (review of #273). A clean
+    /// stalled by other work — a hostile body's clean on the other permit,
+    /// ingest, a CPU quota — took long by the clock but not in work done, and
+    /// marking it slow would show an ordinary article as "too complex" for
+    /// the rest of the process. The slow set counts the clean's own CPU
+    /// time: here a clean that waits 200 ms without working is not marked,
+    /// and is cleaned again after eviction like any fast body.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_clean_stalled_by_a_busy_host_is_not_marked_slow() {
+        let r = BodyRenderer::new(2, Duration::from_secs(10), 1_000_000, 1)
+            .with_slow_threshold(Duration::from_millis(100));
+        r.set_during_clean(|| std::thread::sleep(Duration::from_millis(200)));
+        let a = "<p>an ordinary article</p>".to_string();
+        let b = "<p>another one</p>".to_string();
+        html(r.render(a.clone()).await.unwrap());
+        html(r.render(b).await.unwrap());
+        let again = r.render(a).await.unwrap();
+        assert!(
+            matches!(again, BodyRender::Html(_)),
+            "a clean stalled 200 ms without working was marked slow"
+        );
+        assert_eq!(r.cleans(), 3);
+    }
+
     #[tokio::test]
     async fn a_slow_body_is_not_cleaned_again_after_eviction() {
         let r = BodyRenderer::new(2, Duration::from_secs(10), 1_000_000, 1)
