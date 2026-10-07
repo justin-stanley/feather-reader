@@ -55,6 +55,8 @@
               <p class="muted body-too-large">This article's stored body is too large to display. Open the original above.</p>
             {% when BodyRender::Unavailable %}
               <p class="muted body-unavailable">This article's body is temporarily unavailable. Open the original above, or try again in a moment.</p>
+            {% when BodyRender::TooSlow %}
+              <p class="muted body-too-slow">This article's stored body is too complex to display. Open the original above.</p>
           {% endmatch %}
         {% else %}
           <p class="muted">This entry has no stored content. Open the original above.</p>

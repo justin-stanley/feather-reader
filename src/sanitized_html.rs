@@ -146,6 +146,10 @@ pub enum BodyRender {
     /// first time this process. The reader can retry; by then the slow ones
     /// are cached.
     Unavailable,
+    /// The body was cleaned once this process and was slow to clean
+    /// (`SLOW_CLEAN`, 500 ms); it has since left the cache, and render does not
+    /// clean it again — that would put a slow clean on every view of it.
+    TooSlow,
 }
 
 /// The longest stored body render will sanitize: ingest's own stored bound
@@ -191,6 +195,46 @@ pub const CACHE_MAX_ENTRIES: usize = 256;
 /// row — a hostile feed's body (#226), or one written some other way — can be
 /// found.
 const SLOW_CLEAN: Duration = Duration::from_millis(500);
+
+/// How many slow bodies render remembers (`SlowSet`). 32 bytes each, so
+/// 128 KiB at most; far more slow bodies than any instance should ever hold.
+pub const SLOW_KEYS_MAX: usize = 4096;
+
+/// The bodies whose clean took longer than [`SLOW_CLEAN`], by hash, oldest
+/// out first. **Separate from the output cache on purpose:** the cache evicts
+/// by bytes and age, so a handful of slow ~2 MiB bodies viewed in turn would
+/// push each other out and re-run a ~37 s clean on every view. A body in this
+/// set is cleaned at most once per process however the cache churns; after
+/// its result leaves the cache it renders as [`BodyRender::TooSlow`].
+struct SlowSet {
+    keys: std::collections::HashSet<Key>,
+    order: std::collections::VecDeque<Key>,
+}
+
+impl SlowSet {
+    fn new() -> Self {
+        Self {
+            keys: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, key: &Key) -> bool {
+        self.keys.contains(key)
+    }
+
+    fn insert(&mut self, key: Key) {
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.order.len() > SLOW_KEYS_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+            }
+        }
+    }
+}
 
 /// SHA-256 of the stored body: the cache key.
 ///
@@ -294,6 +338,14 @@ struct Inner {
     wait: Duration,
     cache: Mutex<Cache>,
     in_flight: Mutex<InFlight>,
+    /// Bodies already cleaned slowly once this process ([`SlowSet`]).
+    slow_keys: Mutex<SlowSet>,
+    /// A clean slower than this marks the body slow ([`SLOW_CLEAN`]; tests
+    /// lower it).
+    slow: Duration,
+    /// Test-only: runs between the cache lookup and the in-flight check.
+    #[cfg(test)]
+    after_lookup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// How many times the sanitizer has run through this renderer. Tests use
     /// it to show the cap, the cache and single flight keep it from running.
     cleans: AtomicUsize,
@@ -317,9 +369,11 @@ struct Inner {
 ///    comes), then cleans on the blocking pool holding the permit, caches the
 ///    result and publishes it.
 ///
-/// So each distinct body is cleaned once per process while it stays cached,
-/// at most once at a time while it does not, and a body that is slow to clean
-/// is slow on its own page views, holding one permit, and nowhere else. The
+/// So each distinct body is cleaned at most once at a time; a fast body again
+/// only after it leaves the cache; and a body that was slow to clean
+/// (`SLOW_CLEAN`, 500 ms) at most once per process — after its result leaves the
+/// cache it renders as [`BodyRender::TooSlow`] instead (`SlowSet`). A slow
+/// body therefore costs one clean, holding one permit, per process. The
 /// async worker is never blocked: the hash, the lookup and the clean run on
 /// the blocking pool, and every wait is an async one.
 ///
@@ -358,8 +412,32 @@ impl BodyRenderer {
             wait,
             cache: Mutex::new(Cache::new(cache_bytes, cache_entries)),
             in_flight: Mutex::new(HashMap::new()),
+            slow_keys: Mutex::new(SlowSet::new()),
+            slow: SLOW_CLEAN,
+            #[cfg(test)]
+            after_lookup: Mutex::new(None),
             cleans: AtomicUsize::new(0),
         }))
+    }
+
+    /// This renderer, with a different slow-clean threshold. Tests only:
+    /// the inner state must not be shared yet.
+    #[cfg(test)]
+    fn with_slow_threshold(mut self, slow: Duration) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set the slow threshold before sharing the renderer")
+            .slow = slow;
+        self
+    }
+
+    /// Run `hook` between the cache lookup and the in-flight check.
+    #[cfg(test)]
+    fn set_after_lookup(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .0
+            .after_lookup
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// The process-wide renderer, with [`RENDER_PERMITS`], [`RENDER_WAIT`],
@@ -405,14 +483,44 @@ impl BodyRenderer {
                 html: html.to_string(),
             }));
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .0
+            .after_lookup
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            hook();
+        }
 
         // Join the clean already in flight for this body, or lead one. The
         // map is checked and the entry inserted under one lock, so two misses
-        // for the same key cannot both lead.
+        // for the same key cannot both lead. Under that lock, in this order:
+        // 1. the cache again — a leader may have finished between the lookup
+        //    above and here (it caches before it leaves the in-flight table),
+        //    and starting a second clean of a body just cleaned is the cost
+        //    single flight exists to avoid;
+        // 2. a clean in flight — join it. Checked before the slow set because
+        //    a leader marks its body slow before it publishes, and its
+        //    joiners should get that result, not a refusal;
+        // 3. the slow set — cleaned slowly once already, and out of the cache
+        //    now: not again (`TooSlow`);
+        // 4. otherwise lead.
+        // Lock order is always in-flight, then cache or slow set; nothing
+        // takes them the other way round.
         let mut rx = {
             let mut in_flight = self.0.in_flight();
+            if let Some(html) = self.0.cache().get(&key) {
+                return Ok(BodyRender::Html(SanitizedHtml {
+                    html: html.to_string(),
+                }));
+            }
             match in_flight.get(&key) {
                 Some(rx) => rx.clone(),
+                None if self.0.slow_keys().contains(&key) => {
+                    return Ok(BodyRender::TooSlow);
+                }
                 None => {
                     let (tx, rx) = watch::channel(None);
                     in_flight.insert(key, rx.clone());
@@ -472,6 +580,9 @@ impl BodyRenderer {
             let started = Instant::now();
             let html: Arc<str> = Arc::from(SanitizedHtml::clean(&raw).html.as_str());
             let took = started.elapsed();
+            if took > work.slow {
+                work.slow_keys().insert(key);
+            }
             if took > SLOW_CLEAN {
                 warn!(
                     bytes = raw.len(),
@@ -521,6 +632,12 @@ impl Inner {
         // Nothing here panics while holding the lock; recovering a poisoned
         // lock rather than propagating is the right call for a cache.
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn slow_keys(&self) -> std::sync::MutexGuard<'_, SlowSet> {
+        self.slow_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
@@ -822,6 +939,7 @@ mod tests {
             BodyRender::Html(h) => h.as_str().to_string(),
             BodyRender::TooLarge => panic!("the body was refused as too large"),
             BodyRender::Unavailable => panic!("the body was refused as unavailable"),
+            BodyRender::TooSlow => panic!("the body was refused as too slow"),
         }
     }
 
@@ -1122,6 +1240,57 @@ mod tests {
         html(r.render("<p>x</p>".to_string()).await.unwrap());
         html(r.render("<p>x</p>".to_string()).await.unwrap());
         assert_eq!(r.in_flight(), 0);
+    }
+
+    /// **A slow body is cleaned once per process, eviction or not.** Every
+    /// clean here counts as slow (threshold zero) and the cache holds one
+    /// body, so viewing A, then B, evicts A. Viewing A again must not clean it
+    /// a second time — a hostile feed's handful of slow bodies, viewed in
+    /// turn, would otherwise re-run a ~37 s clean on every view and keep both
+    /// permits busy. It is shown as too slow to display instead.
+    #[tokio::test]
+    async fn a_slow_body_is_not_cleaned_again_after_eviction() {
+        let r = BodyRenderer::new(2, Duration::from_secs(10), 1_000_000, 1)
+            .with_slow_threshold(Duration::ZERO);
+        let a = "<p>body A</p>".to_string();
+        let b = "<p>body B</p>".to_string();
+        html(r.render(a.clone()).await.unwrap());
+        html(r.render(b.clone()).await.unwrap());
+        assert_eq!(r.cleans(), 2);
+        let again = r.render(a.clone()).await.unwrap();
+        assert_eq!(r.cleans(), 2, "an evicted slow body was cleaned again");
+        assert!(
+            matches!(again, BodyRender::TooSlow),
+            "an evicted slow body was not reported as too slow"
+        );
+        // A body that was fast stays an ordinary cache miss: cleaned again.
+        let fast = BodyRenderer::new(2, Duration::from_secs(10), 1_000_000, 1);
+        html(fast.render(a.clone()).await.unwrap());
+        html(fast.render(b.clone()).await.unwrap());
+        html(fast.render(a.clone()).await.unwrap());
+        assert_eq!(fast.cleans(), 3, "a fast body was refused after eviction");
+    }
+
+    /// **No second clean in the window between a miss and the in-flight
+    /// check.** A request misses the cache; before it takes the in-flight
+    /// lock, the leader of the same body finishes, caches its result and
+    /// leaves the in-flight table. The request must use that result, not
+    /// lead a second clean.
+    #[tokio::test]
+    async fn a_clean_that_finishes_after_a_miss_is_not_repeated() {
+        let r = BodyRenderer::new(2, Duration::from_secs(10), 1_000_000, 16);
+        let body = "<p>raced</p>".to_string();
+        let cached: Arc<str> = Arc::from(sanitize_html(&body).as_str());
+        let key = key_of(&body);
+        let inner = Arc::clone(&r.0);
+        r.set_after_lookup(move || inner.cache().insert(key, Arc::clone(&cached)));
+        let out = html(r.render(body.clone()).await.unwrap());
+        assert_eq!(out, sanitize_html(&body));
+        assert_eq!(
+            r.cleans(),
+            0,
+            "a clean that had just finished was run again"
+        );
     }
 
     /// The shared instance carries the documented parameters.

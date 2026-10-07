@@ -67,11 +67,20 @@ deploying is separate.
   - **Cache.** Cleaned output is cached in memory, keyed by the SHA-256 of
     the stored body (`ring`, already a dependency; a fast hash's collisions
     would show one entry's body on another's page), least recently used
-    out first, bounded at 256 bodies and 8 MiB of output.
+    out first, bounded at 256 bodies and 8 MiB of output. A clean that
+    finishes between a request's cache miss and its turn at the in-flight
+    table is found by a second lookup under that table's lock, not repeated.
+  - **Slow set.** A body whose clean took over 500 ms is remembered by hash
+    (up to 4,096, oldest out first), apart from the cache. The cache evicts
+    by size, so a few slow ~2 MiB bodies viewed in turn would push each
+    other out and pay ~37 s per view; instead, once a slow body's output has
+    left the cache, its page shows "too complex to display" and the link to
+    the original, and it is not cleaned again until restart.
 
-  Together: each distinct body is cleaned at most once per process, holding
-  one of two permits; a slow body's own readers wait its full cost once
-  (~37 s worst measured), other readers' uncached bodies wait at most 2 s
+  Together: a fast body is cleaned again only after it leaves the cache, a
+  slow one at most once per process, either holding one of two permits; a
+  slow body's own readers wait its full cost once (~37 s worst measured),
+  other readers' uncached bodies wait at most 2 s
   and then see the note, and cached bodies render regardless. Two slow
   bodies at once is the worst case for everyone else; a third is queued.
 
