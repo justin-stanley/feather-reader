@@ -1117,6 +1117,8 @@ async fn stats(State(state): State<AppState>) -> Response {
 
     // Percentage of a zero-feed instance is 100, not a divide-by-zero: a fresh
     // instance is not behind on anything.
+    let (deferred, starved_since) = state.sanitize_starvation.snapshot();
+
     let polled_pct = if health.feeds_tracked == 0 {
         100
     } else {
@@ -1158,6 +1160,8 @@ async fn stats(State(state): State<AppState>) -> Response {
         badly_broken: health.badly_broken,
         failure_kinds: health.failure_kinds,
         fetching: fetching_state(&state.runtime_health, now.timestamp()),
+        deferred_no_permit: deferred,
+        starved_since: starved_since.map(|since| humanise_ago(Some(now.timestamp() - since))),
     })
 }
 
@@ -1665,6 +1669,12 @@ struct StatsTemplate {
     /// watermark), `starting` (no tick completed yet) or `off` (schedulers
     /// disabled). Three of those four used to render as "running".
     fetching: &'static str,
+    /// Polls deferred since boot because no sanitize permit came free (#226),
+    /// and — while that is still so — since when, humanised. Deferred polls
+    /// store nothing and file nothing against their feeds, so this row is the
+    /// only sign that hostile bodies' sanitizes hold every permit.
+    deferred_no_permit: u64,
+    starved_since: Option<String>,
 }
 
 /// The public `/privacy` page — what the server holds vs. what lives in the
@@ -14591,6 +14601,66 @@ mod tests {
         assert!(
             body.contains("the cache is at its size limit"),
             "a watermark pause is hidden once the poller is ticking"
+        );
+    }
+
+    /// **Ingest starved of sanitize permits shows on `/stats`** (review of
+    /// #274). Four hostile feeds can hold every permit; every other poll then
+    /// defers, storing nothing and filing nothing against its feed, so the
+    /// failing-feeds rows stay clean while nothing updates. This row is how
+    /// anyone sees it: absent until a deferral, then the count, and while no
+    /// permit has come free, "stalled" and since when.
+    #[tokio::test]
+    async fn stats_shows_ingest_starved_of_sanitize_permits() {
+        let mut state = test_state(&[]).await;
+        let starvation: &'static crate::feed::Starvation =
+            Box::leak(Box::new(crate::feed::Starvation::new()));
+        state.sanitize_starvation = starvation;
+        let render = |state: AppState| async move {
+            let resp = router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        let body = render(state.clone()).await;
+        assert!(
+            !body.contains("no sanitize capacity"),
+            "the row shows on an instance that never deferred"
+        );
+
+        let ten_min_ago = chrono::Utc::now().timestamp() - 600;
+        starvation.record_no_permit(ten_min_ago);
+        starvation.record_no_permit(ten_min_ago + 1);
+        starvation.record_no_permit(ten_min_ago + 2);
+        let body = render(state.clone()).await;
+        assert!(body.contains("3 polls deferred since boot"), "{body}");
+        assert!(
+            body.contains(
+                "<strong>stalled</strong> — no feed body has been sanitized since 10m ago"
+            ),
+            "a starved instance does not read as stalled"
+        );
+
+        starvation.record_permit();
+        let body = render(state).await;
+        assert!(body.contains("3 polls deferred since boot"));
+        assert!(
+            !body.contains("<strong>stalled</strong> — no feed body"),
+            "a permit came free but /stats still reads stalled"
         );
     }
 

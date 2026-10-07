@@ -82,6 +82,14 @@
               {% endif %}
             </td>
           </tr>
+          {% if deferred_no_permit > 0 %}
+          <tr>
+            <th scope="row">Deferred (no sanitize capacity)</th>
+            <td>
+              {% if let Some(since) = starved_since %}<strong>stalled</strong> — no feed body has been sanitized since {{ since }}; {% endif %}{{ deferred_no_permit }} polls deferred since boot
+            </td>
+          </tr>
+          {% endif %}
           <tr>
             <th scope="row">Target interval</th>
             <td>every {{ poll_interval_mins }} minutes</td>

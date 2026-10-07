@@ -249,6 +249,11 @@ pub struct NewEntry {
     pub content_html: Option<String>,
     /// Optional explicit fetch time (RFC3339); defaults to now if `None`.
     pub fetched_at: Option<String>,
+    /// When the entry is already stored, keep its `content_html` rather than
+    /// overwrite it with this one's. Set when this poll could not sanitize the
+    /// body in time (#226): a body that exists must not be replaced by none. A
+    /// new entry is inserted with `content_html` as given.
+    pub keep_stored_content: bool,
 }
 
 /// The SQLite schema. Idempotent — safe to run on every startup.
@@ -1708,7 +1713,8 @@ pub async fn insert_entries(
                 title        = excluded.title,
                 author       = excluded.author,
                 published    = excluded.published,
-                content_html = excluded.content_html
+                content_html = CASE WHEN ?9 THEN entries.content_html
+                                    ELSE excluded.content_html END
             "#,
         )
         .bind(feed_id)
@@ -1719,6 +1725,7 @@ pub async fn insert_entries(
         .bind(&e.published)
         .bind(&e.content_html)
         .bind(&fetched_at)
+        .bind(e.keep_stored_content)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("insert entry {} failed", e.guid))?;
