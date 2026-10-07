@@ -14,6 +14,95 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **The reader no longer renders a stored article body with `|safe` (#151).**
+  `EntryTemplate.content_html` was the stored `entries.content_html` string,
+  emitted into `entry.html` unescaped. It was safe only because ingest had
+  run `ammonia` over it in `feed.rs` — a procedural guard on another code
+  path, the same shape `SafeLink` replaced for the entry's links. Not a live
+  hole: ingest is the only writer and its sanitizing is tested.
+
+  **The type.** New module `sanitized_html` with `SanitizedHtml`: a private
+  field, no `From<String>`, no `Deref`. Its only constructor runs ingest's
+  own `feed::sanitize_html` (one policy, pinned byte for byte by a test), and
+  it implements askama's `HtmlSafe`, so `entry.html` renders it with no
+  `|safe` at all. The guarantee cannot ride through SQLite `TEXT`, so the
+  handler re-cleans the stored body at render, on tokio's blocking pool. Two
+  `compile_fail` doctests, pinned to E0451 and E0277, show a raw string
+  cannot become one. A test that writes `<script>`, `onerror` and a
+  `javascript:` link straight into the column, bypassing ingest, failed
+  before the change: all three reached the page.
+
+  **Measured cost.** On 545 real bodies from 20 public feeds (release build),
+  re-cleaning took p50 31 µs, p99 1.1 ms, max 3.5 ms (a 561 KB body), and is
+  idempotent on all 545: identical bytes, so readers see no change. Two
+  known exceptions, both the same page to a browser, each pinned by a test:
+  a literal U+00A0 in a standard.site plain-text summary comes back as
+  `&nbsp;`, and a table whose `<tfoot>` the policy stripped gains the
+  `<tbody>` a browser builds around those rows anyway.
+
+  **Threat model, stated plainly.** The sanitizer is quadratic on shapes
+  any feed can serve, and ingest can store them (#226, which is fixed
+  separately): measured as stored, 2 MiB of nested `<div>`s re-cleans in
+  ~37 s, a 2 MiB `&` run in 2.4 s, a U+00A0 run in 3.4 s. Such rows may
+  already exist in databases upgraded from 0.4.6 or earlier, and after
+  #226's fix a body that sanitizes under its timeout can still be slow here.
+  So render assumes nothing about a stored body's cost. It bounds what one
+  slow body can cost everyone else (`BodyRenderer`):
+  - **Size cap.** A stored body over the bound ingest enforces
+    (`MAX_CONTENT_HTML_BYTES`, 2 MiB) is not given to the sanitizer; the
+    page shows a short note and the link to the original.
+  - **Concurrency limit.** A process-wide semaphore of 2 permits around the
+    clean. A request waits up to 2 s for a permit (asynchronously; no worker
+    thread is blocked), then shows a "temporarily unavailable" note. Real
+    cleans take microseconds, so the wait is only reached while two slow
+    bodies are being cleaned at once — each for the first time.
+  - **Single flight.** Concurrent views of the same uncached body share one
+    clean: the first leads it as its own task (so a client that disconnects
+    neither cancels it nor strands anyone), the rest wait for its result and
+    take no permit; the in-flight entry is removed however the clean ends.
+  - **Cache.** Cleaned output is cached in memory, keyed by the SHA-256 of
+    the stored body (`ring`, already a dependency; a fast hash's collisions
+    would show one entry's body on another's page), least recently used
+    out first, bounded at 256 bodies and 8 MiB of output. A clean that
+    finishes between a request's cache miss and its turn at the in-flight
+    table is found by a second lookup under that table's lock, not repeated.
+  - **Slow set.** A body whose clean used over 500 ms of CPU time (the
+    thread's own, so a clean merely stalled by a busy host does not count) is
+    remembered by hash (up to 4,096, oldest out first), apart from the cache. The cache evicts
+    by size, so a few slow ~2 MiB bodies viewed in turn would push each
+    other out and pay ~37 s per view; instead, once a slow body's output has
+    left the cache, its page shows "too complex to display" and the link to
+    the original, and it is not cleaned again until restart.
+
+  Together: a fast body is cleaned again only after it leaves the cache, a
+  slow one at most once per process, either holding one of two permits; a
+  slow body's own readers wait its full cost once (~37 s worst measured),
+  other readers' uncached bodies wait at most 2 s
+  and then see the note, and cached bodies render regardless. Two slow
+  bodies at once is the worst case for everyone else; a third is queued.
+
+  **Why not a pre-scan.** Earlier revisions of this change bounded the cost
+  with a linear scan in front of the sanitizer that modelled html5ever's
+  open-element stack and text nodes (nesting depth, a text-cost budget for
+  `&` and U+00A0, attribute limits, implicit-close rules) and cut the body
+  where the model ran out. Three review rounds each found a mismatch between
+  the model and the parser; the last found it cutting articles ingest
+  legitimately stores: `<li>` in `<li>` after ammonia strips a `<section>`
+  (and `p`/`a`/`h2` likewise), an unhighlighted `<pre><code>` XML listing
+  of ~245 KB, and `<rt>` inside a `<span>` in `<ruby>`. Re-implementing the
+  parser's rules in front of the parser can only reopen a slow path or
+  truncate real articles, so the scan is gone and those shapes are pinned by
+  a test that renders each in full.
+
+  The other `|safe` in the templates, in `manage.html`, renders the
+  compile-time constant `FEED_URL_PATTERN`, not content, and is unchanged.
+
+---
+
 ## 0.4.6 — 2026-10-06
 
 Renames no longer lose data. Renaming a subscription is a compare-and-swap
