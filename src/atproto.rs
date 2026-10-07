@@ -1127,6 +1127,8 @@ impl PdsClient {
     ///
     /// Bounded by `MAX_LIST_PAGES` and by cursor-repetition detection, because
     /// `pds_base` may be a host we did not choose (see [`PdsClient::anonymous`]).
+    /// Both are refusals, not short answers: a repeated cursor on a non-empty
+    /// page is an `Err` (#203), since the result may reach `replace_sub_refs`.
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
         self.list_all_records_within(collection, &mut ByteBudget::new(MAX_LIST_BYTES))
             .await
@@ -1219,10 +1221,20 @@ impl PdsClient {
             }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
-                // Guard against a PDS that echoes a cursor with an empty page,
-                // or that hands back the SAME cursor forever (an infinite walk
-                // that would otherwise re-count the same page every pass).
-                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => {
+                // **A repeated cursor on a non-empty page is refused (#203).**
+                // Following it loops forever; stopping with what we hold hands
+                // `replace_sub_refs` a list the server itself said was
+                // unfinished, which deletes everything past it.
+                Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
+                    anyhow::bail!(
+                        "listRecords for {collection} returned a repeated cursor on a \
+                         non-empty page ({} held) — refusing a list the server did not finish",
+                        out.len(),
+                    );
+                }
+                // A cursor on an EMPTY page ends the walk: a real PDS (this
+                // project's own) returns one alongside its last page.
+                Some(next) if got > 0 => {
                     cursor = Some(next);
                     more_offered = true;
                 }
@@ -1348,6 +1360,12 @@ impl PdsClient {
             // cursor with an empty page, or hand back the same one forever.)
             let more =
                 matches!(&page.cursor, Some(next) if got > 0 && Some(next) != cursor.as_ref());
+            // A repeated cursor on a non-empty page is not followed, but it is
+            // not the end of the collection either: the server said it had more.
+            // This walk keeps what it read (a stranger's repo, never
+            // `replace_sub_refs`) and reports itself partial (#203).
+            let cut_off =
+                matches!(&page.cursor, Some(next) if got > 0 && Some(next) == cursor.as_ref());
             // **The transient page needs its own bound.** The running total
             // charges what is KEPT, because that is what the walk retains and a
             // page is dropped after the filter. But transient is not free, and
@@ -1389,10 +1407,13 @@ impl PdsClient {
                 // collection had more to give — `extend_truncating` cannot see
                 // that, so the caller's "incomplete" signal is decided here.
                 return Ok(RecordWalk {
-                    complete: !more,
+                    complete: !more && !cut_off,
                     records: out,
                     malformed,
                 });
+            }
+            if cut_off {
+                return Ok(walk(RecordWalk::partial(out), malformed));
             }
             if !more {
                 return Ok(walk(RecordWalk::complete(out), malformed));
@@ -1986,7 +2007,8 @@ impl SidecarClient {
     ///
     /// Bounded by `MAX_LIST_PAGES` and cursor-repetition detection, same as
     /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
-    /// PDS, so the page count is ultimately remote-controlled here too.
+    /// PDS, so the page count is ultimately remote-controlled here too. Both
+    /// refuse rather than return a short list (#203).
     pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
         self.list_all_records_within(did, collection, &mut ByteBudget::new(MAX_LIST_BYTES))
             .await
@@ -2022,7 +2044,17 @@ impl SidecarClient {
             }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
-                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => {
+                // Same two exits as `walk_all_within`: a repeated cursor on a
+                // non-empty page is refused (#203); a cursor on an empty page
+                // ends the walk, as a real PDS's last page does.
+                Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
+                    anyhow::bail!(
+                        "listRecords for {collection} returned a repeated cursor on a \
+                         non-empty page ({} held) — refusing a list the server did not finish",
+                        out.len(),
+                    );
+                }
+                Some(next) if got > 0 => {
                     cursor = Some(next);
                     more_offered = true;
                 }
@@ -3640,6 +3672,29 @@ pub(crate) mod tests {
         );
     }
 
+    /// **A repeated cursor is not the end of the collection (#203).** The
+    /// stranger-repo walk keeps what it read rather than refusing, but a server
+    /// that repeated its cursor on a non-empty page said it had more: the walk
+    /// is partial, not complete.
+    #[tokio::test]
+    async fn a_walk_ended_by_a_repeated_cursor_reports_itself_incomplete() {
+        let body = serde_json::json!({
+            "records": [{"uri": "at://did:plc:x/c/1", "value": {}}],
+            "cursor": "same-every-time",
+        })
+        .to_string();
+        let (base, _) = host_for(vec![body.into_bytes()], "repeat-partial.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let walk = client
+            .list_recent_matching("c", 100, 100, |_| true)
+            .await
+            .expect("walk failed");
+        assert!(
+            !walk.complete,
+            "a walk the server cut off with a repeated cursor called itself complete"
+        );
+    }
+
     /// The other side: a collection that runs out IS complete, so the caller
     /// does not warn about every ordinary small publication.
     #[tokio::test]
@@ -4548,12 +4603,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// **The walk stops on a repeated cursor.** `MAX_LIST_PAGES`, the
-    /// same-cursor guard and the `got > 0` guard had no test; only
-    /// `extend_bounded` was covered directly. A PDS that echoes the same
-    /// cursor forever would otherwise be walked for 200 pages.
+    /// **The walk refuses a repeated cursor (#203).** A PDS that echoes the
+    /// same cursor forever would otherwise be walked for 200 pages, so the
+    /// walk must not follow it — but it must not return what it has either.
+    /// This walk feeds `replace_sub_refs`, and the two pages it read are a
+    /// list the server said was unfinished: returned as `Ok`, every
+    /// subscription past them is deleted from the reader's projection.
     #[tokio::test]
-    async fn list_all_records_stops_on_a_repeated_cursor() {
+    async fn list_all_records_refuses_a_repeated_cursor() {
         let body = serde_json::json!({
             "records": [{"uri": "at://did:plc:x/c/1", "value": {}}],
             "cursor": "same-every-time"
@@ -4576,10 +4633,66 @@ pub(crate) mod tests {
             format!("http://repeated-cursor.test:{port}"),
             "did:plc:x",
         );
-        let records = client.list_all_records("c").await.expect("walk failed");
-        // Page 1: cursor None → "same". Page 2: "same" again → stop, after
-        // taking that page. Two pages, not two hundred.
-        assert_eq!(records.len(), 2, "a repeated cursor was followed");
+        // Page 1: cursor None → "same". Page 2: "same" again, with a record →
+        // refused. Two requests, not two hundred, and no short list.
+        let err = client
+            .list_all_records("c")
+            .await
+            .expect_err("a repeated cursor ended the walk with a short list");
+        assert!(
+            format!("{err:#}").contains("repeated cursor"),
+            "refused for the wrong reason: {err:#}"
+        );
+    }
+
+    /// Twin of `list_all_records_refuses_a_repeated_cursor` for the sidecar
+    /// walk, the default backend.
+    #[tokio::test]
+    async fn the_sidecar_walk_refuses_a_repeated_cursor() {
+        let body = serde_json::json!({
+            "ok": true,
+            "data": {
+                "records": [{ "uri": "at://did:plc:x/c/3labONE", "value": {} }],
+                "cursor": "same-every-time",
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let base = crate::net::tests::serve_body(body).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let err = client
+            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
+            .await
+            .expect_err("a repeated cursor ended the walk with a short list");
+        assert!(
+            format!("{err:#}").contains("repeated cursor"),
+            "refused for the wrong reason: {err:#}"
+        );
+    }
+
+    /// **A cursor on an EMPTY page still ends the walk normally.** This
+    /// project's own PDS returns a cursor alongside its last page, so the
+    /// repeated-cursor refusal must not reach a page with no records.
+    #[tokio::test]
+    async fn the_sidecar_walk_ends_on_an_empty_page_that_carries_a_cursor() {
+        let bodies = vec![
+            serde_json::json!({ "ok": true, "data": {
+                "records": [{ "uri": "at://did:plc:x/c/3labONE", "value": {} }],
+                "cursor": "p1",
+            }})
+            .to_string()
+            .into_bytes(),
+            serde_json::json!({ "ok": true, "data": { "records": [], "cursor": "p1" }})
+                .to_string()
+                .into_bytes(),
+        ];
+        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
+        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+        let records = client
+            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
+            .await
+            .expect("an empty page with a cursor is how a real PDS ends a list");
+        assert_eq!(records.len(), 1);
     }
 
     // -- bounding the parse before it allocates -----------------------------
@@ -4970,7 +5083,7 @@ pub(crate) mod tests {
     /// pointing at the next. Returns the base URL and what one page costs.
     ///
     /// **Pages that differ is the whole point.** A walk served the same body
-    /// twice stops on its repeated-cursor guard, so every test built on the
+    /// twice is refused by its repeated-cursor guard, so every test built on the
     /// fixed-body server refuses on page one and never exercises accumulation
     /// at all — which is how a per-page budget once passed a whole suite.
     pub(crate) fn paged_bodies(

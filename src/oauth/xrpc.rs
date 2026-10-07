@@ -225,7 +225,8 @@ impl Repo<'_> {
     ///
     /// Bounded at `MAX_LIST_PAGES`: the repo is user-controlled, so an
     /// unbounded walk is a denial-of-service against ourselves. A cursor that
-    /// does not advance also terminates the walk rather than spinning.
+    /// does not advance on a non-empty page is refused rather than followed or
+    /// stopped on: either would hand back an unfinished list (#203).
     pub async fn list_all_records(&self, collection: &str) -> Result<Vec<RecordEntry>> {
         self.list_all_records_within(
             collection,
@@ -276,8 +277,17 @@ impl Repo<'_> {
                 // against the sidecar.
                 //
                 // The cursor-repeat check is the separate concern: a server that
-                // hands back the same cursor forever would otherwise loop.
-                Some(next) if got > 0 && Some(&next) != cursor.as_ref() => {
+                // hands back the same cursor forever would otherwise loop. It is
+                // REFUSED rather than ended on (#203): stopping there hands
+                // `replace_sub_refs` a list the server said was unfinished.
+                Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
+                    anyhow::bail!(
+                        "listRecords for {collection} returned a repeated cursor on a \
+                         non-empty page ({} held) — refusing a list the server did not finish",
+                        out.len(),
+                    );
+                }
+                Some(next) if got > 0 => {
                     cursor = Some(next);
                     more_offered = true;
                 }
@@ -1136,6 +1146,49 @@ mod tests {
             records.len(),
             MAX_LIST_PAGES,
             "a walk that used its whole page budget and finished lost records",
+        );
+    }
+
+    /// **The live walk refuses a repeated cursor (#203).** A server that hands
+    /// back the same cursor with a non-empty page said it had more and then
+    /// did not move. Stopping there with `Ok` handed a short list to
+    /// `replace_sub_refs`; following it would loop. Refusing is the only exit
+    /// that neither spins nor deletes.
+    #[tokio::test]
+    async fn the_live_walk_refuses_a_repeated_cursor() {
+        let body = serde_json::json!({
+            "records": [{ "uri": "at://did:plc:x/c/3labONE", "value": {} }],
+            "cursor": "same-every-time",
+        })
+        .to_string()
+        .into_bytes();
+        let base = crate::net::tests::serve_body(body).await;
+        let port: u16 = base
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        crate::net::test_host_override(
+            "repeated-cursor-live.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let http = Client::new();
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        crate::store::init_schema(&pool).await.unwrap();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = format!("http://repeated-cursor-live.test:{port}");
+        let repo = repo(&http, &pool, &s, &key);
+
+        let err = repo
+            .list_all_records("app.feather.subscription")
+            .await
+            .expect_err("a repeated cursor ended the walk with a short list");
+        assert!(
+            format!("{err:#}").contains("repeated cursor"),
+            "refused for the wrong reason: {err:#}"
         );
     }
 

@@ -14,6 +14,45 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **Two more ways a short subscription list could pass for a complete one
+  (#203).** The walks that feed `store::replace_sub_refs` — which DELETEs a
+  reader's whole `sub_ref` projection, the per-DID authorization set, and
+  rewrites it — had two non-advancing exits that returned `Ok` with what
+  they held: (a) a page carrying a cursor and no records, and (b) a page
+  with records whose cursor repeated the previous one. Either drops every
+  subscription past the cut, given a broken or hostile PDS. Not reachable
+  without one; #200 closed the case that needed no server misbehaviour.
+
+  **(b) is refused at the walk.** All three walks that reach `sub_ref` —
+  `PdsClient::list_all_records_within`, the sidecar's, and the OAuth
+  client's — now return `Err` naming the collection and "repeated cursor",
+  which takes `resolve_subscriptions`' existing fail-closed branch.
+  `list_all_records_stops_on_a_repeated_cursor`, which asserted the old
+  `Ok` with two records, is now `…_refuses_a_repeated_cursor`, with twins for
+  the sidecar and OAuth walks. The stranger-repo walk (`RecordWalk`) still
+  keeps what it read, but now reports itself partial rather than complete.
+
+  **(a) is checked at the destination.** The walk cannot refuse it: this
+  project's own PDS returns a cursor alongside its last page. Instead,
+  `resolve_subscriptions` now counts how many current `sub_ref` feeds the
+  new list drops; at 3 or more (`SUB_REF_SHRINK_CORROBORATE` — unsubscribing
+  here is one feed at a time, and a mass drop is the shape an early-ended
+  walk produces) it lists subscriptions a second time. If both listings
+  name the same URLs the change is applied; if they differ or the second
+  read fails, `sub_ref` is left untouched and the reader sees their
+  last-known list with an alert, via the same cached fallback as a failed
+  listing. Each mutation — repeated cursor back to `Ok` in each walk, the
+  corroboration skipped, the threshold removed or moved by one — fails a
+  test.
+
+  **The limit, stated:** a server that truncates identically twice is
+  indistinguishable from a reader who really unsubscribed from those feeds,
+  and is applied.
+
 ## 0.4.7 — 2026-10-07
 
 Hostile feed bodies are contained. The reader renders stored article bodies
