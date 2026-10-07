@@ -181,6 +181,10 @@ pub struct AppState {
     /// `/stats`. See [`runtime_health`] for why these two states needed a home
     /// outside the log stream.
     pub runtime_health: Arc<runtime_health::RuntimeHealth>,
+    /// Whether ingest is starved of sanitize permits (#226), read by
+    /// `/stats`: [`feed::SANITIZE_STARVATION`], which the poll path records
+    /// into; tests swap in their own.
+    pub sanitize_starvation: &'static feed::Starvation,
 }
 
 impl AppState {
@@ -225,6 +229,7 @@ impl AppState {
             metrics: Arc::new(metrics::RepoMetrics::new()),
             oauth,
             runtime_health: Arc::new(runtime_health::RuntimeHealth::new()),
+            sanitize_starvation: &feed::SANITIZE_STARVATION,
         })
     }
 }

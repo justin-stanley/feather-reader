@@ -1323,6 +1323,67 @@ impl Drop for AbandonGuard {
     }
 }
 
+/// Whether ingest is being starved of sanitize permits, for `/stats` and the
+/// logs (review of #274).
+///
+/// **Why:** one feed holds at most one thread (`InFlight`), but four hostile
+/// feeds — four URL variants of one, say — can still hold all
+/// `SANITIZE_CONCURRENCY` permits with sanitizes nobody can cancel. Every
+/// other feed's poll then defers (`SanitizeGaveUp::NoPermit`): nothing is
+/// stored and, by design, nothing is filed against those feeds — so without
+/// this the instance would silently stop updating. Counted, not prevented:
+/// the starvation lasts until those sanitizes finish.
+pub struct Starvation {
+    /// Polls deferred for want of a permit, since boot.
+    deferred: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the first such deferral since a permit was last
+    /// acquired; 0 while permits are coming free.
+    since: std::sync::atomic::AtomicI64,
+}
+
+/// After this long without a free permit, a deferral logs at error level.
+pub const STARVED_ALERT_SECS: i64 = 5 * 60;
+
+impl Starvation {
+    pub const fn new() -> Self {
+        Starvation {
+            deferred: std::sync::atomic::AtomicU64::new(0),
+            since: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// A poll got no permit at `now` (unix seconds). Returns how long the
+    /// instance has gone without one.
+    pub(crate) fn record_no_permit(&self, now: i64) -> i64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.deferred.fetch_add(1, Relaxed);
+        let _ = self.since.compare_exchange(0, now, Relaxed, Relaxed);
+        now - self.since.load(Relaxed)
+    }
+
+    /// A permit was acquired: not starved (any more).
+    pub(crate) fn record_permit(&self) {
+        self.since.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Polls deferred since boot, and since when (unix seconds) no permit has
+    /// come free, if that is now.
+    pub fn snapshot(&self) -> (u64, Option<i64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let since = self.since.load(Relaxed);
+        (self.deferred.load(Relaxed), (since != 0).then_some(since))
+    }
+}
+
+impl Default for Starvation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The production [`Starvation`], which `/stats` reads.
+pub static SANITIZE_STARVATION: Starvation = Starvation::new();
+
 /// The production [`InFlight`].
 static IN_FLIGHT: InFlight = InFlight::new();
 
@@ -1335,6 +1396,9 @@ pub(crate) struct SanitizeLimits {
     pub(crate) permits: &'static tokio::sync::Semaphore,
     pub(crate) in_flight: &'static InFlight,
     pub(crate) timeout: Duration,
+    /// Where permit starvation is recorded: [`SANITIZE_STARVATION`] in
+    /// production.
+    pub(crate) starvation: &'static Starvation,
     /// What runs on the blocking pool: [`sanitize_body`] in production. A seam
     /// for tests only — one that panics, or that takes the remaining permits
     /// mid-poll — so the paths those reach are tested deterministically.
@@ -1347,6 +1411,7 @@ impl SanitizeLimits {
         permits: &SANITIZE_PERMITS,
         in_flight: &IN_FLIGHT,
         timeout: SANITIZE_TIMEOUT,
+        starvation: &SANITIZE_STARVATION,
         sanitize: sanitize_body,
     };
 }
@@ -1405,9 +1470,24 @@ async fn sanitize_off_runtime(
     let guard = AbandonGuard::register(limits.in_flight, feed)?;
     let state = std::sync::Arc::clone(&guard.state);
     let permit = match tokio::time::timeout(limits.timeout, limits.permits.acquire()).await {
-        Ok(Ok(permit)) => permit,
+        Ok(Ok(permit)) => {
+            limits.starvation.record_permit();
+            permit
+        }
         // `Ok(Err(_))` is a closed semaphore, which this never does.
-        Ok(Err(_)) | Err(_) => return Err(SanitizeGaveUp::NoPermit),
+        Ok(Err(_)) | Err(_) => {
+            let starved = limits.starvation.record_no_permit(Utc::now().timestamp());
+            if starved >= STARVED_ALERT_SECS {
+                tracing::error!(
+                    starved_secs = starved,
+                    "ingest is stalled: no sanitize permit has come free for {}m, so every \
+                     poll is deferred and nothing is stored (#226: slow bodies' abandoned \
+                     sanitizes hold them all)",
+                    starved / 60
+                );
+            }
+            return Err(SanitizeGaveUp::NoPermit);
+        }
     };
     let sanitize = limits.sanitize;
     let task = tokio::task::spawn_blocking(move || {
@@ -4110,6 +4190,7 @@ mod sanitize_off_runtime_tests {
             permits,
             in_flight: Box::leak(Box::new(InFlight::new())),
             timeout,
+            starvation: Box::leak(Box::new(Starvation::new())),
             sanitize: sanitize_body,
         }
     }
@@ -4559,6 +4640,7 @@ mod sanitize_off_runtime_tests {
             permits: sem,
             in_flight: set,
             timeout: SHORT,
+            starvation: Box::leak(Box::new(Starvation::new())),
             sanitize: sanitize_body,
         };
 
@@ -4827,6 +4909,7 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
             permits: sem,
             in_flight: set,
             timeout: GENEROUS,
+            starvation: Box::leak(Box::new(Starvation::new())),
             sanitize: sanitize_body,
         };
         let feed = "https://hostile.test/feed";
@@ -4869,5 +4952,43 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
             Ok(clean(ORDINARY_B).unwrap())
         );
         assert!(set.lock().is_empty(), "the registry kept a finished feed");
+    }
+
+    /// **A starved instance is counted, not silent** (third review of #274).
+    /// Four hostile feeds can hold every permit; the polls that then defer
+    /// store nothing and file nothing against their feeds, so the starvation
+    /// itself is recorded: each deferral counts, the first marks since when,
+    /// and the next permit acquired clears that (the count stays).
+    #[tokio::test]
+    async fn permit_starvation_is_recorded_and_cleared() {
+        let sem = permits(1);
+        let short = limits(sem, SHORT);
+        assert_eq!(short.starvation.snapshot(), (0, None));
+        let held = sem.acquire().await.unwrap();
+        let before = Utc::now().timestamp();
+        for feed in ["https://one.test/feed", "https://two.test/feed"] {
+            assert_eq!(
+                sanitize_off_runtime(feed, ORDINARY_B.to_string(), short).await,
+                Err(SanitizeGaveUp::NoPermit)
+            );
+        }
+        let (deferred, since) = short.starvation.snapshot();
+        assert_eq!(
+            deferred, 2,
+            "a deferral for want of a permit went uncounted"
+        );
+        let since = since.expect("a starved instance did not record since when");
+        assert!(since >= before && since <= Utc::now().timestamp());
+
+        drop(held);
+        assert_eq!(
+            sanitize_off_runtime("https://one.test/feed", ORDINARY_B.to_string(), short).await,
+            Ok(clean(ORDINARY_B).unwrap())
+        );
+        assert_eq!(
+            short.starvation.snapshot(),
+            (2, None),
+            "a permit came free but the instance still reads as starved"
+        );
     }
 }

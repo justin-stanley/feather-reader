@@ -132,7 +132,13 @@ deploying is separate.
   permit at all — every one held by other feeds' abandoned sanitizes — is
   not that feed's fault: it stores nothing (no bodiless entries, no
   validators), records no failure and keeps its cadence
-  (`PollOutcome::Deferred`). Ordinary bodies are stored byte-for-byte as before
+  (`PollOutcome::Deferred`). **Known limit:** four hostile feeds (four URL
+  variants of one will do) can still hold all four permits until their
+  sanitizes finish, and every other poll defers meanwhile. That is made
+  visible rather than prevented: `/stats` gains a row counting polls deferred
+  for want of a permit and, while none has come free, "stalled" and since
+  when; after 5 minutes each deferral logs at error level. A structural fix
+  is tracked separately. Ordinary bodies are stored byte-for-byte as before
   (#224's sanitize-then-bound order is unchanged). The server now builds its
   runtime itself and shuts it down with a 5 s bound, because a dropped tokio
   runtime waits without limit for blocking work such as an abandoned
