@@ -1357,8 +1357,14 @@ impl Starvation {
     pub(crate) fn record_no_permit(&self, now: i64) -> i64 {
         use std::sync::atomic::Ordering::Relaxed;
         self.deferred.fetch_add(1, Relaxed);
-        let _ = self.since.compare_exchange(0, now, Relaxed, Relaxed);
-        now - self.since.load(Relaxed)
+        // From the exchange's own result, not a second load: a permit
+        // acquired in between resets `since` to 0, and `now - 0` would log
+        // decades of starvation.
+        let since = match self.since.compare_exchange(0, now, Relaxed, Relaxed) {
+            Ok(_) => now,
+            Err(prev) => prev,
+        };
+        now - since
     }
 
     /// A permit was acquired: not starved (any more).
