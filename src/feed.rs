@@ -1210,33 +1210,47 @@ pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
 static SANITIZE_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(SANITIZE_CONCURRENCY);
 
-/// The feeds with a sanitize a poll has **given up on** still running, each
-/// with how many (#226).
+/// The feeds with a sanitize still running, and how many of those a poll has
+/// **given up on** (#226).
 ///
 /// **Why:** a sanitize that timed out keeps running — ammonia cannot be
 /// interrupted — and the feed's next poll is a full fetch (its validators were
 /// not saved). Without this, every retry started another sanitize, and one
 /// hostile feed could come to hold every permit and starve every other feed.
-/// With it, every body from a feed with an abandoned sanitize still running is
-/// refused at once, without a permit, until that sanitize finishes: **one
-/// hostile feed, at most one thread**, however often it is retried.
+/// With it, a feed with a sanitize still running is not given another until
+/// it returns: **one feed, at most one thread**, however often it is polled.
+///
+/// **Counted from the start**, by a guard the blocking closure owns, and
+/// released only when ammonia returns or panics. Counting only once a poll
+/// gave up let overlapping polls of one feed (the scheduler and a subscribe
+/// POST, which polls inline) each start one before any timed out, and never
+/// counted a sanitize whose poll was dropped mid-way (a client disconnecting).
+/// A feed whose running sanitize was given up on is refused as its own
+/// failure ([`SanitizeGaveUp::StillRunning`]); one whose sanitize is merely
+/// in progress, or orphaned by a dropped poll, defers
+/// ([`SanitizeGaveUp::Busy`]).
 ///
 /// **By feed, not by body hash:** a hash let a feed dodge the refusal by
 /// serving different bytes each fetch (a nonce, or another slow entry on
 /// top), and it shared one feed's timeout with every other feed carrying the
-/// same article. A feed is refused only for its own abandoned sanitize.
-///
-/// A count is taken back by [`AbandonGuard`]'s `Drop`, which the blocking
-/// closure owns — so when the sanitize returns or panics, not when the poll
-/// gives up.
-pub(crate) struct InFlight(std::sync::Mutex<std::collections::BTreeMap<String, usize>>);
+/// same article.
+pub(crate) struct InFlight(std::sync::Mutex<std::collections::BTreeMap<String, Slot>>);
+
+/// One feed's sanitizes in [`InFlight`]. Removed when both are zero.
+#[derive(Default)]
+pub(crate) struct Slot {
+    /// Still running, given up on or not.
+    running: usize,
+    /// Of those, given up on by their poll.
+    abandoned: usize,
+}
 
 impl InFlight {
     pub(crate) const fn new() -> Self {
         InFlight(std::sync::Mutex::new(std::collections::BTreeMap::new()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, Slot>> {
         // Nothing here can leave the map inconsistent, so a poisoned lock is
         // still a usable one.
         self.0.lock().unwrap_or_else(|e| e.into_inner())
@@ -1245,15 +1259,16 @@ impl InFlight {
 
 /// [`AbandonGuard::state`]: running, not given up on.
 const RUNNING: u8 = 0;
-/// Given up on by its poll, and counted against its feed in [`InFlight`].
+/// Given up on by its poll, and counted as abandoned in [`InFlight`].
 const ABANDONED: u8 = 1;
 /// Returned (or panicked); never counted again.
 const DONE: u8 = 2;
 
-/// One sanitize's standing in [`InFlight`]. The state is only read or changed
-/// with the map locked, so "give up" and "return" cannot interleave: a
-/// sanitize that has already returned is never counted, and one that is
-/// counted is uncounted exactly once.
+/// One sanitize's standing in [`InFlight`], from registration until the
+/// sanitize returns. The state is only read or changed with the map locked,
+/// so "give up" and "return" cannot interleave: a sanitize that has already
+/// returned is never counted as abandoned, and every count is taken back
+/// exactly once.
 struct AbandonGuard {
     set: &'static InFlight,
     feed: String,
@@ -1261,13 +1276,32 @@ struct AbandonGuard {
 }
 
 impl AbandonGuard {
-    /// The poll gave up on it: count it against its feed, if still running.
+    /// Register a sanitize for `feed`, unless one is already running: then
+    /// why not — given up on (`StillRunning`) or merely in progress (`Busy`).
+    fn register(set: &'static InFlight, feed: &str) -> Result<Self, SanitizeGaveUp> {
+        let mut map = set.lock();
+        let slot = map.entry(feed.to_owned()).or_default();
+        if slot.abandoned > 0 {
+            return Err(SanitizeGaveUp::StillRunning);
+        }
+        if slot.running > 0 {
+            return Err(SanitizeGaveUp::Busy);
+        }
+        slot.running = 1;
+        Ok(AbandonGuard {
+            set,
+            feed: feed.to_owned(),
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RUNNING)),
+        })
+    }
+
+    /// The poll gave up on it: count it as abandoned, if still running.
     fn abandon(set: &'static InFlight, feed: &str, state: &std::sync::atomic::AtomicU8) {
         use std::sync::atomic::Ordering::SeqCst;
         let mut map = set.lock();
         if state.load(SeqCst) == RUNNING {
             state.store(ABANDONED, SeqCst);
-            *map.entry(feed.to_owned()).or_insert(0) += 1;
+            map.entry(feed.to_owned()).or_default().abandoned += 1;
         }
     }
 }
@@ -1276,12 +1310,14 @@ impl Drop for AbandonGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::SeqCst;
         let mut map = self.set.lock();
-        if self.state.swap(DONE, SeqCst) == ABANDONED {
-            if let Some(n) = map.get_mut(&self.feed) {
-                *n -= 1;
-                if *n == 0 {
-                    map.remove(&self.feed);
-                }
+        let was = self.state.swap(DONE, SeqCst);
+        if let Some(slot) = map.get_mut(&self.feed) {
+            slot.running = slot.running.saturating_sub(1);
+            if was == ABANDONED {
+                slot.abandoned = slot.abandoned.saturating_sub(1);
+            }
+            if slot.running == 0 && slot.abandoned == 0 {
+                map.remove(&self.feed);
             }
         }
     }
@@ -1334,6 +1370,11 @@ enum SanitizeGaveUp {
     /// running ([`InFlight`]); refused without starting another. The feed's
     /// fault exactly as [`SanitizeGaveUp::TimedOut`] is.
     StillRunning,
+    /// A sanitize of this feed's is still running but nobody gave up on it:
+    /// an overlapping poll, or one dropped mid-sanitize ([`InFlight`]). Not
+    /// started, and not the feed's fault: the poll defers, as for
+    /// [`SanitizeGaveUp::NoPermit`].
+    Busy,
 }
 
 /// [`sanitize_html_bounded`] on the blocking pool, under a permit and a
@@ -1351,27 +1392,22 @@ enum SanitizeGaveUp {
 /// graceful shutdown, which drains the polls in flight, past Fly's
 /// `kill_timeout`. So one entry costs a poll at most two timeouts.
 ///
-/// **A feed with a sanitize already given up on is refused before any of
-/// that** — no permit, no thread — until that sanitize finishes; see
-/// [`InFlight`].
+/// **A feed with a sanitize still running is refused before any of that** —
+/// no permit, no thread — until that sanitize finishes; see [`InFlight`].
 async fn sanitize_off_runtime(
     feed: &str,
     raw: String,
     limits: SanitizeLimits,
 ) -> Result<String, SanitizeGaveUp> {
-    if limits.in_flight.lock().contains_key(feed) {
-        return Err(SanitizeGaveUp::StillRunning);
-    }
+    // Registered before the permit wait, so overlapping polls of one feed
+    // cannot both get past here. If the wait fails, or this future is
+    // dropped before the spawn, the guard drops and the count goes with it.
+    let guard = AbandonGuard::register(limits.in_flight, feed)?;
+    let state = std::sync::Arc::clone(&guard.state);
     let permit = match tokio::time::timeout(limits.timeout, limits.permits.acquire()).await {
         Ok(Ok(permit)) => permit,
         // `Ok(Err(_))` is a closed semaphore, which this never does.
         Ok(Err(_)) | Err(_) => return Err(SanitizeGaveUp::NoPermit),
-    };
-    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RUNNING));
-    let guard = AbandonGuard {
-        set: limits.in_flight,
-        feed: feed.to_owned(),
-        state: std::sync::Arc::clone(&state),
     };
     let sanitize = limits.sanitize;
     let task = tokio::task::spawn_blocking(move || {
@@ -1440,6 +1476,14 @@ async fn normalize_entries(
                             timeout = ?limits.timeout,
                             "no sanitize permit came free in time (all held by abandoned \
                              sanitizes); deferring this feed's poll without storing it"
+                        );
+                        return None;
+                    }
+                    Err(SanitizeGaveUp::Busy) => {
+                        tracing::info!(
+                            feed = %feed_url,
+                            "a sanitize for this feed is already running (an overlapping \
+                             or dropped poll); deferring this poll without storing it"
                         );
                         return None;
                     }
@@ -4764,5 +4808,66 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
             err.into_panic().downcast_ref::<&str>(),
             Some(&"the sanitizer panicked")
         );
+    }
+
+    /// **Counted from the start, not from the timeout** (third review of
+    /// #274). A sanitize counted against its feed only once a poll gave up
+    /// on it left two ways for one feed to take every permit: overlapping
+    /// polls (the scheduler, and a subscribe POST, which polls inline) all
+    /// passed the check before any of them timed out; and a poll dropped
+    /// mid-sanitize (a client disconnecting from the subscribe request)
+    /// never counted its sanitize at all. Now a feed with any sanitize still
+    /// running is not given another: a poll that finds one in flight defers
+    /// (`Busy`), without a permit.
+    #[tokio::test]
+    async fn a_feed_with_a_sanitize_in_flight_is_not_given_another() {
+        let sem = permits(4);
+        let set: &'static InFlight = Box::leak(Box::new(InFlight::new()));
+        let generous = SanitizeLimits {
+            permits: sem,
+            in_flight: set,
+            timeout: GENEROUS,
+            sanitize: sanitize_body,
+        };
+        let feed = "https://hostile.test/feed";
+
+        // Overlapping: one poll's sanitize is running, not yet given up on.
+        let first = tokio::spawn(sanitize_off_runtime(feed, slow_body(), generous));
+        while sem.available_permits() == 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let started = Instant::now();
+        assert_eq!(
+            sanitize_off_runtime(feed, slow_body(), generous).await,
+            Err(SanitizeGaveUp::Busy)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            sem.available_permits(),
+            3,
+            "an overlapping poll of the same feed started a second sanitize"
+        );
+
+        // Dropped: the poll goes away mid-sanitize; the sanitize runs on and
+        // still counts.
+        first.abort();
+        let _ = first.await;
+        assert_eq!(
+            sanitize_off_runtime(feed, slow_body(), generous).await,
+            Err(SanitizeGaveUp::Busy)
+        );
+        assert_eq!(
+            sem.available_permits(),
+            3,
+            "a dropped poll's sanitize was not counted against its feed"
+        );
+
+        // Once it returns, the feed is sanitized as usual.
+        wait_for_permits(sem, 4).await;
+        assert_eq!(
+            sanitize_off_runtime(feed, ORDINARY_B.to_string(), generous).await,
+            Ok(clean(ORDINARY_B).unwrap())
+        );
+        assert!(set.lock().is_empty(), "the registry kept a finished feed");
     }
 }

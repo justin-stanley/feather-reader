@@ -119,11 +119,14 @@ deploying is separate.
   the original); nothing degraded is built in its place. The poll does not
   save its `ETag` / `Last-Modified`, so the next poll is a full fetch rather
   than a `304`, and it is reported as a `Body` failure so the feed backs off
-  and `/stats` says why. While a sanitize a poll gave up on is still
-  running, every body from that feed is refused at once without a permit,
-  so one hostile feed holds at most one thread however often it is retried
-  (found in review: retries otherwise piled up until one feed held all four
-  permits). It is tracked by feed, not by body hash: a hash let a feed dodge
+  and `/stats` says why. While any sanitize of a feed's is still running,
+  that feed is given no other, so one hostile feed holds at most one thread
+  however often it is polled (found in review: retries, overlapping polls
+  and polls dropped mid-sanitize otherwise each started another until one
+  feed held all four permits). The count starts when the sanitize does and
+  ends when ammonia returns; a poll that finds its feed's sanitize given up
+  on fails as a `Body` failure, and one that finds it merely in progress
+  defers. It is tracked by feed, not by body hash: a hash let a feed dodge
   the refusal by changing its bytes each fetch, and refused other feeds
   carrying the same article for a timeout that was not theirs. A poll that cannot get a
   permit at all — every one held by other feeds' abandoned sanitizes — is
