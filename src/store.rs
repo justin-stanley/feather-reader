@@ -88,7 +88,14 @@ pub struct Entry {
     pub author: Option<String>,
     /// Publication time as reported by the feed (RFC3339), or `None`.
     pub published: Option<String>,
-    /// Article body HTML, **already sanitized** (ammonia) before it reaches here.
+    /// Article body HTML, sanitized (ammonia) by ingest before it is stored.
+    ///
+    /// **Not trusted on the way out.** The column is plain `TEXT`, so nothing
+    /// here can prove which writer produced a row. The reader re-cleans it at
+    /// render with the same sanitizer, through
+    /// [`crate::sanitized_html::SanitizedHtml`], and never emits this `String`
+    /// unescaped (#151). Ingest sanitizing is still what keeps the stored
+    /// value clean, and a clean value is what re-cleans byte-identically.
     pub content_html: Option<String>,
     /// When FeatherReader first fetched/stored this entry (RFC3339).
     pub fetched_at: String,
@@ -237,7 +244,8 @@ pub struct NewEntry {
     pub title: Option<String>,
     pub author: Option<String>,
     pub published: Option<String>,
-    /// Already-sanitized HTML.
+    /// Already-sanitized HTML. `insert_entries` stores it as given; the
+    /// reader re-cleans it at render regardless (see [`Entry::content_html`]).
     pub content_html: Option<String>,
     /// Optional explicit fetch time (RFC3339); defaults to now if `None`.
     pub fetched_at: Option<String>,

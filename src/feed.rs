@@ -10,10 +10,12 @@
 //!    exponential backoff hint on error. A `304 Not Modified` is a no-op:
 //!    the feed is untouched apart from bumping its next-poll time.
 //! 2. **Safety** — every entry's HTML is run through `ammonia` before it is
-//!    ever stored (and therefore before it is ever rendered). Scripts, event
-//!    handlers, `javascript:` URLs, tracking pixels' dangerous attributes, and
-//!    other XSS vectors are stripped. Feeds carrying `<script>` is not
-//!    hypothetical; treat all feed HTML as untrusted.
+//!    ever stored. Scripts, event handlers, `javascript:` URLs, tracking
+//!    pixels' dangerous attributes, and other XSS vectors are stripped. Feeds
+//!    carrying `<script>` is not hypothetical; treat all feed HTML as
+//!    untrusted. The reader does not rely on this alone: it re-cleans the
+//!    stored body with the same `sanitize_html` at render, through
+//!    [`crate::sanitized_html::SanitizedHtml`] (#151).
 //! 3. **Robustness** — a malformed feed is **logged and skipped**, never a
 //!    panic. One bad publisher must not take down the poller. All non-test
 //!    paths use `Result`/`anyhow`; there are no `unwrap`/`expect`s.
@@ -3909,6 +3911,118 @@ mod tests {
         }
         assert!(is_storable_feed_url("https://example.com/feed.xml", true));
         assert!(is_storable_feed_url("http://example.com/feed.xml", true));
+    }
+
+    /// **What re-cleaning a stored body at render costs (#151).** Not a test: a
+    /// measurement, kept so the numbers in the PR and CHANGELOG can be
+    /// reproduced.
+    ///
+    /// ```text
+    /// FEATHER_BENCH_FEEDS=/path/to/dir/of/feed/files \
+    ///   cargo test --release --lib render_reclean_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// 1. Typical bodies: real feed documents from that directory, put through
+    ///    `normalize_entry` so each is exactly what ingest would store, then
+    ///    re-cleaned with `SanitizedHtml::clean`. Also counts bodies the
+    ///    re-clean changed.
+    /// 2. Pathological bodies: #226's quadratic inputs in their stored
+    ///    (fixed-point) form, up to the 2 MiB stored bound, through the bare
+    ///    sanitizer. A hostile feed can make ingest store these (#226); they
+    ///    are what the renderer's permits, single flight and cache are sized
+    ///    against.
+    ///    `FEATHER_BENCH_UNCAPPED_MAX=<bytes>` skips the larger sizes (2 MiB of
+    ///    nesting takes ~37 s).
+    #[test]
+    #[ignore = "benchmark; see the doc comment"]
+    fn render_reclean_cost() {
+        use crate::sanitized_html::SanitizedHtml;
+        use std::time::{Duration, Instant};
+
+        fn pct(sorted: &[Duration], p: f64) -> Duration {
+            sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
+        }
+
+        if let Ok(dir) = std::env::var("FEATHER_BENCH_FEEDS") {
+            let mut times = Vec::new();
+            let mut sizes = Vec::new();
+            let (mut changed, mut files) = (0usize, 0usize);
+            for path in std::fs::read_dir(&dir).unwrap() {
+                let bytes = std::fs::read(path.unwrap().path()).unwrap();
+                let Ok(parsed) = parse_feed(&bytes) else {
+                    continue;
+                };
+                files += 1;
+                for e in &parsed.entries {
+                    let Some(stored) = normalize_entry(e).content_html else {
+                        continue;
+                    };
+                    // Best of three, to take scheduler noise out of a small body.
+                    let mut best = Duration::MAX;
+                    let mut out = None;
+                    for _ in 0..3 {
+                        let t = Instant::now();
+                        out = Some(SanitizedHtml::clean(&stored));
+                        best = best.min(t.elapsed());
+                    }
+                    let out = out.unwrap();
+                    changed += usize::from(out.as_str() != stored);
+                    times.push(best);
+                    sizes.push(stored.len());
+                }
+            }
+            times.sort();
+            sizes.sort();
+            println!(
+                "real feeds: {files} files, {} bodies; size p50 {} B, p99 {} B, max {} B",
+                times.len(),
+                sizes[sizes.len() / 2],
+                sizes[((sizes.len() - 1) as f64 * 0.99).round() as usize],
+                sizes[sizes.len() - 1],
+            );
+            println!(
+                "  re-clean p50 {:?}, p99 {:?}, max {:?}; changed by re-cleaning: {changed}",
+                pct(&times, 0.5),
+                pct(&times, 0.99),
+                times[times.len() - 1],
+            );
+        }
+
+        let bound = MAX_CONTENT_HTML_BYTES;
+        let uncapped_max = std::env::var("FEATHER_BENCH_UNCAPPED_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(bound);
+        for size in [bound / 8, bound / 4, bound / 2, bound] {
+            if size > uncapped_max {
+                continue;
+            }
+            let depth = size / 11;
+            for (name, stored) in [
+                (
+                    "'&' run",
+                    format!("<p>{}</p>", "&amp;".repeat((size - 7) / 5)),
+                ),
+                (
+                    "U+00A0 run",
+                    format!("<p>{}</p>", "&nbsp;".repeat((size - 7) / 6)),
+                ),
+                (
+                    "nested <div>",
+                    format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth)),
+                ),
+                ("plain text", format!("<p>{}</p>", "a".repeat(size - 7))),
+            ] {
+                let t = Instant::now();
+                let out = sanitize_html(&stored);
+                println!(
+                    "pathological {name:>13} {:>8} B: {:?} (fixed point: {})",
+                    stored.len(),
+                    t.elapsed(),
+                    out == stored
+                );
+            }
+        }
     }
 }
 
