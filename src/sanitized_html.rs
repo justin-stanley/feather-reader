@@ -335,6 +335,10 @@ type InFlight = HashMap<Key, watch::Receiver<Option<Outcome>>>;
 
 struct Inner {
     permits: Arc<Semaphore>,
+    /// Test-only: the size of the permit pool as configured, which
+    /// `available_permits` cannot show while another test holds one.
+    #[cfg(test)]
+    permits_total: usize,
     wait: Duration,
     cache: Mutex<Cache>,
     in_flight: Mutex<InFlight>,
@@ -409,6 +413,8 @@ impl BodyRenderer {
     pub fn new(permits: usize, wait: Duration, cache_bytes: usize, cache_entries: usize) -> Self {
         Self(Arc::new(Inner {
             permits: Arc::new(Semaphore::new(permits)),
+            #[cfg(test)]
+            permits_total: permits,
             wait,
             cache: Mutex::new(Cache::new(cache_bytes, cache_entries)),
             in_flight: Mutex::new(HashMap::new()),
@@ -826,8 +832,14 @@ mod tests {
     ///
     /// Red against the pre-scan this module used to have: five of the six
     /// were cut before the sanitizer saw them.
-    #[test]
-    fn bodies_ingest_stores_render_in_full() {
+    ///
+    /// Each stored body goes through [`BodyRenderer::render`], the path the
+    /// reader takes, not just [`SanitizedHtml::clean`]: a render-time bound
+    /// tighter than what ingest stores (a size cap of 200 KB would refuse
+    /// the 245 KB listing) cuts the article just as surely as a pre-scan, and
+    /// a test of `clean` alone cannot see it (vacuous-test hunt of #273).
+    #[tokio::test]
+    async fn bodies_ingest_stores_render_in_full() {
         const REST: &str = "<p>REST-OF-ARTICLE</p>";
         let mut listing = String::new();
         let mut i = 0;
@@ -863,6 +875,7 @@ mod tests {
                 format!("<p>A<ruby><span>\u{6f22}<rt>kan</rt></span></ruby> B</p>{REST}"),
             ),
         ];
+        let r = renderer();
         let mut cut = Vec::new();
         for (name, raw) in &shapes {
             let stored = sanitize_html(raw);
@@ -870,7 +883,21 @@ mod tests {
                 stored.contains("REST-OF-ARTICLE"),
                 "{name}: ingest itself dropped the rest; this shape tests nothing"
             );
-            let out = SanitizedHtml::clean(&stored);
+            let out = match r.render(stored.clone()).await.unwrap() {
+                BodyRender::Html(out) => out,
+                refused => {
+                    cut.push(format!(
+                        "{name} (refused whole: {})",
+                        match refused {
+                            BodyRender::TooLarge => "too large",
+                            BodyRender::Unavailable => "unavailable",
+                            BodyRender::TooSlow => "too slow",
+                            BodyRender::Html(_) => unreachable!(),
+                        }
+                    ));
+                    continue;
+                }
+            };
             if !out.as_str().contains("REST-OF-ARTICLE") {
                 cut.push(format!(
                     "{name} (stored tail …{:?})",
@@ -1171,8 +1198,17 @@ mod tests {
 
     /// **Single flight.** Two concurrent renders of the same uncached body run
     /// the sanitizer once and both get its result; the second does not take a
-    /// permit, so with two permits a third, different body still renders at
-    /// once — it finishes before either of the slow pair.
+    /// permit. So while the pair is in flight exactly one of the two permits
+    /// is taken, and a third, different body renders while the pair is still
+    /// being cleaned.
+    ///
+    /// Checked by state, not by timestamps: the old form compared an instant
+    /// taken inside the join with one taken after it, which always held, so a
+    /// leader taking both permits or a joiner holding one while it waited
+    /// passed (vacuous-test hunt of #273). The after-lookup hook counts the
+    /// two misses; on this current-thread runtime the test only runs again
+    /// once each render has yielded past the in-flight check, so by then the
+    /// joiner has joined and anything it acquired without waiting is held.
     #[tokio::test]
     async fn concurrent_renders_of_one_body_clean_it_once() {
         let r = BodyRenderer::new(
@@ -1181,27 +1217,50 @@ mod tests {
             CACHE_MAX_BYTES,
             CACHE_MAX_ENTRIES,
         );
+        let misses = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&misses);
+        r.set_after_lookup(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
         let slow = slow_body();
+        let spawn_render = |body: String| {
+            let r = r.clone();
+            tokio::spawn(async move { r.render(body).await })
+        };
+        let a = spawn_render(slow.clone());
+        let b = spawn_render(slow.clone());
+        // Both have missed the cache and passed the in-flight check, and the
+        // leader holds its permit and is cleaning.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while misses.load(Ordering::SeqCst) < 2 || r.cleans() < 1 {
+            assert!(Instant::now() < deadline, "the slow pair never started");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(r.in_flight(), 1, "the slow pair is not one clean in flight");
+        assert_eq!(
+            r.permits().available_permits(),
+            1,
+            "the slow pair holds other than one permit: the leader took more, or the joiner took one"
+        );
+
         let other = "<p>a different, cheap body</p>".to_string();
-        let (a, b, (c, c_done)) =
-            tokio::join!(r.render(slow.clone()), r.render(slow.clone()), async {
-                // Let the slow pair start first.
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                (r.render(other.clone()).await, Instant::now())
-            });
-        let pair_done = Instant::now();
-        let (a, b) = (html(a.unwrap()), html(b.unwrap()));
+        assert_eq!(html(r.render(other.clone()).await.unwrap()), other);
+        assert_eq!(
+            r.in_flight(),
+            1,
+            "the cheap body waited behind the slow pair: no permit was free"
+        );
+
+        let (a, b) = (
+            html(a.await.unwrap().unwrap()),
+            html(b.await.unwrap().unwrap()),
+        );
         assert_eq!(a, b);
         assert_eq!(a, sanitize_html(&slow));
-        assert_eq!(html(c.unwrap()), other);
         assert_eq!(
             r.cleans(),
             2,
             "the slow body was cleaned more than once, or the cheap one was not"
-        );
-        assert!(
-            c_done < pair_done,
-            "the cheap body waited behind the slow pair: no permit was free"
         );
     }
 
@@ -1293,12 +1352,18 @@ mod tests {
         );
     }
 
-    /// The shared instance carries the documented parameters.
+    /// The shared instance carries the documented parameters. The permit
+    /// count is the configured pool, not `available_permits`: the web tests
+    /// render through this same process-wide instance concurrently, so a
+    /// permit held by one of them made this flaky; and the slow threshold is
+    /// [`SLOW_CLEAN`], which nothing checked on the shared instance
+    /// (vacuous-test hunt of #273).
     #[test]
     fn the_shared_renderer_has_the_documented_parameters() {
         let shared = BodyRenderer::shared();
-        assert_eq!(shared.0.permits.available_permits(), RENDER_PERMITS);
+        assert_eq!(shared.0.permits_total, RENDER_PERMITS);
         assert_eq!(shared.0.wait, RENDER_WAIT);
+        assert_eq!(shared.0.slow, SLOW_CLEAN);
         let cache = shared.0.cache();
         assert_eq!(cache.max_bytes, CACHE_MAX_BYTES);
         assert_eq!(cache.max_entries, CACHE_MAX_ENTRIES);

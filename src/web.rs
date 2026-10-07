@@ -10021,7 +10021,9 @@ mod tests {
             "an already-clean stored body did not render byte-identically: {clean}",
         );
         assert!(
-            !clean.contains("body-too-large") && !clean.contains("body-unavailable"),
+            !clean.contains("body-too-large")
+                && !clean.contains("body-unavailable")
+                && !clean.contains("body-too-slow"),
             "a whole, ordinary body was shown as refused: {clean}",
         );
 
@@ -10039,11 +10041,14 @@ mod tests {
         );
     }
 
-    /// **Each of the renderer's three outcomes has its own branch in
+    /// **Each of the renderer's four outcomes has its own branch in
     /// `entry.html`.** The handler test above drives the first two through the
     /// real path; `Unavailable` cannot be forced there without starving the
-    /// process-wide permits that every other test shares, so the template is
-    /// rendered directly for all three.
+    /// process-wide permits that every other test shares, and `TooSlow` needs
+    /// a body that took over 500 ms to clean, so the template is rendered
+    /// directly for all four. `TooSlow` was missing here, so deleting its note
+    /// from the template left the page silently empty with every test green
+    /// (vacuous-test hunt of #273).
     #[test]
     fn the_reader_template_renders_each_body_outcome() {
         let config = Config::default();
@@ -10081,7 +10086,11 @@ mod tests {
             crate::sanitized_html::SanitizedHtml::clean("<p>body <b>here</b></p>"),
         )));
         assert!(html.contains("<p>body <b>here</b></p>"), "{html}");
-        assert!(!html.contains("body-too-large") && !html.contains("body-unavailable"));
+        assert!(
+            !html.contains("body-too-large")
+                && !html.contains("body-unavailable")
+                && !html.contains("body-too-slow")
+        );
 
         let too_large = page(Some(BodyRender::TooLarge));
         assert!(too_large.contains("body-too-large"), "{too_large}");
@@ -10095,6 +10104,14 @@ mod tests {
             "{unavailable}"
         );
         assert!(!unavailable.contains("body-too-large"));
+
+        let too_slow = page(Some(BodyRender::TooSlow));
+        assert!(too_slow.contains("body-too-slow"), "{too_slow}");
+        assert!(too_slow.contains("too complex to display"), "{too_slow}");
+        assert!(
+            !too_slow.contains("body-too-large") && !too_slow.contains("body-unavailable"),
+            "{too_slow}"
+        );
 
         let none = page(None);
         assert!(none.contains("has no stored content"), "{none}");
