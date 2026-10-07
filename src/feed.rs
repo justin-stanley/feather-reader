@@ -1208,52 +1208,80 @@ pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
 static SANITIZE_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(SANITIZE_CONCURRENCY);
 
-/// The SHA-256 of a raw body: what [`InFlight`] tracks a sanitize by.
-type BodyKey = [u8; 32];
-
-/// The bodies being sanitized right now, by content hash, each with whether a
-/// poll has **given up** on it (#226).
+/// The feeds with a sanitize a poll has **given up on** still running, each
+/// with how many (#226).
 ///
 /// **Why:** a sanitize that timed out keeps running — ammonia cannot be
 /// interrupted — and the feed's next poll is a full fetch (its validators were
-/// not saved) of the same bytes. Without this, every retry started another
-/// sanitize of a body already known to be too slow, and one hostile feed could
-/// come to hold every permit and starve every other feed. With it, a body a
-/// poll has abandoned is refused at once, without a permit, until its one
-/// sanitize finishes: **one hostile body, at most one thread**, however often
-/// it is retried. A content hash rather than `(feed, guid)`, because a retry
-/// fetches identical bytes whatever feed or id carries them.
+/// not saved). Without this, every retry started another sanitize, and one
+/// hostile feed could come to hold every permit and starve every other feed.
+/// With it, every body from a feed with an abandoned sanitize still running is
+/// refused at once, without a permit, until that sanitize finishes: **one
+/// hostile feed, at most one thread**, however often it is retried.
 ///
-/// Only an ABANDONED body is refused. A body merely in progress (the same
-/// article in two feeds polled at once) is sanitized again, as before, rather
-/// than failed for a coincidence.
+/// **By feed, not by body hash:** a hash let a feed dodge the refusal by
+/// serving different bytes each fetch (a nonce, or another slow entry on
+/// top), and it shared one feed's timeout with every other feed carrying the
+/// same article. A feed is refused only for its own abandoned sanitize.
 ///
-/// An entry is removed by [`InFlightGuard`]'s `Drop`, which the blocking
+/// A count is taken back by [`AbandonGuard`]'s `Drop`, which the blocking
 /// closure owns — so when the sanitize returns or panics, not when the poll
 /// gives up.
-pub(crate) struct InFlight(std::sync::Mutex<std::collections::BTreeMap<BodyKey, bool>>);
+pub(crate) struct InFlight(std::sync::Mutex<std::collections::BTreeMap<String, usize>>);
 
 impl InFlight {
     pub(crate) const fn new() -> Self {
         InFlight(std::sync::Mutex::new(std::collections::BTreeMap::new()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<BodyKey, bool>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, usize>> {
         // Nothing here can leave the map inconsistent, so a poisoned lock is
         // still a usable one.
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// Removes its key from an [`InFlight`] when dropped.
-struct InFlightGuard {
+/// [`AbandonGuard::state`]: running, not given up on.
+const RUNNING: u8 = 0;
+/// Given up on by its poll, and counted against its feed in [`InFlight`].
+const ABANDONED: u8 = 1;
+/// Returned (or panicked); never counted again.
+const DONE: u8 = 2;
+
+/// One sanitize's standing in [`InFlight`]. The state is only read or changed
+/// with the map locked, so "give up" and "return" cannot interleave: a
+/// sanitize that has already returned is never counted, and one that is
+/// counted is uncounted exactly once.
+struct AbandonGuard {
     set: &'static InFlight,
-    key: BodyKey,
+    feed: String,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
-impl Drop for InFlightGuard {
+impl AbandonGuard {
+    /// The poll gave up on it: count it against its feed, if still running.
+    fn abandon(set: &'static InFlight, feed: &str, state: &std::sync::atomic::AtomicU8) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut map = set.lock();
+        if state.load(SeqCst) == RUNNING {
+            state.store(ABANDONED, SeqCst);
+            *map.entry(feed.to_owned()).or_insert(0) += 1;
+        }
+    }
+}
+
+impl Drop for AbandonGuard {
     fn drop(&mut self) {
-        self.set.lock().remove(&self.key);
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut map = self.set.lock();
+        if self.state.swap(DONE, SeqCst) == ABANDONED {
+            if let Some(n) = map.get_mut(&self.feed) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&self.feed);
+                }
+            }
+        }
     }
 }
 
@@ -1289,18 +1317,10 @@ enum SanitizeGaveUp {
     /// The sanitize did not finish within the timeout (or the runtime is
     /// shutting down and cancelled it before it started).
     TimedOut,
-    /// This exact body's sanitize was already given up on and is still
+    /// A sanitize of this feed's was already given up on and is still
     /// running ([`InFlight`]); refused without starting another. The feed's
     /// fault exactly as [`SanitizeGaveUp::TimedOut`] is.
     StillRunning,
-}
-
-/// The [`InFlight`] key of a raw body.
-fn body_key(raw: &str) -> BodyKey {
-    let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(digest.as_ref());
-    key
 }
 
 /// [`sanitize_html_bounded`] on the blocking pool, under a permit and a
@@ -1318,37 +1338,27 @@ fn body_key(raw: &str) -> BodyKey {
 /// graceful shutdown, which drains the polls in flight, past Fly's
 /// `kill_timeout`. So one entry costs a poll at most two timeouts.
 ///
-/// **A body already given up on is refused before any of that** — no permit,
-/// no thread — until its one sanitize finishes; see [`InFlight`]. The hash is
-/// SHA-256 on the async task: linear, and at most `net::MAX_BODY_BYTES` per
-/// poll, unlike the sanitize it guards.
+/// **A feed with a sanitize already given up on is refused before any of
+/// that** — no permit, no thread — until that sanitize finishes; see
+/// [`InFlight`].
 async fn sanitize_off_runtime(
+    feed: &str,
     raw: String,
     limits: SanitizeLimits,
 ) -> Result<String, SanitizeGaveUp> {
-    let key = body_key(&raw);
-    // Register the body unless it is already in progress. Only the poll that
-    // registered it owns the guard; a concurrent identical body (not
-    // abandoned) is simply sanitized again, unregistered.
-    let guard = {
-        let mut map = limits.in_flight.lock();
-        match map.get(&key) {
-            Some(true) => return Err(SanitizeGaveUp::StillRunning),
-            Some(false) => None,
-            None => {
-                map.insert(key, false);
-                Some(InFlightGuard {
-                    set: limits.in_flight,
-                    key,
-                })
-            }
-        }
-    };
+    if limits.in_flight.lock().contains_key(feed) {
+        return Err(SanitizeGaveUp::StillRunning);
+    }
     let permit = match tokio::time::timeout(limits.timeout, limits.permits.acquire()).await {
         Ok(Ok(permit)) => permit,
-        // `Ok(Err(_))` is a closed semaphore, which this never does. The guard
-        // drops here: nothing was started, so nothing stays registered.
+        // `Ok(Err(_))` is a closed semaphore, which this never does.
         Ok(Err(_)) | Err(_) => return Err(SanitizeGaveUp::NoPermit),
+    };
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RUNNING));
+    let guard = AbandonGuard {
+        set: limits.in_flight,
+        feed: feed.to_owned(),
+        state: std::sync::Arc::clone(&state),
     };
     let task = tokio::task::spawn_blocking(move || {
         // Both released when ammonia returns — or panics — not when the poll
@@ -1362,11 +1372,8 @@ async fn sanitize_off_runtime(
         // A panic in the sanitizer propagates as it did when this ran inline.
         Ok(Err(err)) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
         Ok(Err(_)) | Err(_) => {
-            // Mark it given up on, if it is still running (whoever registered
-            // it): from now until it returns, this body is refused.
-            if let Some(abandoned) = limits.in_flight.lock().get_mut(&key) {
-                *abandoned = true;
-            }
+            // From now until it returns, this feed is refused.
+            AbandonGuard::abandon(limits.in_flight, feed, &state);
             Err(SanitizeGaveUp::TimedOut)
         }
     }
@@ -1403,7 +1410,7 @@ async fn normalize_entries(
             if timed_out {
                 entry.keep_stored_content = true;
             } else {
-                match sanitize_off_runtime(body.to_owned(), limits).await {
+                match sanitize_off_runtime(feed_url, body.to_owned(), limits).await {
                     Ok(html) => entry.content_html = Some(html),
                     Err(SanitizeGaveUp::NoPermit) => {
                         tracing::warn!(
@@ -4398,5 +4405,59 @@ mod sanitize_off_runtime_tests {
         assert!(bodies(&pool)
             .await
             .contains(&("urn:slow".to_string(), clean(&slow))));
+    }
+
+    /// **One hostile feed, at most one thread — whatever bytes it serves**
+    /// (second review of #274). Tracking by body hash let a feed dodge the
+    /// refusal by changing its slow body each fetch (a nonce, or another slow
+    /// entry on top), leaving one more uncancellable sanitize behind per poll
+    /// until it held every permit. Tracked by feed, any body from a feed with
+    /// an abandoned sanitize still running is refused, without a permit.
+    #[tokio::test]
+    async fn a_feed_cannot_dodge_the_refusal_by_changing_its_body() {
+        let sem = permits(4);
+        let short = limits(sem, SHORT);
+        let slow = slow_body();
+        let first = sanitize_off_runtime("https://hostile.test/feed", slow.clone(), short).await;
+        assert_eq!(first, Err(SanitizeGaveUp::TimedOut));
+        for nonce in 0..3 {
+            let changed = format!("{slow}<!-- {nonce} -->");
+            let started = Instant::now();
+            let again = sanitize_off_runtime("https://hostile.test/feed", changed, short).await;
+            assert_eq!(again, Err(SanitizeGaveUp::StillRunning));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        assert_eq!(
+            sem.available_permits(),
+            3,
+            "a changed body from the same feed started another sanitize"
+        );
+        wait_for_permits(sem, 4).await;
+    }
+
+    /// **Another feed's timeout is not this feed's** (second review of #274).
+    /// Shared by body hash, one feed's abandoned sanitize refused every other
+    /// feed carrying the same article, as a `Body` failure of their own. Now
+    /// another feed is sanitized as usual, and a feed with an ordinary body
+    /// is never held up by a hostile one.
+    #[tokio::test]
+    async fn one_feeds_abandoned_sanitize_does_not_refuse_another_feed() {
+        let sem = permits(4);
+        let short = limits(sem, SHORT);
+        let slow = slow_body();
+        assert_eq!(
+            sanitize_off_runtime("https://hostile.test/feed", slow.clone(), short).await,
+            Err(SanitizeGaveUp::TimedOut)
+        );
+        // The same article in another feed: its own attempt, not a refusal.
+        assert_eq!(
+            sanitize_off_runtime("https://mirror.test/feed", slow, short).await,
+            Err(SanitizeGaveUp::TimedOut)
+        );
+        assert_eq!(
+            sanitize_off_runtime("https://ordinary.test/feed", ORDINARY_B.to_string(), short).await,
+            Ok(clean(ORDINARY_B).unwrap())
+        );
+        wait_for_permits(sem, 4).await;
     }
 }

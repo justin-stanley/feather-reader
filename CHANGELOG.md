@@ -34,11 +34,13 @@ deploying is separate.
   the original); nothing degraded is built in its place. The poll does not
   save its `ETag` / `Last-Modified`, so the next poll is a full fetch rather
   than a `304`, and it is reported as a `Body` failure so the feed backs off
-  and `/stats` says why. A body a poll has given up on is tracked by its
-  SHA-256 until its one sanitize returns, and a re-fetch of the same bytes
-  is refused at once without a permit, so one hostile body holds at most one
-  thread however often it is retried (found in review: retries otherwise
-  piled up until one feed held all four permits). A poll that cannot get a
+  and `/stats` says why. While a sanitize a poll gave up on is still
+  running, every body from that feed is refused at once without a permit,
+  so one hostile feed holds at most one thread however often it is retried
+  (found in review: retries otherwise piled up until one feed held all four
+  permits). It is tracked by feed, not by body hash: a hash let a feed dodge
+  the refusal by changing its bytes each fetch, and refused other feeds
+  carrying the same article for a timeout that was not theirs. A poll that cannot get a
   permit at all — every one held by other feeds' abandoned sanitizes — is
   not that feed's fault: it stores nothing (no bodiless entries, no
   validators), records no failure and keeps its cadence
