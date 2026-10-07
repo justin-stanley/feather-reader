@@ -1297,6 +1297,10 @@ pub(crate) struct SanitizeLimits {
     pub(crate) permits: &'static tokio::sync::Semaphore,
     pub(crate) in_flight: &'static InFlight,
     pub(crate) timeout: Duration,
+    /// What runs on the blocking pool: [`sanitize_body`] in production. A seam
+    /// for tests only — one that panics, or that takes the remaining permits
+    /// mid-poll — so the paths those reach are tested deterministically.
+    pub(crate) sanitize: fn(&str) -> String,
 }
 
 impl SanitizeLimits {
@@ -1305,7 +1309,14 @@ impl SanitizeLimits {
         permits: &SANITIZE_PERMITS,
         in_flight: &IN_FLIGHT,
         timeout: SANITIZE_TIMEOUT,
+        sanitize: sanitize_body,
     };
+}
+
+/// An entry body as it is stored: [`sanitize_html_bounded`] to
+/// [`MAX_CONTENT_HTML_BYTES`].
+fn sanitize_body(raw: &str) -> String {
+    sanitize_html_bounded(raw, MAX_CONTENT_HTML_BYTES)
 }
 
 /// Why [`sanitize_off_runtime`] produced no body.
@@ -1360,12 +1371,13 @@ async fn sanitize_off_runtime(
         feed: feed.to_owned(),
         state: std::sync::Arc::clone(&state),
     };
+    let sanitize = limits.sanitize;
     let task = tokio::task::spawn_blocking(move || {
         // Both released when ammonia returns — or panics — not when the poll
         // gives up.
         let _permit = permit;
         let _guard = guard;
-        sanitize_html_bounded(&raw, MAX_CONTENT_HTML_BYTES)
+        sanitize(&raw)
     });
     match tokio::time::timeout(limits.timeout, task).await {
         Ok(Ok(html)) => Ok(html),
@@ -1384,7 +1396,12 @@ async fn sanitize_off_runtime(
 /// timed out — or `None` when the poll should be **deferred**.
 ///
 /// **After the first timeout no further body is sanitized in this poll**, so
-/// one hostile feed costs at most one abandoned blocking thread per poll. The
+/// one hostile feed costs at most one abandoned blocking thread per poll. What
+/// stops the later entries is the per-feed refusal ([`InFlight`]): the
+/// abandoned sanitize is still running, so [`sanitize_off_runtime`] refuses
+/// each of them at once. The `timed_out` guard here is only a backup, for the
+/// race in which that sanitize finishes between being given up on and the
+/// next entry — without it, that entry would be sanitized after all. The
 /// timed-out entry and every later entry with a body are returned with
 /// `content_html: None` and `keep_stored_content: true`: an entry already
 /// stored keeps the body it has, and a new one is stored without a body (the
@@ -1408,6 +1425,9 @@ async fn normalize_entries(
         let mut entry = entry_without_body(e);
         if let Some(body) = entry_raw_body(e) {
             if timed_out {
+                // Normally `sanitize_off_runtime` would refuse it anyway (the
+                // abandoned sanitize is still in flight); this covers the
+                // race where that sanitize has already finished.
                 entry.keep_stored_content = true;
             } else {
                 match sanitize_off_runtime(feed_url, body.to_owned(), limits).await {
@@ -3932,6 +3952,7 @@ mod sanitize_off_runtime_tests {
             permits,
             in_flight: Box::leak(Box::new(InFlight::new())),
             timeout,
+            sanitize: sanitize_body,
         }
     }
 
@@ -4083,8 +4104,11 @@ mod sanitize_off_runtime_tests {
             worst_gap < Duration::from_millis(700),
             "the runtime stalled for {worst_gap:?} during the poll: the sanitize ran on it"
         );
+        // Tight enough that a sanitize timeout a few times `SHORT` fails it
+        // (vacuous-test hunt of #274: `< 1 s` let an 8x timeout through;
+        // 6x leaves a loaded CI runner room).
         assert!(
-            took < Duration::from_millis(1_000),
+            took < SHORT * 6,
             "the poll took {took:?}; it should end at the {SHORT:?} timeout"
         );
         assert!(
@@ -4102,7 +4126,9 @@ mod sanitize_off_runtime_tests {
             vec![
                 // Before the slow entry: sanitized and stored as always.
                 ("urn:a".to_string(), clean(ORDINARY_A)),
-                // After it: not sanitized this poll, so stored without a body.
+                // After it: refused while the slow entry's abandoned sanitize
+                // runs (the per-feed refusal; `timed_out` backs it up), so
+                // stored without a body.
                 ("urn:b".to_string(), None),
                 ("urn:bare".to_string(), None),
                 // The slow entry itself: no body, and nothing degraded instead.
@@ -4236,8 +4262,37 @@ mod sanitize_off_runtime_tests {
     /// With every permit held, a poll waits for one **asynchronously**: other
     /// work on the same current-thread runtime goes on, and the poll finishes
     /// once a permit is free.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_poll_waits_for_a_permit_without_blocking_the_runtime() {
+    ///
+    /// A wait that blocks the runtime would never let the test release the
+    /// permit, so it would hang rather than fail; a timeout on that same
+    /// runtime could never fire. So the runtime runs on a thread of its own,
+    /// and the test fails if it has not finished in 10 s (vacuous-test hunt of
+    /// #274).
+    #[test]
+    fn a_poll_waits_for_a_permit_without_blocking_the_runtime() {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runtime = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(poll_waits_for_a_permit());
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => runtime.join().unwrap(),
+            // The body panicked: fail with its panic.
+            Err(RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(runtime.join().unwrap_err())
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("the poll blocked the runtime while waiting for a permit")
+            }
+        }
+    }
+
+    async fn poll_waits_for_a_permit() {
         let (pool, feed, _) = fixture("permit-wait.test", rss(ORDINARY_B)).await;
         let sem = permits(1);
         let held = sem.acquire().await.unwrap();
@@ -4289,11 +4344,11 @@ mod sanitize_off_runtime_tests {
         let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(sem, SHORT))
             .await
             .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
+        // It waited the timeout for a permit, and not much more (vacuous-test
+        // hunt of #274: `< 2 s` let a 15x permit wait through; 10x leaves a
+        // loaded CI runner room).
+        let took = started.elapsed();
+        assert!(took >= SHORT && took < SHORT * 10, "{took:?}");
         assert_eq!(outcome, PollOutcome::Deferred);
         let cadence = Duration::from_secs(3600);
         settle_poll(&pool, &feed.url, &outcome, cadence).await;
@@ -4329,15 +4384,16 @@ mod sanitize_off_runtime_tests {
         }
     }
 
-    /// **One hostile body, at most one thread** (review of #274). A re-poll
-    /// while the body's abandoned sanitize is still running starts no second
-    /// sanitize and takes no permit: it is refused at once, as timed out.
-    /// Once that sanitize finishes, its key is released and the body can be
-    /// sanitized again.
+    /// **One hostile feed, at most one thread** (review of #274). A re-poll
+    /// while the feed's abandoned sanitize is still running starts no second
+    /// sanitize and takes no permit, whatever body it now serves: it is
+    /// refused at once, as timed out. Once that sanitize finishes, the feed is
+    /// released and its body is sanitized again. (Renamed in the vacuous-test
+    /// hunt of #274: it dated from when the refusal was keyed by body hash.)
     #[tokio::test]
-    async fn an_abandoned_body_is_not_sanitized_again_until_its_sanitize_finishes() {
+    async fn a_feed_is_refused_until_its_abandoned_sanitize_finishes() {
         let slow = slow_body();
-        let (pool, feed, _) = fixture("abandoned-body.test", rss(&slow)).await;
+        let (pool, feed, served) = fixture("abandoned-body.test", rss(&slow)).await;
         let client = build_client().unwrap();
         let sem = permits(4);
         let set: &'static InFlight = Box::leak(Box::new(InFlight::new()));
@@ -4345,6 +4401,7 @@ mod sanitize_off_runtime_tests {
             permits: sem,
             in_flight: set,
             timeout: SHORT,
+            sanitize: sanitize_body,
         };
 
         poll_feed_with(&pool, &client, &feed, 0, short)
@@ -4356,8 +4413,10 @@ mod sanitize_off_runtime_tests {
             "the first poll abandoned one sanitize"
         );
 
-        // Re-polls while it runs: each refused at once, no permit taken.
-        for _ in 0..3 {
+        // Re-polls while it runs, each serving a changed body: each refused
+        // at once, no permit taken.
+        for nonce in 0..3 {
+            *served.lock().unwrap() = rss(&format!("{slow}<!-- {nonce} -->")).into_bytes();
             let started = Instant::now();
             let outcome = poll_feed_with(&pool, &client, &feed, 0, short)
                 .await
@@ -4381,10 +4440,11 @@ mod sanitize_off_runtime_tests {
         assert_eq!(
             sem.available_permits(),
             3,
-            "a re-poll started another sanitize of a body already abandoned"
+            "a re-poll started another sanitize for a feed already abandoned"
         );
 
-        // Once the abandoned sanitize returns, the body is no longer refused.
+        // Once the abandoned sanitize returns, the feed is no longer refused.
+        *served.lock().unwrap() = rss(&slow).into_bytes();
         wait_for_permits(sem, 4).await;
         let outcome = poll_feed_with(
             &pool,
@@ -4459,5 +4519,136 @@ mod sanitize_off_runtime_tests {
             Ok(clean(ORDINARY_B).unwrap())
         );
         wait_for_permits(sem, 4).await;
+    }
+
+    /// The **content** body is stored, not the summary, and a body that
+    /// sanitizes past [`MAX_CONTENT_HTML_BYTES`] is stored within it — with
+    /// literal expectations, not ones built from the functions under test
+    /// (vacuous-test hunt of #274: the poll path could have read the summary
+    /// only, or dropped the bound, and the byte-identical test still passed).
+    #[tokio::test]
+    async fn the_content_body_is_stored_over_the_summary_and_within_the_bound() {
+        let huge = format!("<p>{}<b>tail</b></p>", "a".repeat(MAX_CONTENT_HTML_BYTES));
+        let item = |guid: &str, content: &str, summary: &str| {
+            format!(
+                "<item><title>{guid}</title><link>https://content.example/{guid}</link>\
+                 <guid>urn:{guid}</guid>\
+                 <description><![CDATA[{summary}]]></description>\
+                 <content:encoded><![CDATA[{content}]]></content:encoded></item>"
+            )
+        };
+        let doc = format!(
+            r#"<?xml version="1.0"?><rss version="2.0"
+xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content</title>
+<link>https://content.example/</link>{}{}</channel></rss>"#,
+            item(
+                "full",
+                "<p>The <b>full</b> body.<script>x()</script></p>",
+                "<p>Only the teaser.</p>"
+            ),
+            item("huge", &huge, "<p>Short.</p>"),
+        );
+        let (pool, feed, _) = fixture("content-body.test", doc).await;
+        let client = build_client().unwrap();
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, limits(permits(4), GENEROUS))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Updated { .. }),
+            "{outcome:?}"
+        );
+        let stored = bodies(&pool).await;
+        assert_eq!(
+            stored[0],
+            (
+                "urn:full".to_string(),
+                Some("<p>The <b>full</b> body.</p>".to_string())
+            )
+        );
+        let (guid, body) = &stored[1];
+        assert_eq!(guid, "urn:huge");
+        let len = body.as_deref().map_or(0, str::len);
+        assert!(
+            (MAX_CONTENT_HTML_BYTES / 2..=MAX_CONTENT_HTML_BYTES).contains(&len),
+            "stored {len} bytes against a bound of {MAX_CONTENT_HTML_BYTES}"
+        );
+    }
+
+    /// Two permits, emptied mid-poll by [`sanitize_then_starve`].
+    static STARVE: Semaphore = Semaphore::const_new(2);
+    static STARVE_RAN: AtomicBool = AtomicBool::new(false);
+
+    /// [`sanitize_body`], which first — while its own sanitize holds one of
+    /// [`STARVE`]'s permits — queues a task for both, so it takes the other
+    /// now and this one as soon as it is released, and keeps them. The poll's
+    /// next entry then finds no permit, deterministically.
+    fn sanitize_then_starve(raw: &str) -> String {
+        tokio::runtime::Handle::current()
+            .spawn(async { STARVE.acquire_many(2).await.unwrap().forget() });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while STARVE.available_permits() > 0 {
+            assert!(Instant::now() < deadline, "the starving task never queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        STARVE_RAN.store(true, Ordering::SeqCst);
+        sanitize_body(raw)
+    }
+
+    /// **No permit after earlier entries were sanitized still defers the
+    /// whole poll**: the bodies already sanitized are not stored, no entry is
+    /// stored without its body, no validator is saved and no failure is
+    /// filed (vacuous-test hunt of #274: every starved-poll test starved the
+    /// first entry, so storing the part already done went unnoticed).
+    #[tokio::test]
+    async fn a_poll_starved_after_its_first_entry_still_stores_nothing() {
+        let (pool, feed, _) = fixture("starved-midway.test", rss(ORDINARY_B)).await;
+        let client = build_client().unwrap();
+        let outcome = poll_feed_with(
+            &pool,
+            &client,
+            &feed,
+            0,
+            SanitizeLimits {
+                sanitize: sanitize_then_starve,
+                ..limits(&STARVE, SHORT)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            STARVE_RAN.load(Ordering::SeqCst),
+            "the first entry was not sanitized"
+        );
+        assert_eq!(outcome, PollOutcome::Deferred);
+        assert_eq!(
+            bodies(&pool).await,
+            vec![],
+            "stored part of a deferred poll"
+        );
+        assert_eq!(validators(&pool, &feed.url).await, (None, None));
+    }
+
+    fn sanitize_panics(_: &str) -> String {
+        panic!("the sanitizer panicked")
+    }
+
+    /// A panic in the sanitizer propagates to the poll, as it did when the
+    /// sanitize ran inline — not swallowed as a timeout (vacuous-test hunt of
+    /// #274: the `resume_unwind` arm had no test).
+    #[tokio::test]
+    async fn a_sanitizer_panic_propagates_to_the_poll() {
+        let limits = SanitizeLimits {
+            sanitize: sanitize_panics,
+            ..limits(permits(1), GENEROUS)
+        };
+        let joined = tokio::spawn(async move {
+            sanitize_off_runtime("https://panics.test/feed", ORDINARY_B.to_string(), limits).await
+        })
+        .await;
+        let err = joined.expect_err("the panic did not propagate");
+        assert_eq!(
+            err.into_panic().downcast_ref::<&str>(),
+            Some(&"the sanitizer panicked")
+        );
     }
 }

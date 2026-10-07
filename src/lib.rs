@@ -241,6 +241,23 @@ pub fn build_http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// Run `future` on a new multi-thread runtime — what `#[tokio::main]` builds —
+/// then shut that runtime down waiting **at most `shutdown`** for work still on
+/// its blocking pool, where dropping it would wait without limit. The server's
+/// `main` runs on this; see its `RUNTIME_SHUTDOWN_TIMEOUT` for why (#226: an
+/// abandoned ingest sanitize cannot be cancelled).
+pub fn block_on_then_shutdown<F: std::future::Future>(
+    future: F,
+    shutdown: std::time::Duration,
+) -> std::io::Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_timeout(shutdown);
+    Ok(output)
+}
+
 /// The crate version — surfaced for the server's `--version` / health output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -254,3 +271,31 @@ pub const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (+https://feather-reader.com)"
 );
+
+#[cfg(test)]
+mod runtime_shutdown_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Blocking work still running when the future returns holds the shutdown
+    /// up for the bound and no longer — a plain drop of the runtime would wait
+    /// the full 10 s for it (vacuous-test hunt of #274: `main`'s
+    /// `shutdown_timeout` had no test).
+    #[test]
+    fn shutdown_waits_for_blocking_work_at_most_the_bound() {
+        let started = Instant::now();
+        let out = block_on_then_shutdown(
+            async {
+                drop(tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_secs(10))
+                }));
+                7
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let took = started.elapsed();
+        assert_eq!(out, 7);
+        assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
+    }
+}

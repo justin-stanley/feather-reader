@@ -51,13 +51,8 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 fn main() -> Result<()> {
     // What `#[tokio::main]` builds, but shut down with a bound; see
     // `RUNTIME_SHUTDOWN_TIMEOUT`.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building the tokio runtime")?;
-    let result = runtime.block_on(run());
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-    result
+    feather_reader::block_on_then_shutdown(run(), RUNTIME_SHUTDOWN_TIMEOUT)
+        .context("building the tokio runtime")?
 }
 
 async fn run() -> Result<()> {
