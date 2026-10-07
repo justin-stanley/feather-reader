@@ -2164,16 +2164,20 @@ async fn resolve_subscriptions_noting(
     // and also how a broken or hostile one cuts it short. Here, where the
     // result would DELETE `sub_ref` rows, a shrink of the ordinary size is
     // applied at once and a big one must read the same a second time.
-    if !shrink_is_corroborated(state, did, &out).await {
-        return (
-            cached_subscriptions(pool, did).await,
-            Some(
-                "Your subscription list came back much shorter than before and did not \
-                 read the same twice, so it was not applied. Showing your last-known \
-                 subscriptions; nothing was removed."
-                    .to_string(),
-            ),
-        );
+    let refused = match shrink_is_corroborated(state, did, &out).await {
+        Shrink::Apply => None,
+        Shrink::Disagreed => Some(
+            "Your subscription list came back much shorter than before and did not \
+             read the same twice, so it was not applied. Showing your last-known \
+             subscriptions; nothing was removed."
+                .to_string(),
+        ),
+        // Not a disagreement: the second read failed outright, and the reader
+        // is told why, exactly as for a failed first read (#177).
+        Shrink::Unreadable(err) => Some(subscriptions_alert(&err)),
+    };
+    if let Some(alert) = refused {
+        return (cached_subscriptions(pool, did).await, Some(alert));
     }
     // Mirror the caller's resolved subscription set into `sub_ref`, so every
     // scoped entry/feed read + read/star mutation authorizes against exactly
@@ -2194,6 +2198,17 @@ async fn resolve_subscriptions_noting(
 /// those read the same twice and are applied.
 const SUB_REF_SHRINK_CORROBORATE: usize = 3;
 
+/// What [`shrink_is_corroborated`] found.
+enum Shrink {
+    /// Apply the listing to `sub_ref`.
+    Apply,
+    /// A big shrink whose second listing returned different subscriptions.
+    Disagreed,
+    /// A big shrink whose second listing could not be read at all; the
+    /// error, so the reader is told the real cause.
+    Unreadable(anyhow::Error),
+}
+
 /// Whether `resolved` may replace `did`'s `sub_ref` projection: yes outright
 /// unless it drops [`SUB_REF_SHRINK_CORROBORATE`] or more current feeds, in
 /// which case only if a second listing returns the same subscription URLs.
@@ -2202,14 +2217,14 @@ const SUB_REF_SHRINK_CORROBORATE: usize = 3;
 /// indistinguishable from a reader who really unsubscribed from those feeds,
 /// and is applied. This closes the walk that ends early once, not a server
 /// determined to lie consistently.
-async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[ResolvedSub]) -> bool {
+async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[ResolvedSub]) -> Shrink {
     let current = match store::subscribed_feed_ids(&state.db, did).await {
         Ok(ids) => ids,
         Err(err) => {
             // Nothing to compare against; the write below will meet the same
             // database and log its own failure.
             warn!(%err, %did, "could not read sub_ref to check for a mass drop");
-            return true;
+            return Shrink::Apply;
         }
     };
     let kept: std::collections::HashSet<i64> = resolved
@@ -2218,7 +2233,7 @@ async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[Resolve
         .collect();
     let dropped = current.iter().filter(|id| !kept.contains(id)).count();
     if dropped < SUB_REF_SHRINK_CORROBORATE {
-        return true;
+        return Shrink::Apply;
     }
     let first: std::collections::HashSet<&str> =
         resolved.iter().map(|s| s.sub.url.as_str()).collect();
@@ -2227,7 +2242,7 @@ async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[Resolve
             let second: std::collections::HashSet<&str> =
                 again.iter().map(|(_, s)| s.url.as_str()).collect();
             if first == second {
-                return true;
+                return Shrink::Apply;
             }
             warn!(
                 %did,
@@ -2238,7 +2253,7 @@ async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[Resolve
                 "subscription list shrank sharply and did not read the same twice; \
                  leaving sub_ref untouched"
             );
-            false
+            Shrink::Disagreed
         }
         Err(err) => {
             warn!(
@@ -2249,7 +2264,7 @@ async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[Resolve
                 "subscription list shrank sharply and could not be read a second time; \
                  leaving sub_ref untouched"
             );
-            false
+            Shrink::Unreadable(err)
         }
     }
 }
@@ -10308,6 +10323,9 @@ mod tests {
     /// A sidecar that answers the `n`th subscription listing with
     /// `listings[n]` (the last one repeats), one page each, no cursor, and
     /// counts how many listings it served.
+    /// In a `spawn_listing_sidecar` listing: serve a malformed record there.
+    const MALFORMED_LISTING: &str = "<malformed>";
+
     async fn spawn_listing_sidecar(
         listings: Vec<Vec<String>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -10353,6 +10371,11 @@ mod tests {
                     urls.iter()
                         .enumerate()
                         .map(|(j, url)| {
+                            // A record no client could have meant: the walk
+                            // refuses the whole listing (`MalformedRecords`).
+                            if url == MALFORMED_LISTING {
+                                return serde_json::json!({ "uri": 7 });
+                            }
                             serde_json::json!({
                                 "uri": format!("at://did:plc:x/{}/3lab{j}", lexicon::nsid::SUBSCRIPTION),
                                 "cid": "bafy",
@@ -10454,6 +10477,34 @@ mod tests {
             "wrong alert: {alert}"
         );
         assert_eq!(subs.len(), 5, "the last-known list was not the one shown");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// **A second read that fails says why** (review of #278). A refused
+    /// shrink whose second listing could not be read at all — the PDS gone,
+    /// or a malformed record — is not a disagreement, and "did not read the
+    /// same twice" sent the reader looking for a race. It gets the alert a
+    /// failed first read gets (#177), and `sub_ref` is still left untouched.
+    #[tokio::test]
+    async fn a_big_shrink_whose_second_read_fails_names_the_failure() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        let (state, served, ids) = shrink_state(
+            did,
+            5,
+            vec![all[..1].to_vec(), vec![MALFORMED_LISTING.to_string()]],
+        )
+        .await;
+
+        let (subs, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(sub_ref_sorted(&state, did).await, ids);
+        let alert = alert.expect("a refused shrink must say why the list is stale");
+        assert!(
+            alert.contains("1 record(s) in your subscription list could not be read"),
+            "the failed second read was reported as a disagreement: {alert}"
+        );
+        assert_eq!(subs.len(), 5);
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
