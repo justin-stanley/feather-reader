@@ -1350,9 +1350,8 @@ const SITE_TITLE: &str = "FeatherReader — read, quietly";
 
 /// The site's one-paragraph description: the landing page's, and the one every
 /// private view shows instead of its own.
-const SITE_DESCRIPTION: &str = "A minimalist, atproto-native reader for RSS feeds and \
-standard.site publications. Your subscriptions live in your own PDS — no signup, no \
-password, no tracking.";
+const SITE_DESCRIPTION: &str = "A minimalist RSS and standard.site reader that keeps your \
+place: your subscriptions and what you've read are records in your own atproto PDS.";
 
 /// Where the share image is served, relative to the public origin. The file is
 /// `static/social-card.png`, rendered from `static/social-card.svg` by

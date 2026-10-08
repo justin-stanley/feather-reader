@@ -17,8 +17,8 @@ FeatherReader is a calm, typography-first reader for people who left
 algorithmic feeds on purpose. Its defining idea: **your subscriptions, folders,
 stars, and read-state live as records in your own [atproto](https://atproto.com)
 PDS** — not in the app's database. You sign in with your atproto identity, and
-your reading list follows you to *any* reader that speaks the same open
-lexicon. Since 0.4.0 the same list can hold a
+your reading list follows you to any reader that adopts the same open
+lexicon — today, that means any FeatherReader instance. Since 0.4.0 the same list can hold a
 [standard.site](https://standard.site) publication beside an RSS feed: its
 articles are records in the author's atproto repo, and FeatherReader reads them
 the way it reads a feed. The app holds a cache and a login session; you own the
@@ -42,8 +42,9 @@ self-hosted.
 - **Own your data — as an open standard.** Subscriptions, folders, saved items,
   and read-state are written as `community.lexicon.rss.*` records in *your* PDS.
   There's no signup and no password database: your atproto handle **is** your
-  account. Because the records use a shared, vendor-neutral schema, your feed
-  list is portable across *readers*, not just across FeatherReader instances.
+  account. The records use an open, vendor-neutral schema that any reader can
+  adopt; today FeatherReader is its only implementation, so your feed list is
+  portable across FeatherReader instances.
 - **Minimalist by design.** A single sorted list, a distraction-free reading
   view, keyboard flow, dark mode. No ads, no tracking, no telemetry, no
   algorithm, no "discover" tab. Every feature has to earn its place against
@@ -82,9 +83,10 @@ self-hosted.
 Most readers own your account and your export format. FeatherReader holds
 neither. Your data is stored under a **neutral, community-owned lexicon** that any
 atproto RSS reader can adopt — the same way `community.lexicon.calendar.event`
-lets any atproto calendar app read the same events. Log in anywhere with your
-handle and your feeds are already there. If you switch readers, there's nothing
-to export: the records are a shared standard.
+lets any atproto calendar app read the same events. Log in to any FeatherReader
+instance with your handle and your feeds are already there, with nothing to
+export. FeatherReader is the lexicon's only implementation so far; a reader that
+adopts it reads the same records.
 
 The record types ([`src/lexicon.rs`](src/lexicon.rs)):
 
