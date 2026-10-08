@@ -1811,6 +1811,64 @@ pub(crate) mod tests {
         );
     }
 
+    /// #227: a listing that ARRIVED and was refused was filed as `Fetch` ("the
+    /// request never produced a response"), because its refusal was a bare
+    /// string `publication_failure_kind` could not branch on.
+    #[tokio::test]
+    async fn a_refused_listing_is_filed_under_what_the_pds_sent() {
+        use crate::feed::FailureKind;
+        let zero = std::time::Duration::ZERO;
+        // One byte over `read_capped`'s cap, as a 200. Leaked: the helper takes
+        // a `'static` body, and this is one allocation per test run.
+        let oversized: &'static str =
+            Box::leak("x".repeat(crate::net::MAX_BODY_BYTES + 1).into_boxed_str());
+        let mut misfiled = Vec::new();
+        for (did, (status, body), endless, want, label) in [
+            (
+                "did:plc:emptybodyaaaaaaaaaaaaaaa",
+                (200, ""),
+                false,
+                FailureKind::Parse,
+                "a 200 with an empty body",
+            ),
+            (
+                "did:plc:norecordsaaaaaaaaaaaaaaa",
+                (200, "{}"),
+                false,
+                FailureKind::Parse,
+                "a 200 with no records field",
+            ),
+            (
+                "did:plc:envelopeaaaaaaaaaaaaaaaa",
+                (200, r#"{"error":"RepoDeactivated"}"#),
+                false,
+                FailureKind::Status,
+                "a 200 carrying an error envelope",
+            ),
+            (
+                "did:plc:endlessaaaaaaaaaaaaaaaaa",
+                (200, ""),
+                true,
+                FailureKind::Body,
+                "more pages than MAX_LIST_PAGES",
+            ),
+            (
+                "did:plc:oversizedaaaaaaaaaaaaaaa",
+                (200, oversized),
+                false,
+                FailureKind::Body,
+                "a body over read_capped's cap",
+            ),
+        ] {
+            let plc = serve_answering(did, 200, (status, body), zero, endless).await;
+            let outcome = poll_publication_at(did, plc, None).await;
+            if kind_of(&outcome) != Some(want) {
+                misfiled.push(format!("{label}: want {want:?}, got {outcome:?}"));
+            }
+        }
+        assert!(misfiled.is_empty(), "misfiled:\n{}", misfiled.join("\n"));
+    }
+
     /// Two of 17 measured publications had no documents. That is a healthy,
     /// empty feed — not a failure, and not a reason to back off.
     #[tokio::test]

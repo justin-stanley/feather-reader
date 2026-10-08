@@ -705,9 +705,13 @@ pub enum FailureKind {
     /// The request never produced a response — DNS, TLS, timeout, connection
     /// refused, or a refusal by the SSRF guard.
     Fetch,
-    /// A response arrived with a non-success status.
+    /// A response arrived with a non-success status — or, from an atproto
+    /// PDS, a 2xx carrying an error envelope, which is the same refusal said
+    /// in the body.
     Status,
-    /// The body was too large, or reading it failed part-way.
+    /// The body was too large, or reading it failed part-way. For a
+    /// publication this includes a listing too large to walk: more pages,
+    /// bytes or records than the walk allows.
     Body,
     /// The body arrived and is not a feed this parser can read.
     Parse,
@@ -1036,12 +1040,22 @@ pub async fn poll_feed_by_kind(
 /// with a 404 for a tombstoned DID, `RepoNotFound`, `RepoDeactivated` — is
 /// `Status`, and an answer that was not what it claimed to be is `Parse`. Filed
 /// as `Fetch`, a deleted account read as its server being down (found in
-/// review).
-fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
-    use crate::atproto::{AtProtoError, DidResolutionCause};
+/// review). A listing refusal is typed for the same reason (#227): a 200 with
+/// no `records` is `Parse`, a 200 error envelope is `Status`, and a listing or
+/// body over its cap is `Body`.
+pub(crate) fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
+    use crate::atproto::{AtProtoError, DidResolutionCause, ListingTooLarge, UnreadableListing};
     for cause in err.chain() {
         if cause.is::<crate::standard_site::NotAPublication>() || cause.is::<serde_json::Error>() {
             return FailureKind::Parse;
+        }
+        if cause.is::<ListingTooLarge>() || cause.is::<crate::net::BodyTooLarge>() {
+            return FailureKind::Body;
+        }
+        match cause.downcast_ref::<UnreadableListing>() {
+            Some(UnreadableListing::NoRecords) => return FailureKind::Parse,
+            Some(UnreadableListing::ErrorEnvelope { .. }) => return FailureKind::Status,
+            None => {}
         }
         match cause.downcast_ref::<AtProtoError>() {
             Some(AtProtoError::Xrpc { .. }) => return FailureKind::Status,

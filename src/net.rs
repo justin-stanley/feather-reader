@@ -1340,6 +1340,17 @@ async fn guarded_post(
     Ok(resp)
 }
 
+/// A response body refused by [`read_capped`] for exceeding its cap.
+///
+/// Typed so a caller can tell "the server answered, too much" from "the server
+/// never answered" (#227): a publication read files it as `Body`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("response body exceeded the {cap} byte cap; aborting")]
+pub struct BodyTooLarge {
+    /// The cap it exceeded, in bytes.
+    pub cap: usize,
+}
+
 /// Read a response body, streaming chunk-by-chunk and **aborting** the moment
 /// the accumulated size would exceed [`MAX_BODY_BYTES`]. Never trusts
 /// `Content-Length` (gzip strips it) and never fully buffers an over-cap body —
@@ -1348,10 +1359,10 @@ pub async fn read_capped(mut resp: Response) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     while let Some(chunk) = resp.chunk().await.context("reading response body chunk")? {
         if buf.len() + chunk.len() > MAX_BODY_BYTES {
-            bail!(
-                "response body exceeded the {} byte cap; aborting",
-                MAX_BODY_BYTES
-            );
+            return Err(BodyTooLarge {
+                cap: MAX_BODY_BYTES,
+            }
+            .into());
         }
         buf.extend_from_slice(&chunk);
     }
@@ -2128,8 +2139,17 @@ pub(crate) mod tests {
         let base = serve_body(big).await;
         let client = reqwest::Client::builder().build().unwrap();
         let resp = client.get(&base).send().await.unwrap();
-        let err = read_capped(resp).await.unwrap_err().to_string();
-        assert!(err.contains("exceeded"), "unexpected error: {err}");
+        let err = read_capped(resp).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded"),
+            "unexpected error: {err}"
+        );
+        // #227: an oversized body is `Body`, not "never produced a response".
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

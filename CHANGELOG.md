@@ -53,6 +53,28 @@ deploying is separate.
   indistinguishable from a reader who really unsubscribed from those feeds,
   and is applied.
 
+### Fixed
+
+- **A publication's PDS that answered badly was filed as unreachable
+  (#227).** Several `listRecords` refusals were bare `anyhow::bail!`
+  strings, so `feed::publication_failure_kind` could not branch on them and
+  they fell through to `Fetch`, documented as "the request never produced a
+  response". `/stats` then counted them under "why they are failing" as
+  network failures, and the backoff detail said the same. Probed through a
+  real poll: a 200 with an empty body or no `records` field is now `Parse`;
+  a 200 carrying an error envelope (`{"error":"RepoDeactivated"}`) is
+  `Status`, as the same answer on a 400 already was; a walk that runs out of
+  pages is `Body`. Found by reading, and also `Body` now: a byte-budget or
+  record-cap refusal, and a response over `net::read_capped`'s cap.
+
+  **Mechanism.** Two error types in `atproto`, `UnreadableListing`
+  (`NoRecords`, `ErrorEnvelope`) and `ListingTooLarge` (`Pages`, `Bytes`,
+  `MalformedBytes`, `Records`), and `net::BodyTooLarge`, raised where the
+  strings were, in all three clients' walks. Their messages are the old
+  strings. `publication_failure_kind` maps them by walking the error chain,
+  as it already did for the others. Each mapping arm and each raising site
+  was reverted in turn, and each reversion fails a test.
+
 ## 0.4.7 — 2026-10-07
 
 Hostile feed bodies are contained. The reader renders stored article bodies
