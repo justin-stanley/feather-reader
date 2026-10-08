@@ -75,6 +75,36 @@ deploying is separate.
   as it already did for the others. Each mapping arm and each raising site
   was reverted in turn, and each reversion fails a test.
 
+- **Big siblings could starve a quiet publication in the same repo
+  (#229).** Up to 16 publications of one repo share one walk of its
+  documents and one `MAX_LIST_BYTES` budget. Big siblings could spend it,
+  the walk then ended before a quiet publication's documents, and that
+  publication failed every poll with "stopped before its first document".
+  Latent: reaching it needs about four publications near the 2,000-document
+  cap in one repo; the measured corpus is 449 documents in total.
+
+  **Mechanism.** A group read now marks a member `cut_short_by_group` when
+  the shared walk ran out of BYTES before the member reached its own cap —
+  never for a lone publication, and not when the walk stopped at the page
+  limit, a repeated cursor or the combined record cap, which stop a read
+  alone at the same place (`RecordWalk::out_of_budget` says which). After every group read is stored and dropped,
+  `feed::poll_publication_group` re-reads each such member alone, one at a
+  time, so memory stays one budget at a time, and stores it; entries upsert
+  on `(feed_id, guid)`, so the overlap with what the group stored is not
+  duplicated. The re-reads share the existing `publication_read_deadline`,
+  measured from the group read's start, starved members first (fewest
+  entries from the group); when it runs out, the rest keep the group's
+  outcome. A static per-publication share was tried before and
+  broke two cases that regression tests pin; re-reading alone can never
+  read a publication worse than reading it alone, by construction. A
+  re-read that fails keeps the group's outcome. The former `#[ignore]`d test now runs at
+  the poller level. Removing the re-read, never setting the flag, setting
+  it for a lone publication or a member at its own cap, and ignoring the
+  deadline's remainder each fail a test.
+
+  **Not fixed:** a page carrying a malformed record still charges its whole
+  wire size to the shared budget, siblings' documents included.
+
 ## 0.4.7 — 2026-10-07
 
 Hostile feed bodies are contained. The reader renders stored article bodies

@@ -1100,11 +1100,39 @@ async fn poll_publication(
 ///
 /// **Why one walk:** cost scales with the repo, not the publication. Nine
 /// publications in one repo were nine full walks of its documents.
+///
+/// A member the shared walk cut short is then re-read alone, within the same
+/// read deadline (#229); see the comment above the re-read loop.
 pub async fn poll_publication_group(
     pool: &SqlitePool,
     client: &Client,
     config: &crate::config::Config,
     feeds: &[Feed],
+) -> Vec<Result<PollOutcome>> {
+    poll_publication_group_with(
+        pool,
+        client,
+        config,
+        feeds,
+        crate::atproto::MAX_LARGE_RECORDS,
+        crate::atproto::MAX_LIST_BYTES,
+        std::time::Instant::now(),
+    )
+    .await
+}
+
+/// [`poll_publication_group`] with the walk's limits and the deadline's start
+/// passed in, so the re-read of starved members is testable without 128 MiB
+/// of documents or a clock that really runs out. Production passes
+/// `MAX_LARGE_RECORDS`, `MAX_LIST_BYTES` and `Instant::now()`.
+pub(crate) async fn poll_publication_group_with(
+    pool: &SqlitePool,
+    client: &Client,
+    config: &crate::config::Config,
+    feeds: &[Feed],
+    per_site_cap: usize,
+    budget_bytes: usize,
+    deadline_started: std::time::Instant,
 ) -> Vec<Result<PollOutcome>> {
     let failed = |kind: FailureKind, detail: String| -> Result<PollOutcome> {
         Ok(PollOutcome::Failed {
@@ -1146,7 +1174,14 @@ pub async fn poll_publication_group(
     // pages slowly, all of it holding up the publication loop.
     let fetched = tokio::time::timeout(
         config.publication_read_deadline,
-        crate::standard_site::fetch_repo(client, &config.oauth.plc_directory, &did, &rkeys),
+        crate::standard_site::fetch_repo_capped(
+            client,
+            &config.oauth.plc_directory,
+            &did,
+            &rkeys,
+            per_site_cap,
+            budget_bytes,
+        ),
     )
     .await;
     let mut reads: Vec<Option<anyhow::Result<crate::standard_site::PublicationRead>>> =
@@ -1169,19 +1204,28 @@ pub async fn poll_publication_group(
     };
 
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
+    let store = |url: String, read: crate::standard_site::PublicationRead| async move {
+        crate::standard_site::store_publication(
+            pool,
+            &url,
+            read,
+            config.max_entries_per_feed,
+            retention_days,
+            retention_hard_days,
+        )
+        .await
+    };
     let mut out = Vec::with_capacity(feeds.len());
+    // The members the group's walk cut short, with how many entries the group
+    // read gave each — taken before the read is moved into the store.
+    let mut cut_short: Vec<(usize, usize)> = Vec::new();
     for (i, feed) in feeds.iter().enumerate() {
         let outcome = match (reads[i].take(), &repo_failure) {
             (Some(Ok(read)), _) => {
-                crate::standard_site::store_publication(
-                    pool,
-                    &feed.url,
-                    read,
-                    config.max_entries_per_feed,
-                    retention_days,
-                    retention_hard_days,
-                )
-                .await
+                if read.cut_short_by_group {
+                    cut_short.push((i, read.entries.len()));
+                }
+                store(feed.url.clone(), read).await
             }
             (Some(Err(err)), _) => failed(publication_failure_kind(&err), format!("{err:#}")),
             (None, Some((kind, detail))) if readable.contains(&i) => failed(*kind, detail.clone()),
@@ -1192,6 +1236,125 @@ pub async fn poll_publication_group(
         };
         out.push(outcome);
     }
+    drop(reads);
+
+    // **Re-read alone each member the group's walk cut short (#229).** One
+    // repo's publications share one walk and one byte budget, so big siblings
+    // can spend it and the walk ends before a quiet one's documents — every
+    // poll. A static per-publication share fixed that and broke two worse
+    // cases (a busy publication beside idle siblings was cut to a fraction;
+    // one large document failed its publication every poll). Read alone, a
+    // publication has the whole budget, so this is never worse than reading
+    // it alone, by construction.
+    //
+    // **After every group read is stored and dropped, and one at a time**, so
+    // at most one budget's worth of reads is held, as before. What the group
+    // read stored stays: entries are upserted on `(feed_id, guid)`, so the
+    // re-read's overlap updates rows rather than duplicating them.
+    //
+    // **Inside the same read deadline**, measured from the group read's start:
+    // the re-reads must not stretch one group's poll past the bound the tick
+    // was sized for. A member left over keeps its group outcome.
+    if cut_short.is_empty() {
+        return out;
+    }
+    // **Starved first.** The re-reads share one deadline and stop at the
+    // first that overruns it, so the order decides who gets one. A big
+    // sibling read alone can cost as much as the whole group read, and in
+    // feed order it went first on every poll — leaving the quiet publication
+    // this exists for `Failed` forever (review of #281). Fewest entries from
+    // the group first, those with none ahead of all; ties keep feed order.
+    cut_short.sort_by_key(|&(_, group_kept)| group_kept);
+    let mut reread = 0usize;
+    let mut improved = 0usize;
+    for &(i, group_kept) in &cut_short {
+        let feed = &feeds[i];
+        let remaining = config
+            .publication_read_deadline
+            .saturating_sub(deadline_started.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
+                repo = %did,
+                feed = %feed.url,
+                left = cut_short.len() - reread,
+                "the read deadline was spent before every publication its group cut short was re-read alone; the rest keep the group's outcome"
+            );
+            break;
+        }
+        let rkey = std::slice::from_ref(&uris[i].as_ref().expect("a read feed has a URI").rkey);
+        let alone = tokio::time::timeout(
+            remaining,
+            crate::standard_site::fetch_repo_capped(
+                client,
+                &config.oauth.plc_directory,
+                &did,
+                rkey,
+                per_site_cap,
+                budget_bytes,
+            ),
+        )
+        .await;
+        // A re-read that fails keeps the group's outcome: the group read
+        // already stored what it reached, and one failed attempt to read
+        // further is not this feed's failure.
+        let outcome = match alone {
+            Err(_) => {
+                tracing::warn!(
+                    repo = %did,
+                    feed = %feed.url,
+                    left = cut_short.len() - reread,
+                    "a re-read alone overran the read deadline; it and the rest keep the group's outcome"
+                );
+                break;
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(repo = %did, feed = %feed.url, err = %format!("{err:#}"),
+                    "a re-read alone failed; keeping the group's outcome");
+                reread += 1;
+                continue;
+            }
+            Ok(Ok(mut per)) => match per.pop() {
+                Some(Ok(read)) => {
+                    let better = read.complete || read.entries.len() > group_kept;
+                    match store(feed.url.clone(), read).await {
+                        Ok(outcome) => {
+                            if better {
+                                improved += 1;
+                            }
+                            Ok(outcome)
+                        }
+                        // The group's rows are already stored; a failed second
+                        // store is not this feed's poll failing.
+                        Err(err) => {
+                            tracing::warn!(repo = %did, feed = %feed.url, err = %format!("{err:#}"),
+                                "storing a re-read failed; keeping the group's outcome");
+                            reread += 1;
+                            continue;
+                        }
+                    }
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(repo = %did, feed = %feed.url, err = %format!("{err:#}"),
+                        "a re-read alone found no readable publication; keeping the group's outcome");
+                    reread += 1;
+                    continue;
+                }
+                None => {
+                    reread += 1;
+                    continue;
+                }
+            },
+        };
+        reread += 1;
+        out[i] = outcome;
+    }
+    tracing::info!(
+        repo = %did,
+        cut_short = cut_short.len(),
+        reread,
+        improved,
+        "re-read alone the publications their group's shared walk cut short"
+    );
     out
 }
 
