@@ -350,9 +350,25 @@ pub struct ReadState {
     #[serde(rename = "unreadIds", skip_serializing_if = "Vec::is_empty", default)]
     pub unread_ids: Vec<String>,
 
-    /// Last time this cursor was flushed (ISO-8601 datetime). Required. Intended
-    /// as the tie-breaker for cross-device merges (newest `updatedAt` wins);
-    /// a login-time reconcile that uses it is not implemented yet.
+    /// What the strings in `readIds` / `unreadIds` are. FeatherReader writes
+    /// [`ReadState::ID_TYPE_GUID`]: each is the entry's GUID as the feed
+    /// publishes it (or the stable stand-in FeatherReader derives when it does
+    /// not — `feed::stable_guid` / `feed::bound_guid`, both fixed-key hashes, so
+    /// every instance derives the same one), which means the same thing on any
+    /// instance and in any client.
+    ///
+    /// **Absent means legacy.** Records written before #246 carried this
+    /// instance's LOCAL SQLite row ids, which are meaningless anywhere else —
+    /// including on a fresh or restored database of the same instance. A
+    /// reader must ignore the id arrays of such a record; its `readThrough`
+    /// is still a timestamp and still usable.
+    #[serde(rename = "idType", skip_serializing_if = "Option::is_none", default)]
+    pub id_type: Option<String>,
+
+    /// Last time this cursor was changed (ISO-8601 datetime). Required. The
+    /// tie-breaker for cross-instance merges: when one side lists an entry read
+    /// and the other lists it unread, the newer `updatedAt` wins
+    /// (`readstate::flush_did`).
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
 }
@@ -366,6 +382,10 @@ impl ReadState {
     /// lexicon. The flusher enforces this cap before writing (see
     /// `scheduler::cap`).
     pub const MAX_IDS: usize = 1000;
+
+    /// The [`ReadState::id_type`] FeatherReader writes: the id arrays hold
+    /// entry GUIDs.
+    pub const ID_TYPE_GUID: &'static str = "guid";
 
     /// Construct a minimal read cursor with only the required fields.
     ///
@@ -383,6 +403,7 @@ impl ReadState {
             read_through,
             read_ids: Vec::new(),
             unread_ids: Vec::new(),
+            id_type: None,
             updated_at: updated_at.into(),
         }
     }
@@ -642,6 +663,27 @@ mod tests {
         assert_eq!(rs.read_ids, vec!["entry-a", "entry-b"]);
         assert_eq!(rs.unread_ids, vec!["entry-c"]);
         assert_eq!(serde_json::to_value(&rs).expect("serialize"), value);
+    }
+
+    /// `idType` round-trips, and a record without it (every pre-#246
+    /// record) parses with `None` — which readers take as legacy row ids.
+    #[test]
+    fn read_state_id_type_round_trips_and_defaults_to_legacy() {
+        let mut rs = ReadState::new("https://example.com/feed.xml", None, "2026-10-08T00:00:00Z");
+        rs.id_type = Some(ReadState::ID_TYPE_GUID.to_string());
+        rs.read_ids = vec!["12345".into()];
+        let value = serde_json::to_value(&rs).expect("serialize");
+        assert_eq!(value["idType"], "guid");
+        assert_eq!(serde_json::from_value::<ReadState>(value).unwrap(), rs);
+
+        let legacy: ReadState = serde_json::from_value(json!({
+            "$type": "community.lexicon.rss.readState",
+            "feedUrl": "https://example.com/feed.xml",
+            "readIds": ["1"],
+            "updatedAt": "2026-07-12T00:00:00Z",
+        }))
+        .expect("a legacy record parses");
+        assert_eq!(legacy.id_type, None);
     }
 
     #[test]
