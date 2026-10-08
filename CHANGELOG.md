@@ -66,21 +66,50 @@ deploying is separate.
     time is its record's `updatedAt`, the local side's is the cursor's
     `updated_at`, and a tie goes to local. Times are compared as parsed
     instants, not strings.
-  - **Remote GUIDs with no local entry are carried into the written
-    record.** They are not stored locally. Dropping them was the core of
-    the bug: it erased reads made on another instance.
+  - **Every remote GUID that did not lose a conflict is carried into the
+    written record**, whether or not this instance has its entry. The
+    written read set is the local read GUIDs plus all remote read GUIDs,
+    minus those that lost to a newer local unread; the unread set likewise.
+    Remote GUIDs are not stored locally unless imported. Dropping them was
+    the core of the bug: it erased reads made on another instance. Carrying
+    only the unresolved ones was not enough. A GUID whose entry is read here
+    but has been compacted out of `read_ids` would vanish, since no other
+    instance applies a `readThrough` to its entries. So would one in a feed
+    the reader has left, which the import refuses.
   - **`readThrough` is the later of the two.**
   - **Size.** Compaction still runs on the local cursor, after the import.
-    At `ReadState::MAX_IDS` the carried GUIDs go first, oldest first, and
-    that is logged. Then the existing tail-keeping cap applies.
+    At `ReadState::MAX_IDS` the carried GUIDs go first and that is logged:
+    those with no local entry (which this instance cannot vouch for, and
+    which look exactly like GUIDs it has swept), then those it has an entry
+    for, each oldest first. Then the existing tail-keeping cap applies to
+    the local GUIDs.
+
+  **Timestamps.** A cursor's `updated_at` is when its content last changed.
+  It is written as the record's `updatedAt` and compared in conflicts. A
+  local mark stamps the current time. An import stamps the later of the
+  cursor's own time and the record's `updatedAt`, never the import time. If
+  the import stamped now, older state would look newer. Suppose instance A
+  read X at 09:00, and instance B marked X unread at 10:00 but has not
+  flushed. A then imports another client's read at 10:00:30. If that import
+  stamped 10:00:30, A's record would make the 09:00 read beat B's 10:00
+  unread. A would also never import B's record, because 10:00 is not later
+  than its cursor. The same `updated_at` is the row version the flusher's
+  conditional dirty-clear compares. That still holds: the flusher re-reads
+  the row after an import, and a mark-read during the write stamps the
+  current time.
 
   Clean cursors import too: in the same listing, a clean feed whose record
-  is newer than its cursor imports that record's reads.
-  `store::import_remote_read_state` keeps the cursor's `dirty` flag, so an
-  import costs no write. The imported reads are already on the PDS, and
-  re-dirtying would write them straight back. Convergence is pinned: after a
-  merging flush, a second flush with no new local reads lists nothing and
-  writes nothing.
+  is newer than its cursor imports that record's reads. **A subscribed feed
+  with a GUID record and no cursor gets one.** It is created clean,
+  `pds_created`, stamped with the record's `updatedAt`, and then imported
+  into. On a fresh database only the feeds read there have cursors, so
+  without this every other feed's PDS reads stayed unread until the reader
+  marked something in that feed. Feeds the reader does not subscribe to get
+  no cursor. `store::import_remote_read_state` keeps the cursor's `dirty`
+  flag, so an import costs no write. The imported reads are already on the
+  PDS, and re-dirtying would write them straight back. Convergence is
+  pinned: after a merging flush, a second flush with no new local reads
+  lists nothing and writes nothing.
 
   A listing that fails does not block the flush. It is logged, and the flush
   writes local state alone, in the GUID format.
@@ -88,15 +117,28 @@ deploying is separate.
   **Limits.** `applyWrites` has no per-record compare-and-swap here. A write
   from another client between the listing and this write is lost until that
   client's next flush, which reads and merges in turn if it is FeatherReader.
-  Clean feeds import only on rounds that list, which means rounds where the
-  DID has some dirty cursor. A carried GUID can't be told apart from one
-  this instance wrote and has since swept, so such GUIDs persist in the
-  record until the cap drops them.
+  Clean feeds, and feeds with no cursor yet, import only on rounds that
+  list, which means rounds where the DID has some dirty cursor. A carried
+  GUID can't be told apart from one this instance wrote and has since
+  swept, so such GUIDs persist in the record until the cap drops them. A
+  record has one `updatedAt`, so a conflict is settled per record, not per
+  entry. Once an import moves the cursor's time forward, an older local
+  unread in the same record is judged at that time. Compaction keeps the
+  cursor's time: it changes how reads are written down, not what was read
+  (`store::compaction_keeps_the_cursors_updated_at`). Local reads compacted into `readThrough`
+  before they were ever written are not in the record, and other instances
+  do not learn them.
 
   Tests in `readstate::tests`, run against both repo backends:
   - a fresh database merges into an existing record as one `#update`;
   - another client's reads survive between two flushes;
   - an unresolved remote GUID survives a write;
+  - a remote read compacted out of `read_ids` here stays in the record;
+  - a remote read in a feed the reader has left stays in the record;
+  - an import does not let an older read beat a newer unread, and does not
+    hide a later remote unread from the next round;
+  - a subscribed feed with a record and no cursor imports it, unwritten,
+    and an unsubscribed one gets no cursor;
   - remote reads are imported, and the import converges;
   - a clean feed imports without being dirtied or written;
   - a legacy record's ids are ignored but its `readThrough` merges;
@@ -108,10 +150,12 @@ deploying is separate.
 
   Each is red against the pre-change code. Mutations that each fail at least
   one test: removing the merge, treating legacy ids as GUIDs, dropping the
-  carry, skipping the import, skipping the clean-feed import, letting an
-  import dirty a clean cursor, skipping `pds_created` from the listing,
-  flipping the conflict rule, and capping without dropping carried GUIDs
-  first.
+  carry, carrying only the unresolved GUIDs, skipping the import, skipping
+  the clean-feed import, skipping the no-cursor import, creating a cursor
+  without the `sub_ref` check, stamping an import with the import time,
+  letting an import dirty a clean cursor, skipping `pds_created` from the
+  listing, flipping the conflict rule, and capping without dropping carried
+  GUIDs first.
 
   The #241 reconcile tests now fail the pre-write listing on purpose, since
   the listing would otherwise correct the flag before the write, and they

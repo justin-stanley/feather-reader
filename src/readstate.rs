@@ -25,8 +25,9 @@ use crate::AppState;
 /// elsewhere. Now, before writing, the DID's `readState` records are listed
 /// ONCE and each dirty cursor is merged with its own record (see
 /// `merge_remote`): remote reads of entries this instance has are imported
-/// into `entry_state`, remote GUIDs it has no entry for are carried into the
-/// written record, and `readThrough` is the later of the two. The same listing
+/// into `entry_state`, every remote GUID that did not lose a conflict is
+/// carried into the written record, and `readThrough` is the later of the
+/// two. The same listing
 /// sets each cursor's `pds_created`, so a fresh database's first flush is an
 /// `#update` rather than a refused `#create`.
 ///
@@ -228,9 +229,19 @@ async fn learn_pds_created(state: &AppState, did: &str, cursor: &mut ReadCursor,
     }
 }
 
-/// Remote GUIDs this instance has no entry for, carried into the written
-/// record so they are not erased. Never stored locally — there is nothing to
-/// store them against.
+/// Remote GUIDs carried into the written record so they are not erased: every
+/// one the remote record lists, except those that lost a conflict to this
+/// instance's newer state.
+///
+/// Not only the ones with no local entry. A GUID whose entry is read here can
+/// still be missing from the cursor's `read_ids` — compaction folds it into
+/// `readThrough`, which no other instance applies to its entries — and one in
+/// a feed the reader has left is refused by the import. Either way the local
+/// sets alone would drop it.
+///
+/// Each list is ordered for the cap ([`cap_merged`] drops from the front):
+/// GUIDs with no local entry first, then GUIDs this instance has, each in the
+/// remote record's order.
 #[derive(Default, Debug)]
 struct Carry {
     read: Vec<String>,
@@ -264,7 +275,8 @@ fn later(a: &str, b: &str) -> bool {
 ///   unless it conflicts: read there and explicitly unread here (in the
 ///   cursor's `unread_ids`), or unread there and read here. Then the side with
 ///   the newer `updatedAt` wins, and a tie goes to local.
-/// - **A remote GUID with no local entry** is carried into the record.
+/// - **Every remote GUID that did not lose that conflict** is carried into the
+///   record (see [`Carry`]), whether or not it has a local entry.
 ///
 /// Remote `readThrough` is NOT applied to local entries: undated entries
 /// compare by `fetched_at`, which is instance-local, so the same water-mark
@@ -319,25 +331,29 @@ async fn merge_guid_record(
         .collect();
     let remote_wins = later(&theirs.updated_at, &cursor.updated_at);
 
-    let mut carry = Carry::default();
+    // Unresolved first, then resolved: the order the cap drops them in.
+    let (mut unresolved, mut resolved) = (Carry::default(), Carry::default());
     let (mut to_read, mut to_unread) = (Vec::new(), Vec::new());
     for guid in remote_read {
         match local.get(&guid) {
-            None => carry.read.push(guid),
+            None => unresolved.read.push(guid),
             Some(e) => {
                 let explicitly_unread = local_unread.contains(&e.id);
                 if explicitly_unread && !remote_wins {
+                    // Lost to the newer local unread: neither imported nor
+                    // carried.
                     continue;
                 }
                 if !e.read || explicitly_unread {
                     to_read.push(e.id);
                 }
+                resolved.read.push(guid);
             }
         }
     }
     for guid in remote_unread {
         match local.get(&guid) {
-            None => carry.unread.push(guid),
+            None => unresolved.unread.push(guid),
             Some(e) => {
                 if e.read && !remote_wins {
                     continue;
@@ -348,19 +364,29 @@ async fn merge_guid_record(
                 if e.read || !local_unread.contains(&e.id) {
                     to_unread.push(e.id);
                 }
+                resolved.unread.push(guid);
             }
         }
     }
+    let mut carry = unresolved;
+    carry.read.append(&mut resolved.read);
+    carry.unread.append(&mut resolved.unread);
 
-    let imported =
-        store::import_remote_read_state(&state.db, did, &cursor.feed_url, &to_read, &to_unread)
-            .await?;
+    let imported = store::import_remote_read_state(
+        &state.db,
+        did,
+        &cursor.feed_url,
+        &to_read,
+        &to_unread,
+        &theirs.updated_at,
+    )
+    .await?;
     if imported == 0 {
         return Ok((None, carry));
     }
     info!(%did, feed = %cursor.feed_url, imported, "read-state flusher: imported read state from the PDS");
-    // Re-read: the import rewrote the row and moved `updated_at`, which the
-    // conditional dirty-clear compares against.
+    // Re-read: the import rewrote the row — and may have moved `updated_at`,
+    // which the conditional dirty-clear compares against.
     Ok((
         store::get_cursor(&state.db, did, &cursor.feed_url).await?,
         carry,
@@ -374,6 +400,13 @@ async fn merge_guid_record(
 /// another client changed since this instance last wrote or imported it. The
 /// import never dirties the cursor ([`store::import_remote_read_state`]), so it
 /// costs no write; the carried GUIDs are irrelevant here — nothing is written.
+///
+/// **A subscribed feed with a record and no cursor gets one** — clean,
+/// `pds_created`, stamped with the record's `updatedAt` — and imports into it.
+/// On a fresh database only the feeds read here have cursors; without this
+/// every other feed's PDS reads stayed invisible until the reader marked
+/// something in that feed. Only GUID records, and only feeds the DID
+/// subscribes to ([`store::create_clean_cursor`]).
 ///
 /// It runs only on rounds that list anyway, i.e. when the DID has some dirty
 /// cursor: a reader who reads only elsewhere sees those reads arrive here the
@@ -395,6 +428,34 @@ async fn import_into_clean_cursors(state: &AppState, did: &str, remote: &Remote)
             continue;
         }
         let _ = merge_remote(state, did, cursor, theirs).await;
+    }
+
+    for (rkey, theirs) in &remote.records {
+        if theirs.id_type.as_deref() != Some(ReadState::ID_TYPE_GUID)
+            || read_state_rkey(&theirs.feed_url) != *rkey
+        {
+            continue;
+        }
+        let feed = &theirs.feed_url;
+        match store::create_clean_cursor(&state.db, did, feed, &theirs.updated_at).await {
+            Ok(true) => {}
+            // Already has a cursor (handled above, or dirty and merged by the
+            // flush), not subscribed, or no usable `updatedAt`.
+            Ok(false) => continue,
+            Err(err) => {
+                warn!(%did, %feed, %err, "read-state flusher: could not create a cursor to import into");
+                continue;
+            }
+        }
+        match store::get_cursor(&state.db, did, feed).await {
+            Ok(Some(cursor)) => {
+                let _ = merge_remote(state, did, cursor, theirs).await;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(%did, %feed, %err, "read-state flusher: could not read a new cursor back");
+            }
+        }
     }
 }
 
@@ -678,8 +739,8 @@ fn build_record(
     // by omitting `readThrough` (None), not by back-dating it to flush time.
     let mut record = ReadState::new(&cursor.feed_url, read_through, &cursor.updated_at);
     record.id_type = Some(ReadState::ID_TYPE_GUID.to_string());
-    // Carried GUIDs are disjoint from local ones by construction (they have no
-    // local entry); filtered anyway, so the two sets can never overlap.
+    // A carried GUID already in a local set is local: written once, and on the
+    // side the local state says — so the two sets can never overlap.
     let local: HashSet<&String> = read_ids.iter().chain(&unread_ids).collect();
     let carried = |ids: &[String]| -> Vec<String> {
         ids.iter().filter(|g| !local.contains(g)).cloned().collect()
@@ -691,12 +752,14 @@ fn build_record(
 }
 
 /// Fit carried remote GUIDs plus local GUIDs into `max`, dropping carried ones
-/// first — the oldest of them, as the remote record ordered them.
+/// first, from the front of `carried` (see [`Carry`] for its order).
 ///
-/// A carried GUID is one this instance cannot vouch for: no entry here has it,
-/// which is also what a GUID this instance once wrote and has since swept
-/// looks like. Local reads are what this instance knows; they go last, and
-/// only through the ordinary tail-keeping [`cap`].
+/// GUIDs with no local entry go first: this instance cannot vouch for them,
+/// and a GUID it once wrote and has since swept looks exactly like one. Then
+/// remote GUIDs it has an entry for but no id in its sets for (folded into its
+/// `readThrough`, or in a feed it has left) — entries it still holds, so
+/// closer to what it knows. Within each, the remote record's oldest first.
+/// Local GUIDs go last, and only through the ordinary tail-keeping [`cap`].
 fn cap_merged(mut carried: Vec<String>, local: Vec<String>, max: usize) -> Vec<String> {
     let over = (carried.len() + local.len()).saturating_sub(max);
     if over > 0 && !carried.is_empty() {
@@ -2462,6 +2525,263 @@ pub(crate) mod tests {
             );
             assert_eq!(rec["idType"], "guid", "{backend:?}: {rec}");
             assert!(!cursor(&state, 1).await.dirty, "{backend:?}");
+        }
+    }
+
+    // ── #246 review: timestamps, carrying, fresh cursors ─────────────────────
+
+    /// Pin feed `i`'s cursor `updated_at` — when its content last changed —
+    /// so a test can say "at 10:00" while the import runs at the real now.
+    async fn set_updated_at(state: &AppState, i: usize, at: &str) {
+        let n =
+            sqlx::query("UPDATE read_cursor SET updated_at = ?3 WHERE did = ?1 AND feed_url = ?2")
+                .bind(DID)
+                .bind(feed(i))
+                .bind(at)
+                .execute(&state.db)
+                .await
+                .unwrap()
+                .rows_affected();
+        assert_eq!(n, 1, "fixture: no cursor for feed {i}");
+    }
+
+    /// Another client adds `guid` to the record's `readIds` at `at`.
+    fn remote_reads(fake: &Arc<Mutex<FakeRepo>>, i: usize, guid: &str, at: &str) {
+        let mut f = fake.lock().unwrap();
+        let rec = f.records.get_mut(&read_state_rkey(&feed(i))).unwrap();
+        rec["readIds"].as_array_mut().unwrap().push(guid.into());
+        rec["updatedAt"] = at.into();
+    }
+
+    /// **An import does not make older state look newer.** A read x at 09:00;
+    /// B marked x unread at 10:00 and has not flushed. Then A's flush — at the
+    /// real now, long after 10:00 — imports another client's 09:30 read. The
+    /// record A writes must not say "now": nothing in it is newer than 09:30,
+    /// and B's later unread must still win when B flushes.
+    #[tokio::test]
+    async fn an_import_does_not_let_an_older_read_beat_a_newer_unread() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let a = state_on(backend, &fake).await;
+            let b = state_on(backend, &fake).await;
+            mark_read(&a, 1, "x").await;
+            set_updated_at(&a, 1, "2026-01-01T09:00:00Z").await;
+            flush_did(&a, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let bx = mark_read(&b, 1, "x").await;
+            store::mark_read(&b.db, DID, bx, false).await.unwrap();
+            set_updated_at(&b, 1, "2026-01-01T10:00:00Z").await;
+
+            entry(&a, 1, "z").await;
+            remote_reads(&fake, 1, "z", "2026-01-01T09:30:00Z");
+            mark_read(&a, 1, "w").await;
+            set_updated_at(&a, 1, "2026-01-01T09:05:00Z").await;
+            flush_did(&a, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            flush_did(&b, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            let rec = pds_record(&fake, 1);
+            assert!(
+                !is_read(&b, bx).await,
+                "{backend:?}: B's newer unread lost to A's older read: {rec}"
+            );
+            assert!(
+                id_set(&rec, "unreadIds").contains("x"),
+                "{backend:?}: {rec}"
+            );
+            assert!(!id_set(&rec, "readIds").contains("x"), "{backend:?}: {rec}");
+        }
+    }
+
+    /// **An import does not hide a later remote change.** A clean-imports a
+    /// 09:30 record; B then flushes an unread it made at 10:00. On A's next
+    /// round that record is newer than anything A holds, so A imports it.
+    #[tokio::test]
+    async fn a_clean_import_does_not_hide_a_later_remote_unread() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let a = state_on(backend, &fake).await;
+            let b = state_on(backend, &fake).await;
+            let ax = mark_read(&a, 1, "x").await;
+            set_updated_at(&a, 1, "2026-01-01T09:00:00Z").await;
+            flush_did(&a, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            // Another client reads z at 09:30; A imports it, clean.
+            let az = entry(&a, 1, "z").await;
+            remote_reads(&fake, 1, "z", "2026-01-01T09:30:00Z");
+            mark_read(&a, 2, "a2").await;
+            flush_did(&a, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(is_read(&a, az).await, "{backend:?}: fixture: z imported");
+
+            // B marks x unread at 10:00 and flushes it.
+            let bx = mark_read(&b, 1, "x").await;
+            store::mark_read(&b.db, DID, bx, false).await.unwrap();
+            set_updated_at(&b, 1, "2026-01-01T10:00:00Z").await;
+            flush_did(&b, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(
+                id_set(&pds_record(&fake, 1), "unreadIds").contains("x"),
+                "{backend:?}: fixture: B's unread is on the PDS"
+            );
+
+            mark_read(&a, 2, "a3").await;
+            flush_did(&a, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(
+                !is_read(&a, ax).await,
+                "{backend:?}: A skipped B's later unread"
+            );
+        }
+    }
+
+    /// **A remote read this instance has folded into its water-mark stays in
+    /// the record.** Other instances never apply a remote `readThrough` to
+    /// their entries, so the GUID is the only way they learn it.
+    #[tokio::test]
+    async fn a_remote_read_compacted_here_stays_in_the_record() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["l-0000", "elsewhere"], &[], "2026-01-01T00:00:00Z"),
+            );
+            for i in 0..COMPACT_READ_IDS_THRESHOLD + 10 {
+                let day = format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60);
+                let id = entry_at(&state, 1, &format!("l-{i:04}"), &day).await;
+                store::mark_read(&state.db, DID, id, true).await.unwrap();
+            }
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert!(
+                rec["readThrough"].is_string(),
+                "{backend:?}: fixture: {rec}"
+            );
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["l-0000", "elsewhere"]),
+                "{backend:?}: a remote read vanished from the record"
+            );
+        }
+    }
+
+    /// **A subscribed feed with a PDS record and no local cursor imports it.**
+    /// On a fresh database only feeds read here have cursors; the rest must
+    /// still pick up their reads — without being written. A feed the reader
+    /// does not subscribe to gets nothing.
+    #[tokio::test]
+    async fn a_subscribed_feed_with_no_cursor_imports_its_record() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let a = entry(&state, 1, "g-a").await;
+            let b = entry(&state, 1, "g-b").await;
+            let c = entry(&state, 1, "g-c").await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-a", "g-b"], &[], "2026-01-01T00:00:00Z"),
+            );
+            // Feed 3: an entry, a record, but no subscription.
+            let gone = entry(&state, 3, "g-gone").await;
+            sqlx::query(
+                "DELETE FROM sub_ref WHERE did = ?1 AND feed_id = (SELECT id FROM feeds WHERE url = ?2)",
+            )
+            .bind(DID)
+            .bind(feed(3))
+            .execute(&state.db)
+            .await
+            .unwrap();
+            put_remote(
+                &fake,
+                3,
+                remote_guid_record(3, &["g-gone"], &[], "2026-01-01T00:00:00Z"),
+            );
+            assert!(
+                store::get_cursor(&state.db, DID, &feed(1))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "fixture: a fresh database"
+            );
+            let before = pds_record(&fake, 1);
+
+            mark_read(&state, 2, "g2").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, a).await && is_read(&state, b).await,
+                "{backend:?}: the record was not imported"
+            );
+            assert!(!is_read(&state, c).await, "{backend:?}");
+            let cur = cursor(&state, 1).await;
+            assert!(!cur.dirty && cur.pds_created, "{backend:?}: {cur:?}");
+            assert_eq!(
+                pds_record(&fake, 1),
+                before,
+                "{backend:?}: feed 1 was written"
+            );
+            assert!(
+                !is_read(&state, gone).await,
+                "{backend:?}: unsubscribed feed imported"
+            );
+            assert!(
+                store::get_cursor(&state.db, DID, &feed(3))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{backend:?}: a cursor for a feed the reader does not subscribe to"
+            );
+        }
+    }
+
+    /// **A remote read of an entry in a feed the reader has left survives a
+    /// write.** The import refuses it (no `sub_ref`), so it must be carried.
+    #[tokio::test]
+    async fn a_remote_read_in_an_unsubscribed_feed_survives_a_write() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            entry(&state, 1, "g-x").await;
+            mark_read(&state, 1, "g1").await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-x"], &[], "2026-01-01T00:00:00Z"),
+            );
+            sqlx::query("DELETE FROM sub_ref WHERE did = ?1")
+                .bind(DID)
+                .execute(&state.db)
+                .await
+                .unwrap();
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g1", "g-x"]),
+                "{backend:?}: the remote read was erased"
+            );
         }
     }
 }

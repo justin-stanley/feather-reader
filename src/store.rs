@@ -3003,6 +3003,18 @@ pub async fn compact_cursor(
     let keep_unread =
         ids_published_at_or_before(&mut tx, feed_url, &unread_ids, &watermark).await?;
 
+    // **The row's own `updated_at`, not now** (review of #286). It is the
+    // record's `updatedAt`, which settles read/unread conflicts between
+    // instances, and compaction changes how reads are written down, not what
+    // was read. The flusher re-reads the row after compacting, so its
+    // dirty-clear snapshot still matches; a mark-read meanwhile stamps now.
+    let updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM read_cursor WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .fetch_one(&mut *tx)
+            .await
+            .with_context(|| format!("compact_cursor: updated_at for {did}/{feed_url}"))?;
     write_cursor_sets(
         &mut tx,
         did,
@@ -3010,7 +3022,7 @@ pub async fn compact_cursor(
         Some(&watermark),
         &keep_above,
         &keep_unread,
-        &now_rfc3339(),
+        &updated_at,
     )
     .await?;
     tx.commit().await.context("commit compact_cursor tx")?;
@@ -3751,9 +3763,24 @@ pub async fn entries_for_guids(
 /// brings in is already on the PDS. Dirtying a clean cursor would make the
 /// next round write the same reads straight back — a write per import, for
 /// nothing. A dirty cursor stays dirty, and is written this round anyway.
-/// `updated_at` does move, so the flusher re-reads the row before its
-/// conditional dirty-clear, and a later round does not re-import the same
-/// record (it is no longer newer than the cursor).
+///
+/// **`updated_at` becomes the later of the cursor's own and `remote_updated_at`
+/// — never the import time.** `updated_at` is when the cursor's CONTENT last
+/// changed: it is written as the record's `updatedAt`, and the merge compares
+/// it against other records to settle read/unread conflicts. Stamping "now"
+/// made an import look newer than state it had not seen: an older read,
+/// imported after another instance's newer unread, then beat that unread, and
+/// that instance's record no longer looked newer than this cursor, so it was
+/// never imported here either. A local mark-read still stamps "now", because
+/// that change IS made now.
+///
+/// It is also the row version the flusher's conditional dirty-clear compares
+/// ([`clear_cursor_dirty`]). That still holds: the flusher re-reads the row
+/// after an import, so its snapshot is the imported row whatever the stamp,
+/// and a mark-read during the PDS write stamps "now", which differs from it.
+/// (Two writes in the same second share a stamp; that was already so.) A later
+/// round does not re-import the same record: it is no longer newer than the
+/// cursor.
 ///
 /// Authorized like [`mark_read`]: only entries of a feed `did` subscribes to
 /// (`sub_ref`) are touched. A cursor row that no longer exists is left alone.
@@ -3763,6 +3790,7 @@ pub async fn import_remote_read_state(
     feed_url: &str,
     read: &[i64],
     unread: &[i64],
+    remote_updated_at: &str,
 ) -> Result<usize> {
     if read.is_empty() && unread.is_empty() {
         return Ok(0);
@@ -3772,16 +3800,18 @@ pub async fn import_remote_read_state(
         .begin()
         .await
         .context("begin import_remote_read_state tx")?;
-    let dirty: Option<bool> =
-        sqlx::query_scalar("SELECT dirty FROM read_cursor WHERE did = ?1 AND feed_url = ?2")
-            .bind(did)
-            .bind(feed_url)
-            .fetch_optional(&mut *tx)
-            .await
-            .with_context(|| format!("import_remote_read_state: cursor for {did}/{feed_url}"))?;
-    let Some(dirty) = dirty else {
+    let row: Option<(bool, String)> = sqlx::query_as(
+        "SELECT dirty, updated_at FROM read_cursor WHERE did = ?1 AND feed_url = ?2",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("import_remote_read_state: cursor for {did}/{feed_url}"))?;
+    let Some((dirty, updated_at)) = row else {
         return Ok(0);
     };
+    let stamp = later_timestamp(&updated_at, remote_updated_at);
 
     let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
     let mut written = 0;
@@ -3830,7 +3860,7 @@ pub async fn import_remote_read_state(
             read_through.as_deref(),
             &read_ids,
             &unread_ids,
-            &now,
+            &stamp,
         )
         .await?;
         sqlx::query("UPDATE read_cursor SET dirty = ?3 WHERE did = ?1 AND feed_url = ?2")
@@ -3845,6 +3875,67 @@ pub async fn import_remote_read_state(
         .await
         .context("commit import_remote_read_state tx")?;
     Ok(written)
+}
+
+/// The later of two RFC 3339 instants, compared as instants. `local` is kept
+/// as written when it is not earlier; `remote` — from any client, with any
+/// offset or precision — is normalised to UTC `...Z` when it wins. An
+/// unparseable `remote` never wins.
+fn later_timestamp(local: &str, remote: &str) -> String {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (parse(local), parse(remote)) {
+        (Some(l), Some(r)) if r > l => utc_timestamp(r),
+        (None, Some(r)) => utc_timestamp(r),
+        _ => local.to_string(),
+    }
+}
+
+fn utc_timestamp(t: chrono::DateTime<chrono::FixedOffset>) -> String {
+    t.with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+/// Create a CLEAN cursor for `did` on `feed_url`, stamped `updated_at`, if
+/// `did` subscribes to the feed and has no cursor for it yet. Returns whether
+/// one was created.
+///
+/// For a feed whose `readState` record is on the PDS but which has never been
+/// read on this database — every feed but the ones read here, on a fresh one
+/// (#246). The record exists, so `pds_created` is set; nothing local changed,
+/// so it is not dirty; and `updated_at` is the record's, so the import that
+/// follows is not mistaken for something newer than the record.
+///
+/// `updated_at` must be RFC 3339; an unparseable one creates nothing.
+pub async fn create_clean_cursor(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return Ok(false);
+    };
+    let res = sqlx::query(
+        r#"
+        INSERT INTO read_cursor
+            (did, feed_url, read_through, read_ids, unread_ids, dirty, pds_created, updated_at)
+        SELECT ?1, f.url, NULL, '[]', '[]', 0, 1, ?3
+        FROM feeds f
+        WHERE f.url = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = f.id
+          )
+        ON CONFLICT (did, feed_url) DO NOTHING
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(utc_timestamp(at))
+    .execute(pool)
+    .await
+    .with_context(|| format!("create_clean_cursor failed for {did}/{feed_url}"))?;
+    Ok(res.rows_affected() > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -5722,6 +5813,58 @@ mod tests {
         // 30th — STRICTLY below the oldest unread, never equal to it.
         assert_eq!(watermark, "2026-01-30T00:00:00Z");
         assert!(after.dirty, "a rewritten cursor must be re-flushed");
+        Ok(())
+    }
+
+    /// **Compaction is not a change to what was read** (review of #286). The
+    /// cursor's `updated_at` is the record's `updatedAt`, which settles
+    /// read/unread conflicts between instances; stamping it "now" made a
+    /// compacting flush look newer than its content, so its older reads could
+    /// beat another instance's newer explicit unread.
+    #[tokio::test]
+    async fn compaction_keeps_the_cursors_updated_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:compactstamp";
+        let feed_url = "https://compactstamp.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..10)
+            .map(|i| NewEntry {
+                guid: format!("s-{i:03}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let mut oldest_first = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        oldest_first.reverse();
+        for row in oldest_first.iter().take(5) {
+            mark_read(&pool, did, row.id, true).await?;
+        }
+        let stamp = "2026-02-01T00:00:00Z";
+        sqlx::query("UPDATE read_cursor SET updated_at = ?3 WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .bind(stamp)
+            .execute(&pool)
+            .await?;
+
+        compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("the water-mark must advance");
+
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert_eq!(
+            after.updated_at, stamp,
+            "compaction stamped the cursor as if its reads had changed"
+        );
         Ok(())
     }
 
