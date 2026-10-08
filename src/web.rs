@@ -2080,33 +2080,7 @@ async fn resolve_subscriptions_noting(
         Err(err) => {
             let alert = subscriptions_alert(&err);
             warn!(%err, %did, "could not list PDS subscriptions; showing this DID's cached subscriptions only");
-            // Fail CLOSED: the PDS is the source of truth for what this DID
-            // follows. When it is unreachable we must NOT widen the caller's
-            // authorization surface. Serve from the DID's OWN last-known
-            // `sub_ref` projection (its own feeds, possibly stale) and leave
-            // `sub_ref` untouched — never synthesize from every cached feed,
-            // which would grant cross-tenant read+mutate during any outage.
-            // A DB failure here is NOT the same as "this DID follows nothing",
-            // but `unwrap_or_default` rendered it as exactly that: an empty
-            // sidebar and an empty reader, which arrives as "all my feeds
-            // vanished". It still degrades to empty — there is nothing better to
-            // show — but it says so, so the support ticket and the log line can
-            // be matched up.
-            let feeds = store::feeds_for_did(pool, did).await.unwrap_or_else(|err| {
-                warn!(%err, %did, "the PDS is unreachable AND the local subscription \
-                                   projection could not be read; rendering an EMPTY \
-                                   feed list, which is not the same as having none");
-                Vec::new()
-            });
-            let cached = feeds
-                .into_iter()
-                .map(|f| ResolvedSub {
-                    rkey: String::new(),
-                    sub: Subscription::new(f.url.clone(), now_rfc3339()),
-                    feed: Some(f),
-                })
-                .collect();
-            return (cached, Some(alert));
+            return (cached_subscriptions(pool, did).await, Some(alert));
         }
     };
 
@@ -2184,11 +2158,148 @@ async fn resolve_subscriptions_noting(
         };
         out.push(ResolvedSub { rkey, sub, feed });
     }
+    // **A mass drop is read twice before it is believed (#203).** A walk
+    // that ended early is indistinguishable from a complete one at the walk:
+    // a page carrying a cursor and no records is how a real PDS ends a list,
+    // and also how a broken or hostile one cuts it short. Here, where the
+    // result would DELETE `sub_ref` rows, a shrink of the ordinary size is
+    // applied at once and a big one must read the same a second time.
+    let refused = match shrink_is_corroborated(state, did, &out).await {
+        Shrink::Apply => None,
+        Shrink::Disagreed => Some(
+            "Your subscription list came back much shorter than before and did not \
+             read the same twice, so it was not applied. Showing your last-known \
+             subscriptions; nothing was removed."
+                .to_string(),
+        ),
+        // Not a disagreement: the second read failed outright, and the reader
+        // is told why, exactly as for a failed first read (#177).
+        Shrink::Unreadable(err) => Some(subscriptions_alert(&err)),
+    };
+    if let Some(alert) = refused {
+        return (cached_subscriptions(pool, did).await, Some(alert));
+    }
     // Mirror the caller's resolved subscription set into `sub_ref`, so every
     // scoped entry/feed read + read/star mutation authorizes against exactly
     // the feeds this DID follows right now. This is THE per-DID isolation hook.
     sync_sub_refs(pool, did, &out).await;
     (out, None)
+}
+
+/// How many feeds one resolve may drop from a reader's `sub_ref` before the
+/// listing has to read the same twice to be applied (#203).
+///
+/// **Why 3.** Unsubscribing in this app is one feed at a time, so an ordinary
+/// resolve drops one, occasionally two when another client removed one in the
+/// meantime. Dropping three or more at once is the shape a walk that ended
+/// early produces — every record past the cut gone in one step — and is rare
+/// enough from a real reader that paying one extra listing for it is cheap.
+/// A folder delete or a cleanup in another client can legitimately drop many;
+/// those read the same twice and are applied.
+const SUB_REF_SHRINK_CORROBORATE: usize = 3;
+
+/// What [`shrink_is_corroborated`] found.
+enum Shrink {
+    /// Apply the listing to `sub_ref`.
+    Apply,
+    /// A big shrink whose second listing returned different subscriptions.
+    Disagreed,
+    /// A big shrink whose second listing could not be read at all; the
+    /// error, so the reader is told the real cause.
+    Unreadable(anyhow::Error),
+}
+
+/// Whether `resolved` may replace `did`'s `sub_ref` projection: yes outright
+/// unless it drops [`SUB_REF_SHRINK_CORROBORATE`] or more current feeds, in
+/// which case only if a second listing returns the same subscription URLs.
+///
+/// **The limit, stated:** a server that truncates identically twice is
+/// indistinguishable from a reader who really unsubscribed from those feeds,
+/// and is applied. This closes the walk that ends early once, not a server
+/// determined to lie consistently.
+async fn shrink_is_corroborated(state: &AppState, did: &str, resolved: &[ResolvedSub]) -> Shrink {
+    let current = match store::subscribed_feed_ids(&state.db, did).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            // Nothing to compare against; the write below will meet the same
+            // database and log its own failure.
+            warn!(%err, %did, "could not read sub_ref to check for a mass drop");
+            return Shrink::Apply;
+        }
+    };
+    let kept: std::collections::HashSet<i64> = resolved
+        .iter()
+        .filter_map(|s| s.feed.as_ref().map(|f| f.id))
+        .collect();
+    let dropped = current.iter().filter(|id| !kept.contains(id)).count();
+    if dropped < SUB_REF_SHRINK_CORROBORATE {
+        return Shrink::Apply;
+    }
+    let first: std::collections::HashSet<&str> =
+        resolved.iter().map(|s| s.sub.url.as_str()).collect();
+    match state.repo().list_subscriptions_sorted(did).await {
+        Ok(again) => {
+            let second: std::collections::HashSet<&str> =
+                again.iter().map(|(_, s)| s.url.as_str()).collect();
+            if first == second {
+                return Shrink::Apply;
+            }
+            warn!(
+                %did,
+                current = current.len(),
+                dropped,
+                first = first.len(),
+                second = second.len(),
+                "subscription list shrank sharply and did not read the same twice; \
+                 leaving sub_ref untouched"
+            );
+            Shrink::Disagreed
+        }
+        Err(err) => {
+            warn!(
+                %err,
+                %did,
+                current = current.len(),
+                dropped,
+                "subscription list shrank sharply and could not be read a second time; \
+                 leaving sub_ref untouched"
+            );
+            Shrink::Unreadable(err)
+        }
+    }
+}
+
+/// The fail-closed answer when the PDS listing cannot be applied: `did`'s OWN
+/// last-known subscriptions, from its `sub_ref` projection, which is left
+/// untouched.
+async fn cached_subscriptions(pool: &store::Pool, did: &str) -> Vec<ResolvedSub> {
+    // Fail CLOSED: the PDS is the source of truth for what this DID
+    // follows. When it is unreachable, or its answer is not trusted, we
+    // must NOT widen the caller's authorization surface. Serve from the
+    // DID's OWN last-known `sub_ref` projection (its own feeds, possibly
+    // stale) and leave `sub_ref` untouched — never synthesize from every
+    // cached feed, which would grant cross-tenant read+mutate during any
+    // outage.
+    // A DB failure here is NOT the same as "this DID follows nothing",
+    // but `unwrap_or_default` rendered it as exactly that: an empty
+    // sidebar and an empty reader, which arrives as "all my feeds
+    // vanished". It still degrades to empty — there is nothing better to
+    // show — but it says so, so the support ticket and the log line can
+    // be matched up.
+    let feeds = store::feeds_for_did(pool, did).await.unwrap_or_else(|err| {
+        warn!(%err, %did, "the PDS listing could not be applied AND the local \
+                           subscription projection could not be read; rendering an \
+                           EMPTY feed list, which is not the same as having none");
+        Vec::new()
+    });
+    feeds
+        .into_iter()
+        .map(|f| ResolvedSub {
+            rkey: String::new(),
+            sub: Subscription::new(f.url.clone(), now_rfc3339()),
+            feed: Some(f),
+        })
+        .collect()
 }
 
 /// Refresh the `sub_ref` projection for `did` to exactly the feed ids present
@@ -10204,6 +10315,254 @@ mod tests {
             vec!["https://a.example/feed.xml"],
             "the outage fallback must return the caller's OWN subscriptions only; \
              any other feed here is cross-tenant read access granted by an outage",
+        );
+    }
+
+    // -- #203: a big shrink of sub_ref is corroborated before it is applied --
+
+    /// A sidecar that answers the `n`th subscription listing with
+    /// `listings[n]` (the last one repeats), one page each, no cursor, and
+    /// counts how many listings it served.
+    /// In a `spawn_listing_sidecar` listing: serve a malformed record there.
+    const MALFORMED_LISTING: &str = "<malformed>";
+
+    async fn spawn_listing_sidecar(
+        listings: Vec<Vec<String>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Drain head and declared body, so closing does not RST.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let len = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).to_string();
+                let records = if req.contains("subscription") {
+                    let i = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let urls = &listings[i.min(listings.len() - 1)];
+                    urls.iter()
+                        .enumerate()
+                        .map(|(j, url)| {
+                            // A record no client could have meant: the walk
+                            // refuses the whole listing (`MalformedRecords`).
+                            if url == MALFORMED_LISTING {
+                                return serde_json::json!({ "uri": 7 });
+                            }
+                            serde_json::json!({
+                                "uri": format!("at://did:plc:x/{}/3lab{j}", lexicon::nsid::SUBSCRIPTION),
+                                "cid": "bafy",
+                                "value": {
+                                    "$type": lexicon::nsid::SUBSCRIPTION,
+                                    "url": url,
+                                    "createdAt": "2026-01-01T00:00:00Z"
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let body =
+                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), served)
+    }
+
+    fn shrink_feed_urls(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("https://shrink{i}.example/feed.xml"))
+            .collect()
+    }
+
+    /// A state whose sidecar serves `listings`, with `did`'s `sub_ref` seeded
+    /// to the first `subscribed` of five cached feeds. Returns the state, the
+    /// listing counter, and the five feed ids.
+    async fn shrink_state(
+        did: &str,
+        subscribed: usize,
+        listings: Vec<Vec<String>>,
+    ) -> (
+        AppState,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Vec<i64>,
+    ) {
+        let (url, served) = spawn_listing_sidecar(listings).await;
+        let state = test_state_with_sidecar(&[did], &url).await;
+        let mut ids = Vec::new();
+        for u in shrink_feed_urls(5) {
+            ids.push(
+                store::upsert_feed(
+                    &state.db,
+                    &store::NewFeed {
+                        url: u,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        store::replace_sub_refs(&state.db, did, &ids[..subscribed])
+            .await
+            .unwrap();
+        (state, served, ids)
+    }
+
+    async fn sub_ref_sorted(state: &AppState, did: &str) -> Vec<i64> {
+        let mut ids = store::subscribed_feed_ids(&state.db, did).await.unwrap();
+        ids.sort();
+        ids
+    }
+
+    /// **A mass drop that does not read the same twice is not applied.** A
+    /// walk that ended early (a page with a cursor and no records, which a real
+    /// PDS also sends at the end of a list) is indistinguishable from a
+    /// complete one at the walk, so the destination asks again before it
+    /// DELETEs the reader's authorization set.
+    #[tokio::test]
+    async fn a_big_shrink_that_does_not_read_the_same_twice_is_not_applied() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        // Drops exactly SUB_REF_SHRINK_CORROBORATE (5 -> 2), pinning the
+        // threshold from this side; `a_small_shrink_is_applied_on_one_read`
+        // pins it from the other.
+        let (state, served, ids) = shrink_state(did, 5, vec![all[..2].to_vec(), all.clone()]).await;
+
+        let (subs, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(
+            sub_ref_sorted(&state, did).await,
+            ids,
+            "a mass drop that did not read the same twice was applied to sub_ref"
+        );
+        let alert = alert.expect("a refused shrink must say why the list is stale");
+        assert!(
+            alert.contains("did not read the same twice"),
+            "wrong alert: {alert}"
+        );
+        assert_eq!(subs.len(), 5, "the last-known list was not the one shown");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// **A second read that fails says why** (review of #278). A refused
+    /// shrink whose second listing could not be read at all — the PDS gone,
+    /// or a malformed record — is not a disagreement, and "did not read the
+    /// same twice" sent the reader looking for a race. It gets the alert a
+    /// failed first read gets (#177), and `sub_ref` is still left untouched.
+    #[tokio::test]
+    async fn a_big_shrink_whose_second_read_fails_names_the_failure() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        let (state, served, ids) = shrink_state(
+            did,
+            5,
+            vec![all[..1].to_vec(), vec![MALFORMED_LISTING.to_string()]],
+        )
+        .await;
+
+        let (subs, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(sub_ref_sorted(&state, did).await, ids);
+        let alert = alert.expect("a refused shrink must say why the list is stale");
+        assert!(
+            alert.contains("1 record(s) in your subscription list could not be read"),
+            "the failed second read was reported as a disagreement: {alert}"
+        );
+        assert_eq!(subs.len(), 5);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The other side: a mass drop that reads the same twice IS applied —
+    /// a reader can unsubscribe from many feeds, and a stale `sub_ref` would
+    /// keep authorizing feeds they left.
+    #[tokio::test]
+    async fn a_big_shrink_that_reads_the_same_twice_is_applied() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        let (state, served, ids) =
+            shrink_state(did, 5, vec![all[..1].to_vec(), all[..1].to_vec()]).await;
+
+        let (_, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(alert, None);
+        assert_eq!(
+            sub_ref_sorted(&state, did).await,
+            vec![ids[0]],
+            "a corroborated mass drop was not applied"
+        );
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A drop below the threshold is the ordinary one-at-a-time unsubscribe:
+    /// applied on one read, without paying a second round trip.
+    #[tokio::test]
+    async fn a_small_shrink_is_applied_on_one_read() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        let (state, served, ids) = shrink_state(did, 5, vec![all[..3].to_vec()]).await;
+
+        let (_, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(alert, None);
+        assert_eq!(sub_ref_sorted(&state, did).await, ids[..3].to_vec());
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a shrink below the threshold paid for a second listing"
+        );
+    }
+
+    /// The first resolve for a reader has nothing to shrink from.
+    #[tokio::test]
+    async fn the_first_resolve_is_never_corroborated() {
+        let did = "did:plc:shrinker";
+        let all = shrink_feed_urls(5);
+        let (state, served, ids) = shrink_state(did, 0, vec![all.clone()]).await;
+
+        let (_, alert) = resolve_subscriptions_noting(&state, did).await;
+
+        assert_eq!(alert, None);
+        assert_eq!(sub_ref_sorted(&state, did).await, ids);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a first-ever resolve paid for a second listing"
         );
     }
 
