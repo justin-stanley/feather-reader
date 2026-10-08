@@ -1578,6 +1578,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.4.8",
+        date: "2026-10-08",
+        summary: "A misbehaving server can no longer drop your subscriptions by \
+                  cutting a list short, and a small publication that shares a \
+                  repo with big ones is read in full.",
+    },
+    Release {
         version: "0.4.7",
         date: "2026-10-07",
         summary: "A feed can no longer stall the reader with an article that is \
@@ -8390,7 +8397,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#047--2026-10-07"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#048--2026-10-08"
         );
     }
 

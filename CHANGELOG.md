@@ -14,7 +14,27 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.8 — 2026-10-08
+
+A PDS that ends a listing early can no longer drop a reader's
+subscriptions (#203), a publication read that fails is filed under what
+the PDS actually sent (#227), and a quiet publication is no longer starved
+by big siblings in the same repo (#229).
+
+### Upgrade notes
+
+- **No schema change, no new settings.** Upgrading from 0.4.7 is a deploy;
+  rolling back to 0.4.7 is a redeploy.
+- **A subscription listing that repeats its cursor is refused**, and the
+  reader sees their last-known list, as for any listing failure.
+- **A refresh that would drop 3 or more of a reader's feeds reads the list
+  twice** and applies it only if both reads agree; otherwise the reader
+  sees their last-known list with an alert, and nothing is removed.
+- **`/stats` "why they are failing" shifts** for publications: listing
+  failures that were counted as `fetch` now count as `parse`, `status` or
+  `body`, by what the PDS sent.
+- **A repo whose publications exhaust the shared read budget** re-reads
+  the starved ones alone, within the existing read deadline.
 
 ### Security
 
