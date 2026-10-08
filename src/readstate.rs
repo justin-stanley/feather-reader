@@ -7,7 +7,7 @@
 //! them (#117). `scheduler` keeps the *scheduling* — the interval loop and the
 //! DID selection; this module owns the domain logic.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tracing::{info, warn};
 
@@ -18,17 +18,56 @@ use crate::AppState;
 
 /// Flush a single DID's dirty cursors in one batched `applyWrites`, then clear
 /// the `dirty` flag for the cursors that were included.
+///
+/// **Read, merge, write (#246).** A flush used to write the local cursor over
+/// whatever the PDS held, so a fresh or restored database — or this instance
+/// after another client marked something read — erased read state recorded
+/// elsewhere. Now, before writing, the DID's `readState` records are listed
+/// ONCE and each dirty cursor is merged with its own record (see
+/// `merge_remote`): remote reads of entries this instance has are imported
+/// into `entry_state`, remote GUIDs it has no entry for are carried into the
+/// written record, and `readThrough` is the later of the two. The same listing
+/// sets each cursor's `pds_created`, so a fresh database's first flush is an
+/// `#update` rather than a refused `#create`.
+///
+/// A listing that fails does not block the flush: it is logged and the flush
+/// writes local state alone, as it did before.
 pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
     let cursors = store::dirty_cursors(&state.db, did).await?;
     if cursors.is_empty() {
         return Ok(());
     }
 
+    let remote = match state
+        .repo()
+        .list_all_records(did, crate::lexicon::nsid::READ_STATE)
+        .await
+    {
+        Ok(records) => Some(Remote::from_listing(&records)),
+        Err(err) => {
+            warn!(%did, err = %err, "read-state flusher: could not list readState records; writing local state without merging");
+            None
+        }
+    };
+    if let Some(remote) = &remote {
+        import_into_clean_cursors(state, did, remote).await;
+    }
+
     // Build (rkey, ReadState) pairs, deduping on rkey so two rows that hash to
     // the same feed-key don't produce two ops in one batch (applyWrites rejects
     // duplicate writes to the same key). Deterministic order for stable batches.
     let mut batch: Batch = BTreeMap::new();
-    for cursor in cursors {
+    for mut cursor in cursors {
+        let rkey = read_state_rkey(&cursor.feed_url);
+        let mut theirs = None;
+        if let Some(remote) = &remote {
+            learn_pds_created(state, did, &mut cursor, remote.rkeys.contains(&rkey)).await;
+            theirs = remote.record_for(&rkey, &cursor.feed_url);
+        }
+        let mut carry = Carry::default();
+        if let Some(theirs) = theirs {
+            (cursor, carry) = merge_remote(state, did, cursor, theirs).await;
+        }
         // **Compact before capping.**
         //
         // `read_ids` grows one id per article read and is bounded only by
@@ -43,10 +82,31 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         // was never being computed. Done here rather than on every mark-read
         // because this is the moment the size actually matters, and it is per
         // dirty cursor per flush rather than per click.
+        //
+        // AFTER the merge: the import changes `entry_state`, which is what
+        // compaction reads, and an entry read elsewhere can be what lets the
+        // water-mark advance.
         let cursor = compact_if_large(state, did, cursor).await;
-        let rkey = read_state_rkey(&cursor.feed_url);
-        let record = read_state_record(&cursor);
+        let record = match read_state_record(
+            state,
+            &cursor,
+            theirs.and_then(|t| t.read_through.as_deref()),
+            &carry,
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                // Without the GUIDs there is nothing correct to write; the
+                // cursor stays dirty and goes again next round.
+                warn!(%did, feed = %cursor.feed_url, %err, "read-state flusher: could not map entry ids to GUIDs; skipping this feed this round");
+                continue;
+            }
+        };
         batch.insert(rkey, (record, cursor));
+    }
+    if batch.is_empty() {
+        return Ok(());
     }
 
     // ONE applyWrites batch for all of this DID's dirty feeds — sent as several
@@ -63,24 +123,17 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
 
         // **A flag that disagrees with the PDS wedged this DID forever (#241).**
         //
-        // `pds_created` picks create-vs-update and is learned only from a
-        // success. A success whose answer was lost, or a fresh or restored
-        // database against a repo that already holds these stable rkeys, leaves
-        // it false over a record that exists; a record deleted elsewhere leaves
-        // it true over one that does not. Either way one op fails, applyWrites
-        // is atomic, the whole call fails — and the next flush sends the same
-        // batch. Nothing ever corrected the flag.
+        // `pds_created` picks create-vs-update. Since #246 it is set from the
+        // listing at the top of every flush, but that listing can fail (then
+        // the stored flag is used as-is), and a record can be created or
+        // deleted by another client between the listing and the write. Either
+        // way one op fails, applyWrites is atomic, the whole call fails.
         //
         // So on a failure that COULD be that, ask the PDS once what exists, and
         // retry what did not land, once, if the answer changes anything. Never
         // in a loop: a retry that fails again is returned like any other
         // failure, and the corrected flags it leaves behind make the next round
         // an ordinary flush.
-        //
-        // Not ALSO proactively, on each DID's first flush after startup: that
-        // costs every healthy DID a listing per restart to save a wedged one a
-        // single failed applyWrites, since this path converges inside the same
-        // flush — and it would not cover a success lost mid-process anyway.
         if !may_be_existence_mismatch(&err) {
             return Err(err);
         }
@@ -120,6 +173,235 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
 
     info!(%did, feeds = flushed, "read-state flusher: flushed dirty cursors");
     Ok(())
+}
+
+/// One listing of a DID's `readState` collection, as the merge needs it.
+struct Remote {
+    /// Every rkey that exists — including records that did not parse, so a
+    /// record this instance cannot read is still never sent a `#create`.
+    rkeys: HashSet<String>,
+    /// The records that parsed, by rkey.
+    records: HashMap<String, ReadState>,
+}
+
+impl Remote {
+    fn from_listing(records: &[crate::atproto::RecordEntry]) -> Self {
+        let mut rkeys = HashSet::new();
+        let mut parsed = HashMap::new();
+        for record in records {
+            let Some(rkey) = record.rkey() else { continue };
+            rkeys.insert(rkey.to_string());
+            match record.parse::<ReadState>() {
+                Ok(rs) => {
+                    parsed.insert(rkey.to_string(), rs);
+                }
+                Err(err) => {
+                    warn!(uri = %record.uri, %err, "read-state flusher: unparseable readState record; not merged");
+                }
+            }
+        }
+        Self {
+            rkeys,
+            records: parsed,
+        }
+    }
+
+    /// The record at `rkey`, if it is about `feed_url` — a hash collision
+    /// between two feeds' rkeys must not merge one feed's reads into another.
+    fn record_for(&self, rkey: &str, feed_url: &str) -> Option<&ReadState> {
+        self.records.get(rkey).filter(|r| r.feed_url == feed_url)
+    }
+}
+
+/// Set `cursor.pds_created` to what the listing says, persisting a change.
+///
+/// A failure to persist is logged: the in-memory flag still drives this
+/// flush, and the next flush lists again.
+async fn learn_pds_created(state: &AppState, did: &str, cursor: &mut ReadCursor, exists: bool) {
+    if cursor.pds_created == exists {
+        return;
+    }
+    cursor.pds_created = exists;
+    if let Err(err) = store::set_cursor_pds_created(&state.db, did, &cursor.feed_url, exists).await
+    {
+        warn!(%did, feed = %cursor.feed_url, %err, "failed to record pds_created from the listing");
+    }
+}
+
+/// Remote GUIDs this instance has no entry for, carried into the written
+/// record so they are not erased. Never stored locally — there is nothing to
+/// store them against.
+#[derive(Default, Debug)]
+struct Carry {
+    read: Vec<String>,
+    unread: Vec<String>,
+}
+
+/// Whether timestamp `a` is strictly later than `b`, compared as instants.
+///
+/// Parsed, not string-compared: this instance writes UTC seconds `...Z`, but
+/// `updatedAt` / `readThrough` come from any client, with any offset or
+/// precision. An unparseable side is never the later one.
+fn later(a: &str, b: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
+/// Merge `theirs` — the PDS record at this cursor's rkey — into the local
+/// state, and return the (re-read) cursor and the remote GUIDs to carry.
+///
+/// The rules:
+/// - **A legacy record** (no `idType`) holds another database's row ids: its
+///   id arrays are ignored entirely. Its `readThrough` still merges, in
+///   [`read_state_record`].
+/// - **A remote GUID with a local entry** is imported into `entry_state`
+///   unless it conflicts: read there and explicitly unread here (in the
+///   cursor's `unread_ids`), or unread there and read here. Then the side with
+///   the newer `updatedAt` wins, and a tie goes to local.
+/// - **A remote GUID with no local entry** is carried into the record.
+///
+/// Remote `readThrough` is NOT applied to local entries: undated entries
+/// compare by `fetched_at`, which is instance-local, so the same water-mark
+/// would mark different entries read on different instances.
+///
+/// Any failure is logged and leaves the cursor as given with nothing carried
+/// — the pre-#246 behaviour for that one feed, not a failed flush.
+async fn merge_remote(
+    state: &AppState,
+    did: &str,
+    cursor: ReadCursor,
+    theirs: &ReadState,
+) -> (ReadCursor, Carry) {
+    if theirs.id_type.as_deref() != Some(ReadState::ID_TYPE_GUID) {
+        return (cursor, Carry::default());
+    }
+    match merge_guid_record(state, did, &cursor, theirs).await {
+        Ok((Some(fresh), carry)) => (fresh, carry),
+        Ok((None, carry)) => (cursor, carry),
+        Err(err) => {
+            warn!(%did, feed = %cursor.feed_url, %err, "read-state flusher: could not merge the PDS record; writing local state");
+            (cursor, Carry::default())
+        }
+    }
+}
+
+/// [`merge_remote`] for a GUID record. Returns the re-read cursor when the
+/// import changed it.
+async fn merge_guid_record(
+    state: &AppState,
+    did: &str,
+    cursor: &ReadCursor,
+    theirs: &ReadState,
+) -> anyhow::Result<(Option<ReadCursor>, Carry)> {
+    let remote_read: Vec<String> = dedup(theirs.read_ids.iter().cloned());
+    let read_set: HashSet<&String> = remote_read.iter().collect();
+    // A GUID in both of the remote's own sets is read: the record contradicts
+    // itself, and read is what its `readIds` field asserts most directly.
+    let remote_unread: Vec<String> = dedup(
+        theirs
+            .unread_ids
+            .iter()
+            .filter(|g| !read_set.contains(g))
+            .cloned(),
+    );
+
+    let all: Vec<String> = remote_read.iter().chain(&remote_unread).cloned().collect();
+    let local = store::entries_for_guids(&state.db, did, &cursor.feed_url, &all).await?;
+    let local_unread: HashSet<i64> = parse_id_array(&cursor.unread_ids)
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let remote_wins = later(&theirs.updated_at, &cursor.updated_at);
+
+    let mut carry = Carry::default();
+    let (mut to_read, mut to_unread) = (Vec::new(), Vec::new());
+    for guid in remote_read {
+        match local.get(&guid) {
+            None => carry.read.push(guid),
+            Some(e) => {
+                let explicitly_unread = local_unread.contains(&e.id);
+                if explicitly_unread && !remote_wins {
+                    continue;
+                }
+                if !e.read || explicitly_unread {
+                    to_read.push(e.id);
+                }
+            }
+        }
+    }
+    for guid in remote_unread {
+        match local.get(&guid) {
+            None => carry.unread.push(guid),
+            Some(e) => {
+                if e.read && !remote_wins {
+                    continue;
+                }
+                // Into `unread_ids` even when it is already unread here, or the
+                // record would drop it — and below a `readThrough`, a missing
+                // unread id reads as read.
+                if e.read || !local_unread.contains(&e.id) {
+                    to_unread.push(e.id);
+                }
+            }
+        }
+    }
+
+    let imported =
+        store::import_remote_read_state(&state.db, did, &cursor.feed_url, &to_read, &to_unread)
+            .await?;
+    if imported == 0 {
+        return Ok((None, carry));
+    }
+    info!(%did, feed = %cursor.feed_url, imported, "read-state flusher: imported read state from the PDS");
+    // Re-read: the import rewrote the row and moved `updated_at`, which the
+    // conditional dirty-clear compares against.
+    Ok((
+        store::get_cursor(&state.db, did, &cursor.feed_url).await?,
+        carry,
+    ))
+}
+
+/// Import remote reads into the DID's CLEAN cursors, from the listing this
+/// flush already made.
+///
+/// Only when the remote record is newer than the cursor: that is the record
+/// another client changed since this instance last wrote or imported it. The
+/// import never dirties the cursor ([`store::import_remote_read_state`]), so it
+/// costs no write; the carried GUIDs are irrelevant here — nothing is written.
+///
+/// It runs only on rounds that list anyway, i.e. when the DID has some dirty
+/// cursor: a reader who reads only elsewhere sees those reads arrive here the
+/// next time they read anything here.
+async fn import_into_clean_cursors(state: &AppState, did: &str, remote: &Remote) {
+    let clean = match store::clean_cursors(&state.db, did).await {
+        Ok(clean) => clean,
+        Err(err) => {
+            warn!(%did, %err, "read-state flusher: could not load clean cursors to import into");
+            return;
+        }
+    };
+    for cursor in clean {
+        let rkey = read_state_rkey(&cursor.feed_url);
+        let Some(theirs) = remote.record_for(&rkey, &cursor.feed_url) else {
+            continue;
+        };
+        if !later(&theirs.updated_at, &cursor.updated_at) {
+            continue;
+        }
+        let _ = merge_remote(state, did, cursor, theirs).await;
+    }
+}
+
+/// `ids` in first-seen order, without repeats.
+fn dedup(ids: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    ids.filter(|id| seen.insert(id.clone())).collect()
 }
 
 /// Record that `cursor`'s write landed: mark its PDS record as created (so
@@ -332,32 +614,102 @@ async fn compact_if_large(state: &AppState, did: &str, cursor: ReadCursor) -> Re
     }
 }
 
-/// Turn a local [`ReadCursor`] row into the PDS [`ReadState`] lexicon record.
-///
-/// The store keeps `read_ids` / `unread_ids` as JSON arrays of ids; the lexicon
-/// wants string arrays. `read_through` is optional both locally AND in the
-/// record: when the cursor has no local high-water-mark we pass `None` so the
-/// record OMITS `readThrough` entirely. This is the conservative behaviour —
-/// `readThrough` is a "everything seen/published `<=` this is read" water-mark,
-/// so synthesizing a flush-time (`≈ now`) value for a cursor that has none would
-/// assert the whole unread backlog is read. With `None` only the explicit
-/// `read_ids` mark entries read. Both id-sets are capped at [`ReadState::MAX_IDS`]
-/// to respect the lexicon bound.
-fn read_state_record(cursor: &ReadCursor) -> ReadState {
-    let read_ids = parse_id_array(&cursor.read_ids);
-    let unread_ids = parse_id_array(&cursor.unread_ids);
+/// Turn a local [`ReadCursor`] row into the PDS [`ReadState`] lexicon record,
+/// with its row ids translated to entry GUIDs (see [`build_record`]).
+async fn read_state_record(
+    state: &AppState,
+    cursor: &ReadCursor,
+    remote_read_through: Option<&str>,
+    carry: &Carry,
+) -> anyhow::Result<ReadState> {
+    let ids: Vec<i64> = parse_id_array(&cursor.read_ids)
+        .iter()
+        .chain(&parse_id_array(&cursor.unread_ids))
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let guids = store::guids_for_entry_ids(&state.db, &cursor.feed_url, &ids).await?;
+    Ok(build_record(cursor, &guids, remote_read_through, carry))
+}
 
-    // Do NOT synthesize a water-mark from `updated_at`: an unset local
-    // `read_through` means "no high-water-mark", which the record represents by
-    // omitting `readThrough` (None), not by back-dating it to flush time.
-    let mut record = ReadState::new(
-        &cursor.feed_url,
-        cursor.read_through.clone(),
-        &cursor.updated_at,
-    );
-    record.read_ids = cap(read_ids, ReadState::MAX_IDS);
-    record.unread_ids = cap(unread_ids, ReadState::MAX_IDS);
+/// Build the record from a cursor, the GUIDs of its ids, the remote
+/// `readThrough` and the remote GUIDs to carry.
+///
+/// **Ids are GUIDs, and the record says so** (`idType: "guid"`): the cursor's
+/// row ids mean nothing on another instance. A row id with no GUID — its entry
+/// was swept — drops out; there is nothing it could mean to anyone.
+///
+/// `read_through` is optional both locally AND in the record: when neither
+/// side has a high-water-mark the record OMITS `readThrough` entirely. This is
+/// the conservative behaviour — `readThrough` is a "everything seen/published
+/// `<=` this is read" water-mark, so synthesizing a flush-time (`≈ now`) value
+/// for a cursor that has none would assert the whole unread backlog is read.
+/// When both sides have one, the later wins: neither side's water-mark is
+/// ever moved backwards by the other.
+///
+/// Both id-sets are capped at [`ReadState::MAX_IDS`] to respect the lexicon
+/// bound, dropping carried remote GUIDs first (see [`cap_merged`]).
+fn build_record(
+    cursor: &ReadCursor,
+    guids: &HashMap<i64, String>,
+    remote_read_through: Option<&str>,
+    carry: &Carry,
+) -> ReadState {
+    let to_guids = |raw: &str| -> Vec<String> {
+        dedup(
+            parse_id_array(raw)
+                .iter()
+                .filter_map(|s| s.parse::<i64>().ok())
+                .filter_map(|id| guids.get(&id).cloned()),
+        )
+    };
+    let read_ids = to_guids(&cursor.read_ids);
+    let unread_ids = to_guids(&cursor.unread_ids);
+
+    let read_through = match (cursor.read_through.as_deref(), remote_read_through) {
+        (Some(local), Some(remote)) if later(remote, local) => Some(remote.to_string()),
+        (Some(local), _) => Some(local.to_string()),
+        (None, remote) => remote
+            .filter(|r| chrono::DateTime::parse_from_rfc3339(r).is_ok())
+            .map(str::to_string),
+    };
+
+    // Do NOT synthesize a water-mark from `updated_at`: an unset
+    // `read_through` means "no high-water-mark", which the record represents
+    // by omitting `readThrough` (None), not by back-dating it to flush time.
+    let mut record = ReadState::new(&cursor.feed_url, read_through, &cursor.updated_at);
+    record.id_type = Some(ReadState::ID_TYPE_GUID.to_string());
+    // Carried GUIDs are disjoint from local ones by construction (they have no
+    // local entry); filtered anyway, so the two sets can never overlap.
+    let local: HashSet<&String> = read_ids.iter().chain(&unread_ids).collect();
+    let carried = |ids: &[String]| -> Vec<String> {
+        ids.iter().filter(|g| !local.contains(g)).cloned().collect()
+    };
+    let (carry_read, carry_unread) = (carried(&carry.read), carried(&carry.unread));
+    record.read_ids = cap_merged(carry_read, read_ids, ReadState::MAX_IDS);
+    record.unread_ids = cap_merged(carry_unread, unread_ids, ReadState::MAX_IDS);
     record
+}
+
+/// Fit carried remote GUIDs plus local GUIDs into `max`, dropping carried ones
+/// first — the oldest of them, as the remote record ordered them.
+///
+/// A carried GUID is one this instance cannot vouch for: no entry here has it,
+/// which is also what a GUID this instance once wrote and has since swept
+/// looks like. Local reads are what this instance knows; they go last, and
+/// only through the ordinary tail-keeping [`cap`].
+fn cap_merged(mut carried: Vec<String>, local: Vec<String>, max: usize) -> Vec<String> {
+    let over = (carried.len() + local.len()).saturating_sub(max);
+    if over > 0 && !carried.is_empty() {
+        let drop = over.min(carried.len());
+        warn!(
+            dropped = drop,
+            kept = carried.len() - drop,
+            "read-state record over the lexicon cap; dropping the oldest remote GUIDs with no local entry"
+        );
+        carried.drain(0..drop);
+    }
+    carried.extend(cap(local, max));
+    carried
 }
 
 /// Parse a stored JSON id-array into `Vec<String>`, tolerating both string and
@@ -450,6 +802,17 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 pub(crate) mod tests {
     use super::*;
 
+    /// [`build_record`] for a cursor whose ids are their own GUIDs, with no
+    /// remote record — the shape the pre-#246 unit tests assert on.
+    fn record_of(cursor: &ReadCursor) -> ReadState {
+        let guids = parse_id_array(&cursor.read_ids)
+            .into_iter()
+            .chain(parse_id_array(&cursor.unread_ids))
+            .filter_map(|s| Some((s.parse().ok()?, s)))
+            .collect();
+        build_record(cursor, &guids, None, &Carry::default())
+    }
+
     #[test]
     fn rkey_is_stable_and_valid() {
         let a = read_state_rkey("https://example.com/feed.xml");
@@ -493,7 +856,7 @@ pub(crate) mod tests {
             pds_created: false,
             updated_at: "2026-07-12T00:00:00Z".into(),
         };
-        let rec = read_state_record(&cursor);
+        let rec = record_of(&cursor);
         assert_eq!(
             rec.read_ids.len(),
             ReadState::MAX_IDS,
@@ -518,7 +881,7 @@ pub(crate) mod tests {
             pds_created: false,
             updated_at: "2026-07-12T01:00:00Z".into(),
         };
-        let rec = read_state_record(&cursor);
+        let rec = record_of(&cursor);
         assert_eq!(rec.feed_url, "https://example.com/feed.xml");
         assert_eq!(rec.read_through.as_deref(), Some("2026-07-12T00:00:00Z"));
         assert_eq!(rec.read_ids, vec!["10", "11"]);
@@ -540,7 +903,7 @@ pub(crate) mod tests {
             pds_created: false,
             updated_at: "2026-07-12T01:00:00Z".into(),
         };
-        let rec = read_state_record(&cursor);
+        let rec = record_of(&cursor);
         assert_eq!(
             rec.read_through, None,
             "no local water-mark => readThrough absent (backlog not implicitly read)"
@@ -564,7 +927,7 @@ pub(crate) mod tests {
             pds_created: false,
             updated_at: "2026-07-12T01:00:00Z".into(),
         };
-        let rec = read_state_record(&cursor);
+        let rec = record_of(&cursor);
         assert_eq!(rec.read_through.as_deref(), Some("2026-07-11T00:00:00Z"));
     }
     #[test]
@@ -582,7 +945,7 @@ pub(crate) mod tests {
             pds_created: false,
             updated_at: "2026-07-12T02:00:00Z".into(),
         };
-        let rec = read_state_record(&cursor);
+        let rec = record_of(&cursor);
         assert_eq!(rec.read_through, None);
         assert_eq!(rec.read_ids, vec!["100", "101", "102"]);
         let json = serde_json::to_value(&rec).expect("serialize");
@@ -636,6 +999,10 @@ pub(crate) mod tests {
         partial_then_503: Option<usize>,
         /// Answer every listRecords with a 503.
         list_fails: bool,
+        /// Answer the next N listing WALKS with a 503 — the pre-write listing
+        /// failing, so the flush falls back to its stored `pds_created` flags
+        /// and the #241 reconcile is what corrects them.
+        pub(crate) fail_lists: usize,
         /// Drop the connection, unanswered, on this applyWrites call (1-based)
         /// — a transport failure after the earlier calls committed.
         pub(crate) drop_call: Option<usize>,
@@ -648,6 +1015,18 @@ pub(crate) mod tests {
     };
 
     impl FakeRepo {
+        /// Whether this listRecords request is answered with a 503.
+        fn list_refused(&mut self, cursor: Option<&str>) -> bool {
+            if self.list_fails {
+                return true;
+            }
+            if cursor.is_none() && self.fail_lists > 0 {
+                self.fail_lists -= 1;
+                return true;
+            }
+            false
+        }
+
         fn op(w: &serde_json::Value) -> (String, String, serde_json::Value) {
             // The sidecar spells the action out; XRPC tags the union member.
             let action = w["action"].as_str().map(str::to_string).unwrap_or_else(|| {
@@ -777,7 +1156,7 @@ pub(crate) mod tests {
                                     req["limit"].as_u64().map(|l| l as usize),
                                     req["cursor"].as_str(),
                                 );
-                                if fake.list_fails {
+                                if fake.list_refused(req["cursor"].as_str()) {
                                     return reply(
                                         503,
                                         serde_json::json!({ "ok": false, "error": "PartitionUnavailable", "status": 503 }),
@@ -815,7 +1194,7 @@ pub(crate) mod tests {
                             query.get("limit").and_then(|l| l.parse().ok()),
                             query.get("cursor").map(String::as_str),
                         );
-                        if fake.list_fails {
+                        if fake.list_refused(query.get("cursor").map(String::as_str)) {
                             return reply(503, serde_json::json!({ "error": "PartitionUnavailable" }));
                         }
                         reply(200, page)
@@ -903,31 +1282,109 @@ pub(crate) mod tests {
         format!("https://f{i}.example/feed.xml")
     }
 
-    /// A dirty cursor for feed `i`, as a mark-read leaves it. `updated_at`
-    /// differs per call so the conditional dirty-clear sees a new snapshot.
-    pub(crate) async fn mark_read(state: &AppState, i: usize, id: &str) {
-        static TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        store::upsert_cursor(
+    /// Feed `i` holds an entry with `guid`, published at `published`, and
+    /// [`DID`] subscribes to the feed. Returns the entry's LOCAL row id.
+    pub(crate) async fn entry_at(state: &AppState, i: usize, guid: &str, published: &str) -> i64 {
+        let feed_id = store::upsert_feed(
             &state.db,
-            &ReadCursor {
-                did: DID.into(),
-                feed_url: feed(i),
-                read_through: None,
-                read_ids: format!("[\"{id}\"]"),
-                unread_ids: "[]".into(),
-                dirty: true,
-                pds_created: false,
-                updated_at: format!(
-                    "2026-10-04T{:02}:{:02}:{:02}Z",
-                    tick / 3600 % 24,
-                    tick / 60 % 60,
-                    tick % 60
-                ),
+            &store::NewFeed {
+                url: feed(i),
+                ..Default::default()
             },
         )
         .await
         .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[store::NewEntry {
+                guid: guid.into(),
+                published: Some(published.into()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(DID)
+            .bind(feed_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2")
+            .bind(feed_id)
+            .bind(guid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn entry(state: &AppState, i: usize, guid: &str) -> i64 {
+        entry_at(state, i, guid, "2026-01-01T00:00:00Z").await
+    }
+
+    /// The reader marks the entry `guid` of feed `i` read here, through the
+    /// real mark-read path: `entry_state`, projected into a dirty cursor.
+    pub(crate) async fn mark_read(state: &AppState, i: usize, guid: &str) -> i64 {
+        let id = entry(state, i, guid).await;
+        assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+        id
+    }
+
+    /// Whether [`DID`] has entry `id` read locally — `entry_state`, which is
+    /// what every local view reads.
+    async fn is_read(state: &AppState, id: i64) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE((SELECT read FROM entry_state WHERE did = ?1 AND entry_id = ?2), 0)",
+        )
+        .bind(DID)
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+            == 1
+    }
+
+    /// Put `record` (raw JSON, as any client could have written it) in the
+    /// fake repo at feed `i`'s rkey.
+    fn put_remote(fake: &Arc<Mutex<FakeRepo>>, i: usize, record: serde_json::Value) {
+        fake.lock()
+            .unwrap()
+            .records
+            .insert(read_state_rkey(&feed(i)), record);
+    }
+
+    /// A `readState` record another client wrote, in the GUID format.
+    fn remote_guid_record(
+        i: usize,
+        read: &[&str],
+        unread: &[&str],
+        updated_at: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "$type": crate::lexicon::nsid::READ_STATE,
+            "feedUrl": feed(i),
+            "idType": "guid",
+            "readIds": read,
+            "unreadIds": unread,
+            "updatedAt": updated_at,
+        })
+    }
+
+    fn pds_record(fake: &Arc<Mutex<FakeRepo>>, i: usize) -> serde_json::Value {
+        fake.lock().unwrap().records[&read_state_rkey(&feed(i))].clone()
+    }
+
+    fn id_set(record: &serde_json::Value, field: &str) -> std::collections::BTreeSet<String> {
+        record[field]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    fn set_of(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 
     /// A record already in the fake repo for feed `i`, from some earlier flush.
@@ -957,6 +1414,10 @@ pub(crate) mod tests {
     /// false and every later flush sends `#create` at an rkey that exists. Before
     /// the fix that batch failed forever and took the DID's whole read-state
     /// sync with it.
+    ///
+    /// Since #246 the pre-write listing corrects the flag before the write, so
+    /// this drives the case where that listing failed: the stored flag is
+    /// used, the write is refused, and the reconcile converges it.
     #[tokio::test]
     async fn a_lost_create_response_converges_on_the_next_flush() {
         for backend in BACKENDS {
@@ -964,6 +1425,7 @@ pub(crate) mod tests {
             let state = state_on(backend, &fake).await;
             existing(&fake, 1);
             mark_read(&state, 1, "42").await;
+            fake.lock().unwrap().fail_lists = 1;
 
             flush_did(&state, DID)
                 .await
@@ -980,8 +1442,8 @@ pub(crate) mod tests {
             {
                 let f = fake.lock().unwrap();
                 assert_eq!(
-                    f.list_walks, 1,
-                    "{backend:?}: expected exactly one reconcile"
+                    f.list_walks, 2,
+                    "{backend:?}: the failed pre-write listing, then exactly one reconcile"
                 );
                 assert_eq!(
                     f.apply_calls, 2,
@@ -989,11 +1451,12 @@ pub(crate) mod tests {
                 );
             }
 
-            // Steady state again: the next flush is a plain update, no listing.
+            // Steady state again: the next flush lists once (#246) and is a
+            // plain update — no reconcile.
             mark_read(&state, 1, "43").await;
             flush_did(&state, DID).await.expect("steady-state flush");
             let f = fake.lock().unwrap();
-            assert_eq!(f.list_walks, 1, "{backend:?}: a healthy flush reconciled");
+            assert_eq!(f.list_walks, 3, "{backend:?}: a healthy flush reconciled");
             assert_eq!(f.apply_calls, 3, "{backend:?}");
         }
     }
@@ -1012,6 +1475,9 @@ pub(crate) mod tests {
             for i in [3, 77, 149] {
                 mark_read(&state, i, "7").await;
             }
+            // The pre-write listing (#246) would set the flags itself; this
+            // drives the reconcile that covers its failure.
+            fake.lock().unwrap().fail_lists = 1;
 
             flush_did(&state, DID)
                 .await
@@ -1030,7 +1496,7 @@ pub(crate) mod tests {
                 );
             }
             let f = fake.lock().unwrap();
-            assert_eq!(f.list_walks, 1, "{backend:?}");
+            assert_eq!(f.list_walks, 2, "{backend:?}");
             assert_eq!(f.apply_calls, 2, "{backend:?}");
             assert_eq!(
                 f.records.len(),
@@ -1052,6 +1518,7 @@ pub(crate) mod tests {
             store::mark_cursor_pds_created(&state.db, DID, &feed(1))
                 .await
                 .unwrap();
+            fake.lock().unwrap().fail_lists = 1;
 
             flush_did(&state, DID)
                 .await
@@ -1065,7 +1532,7 @@ pub(crate) mod tests {
                 "{backend:?}"
             );
             let f = fake.lock().unwrap();
-            assert_eq!((f.list_walks, f.apply_calls), (1, 2), "{backend:?}");
+            assert_eq!((f.list_walks, f.apply_calls), (2, 2), "{backend:?}");
         }
     }
 
@@ -1086,7 +1553,13 @@ pub(crate) mod tests {
             store::mark_cursor_pds_created(&state.db, DID, &feed(4))
                 .await
                 .unwrap();
-            fake.lock().unwrap().partial_then_503 = Some(2);
+            {
+                let mut f = fake.lock().unwrap();
+                f.partial_then_503 = Some(2);
+                // Both flushes' pre-write listings fail, so the stale flags
+                // are what is sent and the reconcile is what converges.
+                f.fail_lists = 2;
+            }
 
             flush_did(&state, DID)
                 .await
@@ -1094,7 +1567,7 @@ pub(crate) mod tests {
             {
                 let f = fake.lock().unwrap();
                 assert_eq!(
-                    f.list_walks, 0,
+                    f.list_walks, 1,
                     "{backend:?}: a 503 is not a mismatch and must not reconcile"
                 );
                 assert_eq!(f.records.len(), 2, "{backend:?}: fixture");
@@ -1113,7 +1586,7 @@ pub(crate) mod tests {
                 );
             }
             let f = fake.lock().unwrap();
-            assert_eq!(f.list_walks, 1, "{backend:?}");
+            assert_eq!(f.list_walks, 3, "{backend:?}");
             assert_eq!(f.apply_calls, 3, "{backend:?}: 503, mismatch, retry");
         }
     }
@@ -1149,7 +1622,12 @@ pub(crate) mod tests {
                 // something to fix — what is under test is that it is not tried.
                 existing(&fake, 1);
                 mark_read(&state, 1, "1").await;
-                fake.lock().unwrap().always_fail = Some(fail);
+                {
+                    let mut f = fake.lock().unwrap();
+                    f.always_fail = Some(fail);
+                    // Keep the stale flag: the pre-write listing would fix it.
+                    f.fail_lists = 1;
+                }
 
                 flush_did(&state, DID)
                     .await
@@ -1160,8 +1638,8 @@ pub(crate) mod tests {
                 assert!(!c.pds_created, "{backend:?} {fail:?}: the flag moved");
                 let f = fake.lock().unwrap();
                 assert_eq!(
-                    f.list_walks, 0,
-                    "{backend:?} {fail:?}: reconciled an unrelated failure"
+                    f.list_walks, 1,
+                    "{backend:?} {fail:?}: reconciled an unrelated failure (only the pre-write listing)"
                 );
                 assert_eq!(
                     f.apply_calls, 1,
@@ -1182,7 +1660,11 @@ pub(crate) mod tests {
             let state = state_on(backend, &fake).await;
             existing(&fake, 1);
             mark_read(&state, 1, "1").await;
-            fake.lock().unwrap().always_fail = Some(MISMATCH);
+            {
+                let mut f = fake.lock().unwrap();
+                f.always_fail = Some(MISMATCH);
+                f.fail_lists = 1;
+            }
 
             let err = flush_did(&state, DID)
                 .await
@@ -1206,7 +1688,10 @@ pub(crate) mod tests {
                 "{backend:?}: the truth the listing found was not kept"
             );
             let f = fake.lock().unwrap();
-            assert_eq!(f.list_walks, 1, "{backend:?}: reconciled more than once");
+            assert_eq!(
+                f.list_walks, 2,
+                "{backend:?}: reconciled more than once (the first walk is the failed pre-write listing)"
+            );
             assert_eq!(f.apply_calls, 2, "{backend:?}: retried more than once");
         }
     }
@@ -1287,7 +1772,8 @@ pub(crate) mod tests {
             let c = cursor(&state, 1).await;
             assert!(c.dirty && !c.pds_created, "{backend:?}");
             let f = fake.lock().unwrap();
-            assert_eq!((f.list_walks, f.apply_calls), (1, 1), "{backend:?}");
+            // The pre-write listing and the reconcile's, both refused.
+            assert_eq!((f.list_walks, f.apply_calls), (2, 1), "{backend:?}");
         }
     }
 
@@ -1311,7 +1797,8 @@ pub(crate) mod tests {
             let c = cursor(&state, 1).await;
             assert!(c.dirty && !c.pds_created, "{backend:?}");
             let f = fake.lock().unwrap();
-            assert_eq!((f.list_walks, f.apply_calls), (1, 1), "{backend:?}");
+            // The pre-write listing, then the reconcile's.
+            assert_eq!((f.list_walks, f.apply_calls), (2, 1), "{backend:?}");
         }
     }
 
@@ -1370,7 +1857,8 @@ pub(crate) mod tests {
             {
                 let f = fake.lock().unwrap();
                 assert_eq!(f.records.len(), 200, "{backend:?}: fixture");
-                assert_eq!((f.list_walks, f.apply_calls), (0, 2), "{backend:?}");
+                // One pre-write listing; no reconcile.
+                assert_eq!((f.list_walks, f.apply_calls), (1, 2), "{backend:?}");
             }
 
             // A landed feed is read again: it must go as #update now — the
@@ -1385,15 +1873,15 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 read_ids_on_pds(&fake, landed[0]),
-                serde_json::json!(["2"]),
+                serde_json::json!(["1", "2"]),
                 "{backend:?}"
             );
             let f = fake.lock().unwrap();
             assert_eq!(f.records.len(), 250, "{backend:?}");
             assert_eq!(
                 (f.list_walks, f.apply_calls),
-                (0, 3),
-                "{backend:?}: 51 writes are one call, and nothing needed listing"
+                (2, 3),
+                "{backend:?}: 51 writes are one call, and nothing needed a reconcile"
             );
         }
     }
@@ -1414,6 +1902,7 @@ pub(crate) mod tests {
             for i in 0..250 {
                 mark_read(&state, i, "3").await;
             }
+            fake.lock().unwrap().fail_lists = 1;
 
             flush_did(&state, DID)
                 .await
@@ -1430,7 +1919,10 @@ pub(crate) mod tests {
             }
             let f = fake.lock().unwrap();
             assert_eq!(f.records.len(), 250, "{backend:?}");
-            assert_eq!(f.list_walks, 1, "{backend:?}: expected one reconcile");
+            assert_eq!(
+                f.list_walks, 2,
+                "{backend:?}: the failed pre-write listing, then one reconcile"
+            );
             assert_eq!(
                 f.apply_calls, 3,
                 "{backend:?}: call 1, call 2 refused, then one retry of the 50 left"
@@ -1503,7 +1995,11 @@ pub(crate) mod tests {
             }
             // Call 1 refused (mismatch), call 2 is the retry's first, call 3
             // the retry's second.
-            fake.lock().unwrap().drop_call = Some(3);
+            {
+                let mut f = fake.lock().unwrap();
+                f.drop_call = Some(3);
+                f.fail_lists = 1;
+            }
 
             let err = flush_did(&state, DID)
                 .await
@@ -1526,7 +2022,446 @@ pub(crate) mod tests {
                 assert!(c.dirty && !c.pds_created, "{backend:?}: feed {i}");
             }
             let f = fake.lock().unwrap();
-            assert_eq!((f.list_walks, f.apply_calls), (1, 3), "{backend:?}");
+            assert_eq!((f.list_walks, f.apply_calls), (2, 3), "{backend:?}");
+        }
+    }
+
+    // ── #246: read, merge, write ─────────────────────────────────────────────
+    //
+    // A flush used to write the local cursor over whatever the PDS held, and
+    // its ids were this instance's SQLite row ids. Now the ids are GUIDs and a
+    // flush lists the DID's records once, merges, and then writes.
+
+    /// **A fresh database against a PDS record with other reads.** The record
+    /// must end up holding the union, written as `#update` straight away. The
+    /// `pds_created` flag is learned from the listing, so it is not a failed
+    /// `#create` and then a reconcile.
+    #[tokio::test]
+    async fn a_fresh_database_merges_into_the_existing_record_as_an_update() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-remote"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "g-local").await;
+            assert!(!cursor(&state, 1).await.pds_created, "fixture: a fresh DB");
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(rec["idType"], "guid", "{backend:?}: {rec}");
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["g-local", "g-remote"]),
+                "{backend:?}: {rec}"
+            );
+            let c = cursor(&state, 1).await;
+            assert!(c.pds_created && !c.dirty, "{backend:?}");
+            let f = fake.lock().unwrap();
+            assert_eq!(
+                f.apply_calls, 1,
+                "{backend:?}: expected one #update, not #create then a retry"
+            );
+        }
+    }
+
+    /// **Another client's reads between two flushes survive the second.**
+    #[tokio::test]
+    async fn another_clients_reads_between_flushes_survive() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            mark_read(&state, 1, "g1").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g1"]),
+                "{backend:?}"
+            );
+
+            // Another client adds a read to the same record.
+            {
+                let mut f = fake.lock().unwrap();
+                let rec = f.records.get_mut(&read_state_rkey(&feed(1))).unwrap();
+                rec["readIds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push("g-other".into());
+                rec["updatedAt"] = "2099-01-01T00:00:00Z".into();
+            }
+
+            mark_read(&state, 1, "g2").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g1", "g2", "g-other"]),
+                "{backend:?}: another client's read was overwritten"
+            );
+        }
+    }
+
+    /// **A remote GUID with no local entry is carried, not dropped.** Not
+    /// stored locally (there is nothing to store it against), but written
+    /// back: dropping it erases another instance's read.
+    #[tokio::test]
+    async fn a_remote_guid_with_no_local_entry_survives_a_write() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(
+                    1,
+                    &["elsewhere-read"],
+                    &["elsewhere-unread"],
+                    "2026-01-01T00:00:00Z",
+                ),
+            );
+            mark_read(&state, 1, "g1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["g1", "elsewhere-read"]),
+                "{backend:?}: {rec}"
+            );
+            assert_eq!(
+                id_set(&rec, "unreadIds"),
+                set_of(&["elsewhere-unread"]),
+                "{backend:?}: {rec}"
+            );
+            let known: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE guid LIKE 'elsewhere-%'")
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(known, 0, "{backend:?}: fixture");
+        }
+    }
+
+    /// **Remote reads of entries this instance has are imported** into
+    /// `entry_state`, which is what the reader sees. And it converges: a second
+    /// flush with no new local reads writes nothing at all.
+    #[tokio::test]
+    async fn remote_reads_of_local_entries_are_imported_and_converge() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let a = entry(&state, 1, "g-a").await;
+            let b = entry(&state, 1, "g-b").await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-a", "g-b"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "g-c").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, a).await && is_read(&state, b).await,
+                "{backend:?}: not imported"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g-a", "g-b", "g-c"]),
+                "{backend:?}"
+            );
+            assert!(
+                !cursor(&state, 1).await.dirty,
+                "{backend:?}: the import left the cursor dirty"
+            );
+
+            let before = {
+                let f = fake.lock().unwrap();
+                (f.list_walks, f.apply_calls)
+            };
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            let f = fake.lock().unwrap();
+            assert_eq!(
+                (f.list_walks, f.apply_calls),
+                before,
+                "{backend:?}: the import did not converge"
+            );
+        }
+    }
+
+    /// **A CLEAN feed imports too**, from the listing a flush of another feed
+    /// already made, without being dirtied — so without a write of its own.
+    #[tokio::test]
+    async fn a_clean_feed_imports_newer_remote_reads_without_being_written() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            mark_read(&state, 1, "g1").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(!cursor(&state, 1).await.dirty, "fixture");
+
+            // Another client reads an entry of feed 1 that this instance has.
+            let other = entry(&state, 1, "g-other").await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g1", "g-other"], &[], "2099-01-01T00:00:00Z"),
+            );
+            let before = pds_record(&fake, 1);
+
+            // A read in feed 2 is what makes this round flush.
+            mark_read(&state, 2, "g2").await;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, other).await,
+                "{backend:?}: the clean feed did not import"
+            );
+            assert!(
+                !cursor(&state, 1).await.dirty,
+                "{backend:?}: the import dirtied a clean cursor"
+            );
+            assert_eq!(
+                pds_record(&fake, 1),
+                before,
+                "{backend:?}: the clean feed was written"
+            );
+        }
+    }
+
+    /// **A legacy record — no `idType` — has instance-local row ids.** They
+    /// are ignored, never imported and never written back; its `readThrough`
+    /// is a timestamp and still merges.
+    #[tokio::test]
+    async fn a_legacy_records_ids_are_ignored_but_its_read_through_merges() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let a = entry(&state, 1, "g-a").await;
+            let b = entry(&state, 1, "g-b").await;
+            put_remote(
+                &fake,
+                1,
+                serde_json::json!({
+                    "$type": crate::lexicon::nsid::READ_STATE,
+                    "feedUrl": feed(1),
+                    "readThrough": "2026-05-01T00:00:00Z",
+                    "readIds": [a.to_string(), b.to_string()],
+                    "updatedAt": "2099-01-01T00:00:00Z",
+                }),
+            );
+            mark_read(&state, 1, "g-c").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                !is_read(&state, a).await && !is_read(&state, b).await,
+                "{backend:?}: legacy ids imported"
+            );
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["g-c"]),
+                "{backend:?}: {rec}"
+            );
+            assert_eq!(
+                rec["readThrough"], "2026-05-01T00:00:00Z",
+                "{backend:?}: {rec}"
+            );
+            assert_eq!(rec["idType"], "guid", "{backend:?}: {rec}");
+        }
+    }
+
+    /// **An all-digit GUID in a GUID record is a GUID**, not a row id.
+    #[tokio::test]
+    async fn an_all_digit_guid_is_honoured() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let digits = entry(&state, 1, "12345").await;
+            assert_ne!(
+                digits, 12345,
+                "fixture: the GUID must not be its own row id"
+            );
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["12345", "67890"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "g1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, digits).await,
+                "{backend:?}: the all-digit GUID was not imported"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g1", "12345", "67890"]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **Read on one side, unread on the other: the newer `updatedAt` wins**,
+    /// in both directions and for both states.
+    #[tokio::test]
+    async fn a_read_unread_conflict_goes_to_the_newer_side() {
+        const NEWER: &str = "2099-01-01T00:00:00Z";
+        const OLDER: &str = "2000-01-01T00:00:00Z";
+        for backend in BACKENDS {
+            // (local read?, remote updatedAt) → expected final read state.
+            for (local_read, remote_at, want_read) in [
+                (false, NEWER, true),
+                (false, OLDER, false),
+                (true, NEWER, false),
+                (true, OLDER, true),
+            ] {
+                let fake = Arc::new(Mutex::new(FakeRepo::default()));
+                let state = state_on(backend, &fake).await;
+                let x = mark_read(&state, 1, "x").await;
+                if !local_read {
+                    store::mark_read(&state.db, DID, x, false).await.unwrap();
+                }
+                let remote = if local_read {
+                    remote_guid_record(1, &[], &["x"], remote_at)
+                } else {
+                    remote_guid_record(1, &["x"], &[], remote_at)
+                };
+                put_remote(&fake, 1, remote);
+
+                flush_did(&state, DID)
+                    .await
+                    .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+                let case = format!("{backend:?}: local read={local_read}, remote at {remote_at}");
+                assert_eq!(is_read(&state, x).await, want_read, "{case}: local state");
+                let rec = pds_record(&fake, 1);
+                let (yes, no) = if want_read {
+                    ("readIds", "unreadIds")
+                } else {
+                    ("unreadIds", "readIds")
+                };
+                assert!(id_set(&rec, yes).contains("x"), "{case}: {rec}");
+                assert!(!id_set(&rec, no).contains("x"), "{case}: {rec}");
+            }
+        }
+    }
+
+    /// **The record stays inside the lexicon's bound, and what goes first is
+    /// what this instance cannot vouch for:** remote GUIDs it has no entry for.
+    #[tokio::test]
+    async fn at_the_cap_unresolved_remote_guids_are_dropped_first() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Sidecar, &fake).await;
+        let remote: Vec<String> = (0..ReadState::MAX_IDS)
+            .map(|i| format!("r-{i:04}"))
+            .collect();
+        let remote: Vec<&str> = remote.iter().map(String::as_str).collect();
+        put_remote(
+            &fake,
+            1,
+            remote_guid_record(1, &remote, &[], "2026-01-01T00:00:00Z"),
+        );
+        // Dated in the future, so compaction cannot fold them away... and one
+        // older unread entry keeps the water-mark from passing them.
+        entry_at(&state, 1, "old-unread", "2025-01-01T00:00:00Z").await;
+        for i in 0..5 {
+            mark_read(&state, 1, &format!("l-{i}")).await;
+        }
+
+        flush_did(&state, DID).await.unwrap();
+
+        let ids = id_set(&pds_record(&fake, 1), "readIds");
+        assert_eq!(ids.len(), ReadState::MAX_IDS);
+        for i in 0..5 {
+            assert!(
+                ids.contains(&format!("l-{i}")),
+                "a local read was dropped before a remote GUID"
+            );
+        }
+        for i in 0..5 {
+            assert!(
+                !ids.contains(&format!("r-{i:04}")),
+                "the oldest remote GUIDs go first"
+            );
+        }
+    }
+
+    /// **Compaction still bounds the record**: past the threshold, local reads
+    /// fold into `readThrough`, and remote GUIDs are still carried beside it.
+    #[tokio::test]
+    async fn compaction_still_bounds_a_merged_record() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Sidecar, &fake).await;
+        put_remote(
+            &fake,
+            1,
+            remote_guid_record(1, &["elsewhere"], &[], "2026-01-01T00:00:00Z"),
+        );
+        for i in 0..COMPACT_READ_IDS_THRESHOLD + 10 {
+            let day = format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60);
+            let id = entry_at(&state, 1, &format!("l-{i:04}"), &day).await;
+            store::mark_read(&state.db, DID, id, true).await.unwrap();
+        }
+
+        flush_did(&state, DID).await.unwrap();
+
+        let rec = pds_record(&fake, 1);
+        assert!(
+            rec["readThrough"].is_string(),
+            "not compacted: {}",
+            rec["readThrough"]
+        );
+        assert_eq!(id_set(&rec, "readIds"), set_of(&["elsewhere"]));
+    }
+
+    /// **A listing that fails does not block the flush**: the local state is
+    /// written as it would have been before #246 — GUIDs, `idType` and all.
+    #[tokio::test]
+    async fn a_listing_failure_still_writes_local_state() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            fake.lock().unwrap().list_fails = true;
+            mark_read(&state, 1, "g1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["g1"]),
+                "{backend:?}: {rec}"
+            );
+            assert_eq!(rec["idType"], "guid", "{backend:?}: {rec}");
+            assert!(!cursor(&state, 1).await.dirty, "{backend:?}");
         }
     }
 }

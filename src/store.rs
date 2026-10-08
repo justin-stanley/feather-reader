@@ -3637,6 +3637,216 @@ pub async fn clear_cursor_dirty(
     Ok(())
 }
 
+/// Every cursor of `did` that is NOT dirty — the ones a flush round does not
+/// write, but whose PDS record another client may have moved on (#246).
+pub async fn clean_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCursor>> {
+    sqlx::query_as::<_, ReadCursor>("SELECT * FROM read_cursor WHERE did = ?1 AND dirty = 0")
+        .bind(did)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("clean_cursors failed for {did}"))
+}
+
+// ---------------------------------------------------------------------------
+// Read-state ids at the PDS boundary (#246)
+// ---------------------------------------------------------------------------
+//
+// Locally, `read_ids` / `unread_ids` hold `entries.id` row ids, and ~every read
+// query joins on them. A row id means nothing on another instance — or on a
+// fresh database of this one — so the `readState` record carries entry GUIDs
+// instead, and these two helpers translate at the boundary. Both are ONE
+// query over a `json_each` of the whole set, not one per id.
+
+/// The GUIDs of `ids` among `feed_url`'s entries. An id with no entry (swept by
+/// retention, or never on this feed) is simply absent from the map.
+pub async fn guids_for_entry_ids(
+    pool: &SqlitePool,
+    feed_url: &str,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = serde_json::to_string(ids).context("encoding entry ids")?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT e.id, e.guid
+        FROM json_each(?2) j
+        JOIN entries e ON e.id = j.value
+        JOIN feeds f ON f.id = e.feed_id
+        WHERE f.url = ?1
+        "#,
+    )
+    .bind(feed_url)
+    .bind(json)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("guids_for_entry_ids failed for {feed_url}"))?;
+    Ok(rows.into_iter().collect())
+}
+
+/// A local entry a remote GUID resolved to: its row id, and whether `did` has
+/// it read here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuidEntry {
+    pub id: i64,
+    pub read: bool,
+}
+
+/// Resolve `guids` against `feed_url`'s entries, with `did`'s read state for
+/// each. A GUID this instance has no entry for is absent from the map — the
+/// caller decides what an unresolved GUID means.
+///
+/// The GUIDs go in as a JSON array of STRINGS, so an all-digit GUID compares
+/// as text against `entries.guid` and can never be mistaken for a row id.
+pub async fn entries_for_guids(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    guids: &[String],
+) -> Result<std::collections::HashMap<String, GuidEntry>> {
+    if guids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = serde_json::to_string(guids).context("encoding guids")?;
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT e.guid, e.id, COALESCE(s.read, 0)
+        FROM json_each(?3) j
+        JOIN entries e ON e.guid = j.value
+        JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        WHERE f.url = ?2
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(json)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("entries_for_guids failed for {did}/{feed_url}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(guid, id, read)| {
+            (
+                guid,
+                GuidEntry {
+                    id,
+                    read: read == 1,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Apply read / unread state learned from the PDS to `did`'s entries on
+/// `feed_url`, and project it into the cursor — WITHOUT changing the cursor's
+/// `dirty` flag. Returns how many entries were written.
+///
+/// **`entry_state` is what is written**, because it is what every local view
+/// reads; `read_cursor` is a projection of it, kept in step here exactly as
+/// [`mark_read`] keeps it. Writing cursor ids alone would show nothing read.
+///
+/// **Why the flag is preserved.** An import is not a local change: what it
+/// brings in is already on the PDS. Dirtying a clean cursor would make the
+/// next round write the same reads straight back — a write per import, for
+/// nothing. A dirty cursor stays dirty, and is written this round anyway.
+/// `updated_at` does move, so the flusher re-reads the row before its
+/// conditional dirty-clear, and a later round does not re-import the same
+/// record (it is no longer newer than the cursor).
+///
+/// Authorized like [`mark_read`]: only entries of a feed `did` subscribes to
+/// (`sub_ref`) are touched. A cursor row that no longer exists is left alone.
+pub async fn import_remote_read_state(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    read: &[i64],
+    unread: &[i64],
+) -> Result<usize> {
+    if read.is_empty() && unread.is_empty() {
+        return Ok(0);
+    }
+    let now = now_rfc3339();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin import_remote_read_state tx")?;
+    let dirty: Option<bool> =
+        sqlx::query_scalar("SELECT dirty FROM read_cursor WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .fetch_optional(&mut *tx)
+            .await
+            .with_context(|| format!("import_remote_read_state: cursor for {did}/{feed_url}"))?;
+    let Some(dirty) = dirty else {
+        return Ok(0);
+    };
+
+    let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+    let mut written = 0;
+    for (ids, value) in [(read, true), (unread, false)] {
+        if ids.is_empty() {
+            continue;
+        }
+        let json = serde_json::to_string(ids).context("encoding entry ids")?;
+        let authorized: Vec<i64> = sqlx::query_scalar(
+            r#"
+            INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+            SELECT ?1, e.id, ?3, 0, ?4
+            FROM json_each(?5) j
+            JOIN entries e ON e.id = j.value
+            JOIN feeds f ON f.id = e.feed_id
+            WHERE f.url = ?2
+              AND EXISTS (
+                  SELECT 1 FROM sub_ref sr
+                  WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+              )
+            ON CONFLICT (did, entry_id) DO UPDATE SET
+                read       = excluded.read,
+                updated_at = excluded.updated_at
+            RETURNING entry_id
+            "#,
+        )
+        .bind(did)
+        .bind(feed_url)
+        .bind(value)
+        .bind(&now)
+        .bind(json)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("import_remote_read_state failed for {did}/{feed_url}"))?;
+        for id in &authorized {
+            read_ids = json_id_set_toggle(&read_ids, *id, value);
+            unread_ids = json_id_set_toggle(&unread_ids, *id, !value);
+        }
+        written += authorized.len();
+    }
+    if written > 0 {
+        write_cursor_sets(
+            &mut tx,
+            did,
+            feed_url,
+            read_through.as_deref(),
+            &read_ids,
+            &unread_ids,
+            &now,
+        )
+        .await?;
+        sqlx::query("UPDATE read_cursor SET dirty = ?3 WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .bind(dirty)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("import_remote_read_state: dirty for {did}/{feed_url}"))?;
+    }
+    tx.commit()
+        .await
+        .context("commit import_remote_read_state tx")?;
+    Ok(written)
+}
+
 // ---------------------------------------------------------------------------
 // Closed-beta invite gate (beta_access + invite_codes)
 // ---------------------------------------------------------------------------

@@ -14,6 +14,109 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Upgrade notes
+
+- **`readState` records change format (#246).** They now carry
+  `idType: "guid"` and entry GUIDs in `readIds` / `unreadIds`, instead of
+  this instance's SQLite row ids. Existing records are rewritten in the new
+  format on each feed's next flush; until then they are read as legacy (see
+  below). No local schema change: the database still keeps row ids.
+- **Each flush round with dirty read state lists the reader's `readState`
+  collection once** before writing — one more bounded repo walk per DID per
+  round that has something to write. Rounds with nothing dirty do not list.
+
+### Fixed
+
+- **A fresh or restored database, or another client, no longer has its read
+  state overwritten by the next flush (#246).** A flush wrote the local
+  `read_cursor` over whatever the PDS held, with `#update` replacing the whole
+  record. So a new instance, a rebuilt database, or another atproto reader
+  marking articles read in the same feed lost those reads the next time
+  FeatherReader flushed that feed, and the articles came back unread. Worse,
+  the ids in the record were `entries.id` row ids, meaningful only to the
+  database that wrote them: no other instance, and no fresh database of this
+  one, could have used them even if it had read them.
+
+  **The format.** `community.lexicon.rss.readState` gains `idType`. This is a
+  change to the user's own lexicon, which FeatherReader is the only known
+  writer of. FeatherReader writes `"guid"`, and the arrays hold `entries.guid`
+  values: the publisher's id, or FeatherReader's fixed-key SipHash stand-in
+  (`featherreader:synthetic:` / `featherreader:long-guid:`), or the `at://`
+  URI for standard.site documents. Each is the same on every instance. A
+  record without `idType` is **legacy**: its id arrays are ignored, never
+  imported and never written back. Its `readThrough` is a timestamp and still
+  merges. Row ids are translated to GUIDs only at the PDS boundary, in one
+  `json_each` query per feed, so an id whose entry was swept drops out.
+
+  **The merge.** `flush_did` lists the DID's records once, then for each
+  dirty cursor:
+  - **`pds_created` is set from the listing**, so a fresh database's first
+    flush is an `#update` rather than a refused `#create` and a reconcile.
+    The #241 reconcile stays as the fallback, for a failed listing or a
+    record created or deleted between the listing and the write.
+  - **Remote GUIDs this instance has an entry for are imported into
+    `entry_state`**, which is what every view reads, and projected into the
+    cursor as a mark-read is. Remote `readThrough` is not applied to local
+    entries: undated entries compare by `fetched_at`, which is
+    instance-local.
+  - **A conflict goes to the newer `updatedAt`.** A conflict is an entry
+    read on one side and explicitly unread on the other. The remote side's
+    time is its record's `updatedAt`, the local side's is the cursor's
+    `updated_at`, and a tie goes to local. Times are compared as parsed
+    instants, not strings.
+  - **Remote GUIDs with no local entry are carried into the written
+    record.** They are not stored locally. Dropping them was the core of
+    the bug: it erased reads made on another instance.
+  - **`readThrough` is the later of the two.**
+  - **Size.** Compaction still runs on the local cursor, after the import.
+    At `ReadState::MAX_IDS` the carried GUIDs go first, oldest first, and
+    that is logged. Then the existing tail-keeping cap applies.
+
+  Clean cursors import too: in the same listing, a clean feed whose record
+  is newer than its cursor imports that record's reads.
+  `store::import_remote_read_state` keeps the cursor's `dirty` flag, so an
+  import costs no write. The imported reads are already on the PDS, and
+  re-dirtying would write them straight back. Convergence is pinned: after a
+  merging flush, a second flush with no new local reads lists nothing and
+  writes nothing.
+
+  A listing that fails does not block the flush. It is logged, and the flush
+  writes local state alone, in the GUID format.
+
+  **Limits.** `applyWrites` has no per-record compare-and-swap here. A write
+  from another client between the listing and this write is lost until that
+  client's next flush, which reads and merges in turn if it is FeatherReader.
+  Clean feeds import only on rounds that list, which means rounds where the
+  DID has some dirty cursor. A carried GUID can't be told apart from one
+  this instance wrote and has since swept, so such GUIDs persist in the
+  record until the cap drops them.
+
+  Tests in `readstate::tests`, run against both repo backends:
+  - a fresh database merges into an existing record as one `#update`;
+  - another client's reads survive between two flushes;
+  - an unresolved remote GUID survives a write;
+  - remote reads are imported, and the import converges;
+  - a clean feed imports without being dirtied or written;
+  - a legacy record's ids are ignored but its `readThrough` merges;
+  - an all-digit GUID is treated as a GUID;
+  - a read/unread conflict goes to the newer side, in all four cases;
+  - unresolved GUIDs are dropped first at the cap;
+  - compaction still bounds a merged record;
+  - a listing failure still writes.
+
+  Each is red against the pre-change code. Mutations that each fail at least
+  one test: removing the merge, treating legacy ids as GUIDs, dropping the
+  carry, skipping the import, skipping the clean-feed import, letting an
+  import dirty a clean cursor, skipping `pds_created` from the listing,
+  flipping the conflict rule, and capping without dropping carried GUIDs
+  first.
+
+  The #241 reconcile tests now fail the pre-write listing on purpose, since
+  the listing would otherwise correct the flag before the write, and they
+  count it as one more walk.
+
 ## 0.4.8 — 2026-10-08
 
 A PDS that ends a listing early can no longer drop a reader's
