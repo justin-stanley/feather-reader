@@ -260,12 +260,13 @@ impl Repo<'_> {
             // This is the LIVE walk on `backend=rust` — its result reaches
             // `replace_sub_refs`, so a truncation here is revoked access.
             if !budget.admit(&page) {
-                anyhow::bail!(
-                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
-                     ({} held, {} bytes charged) — refusing to accumulate further",
-                    out.len(),
-                    budget.used(),
-                );
+                return Err(crate::atproto::ListingTooLarge::Bytes {
+                    collection: collection.to_string(),
+                    max_bytes,
+                    held: out.len(),
+                    charged: budget.used(),
+                }
+                .into());
             }
             crate::atproto::extend_bounded(&mut out, page, MAX_LIST_RECORDS, collection)?;
             match next {
@@ -326,11 +327,12 @@ impl Repo<'_> {
         // walks this too, one record per starred article, where 4 900 is a
         // plausible number for a real reader.
         if more_offered {
-            anyhow::bail!(
-                "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
-                 ({} held, and the PDS still offered more) — refusing a short list",
-                out.len(),
-            );
+            return Err(crate::atproto::ListingTooLarge::Pages {
+                collection: collection.to_string(),
+                pages: MAX_LIST_PAGES,
+                held: out.len(),
+            }
+            .into());
         }
         Ok(out)
     }
@@ -947,6 +949,11 @@ mod tests {
             msg.contains("2 held"),
             "the live walk did not accumulate across pages: {msg}"
         );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{msg}"
+        );
     }
 
     /// **The live walk refuses a short list.** Its result reaches
@@ -991,6 +998,11 @@ mod tests {
         assert!(
             format!("{err:#}").contains("did not finish"),
             "failed for the wrong reason: {err:#}"
+        );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{err:#}"
         );
     }
 

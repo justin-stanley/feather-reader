@@ -433,12 +433,13 @@ pub(crate) fn extend_bounded(
     collection: &str,
 ) -> Result<()> {
     if out.len() + page.len() > max {
-        anyhow::bail!(
-            "listRecords for {collection} exceeded the {max}-record cap \
-             ({} held, {} more offered) — refusing to accumulate further",
-            out.len(),
-            page.len(),
-        );
+        return Err(ListingTooLarge::Records {
+            collection: collection.to_string(),
+            max,
+            held: out.len(),
+            offered: page.len(),
+        }
+        .into());
     }
     out.extend(page);
     Ok(())
@@ -947,6 +948,89 @@ impl std::fmt::Display for MalformedRecords {
 
 impl std::error::Error for MalformedRecords {}
 
+/// **A `listRecords` answer arrived, and it is not a page** (#227).
+///
+/// Typed so a poller can file it by what the PDS sent rather than as "the
+/// request never produced a response", which is what a bare string fell
+/// through to. The texts are the ones the bare strings carried.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnreadableListing {
+    /// The body was empty, or had no `records` field: what a proxy makes of an
+    /// empty or unexpected upstream body. Absent is not empty.
+    #[error("listRecords returned no records field (empty or unexpected body)")]
+    NoRecords,
+    /// A 2xx carrying an atproto error envelope: the PDS said no, in the body
+    /// instead of the status.
+    #[error("PDS answered 2xx with an error envelope: {error}{}", .message.as_deref().map(|m| format!(" — {m}")).unwrap_or_default())]
+    ErrorEnvelope {
+        /// The envelope's `error` name.
+        error: String,
+        /// Its `message`, already truncated for a log line.
+        message: Option<String>,
+    },
+}
+
+/// **A walk refused to read further because the listing is too big** (#227):
+/// more pages, bytes or records than it allows. Refused rather than truncated,
+/// for the reason `extend_bounded` gives.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ListingTooLarge {
+    /// The page cap ran out with the PDS still offering a cursor.
+    #[error(
+        "listRecords for {collection} did not finish within {pages} pages \
+         ({held} held, and the PDS still offered more) — refusing a short list"
+    )]
+    Pages {
+        /// The collection being listed.
+        collection: String,
+        /// The walk's page cap.
+        pages: usize,
+        /// Records held when it ran out.
+        held: usize,
+    },
+    /// The walk's byte budget would be exceeded by the next page.
+    #[error(
+        "listRecords for {collection} exceeded the {max_bytes}-byte cap \
+         ({held} held, {charged} bytes charged) — refusing to accumulate further"
+    )]
+    Bytes {
+        /// The collection being listed.
+        collection: String,
+        /// The budget's ceiling.
+        max_bytes: usize,
+        /// Records held when it was refused.
+        held: usize,
+        /// Bytes charged to the budget so far.
+        charged: usize,
+    },
+    /// The byte budget ran out on pages that skipped malformed records.
+    #[error(
+        "listRecords for {collection} exceeded the {max_bytes}-byte cap on pages \
+         of malformed records — refusing to read further"
+    )]
+    MalformedBytes {
+        /// The collection being listed.
+        collection: String,
+        /// The budget's ceiling.
+        max_bytes: usize,
+    },
+    /// The record cap would be exceeded by the next page.
+    #[error(
+        "listRecords for {collection} exceeded the {max}-record cap \
+         ({held} held, {offered} more offered) — refusing to accumulate further"
+    )]
+    Records {
+        /// The collection being listed.
+        collection: String,
+        /// The record cap.
+        max: usize,
+        /// Records held.
+        held: usize,
+        /// Records the refused page offered.
+        offered: usize,
+    },
+}
+
 /// The `com.atproto.repo.createRecord` / `putRecord` response (a strong ref to
 /// the written record).
 #[derive(Debug, Clone, Deserialize)]
@@ -1196,10 +1280,11 @@ impl PdsClient {
                         .max(page.records.iter().map(approx_bytes).sum()),
                 )
             {
-                anyhow::bail!(
-                    "listRecords for {collection} exceeded the {max_bytes}-byte cap on pages \
-                     of malformed records — refusing to read further"
-                );
+                return Err(ListingTooLarge::MalformedBytes {
+                    collection: collection.to_string(),
+                    max_bytes,
+                }
+                .into());
             }
             malformed += page.malformed;
             // Skipped records count toward "the page had something", so a page
@@ -1212,12 +1297,13 @@ impl PdsClient {
             // size above, which covers its good records too; charging them again
             // failed walks that fit (found in review).
             if page.malformed == 0 && !budget.admit(&page.records) {
-                anyhow::bail!(
-                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
-                     ({} held, {} bytes charged) — refusing to accumulate further",
-                    out.len(),
-                    budget.used(),
-                );
+                return Err(ListingTooLarge::Bytes {
+                    collection: collection.to_string(),
+                    max_bytes,
+                    held: out.len(),
+                    charged: budget.used(),
+                }
+                .into());
             }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
@@ -1272,11 +1358,12 @@ impl PdsClient {
         // records. The direction is safe and the alternative is deleting feeds,
         // but it is a false refusal and not a clean boundary.
         if more_offered {
-            anyhow::bail!(
-                "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
-                 ({} held, and the PDS still offered more) — refusing a short list",
-                out.len(),
-            );
+            return Err(ListingTooLarge::Pages {
+                collection: collection.to_string(),
+                pages: MAX_LIST_PAGES,
+                held: out.len(),
+            }
+            .into());
         }
         Ok((out, malformed))
     }
@@ -1998,7 +2085,7 @@ impl SidecarClient {
             anyhow::bail!("the sidecar answered 2xx with an error envelope: {name}");
         }
         let Some(data) = envelope.data else {
-            anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
+            return Err(UnreadableListing::NoRecords.into());
         };
         page_from_body(data).context("parsing sidecar listRecords data")
     }
@@ -2035,12 +2122,13 @@ impl SidecarClient {
             // remote-controlled as the direct client's. It carried no budget at
             // all until a review noticed it was the default backend.
             if !budget.admit(&page.records) {
-                anyhow::bail!(
-                    "listRecords for {collection} exceeded the {max_bytes}-byte cap \
-                     ({} held, {} bytes charged) — refusing to accumulate further",
-                    out.len(),
-                    budget.used(),
-                );
+                return Err(ListingTooLarge::Bytes {
+                    collection: collection.to_string(),
+                    max_bytes,
+                    held: out.len(),
+                    charged: budget.used(),
+                }
+                .into());
             }
             extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
             match page.cursor {
@@ -2092,11 +2180,12 @@ impl SidecarClient {
         // records. The direction is safe and the alternative is deleting feeds,
         // but it is a false refusal and not a clean boundary.
         if more_offered {
-            anyhow::bail!(
-                "listRecords for {collection} did not finish within {MAX_LIST_PAGES} pages \
-                 ({} held, and the PDS still offered more) — refusing a short list",
-                out.len(),
-            );
+            return Err(ListingTooLarge::Pages {
+                collection: collection.to_string(),
+                pages: MAX_LIST_PAGES,
+                held: out.len(),
+            }
+            .into());
         }
         Ok(out)
     }
@@ -3139,7 +3228,7 @@ pub(crate) fn parse_list_records(body: &[u8]) -> Result<ListRecordsResponse> {
     // outside the tests matches on the text, and `resolve_subscriptions` fails
     // closed on any `Err`. It is for whoever reads the log.
     if body.is_empty() {
-        anyhow::bail!("listRecords returned no records field (empty or unexpected body)");
+        return Err(UnreadableListing::NoRecords.into());
     }
     refuse_a_structure_explosion(body, "the listRecords body")?;
     let parsed: ListRecordsBody =
@@ -3161,13 +3250,10 @@ fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
             .message
             .as_ref()
             .and_then(Value::as_str)
-            .map(|m| format!(" — {}", truncate_for_message(m)))
-            .unwrap_or_default();
-        anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}");
+            .map(truncate_for_message);
+        return Err(UnreadableListing::ErrorEnvelope { error, message }.into());
     }
-    let entries = parsed.records.ok_or_else(|| {
-        anyhow::anyhow!("listRecords returned no records field (empty or unexpected body)")
-    })?;
+    let entries = parsed.records.ok_or(UnreadableListing::NoRecords)?;
     let mut records = Vec::with_capacity(entries.len());
     let mut malformed = 0;
     for entry in entries {
@@ -3343,9 +3429,8 @@ pub(crate) fn reject_error_envelope(value: &Value) -> Result<()> {
     let message = value
         .get("message")
         .and_then(Value::as_str)
-        .map(|m| format!(" — {}", truncate_for_message(m)))
-        .unwrap_or_default();
-    anyhow::bail!("PDS answered 2xx with an error envelope: {error}{message}")
+        .map(truncate_for_message);
+    Err(UnreadableListing::ErrorEnvelope { error, message }.into())
 }
 
 /// The name in an `error` field, or `None` when the field does not denote one.
@@ -3739,9 +3824,26 @@ pub(crate) mod tests {
         let err =
             parse_list_records(br#"{}"#).expect_err("`{}` was read as a page of zero records");
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Parse,
+            "{err:#}"
+        );
         let err = parse_list_records(br#"{"cursor":"c"}"#)
             .expect_err("a cursor-only body was read as a page");
         assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Parse,
+            "{err:#}"
+        );
+        // #227: an empty body is the same refusal, and files the same way.
+        let err = parse_list_records(b"").expect_err("an empty body was read as a page");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Parse,
+            "{err:#}"
+        );
         let page = parse_list_records(br#"{"records":[]}"#).unwrap();
         assert!(page.records.is_empty());
     }
@@ -3843,18 +3945,27 @@ pub(crate) mod tests {
     /// unexpected upstream body.
     #[tokio::test]
     async fn the_sidecar_client_refuses_a_data_object_without_records() {
-        let base = crate::net::tests::serve_body(br#"{"ok":true,"data":{}}"#.to_vec()).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_records(
-                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                "app.feather.subscription",
-                None,
-                None,
-            )
-            .await
-            .expect_err("`data: {}` was read as an empty repo");
-        assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+        // `data: {}` reaches `page_from_body`; no `data` at all is refused
+        // before it, by the sidecar client itself. Both are the same refusal.
+        for body in [&br#"{"ok":true,"data":{}}"#[..], &br#"{"ok":true}"#[..]] {
+            let base = crate::net::tests::serve_body(body.to_vec()).await;
+            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
+            let err = client
+                .list_records(
+                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                    "app.feather.subscription",
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a data object without records was read as an empty repo");
+            assert!(format!("{err:#}").contains("no records field"), "{err:#}");
+            assert_eq!(
+                crate::feed::publication_failure_kind(&err),
+                crate::feed::FailureKind::Parse,
+                "{err:#}"
+            );
+        }
     }
 
     /// An exactly-full final page dropped nothing, so it must not warn that it
@@ -4004,6 +4115,11 @@ pub(crate) mod tests {
         let envelope = serde_json::json!({"error": "InvalidRequest", "message": "bad cursor"});
         let err = reject_error_envelope(&envelope).expect_err("an envelope passed as data");
         assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Status,
+            "{err:#}"
+        );
         // A real page, and an empty real page, are both data.
         reject_error_envelope(&serde_json::json!({"records": []})).expect("an empty page is data");
         reject_error_envelope(&serde_json::json!({"records": [], "cursor": "c"})).unwrap();
@@ -4019,6 +4135,12 @@ pub(crate) mod tests {
         let err = parse_list_records(br#"{"error":"InvalidRequest","message":"bad cursor"}"#)
             .expect_err("an error envelope parsed as a page");
         assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
+        // #227: an error said on a 200 is the PDS answering no, as a 400 is.
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Status,
+            "{err:#}"
+        );
         let page = parse_list_records(br#"{"records":[]}"#).expect("an empty page is a page");
         assert!(page.records.is_empty() && page.cursor.is_none());
     }
@@ -5309,17 +5431,28 @@ pub(crate) mod tests {
         // Control: without the malformed records the walk is refused.
         let (base, _) = host_for(pages(false), "retained-control.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
-        client
+        let err = client
             .list_all_records_skipping_within("c", &mut ByteBudget::new(BUDGET))
             .await
             .expect_err("control: the clean pages fit a budget they exceed");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{err:#}"
+        );
 
         let (base, _) = host_for(pages(true), "retained-skipping.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
-        client
+        let err = client
             .list_all_records_skipping_within("c", &mut ByteBudget::new(BUDGET))
             .await
             .expect_err("one malformed record per page bought pages the budget refuses");
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{err:#}"
+        );
 
         // The documents walk, with pages that each FIT the remaining budget
         // but together exceed it: only charging what the kept records retain
@@ -5456,6 +5589,11 @@ pub(crate) mod tests {
             msg.contains("2 held"),
             "the walk did not keep exactly the two pages that fit: {msg}"
         );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -5552,6 +5690,11 @@ pub(crate) mod tests {
         assert!(
             msg.contains("did not finish"),
             "failed for the wrong reason: {msg}"
+        );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{msg}"
         );
     }
 
@@ -5775,6 +5918,11 @@ pub(crate) mod tests {
             format!("{err:#}").contains("did not finish"),
             "failed for the wrong reason: {err:#}"
         );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{err:#}"
+        );
     }
 
     /// **A budget passed to two walks is spent by both of them.**
@@ -5886,6 +6034,11 @@ pub(crate) mod tests {
         assert!(
             msg.contains("2 held"),
             "did not accumulate across pages: {msg}"
+        );
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{msg}"
         );
     }
 
@@ -6433,6 +6586,11 @@ pub(crate) mod tests {
             .expect_err("a page past the cap was accepted");
         let msg = format!("{err:#}");
         assert!(msg.contains("100"), "the cap is not named: {msg}");
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Body,
+            "{msg}"
+        );
         assert_eq!(
             out.len(),
             90,
