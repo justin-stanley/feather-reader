@@ -788,11 +788,16 @@ pub(crate) async fn fetch_repo_capped(
                     records,
                     complete: documents.complete && !capped[i],
                     malformed: documents.malformed,
+                    out_of_budget: documents.out_of_budget,
                 };
                 let mut read = read_from(publication, &site, walk, orphaned);
-                // Its own cap is its own limit; only the shared walk's end is
-                // the group's doing, and only when there was a group.
-                read.cut_short_by_group = grouped && !documents.complete && !capped[i];
+                // Its own cap is its own limit; only the shared walk running
+                // out of BYTES is the group's doing, and only when there was a
+                // group. The page limit, a repeated cursor and the combined
+                // record cap stop a read alone at the same place, so a re-read
+                // there is a full walk of the repo that gains nothing (review
+                // of #281).
+                read.cut_short_by_group = grouped && documents.out_of_budget && !capped[i];
                 Ok(read)
             }
         })
@@ -912,6 +917,7 @@ pub(crate) mod tests {
                 records: Vec::new(),
                 complete,
                 malformed: 0,
+                out_of_budget: false,
             };
             let read = read_from(publication.clone(), "at://d/c/r", walk, 0);
             assert_eq!(
@@ -2255,6 +2261,140 @@ pub(crate) mod tests {
             ),
             (0, false, true),
             "the quiet publication's group read was not flagged as cut short by its group"
+        );
+    }
+
+    /// **Only running out of bytes is the group's doing** (review of #281).
+    /// A group walk that stops at the combined record cap (`per_site_cap` x
+    /// members), the page limit or a repeated cursor stops a read alone at
+    /// the same place, so flagging it re-walked the whole repo once per member
+    /// on every poll for nothing. Here the walk reaches the combined cap at a
+    /// page boundary, before either member sees a record past its own cap.
+    #[tokio::test]
+    async fn a_walk_that_stops_at_the_combined_cap_flags_no_one() {
+        let mut records = vec![
+            (
+                nsid::STANDARD_PUBLICATION,
+                "alpha",
+                json!({ "name": "Alpha", "url": "https://a.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "beta",
+                json!({ "name": "Beta", "url": "https://b.example" }),
+            ),
+            (
+                nsid::STANDARD_PUBLICATION,
+                "other",
+                json!({ "name": "Other", "url": "https://o.example" }),
+            ),
+            (
+                nsid::STANDARD_DOCUMENT,
+                "3l2capaaaaa00",
+                shared_doc("alpha", "a1", "2026-07-11T00:00:00Z"),
+            ),
+            (
+                nsid::STANDARD_DOCUMENT,
+                "3l2capaaaaa01",
+                shared_doc("beta", "b1", "2026-07-11T00:00:00Z"),
+            ),
+        ];
+        // The rest of the first page: a sibling nobody asked for.
+        for i in 2..DOCUMENT_PAGE_SIZE as usize {
+            let rkey: &'static str = Box::leak(format!("3l2capaaaaa{i:02}").into_boxed_str());
+            records.push((
+                nsid::STANDARD_DOCUMENT,
+                rkey,
+                shared_doc("other", &format!("o{i}"), "2026-07-11T00:00:00Z"),
+            ));
+        }
+        // Page two, which the walk never reaches.
+        records.push((
+            nsid::STANDARD_DOCUMENT,
+            "3l2capaaaaz99",
+            shared_doc("alpha", "a2", "2026-07-11T00:00:00Z"),
+        ));
+        let (plc, _) = serve_repo(SHARED, records).await;
+        let client = crate::feed::build_client().unwrap();
+        let rkeys = vec!["alpha".to_string(), "beta".to_string()];
+        let reads = fetch_repo_capped(&client, &plc, SHARED, &rkeys, 1, STARVED_BUDGET)
+            .await
+            .unwrap();
+        for (name, read) in rkeys.iter().zip(&reads) {
+            let read = read.as_ref().unwrap();
+            assert_eq!(read.entries.len(), 1, "{name}");
+            assert!(
+                !read.cut_short_by_group,
+                "{name} was flagged for a re-read that would stop at the same place"
+            );
+        }
+    }
+
+    /// **The starved are re-read first** (review of #281). Re-reads share one
+    /// deadline and stop at the first that overruns it; in feed order a big
+    /// sibling went first, could spend the remainder, and left the quiet
+    /// publication `Failed` on every poll. Here the deadline allows exactly
+    /// one re-read, and the quiet publication — no entries from its group —
+    /// is the one that gets it.
+    #[tokio::test]
+    async fn the_publication_its_group_starved_is_re_read_first() {
+        let client = crate::feed::build_client().unwrap();
+        let (plc, hits) = serve_repo(SHARED, starved_group_records()).await;
+        fetch_repo_capped(
+            &client,
+            &plc,
+            SHARED,
+            &starved_rkeys(),
+            2_000,
+            STARVED_BUDGET,
+        )
+        .await
+        .unwrap();
+        let group_read = hits_of(&hits);
+        let (plc, hits) = serve_repo(SHARED, starved_group_records()).await;
+        fetch_repo_capped(
+            &client,
+            &plc,
+            SHARED,
+            &starved_rkeys()[2..],
+            2_000,
+            STARVED_BUDGET,
+        )
+        .await
+        .unwrap();
+        let quiet_alone = hits_of(&hits);
+
+        // Room for the group read and the quiet publication's re-read; every
+        // request after that stalls past the deadline.
+        let (plc, _) = serve_repo_slow_after(
+            SHARED,
+            starved_group_records(),
+            group_read + quiet_alone,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
+        let feeds = shared_feeds(&pool, &starved_rkeys()).await;
+        let mut config = crate::config::Config::default();
+        config.oauth.plc_directory = plc;
+        config.publication_read_deadline = std::time::Duration::from_secs(3);
+        let outcomes = crate::feed::poll_publication_group_with(
+            &pool,
+            &client,
+            &config,
+            &feeds,
+            2_000,
+            STARVED_BUDGET,
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcomes[2].as_ref().unwrap(),
+                crate::feed::PollOutcome::Updated { .. }
+            ),
+            "a big sibling's re-read spent the deadline and the starved one stayed: {:?}",
+            outcomes[2]
         );
     }
 

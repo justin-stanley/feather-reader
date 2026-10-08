@@ -1258,6 +1258,13 @@ pub(crate) async fn poll_publication_group_with(
     if cut_short.is_empty() {
         return out;
     }
+    // **Starved first.** The re-reads share one deadline and stop at the
+    // first that overruns it, so the order decides who gets one. A big
+    // sibling read alone can cost as much as the whole group read, and in
+    // feed order it went first on every poll — leaving the quiet publication
+    // this exists for `Failed` forever (review of #281). Fewest entries from
+    // the group first, those with none ahead of all; ties keep feed order.
+    cut_short.sort_by_key(|&(_, group_kept)| group_kept);
     let mut reread = 0usize;
     let mut improved = 0usize;
     for &(i, group_kept) in &cut_short {
@@ -1308,10 +1315,23 @@ pub(crate) async fn poll_publication_group_with(
             }
             Ok(Ok(mut per)) => match per.pop() {
                 Some(Ok(read)) => {
-                    if read.complete || read.entries.len() > group_kept {
-                        improved += 1;
+                    let better = read.complete || read.entries.len() > group_kept;
+                    match store(feed.url.clone(), read).await {
+                        Ok(outcome) => {
+                            if better {
+                                improved += 1;
+                            }
+                            Ok(outcome)
+                        }
+                        // The group's rows are already stored; a failed second
+                        // store is not this feed's poll failing.
+                        Err(err) => {
+                            tracing::warn!(repo = %did, feed = %feed.url, err = %format!("{err:#}"),
+                                "storing a re-read failed; keeping the group's outcome");
+                            reread += 1;
+                            continue;
+                        }
                     }
-                    store(feed.url.clone(), read).await
                 }
                 Some(Err(err)) => {
                     tracing::warn!(repo = %did, feed = %feed.url, err = %format!("{err:#}"),

@@ -84,14 +84,17 @@ deploying is separate.
   cap in one repo; the measured corpus is 449 documents in total.
 
   **Mechanism.** A group read now marks a member `cut_short_by_group` when
-  the shared walk ended before it reached its own cap — never for a lone
-  publication. After every group read is stored and dropped,
+  the shared walk ran out of BYTES before the member reached its own cap —
+  never for a lone publication, and not when the walk stopped at the page
+  limit, a repeated cursor or the combined record cap, which stop a read
+  alone at the same place (`RecordWalk::out_of_budget` says which). After every group read is stored and dropped,
   `feed::poll_publication_group` re-reads each such member alone, one at a
   time, so memory stays one budget at a time, and stores it; entries upsert
   on `(feed_id, guid)`, so the overlap with what the group stored is not
   duplicated. The re-reads share the existing `publication_read_deadline`,
-  measured from the group read's start; when it runs out, the rest keep the
-  group's outcome. A static per-publication share was tried before and
+  measured from the group read's start, starved members first (fewest
+  entries from the group); when it runs out, the rest keep the group's
+  outcome. A static per-publication share was tried before and
   broke two cases that regression tests pin; re-reading alone can never
   read a publication worse than reading it alone, by construction. A
   re-read that fails keeps the group's outcome. The former `#[ignore]`d test now runs at

@@ -217,6 +217,11 @@ pub struct RecordWalk {
     /// walk that SKIPS can report this; the walks that feed `replace_sub_refs`
     /// refuse instead, with [`MalformedRecords`].
     pub malformed: usize,
+    /// The walk stopped because its byte budget ran out — not at a record
+    /// cap, the page limit or a repeated cursor. Only this end is one a
+    /// caller can change by reading with a budget of its own (#229): the
+    /// others stop a read alone at the same place.
+    pub out_of_budget: bool,
 }
 
 impl RecordWalk {
@@ -225,6 +230,7 @@ impl RecordWalk {
             records,
             complete: true,
             malformed: 0,
+            out_of_budget: false,
         }
     }
     fn partial(records: Vec<RecordEntry>) -> Self {
@@ -232,6 +238,7 @@ impl RecordWalk {
             records,
             complete: false,
             malformed: 0,
+            out_of_budget: false,
         }
     }
 }
@@ -1469,7 +1476,9 @@ impl PdsClient {
                 page_cost = page_cost.max(page.wire_bytes);
             }
             if page_cost > budget.remaining() {
-                return Ok(walk(RecordWalk::partial(out), malformed));
+                let mut w = RecordWalk::partial(out);
+                w.out_of_budget = true;
+                return Ok(walk(w, malformed));
             }
             let kept: Vec<RecordEntry> = page.records.into_iter().filter(|r| keep(r)).collect();
             // Charged on what is KEPT, which is what this walk retains. **This
@@ -1497,6 +1506,7 @@ impl PdsClient {
                     complete: !more && !cut_off,
                     records: out,
                     malformed,
+                    out_of_budget: false,
                 });
             }
             if cut_off {
