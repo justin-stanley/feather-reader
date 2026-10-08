@@ -3003,6 +3003,18 @@ pub async fn compact_cursor(
     let keep_unread =
         ids_published_at_or_before(&mut tx, feed_url, &unread_ids, &watermark).await?;
 
+    // **The row's own `updated_at`, not now** (review of #286). It is the
+    // record's `updatedAt`, which settles read/unread conflicts between
+    // instances, and compaction changes how reads are written down, not what
+    // was read. The flusher re-reads the row after compacting, so its
+    // dirty-clear snapshot still matches; a mark-read meanwhile stamps now.
+    let updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM read_cursor WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .fetch_one(&mut *tx)
+            .await
+            .with_context(|| format!("compact_cursor: updated_at for {did}/{feed_url}"))?;
     write_cursor_sets(
         &mut tx,
         did,
@@ -3010,7 +3022,7 @@ pub async fn compact_cursor(
         Some(&watermark),
         &keep_above,
         &keep_unread,
-        &now_rfc3339(),
+        &updated_at,
     )
     .await?;
     tx.commit().await.context("commit compact_cursor tx")?;
@@ -3635,6 +3647,325 @@ pub async fn clear_cursor_dirty(
     .await
     .context("clear_cursor_dirty failed")?;
     Ok(())
+}
+
+/// Every cursor of `did` that is NOT dirty — the ones a flush round does not
+/// write, but whose PDS record another client may have moved on (#246).
+pub async fn clean_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCursor>> {
+    sqlx::query_as::<_, ReadCursor>("SELECT * FROM read_cursor WHERE did = ?1 AND dirty = 0")
+        .bind(did)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("clean_cursors failed for {did}"))
+}
+
+// ---------------------------------------------------------------------------
+// Read-state ids at the PDS boundary (#246)
+// ---------------------------------------------------------------------------
+//
+// Locally, `read_ids` / `unread_ids` hold `entries.id` row ids, and ~every read
+// query joins on them. A row id means nothing on another instance — or on a
+// fresh database of this one — so the `readState` record carries entry GUIDs
+// instead, and these two helpers translate at the boundary. Both are ONE
+// query over a `json_each` of the whole set, not one per id.
+
+/// The GUIDs of `ids` among `feed_url`'s entries. An id with no entry (swept by
+/// retention, or never on this feed) is simply absent from the map.
+pub async fn guids_for_entry_ids(
+    pool: &SqlitePool,
+    feed_url: &str,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = serde_json::to_string(ids).context("encoding entry ids")?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT e.id, e.guid
+        FROM json_each(?2) j
+        JOIN entries e ON e.id = j.value
+        JOIN feeds f ON f.id = e.feed_id
+        WHERE f.url = ?1
+        "#,
+    )
+    .bind(feed_url)
+    .bind(json)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("guids_for_entry_ids failed for {feed_url}"))?;
+    Ok(rows.into_iter().collect())
+}
+
+/// A local entry a remote GUID resolved to: its row id, and `did`'s
+/// `entry_state` for it as it was when resolved.
+///
+/// The state is also the snapshot [`import_remote_read_state`] re-checks: a
+/// decision made from it is applied only while it still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidEntry {
+    pub id: i64,
+    /// Whether `did` has it read here.
+    pub read: bool,
+    /// Its `entry_state.updated_at`; `None` when it has no `entry_state` row.
+    pub updated_at: Option<String>,
+}
+
+/// Resolve `guids` against `feed_url`'s entries, with `did`'s read state for
+/// each. A GUID this instance has no entry for is absent from the map — the
+/// caller decides what an unresolved GUID means.
+///
+/// The GUIDs go in as a JSON array of STRINGS, so an all-digit GUID compares
+/// as text against `entries.guid` and can never be mistaken for a row id.
+pub async fn entries_for_guids(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    guids: &[String],
+) -> Result<std::collections::HashMap<String, GuidEntry>> {
+    if guids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = serde_json::to_string(guids).context("encoding guids")?;
+    let rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT e.guid, e.id, COALESCE(s.read, 0), s.updated_at
+        FROM json_each(?3) j
+        JOIN entries e ON e.guid = j.value
+        JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        WHERE f.url = ?2
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(json)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("entries_for_guids failed for {did}/{feed_url}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(guid, id, read, updated_at)| {
+            (
+                guid,
+                GuidEntry {
+                    id,
+                    read: read == 1,
+                    updated_at,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Apply read / unread state learned from the PDS to `did`'s entries on
+/// `feed_url`, and project it into the cursor — WITHOUT changing the cursor's
+/// `dirty` flag. Returns how many entries were written.
+///
+/// **`entry_state` is what is written**, because it is what every local view
+/// reads; `read_cursor` is a projection of it, kept in step here exactly as
+/// [`mark_read`] keeps it. Writing cursor ids alone would show nothing read.
+///
+/// **Why the flag is preserved.** An import is not a local change: what it
+/// brings in is already on the PDS. Dirtying a clean cursor would make the
+/// next round write the same reads straight back — a write per import, for
+/// nothing. A dirty cursor stays dirty, and is written this round anyway.
+///
+/// **`updated_at` becomes the later of the cursor's own and `remote_updated_at`
+/// — never the import time.** `updated_at` is when the cursor's CONTENT last
+/// changed: it is written as the record's `updatedAt`, and the merge compares
+/// it against other records to settle read/unread conflicts. Stamping "now"
+/// made an import look newer than state it had not seen: an older read,
+/// imported after another instance's newer unread, then beat that unread, and
+/// that instance's record no longer looked newer than this cursor, so it was
+/// never imported here either. A local mark-read still stamps "now", because
+/// that change IS made now.
+///
+/// It is also the row version the flusher's conditional dirty-clear compares
+/// ([`clear_cursor_dirty`]). That still holds: the flusher re-reads the row
+/// after an import, so its snapshot is the imported row whatever the stamp,
+/// and a mark-read during the PDS write stamps "now", which differs from it.
+/// (Two writes in the same second share a stamp; that was already so.) A later
+/// round does not re-import the same record: it is no longer newer than the
+/// cursor.
+///
+/// **Each entry is written only if its `entry_state` is still what the
+/// caller decided from** — the [`GuidEntry`] it passes, from
+/// [`entries_for_guids`]. The decision and this write are separate
+/// transactions, and the flush's PDS round trips sit between them; a reader
+/// marking the entry in that window made a change newer than the remote
+/// record, which must not be overwritten by it. That entry is skipped, and the
+/// next round decides again from the new state.
+///
+/// The snapshot is the pair (`read`, `updated_at`), with no row matching only
+/// no row. `updated_at` alone is second-precision, so a flip within the same
+/// second as the snapshot's write would match it; `read` catches the flip.
+/// What the pair can miss is a write that leaves `read` as it was in the same
+/// second as the row's previous one (unread, then explicitly unread, within
+/// one second) — accepted as that narrow.
+///
+/// Authorized like [`mark_read`]: only entries of a feed `did` subscribes to
+/// (`sub_ref`) are touched. A cursor row that no longer exists is left alone.
+pub async fn import_remote_read_state(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    read: &[GuidEntry],
+    unread: &[GuidEntry],
+    remote_updated_at: &str,
+) -> Result<usize> {
+    if read.is_empty() && unread.is_empty() {
+        return Ok(0);
+    }
+    let now = now_rfc3339();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin import_remote_read_state tx")?;
+    let row: Option<(bool, String)> = sqlx::query_as(
+        "SELECT dirty, updated_at FROM read_cursor WHERE did = ?1 AND feed_url = ?2",
+    )
+    .bind(did)
+    .bind(feed_url)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("import_remote_read_state: cursor for {did}/{feed_url}"))?;
+    let Some((dirty, updated_at)) = row else {
+        return Ok(0);
+    };
+    let stamp = later_timestamp(&updated_at, remote_updated_at);
+
+    let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
+    let mut written = 0;
+    for (entries, value) in [(read, true), (unread, false)] {
+        if entries.is_empty() {
+            continue;
+        }
+        let snapshot: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| serde_json::json!({ "id": e.id, "read": e.read, "at": e.updated_at }))
+            .collect();
+        let json = serde_json::to_string(&snapshot).context("encoding entry snapshots")?;
+        // `IS`, not `=`: no row on both sides (NULL, NULL) is a match.
+        let authorized: Vec<i64> = sqlx::query_scalar(
+            r#"
+            INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
+            SELECT ?1, e.id, ?3, 0, ?4
+            FROM json_each(?5) j
+            JOIN entries e ON e.id = json_extract(j.value, '$.id')
+            JOIN feeds f ON f.id = e.feed_id
+            LEFT JOIN entry_state s ON s.did = ?1 AND s.entry_id = e.id
+            WHERE f.url = ?2
+              AND EXISTS (
+                  SELECT 1 FROM sub_ref sr
+                  WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
+              )
+              AND COALESCE(s.read, 0) = json_extract(j.value, '$.read')
+              AND s.updated_at IS json_extract(j.value, '$.at')
+            ON CONFLICT (did, entry_id) DO UPDATE SET
+                read       = excluded.read,
+                updated_at = excluded.updated_at
+            RETURNING entry_id
+            "#,
+        )
+        .bind(did)
+        .bind(feed_url)
+        .bind(value)
+        .bind(&now)
+        .bind(json)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("import_remote_read_state failed for {did}/{feed_url}"))?;
+        for id in &authorized {
+            read_ids = json_id_set_toggle(&read_ids, *id, value);
+            unread_ids = json_id_set_toggle(&unread_ids, *id, !value);
+        }
+        written += authorized.len();
+    }
+    if written > 0 {
+        write_cursor_sets(
+            &mut tx,
+            did,
+            feed_url,
+            read_through.as_deref(),
+            &read_ids,
+            &unread_ids,
+            &stamp,
+        )
+        .await?;
+        sqlx::query("UPDATE read_cursor SET dirty = ?3 WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .bind(dirty)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("import_remote_read_state: dirty for {did}/{feed_url}"))?;
+    }
+    tx.commit()
+        .await
+        .context("commit import_remote_read_state tx")?;
+    Ok(written)
+}
+
+/// The later of two RFC 3339 instants, compared as instants. `local` is kept
+/// as written when it is not earlier; `remote` — from any client, with any
+/// offset or precision — is normalised to UTC `...Z` when it wins. An
+/// unparseable `remote` never wins.
+pub(crate) fn later_timestamp(local: &str, remote: &str) -> String {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (parse(local), parse(remote)) {
+        (Some(l), Some(r)) if r > l => utc_timestamp(r),
+        (None, Some(r)) => utc_timestamp(r),
+        _ => local.to_string(),
+    }
+}
+
+fn utc_timestamp(t: chrono::DateTime<chrono::FixedOffset>) -> String {
+    t.with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+/// Create a CLEAN cursor for `did` on `feed_url`, stamped `updated_at`, if
+/// `did` subscribes to the feed and has no cursor for it yet. Returns whether
+/// one was created.
+///
+/// For a feed whose `readState` record is on the PDS but which has never been
+/// read on this database — every feed but the ones read here, on a fresh one
+/// (#246). The record exists, so `pds_created` is set; nothing local changed,
+/// so it is not dirty; and `updated_at` is the record's, so the import that
+/// follows is not mistaken for something newer than the record.
+///
+/// `updated_at` must be RFC 3339; an unparseable one creates nothing.
+pub async fn create_clean_cursor(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return Ok(false);
+    };
+    let res = sqlx::query(
+        r#"
+        INSERT INTO read_cursor
+            (did, feed_url, read_through, read_ids, unread_ids, dirty, pds_created, updated_at)
+        SELECT ?1, f.url, NULL, '[]', '[]', 0, 1, ?3
+        FROM feeds f
+        WHERE f.url = ?2
+          AND EXISTS (
+              SELECT 1 FROM sub_ref sr
+              WHERE sr.did = ?1 AND sr.feed_id = f.id
+          )
+        ON CONFLICT (did, feed_url) DO NOTHING
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(utc_timestamp(at))
+    .execute(pool)
+    .await
+    .with_context(|| format!("create_clean_cursor failed for {did}/{feed_url}"))?;
+    Ok(res.rows_affected() > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -5512,6 +5843,58 @@ mod tests {
         // 30th — STRICTLY below the oldest unread, never equal to it.
         assert_eq!(watermark, "2026-01-30T00:00:00Z");
         assert!(after.dirty, "a rewritten cursor must be re-flushed");
+        Ok(())
+    }
+
+    /// **Compaction is not a change to what was read** (review of #286). The
+    /// cursor's `updated_at` is the record's `updatedAt`, which settles
+    /// read/unread conflicts between instances; stamping it "now" made a
+    /// compacting flush look newer than its content, so its older reads could
+    /// beat another instance's newer explicit unread.
+    #[tokio::test]
+    async fn compaction_keeps_the_cursors_updated_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:compactstamp";
+        let feed_url = "https://compactstamp.example/f.xml";
+        let feed_id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: feed_url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let entries: Vec<NewEntry> = (0..10)
+            .map(|i| NewEntry {
+                guid: format!("s-{i:03}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let mut oldest_first = list_entries(&pool, did, ListView::All, None, 100, 0).await?;
+        oldest_first.reverse();
+        for row in oldest_first.iter().take(5) {
+            mark_read(&pool, did, row.id, true).await?;
+        }
+        let stamp = "2026-02-01T00:00:00Z";
+        sqlx::query("UPDATE read_cursor SET updated_at = ?3 WHERE did = ?1 AND feed_url = ?2")
+            .bind(did)
+            .bind(feed_url)
+            .bind(stamp)
+            .execute(&pool)
+            .await?;
+
+        compact_cursor(&pool, did, feed_url)
+            .await?
+            .expect("the water-mark must advance");
+
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        assert_eq!(
+            after.updated_at, stamp,
+            "compaction stamped the cursor as if its reads had changed"
+        );
         Ok(())
     }
 
