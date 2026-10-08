@@ -31,23 +31,38 @@ use crate::AppState;
 /// sets each cursor's `pds_created`, so a fresh database's first flush is an
 /// `#update` rather than a refused `#create`.
 ///
-/// A listing that fails does not block the flush: it is logged and the flush
-/// writes local state alone, as it did before.
+/// A listing that fails does not block the flush, but nothing that exists is
+/// overwritten without it: only cursors whose record is believed not to exist
+/// (`pds_created` false) are written, and the rest stay dirty for the next
+/// round.
 pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
     let cursors = store::dirty_cursors(&state.db, did).await?;
     if cursors.is_empty() {
         return Ok(());
     }
 
-    let remote = match state
+    let (remote, cursors) = match state
         .repo()
         .list_all_records(did, crate::lexicon::nsid::READ_STATE)
         .await
     {
-        Ok(records) => Some(Remote::from_listing(&records)),
+        Ok(records) => (Some(Remote::from_listing(&records)), cursors),
         Err(err) => {
-            warn!(%did, err = %err, "read-state flusher: could not list readState records; writing local state without merging");
-            None
+            // **Without the listing, only records believed not to exist are
+            // written.** Writing local state over one that does, unmerged,
+            // erases what other clients put in it and can move its
+            // `readThrough` backwards — #246 itself. A `#create` cannot erase
+            // anything: if the record exists after all, the PDS refuses it and
+            // the reconcile below takes over.
+            let (new, held): (Vec<_>, Vec<_>) = cursors.into_iter().partition(|c| !c.pds_created);
+            warn!(
+                %did,
+                err = %err,
+                writing = new.len(),
+                held = held.len(),
+                "read-state flusher: could not list readState records; writing only new records, leaving existing ones dirty for the next round"
+            );
+            (None, new)
         }
     };
     if let Some(remote) = &remote {
@@ -126,8 +141,9 @@ pub async fn flush_did(state: &AppState, did: &str) -> anyhow::Result<()> {
         //
         // `pds_created` picks create-vs-update. Since #246 it is set from the
         // listing at the top of every flush, but that listing can fail (then
-        // the stored flag is used as-is), and a record can be created or
-        // deleted by another client between the listing and the write. Either
+        // only cursors stored as not created are sent, as `#create`, and one
+        // may collide), and a record can be created or deleted by another
+        // client between the listing and the write. Either
         // way one op fails, applyWrites is atomic, the whole call fails.
         //
         // So on a failure that COULD be that, ask the PDS once what exists, and
@@ -239,13 +255,36 @@ async fn learn_pds_created(state: &AppState, did: &str, cursor: &mut ReadCursor,
 /// a feed the reader has left is refused by the import. Either way the local
 /// sets alone would drop it.
 ///
-/// Each list is ordered for the cap ([`cap_merged`] drops from the front):
+/// Each set is split by how far this instance can vouch for a GUID, which is
+/// the order the caps drop them in ([`cap_merged`], [`fit_record_bytes`]):
 /// GUIDs with no local entry first, then GUIDs this instance has, each in the
-/// remote record's order.
+/// remote record's order — oldest first.
+///
+/// `updated_at` is the merged record's `updatedAt`, set whenever a GUID record
+/// was merged: the written record carries its state, so it must not claim to
+/// be older than it ([`build_record`]).
 #[derive(Default, Debug)]
 struct Carry {
-    read: Vec<String>,
-    unread: Vec<String>,
+    read: Carried,
+    unread: Carried,
+    updated_at: Option<String>,
+}
+
+/// One id set's carried remote GUIDs, by tier (see [`Carry`]).
+#[derive(Default, Debug, Clone)]
+struct Carried {
+    /// No local entry: this instance cannot vouch for them, and a GUID it once
+    /// wrote and has since swept looks exactly like one. Dropped first.
+    unresolved: Vec<String>,
+    /// A local entry, but no id in the local set (folded into `readThrough`,
+    /// or in a feed the reader has left). Dropped second.
+    resolved: Vec<String>,
+}
+
+impl Carried {
+    fn len(&self) -> usize {
+        self.unresolved.len() + self.resolved.len()
+    }
 }
 
 /// Whether timestamp `a` is strictly later than `b`, compared as instants.
@@ -311,6 +350,41 @@ async fn merge_guid_record(
     cursor: &ReadCursor,
     theirs: &ReadState,
 ) -> anyhow::Result<(Option<ReadCursor>, Carry)> {
+    let plan = plan_guid_merge(state, did, cursor, theirs).await?;
+    let imported = apply_guid_merge(state, did, &cursor.feed_url, &plan).await?;
+    if imported == 0 {
+        return Ok((None, plan.carry));
+    }
+    info!(%did, feed = %cursor.feed_url, imported, "read-state flusher: imported read state from the PDS");
+    // Re-read: the import rewrote the row — and may have moved `updated_at`,
+    // which the conditional dirty-clear compares against.
+    Ok((
+        store::get_cursor(&state.db, did, &cursor.feed_url).await?,
+        plan.carry,
+    ))
+}
+
+/// What [`merge_guid_record`] decided, before any of it is applied.
+#[derive(Debug)]
+struct MergePlan {
+    /// Remote GUIDs to carry into the written record.
+    carry: Carry,
+    /// Local entries to mark read, as they were when the decision was made.
+    to_read: Vec<store::GuidEntry>,
+    /// Local entries to mark unread, likewise.
+    to_unread: Vec<store::GuidEntry>,
+    /// The remote record's `updatedAt`.
+    remote_updated_at: String,
+}
+
+/// Decide, from the local state as it is now, what of `theirs` to import and
+/// what to carry. Writes nothing.
+async fn plan_guid_merge(
+    state: &AppState,
+    did: &str,
+    cursor: &ReadCursor,
+    theirs: &ReadState,
+) -> anyhow::Result<MergePlan> {
     let remote_read: Vec<String> = dedup(theirs.read_ids.iter().cloned());
     let read_set: HashSet<&String> = remote_read.iter().collect();
     // A GUID in both of the remote's own sets is read: the record contradicts
@@ -325,18 +399,29 @@ async fn merge_guid_record(
 
     let all: Vec<String> = remote_read.iter().chain(&remote_unread).cloned().collect();
     let local = store::entries_for_guids(&state.db, did, &cursor.feed_url, &all).await?;
+    // **The cursor is re-read AFTER `entry_state`**, so the two are one
+    // snapshot as far as the import's re-check can tell. The flush's cursor
+    // was read before its listing — a PDS round trip earlier — and a mark in
+    // that window is in `entry_state` but not in it: the entry looked plainly
+    // unread rather than explicitly unread, and the older remote read was
+    // imported over it. Read in this order, a mark before the entries read is
+    // in both, and one after it fails the import's re-check.
+    let fresh = store::get_cursor(&state.db, did, &cursor.feed_url).await?;
+    let cursor = fresh.as_ref().unwrap_or(cursor);
     let local_unread: HashSet<i64> = parse_id_array(&cursor.unread_ids)
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
     let remote_wins = later(&theirs.updated_at, &cursor.updated_at);
 
-    // Unresolved first, then resolved: the order the cap drops them in.
-    let (mut unresolved, mut resolved) = (Carry::default(), Carry::default());
+    let mut carry = Carry {
+        updated_at: Some(theirs.updated_at.clone()),
+        ..Carry::default()
+    };
     let (mut to_read, mut to_unread) = (Vec::new(), Vec::new());
     for guid in remote_read {
         match local.get(&guid) {
-            None => unresolved.read.push(guid),
+            None => carry.read.unresolved.push(guid),
             Some(e) => {
                 let explicitly_unread = local_unread.contains(&e.id);
                 if explicitly_unread && !remote_wins {
@@ -345,15 +430,15 @@ async fn merge_guid_record(
                     continue;
                 }
                 if !e.read || explicitly_unread {
-                    to_read.push(e.id);
+                    to_read.push(e.clone());
                 }
-                resolved.read.push(guid);
+                carry.read.resolved.push(guid);
             }
         }
     }
     for guid in remote_unread {
         match local.get(&guid) {
-            None => unresolved.unread.push(guid),
+            None => carry.unread.unresolved.push(guid),
             Some(e) => {
                 if e.read && !remote_wins {
                     continue;
@@ -362,35 +447,40 @@ async fn merge_guid_record(
                 // record would drop it — and below a `readThrough`, a missing
                 // unread id reads as read.
                 if e.read || !local_unread.contains(&e.id) {
-                    to_unread.push(e.id);
+                    to_unread.push(e.clone());
                 }
-                resolved.unread.push(guid);
+                carry.unread.resolved.push(guid);
             }
         }
     }
-    let mut carry = unresolved;
-    carry.read.append(&mut resolved.read);
-    carry.unread.append(&mut resolved.unread);
+    Ok(MergePlan {
+        carry,
+        to_read,
+        to_unread,
+        remote_updated_at: theirs.updated_at.clone(),
+    })
+}
 
-    let imported = store::import_remote_read_state(
+/// Apply a [`MergePlan`]'s imports. Returns how many entries were written.
+///
+/// An entry whose `entry_state` changed since the plan was made is skipped
+/// ([`store::import_remote_read_state`]): the change is the reader's, and
+/// newer than the remote record.
+async fn apply_guid_merge(
+    state: &AppState,
+    did: &str,
+    feed_url: &str,
+    plan: &MergePlan,
+) -> anyhow::Result<usize> {
+    store::import_remote_read_state(
         &state.db,
         did,
-        &cursor.feed_url,
-        &to_read,
-        &to_unread,
-        &theirs.updated_at,
+        feed_url,
+        &plan.to_read,
+        &plan.to_unread,
+        &plan.remote_updated_at,
     )
-    .await?;
-    if imported == 0 {
-        return Ok((None, carry));
-    }
-    info!(%did, feed = %cursor.feed_url, imported, "read-state flusher: imported read state from the PDS");
-    // Re-read: the import rewrote the row — and may have moved `updated_at`,
-    // which the conditional dirty-clear compares against.
-    Ok((
-        store::get_cursor(&state.db, did, &cursor.feed_url).await?,
-        carry,
-    ))
+    .await
 }
 
 /// Import remote reads into the DID's CLEAN cursors, from the listing this
@@ -708,7 +798,12 @@ async fn read_state_record(
 /// ever moved backwards by the other.
 ///
 /// Both id-sets are capped at [`ReadState::MAX_IDS`] to respect the lexicon
-/// bound, dropping carried remote GUIDs first (see [`cap_merged`]).
+/// bound, dropping carried remote GUIDs first (see [`cap_merged`]), and the
+/// record at [`READ_STATE_RECORD_MAX_BYTES`] in the same order
+/// ([`fit_record_bytes`]).
+///
+/// `updatedAt` is the cursor's `updated_at`, or the merged record's when that
+/// is later (see [`Carry`]).
 fn build_record(
     cursor: &ReadCursor,
     guids: &HashMap<i64, String>,
@@ -737,22 +832,133 @@ fn build_record(
     // Do NOT synthesize a water-mark from `updated_at`: an unset
     // `read_through` means "no high-water-mark", which the record represents
     // by omitting `readThrough` (None), not by back-dating it to flush time.
-    let mut record = ReadState::new(&cursor.feed_url, read_through, &cursor.updated_at);
+    // **`updatedAt` never goes backwards.** A merged record's state is in this
+    // one, so it is stamped no earlier than the record it merged: B's read at
+    // 05:00, carried by an instance whose cursor last changed at 03:00 and
+    // stamped 03:00, would lose to a third instance's 04:00 unread. Only the
+    // record is stamped; the cursor's own `updated_at` moves only when its
+    // content does (an import), since carrying changes nothing local.
+    let updated_at = match carry.updated_at.as_deref() {
+        Some(remote) => store::later_timestamp(&cursor.updated_at, remote),
+        None => cursor.updated_at.clone(),
+    };
+    let mut record = ReadState::new(&cursor.feed_url, read_through, &updated_at);
     record.id_type = Some(ReadState::ID_TYPE_GUID.to_string());
     // A carried GUID already in a local set is local: written once, and on the
     // side the local state says — so the two sets can never overlap.
     let local: HashSet<&String> = read_ids.iter().chain(&unread_ids).collect();
-    let carried = |ids: &[String]| -> Vec<String> {
-        ids.iter().filter(|g| !local.contains(g)).cloned().collect()
+    let carried = |c: &Carried| -> Carried {
+        let keep = |ids: &[String]| -> Vec<String> {
+            ids.iter().filter(|g| !local.contains(g)).cloned().collect()
+        };
+        Carried {
+            unresolved: keep(&c.unresolved),
+            resolved: keep(&c.resolved),
+        }
     };
     let (carry_read, carry_unread) = (carried(&carry.read), carried(&carry.unread));
-    record.read_ids = cap_merged(carry_read, read_ids, ReadState::MAX_IDS);
-    record.unread_ids = cap_merged(carry_unread, unread_ids, ReadState::MAX_IDS);
+    let mut read = cap_merged(carry_read, read_ids, ReadState::MAX_IDS);
+    let mut unread = cap_merged(carry_unread, unread_ids, ReadState::MAX_IDS);
+    fit_record_bytes(&record, &mut read, &mut unread, READ_STATE_RECORD_MAX_BYTES);
+    record.read_ids = read.into_ids();
+    record.unread_ids = unread.into_ids();
     record
 }
 
+/// One id set as the caps see it: carried remote GUIDs by tier, then local.
+struct Merged {
+    carried: Carried,
+    local: Vec<String>,
+}
+
+impl Merged {
+    /// The set as written: carried, then local.
+    fn into_ids(self) -> Vec<String> {
+        let mut ids = self.carried.unresolved;
+        ids.extend(self.carried.resolved);
+        ids.extend(self.local);
+        ids
+    }
+}
+
+/// Most bytes one `readState` record may serialize to.
+///
+/// **The id cap alone does not bound a record's size.** GUIDs run up to
+/// `MAX_GUID_BYTES` (2048) and are often 80–200 bytes, so 1,000 carried ids
+/// can make one record 150 KiB or more. [`crate::atproto::chunk_writes`] sends
+/// an op larger than [`crate::atproto::APPLY_WRITES_MAX_BYTES`] alone, a PDS
+/// still on the 150 KiB `jsonLimit` refuses it, the chunked write stops there
+/// — and the cursor fails every round while every feed sorted after it
+/// starves.
+///
+/// 64 KiB is half the per-call budget: with the op's own wrapper (collection,
+/// rkey, action — around 150 bytes) it always fits one call with room for
+/// another such op, and it is under the 150 KiB `jsonLimit` with more than
+/// 80 KiB to spare for the request envelope. It still holds the full 1,000-id
+/// cap of GUIDs averaging ~60 bytes, so it binds only on long GUIDs.
+const READ_STATE_RECORD_MAX_BYTES: usize = 64 * 1024;
+
+/// Trim `read` and `unread` until the record serializes to at most `max`
+/// bytes, in the count cap's order across both sets: carried GUIDs with no
+/// local entry, then carried GUIDs this instance has, then local GUIDs —
+/// oldest first within each, read before unread. `record` is the record with
+/// its id sets still empty.
+///
+/// The size is the serialized JSON's: each id costs its JSON string plus a
+/// comma, on top of the empty record and both arrays' keys — an over-estimate
+/// by at most a comma per set.
+fn fit_record_bytes(record: &ReadState, read: &mut Merged, unread: &mut Merged, max: usize) {
+    let cost = |id: &String| serde_json::to_string(id).map_or(id.len() * 6 + 2, |j| j.len()) + 1;
+    let base = serde_json::to_vec(record).map_or(0, |v| v.len())
+        + r#","readIds":[]"#.len()
+        + r#","unreadIds":[]"#.len();
+    let ids = |m: &Merged| {
+        m.carried
+            .unresolved
+            .iter()
+            .chain(&m.carried.resolved)
+            .chain(&m.local)
+            .map(cost)
+            .sum::<usize>()
+    };
+    let mut size = base + ids(read) + ids(unread);
+    if size <= max {
+        return;
+    }
+    let before = size;
+    let mut dropped = 0;
+    for tier in [
+        &mut read.carried.unresolved,
+        &mut unread.carried.unresolved,
+        &mut read.carried.resolved,
+        &mut unread.carried.resolved,
+        &mut read.local,
+        &mut unread.local,
+    ] {
+        let mut n = 0;
+        while size > max && n < tier.len() {
+            size -= cost(&tier[n]);
+            n += 1;
+        }
+        tier.drain(0..n);
+        dropped += n;
+        if size <= max {
+            break;
+        }
+    }
+    warn!(
+        feed = %record.feed_url,
+        dropped,
+        before,
+        after = size,
+        max,
+        "read-state record over the byte budget; dropped the oldest ids, remote GUIDs with no local entry first"
+    );
+}
+
 /// Fit carried remote GUIDs plus local GUIDs into `max`, dropping carried ones
-/// first, from the front of `carried` (see [`Carry`] for its order).
+/// first: the unresolved tier, then the resolved one, each from the front
+/// (see [`Carry`] for the order).
 ///
 /// GUIDs with no local entry go first: this instance cannot vouch for them,
 /// and a GUID it once wrote and has since swept looks exactly like one. Then
@@ -760,19 +966,24 @@ fn build_record(
 /// `readThrough`, or in a feed it has left) — entries it still holds, so
 /// closer to what it knows. Within each, the remote record's oldest first.
 /// Local GUIDs go last, and only through the ordinary tail-keeping [`cap`].
-fn cap_merged(mut carried: Vec<String>, local: Vec<String>, max: usize) -> Vec<String> {
-    let over = (carried.len() + local.len()).saturating_sub(max);
-    if over > 0 && !carried.is_empty() {
-        let drop = over.min(carried.len());
+fn cap_merged(mut carried: Carried, local: Vec<String>, max: usize) -> Merged {
+    let total = carried.len();
+    let over = (total + local.len()).saturating_sub(max);
+    if over > 0 && total > 0 {
+        let drop = over.min(total);
         warn!(
             dropped = drop,
-            kept = carried.len() - drop,
+            kept = total - drop,
             "read-state record over the lexicon cap; dropping the oldest remote GUIDs with no local entry"
         );
-        carried.drain(0..drop);
+        let first = drop.min(carried.unresolved.len());
+        carried.unresolved.drain(0..first);
+        carried.resolved.drain(0..drop - first);
     }
-    carried.extend(cap(local, max));
-    carried
+    Merged {
+        carried,
+        local: cap(local, max),
+    }
 }
 
 /// Parse a stored JSON id-array into `Vec<String>`, tolerating both string and
@@ -1069,6 +1280,13 @@ pub(crate) mod tests {
         /// Drop the connection, unanswered, on this applyWrites call (1-based)
         /// — a transport failure after the earlier calls committed.
         pub(crate) drop_call: Option<usize>,
+        /// Refuse an applyWrites whose serialized `writes` exceed this many
+        /// bytes, as a PDS with a `jsonLimit` does (413).
+        json_limit: Option<usize>,
+        /// Delete this rkey right after the next listing walk has seen it —
+        /// another client deleting the record between the listing and the
+        /// write.
+        delete_after_list: Option<String>,
     }
 
     /// Not an answer: the fake hangs up instead of replying.
@@ -1115,6 +1333,14 @@ pub(crate) mod tests {
                     status: 400,
                     error: "InvalidRequest",
                 });
+            }
+            if let Some(limit) = self.json_limit {
+                if serde_json::to_string(writes).unwrap().len() > limit {
+                    return Err(Fail {
+                        status: 413,
+                        error: "PayloadTooLarge",
+                    });
+                }
             }
             if let Some(fail) = self.always_fail {
                 return Err(fail);
@@ -1169,6 +1395,9 @@ pub(crate) mod tests {
             let mut body = serde_json::json!({ "records": records });
             if after.len() > limit {
                 body["cursor"] = serde_json::json!(page.last().unwrap().0);
+            }
+            if let Some(rkey) = self.delete_after_list.take() {
+                self.records.remove(&rkey);
             }
             body
         }
@@ -1570,18 +1799,23 @@ pub(crate) mod tests {
     }
 
     /// **(3) The mirror: `pds_created` is set but the record was deleted
-    /// elsewhere** (another client, a repo reset). `#update` on a missing rkey
-    /// fails the same way, and converges by creating it.
+    /// elsewhere** (another client, a repo reset) — after the pre-write
+    /// listing saw it. `#update` on a missing rkey fails the same way, and
+    /// converges by creating it.
+    ///
+    /// (A failed listing no longer gets here: a cursor whose record exists is
+    /// not written without one.)
     #[tokio::test]
     async fn a_deleted_record_converges_by_creating_it() {
         for backend in BACKENDS {
             let fake = Arc::new(Mutex::new(FakeRepo::default()));
             let state = state_on(backend, &fake).await;
+            existing(&fake, 1);
             mark_read(&state, 1, "9").await;
             store::mark_cursor_pds_created(&state.db, DID, &feed(1))
                 .await
                 .unwrap();
-            fake.lock().unwrap().fail_lists = 1;
+            fake.lock().unwrap().delete_after_list = Some(read_state_rkey(&feed(1)));
 
             flush_did(&state, DID)
                 .await
@@ -1602,8 +1836,13 @@ pub(crate) mod tests {
     /// **(4) Part of a batch landed.** With applyWrites chunked (#240), a later
     /// chunk can fail after an earlier one committed — exactly this issue's
     /// state for every cursor in the landed chunk. That first failure is a 503,
-    /// which is NOT reconciled; the next flush meets the half-landed batch, mixed
-    /// with a flag that is wrong the other way, and converges in one reconcile.
+    /// which is NOT reconciled; the next flush meets the half-landed batch and
+    /// converges in one reconcile.
+    ///
+    /// Feed 4's flag is wrong the other way — it claims a record that is not
+    /// there. While the listings fail it is not written at all (a cursor whose
+    /// record exists is never written unmerged); the first round whose listing
+    /// works corrects the flag and creates it.
     #[tokio::test]
     async fn a_partially_landed_batch_converges() {
         for backend in BACKENDS {
@@ -1639,7 +1878,7 @@ pub(crate) mod tests {
             flush_did(&state, DID)
                 .await
                 .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
-            for i in 1..=4 {
+            for i in 1..=3 {
                 let c = cursor(&state, i).await;
                 assert!(c.pds_created && !c.dirty, "{backend:?}: feed {i}");
                 assert_eq!(
@@ -1648,9 +1887,30 @@ pub(crate) mod tests {
                     "{backend:?}"
                 );
             }
+            {
+                let f = fake.lock().unwrap();
+                assert_eq!(f.list_walks, 3, "{backend:?}");
+                assert_eq!(f.apply_calls, 3, "{backend:?}: 503, mismatch, retry");
+                assert!(
+                    !f.records.contains_key(&read_state_rkey(&feed(4))),
+                    "{backend:?}: feed 4 was written without a listing"
+                );
+            }
+            assert!(cursor(&state, 4).await.dirty, "{backend:?}: feed 4");
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            let c = cursor(&state, 4).await;
+            assert!(c.pds_created && !c.dirty, "{backend:?}: feed 4");
+            assert_eq!(
+                read_ids_on_pds(&fake, 4),
+                serde_json::json!(["5"]),
+                "{backend:?}"
+            );
             let f = fake.lock().unwrap();
-            assert_eq!(f.list_walks, 3, "{backend:?}");
-            assert_eq!(f.apply_calls, 3, "{backend:?}: 503, mismatch, retry");
+            assert_eq!(f.list_walks, 4, "{backend:?}");
+            assert_eq!(f.apply_calls, 4, "{backend:?}: plus feed 4's create");
         }
     }
 
@@ -2503,10 +2763,11 @@ pub(crate) mod tests {
         assert_eq!(id_set(&rec, "readIds"), set_of(&["elsewhere"]));
     }
 
-    /// **A listing that fails does not block the flush**: the local state is
-    /// written as it would have been before #246 — GUIDs, `idType` and all.
+    /// **A listing that fails does not block a new record**: a feed with no
+    /// record yet is created from local state — GUIDs, `idType` and all —
+    /// since there is nothing on the PDS for it to erase.
     #[tokio::test]
-    async fn a_listing_failure_still_writes_local_state() {
+    async fn a_listing_failure_still_creates_a_new_record() {
         for backend in BACKENDS {
             let fake = Arc::new(Mutex::new(FakeRepo::default()));
             let state = state_on(backend, &fake).await;
@@ -2781,6 +3042,277 @@ pub(crate) mod tests {
                 id_set(&pds_record(&fake, 1), "readIds"),
                 set_of(&["g1", "g-x"]),
                 "{backend:?}: the remote read was erased"
+            );
+        }
+    }
+
+    // ── #246 second review: size, timestamps, failed listings, races ─────────
+
+    /// A GUID of about 200 bytes, distinct per `tag` and `i` — a long
+    /// publisher id, well under `MAX_GUID_BYTES`.
+    fn long_guid(tag: &str, i: usize) -> String {
+        format!("{tag}-{i:04}-{}", "x".repeat(190))
+    }
+
+    /// **A record over the byte budget is trimmed under it**, and what goes
+    /// first is what the count cap drops first: carried GUIDs with no local
+    /// entry, oldest first. 900 ids is under the 1000-id cap, so only the byte
+    /// budget can act here.
+    #[test]
+    fn an_oversized_record_is_trimmed_carried_unresolved_guids_first() {
+        let unresolved: Vec<String> = (0..900).map(|i| long_guid("u", i)).collect();
+        let resolved: Vec<String> = (0..5).map(|i| long_guid("h", i)).collect();
+        let local: Vec<String> = (0..5).map(|i| long_guid("l", i)).collect();
+        let cursor = ReadCursor {
+            did: DID.into(),
+            feed_url: feed(1),
+            read_through: None,
+            read_ids: "[1,2,3,4,5]".into(),
+            unread_ids: "[]".into(),
+            dirty: true,
+            pds_created: true,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let guids: HashMap<i64, String> = (1..=5).zip(local.iter().cloned()).collect();
+        let carry = Carry {
+            read: Carried {
+                unresolved: unresolved.clone(),
+                resolved: resolved.clone(),
+            },
+            ..Carry::default()
+        };
+
+        let rec = build_record(&cursor, &guids, None, &carry);
+
+        let size = serde_json::to_vec(&rec).unwrap().len();
+        assert!(
+            size <= READ_STATE_RECORD_MAX_BYTES,
+            "{size} bytes, over the {READ_STATE_RECORD_MAX_BYTES}-byte budget"
+        );
+        for g in local.iter().chain(&resolved) {
+            assert!(
+                rec.read_ids.contains(g),
+                "{g:.8}: dropped before the unresolved GUIDs"
+            );
+        }
+        assert!(
+            !rec.read_ids.contains(&unresolved[0]),
+            "the oldest unresolved GUID is dropped first"
+        );
+        assert!(
+            rec.read_ids.contains(&unresolved[899]),
+            "trimmed further than the budget needs"
+        );
+    }
+
+    /// **One oversized record does not starve the feeds sorted after it.** A
+    /// PDS with a 150 KiB `jsonLimit` refuses a ~180 KB record outright; the
+    /// chunked write stops at the refused call, and every later feed never
+    /// went out — every round. Trimmed to the budget, both land.
+    #[tokio::test]
+    async fn an_oversized_record_does_not_starve_the_feeds_after_it() {
+        let (big, small) = if read_state_rkey(&feed(1)) < read_state_rkey(&feed(2)) {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo {
+                json_limit: Some(150 * 1024),
+                ..FakeRepo::default()
+            }));
+            let state = state_on(backend, &fake).await;
+            let remote: Vec<String> = (0..900).map(|i| long_guid("u", i)).collect();
+            let remote: Vec<&str> = remote.iter().map(String::as_str).collect();
+            put_remote(
+                &fake,
+                big,
+                remote_guid_record(big, &remote, &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, big, "g-big").await;
+            mark_read(&state, small, "g-small").await;
+
+            let res = flush_did(&state, DID).await;
+
+            let landed = fake
+                .lock()
+                .unwrap()
+                .records
+                .get(&read_state_rkey(&feed(small)))
+                .cloned();
+            assert!(
+                landed.is_some_and(|r| id_set(&r, "readIds") == set_of(&["g-small"])),
+                "{backend:?}: the feed after the oversized record starved: {res:?}"
+            );
+            res.unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            let rec = pds_record(&fake, big);
+            assert!(
+                id_set(&rec, "readIds").contains("g-big"),
+                "{backend:?}: the local read was dropped"
+            );
+            assert!(
+                serde_json::to_vec(&rec).unwrap().len() <= READ_STATE_RECORD_MAX_BYTES,
+                "{backend:?}"
+            );
+            for i in [big, small] {
+                assert!(!cursor(&state, i).await.dirty, "{backend:?}: feed {i}");
+            }
+        }
+    }
+
+    /// **Carrying a remote record never moves `updatedAt` backwards.** B wrote
+    /// a read at 05:00; A, whose cursor last changed at 03:00, carries it and
+    /// rewrites the record. Stamped 03:00, a third instance whose 04:00 unread
+    /// conflicts would now look newer than the record and win against B's
+    /// later read. The record keeps the later stamp — normalised to UTC — and
+    /// A's own cursor, which imported nothing, keeps its own.
+    #[tokio::test]
+    async fn a_carried_record_never_moves_updated_at_backwards() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-b"], &[], "2026-01-01T06:00:00+01:00"),
+            );
+            mark_read(&state, 1, "g-a").await;
+            set_updated_at(&state, 1, "2026-01-01T03:00:00Z").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["g-a", "g-b"]),
+                "{backend:?}: fixture: {rec}"
+            );
+            assert_eq!(
+                rec["updatedAt"], "2026-01-01T05:00:00Z",
+                "{backend:?}: updatedAt went backwards: {rec}"
+            );
+            let c = cursor(&state, 1).await;
+            assert_eq!(
+                c.updated_at, "2026-01-01T03:00:00Z",
+                "{backend:?}: a pure carry moved the local cursor"
+            );
+            assert!(!c.dirty, "{backend:?}");
+        }
+    }
+
+    /// **A failed listing does not overwrite a record that exists.** Without
+    /// the listing there is nothing to merge, and writing local state over the
+    /// record erases what other clients put there — #246 itself. The cursor
+    /// waits, dirty, for a round whose listing works; a feed with no record
+    /// yet still flushes, since there is nothing to erase.
+    #[tokio::test]
+    async fn a_listing_failure_does_not_overwrite_an_existing_record() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["g-elsewhere"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "g1").await;
+            store::mark_cursor_pds_created(&state.db, DID, &feed(1))
+                .await
+                .unwrap();
+            mark_read(&state, 2, "g2").await;
+            let before = pds_record(&fake, 1);
+            fake.lock().unwrap().list_fails = true;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert_eq!(
+                pds_record(&fake, 1),
+                before,
+                "{backend:?}: an existing record was overwritten unmerged"
+            );
+            assert!(cursor(&state, 1).await.dirty, "{backend:?}: feed 1");
+            assert_eq!(
+                id_set(&pds_record(&fake, 2), "readIds"),
+                set_of(&["g2"]),
+                "{backend:?}: the new record was not created"
+            );
+            assert!(!cursor(&state, 2).await.dirty, "{backend:?}: feed 2");
+
+            // The next round lists, merges and writes it.
+            fake.lock().unwrap().list_fails = false;
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["g1", "g-elsewhere"]),
+                "{backend:?}"
+            );
+            assert!(!cursor(&state, 1).await.dirty, "{backend:?}");
+        }
+    }
+
+    /// The remote record for feed `i`, parsed as the flusher parses it.
+    fn parsed(record: serde_json::Value) -> ReadState {
+        serde_json::from_value(record).unwrap()
+    }
+
+    /// **A local mark between the merge's decision and its import survives.**
+    /// The decision reads `entry_state`; the import writes it in a later
+    /// transaction. The reader marking x unread in between is newer than the
+    /// remote's read, and must not be overwritten by it.
+    #[tokio::test]
+    async fn a_local_mark_between_the_decision_and_the_import_survives() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let x = entry(&state, 1, "x").await;
+            mark_read(&state, 1, "other").await;
+            let theirs = parsed(remote_guid_record(1, &["x"], &[], "2026-01-01T00:00:00Z"));
+            let plan = plan_guid_merge(&state, DID, &cursor(&state, 1).await, &theirs)
+                .await
+                .unwrap();
+            assert_eq!(plan.to_read.len(), 1, "{backend:?}: fixture");
+
+            assert!(store::mark_read(&state.db, DID, x, false).await.unwrap());
+            apply_guid_merge(&state, DID, &feed(1), &plan)
+                .await
+                .unwrap();
+
+            assert!(
+                !is_read(&state, x).await,
+                "{backend:?}: the import overwrote a newer local unread"
+            );
+            assert!(
+                parse_id_array(&cursor(&state, 1).await.unread_ids).contains(&x.to_string()),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **The same, with the mark during the listing**: the flush's cursor
+    /// snapshot is older than the mark, `entry_state` is not. The decision
+    /// must not mix the two.
+    #[tokio::test]
+    async fn a_local_mark_during_the_listing_survives_the_import() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let x = entry(&state, 1, "x").await;
+            mark_read(&state, 1, "other").await;
+            let stale = cursor(&state, 1).await;
+            let theirs = parsed(remote_guid_record(1, &["x"], &[], "2026-01-01T00:00:00Z"));
+
+            assert!(store::mark_read(&state.db, DID, x, false).await.unwrap());
+            let _ = merge_remote(&state, DID, stale, &theirs).await;
+
+            assert!(
+                !is_read(&state, x).await,
+                "{backend:?}: the import overwrote a newer local unread"
             );
         }
     }

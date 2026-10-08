@@ -82,7 +82,14 @@ deploying is separate.
     those with no local entry (which this instance cannot vouch for, and
     which look exactly like GUIDs it has swept), then those it has an entry
     for, each oldest first. Then the existing tail-keeping cap applies to
-    the local GUIDs.
+    the local GUIDs. **A record is also capped at 64 KiB of serialized
+    JSON**, trimmed in the same order across both sets (local GUIDs last,
+    oldest first) and logged. GUIDs run to 2,048 bytes and are often
+    80–200, so 1,000 carried ids could make one record 150 KiB or more. A
+    PDS still on the 150 KiB `jsonLimit` refused that op, the chunked write
+    stopped there, and that feed, and every feed sorted after it, failed
+    every round. 64 KiB is half the per-call `applyWrites` budget, so one
+    such op always fits a call with room to spare.
 
   **Timestamps.** A cursor's `updated_at` is when its content last changed.
   It is written as the record's `updatedAt` and compared in conflicts. A
@@ -96,7 +103,21 @@ deploying is separate.
   than its cursor. The same `updated_at` is the row version the flusher's
   conditional dirty-clear compares. That still holds: the flusher re-reads
   the row after an import, and a mark-read during the write stamps the
-  current time.
+  current time. **A written record's `updatedAt` is never earlier than the
+  record it merged** (the later of the two, in UTC). Carrying remote GUIDs
+  does not change the cursor, so a record stamped with the cursor's time
+  could go backwards: B writes a read at 05:00, A (cursor at 03:00) carries
+  it and rewrites the record at 03:00, and C's 04:00 unread then beats B's
+  later read. Only the record takes the later stamp; the cursor's
+  `updated_at` still moves only when its content does.
+
+  **An import re-checks what it decided from.** The decision reads
+  `entry_state`, and the import writes it in a later transaction, with the
+  flush's PDS round trips between. Each entry is written only if its
+  `entry_state` (`read`, `updated_at`, or no row) is still what the decision
+  saw, so a mark made in that window, newer than the remote record, is not
+  overwritten by it. The cursor is re-read after `entry_state` for the same
+  reason: the flush's own copy predates its listing.
 
   Clean cursors import too: in the same listing, a clean feed whose record
   is newer than its cursor imports that record's reads. **A subscribed feed
@@ -111,8 +132,13 @@ deploying is separate.
   pinned: after a merging flush, a second flush with no new local reads
   lists nothing and writes nothing.
 
-  A listing that fails does not block the flush. It is logged, and the flush
-  writes local state alone, in the GUID format.
+  **A listing that fails does not overwrite a record.** Without it there is
+  nothing to merge, and writing local state over an existing record would
+  erase other clients' reads and could move `readThrough` backwards, which
+  is this bug again. So only cursors whose record is believed not to exist
+  (`pds_created` false) are written, as `#create`; one that collides falls
+  into the #241 reconcile. The rest stay dirty for the next round, and the
+  counts are logged.
 
   **Limits.** `applyWrites` has no per-record compare-and-swap here. A write
   from another client between the listing and this write is lost until that

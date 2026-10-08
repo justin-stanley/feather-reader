@@ -3697,12 +3697,18 @@ pub async fn guids_for_entry_ids(
     Ok(rows.into_iter().collect())
 }
 
-/// A local entry a remote GUID resolved to: its row id, and whether `did` has
-/// it read here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A local entry a remote GUID resolved to: its row id, and `did`'s
+/// `entry_state` for it as it was when resolved.
+///
+/// The state is also the snapshot [`import_remote_read_state`] re-checks: a
+/// decision made from it is applied only while it still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidEntry {
     pub id: i64,
+    /// Whether `did` has it read here.
     pub read: bool,
+    /// Its `entry_state.updated_at`; `None` when it has no `entry_state` row.
+    pub updated_at: Option<String>,
 }
 
 /// Resolve `guids` against `feed_url`'s entries, with `did`'s read state for
@@ -3721,9 +3727,9 @@ pub async fn entries_for_guids(
         return Ok(std::collections::HashMap::new());
     }
     let json = serde_json::to_string(guids).context("encoding guids")?;
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT e.guid, e.id, COALESCE(s.read, 0)
+        SELECT e.guid, e.id, COALESCE(s.read, 0), s.updated_at
         FROM json_each(?3) j
         JOIN entries e ON e.guid = j.value
         JOIN feeds f ON f.id = e.feed_id
@@ -3739,12 +3745,13 @@ pub async fn entries_for_guids(
     .with_context(|| format!("entries_for_guids failed for {did}/{feed_url}"))?;
     Ok(rows
         .into_iter()
-        .map(|(guid, id, read)| {
+        .map(|(guid, id, read, updated_at)| {
             (
                 guid,
                 GuidEntry {
                     id,
                     read: read == 1,
+                    updated_at,
                 },
             )
         })
@@ -3782,14 +3789,29 @@ pub async fn entries_for_guids(
 /// round does not re-import the same record: it is no longer newer than the
 /// cursor.
 ///
+/// **Each entry is written only if its `entry_state` is still what the
+/// caller decided from** — the [`GuidEntry`] it passes, from
+/// [`entries_for_guids`]. The decision and this write are separate
+/// transactions, and the flush's PDS round trips sit between them; a reader
+/// marking the entry in that window made a change newer than the remote
+/// record, which must not be overwritten by it. That entry is skipped, and the
+/// next round decides again from the new state.
+///
+/// The snapshot is the pair (`read`, `updated_at`), with no row matching only
+/// no row. `updated_at` alone is second-precision, so a flip within the same
+/// second as the snapshot's write would match it; `read` catches the flip.
+/// What the pair can miss is a write that leaves `read` as it was in the same
+/// second as the row's previous one (unread, then explicitly unread, within
+/// one second) — accepted as that narrow.
+///
 /// Authorized like [`mark_read`]: only entries of a feed `did` subscribes to
 /// (`sub_ref`) are touched. A cursor row that no longer exists is left alone.
 pub async fn import_remote_read_state(
     pool: &SqlitePool,
     did: &str,
     feed_url: &str,
-    read: &[i64],
-    unread: &[i64],
+    read: &[GuidEntry],
+    unread: &[GuidEntry],
     remote_updated_at: &str,
 ) -> Result<usize> {
     if read.is_empty() && unread.is_empty() {
@@ -3815,23 +3837,31 @@ pub async fn import_remote_read_state(
 
     let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
     let mut written = 0;
-    for (ids, value) in [(read, true), (unread, false)] {
-        if ids.is_empty() {
+    for (entries, value) in [(read, true), (unread, false)] {
+        if entries.is_empty() {
             continue;
         }
-        let json = serde_json::to_string(ids).context("encoding entry ids")?;
+        let snapshot: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| serde_json::json!({ "id": e.id, "read": e.read, "at": e.updated_at }))
+            .collect();
+        let json = serde_json::to_string(&snapshot).context("encoding entry snapshots")?;
+        // `IS`, not `=`: no row on both sides (NULL, NULL) is a match.
         let authorized: Vec<i64> = sqlx::query_scalar(
             r#"
             INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
             SELECT ?1, e.id, ?3, 0, ?4
             FROM json_each(?5) j
-            JOIN entries e ON e.id = j.value
+            JOIN entries e ON e.id = json_extract(j.value, '$.id')
             JOIN feeds f ON f.id = e.feed_id
+            LEFT JOIN entry_state s ON s.did = ?1 AND s.entry_id = e.id
             WHERE f.url = ?2
               AND EXISTS (
                   SELECT 1 FROM sub_ref sr
                   WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
               )
+              AND COALESCE(s.read, 0) = json_extract(j.value, '$.read')
+              AND s.updated_at IS json_extract(j.value, '$.at')
             ON CONFLICT (did, entry_id) DO UPDATE SET
                 read       = excluded.read,
                 updated_at = excluded.updated_at
@@ -3881,7 +3911,7 @@ pub async fn import_remote_read_state(
 /// as written when it is not earlier; `remote` — from any client, with any
 /// offset or precision — is normalised to UTC `...Z` when it wins. An
 /// unparseable `remote` never wins.
-fn later_timestamp(local: &str, remote: &str) -> String {
+pub(crate) fn later_timestamp(local: &str, remote: &str) -> String {
     let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
     match (parse(local), parse(remote)) {
         (Some(l), Some(r)) if r > l => utc_timestamp(r),
