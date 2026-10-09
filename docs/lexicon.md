@@ -57,9 +57,9 @@ A reader's read state for one feed. Key: `any`; FeatherReader uses
 `rs-` followed by the lowercase-hex FNV-1a-64 of `feedUrl`, so there is exactly
 one record per feed and a writer can find it without listing. A second
 implementation that wants to share records with FeatherReader must use the same
-key; one that does not can use any key, and FeatherReader will still merge a
-record it finds at a different key only if `feedUrl` matches its own key
-derivation (it does not, so use the derivation).
+key. FeatherReader ignores a `readState` record at any other key: it neither
+merges nor imports it, and writes its own record for that feed at its own key,
+so the feed's read state would be split across two records.
 
 `feedUrl` and `updatedAt` are required.
 
@@ -115,8 +115,13 @@ stored id and the link, so records written in between still resolve.
 
 An RFC 3339 instant. It is compared against the item's **publication date**:
 RSS `pubDate` / Atom `published`, else Atom `updated`; for a standard.site
-document `publishedAt`, else the instant encoded in the record key's TID. A
-date more than two days in the future is treated as absent.
+document `publishedAt`, else the instant encoded in the record key's TID.
+
+A date implausibly far in the future is not trusted. FeatherReader treats a
+feed item's date more than two days ahead as absent, and falls back from a
+standard.site `publishedAt` more than five minutes ahead to the record key's
+TID instant. A second implementation should apply the same two limits, or the
+two will disagree about which items a `readThrough` covers.
 
 The date a reader first fetched an item is never the basis: it differs between
 instances, so a mark computed from it would mean something different everywhere.

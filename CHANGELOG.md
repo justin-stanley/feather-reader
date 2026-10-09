@@ -37,9 +37,10 @@ deploying is separate.
   and read-merge-write as the writer's duty. A test
   (`lexicon::lexicon_json_tests`) serializes a full sample of each serde type
   and checks it against its JSON both ways, so a field added to one and not
-  the other fails the build. No record changes format in this entry; the
-  item-id and `readThrough` rules it states are implemented by the two
-  entries that follow it.
+  the other fails the build. No record changes format in this entry. The
+  item-id rule it states lands in #287's second PR, before 0.4.9; the
+  `readThrough` basis in its third. Until then FeatherReader writes what the
+  #246 entry below describes.
 
 ### Fixed
 
