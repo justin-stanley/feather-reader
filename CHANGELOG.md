@@ -27,6 +27,20 @@ deploying is separate.
   collection once** before writing — one more bounded repo walk per DID per
   round that has something to write. Rounds with nothing dirty do not list.
 
+### Added
+
+- **The `community.lexicon.rss.*` schema is written down (#287).** Lexicon
+  JSON for `subscription`, `folder`, `saved` and `readState` under
+  `lexicons/community/lexicon/rss/`, and `docs/lexicon.md` with the semantics:
+  what a `readState` record asserts, the item-id rule, what `readThrough` is
+  compared against, `updatedAt` as the tie-break, the 1000-id and 64 KiB caps,
+  and read-merge-write as the writer's duty. A test
+  (`lexicon::lexicon_json_tests`) serializes a full sample of each serde type
+  and checks it against its JSON both ways, so a field added to one and not
+  the other fails the build. No record changes format in this entry; the
+  item-id and `readThrough` rules it states are implemented by the two
+  entries that follow it.
+
 ### Fixed
 
 - **A fresh or restored database, or another client, no longer has its read
