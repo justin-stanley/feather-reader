@@ -96,6 +96,11 @@ The record types ([`src/lexicon.rs`](src/lexicon.rs)):
 - `community.lexicon.rss.saved` — a starred / saved item
 - `community.lexicon.rss.readState` — a compact per-feed read cursor
 
+The schema is written down as Lexicon JSON under
+[`lexicons/community/lexicon/rss/`](lexicons/community/lexicon/rss/), and the
+semantics — what a `readState` record asserts, how items are identified, how
+two writers merge — in [`docs/lexicon.md`](docs/lexicon.md).
+
 ## standard.site publications
 
 A [standard.site](https://standard.site) publication is not a feed document. It
