@@ -102,6 +102,9 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
 
+A writer must not list an id in both `readIds` and `unreadIds`; a reader that
+sees one in both treats it as unread.
+
 An item with neither an id nor a link has no item id. It is never written to
 either array; it is covered by `readThrough` when it has a publication date,
 and otherwise its read state is not portable.

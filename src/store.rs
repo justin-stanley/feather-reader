@@ -3690,32 +3690,52 @@ pub async fn clean_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
 /// entry (swept, or never on this feed) is absent from the map, and so is a
 /// synthesized row with no `url` — an item with neither an id nor a link has
 /// no portable name, and is covered only by `readThrough`.
+///
+/// Each item id comes with when `did` last marked that row
+/// (`entry_state.updated_at`; `None` when it has no `entry_state` row). Several
+/// rows can share one link, and the flush needs the stamps to decide which
+/// side of the record an id shared by a read and an unread row belongs on.
 pub async fn guids_for_entry_ids(
     pool: &SqlitePool,
+    did: &str,
     feed_url: &str,
     ids: &[i64],
-) -> Result<std::collections::HashMap<i64, String>> {
+) -> Result<std::collections::HashMap<i64, ItemRef>> {
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
     let json = serde_json::to_string(ids).context("encoding entry ids")?;
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+    let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         r#"
         SELECT e.id,
-               CASE WHEN e.guid_synthesized = 1 THEN e.url ELSE e.guid END
+               CASE WHEN e.guid_synthesized = 1 THEN e.url ELSE e.guid END,
+               s.updated_at
         FROM json_each(?2) j
         JOIN entries e ON e.id = j.value
         JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?3
         WHERE f.url = ?1
           AND (e.guid_synthesized = 0 OR e.url IS NOT NULL)
         "#,
     )
     .bind(feed_url)
     .bind(json)
+    .bind(did)
     .fetch_all(pool)
     .await
     .with_context(|| format!("guids_for_entry_ids failed for {feed_url}"))?;
-    Ok(rows.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .map(|(row, id, marked_at)| (row, ItemRef { id, marked_at }))
+        .collect())
+}
+
+/// An item id and when the reader last marked the row it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRef {
+    pub id: String,
+    /// The row's `entry_state.updated_at`, when it has one.
+    pub marked_at: Option<String>,
 }
 
 /// A local entry a remote GUID resolved to: its row id, and `did`'s
@@ -6014,7 +6034,16 @@ mod tests {
     async fn guids_for_entry_ids_names_a_synthesized_row_by_its_link() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let (_, [a, b, c, d, ..]) = item_id_rows(&pool).await?;
-        let got = guids_for_entry_ids(&pool, "https://ids.example/f.xml", &[a, b, c, d]).await?;
+        let got = guids_for_entry_ids(
+            &pool,
+            "did:plc:r",
+            "https://ids.example/f.xml",
+            &[a, b, c, d],
+        )
+        .await?
+        .into_iter()
+        .map(|(k, v)| (k, v.id))
+        .collect::<std::collections::HashMap<i64, String>>();
         let want: std::collections::HashMap<i64, String> = [
             (a, "pub-1".to_string()),
             (b, "https://x/2".to_string()),

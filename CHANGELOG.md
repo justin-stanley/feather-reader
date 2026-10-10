@@ -242,6 +242,17 @@ deploying is separate.
   normalisation on either side, because a rule two independent readers must
   agree on cannot have one.
 
+  **One side per id.** Several rows can name one link, so a read row and an
+  explicitly unread row can map to the same item id. `build_record` keeps
+  such an id on the side the reader marked most recently
+  (`entry_state.updated_at`, the latest of each side's rows; one batched
+  query), and a tie or a missing stamp goes to unread, so an explicit unread
+  is never lost to another row's read. A record from an older writer that
+  lists an id in both sets is read as unread (`docs/lexicon.md`). Tests, both
+  backends, each red first: read earlier / unread later, unread earlier / read
+  later, a tie, and a remote id in both sets; always-read, always-unread and
+  both-sets-as-read each fail one.
+
   **Not changed:** stored guids (the dedup key) are byte-identical; `idType`
   stays `"guid"`, documented as "item id"; `saved.entryId` still writes the
   stored guid (follow-up).
