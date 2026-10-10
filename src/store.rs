@@ -827,18 +827,34 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // then (once per database, never on a later boot), the stored validators
     // are cleared: the first poll after the upgrade is a full fetch for every
     // feed, which re-flags every row it still lists.
-    let added = ensure_column(
-        pool,
-        "PRAGMA table_info(entries)",
-        "guid_synthesized",
-        "ALTER TABLE entries ADD COLUMN guid_synthesized INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-    if added {
+    //
+    // **Both in one transaction.** Were they separate statements, a crash
+    // between them would leave the column added and the clear skipped, and
+    // every later boot would see the column and never clear: that database
+    // would keep writing hashes for good. Rolled back together, the next boot
+    // simply does both.
+    let present = sqlx::query("PRAGMA table_info(entries)")
+        .fetch_all(pool)
+        .await
+        .context("PRAGMA table_info(entries) failed")?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "guid_synthesized");
+    if !present {
+        let mut tx = pool
+            .begin()
+            .await
+            .context("begin the guid_synthesized migration")?;
+        sqlx::query("ALTER TABLE entries ADD COLUMN guid_synthesized INTEGER NOT NULL DEFAULT 0")
+            .execute(&mut *tx)
+            .await
+            .context("adding column guid_synthesized")?;
         sqlx::query("UPDATE feeds SET etag = NULL, last_modified = NULL")
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .context("clearing HTTP validators so the first poll re-flags guid_synthesized")?;
+        tx.commit()
+            .await
+            .context("commit the guid_synthesized migration")?;
     }
     Ok(())
 }
