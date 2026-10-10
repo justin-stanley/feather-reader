@@ -310,7 +310,9 @@ fn later(a: &str, b: &str) -> bool {
 /// - **A legacy record** (no `idType`) holds another database's row ids: its
 ///   id arrays are ignored entirely. Its `readThrough` still merges, in
 ///   [`read_state_record`].
-/// - **A remote GUID with a local entry** is imported into `entry_state`
+/// - **A remote item id with a local entry** (matched by guid, or by link for
+///   a row whose guid FeatherReader synthesized — `store::entries_for_guids`)
+///   is imported into `entry_state`
 ///   unless it conflicts: read there and explicitly unread here (in the
 ///   cursor's `unread_ids`), or unread there and read here. Then the side with
 ///   the newer `updatedAt` wins, and a tie goes to local.
@@ -385,17 +387,20 @@ async fn plan_guid_merge(
     cursor: &ReadCursor,
     theirs: &ReadState,
 ) -> anyhow::Result<MergePlan> {
-    let remote_read: Vec<String> = dedup(theirs.read_ids.iter().cloned());
-    let read_set: HashSet<&String> = remote_read.iter().collect();
-    // A GUID in both of the remote's own sets is read: the record contradicts
-    // itself, and read is what its `readIds` field asserts most directly.
-    let remote_unread: Vec<String> = dedup(
+    // An id in both of the remote's own sets is unread: a writer must not list
+    // one in both (docs/lexicon.md), and when one did, the unread is the reader
+    // keeping something, so it is the safer reading. Two different strings can
+    // name ONE row (an old hash and a new link), so the rule is applied twice:
+    // here to identical strings, and below, after resolution, to rows.
+    let unread_set: HashSet<&String> = theirs.unread_ids.iter().collect();
+    let remote_read: Vec<String> = dedup(
         theirs
-            .unread_ids
+            .read_ids
             .iter()
-            .filter(|g| !read_set.contains(g))
+            .filter(|g| !unread_set.contains(g))
             .cloned(),
     );
+    let remote_unread: Vec<String> = dedup(theirs.unread_ids.iter().cloned());
 
     let all: Vec<String> = remote_read.iter().chain(&remote_unread).cloned().collect();
     let local = store::entries_for_guids(&state.db, did, &cursor.feed_url, &all).await?;
@@ -418,19 +423,42 @@ async fn plan_guid_merge(
         updated_at: Some(theirs.updated_at.clone()),
         ..Carry::default()
     };
+    // **Rows the record lists as unread, by any string.** A row named by both a
+    // read id and an unread id is unread; a read id that names only such rows
+    // lost, and is neither imported nor carried (carried, it would be written
+    // back into `readIds` next to the unread one, every round).
+    let unread_rows: HashSet<i64> = remote_unread
+        .iter()
+        .filter_map(|g| local.get(g))
+        .flatten()
+        .map(|e| e.id)
+        .collect();
     let (mut to_read, mut to_unread) = (Vec::new(), Vec::new());
     for guid in remote_read {
         match local.get(&guid) {
             None => carry.read.unresolved.push(guid),
-            Some(e) => {
-                let explicitly_unread = local_unread.contains(&e.id);
+            Some(rows) => {
+                let rows: Vec<store::GuidEntry> = rows
+                    .iter()
+                    .filter(|e| !unread_rows.contains(&e.id))
+                    .cloned()
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = &rows;
+                // Several rows can share a link (a title edit on an id-less
+                // item); the id is explicitly unread here if any of them is.
+                let explicitly_unread = rows.iter().any(|e| local_unread.contains(&e.id));
                 if explicitly_unread && !remote_wins {
                     // Lost to the newer local unread: neither imported nor
                     // carried.
                     continue;
                 }
-                if !e.read || explicitly_unread {
-                    to_read.push(e.clone());
+                for e in rows {
+                    if !e.read || local_unread.contains(&e.id) {
+                        to_read.push(e.clone());
+                    }
                 }
                 carry.read.resolved.push(guid);
             }
@@ -439,15 +467,17 @@ async fn plan_guid_merge(
     for guid in remote_unread {
         match local.get(&guid) {
             None => carry.unread.unresolved.push(guid),
-            Some(e) => {
-                if e.read && !remote_wins {
+            Some(rows) => {
+                if rows.iter().any(|e| e.read) && !remote_wins {
                     continue;
                 }
-                // Into `unread_ids` even when it is already unread here, or the
-                // record would drop it — and below a `readThrough`, a missing
-                // unread id reads as read.
-                if e.read || !local_unread.contains(&e.id) {
-                    to_unread.push(e.clone());
+                for e in rows {
+                    // Into `unread_ids` even when it is already unread here, or
+                    // the record would drop it — and below a `readThrough`, a
+                    // missing unread id reads as read.
+                    if e.read || !local_unread.contains(&e.id) {
+                        to_unread.push(e.clone());
+                    }
                 }
                 carry.unread.resolved.push(guid);
             }
@@ -778,16 +808,18 @@ async fn read_state_record(
         .chain(&parse_id_array(&cursor.unread_ids))
         .filter_map(|s| s.parse().ok())
         .collect();
-    let guids = store::guids_for_entry_ids(&state.db, &cursor.feed_url, &ids).await?;
+    let guids = store::guids_for_entry_ids(&state.db, &cursor.did, &cursor.feed_url, &ids).await?;
     Ok(build_record(cursor, &guids, remote_read_through, carry))
 }
 
 /// Build the record from a cursor, the GUIDs of its ids, the remote
 /// `readThrough` and the remote GUIDs to carry.
 ///
-/// **Ids are GUIDs, and the record says so** (`idType: "guid"`): the cursor's
-/// row ids mean nothing on another instance. A row id with no GUID — its entry
-/// was swept — drops out; there is nothing it could mean to anyone.
+/// **Ids are item ids (`docs/lexicon.md`), and the record says so**
+/// (`idType: "guid"`, the lexicon's historical name for them): the stored
+/// guid, or the link for a row whose guid FeatherReader synthesized
+/// (`store::guids_for_entry_ids`). A row id with no item id — its entry was
+/// swept, or it is an item with neither an id nor a link — drops out.
 ///
 /// `read_through` is optional both locally AND in the record: when neither
 /// side has a high-water-mark the record OMITS `readThrough` entirely. This is
@@ -806,20 +838,62 @@ async fn read_state_record(
 /// is later (see [`Carry`]).
 fn build_record(
     cursor: &ReadCursor,
-    guids: &HashMap<i64, String>,
+    guids: &HashMap<i64, store::ItemRef>,
     remote_read_through: Option<&str>,
     carry: &Carry,
 ) -> ReadState {
-    let to_guids = |raw: &str| -> Vec<String> {
-        dedup(
-            parse_id_array(raw)
-                .iter()
-                .filter_map(|s| s.parse::<i64>().ok())
-                .filter_map(|id| guids.get(&id).cloned()),
-        )
+    // Each side's item ids, deduplicated, with the latest time the reader
+    // marked any row that maps to it. Rows can share an item id (a title edit
+    // on an id-less item makes a second row with the same link).
+    let to_items = |raw: &str| -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for r in parse_id_array(raw)
+            .iter()
+            .filter_map(|s| s.parse::<i64>().ok())
+            .filter_map(|id| guids.get(&id))
+        {
+            match out.iter_mut().find(|(g, _)| *g == r.id) {
+                None => out.push((r.id.clone(), r.marked_at.clone())),
+                Some((_, at)) => {
+                    let newer = match (at.as_deref(), r.marked_at.as_deref()) {
+                        (None, Some(_)) => true,
+                        (Some(a), Some(b)) => later(b, a),
+                        _ => false,
+                    };
+                    if newer {
+                        *at = r.marked_at.clone();
+                    }
+                }
+            }
+        }
+        out
     };
-    let read_ids = to_guids(&cursor.read_ids);
-    let unread_ids = to_guids(&cursor.unread_ids);
+    let (read_items, unread_items) = (to_items(&cursor.read_ids), to_items(&cursor.unread_ids));
+    // **An item id is on one side.** Several rows can share an item id, and
+    // the reader can have marked one read and another unread; the id stays on
+    // the side marked most recently. A tie, or a row with no mark time, goes
+    // to unread: an unread is the reader keeping something, and the wrong
+    // answer there is a lost item rather than a redundant one.
+    let read_wins = |g: &str, read_at: &Option<String>| -> bool {
+        match (
+            read_at.as_deref(),
+            unread_items.iter().find(|(u, _)| u == g),
+        ) {
+            (_, None) => true,
+            (Some(r), Some((_, Some(u)))) => later(r, u),
+            _ => false,
+        }
+    };
+    let read_ids: Vec<String> = read_items
+        .iter()
+        .filter(|(g, at)| read_wins(g, at))
+        .map(|(g, _)| g.clone())
+        .collect();
+    let unread_ids: Vec<String> = unread_items
+        .iter()
+        .filter(|(g, _)| !read_ids.contains(g))
+        .map(|(g, _)| g.clone())
+        .collect();
 
     let read_through = match (cursor.read_through.as_deref(), remote_read_through) {
         (Some(local), Some(remote)) if later(remote, local) => Some(remote.to_string()),
@@ -845,7 +919,8 @@ fn build_record(
     let mut record = ReadState::new(&cursor.feed_url, read_through, &updated_at);
     record.id_type = Some(ReadState::ID_TYPE_GUID.to_string());
     // A carried GUID already in a local set is local: written once, and on the
-    // side the local state says — so the two sets can never overlap.
+    // side the local state says. With the rule above (an item id on one side,
+    // the most recently marked, a tie to unread) the two sets never overlap.
     let local: HashSet<&String> = read_ids.iter().chain(&unread_ids).collect();
     let carried = |c: &Carried| -> Carried {
         let keep = |ids: &[String]| -> Vec<String> {
@@ -1082,7 +1157,15 @@ pub(crate) mod tests {
         let guids = parse_id_array(&cursor.read_ids)
             .into_iter()
             .chain(parse_id_array(&cursor.unread_ids))
-            .filter_map(|s| Some((s.parse().ok()?, s)))
+            .filter_map(|s| {
+                Some((
+                    s.parse().ok()?,
+                    store::ItemRef {
+                        id: s,
+                        marked_at: None,
+                    },
+                ))
+            })
             .collect();
         build_record(cursor, &guids, None, &Carry::default())
     }
@@ -1119,13 +1202,16 @@ pub(crate) mod tests {
     #[test]
     fn read_state_record_applies_the_id_cap() {
         let ids: Vec<String> = (0..ReadState::MAX_IDS + 5).map(|i| i.to_string()).collect();
-        let json = serde_json::to_string(&ids).unwrap();
+        // Disjoint: an item id is on one side of a record.
+        let other: Vec<String> = (0..ReadState::MAX_IDS + 5)
+            .map(|i| (i + 100_000).to_string())
+            .collect();
         let cursor = crate::store::ReadCursor {
             did: "did:plc:x".into(),
             feed_url: "https://example.com/feed.xml".into(),
             read_through: None,
-            read_ids: json.clone(),
-            unread_ids: json,
+            read_ids: serde_json::to_string(&ids).unwrap(),
+            unread_ids: serde_json::to_string(&other).unwrap(),
             dirty: true,
             pds_created: false,
             updated_at: "2026-07-12T00:00:00Z".into(),
@@ -1592,6 +1678,51 @@ pub(crate) mod tests {
             &[store::NewEntry {
                 guid: guid.into(),
                 published: Some(published.into()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(DID)
+            .bind(feed_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2")
+            .bind(feed_id)
+            .bind(guid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+
+    /// Like [`entry_at`], but the row's guid is a FeatherReader stand-in and
+    /// the item is named by `url` (which may be absent) in a record.
+    pub(crate) async fn synthesized_entry(
+        state: &AppState,
+        i: usize,
+        guid: &str,
+        url: Option<&str>,
+    ) -> i64 {
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: feed(i),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[store::NewEntry {
+                guid: guid.into(),
+                url: url.map(str::to_string),
+                published: Some("2026-01-01T00:00:00Z".into()),
+                guid_synthesized: true,
                 ..Default::default()
             }],
             0,
@@ -3073,7 +3204,18 @@ pub(crate) mod tests {
             pds_created: true,
             updated_at: "2026-01-01T00:00:00Z".into(),
         };
-        let guids: HashMap<i64, String> = (1..=5).zip(local.iter().cloned()).collect();
+        let guids: HashMap<i64, store::ItemRef> = (1..=5)
+            .zip(local.iter().cloned())
+            .map(|(i, id)| {
+                (
+                    i,
+                    store::ItemRef {
+                        id,
+                        marked_at: None,
+                    },
+                )
+            })
+            .collect();
         let carry = Carry {
             read: Carried {
                 unresolved: unresolved.clone(),
@@ -3314,6 +3456,389 @@ pub(crate) mod tests {
                 !is_read(&state, x).await,
                 "{backend:?}: the import overwrote a newer local unread"
             );
+        }
+    }
+
+    // ── #287: the item-id rule ───────────────────────────────────────────────
+
+    /// **An item with no publisher id is written as its link**, not as the
+    /// hash FeatherReader made up for it.
+    #[tokio::test]
+    async fn a_link_only_item_is_written_as_its_link() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let hash = "5813b43a0512aaef2750311bf4d978a";
+            let id = synthesized_entry(&state, 1, hash, Some("https://n.example/post")).await;
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["https://n.example/post", "pub-1"]),
+                "{backend:?}: {rec}"
+            );
+        }
+    }
+
+    /// **An item with neither an id nor a link has no portable name**, so it is
+    /// left out of the record; the cursor still holds its row id.
+    #[tokio::test]
+    async fn an_item_with_neither_id_nor_link_is_not_written() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let id = synthesized_entry(&state, 1, "featherreader:synthetic:deadbeef", None).await;
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["pub-1"]),
+                "{backend:?}: {rec}"
+            );
+            let c = cursor(&state, 1).await;
+            assert_eq!(parse_id_array(&c.read_ids).len(), 2, "{backend:?}");
+            assert!(!c.dirty, "{backend:?}");
+        }
+    }
+
+    /// **A remote link id marks the link-only item read here.**
+    #[tokio::test]
+    async fn a_remote_link_id_marks_a_link_only_item_read() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let b = synthesized_entry(&state, 1, "hash-b", Some("https://n.example/b")).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["https://n.example/b"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b).await,
+                "{backend:?}: the link did not resolve"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["https://n.example/b", "pub-1"]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **A record written by a build before #287 still resolves**: it holds the
+    /// feed-rs hash, which is still the row's guid.
+    #[tokio::test]
+    async fn a_record_written_with_a_feed_rs_hash_still_resolves() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let hash = "5813b43a0512aaef2750311bf4d978a";
+            let b = synthesized_entry(&state, 1, hash, Some("https://n.example/post")).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[hash], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b).await,
+                "{backend:?}: the hash did not resolve"
+            );
+            let ids = id_set(&pds_record(&fake, 1), "readIds");
+            for want in ["https://n.example/post", "pub-1", hash] {
+                assert!(
+                    ids.contains(want),
+                    "{backend:?}: {want} missing from {ids:?}"
+                );
+            }
+        }
+    }
+
+    /// **Two rows sharing a link are both imported, and named once.**
+    #[tokio::test]
+    async fn two_rows_sharing_a_link_are_both_marked_read() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/edited";
+            let b1 = synthesized_entry(&state, 1, "hash-old-title", Some(u)).await;
+            let b2 = synthesized_entry(&state, 1, "hash-new-title", Some(u)).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b1).await && is_read(&state, b2).await,
+                "{backend:?}: only one of the two rows was imported"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&[u, "pub-1"]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **An explicit unread on ANY row sharing the link blocks an older
+    /// remote read.**
+    #[tokio::test]
+    async fn a_shared_link_explicitly_unread_on_one_row_blocks_the_import() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/edited";
+            let b1 = synthesized_entry(&state, 1, "hash-old-title", Some(u)).await;
+            let b2 = synthesized_entry(&state, 1, "hash-new-title", Some(u)).await;
+            assert!(store::mark_read(&state.db, DID, b2, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, b2, false).await.unwrap());
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[], "2000-01-01T00:00:00Z"),
+            );
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                !is_read(&state, b1).await && !is_read(&state, b2).await,
+                "{backend:?}: an older remote read beat a newer local unread"
+            );
+            let rec = pds_record(&fake, 1);
+            assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// Stamp a row's mark time (`read_marked_at`, and `updated_at` with it), so
+    /// a test controls which mark is the later one (two marks in one second
+    /// otherwise tie).
+    async fn stamp(state: &AppState, id: i64, at: &str) {
+        sqlx::query(
+            "UPDATE entry_state SET updated_at = ?1, read_marked_at = ?1 \
+             WHERE did = ?2 AND entry_id = ?3",
+        )
+        .bind(at)
+        .bind(DID)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    /// Two rows share a link; `b1` is marked read and `b2` read then unread,
+    /// stamped as given. The flushed record, per backend.
+    async fn shared_link_record(
+        read_at: &str,
+        unread_at: &str,
+    ) -> Vec<(Backend, serde_json::Value)> {
+        let mut out = Vec::new();
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/edited";
+            let b1 = synthesized_entry(&state, 1, "hash-old-title", Some(u)).await;
+            let b2 = synthesized_entry(&state, 1, "hash-new-title", Some(u)).await;
+            assert!(store::mark_read(&state.db, DID, b1, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, b2, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, b2, false).await.unwrap());
+            stamp(&state, b1, read_at).await;
+            stamp(&state, b2, unread_at).await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            out.push((backend, pds_record(&fake, 1)));
+        }
+        out
+    }
+
+    /// **An item id is on one side of the record**: rows sharing a link, one
+    /// read earlier and one unread later, name it in `unreadIds` only.
+    #[tokio::test]
+    async fn a_shared_link_read_earlier_and_unread_later_is_only_unread() {
+        let u = "https://n.example/edited";
+        for (backend, rec) in
+            shared_link_record("2026-03-01T00:00:00Z", "2026-03-02T00:00:00Z").await
+        {
+            assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// The reverse order: unread earlier, read later, is only read.
+    #[tokio::test]
+    async fn a_shared_link_unread_earlier_and_read_later_is_only_read() {
+        let u = "https://n.example/edited";
+        for (backend, rec) in
+            shared_link_record("2026-03-02T00:00:00Z", "2026-03-01T00:00:00Z").await
+        {
+            assert!(id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(!id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// A tie goes to unread.
+    #[tokio::test]
+    async fn a_shared_link_marked_at_the_same_instant_is_unread() {
+        let u = "https://n.example/edited";
+        for (backend, rec) in
+            shared_link_record("2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z").await
+        {
+            assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// **A remote record listing one id in both sets** (an older writer) is
+    /// read as unread, not read.
+    #[tokio::test]
+    async fn a_remote_id_in_both_sets_is_imported_as_unread() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/post";
+            let b = synthesized_entry(&state, 1, "hash-b", Some(u)).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[u], "2999-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(!is_read(&state, b).await, "{backend:?}: imported as read");
+            let rec = pds_record(&fake, 1);
+            assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// **The both-sets rule is applied to ROWS, after resolution.** An old
+    /// hash and a new link can name the same row; a record with one in each
+    /// array lists that row in both, and it is unread. Applied to the strings
+    /// it let both through, the read landed first, the unread failed its
+    /// snapshot check, and the row ended read, every round.
+    #[tokio::test]
+    async fn a_hash_and_a_link_naming_one_row_in_opposite_sets_is_unread() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let (u, hash) = ("https://n.example/post", "5813b43a0512aaef2750311bf4d978a");
+            let b = synthesized_entry(&state, 1, hash, Some(u)).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[hash], "2999-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(!is_read(&state, b).await, "{backend:?}: ended read");
+            let first = pds_record(&fake, 1);
+            assert!(
+                !id_set(&first, "readIds").contains(u),
+                "{backend:?}: {first}"
+            );
+            assert!(
+                !id_set(&first, "readIds").contains(hash),
+                "{backend:?}: {first}"
+            );
+
+            // A second round changes nothing.
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(!is_read(&state, b).await, "{backend:?}: read on round two");
+            let second = pds_record(&fake, 1);
+            assert_eq!(
+                (id_set(&second, "readIds"), id_set(&second, "unreadIds")),
+                (id_set(&first, "readIds"), id_set(&first, "unreadIds")),
+                "{backend:?}: the record moved on round two"
+            );
+        }
+    }
+
+    /// **An explicit unread below a LATER remote mark stays in the record**:
+    /// the record carries the later `readThrough`, so the exception is what
+    /// keeps the entry unread everywhere. Compaction used to drop it.
+    #[tokio::test]
+    async fn an_explicit_unread_below_a_later_remote_mark_stays_in_the_record() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let x = entry_at(&state, 1, "x", "2026-05-01T00:00:00Z").await;
+            assert!(store::mark_read(&state.db, DID, x, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, x, false).await.unwrap());
+            for i in 0..COMPACT_READ_IDS_THRESHOLD + 10 {
+                let day = format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60);
+                let id = entry_at(&state, 1, &format!("l-{i:04}"), &day).await;
+                store::mark_read(&state.db, DID, id, true).await.unwrap();
+            }
+            put_remote(
+                &fake,
+                1,
+                serde_json::json!({
+                    "$type": crate::lexicon::nsid::READ_STATE,
+                    "feedUrl": feed(1),
+                    "idType": "guid",
+                    "readThrough": "2026-12-31T00:00:00Z",
+                    "updatedAt": "2000-01-01T00:00:00Z",
+                }),
+            );
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                rec["readThrough"], "2026-12-31T00:00:00Z",
+                "{backend:?}: {rec}"
+            );
+            assert!(
+                id_set(&rec, "unreadIds").contains("x"),
+                "{backend:?}: {rec}"
+            );
+            assert!(!id_set(&rec, "readIds").contains("x"), "{backend:?}: {rec}");
+            assert!(!is_read(&state, x).await, "{backend:?}");
         }
     }
 }

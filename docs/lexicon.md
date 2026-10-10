@@ -80,8 +80,8 @@ For the feed `feedUrl`, an item is **read** if either:
 2. it has a publication date at or before `readThrough`, and its id is not in
    `unreadIds`.
 
-Otherwise it is unread. An id in both arrays is read (`readIds` wins). An item
-with no publication date is covered only by `readIds`.
+Otherwise it is unread. An id in both arrays is **unread** (see Item ids). An
+item with no publication date is covered only by `readIds`.
 
 ### Item ids (`idType: "guid"`)
 
@@ -102,6 +102,13 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
 
+A writer must not list an id in both `readIds` and `unreadIds`; a reader that
+sees one in both treats it as unread. Several local items can share one id (two
+entries with the same link, after a title edit): a writer that has such items
+on both sides lists the id in the array of the side whose read or unread mark
+is **most recent**. A tie, or a mark with no known time, goes to `unreadIds`.
+FeatherReader keeps the time of each read/unread mark (not of a star) for this.
+
 An item with neither an id nor a link has no item id. It is never written to
 either array; it is covered by `readThrough` when it has a publication date,
 and otherwise its read state is not portable.
@@ -118,11 +125,13 @@ by FeatherReader before 0.4.9 and holds that instance's private row ids: a
 reader must ignore its id arrays entirely. Its `readThrough` is still an
 instant and still merges.
 
-**Status in FeatherReader.** Before PR #287-2 (0.4.9), an item with no
+**Status in FeatherReader.** Implemented from 0.4.9. Before it, an item with no
 publisher id was written as a hash FeatherReader computed from its link and
 title (`5813b43a0512aaef2750311bf4d978a` is one). From 0.4.9 it is written as
-its link, and on read FeatherReader matches an incoming id against both the
-stored id and the link, so records written in between still resolve.
+its link, and on read an incoming id is matched against both the stored id and,
+for such items, the link, so a record written by an earlier build still
+resolves. An item whose only link is not `http(s)` has no portable id, like an
+item with no link.
 
 ### `readThrough`
 

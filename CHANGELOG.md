@@ -22,10 +22,33 @@ deploying is separate.
   `idType: "guid"` and entry GUIDs in `readIds` / `unreadIds`, instead of
   this instance's SQLite row ids. Existing records are rewritten in the new
   format on each feed's next flush; until then they are read as legacy (see
-  below). No local schema change: the database still keeps row ids.
+  below). The database still keeps row ids; the one local schema change is
+  below.
 - **Each flush round with dirty read state lists the reader's `readState`
   collection once** before writing — one more bounded repo walk per DID per
   round that has something to write. Rounds with nothing dirty do not list.
+- **Schema: `entries.guid_synthesized` (#287).** One column, `INTEGER NOT NULL
+  DEFAULT 0`, added by `ALTER TABLE` on first boot. Existing rows read 0, "the
+  publisher's id", which is what every flush assumed before; a row still in
+  its feed gets the right value on the feed's next poll, because the entry
+  upsert refreshes it. **A feed answering 304 is never re-parsed**, so the
+  same migration step that adds the column also clears every feed's stored
+  `etag` and `last_modified` (only when it adds the column: once per
+  database, never on a later boot). **Cost: one full fetch per feed, once,
+  after the upgrade.** Without it an id-less item on a quiet feed would keep
+  being written as a feed-rs hash. Rolling back to 0.4.8 works: that binary never names
+  the column, and SQLite fills the default. Checked by the upgrade test from a
+  0.4.8 schema (`tests/fixtures/schema-v0.4.8.sql`) and by the upgrade-boot
+  gate, which now seeds an entry row too.
+- **Schema: `entry_state.read_marked_at` (#287).** One nullable `TEXT`
+  column, no default, no index, added by `ALTER TABLE` on first boot. It is
+  when the row was last marked read or unread; starring does not move it
+  (`updated_at` does, which is why it is not used). An import sets it to the
+  remote record's `updatedAt`. **No back-fill:** existing rows stay NULL, "no
+  known mark", and a NULL loses against a known time and ties to unread. So
+  the first flush after the upgrade, for an item id shared by rows on both
+  sides, can only say unread until those rows are marked again. Rolling back
+  to 0.4.8 works: it never names the column.
 
 ### Added
 
@@ -201,6 +224,92 @@ deploying is separate.
   The #241 reconcile tests now fail the pre-write listing on purpose, since
   the listing would otherwise correct the flag before the write, and they
   count it as one more walk.
+
+- **An item with no publisher id is named by its link in `readState`, not by
+  a hash only FeatherReader computes (#287).** For an RSS, Atom or JSON Feed
+  item without a `guid`/`id`, `feed::entry_id` stores feed-rs's SipHash of the
+  link and title as the row's guid. Every FeatherReader computes the same
+  value, so #246's records already agreed between instances, but no other
+  reader could, and a title edit changed it. `docs/lexicon.md` now states the
+  item-id rule — publisher id, else a standard.site document's `at://` URI,
+  else the link URL — and the flush follows it.
+
+  **Ingest** records whether a row's guid was synthesized
+  (`entries.guid_synthesized`): `true` for the link+title hash and for
+  `featherreader:synthetic:` (an item with no link either), `false` for a
+  publisher id, a `featherreader:long-guid:` stand-in (the publisher did give
+  an id) and a standard.site URI. The hash case is detected by recomputing
+  `feed::entry_id` from the parsed entry, which is exact because feed-rs
+  generates an id only for an empty one, before it sanitises text.
+
+  **Write.** `store::guids_for_entry_ids` returns the `url` for a synthesized
+  row and the guid for any other. A synthesized row with no `url` is not
+  written: an item with neither an id nor a link has no name another reader
+  could use, and is covered only by `readThrough` when it has a date.
+
+  **Read.** `store::entries_for_guids` matches an incoming id against
+  `entries.guid`, or against `entries.url` for a synthesized row. So a record
+  that still holds a hash — written by an instance between #246 and this
+  change — resolves, and the next flush rewrites it as the link. A link that
+  several rows share (a title edit on an id-less item makes a second row)
+  resolves to all of them. Links are compared exactly, as stored; no
+  normalisation on either side, because a rule two independent readers must
+  agree on cannot have one.
+
+  **One side per id.** Several rows can name one link, so a read row and an
+  explicitly unread row can map to the same item id. `build_record` keeps
+  such an id on the side the reader marked most recently
+  (`entry_state.read_marked_at`, the latest of each side's rows; one batched
+  query), and a tie or a missing stamp goes to unread, so an explicit unread
+  is never lost to another row's read. The time is the read/unread mark's own,
+  not `updated_at`: starring a row moves `updated_at` and must not make an old
+  read look new. A record from an older writer that lists an id in both sets
+  is read as unread (`docs/lexicon.md`), and that is decided on the rows the
+  ids resolve to: an old hash and a new link naming one row, one in each
+  array, leave the row unread (applied to the strings it ended read, every
+  round). Tests, both backends, each red first: read earlier / unread later,
+  unread earlier / read later, a tie, a remote id in both sets, a hash and a
+  link naming one row in opposite sets (and a stable second round), and a
+  star after the marks (store level); always-read, always-unread,
+  both-sets-as-read, `updated_at` as the mark time, a star moving
+  `read_marked_at`, an import not stamping the remote time, and the rule back
+  on strings each fail one.
+
+  **Tests (upgrade validators), red first:** `the_upgrade_clears_http_validators_once`
+  (0.4.8 fixture with a feed holding both validators: NULL after the
+  migration; validators set afterwards survive a second boot) and
+  `a_fresh_database_keeps_its_http_validators`. Never clearing fails the
+  first; clearing on every boot fails both.
+
+  **Not changed:** stored guids (the dedup key) are byte-identical; `idType`
+  stays `"guid"`, documented as "item id"; `saved.entryId` still writes the
+  stored guid (follow-up).
+
+- **Compaction keeps every `unreadIds` exception (#287).** It kept only the
+  ones at or below the local `readThrough`, but the written record carries
+  the later of the local and the remote mark, so an exception above the local
+  one and below the remote one is what keeps that entry unread everywhere.
+  It was dropped before the write, and the record asserted the entry read.
+  Harmless so far only because nothing applies `readThrough` locally yet;
+  the next change makes FeatherReader honour it, so records written from
+  this release on must already be right. An exception now leaves the cursor
+  only when the reader reads the entry or the entry is swept; the 1000-id
+  and 64 KiB caps still bound the record. Tests: `compaction_keeps_explicit_unread_exceptions`,
+  and on both backends `an_explicit_unread_below_a_later_remote_mark_stays_in_the_record`,
+  each red first; filtering `unreadIds` again fails both.
+
+  Tests, each red first: the flag at ingest for the three guid shapes and for
+  a standard.site document; the upsert refreshing the flag; the write-side
+  mapping (publisher id, link, nothing for a synthetic row); the read-side
+  mapping (guid, link only for a synthesized row, several rows per link, exact
+  comparison); on both backends, a link-only item written as its link, a
+  synthetic item not written, a remote link id imported, a hash-era record
+  still resolving, two rows sharing a link both imported, and an explicit
+  unread on one of them blocking the import. Mutations each fail at least one
+  test: the flag never set, the upsert not refreshing it, the CASE always
+  returning the guid, the `url IS NOT NULL` guard dropped, either leg of the
+  matching query dropped, the synthesized guard dropped from the link leg,
+  and the per-row loop replaced by the first row.
 
 ## 0.4.8 — 2026-10-08
 
