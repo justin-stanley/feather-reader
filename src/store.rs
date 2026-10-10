@@ -1736,15 +1736,19 @@ pub async fn insert_entries(
         let res = sqlx::query(
             r#"
             INSERT INTO entries
-                (feed_id, guid, url, title, author, published, content_html, fetched_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (feed_id, guid, url, title, author, published, content_html, fetched_at,
+                 guid_synthesized)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
             ON CONFLICT (feed_id, guid) DO UPDATE SET
                 url          = excluded.url,
                 title        = excluded.title,
                 author       = excluded.author,
                 published    = excluded.published,
                 content_html = CASE WHEN ?9 THEN entries.content_html
-                                    ELSE excluded.content_html END
+                                    ELSE excluded.content_html END,
+                -- Refreshed on every poll: this is the back-fill for rows that
+                -- predate the column (#287).
+                guid_synthesized = excluded.guid_synthesized
             "#,
         )
         .bind(feed_id)
@@ -1756,6 +1760,7 @@ pub async fn insert_entries(
         .bind(&e.content_html)
         .bind(&fetched_at)
         .bind(e.keep_stored_content)
+        .bind(e.guid_synthesized)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("insert entry {} failed", e.guid))?;
