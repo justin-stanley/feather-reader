@@ -387,9 +387,11 @@ async fn plan_guid_merge(
     cursor: &ReadCursor,
     theirs: &ReadState,
 ) -> anyhow::Result<MergePlan> {
-    // A GUID in both of the remote's own sets is unread: a writer must not
-    // list one in both (docs/lexicon.md), and when an older one did, the
-    // unread is the reader keeping something, so it is the safer reading.
+    // An id in both of the remote's own sets is unread: a writer must not list
+    // one in both (docs/lexicon.md), and when one did, the unread is the reader
+    // keeping something, so it is the safer reading. Two different strings can
+    // name ONE row (an old hash and a new link), so the rule is applied twice:
+    // here to identical strings, and below, after resolution, to rows.
     let unread_set: HashSet<&String> = theirs.unread_ids.iter().collect();
     let remote_read: Vec<String> = dedup(
         theirs
@@ -421,11 +423,30 @@ async fn plan_guid_merge(
         updated_at: Some(theirs.updated_at.clone()),
         ..Carry::default()
     };
+    // **Rows the record lists as unread, by any string.** A row named by both a
+    // read id and an unread id is unread; a read id that names only such rows
+    // lost, and is neither imported nor carried (carried, it would be written
+    // back into `readIds` next to the unread one, every round).
+    let unread_rows: HashSet<i64> = remote_unread
+        .iter()
+        .filter_map(|g| local.get(g))
+        .flatten()
+        .map(|e| e.id)
+        .collect();
     let (mut to_read, mut to_unread) = (Vec::new(), Vec::new());
     for guid in remote_read {
         match local.get(&guid) {
             None => carry.read.unresolved.push(guid),
             Some(rows) => {
+                let rows: Vec<store::GuidEntry> = rows
+                    .iter()
+                    .filter(|e| !unread_rows.contains(&e.id))
+                    .cloned()
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = &rows;
                 // Several rows can share a link (a title edit on an id-less
                 // item); the id is explicitly unread here if any of them is.
                 let explicitly_unread = rows.iter().any(|e| local_unread.contains(&e.id));
@@ -3724,6 +3745,51 @@ pub(crate) mod tests {
             let rec = pds_record(&fake, 1);
             assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
             assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// **The both-sets rule is applied to ROWS, after resolution.** An old
+    /// hash and a new link can name the same row; a record with one in each
+    /// array lists that row in both, and it is unread. Applied to the strings
+    /// it let both through, the read landed first, the unread failed its
+    /// snapshot check, and the row ended read, every round.
+    #[tokio::test]
+    async fn a_hash_and_a_link_naming_one_row_in_opposite_sets_is_unread() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let (u, hash) = ("https://n.example/post", "5813b43a0512aaef2750311bf4d978a");
+            let b = synthesized_entry(&state, 1, hash, Some(u)).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[hash], "2999-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(!is_read(&state, b).await, "{backend:?}: ended read");
+            let first = pds_record(&fake, 1);
+            assert!(!id_set(&first, "readIds").contains(u), "{backend:?}: {first}");
+            assert!(
+                !id_set(&first, "readIds").contains(hash),
+                "{backend:?}: {first}"
+            );
+
+            // A second round changes nothing.
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+            assert!(!is_read(&state, b).await, "{backend:?}: read on round two");
+            let second = pds_record(&fake, 1);
+            assert_eq!(
+                (id_set(&second, "readIds"), id_set(&second, "unreadIds")),
+                (id_set(&first, "readIds"), id_set(&first, "unreadIds")),
+                "{backend:?}: the record moved on round two"
+            );
         }
     }
 
