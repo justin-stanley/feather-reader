@@ -2935,10 +2935,12 @@ pub async fn mark_starred(
 /// entry is read.
 ///
 /// Once the watermark moves, every `read_ids` entry at or before it is
-/// redundant and is dropped — that is the compaction. `unread_ids` is filtered
-/// the same way; by construction nothing unread sits at or below the new
-/// watermark, so it empties, but the filter is written rather than assumed so it
-/// stays correct if that invariant ever shifts.
+/// redundant and is dropped — that is the compaction. `unread_ids` is kept
+/// whole (#287): the written record carries the later of this mark and the
+/// remote record's, so an exception above this mark may be load-bearing there,
+/// and it is removed only when the reader reads the entry
+/// (`project_entry_into_cursor`) or the entry is swept
+/// (`prune_orphan_cursor_ids_tx`).
 ///
 /// Timestamps compare lexicographically because every writer normalises to UTC
 /// `...Z` at seconds precision (`feed::fmt_time`, `now_rfc3339`) — the same
@@ -3007,8 +3009,11 @@ pub async fn compact_cursor(
     }
 
     let keep_above = ids_published_after(&mut tx, feed_url, &read_ids, &watermark).await?;
-    let keep_unread =
-        ids_published_at_or_before(&mut tx, feed_url, &unread_ids, &watermark).await?;
+    // `unread_ids` is kept WHOLE (#287). It used to be filtered to ids at or
+    // below the local mark, but the written record carries the later of the
+    // local and the remote `readThrough`: an exception above the local mark
+    // and below the remote one is what keeps that entry unread everywhere,
+    // and it was being dropped before the write.
 
     // **The row's own `updated_at`, not now** (review of #286). It is the
     // record's `updatedAt`, which settles read/unread conflicts between
@@ -3028,7 +3033,7 @@ pub async fn compact_cursor(
         feed_url,
         Some(&watermark),
         &keep_above,
-        &keep_unread,
+        &unread_ids,
         &updated_at,
     )
     .await?;
@@ -3036,52 +3041,26 @@ pub async fn compact_cursor(
     Ok(Some(watermark))
 }
 
-/// The subset of `ids` whose entries are published strictly AFTER `watermark`,
-/// as the canonical JSON array-of-strings the cursor stores.
+/// The subset of `ids` whose entries sort strictly AFTER `watermark` on the
+/// compaction basis, as the canonical JSON array-of-strings the cursor stores.
 async fn ids_published_after(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     feed_url: &str,
     ids: &str,
     watermark: &str,
 ) -> Result<String> {
-    let live = ids_matching_watermark(tx, feed_url, watermark, true).await?;
-    Ok(filter_id_set_to_live(ids, &live))
-}
-
-/// The subset of `ids` whose entries are published at or BEFORE `watermark`.
-async fn ids_published_at_or_before(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    feed_url: &str,
-    ids: &str,
-    watermark: &str,
-) -> Result<String> {
-    let live = ids_matching_watermark(tx, feed_url, watermark, false).await?;
-    Ok(filter_id_set_to_live(ids, &live))
-}
-
-/// Entry ids on `feed_url` on one side of `watermark`. `after = true` selects
-/// strictly newer; `false` selects at-or-older.
-async fn ids_matching_watermark(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    feed_url: &str,
-    watermark: &str,
-    after: bool,
-) -> Result<std::collections::HashSet<i64>> {
-    let sql = if after {
+    let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
         "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
-         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) > ?2"
-    } else {
-        "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
-         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) <= ?2"
-    };
-    Ok(sqlx::query_scalar::<_, i64>(sql)
-        .bind(feed_url)
-        .bind(watermark)
-        .fetch_all(&mut **tx)
-        .await
-        .context("compact_cursor: ids on one side of the watermark")?
-        .into_iter()
-        .collect())
+         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) > ?2",
+    )
+    .bind(feed_url)
+    .bind(watermark)
+    .fetch_all(&mut **tx)
+    .await
+    .context("compact_cursor: ids after the watermark")?
+    .into_iter()
+    .collect();
+    Ok(filter_id_set_to_live(ids, &live))
 }
 
 /// Clear `did`'s star on any cached entry matching `url` or `guid`, **ignoring
