@@ -303,6 +303,12 @@ CREATE TABLE IF NOT EXISTS entries (
     published    TEXT,
     content_html TEXT,
     fetched_at   TEXT NOT NULL,
+    -- 1 when `guid` is a stand-in FeatherReader made because the item had no
+    -- publisher id (feed-rs's link+title hash, or `featherreader:synthetic:`),
+    -- 0 when it is the publisher's id or a standard.site at:// URI. Decides
+    -- what a readState record calls the item (#287): a synthesized row is
+    -- named by its `url`. Set by ingest; refreshed on every re-poll.
+    guid_synthesized INTEGER NOT NULL DEFAULT 0,
     UNIQUE (feed_id, guid)
 );
 -- The list and prev/next queries order on `COALESCE(published, fetched_at)`
@@ -804,6 +810,23 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("clearing stored future publication dates")?;
+
+    // entries.guid_synthesized — whether `guid` is FeatherReader's own stand-in
+    // rather than the publisher's id (#287). Older rows take the DEFAULT, 0,
+    // "the publisher's id": that is what every flush assumed before the column
+    // existed, so nothing changes for them until their feed is polled again,
+    // when `insert_entries` refreshes the flag from the parsed item. Rows that
+    // have left their feed keep 0 and are written as their stored guid, which
+    // every FeatherReader still matches. No back-fill here: the stored `url`
+    // and `title` are the vetted, bounded forms, not what the hash was made
+    // from, so a recomputation could only ever say "not sure".
+    ensure_column(
+        pool,
+        "PRAGMA table_info(entries)",
+        "guid_synthesized",
+        "ALTER TABLE entries ADD COLUMN guid_synthesized INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     Ok(())
 }
 
