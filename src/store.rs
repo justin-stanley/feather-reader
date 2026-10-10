@@ -820,13 +820,26 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // every FeatherReader still matches. No back-fill here: the stored `url`
     // and `title` are the vetted, bounded forms, not what the hash was made
     // from, so a recomputation could only ever say "not sure".
-    ensure_column(
+    //
+    // **The re-poll that sets the flag must happen.** A feed answering 304 is
+    // never re-parsed, so its id-less items would keep flag 0 and keep being
+    // written as feed-rs hashes. So, in the step that adds the column and only
+    // then (once per database, never on a later boot), the stored validators
+    // are cleared: the first poll after the upgrade is a full fetch for every
+    // feed, which re-flags every row it still lists.
+    let added = ensure_column(
         pool,
         "PRAGMA table_info(entries)",
         "guid_synthesized",
         "ALTER TABLE entries ADD COLUMN guid_synthesized INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    if added {
+        sqlx::query("UPDATE feeds SET etag = NULL, last_modified = NULL")
+            .execute(pool)
+            .await
+            .context("clearing HTTP validators so the first poll re-flags guid_synthesized")?;
+    }
     Ok(())
 }
 
@@ -834,12 +847,13 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
 /// does not already report `column`. All three SQL args are hard-coded internal
 /// literals (never user input), so they are safe `&'static str`s — the table name
 /// can't be a bind parameter in `PRAGMA`, which is why they're passed whole.
+/// Returns whether it added the column.
 async fn ensure_column(
     pool: &SqlitePool,
     info_sql: &'static str,
     column: &str,
     alter_sql: &'static str,
-) -> Result<()> {
+) -> Result<bool> {
     let rows = sqlx::query(info_sql)
         .fetch_all(pool)
         .await
@@ -851,7 +865,7 @@ async fn ensure_column(
             .await
             .with_context(|| format!("adding column {column} via {alter_sql}"))?;
     }
-    Ok(())
+    Ok(!present)
 }
 
 /// Insert a feed by URL, or update its metadata if the URL already exists.
@@ -10427,6 +10441,70 @@ mod tests {
             include_str!("../tests/fixtures/schema-v0.4.8.sql"),
         )
         .await
+    }
+
+    async fn validators(pool: &SqlitePool) -> Result<Vec<(Option<String>, Option<String>)>> {
+        Ok(
+            sqlx::query_as("SELECT etag, last_modified FROM feeds ORDER BY id")
+                .fetch_all(pool)
+                .await?,
+        )
+    }
+
+    /// **The upgrade forces one full fetch per feed.** A feed answering 304 is
+    /// never re-parsed, so `guid_synthesized` would stay 0 on its id-less
+    /// items and they would keep being written as feed-rs hashes (#287).
+    #[tokio::test]
+    async fn the_upgrade_clears_http_validators_once() -> Result<()> {
+        let pool = upgrade_test_pool().await?;
+        sqlx::raw_sql(include_str!("../tests/fixtures/schema-v0.4.8.sql"))
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO feeds (url, etag, last_modified) \
+             VALUES ('https://quiet.example/f.xml', '\"abc\"', 'Wed, 01 Jan 2026 00:00:00 GMT')",
+        )
+        .execute(&pool)
+        .await?;
+
+        init_schema(&pool).await?;
+        assert_eq!(
+            validators(&pool).await?,
+            vec![(None, None)],
+            "the first boot after the upgrade left a validator in place"
+        );
+
+        // Once: a validator stored after the upgrade survives later boots.
+        sqlx::query(
+            "UPDATE feeds SET etag = '\"new\"', last_modified = 'Thu, 02 Jan 2026 00:00:00 GMT'",
+        )
+        .execute(&pool)
+        .await?;
+        init_schema(&pool).await?;
+        assert_eq!(
+            validators(&pool).await?,
+            vec![(
+                Some("\"new\"".to_string()),
+                Some("Thu, 02 Jan 2026 00:00:00 GMT".to_string())
+            )],
+            "a later boot cleared the validators again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_keeps_its_http_validators() -> Result<()> {
+        let pool = upgrade_test_pool().await?;
+        init_schema(&pool).await?;
+        sqlx::query("INSERT INTO feeds (url, etag) VALUES ('https://f.example/f.xml', '\"e\"')")
+            .execute(&pool)
+            .await?;
+        init_schema(&pool).await?;
+        assert_eq!(
+            validators(&pool).await?,
+            vec![(Some("\"e\"".to_string()), None)]
+        );
+        Ok(())
     }
 
     #[tokio::test]

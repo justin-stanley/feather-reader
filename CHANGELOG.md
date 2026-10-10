@@ -31,7 +31,12 @@ deploying is separate.
   DEFAULT 0`, added by `ALTER TABLE` on first boot. Existing rows read 0, "the
   publisher's id", which is what every flush assumed before; a row still in
   its feed gets the right value on the feed's next poll, because the entry
-  upsert refreshes it. Rolling back to 0.4.8 works: that binary never names
+  upsert refreshes it. **A feed answering 304 is never re-parsed**, so the
+  same migration step that adds the column also clears every feed's stored
+  `etag` and `last_modified` (only when it adds the column: once per
+  database, never on a later boot). **Cost: one full fetch per feed, once,
+  after the upgrade.** Without it an id-less item on a quiet feed would keep
+  being written as a feed-rs hash. Rolling back to 0.4.8 works: that binary never names
   the column, and SQLite fills the default. Checked by the upgrade test from a
   0.4.8 schema (`tests/fixtures/schema-v0.4.8.sql`) and by the upgrade-boot
   gate, which now seeds an entry row too.
@@ -252,6 +257,12 @@ deploying is separate.
   backends, each red first: read earlier / unread later, unread earlier / read
   later, a tie, and a remote id in both sets; always-read, always-unread and
   both-sets-as-read each fail one.
+
+  **Tests (upgrade validators), red first:** `the_upgrade_clears_http_validators_once`
+  (0.4.8 fixture with a feed holding both validators: NULL after the
+  migration; validators set afterwards survive a second boot) and
+  `a_fresh_database_keeps_its_http_validators`. Never clearing fails the
+  first; clearing on every boot fails both.
 
   **Not changed:** stored guids (the dedup key) are byte-identical; `idType`
   stays `"guid"`, documented as "item id"; `saved.entryId` still writes the
