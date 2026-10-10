@@ -35,7 +35,9 @@ One followed feed. Key: `tid`. `url` and `createdAt` are required.
   has no behaviour today.
 - `siteUrl` is rendered as a link, so a reader must drop a value whose scheme is
   not `http` or `https` when it reads the record.
-- `folder` is a strong ref (`at://`) to a `folder` record in the same repo.
+- `folder` is an `at://` URI string (not a `com.atproto.repo.strongRef`
+  object) naming a `folder` record in the same repo. FeatherReader cannot read
+  a subscription whose `folder` is an object.
 - `fetchHint` is an open enum; an unknown value must not break a reader.
 
 ## `community.lexicon.rss.folder`
@@ -49,12 +51,19 @@ rename) must write back fields it does not know.
 An item kept for later. Key: `tid`. `url` and `createdAt` are required. `url` is
 the permalink; `feedUrl` and `entryId` are soft references that let a reader
 match the record to a cached item (FeatherReader matches on `url` or `entryId`).
-`entryId` follows the item-id rule below.
+`entryId` is meant to follow the item-id rule below.
+
+**Status in FeatherReader.** FeatherReader writes `entryId` as its stored
+entry id, which for an item with no publisher id is its own stand-in (a hash,
+or `featherreader:synthetic:…`) rather than the link. A reader matching saved
+records by `entryId` will not match those items; match on `url` instead.
 
 ## `community.lexicon.rss.readState`
 
-A reader's read state for one feed. Key: `any`; FeatherReader uses
-`rs-` followed by the lowercase-hex FNV-1a-64 of `feedUrl`, so there is exactly
+A reader's read state for one feed. Key: `any`; FeatherReader uses `rs-`
+followed by the FNV-1a-64 hash of the UTF-8 bytes of `feedUrl`, written as
+**16 lowercase hex digits, zero-padded** (offset basis `0xcbf29ce484222325`,
+prime `0x100000001b3`), so there is exactly
 one record per feed and a writer can find it without listing. A second
 implementation that wants to share records with FeatherReader must use the same
 key. FeatherReader ignores a `readState` record at any other key: it neither
@@ -84,7 +93,11 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
    (`at://did/site.standard.document/rkey`).
 3. Else **the item's link URL**: the entry's `rel="alternate"` or rel-less
    link, else its first link that is not a comments link, as the feed gives it,
-   trimmed, with no other normalisation. Compared exactly, byte for byte.
+   trimmed, with no other normalisation. It must parse as an **absolute
+   `http` or `https` URL**; a relative or other-scheme link gives the item no
+   link id. A link over 8192 bytes is cut to its longest prefix of at most
+   8192 bytes that ends on a UTF-8 character boundary. Compared exactly, byte
+   for byte.
 
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
