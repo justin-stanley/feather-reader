@@ -3620,10 +3620,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stamp `entry_state.updated_at` for a row, so a test controls which
-    /// mark is the later one (two marks in one second otherwise tie).
+    /// Stamp a row's mark time (`read_marked_at`, and `updated_at` with it), so
+    /// a test controls which mark is the later one (two marks in one second
+    /// otherwise tie).
     async fn stamp(state: &AppState, id: i64, at: &str) {
-        sqlx::query("UPDATE entry_state SET updated_at = ?1 WHERE did = ?2 AND entry_id = ?3")
+        sqlx::query(
+            "UPDATE entry_state SET updated_at = ?1, read_marked_at = ?1 \
+             WHERE did = ?2 AND entry_id = ?3",
+        )
             .bind(at)
             .bind(DID)
             .bind(id)

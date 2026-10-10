@@ -324,6 +324,13 @@ CREATE TABLE IF NOT EXISTS entry_state (
     read       INTEGER NOT NULL DEFAULT 0,
     starred    INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
+    -- When `read` was last set or asserted: by the reader marking the row
+    -- (read or unread), or by an import, at the remote record's `updatedAt`.
+    -- NOT touched by starring, which moves `updated_at`. NULL when no mark is
+    -- known (a row that predates the column, or one only ever starred). Decides
+    -- which side of a readState record an item id shared by several rows goes
+    -- on: the side marked most recently (#287). Never indexed.
+    read_marked_at TEXT,
     PRIMARY KEY (did, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state_did_read ON entry_state (did, read);
@@ -833,6 +840,19 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // every later boot would see the column and never clear: that database
     // would keep writing hashes for good. Rolled back together, the next boot
     // simply does both.
+    // entry_state.read_marked_at — when `read` was last set (#287). Nullable
+    // with no default: a row that predates the column has no known mark time,
+    // and stays NULL; no back-fill, since `updated_at` also moves on a star and
+    // would invent a time. NULL loses every comparison, so an id shared with a
+    // row marked later is decided by that row; with nothing known, unread.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(entry_state)",
+        "read_marked_at",
+        "ALTER TABLE entry_state ADD COLUMN read_marked_at TEXT",
+    )
+    .await?;
+
     let present = sqlx::query("PRAGMA table_info(entries)")
         .fetch_all(pool)
         .await
@@ -2899,8 +2919,8 @@ pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) 
     let mut tx = pool.begin().await.context("begin mark_read tx")?;
     let res = sqlx::query(
         r#"
-        INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-        SELECT ?1, e.id, ?3, 0, ?4
+        INSERT INTO entry_state (did, entry_id, read, starred, updated_at, read_marked_at)
+        SELECT ?1, e.id, ?3, 0, ?4, ?4
         FROM entries e
         WHERE e.id = ?2
           AND EXISTS (
@@ -2908,8 +2928,9 @@ pub async fn mark_read(pool: &SqlitePool, did: &str, entry_id: i64, read: bool) 
               WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
           )
         ON CONFLICT (did, entry_id) DO UPDATE SET
-            read       = excluded.read,
-            updated_at = excluded.updated_at
+            read           = excluded.read,
+            updated_at     = excluded.updated_at,
+            read_marked_at = excluded.read_marked_at
         "#,
     )
     .bind(did)
@@ -3186,16 +3207,17 @@ pub async fn mark_feed_read(pool: &SqlitePool, did: &str, feed_id: i64, read: bo
     let mut tx = pool.begin().await.context("begin mark_feed_read tx")?;
     let res = sqlx::query(
         r#"
-        INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-        SELECT ?1, e.id, ?2, 0, ?3 FROM entries e
+        INSERT INTO entry_state (did, entry_id, read, starred, updated_at, read_marked_at)
+        SELECT ?1, e.id, ?2, 0, ?3, ?3 FROM entries e
         WHERE e.feed_id = ?4
           AND EXISTS (
               SELECT 1 FROM sub_ref sr
               WHERE sr.did = ?1 AND sr.feed_id = e.feed_id
           )
         ON CONFLICT (did, entry_id) DO UPDATE SET
-            read       = excluded.read,
-            updated_at = excluded.updated_at
+            read           = excluded.read,
+            updated_at     = excluded.updated_at,
+            read_marked_at = excluded.read_marked_at
         "#,
     )
     .bind(did)
@@ -3721,8 +3743,9 @@ pub async fn clean_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
 /// synthesized row with no `url` — an item with neither an id nor a link has
 /// no portable name, and is covered only by `readThrough`.
 ///
-/// Each item id comes with when `did` last marked that row
-/// (`entry_state.updated_at`; `None` when it has no `entry_state` row). Several
+/// Each item id comes with when `did` last marked that row read or unread
+/// (`entry_state.read_marked_at`, which a star does not move; `None` when no
+/// mark time is known). Several
 /// rows can share one link, and the flush needs the stamps to decide which
 /// side of the record an id shared by a read and an unread row belongs on.
 pub async fn guids_for_entry_ids(
@@ -3739,7 +3762,7 @@ pub async fn guids_for_entry_ids(
         r#"
         SELECT e.id,
                CASE WHEN e.guid_synthesized = 1 THEN e.url ELSE e.guid END,
-               s.updated_at
+               s.read_marked_at
         FROM json_each(?2) j
         JOIN entries e ON e.id = j.value
         JOIN feeds f ON f.id = e.feed_id
@@ -3764,7 +3787,7 @@ pub async fn guids_for_entry_ids(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemRef {
     pub id: String,
-    /// The row's `entry_state.updated_at`, when it has one.
+    /// The row's `entry_state.read_marked_at`, when it has one.
     pub marked_at: Option<String>,
 }
 
@@ -3852,6 +3875,11 @@ pub async fn entries_for_guids(
 /// next round write the same reads straight back — a write per import, for
 /// nothing. A dirty cursor stays dirty, and is written this round anyway.
 ///
+/// **Each imported row's `read_marked_at` is `remote_updated_at`** (in UTC),
+/// not the import time: the mark is the other instance's, made then. Without
+/// it the import would look like the newest mark and beat a genuinely later
+/// local one when an item id shared by several rows is placed on a side.
+///
 /// **`updated_at` becomes the later of the cursor's own and `remote_updated_at`
 /// — never the import time.** `updated_at` is when the cursor's CONTENT last
 /// changed: it is written as the record's `updatedAt`, and the merge compares
@@ -3915,6 +3943,12 @@ pub async fn import_remote_read_state(
         return Ok(0);
     };
     let stamp = later_timestamp(&updated_at, remote_updated_at);
+    // The read/unread mark is the remote record's own time, in UTC, so it
+    // compares with local marks as instants. An unparseable one is no known
+    // time (NULL), never "now".
+    let remote_marked_at = chrono::DateTime::parse_from_rfc3339(remote_updated_at)
+        .ok()
+        .map(utc_timestamp);
 
     let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
     let mut written = 0;
@@ -3930,8 +3964,8 @@ pub async fn import_remote_read_state(
         // `IS`, not `=`: no row on both sides (NULL, NULL) is a match.
         let authorized: Vec<i64> = sqlx::query_scalar(
             r#"
-            INSERT INTO entry_state (did, entry_id, read, starred, updated_at)
-            SELECT ?1, e.id, ?3, 0, ?4
+            INSERT INTO entry_state (did, entry_id, read, starred, updated_at, read_marked_at)
+            SELECT ?1, e.id, ?3, 0, ?4, ?6
             FROM json_each(?5) j
             JOIN entries e ON e.id = json_extract(j.value, '$.id')
             JOIN feeds f ON f.id = e.feed_id
@@ -3944,8 +3978,9 @@ pub async fn import_remote_read_state(
               AND COALESCE(s.read, 0) = json_extract(j.value, '$.read')
               AND s.updated_at IS json_extract(j.value, '$.at')
             ON CONFLICT (did, entry_id) DO UPDATE SET
-                read       = excluded.read,
-                updated_at = excluded.updated_at
+                read           = excluded.read,
+                updated_at     = excluded.updated_at,
+                read_marked_at = excluded.read_marked_at
             RETURNING entry_id
             "#,
         )
@@ -3954,6 +3989,7 @@ pub async fn import_remote_read_state(
         .bind(value)
         .bind(&now)
         .bind(json)
+        .bind(remote_marked_at.as_deref())
         .fetch_all(&mut *tx)
         .await
         .with_context(|| format!("import_remote_read_state failed for {did}/{feed_url}"))?;
@@ -6113,6 +6149,172 @@ mod tests {
             .collect();
         let got = entries_for_guids(&pool, "did:plc:r", "https://ids.example/f.xml", &q).await?;
         assert!(got.is_empty(), "matching is exact: {got:?}");
+        Ok(())
+    }
+
+    // ---- #287: when a row was last marked read or unread ----------------
+
+    async fn read_marked_at(pool: &SqlitePool, did: &str, id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT read_marked_at FROM entry_state WHERE did = ?1 AND entry_id = ?2",
+        )
+        .bind(did)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .flatten())
+    }
+
+    async fn set_state_stamps(pool: &SqlitePool, did: &str, id: i64, at: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE entry_state SET read_marked_at = ?3, updated_at = ?3 \
+             WHERE did = ?1 AND entry_id = ?2",
+        )
+        .bind(did)
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A fresh database has the column.
+    #[tokio::test]
+    async fn a_fresh_database_has_read_marked_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pragma_table_info('entry_state') WHERE name = 'read_marked_at'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 1);
+        Ok(())
+    }
+
+    /// **Starring a row is not a read/unread mark**: it bumps `updated_at`,
+    /// and must leave the time of the last read/unread mark alone, or an old
+    /// row starred today would look like the newest mark.
+    #[tokio::test]
+    async fn starring_never_changes_read_marked_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:rm";
+        let (feed_id, [a, b, ..]) = item_id_rows(&pool).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        mark_read(&pool, did, a, true).await?;
+        set_state_stamps(&pool, did, a, "2026-03-01T00:00:00Z").await?;
+        mark_starred(&pool, did, a, true).await?;
+        mark_starred(&pool, did, a, false).await?;
+        assert_eq!(
+            read_marked_at(&pool, did, a).await?.as_deref(),
+            Some("2026-03-01T00:00:00Z")
+        );
+        // A row that was only ever starred has no read mark.
+        mark_starred(&pool, did, b, true).await?;
+        assert_eq!(read_marked_at(&pool, did, b).await?, None);
+        Ok(())
+    }
+
+    /// Every writer of `entry_state.read` stamps `read_marked_at`.
+    #[tokio::test]
+    async fn every_read_writer_stamps_read_marked_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:rw";
+        let (feed_id, [a, b, ..]) = item_id_rows(&pool).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let recent = |s: Option<String>| -> bool {
+            let t = chrono::DateTime::parse_from_rfc3339(&s.expect("stamped")).unwrap();
+            (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().abs() < 60
+        };
+        // mark_read, both values.
+        mark_read(&pool, did, a, true).await?;
+        assert!(recent(read_marked_at(&pool, did, a).await?));
+        set_state_stamps(&pool, did, a, "2000-01-01T00:00:00Z").await?;
+        mark_read(&pool, did, a, false).await?;
+        assert!(recent(read_marked_at(&pool, did, a).await?));
+        // mark_feed_read, both values, on a row that already has an old mark.
+        set_state_stamps(&pool, did, a, "2000-01-01T00:00:00Z").await?;
+        mark_feed_read(&pool, did, feed_id, true).await?;
+        assert!(recent(read_marked_at(&pool, did, a).await?));
+        assert!(recent(read_marked_at(&pool, did, b).await?));
+        set_state_stamps(&pool, did, b, "2000-01-01T00:00:00Z").await?;
+        mark_feed_read(&pool, did, feed_id, false).await?;
+        assert!(recent(read_marked_at(&pool, did, b).await?));
+        Ok(())
+    }
+
+    /// An import stamps the REMOTE record's `updatedAt` (in UTC), not now.
+    #[tokio::test]
+    async fn an_import_stamps_the_remote_updated_at() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:imp";
+        let feed_url = "https://ids.example/f.xml";
+        let (feed_id, [a, b, ..]) = item_id_rows(&pool).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        mark_read(&pool, did, a, true).await?; // creates the cursor
+        let entry = |id| GuidEntry {
+            id,
+            read: false,
+            updated_at: None,
+        };
+        let n = import_remote_read_state(
+            &pool,
+            did,
+            feed_url,
+            &[entry(b)],
+            &[],
+            "2026-02-03T04:05:06+02:00",
+        )
+        .await?;
+        assert_eq!(n, 1);
+        assert_eq!(
+            read_marked_at(&pool, did, b).await?.as_deref(),
+            Some("2026-02-03T02:05:06Z")
+        );
+        // And an unread import likewise.
+        let snap = GuidEntry {
+            id: b,
+            read: true,
+            updated_at: sqlx::query_scalar(
+                "SELECT updated_at FROM entry_state WHERE did = ?1 AND entry_id = ?2",
+            )
+            .bind(did)
+            .bind(b)
+            .fetch_one(&pool)
+            .await?,
+        };
+        import_remote_read_state(&pool, did, feed_url, &[], &[snap], "2026-02-04T00:00:00Z")
+            .await?;
+        assert_eq!(
+            read_marked_at(&pool, did, b).await?.as_deref(),
+            Some("2026-02-04T00:00:00Z")
+        );
+        Ok(())
+    }
+
+    /// **The reviewer's scenario.** b1 read at T1, b2 unread at T2, then b1
+    /// starred at T3: the item id is unread, because the last read/unread mark
+    /// was b2's.
+    #[tokio::test]
+    async fn starring_an_old_read_row_does_not_make_it_the_newest_mark() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:rev";
+        let feed_url = "https://ids.example/f.xml";
+        let (feed_id, [_a, b, _c, _d, _e, f]) = item_id_rows(&pool).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        // b and f share the link https://x/2.
+        mark_read(&pool, did, b, true).await?;
+        mark_read(&pool, did, f, true).await?;
+        mark_read(&pool, did, f, false).await?;
+        set_state_stamps(&pool, did, b, "2026-03-01T00:00:00Z").await?;
+        set_state_stamps(&pool, did, f, "2026-03-02T00:00:00Z").await?;
+        mark_starred(&pool, did, b, true).await?; // T3: bumps updated_at only
+        let got = guids_for_entry_ids(&pool, did, feed_url, &[b, f]).await?;
+        assert_eq!(
+            got[&b].marked_at.as_deref(),
+            Some("2026-03-01T00:00:00Z"),
+            "marked_at must be the read mark, not the star"
+        );
+        assert_eq!(got[&f].marked_at.as_deref(), Some("2026-03-02T00:00:00Z"));
         Ok(())
     }
 
@@ -10342,6 +10544,10 @@ mod tests {
             !has_column(pool.clone(), "entries", "guid_synthesized").await?,
             "pre-condition: a {version} entries table has no guid_synthesized column"
         );
+        assert!(
+            !has_column(pool.clone(), "entry_state", "read_marked_at").await?,
+            "pre-condition: a {version} entry_state table has no read_marked_at column"
+        );
 
         // One row of each kind, inserted the way the old binary did: without `kind`.
         let publication = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
@@ -10359,9 +10565,27 @@ mod tests {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) \
+             VALUES ('did:plc:u', 1, 1, 0, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+
         init_schema(&pool)
             .await
             .unwrap_or_else(|e| panic!("init_schema must upgrade a {version} database: {e:#}"));
+
+        // Existing marks have no known read/unread time: NULL, no back-fill.
+        let marks: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT read, read_marked_at FROM entry_state")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            marks,
+            vec![(1, None)],
+            "{version}: an existing mark has no known time"
+        );
 
         let flagged: Vec<(String, i64)> =
             sqlx::query_as("SELECT guid, guid_synthesized FROM entries ORDER BY id")
