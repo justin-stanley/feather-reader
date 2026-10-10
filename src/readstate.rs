@@ -310,7 +310,9 @@ fn later(a: &str, b: &str) -> bool {
 /// - **A legacy record** (no `idType`) holds another database's row ids: its
 ///   id arrays are ignored entirely. Its `readThrough` still merges, in
 ///   [`read_state_record`].
-/// - **A remote GUID with a local entry** is imported into `entry_state`
+/// - **A remote item id with a local entry** (matched by guid, or by link for
+///   a row whose guid FeatherReader synthesized — `store::entries_for_guids`)
+///   is imported into `entry_state`
 ///   unless it conflicts: read there and explicitly unread here (in the
 ///   cursor's `unread_ids`), or unread there and read here. Then the side with
 ///   the newer `updatedAt` wins, and a tie goes to local.
@@ -791,9 +793,11 @@ async fn read_state_record(
 /// Build the record from a cursor, the GUIDs of its ids, the remote
 /// `readThrough` and the remote GUIDs to carry.
 ///
-/// **Ids are GUIDs, and the record says so** (`idType: "guid"`): the cursor's
-/// row ids mean nothing on another instance. A row id with no GUID — its entry
-/// was swept — drops out; there is nothing it could mean to anyone.
+/// **Ids are item ids (`docs/lexicon.md`), and the record says so**
+/// (`idType: "guid"`, the lexicon's historical name for them): the stored
+/// guid, or the link for a row whose guid FeatherReader synthesized
+/// (`store::guids_for_entry_ids`). A row id with no item id — its entry was
+/// swept, or it is an item with neither an id nor a link — drops out.
 ///
 /// `read_through` is optional both locally AND in the record: when neither
 /// side has a high-water-mark the record OMITS `readThrough` entirely. This is

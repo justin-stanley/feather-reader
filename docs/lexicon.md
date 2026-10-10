@@ -118,11 +118,13 @@ by FeatherReader before 0.4.9 and holds that instance's private row ids: a
 reader must ignore its id arrays entirely. Its `readThrough` is still an
 instant and still merges.
 
-**Status in FeatherReader.** Before PR #287-2 (0.4.9), an item with no
+**Status in FeatherReader.** Implemented from 0.4.9. Before it, an item with no
 publisher id was written as a hash FeatherReader computed from its link and
 title (`5813b43a0512aaef2750311bf4d978a` is one). From 0.4.9 it is written as
-its link, and on read FeatherReader matches an incoming id against both the
-stored id and the link, so records written in between still resolve.
+its link, and on read an incoming id is matched against both the stored id and,
+for such items, the link, so a record written by an earlier build still
+resolves. An item whose only link is not `http(s)` has no portable id, like an
+item with no link.
 
 ### `readThrough`
 
