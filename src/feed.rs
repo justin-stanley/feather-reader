@@ -2056,6 +2056,20 @@ fn entry_id(links: &[RawLink], title: &Option<Text>, _uri: Option<&str>) -> Stri
     }
 }
 
+/// Whether `e.id` is one [`entry_id`] generated, rather than the publisher's.
+///
+/// feed-rs calls the generator only for an entry whose `id` is empty
+/// (`assign_missing_ids`), before it sanitises text, and the generator is a
+/// pure function of the entry's links and title — so recomputing it tells the
+/// two apart. A publisher id equal to the 128-bit hash of the item's own link
+/// and title is the one misclassification, and not a realistic one. An
+/// id-less Atom entry whose `type="html"` title ammonia rewrites recomputes
+/// differently and reads as a publisher id; Atom requires `id`, so that entry
+/// is malformed already, and the cost is a non-portable id, not a wrong one.
+fn id_was_generated(e: &RawEntry) -> bool {
+    !e.id.is_empty() && e.id == entry_id(&e.links, &e.title, None)
+}
+
 /// Whether a link is one of the entry's own links rather than a pointer to its
 /// comments (feed-rs 3.0's `<comments>` / `wfw:commentRss`, marked by
 /// `target`). Only these are candidates for the permalink and the id, which is
@@ -2096,13 +2110,20 @@ fn entry_without_body(e: &RawEntry) -> NewEntry {
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
-    let guid = if !e.id.trim().is_empty() {
-        e.id.trim().to_string()
+    //
+    // `synthesized` says whether FeatherReader made the guid up (#287): a
+    // readState record then names the item by its `url` instead.
+    let (guid, synthesized) = if !e.id.trim().is_empty() {
+        (e.id.trim().to_string(), id_was_generated(e))
     } else if let Some(link) = raw_entry_link(e) {
-        link
+        // Unreachable with `entry_id` installed — feed-rs generates an id for
+        // every entry with a primary link, and `raw_entry_link` only looks at
+        // primary links — but kept as the fallback it was. The link IS the
+        // item id here, so it is not synthesized.
+        (link, false)
     } else {
         // Last resort: derive a stable id so re-fetches dedup rather than dupe.
-        stable_guid(e)
+        (stable_guid(e), true)
     };
 
     NewEntry {
@@ -2117,7 +2138,7 @@ fn entry_without_body(e: &RawEntry) -> NewEntry {
         content_html: None,
         fetched_at: None, // store defaults to "now".
         keep_stored_content: false,
-        guid_synthesized: false,
+        guid_synthesized: synthesized,
     }
 }
 
