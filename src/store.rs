@@ -254,6 +254,13 @@ pub struct NewEntry {
     /// body in time (#226): a body that exists must not be replaced by none. A
     /// new entry is inserted with `content_html` as given.
     pub keep_stored_content: bool,
+    /// Whether `guid` is a stand-in FeatherReader derived because the item had
+    /// no publisher id (`feed::entry_id`'s link+title hash, or
+    /// `feed::stable_guid`). Stored as `entries.guid_synthesized`; a flush
+    /// names such a row by its `url` (#287). `false` for a publisher id, for a
+    /// `featherreader:long-guid:` stand-in (the publisher DID give an id), and
+    /// for a standard.site document (its at:// URI is the id).
+    pub guid_synthesized: bool,
 }
 
 /// The SQLite schema. Idempotent — safe to run on every startup.
@@ -5898,6 +5905,183 @@ mod tests {
         Ok(())
     }
 
+    // ---- #287: item ids -------------------------------------------------
+
+    async fn feed_for_item_ids(pool: &SqlitePool, url: &str) -> Result<i64> {
+        upsert_feed(
+            pool,
+            &NewFeed {
+                url: url.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn row_id(pool: &SqlitePool, feed_id: i64, guid: &str) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2")
+                .bind(feed_id)
+                .bind(guid)
+                .fetch_one(pool)
+                .await?,
+        )
+    }
+
+    #[tokio::test]
+    async fn insert_entries_stores_and_refreshes_guid_synthesized() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://flag.example/f.xml").await?;
+        let row = |flag: bool| NewEntry {
+            guid: "h".into(),
+            url: Some("https://flag.example/1".into()),
+            guid_synthesized: flag,
+            ..Default::default()
+        };
+        let read = || async {
+            sqlx::query_scalar::<_, i64>("SELECT guid_synthesized FROM entries WHERE guid = 'h'")
+                .fetch_one(&pool)
+                .await
+        };
+        insert_entries(&pool, feed_id, &[row(false)], 0).await?;
+        assert_eq!(read().await?, 0);
+        insert_entries(&pool, feed_id, &[row(true)], 0).await?;
+        assert_eq!(read().await?, 1, "the upsert did not refresh the flag");
+        insert_entries(&pool, feed_id, &[row(false)], 0).await?;
+        assert_eq!(read().await?, 0, "the parsed item decides, both ways");
+        Ok(())
+    }
+
+    /// A: publisher id; B: hash, link; C: synthetic, no link; D: at:// URI;
+    /// E: publisher id sharing B's link; F: second hash sharing B's link.
+    async fn item_id_rows(pool: &SqlitePool) -> Result<(i64, [i64; 6])> {
+        let feed_url = "https://ids.example/f.xml";
+        let feed_id = feed_for_item_ids(pool, feed_url).await?;
+        let rows = [
+            ("pub-1", Some("https://x/1"), false),
+            ("hash", Some("https://x/2"), true),
+            ("featherreader:synthetic:abc", None, true),
+            (
+                "at://did:plc:a/site.standard.document/3k",
+                Some("https://x/4"),
+                false,
+            ),
+            ("pub-2", Some("https://x/2"), false),
+            ("hash-f", Some("https://x/2"), true),
+        ];
+        let entries: Vec<NewEntry> = rows
+            .iter()
+            .map(|(g, u, f)| NewEntry {
+                guid: (*g).into(),
+                url: u.map(str::to_string),
+                guid_synthesized: *f,
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(pool, feed_id, &entries, 0).await?;
+        let mut ids = [0; 6];
+        for (i, (g, _, _)) in rows.iter().enumerate() {
+            ids[i] = row_id(pool, feed_id, g).await?;
+        }
+        Ok((feed_id, ids))
+    }
+
+    #[tokio::test]
+    async fn guids_for_entry_ids_names_a_synthesized_row_by_its_link() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let (_, [a, b, c, d, ..]) = item_id_rows(&pool).await?;
+        let got = guids_for_entry_ids(&pool, "https://ids.example/f.xml", &[a, b, c, d]).await?;
+        let want: std::collections::HashMap<i64, String> = [
+            (a, "pub-1".to_string()),
+            (b, "https://x/2".to_string()),
+            (d, "at://did:plc:a/site.standard.document/3k".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn entries_for_guids_matches_a_guid_or_a_synthesized_rows_link() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let (_, [a, b, _c, _d, _e, f]) = item_id_rows(&pool).await?;
+        let ids = |m: &std::collections::HashMap<String, Vec<GuidEntry>>, k: &str| -> Vec<i64> {
+            m.get(k)
+                .map(|v| v.iter().map(|e| e.id).collect())
+                .unwrap_or_default()
+        };
+        let q: Vec<String> = ["pub-1", "hash", "https://x/2", "nope"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = entries_for_guids(&pool, "did:plc:r", "https://ids.example/f.xml", &q).await?;
+        assert_eq!(ids(&got, "pub-1"), vec![a]);
+        assert_eq!(ids(&got, "hash"), vec![b]);
+        assert_eq!(
+            ids(&got, "https://x/2"),
+            vec![b, f],
+            "the link names the synthesized rows only, ascending; the publisher-id row sharing it is not matched"
+        );
+        assert!(!got.contains_key("nope"));
+        let q: Vec<String> = ["https://x/2/", "HTTPS://x/2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = entries_for_guids(&pool, "did:plc:r", "https://ids.example/f.xml", &q).await?;
+        assert!(got.is_empty(), "matching is exact: {got:?}");
+        Ok(())
+    }
+
+    /// **Compaction keeps every explicit unread** (#287): the written record
+    /// carries the later of the local and the remote mark, so an exception
+    /// above the local mark may be load-bearing.
+    #[tokio::test]
+    async fn compaction_keeps_explicit_unread_exceptions() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let did = "did:plc:keepunread";
+        let feed_url = "https://keepunread.example/f.xml";
+        let feed_id = feed_for_item_ids(&pool, feed_url).await?;
+        let entries: Vec<NewEntry> = (0..10)
+            .map(|i| NewEntry {
+                guid: format!("u-{i:02}"),
+                published: Some(format!("2026-01-{:02}T00:00:00Z", i + 1)),
+                ..Default::default()
+            })
+            .collect();
+        insert_entries(&pool, feed_id, &entries, 0).await?;
+        replace_sub_refs(&pool, did, &[feed_id]).await?;
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            ids.push(row_id(&pool, feed_id, &format!("u-{i:02}")).await?);
+        }
+        for id in &ids {
+            mark_read(&pool, did, *id, true).await?;
+        }
+        let seventh = ids[6];
+        mark_read(&pool, did, seventh, false).await?;
+
+        let mark = compact_cursor(&pool, did, feed_url).await?;
+        assert_eq!(mark.as_deref(), Some("2026-01-06T00:00:00Z"));
+        let after = get_cursor(&pool, did, feed_url).await?.expect("cursor");
+        let read: std::collections::HashSet<String> = serde_json::from_str(&after.read_ids)?;
+        assert_eq!(
+            read,
+            [ids[7], ids[8], ids[9]]
+                .iter()
+                .map(|i| i.to_string())
+                .collect(),
+            "reads above the hole stay"
+        );
+        let unread: Vec<String> = serde_json::from_str(&after.unread_ids)?;
+        assert_eq!(
+            unread,
+            vec![seventh.to_string()],
+            "the explicit unread was dropped"
+        );
+        Ok(())
+    }
+
     /// The water-mark may never cover an unread entry, and may never move
     /// backwards. Both would re-assert articles as read that are not.
     #[tokio::test]
@@ -10059,19 +10243,21 @@ mod tests {
         let pool = upgrade_test_pool().await?;
         sqlx::raw_sql(fixture).execute(&pool).await?;
 
-        let has_kind = |pool: SqlitePool| async move {
+        let has_column = |pool: SqlitePool, table: &'static str, column: &'static str| async move {
             Ok::<_, anyhow::Error>(
                 sqlx::query_scalar::<_, i64>(
-                    "SELECT count(*) FROM pragma_table_info('feeds') WHERE name = 'kind'",
+                    "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
                 )
+                .bind(table)
+                .bind(column)
                 .fetch_one(&pool)
                 .await?
                     == 1,
             )
         };
         assert!(
-            !has_kind(pool.clone()).await?,
-            "pre-condition: a {version} feeds table has no kind column"
+            !has_column(pool.clone(), "entries", "guid_synthesized").await?,
+            "pre-condition: a {version} entries table has no guid_synthesized column"
         );
 
         // One row of each kind, inserted the way the old binary did: without `kind`.
@@ -10083,9 +10269,46 @@ mod tests {
                 .await?;
         }
 
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, url, fetched_at) \
+             VALUES (1, '5813b43a0512aaef2750311bf4d978a', 'https://n.example/post', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+
         init_schema(&pool)
             .await
             .unwrap_or_else(|e| panic!("init_schema must upgrade a {version} database: {e:#}"));
+
+        let flagged: Vec<(String, i64)> =
+            sqlx::query_as("SELECT guid, guid_synthesized FROM entries ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            flagged,
+            vec![("5813b43a0512aaef2750311bf4d978a".to_string(), 0)],
+            "{version}: a row that predates the column reads as the publisher's id"
+        );
+        // The upsert is the back-fill: a re-poll of the same item sets the flag.
+        insert_entries(
+            &pool,
+            1,
+            &[NewEntry {
+                guid: "5813b43a0512aaef2750311bf4d978a".into(),
+                url: Some("https://n.example/post".into()),
+                guid_synthesized: true,
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let after: i64 = sqlx::query_scalar("SELECT guid_synthesized FROM entries WHERE id = 1")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            after, 1,
+            "{version}: a re-poll did not refresh guid_synthesized"
+        );
 
         let kinds: Vec<(String, String)> =
             sqlx::query_as("SELECT url, kind FROM feeds ORDER BY id")
@@ -10140,6 +10363,15 @@ mod tests {
         assert_upgrades_from(
             "v0.3.8",
             include_str!("../tests/fixtures/schema-v0.3.8.sql"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_v0_4_8_database_upgrades_to_the_current_schema() -> Result<()> {
+        assert_upgrades_from(
+            "v0.4.8",
+            include_str!("../tests/fixtures/schema-v0.4.8.sql"),
         )
         .await
     }

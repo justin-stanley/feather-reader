@@ -1612,6 +1612,51 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Like [`entry_at`], but the row's guid is a FeatherReader stand-in and
+    /// the item is named by `url` (which may be absent) in a record.
+    pub(crate) async fn synthesized_entry(
+        state: &AppState,
+        i: usize,
+        guid: &str,
+        url: Option<&str>,
+    ) -> i64 {
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: feed(i),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[store::NewEntry {
+                guid: guid.into(),
+                url: url.map(str::to_string),
+                published: Some("2026-01-01T00:00:00Z".into()),
+                guid_synthesized: true,
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(DID)
+            .bind(feed_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2")
+            .bind(feed_id)
+            .bind(guid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+
     pub(crate) async fn entry(state: &AppState, i: usize, guid: &str) -> i64 {
         entry_at(state, i, guid, "2026-01-01T00:00:00Z").await
     }
@@ -3314,6 +3359,234 @@ pub(crate) mod tests {
                 !is_read(&state, x).await,
                 "{backend:?}: the import overwrote a newer local unread"
             );
+        }
+    }
+
+    // ── #287: the item-id rule ───────────────────────────────────────────────
+
+    /// **An item with no publisher id is written as its link**, not as the
+    /// hash FeatherReader made up for it.
+    #[tokio::test]
+    async fn a_link_only_item_is_written_as_its_link() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let hash = "5813b43a0512aaef2750311bf4d978a";
+            let id = synthesized_entry(&state, 1, hash, Some("https://n.example/post")).await;
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["https://n.example/post", "pub-1"]),
+                "{backend:?}: {rec}"
+            );
+        }
+    }
+
+    /// **An item with neither an id nor a link has no portable name**, so it is
+    /// left out of the record; the cursor still holds its row id.
+    #[tokio::test]
+    async fn an_item_with_neither_id_nor_link_is_not_written() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let id = synthesized_entry(&state, 1, "featherreader:synthetic:deadbeef", None).await;
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                id_set(&rec, "readIds"),
+                set_of(&["pub-1"]),
+                "{backend:?}: {rec}"
+            );
+            let c = cursor(&state, 1).await;
+            assert_eq!(parse_id_array(&c.read_ids).len(), 2, "{backend:?}");
+            assert!(!c.dirty, "{backend:?}");
+        }
+    }
+
+    /// **A remote link id marks the link-only item read here.**
+    #[tokio::test]
+    async fn a_remote_link_id_marks_a_link_only_item_read() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let b = synthesized_entry(&state, 1, "hash-b", Some("https://n.example/b")).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &["https://n.example/b"], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b).await,
+                "{backend:?}: the link did not resolve"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&["https://n.example/b", "pub-1"]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **A record written by a build before #287 still resolves**: it holds the
+    /// feed-rs hash, which is still the row's guid.
+    #[tokio::test]
+    async fn a_record_written_with_a_feed_rs_hash_still_resolves() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let hash = "5813b43a0512aaef2750311bf4d978a";
+            let b = synthesized_entry(&state, 1, hash, Some("https://n.example/post")).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[hash], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b).await,
+                "{backend:?}: the hash did not resolve"
+            );
+            let ids = id_set(&pds_record(&fake, 1), "readIds");
+            for want in ["https://n.example/post", "pub-1", hash] {
+                assert!(
+                    ids.contains(want),
+                    "{backend:?}: {want} missing from {ids:?}"
+                );
+            }
+        }
+    }
+
+    /// **Two rows sharing a link are both imported, and named once.**
+    #[tokio::test]
+    async fn two_rows_sharing_a_link_are_both_marked_read() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/edited";
+            let b1 = synthesized_entry(&state, 1, "hash-old-title", Some(u)).await;
+            let b2 = synthesized_entry(&state, 1, "hash-new-title", Some(u)).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                is_read(&state, b1).await && is_read(&state, b2).await,
+                "{backend:?}: only one of the two rows was imported"
+            );
+            assert_eq!(
+                id_set(&pds_record(&fake, 1), "readIds"),
+                set_of(&[u, "pub-1"]),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// **An explicit unread on ANY row sharing the link blocks an older
+    /// remote read.**
+    #[tokio::test]
+    async fn a_shared_link_explicitly_unread_on_one_row_blocks_the_import() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let u = "https://n.example/edited";
+            let b1 = synthesized_entry(&state, 1, "hash-old-title", Some(u)).await;
+            let b2 = synthesized_entry(&state, 1, "hash-new-title", Some(u)).await;
+            assert!(store::mark_read(&state.db, DID, b2, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, b2, false).await.unwrap());
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[u], &[], "2000-01-01T00:00:00Z"),
+            );
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                !is_read(&state, b1).await && !is_read(&state, b2).await,
+                "{backend:?}: an older remote read beat a newer local unread"
+            );
+            let rec = pds_record(&fake, 1);
+            assert!(!id_set(&rec, "readIds").contains(u), "{backend:?}: {rec}");
+            assert!(id_set(&rec, "unreadIds").contains(u), "{backend:?}: {rec}");
+        }
+    }
+
+    /// **An explicit unread below a LATER remote mark stays in the record**:
+    /// the record carries the later `readThrough`, so the exception is what
+    /// keeps the entry unread everywhere. Compaction used to drop it.
+    #[tokio::test]
+    async fn an_explicit_unread_below_a_later_remote_mark_stays_in_the_record() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let x = entry_at(&state, 1, "x", "2026-05-01T00:00:00Z").await;
+            assert!(store::mark_read(&state.db, DID, x, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, x, false).await.unwrap());
+            for i in 0..COMPACT_READ_IDS_THRESHOLD + 10 {
+                let day = format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60);
+                let id = entry_at(&state, 1, &format!("l-{i:04}"), &day).await;
+                store::mark_read(&state.db, DID, id, true).await.unwrap();
+            }
+            put_remote(
+                &fake,
+                1,
+                serde_json::json!({
+                    "$type": crate::lexicon::nsid::READ_STATE,
+                    "feedUrl": feed(1),
+                    "idType": "guid",
+                    "readThrough": "2026-12-31T00:00:00Z",
+                    "updatedAt": "2000-01-01T00:00:00Z",
+                }),
+            );
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert_eq!(
+                rec["readThrough"], "2026-12-31T00:00:00Z",
+                "{backend:?}: {rec}"
+            );
+            assert!(
+                id_set(&rec, "unreadIds").contains("x"),
+                "{backend:?}: {rec}"
+            );
+            assert!(!id_set(&rec, "readIds").contains("x"), "{backend:?}: {rec}");
+            assert!(!is_read(&state, x).await, "{backend:?}");
         }
     }
 }
