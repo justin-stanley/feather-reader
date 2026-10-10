@@ -6223,7 +6223,10 @@ mod tests {
         replace_sub_refs(&pool, did, &[feed_id]).await?;
         let recent = |s: Option<String>| -> bool {
             let t = chrono::DateTime::parse_from_rfc3339(&s.expect("stamped")).unwrap();
-            (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().abs() < 60
+            (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .abs()
+                < 60
         };
         // mark_read, both values.
         mark_read(&pool, did, a, true).await?;

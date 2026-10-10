@@ -3649,12 +3649,12 @@ pub(crate) mod tests {
             "UPDATE entry_state SET updated_at = ?1, read_marked_at = ?1 \
              WHERE did = ?2 AND entry_id = ?3",
         )
-            .bind(at)
-            .bind(DID)
-            .bind(id)
-            .execute(&state.db)
-            .await
-            .unwrap();
+        .bind(at)
+        .bind(DID)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
     }
 
     /// Two rows share a link; `b1` is marked read and `b2` read then unread,
@@ -3773,7 +3773,10 @@ pub(crate) mod tests {
 
             assert!(!is_read(&state, b).await, "{backend:?}: ended read");
             let first = pds_record(&fake, 1);
-            assert!(!id_set(&first, "readIds").contains(u), "{backend:?}: {first}");
+            assert!(
+                !id_set(&first, "readIds").contains(u),
+                "{backend:?}: {first}"
+            );
             assert!(
                 !id_set(&first, "readIds").contains(hash),
                 "{backend:?}: {first}"
