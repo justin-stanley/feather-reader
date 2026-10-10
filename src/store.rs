@@ -3683,8 +3683,13 @@ pub async fn clean_cursors(pool: &SqlitePool, did: &str) -> Result<Vec<ReadCurso
 // instead, and these two helpers translate at the boundary. Both are ONE
 // query over a `json_each` of the whole set, not one per id.
 
-/// The GUIDs of `ids` among `feed_url`'s entries. An id with no entry (swept by
-/// retention, or never on this feed) is simply absent from the map.
+/// The item ids of `ids` among `feed_url`'s entries, by the rule in
+/// `docs/lexicon.md`: the stored `guid` for a row whose guid is the
+/// publisher's id (or a standard.site URI, or a `long-guid` stand-in), and the
+/// `url` for a row whose guid FeatherReader synthesized (#287). An id with no
+/// entry (swept, or never on this feed) is absent from the map, and so is a
+/// synthesized row with no `url` — an item with neither an id nor a link has
+/// no portable name, and is covered only by `readThrough`.
 pub async fn guids_for_entry_ids(
     pool: &SqlitePool,
     feed_url: &str,
@@ -3696,11 +3701,13 @@ pub async fn guids_for_entry_ids(
     let json = serde_json::to_string(ids).context("encoding entry ids")?;
     let rows: Vec<(i64, String)> = sqlx::query_as(
         r#"
-        SELECT e.id, e.guid
+        SELECT e.id,
+               CASE WHEN e.guid_synthesized = 1 THEN e.url ELSE e.guid END
         FROM json_each(?2) j
         JOIN entries e ON e.id = j.value
         JOIN feeds f ON f.id = e.feed_id
         WHERE f.url = ?1
+          AND (e.guid_synthesized = 0 OR e.url IS NOT NULL)
         "#,
     )
     .bind(feed_url)
