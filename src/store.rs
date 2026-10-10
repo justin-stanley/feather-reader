@@ -3732,30 +3732,43 @@ pub struct GuidEntry {
     pub updated_at: Option<String>,
 }
 
-/// Resolve `guids` against `feed_url`'s entries, with `did`'s read state for
-/// each. A GUID this instance has no entry for is absent from the map — the
-/// caller decides what an unresolved GUID means.
+/// Resolve incoming item ids against `feed_url`'s entries, with `did`'s read
+/// state for each row. Keyed by the INCOMING id. An id matches a row whose
+/// `guid` equals it — the publisher's id, a standard.site URI, a `long-guid`
+/// stand-in, or the feed-rs hash a build before #287 wrote for a link-only
+/// item — or, for a row whose guid FeatherReader synthesized, whose `url`
+/// equals it. Several rows can share a `url` (a title edit on an id-less item
+/// makes a second row), so each id maps to every row it names. An id with no
+/// row is absent from the map; the caller decides what that means.
 ///
-/// The GUIDs go in as a JSON array of STRINGS, so an all-digit GUID compares
-/// as text against `entries.guid` and can never be mistaken for a row id.
+/// The ids go in as a JSON array of STRINGS, so an all-digit id compares as
+/// text and can never be mistaken for a row id. `url` is compared exactly, as
+/// stored: no normalisation on either side (docs/lexicon.md).
 pub async fn entries_for_guids(
     pool: &SqlitePool,
     did: &str,
     feed_url: &str,
     guids: &[String],
-) -> Result<std::collections::HashMap<String, GuidEntry>> {
+) -> Result<std::collections::HashMap<String, Vec<GuidEntry>>> {
     if guids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
     let json = serde_json::to_string(guids).context("encoding guids")?;
     let rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT e.guid, e.id, COALESCE(s.read, 0), s.updated_at
+        SELECT j.value AS item_id, e.id, COALESCE(s.read, 0) AS read, s.updated_at
         FROM json_each(?3) j
         JOIN entries e ON e.guid = j.value
         JOIN feeds f ON f.id = e.feed_id
         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
         WHERE f.url = ?2
+        UNION
+        SELECT j.value, e.id, COALESCE(s.read, 0), s.updated_at
+        FROM json_each(?3) j
+        JOIN feeds f ON f.url = ?2
+        JOIN entries e ON e.feed_id = f.id AND e.guid_synthesized = 1 AND e.url = j.value
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        ORDER BY 2
         "#,
     )
     .bind(did)
@@ -3764,19 +3777,16 @@ pub async fn entries_for_guids(
     .fetch_all(pool)
     .await
     .with_context(|| format!("entries_for_guids failed for {did}/{feed_url}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(guid, id, read, updated_at)| {
-            (
-                guid,
-                GuidEntry {
-                    id,
-                    read: read == 1,
-                    updated_at,
-                },
-            )
-        })
-        .collect())
+    let mut out: std::collections::HashMap<String, Vec<GuidEntry>> =
+        std::collections::HashMap::new();
+    for (item_id, id, read, updated_at) in rows {
+        out.entry(item_id).or_default().push(GuidEntry {
+            id,
+            read: read == 1,
+            updated_at,
+        });
+    }
+    Ok(out)
 }
 
 /// Apply read / unread state learned from the PDS to `did`'s entries on

@@ -422,15 +422,19 @@ async fn plan_guid_merge(
     for guid in remote_read {
         match local.get(&guid) {
             None => carry.read.unresolved.push(guid),
-            Some(e) => {
-                let explicitly_unread = local_unread.contains(&e.id);
+            Some(rows) => {
+                // Several rows can share a link (a title edit on an id-less
+                // item); the id is explicitly unread here if any of them is.
+                let explicitly_unread = rows.iter().any(|e| local_unread.contains(&e.id));
                 if explicitly_unread && !remote_wins {
                     // Lost to the newer local unread: neither imported nor
                     // carried.
                     continue;
                 }
-                if !e.read || explicitly_unread {
-                    to_read.push(e.clone());
+                for e in rows {
+                    if !e.read || local_unread.contains(&e.id) {
+                        to_read.push(e.clone());
+                    }
                 }
                 carry.read.resolved.push(guid);
             }
@@ -439,15 +443,17 @@ async fn plan_guid_merge(
     for guid in remote_unread {
         match local.get(&guid) {
             None => carry.unread.unresolved.push(guid),
-            Some(e) => {
-                if e.read && !remote_wins {
+            Some(rows) => {
+                if rows.iter().any(|e| e.read) && !remote_wins {
                     continue;
                 }
-                // Into `unread_ids` even when it is already unread here, or the
-                // record would drop it — and below a `readThrough`, a missing
-                // unread id reads as read.
-                if e.read || !local_unread.contains(&e.id) {
-                    to_unread.push(e.clone());
+                for e in rows {
+                    // Into `unread_ids` even when it is already unread here, or
+                    // the record would drop it — and below a `readThrough`, a
+                    // missing unread id reads as read.
+                    if e.read || !local_unread.contains(&e.id) {
+                        to_unread.push(e.clone());
+                    }
                 }
                 carry.unread.resolved.push(guid);
             }
