@@ -40,6 +40,15 @@ deploying is separate.
   the column, and SQLite fills the default. Checked by the upgrade test from a
   0.4.8 schema (`tests/fixtures/schema-v0.4.8.sql`) and by the upgrade-boot
   gate, which now seeds an entry row too.
+- **Schema: `entry_state.read_marked_at` (#287).** One nullable `TEXT`
+  column, no default, no index, added by `ALTER TABLE` on first boot. It is
+  when the row was last marked read or unread; starring does not move it
+  (`updated_at` does, which is why it is not used). An import sets it to the
+  remote record's `updatedAt`. **No back-fill:** existing rows stay NULL, "no
+  known mark", and a NULL loses against a known time and ties to unread. So
+  the first flush after the upgrade, for an item id shared by rows on both
+  sides, can only say unread until those rows are marked again. Rolling back
+  to 0.4.8 works: it never names the column.
 
 ### Added
 
@@ -250,13 +259,21 @@ deploying is separate.
   **One side per id.** Several rows can name one link, so a read row and an
   explicitly unread row can map to the same item id. `build_record` keeps
   such an id on the side the reader marked most recently
-  (`entry_state.updated_at`, the latest of each side's rows; one batched
+  (`entry_state.read_marked_at`, the latest of each side's rows; one batched
   query), and a tie or a missing stamp goes to unread, so an explicit unread
-  is never lost to another row's read. A record from an older writer that
-  lists an id in both sets is read as unread (`docs/lexicon.md`). Tests, both
-  backends, each red first: read earlier / unread later, unread earlier / read
-  later, a tie, and a remote id in both sets; always-read, always-unread and
-  both-sets-as-read each fail one.
+  is never lost to another row's read. The time is the read/unread mark's own,
+  not `updated_at`: starring a row moves `updated_at` and must not make an old
+  read look new. A record from an older writer that lists an id in both sets
+  is read as unread (`docs/lexicon.md`), and that is decided on the rows the
+  ids resolve to: an old hash and a new link naming one row, one in each
+  array, leave the row unread (applied to the strings it ended read, every
+  round). Tests, both backends, each red first: read earlier / unread later,
+  unread earlier / read later, a tie, a remote id in both sets, a hash and a
+  link naming one row in opposite sets (and a stable second round), and a
+  star after the marks (store level); always-read, always-unread,
+  both-sets-as-read, `updated_at` as the mark time, a star moving
+  `read_marked_at`, an import not stamping the remote time, and the rule back
+  on strings each fail one.
 
   **Tests (upgrade validators), red first:** `the_upgrade_clears_http_validators_once`
   (0.4.8 fixture with a feed holding both validators: NULL after the

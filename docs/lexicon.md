@@ -80,8 +80,8 @@ For the feed `feedUrl`, an item is **read** if either:
 2. it has a publication date at or before `readThrough`, and its id is not in
    `unreadIds`.
 
-Otherwise it is unread. An id in both arrays is read (`readIds` wins). An item
-with no publication date is covered only by `readIds`.
+Otherwise it is unread. An id in both arrays is **unread** (see Item ids). An
+item with no publication date is covered only by `readIds`.
 
 ### Item ids (`idType: "guid"`)
 
@@ -103,7 +103,11 @@ Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
 
 A writer must not list an id in both `readIds` and `unreadIds`; a reader that
-sees one in both treats it as unread.
+sees one in both treats it as unread. Several local items can share one id (two
+entries with the same link, after a title edit): a writer that has such items
+on both sides lists the id in the array of the side whose read or unread mark
+is **most recent**. A tie, or a mark with no known time, goes to `unreadIds`.
+FeatherReader keeps the time of each read/unread mark (not of a star) for this.
 
 An item with neither an id nor a link has no item id. It is never written to
 either array; it is covered by `readThrough` when it has a publication date,
