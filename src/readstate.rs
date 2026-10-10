@@ -1181,13 +1181,16 @@ pub(crate) mod tests {
     #[test]
     fn read_state_record_applies_the_id_cap() {
         let ids: Vec<String> = (0..ReadState::MAX_IDS + 5).map(|i| i.to_string()).collect();
-        let json = serde_json::to_string(&ids).unwrap();
+        // Disjoint: an item id is on one side of a record.
+        let other: Vec<String> = (0..ReadState::MAX_IDS + 5)
+            .map(|i| (i + 100_000).to_string())
+            .collect();
         let cursor = crate::store::ReadCursor {
             did: "did:plc:x".into(),
             feed_url: "https://example.com/feed.xml".into(),
             read_through: None,
-            read_ids: json.clone(),
-            unread_ids: json,
+            read_ids: serde_json::to_string(&ids).unwrap(),
+            unread_ids: serde_json::to_string(&other).unwrap(),
             dirty: true,
             pds_created: false,
             updated_at: "2026-07-12T00:00:00Z".into(),
