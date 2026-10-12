@@ -97,7 +97,7 @@ jobs:
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -134,7 +134,7 @@ jobs:
       # `cargo install ... || true`, which masked an install failure and let the
       # next step die command-not-found — a green job that skipped the RustSec scan.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -153,7 +153,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: 24
           cache: npm
@@ -267,7 +267,7 @@ jobs:
       # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` OR-expression resolves to a
       # permissive branch automatically.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -280,7 +280,7 @@ jobs:
       # green-looking job that never actually ran the RustSec scan. install-action
       # fails the job loudly if the tool can't be fetched. (Cheap nit.)
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-audit@0.22.2
 
