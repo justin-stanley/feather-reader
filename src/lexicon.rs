@@ -21,6 +21,8 @@
 //!   at a feed-derived rkey — never one record per article). Written by the
 //!   read-state flusher; see the caveats on that flush path in
 //!   [`crate::atproto`].
+//!
+//! The Lexicon JSON is under `lexicons/community/lexicon/rss/`; the semantics are in `docs/lexicon.md`; `lexicon_json_tests` keeps the JSON and these types from drifting.
 
 use serde::{Deserialize, Serialize};
 
@@ -350,7 +352,8 @@ pub struct ReadState {
     #[serde(rename = "unreadIds", skip_serializing_if = "Vec::is_empty", default)]
     pub unread_ids: Vec<String>,
 
-    /// What the strings in `readIds` / `unreadIds` are. FeatherReader writes
+    /// What the strings in `readIds` / `unreadIds` are. See docs/lexicon.md for
+    /// the item-id rule the value names. FeatherReader writes
     /// [`ReadState::ID_TYPE_GUID`]: each is the entry's GUID as the feed
     /// publishes it (or the stable stand-in FeatherReader derives when it does
     /// not — `feed::stable_guid` / `feed::bound_guid`, both fixed-key hashes, so
@@ -380,7 +383,7 @@ fn read_state_type() -> String {
 impl ReadState {
     /// Maximum length of the `readIds` / `unreadIds` exception sets, per the
     /// lexicon. The flusher enforces this cap before writing (see
-    /// `scheduler::cap`).
+    /// `readstate::cap`).
     pub const MAX_IDS: usize = 1000;
 
     /// The [`ReadState::id_type`] FeatherReader writes: the id arrays hold
@@ -882,5 +885,245 @@ mod sort_tests {
             saved("r2", "https://b.example/x", "2026-01-01T00:00:00Z"),
         ];
         assert_eq!(order(items, sort::saved), ["r1", "r2", "r3"]);
+    }
+}
+
+/// **The Lexicon JSON and the serde types cannot drift** (#287). Each record
+/// type's full sample is serialized and checked against its JSON: every
+/// emitted key is a declared property of the right type, every declared
+/// property is emitted by the full sample, every `required` property is
+/// present, and the caps and known values are the constants the code uses.
+///
+/// Plain `serde_json::Value` walking, no schema crate: the four files are
+/// small and the checks are the ones that matter for this crate.
+#[cfg(test)]
+mod lexicon_json_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    const SUBSCRIPTION: &str = include_str!("../lexicons/community/lexicon/rss/subscription.json");
+    const FOLDER: &str = include_str!("../lexicons/community/lexicon/rss/folder.json");
+    const SAVED: &str = include_str!("../lexicons/community/lexicon/rss/saved.json");
+    const READ_STATE: &str = include_str!("../lexicons/community/lexicon/rss/readState.json");
+
+    /// The `record` object schema of a lexicon document, after checking its
+    /// envelope: `lexicon: 1`, `id`, one `main` def of type `record`.
+    fn record_schema(doc: &str, nsid: &str, key: &str) -> Value {
+        let v: Value = serde_json::from_str(doc).expect("the lexicon file is JSON");
+        assert_eq!(v["lexicon"], 1, "{nsid}: lexicon version");
+        assert_eq!(v["id"], nsid, "{nsid}: id");
+        let main = &v["defs"]["main"];
+        assert_eq!(main["type"], "record", "{nsid}: defs.main.type");
+        assert_eq!(main["key"], key, "{nsid}: defs.main.key");
+        assert_eq!(
+            v["defs"].as_object().map(|d| d.len()),
+            Some(1),
+            "{nsid}: exactly one def"
+        );
+        let record = main["record"].clone();
+        assert_eq!(record["type"], "object", "{nsid}: record.type");
+        record
+    }
+
+    /// The lexicon type name a serialized JSON value must be declared as.
+    fn lexicon_type_of(v: &Value) -> &'static str {
+        match v {
+            Value::String(_) => "string",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "integer",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            Value::Null => "null",
+        }
+    }
+
+    /// `full` is a serialized record carrying EVERY field the Rust type can
+    /// emit. Checks it against `schema` both ways.
+    fn assert_matches(nsid: &str, schema: &Value, full: &Value) {
+        let props = schema["properties"].as_object().expect("properties");
+        let emitted = full.as_object().expect("a record is an object");
+        for (key, value) in emitted {
+            if key == "$type" {
+                assert_eq!(value, nsid, "{nsid}: $type");
+                continue;
+            }
+            let decl = props.get(key).unwrap_or_else(|| {
+                panic!("{nsid}: the type emits `{key}`, the lexicon does not declare it")
+            });
+            assert_eq!(
+                decl["type"],
+                lexicon_type_of(value),
+                "{nsid}.{key}: the lexicon declares a different type"
+            );
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    assert_eq!(
+                        decl["items"]["type"],
+                        lexicon_type_of(item),
+                        "{nsid}.{key}: item type"
+                    );
+                }
+            }
+        }
+        for key in props.keys() {
+            assert!(
+                emitted.contains_key(key),
+                "{nsid}: the lexicon declares `{key}`, the full sample does not emit it (field missing from the type, or skipped?)"
+            );
+        }
+        for req in schema["required"].as_array().expect("required") {
+            let req = req.as_str().unwrap();
+            assert!(
+                emitted.contains_key(req),
+                "{nsid}: required `{req}` is not emitted"
+            );
+        }
+    }
+
+    /// A minimal record must emit exactly `$type` plus the required fields.
+    fn assert_minimal(nsid: &str, schema: &Value, minimal: &Value) {
+        let mut want: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        want.push("$type");
+        want.sort_unstable();
+        let mut got: Vec<&str> = minimal
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got, want,
+            "{nsid}: a minimal record emits more or less than the required fields"
+        );
+    }
+
+    #[test]
+    fn subscription_matches_its_lexicon() {
+        let schema = record_schema(SUBSCRIPTION, nsid::SUBSCRIPTION, "tid");
+        let mut full = Subscription::new("https://example.com/feed.xml", "2026-07-12T00:00:00Z");
+        full.title = Some("Example".into());
+        full.site_url = Some("https://example.com/".into());
+        full.folder = Some("at://did:plc:abc/community.lexicon.rss.folder/3k".into());
+        full.fetch_hint = Some(FetchHint::Hourly);
+        full.private = Some(true);
+        assert_matches(
+            nsid::SUBSCRIPTION,
+            &schema,
+            &serde_json::to_value(&full).unwrap(),
+        );
+        let minimal = Subscription::new("https://example.com/feed.xml", "2026-07-12T00:00:00Z");
+        assert_minimal(
+            nsid::SUBSCRIPTION,
+            &schema,
+            &serde_json::to_value(&minimal).unwrap(),
+        );
+
+        // Every known fetchHint value is a variant the type names, and every
+        // named variant is a known value.
+        let known: Vec<&str> = schema["properties"]["fetchHint"]["knownValues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for value in &known {
+            let hint: FetchHint = serde_json::from_value(json!(value)).unwrap();
+            assert!(
+                !matches!(hint, FetchHint::Other(_)),
+                "fetchHint `{value}` is known to the lexicon but not to the type"
+            );
+        }
+        for hint in [
+            FetchHint::Realtime,
+            FetchHint::Hourly,
+            FetchHint::Daily,
+            FetchHint::Weekly,
+        ] {
+            let value = serde_json::to_value(&hint).unwrap();
+            assert!(
+                known.contains(&value.as_str().unwrap()),
+                "{value} is a variant the lexicon does not know"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_matches_its_lexicon() {
+        let schema = record_schema(FOLDER, nsid::FOLDER, "tid");
+        let mut full = Folder::new("Tech", "2026-07-12T00:00:00Z");
+        full.position = Some(2);
+        assert_matches(nsid::FOLDER, &schema, &serde_json::to_value(&full).unwrap());
+        assert_minimal(
+            nsid::FOLDER,
+            &schema,
+            &serde_json::to_value(Folder::new("Tech", "2026-07-12T00:00:00Z")).unwrap(),
+        );
+        assert_eq!(schema["properties"]["position"]["minimum"], 0);
+    }
+
+    #[test]
+    fn saved_matches_its_lexicon() {
+        let schema = record_schema(SAVED, nsid::SAVED, "tid");
+        let mut full = Saved::new("https://example.com/post/1", "2026-07-12T00:00:00Z");
+        full.title = Some("A kept post".into());
+        full.feed_url = Some("https://example.com/feed.xml".into());
+        full.entry_id = Some("tag:example.com,2026:1".into());
+        assert_matches(nsid::SAVED, &schema, &serde_json::to_value(&full).unwrap());
+        assert_minimal(
+            nsid::SAVED,
+            &schema,
+            &serde_json::to_value(Saved::new(
+                "https://example.com/post/1",
+                "2026-07-12T00:00:00Z",
+            ))
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn read_state_matches_its_lexicon() {
+        let schema = record_schema(READ_STATE, nsid::READ_STATE, "any");
+        let mut full = ReadState::new(
+            "https://example.com/feed.xml",
+            Some("2026-07-12T00:00:00Z".into()),
+            "2026-07-12T01:00:00Z",
+        );
+        full.read_ids = vec!["a".into()];
+        full.unread_ids = vec!["b".into()];
+        full.id_type = Some(ReadState::ID_TYPE_GUID.into());
+        assert_matches(
+            nsid::READ_STATE,
+            &schema,
+            &serde_json::to_value(&full).unwrap(),
+        );
+        assert_minimal(
+            nsid::READ_STATE,
+            &schema,
+            &serde_json::to_value(ReadState::new(
+                "https://example.com/feed.xml",
+                None,
+                "2026-07-12T01:00:00Z",
+            ))
+            .unwrap(),
+        );
+        // The caps and the id type are the constants the flusher enforces.
+        for set in ["readIds", "unreadIds"] {
+            assert_eq!(
+                schema["properties"][set]["maxLength"],
+                ReadState::MAX_IDS,
+                "{set}: the lexicon cap is not ReadState::MAX_IDS"
+            );
+        }
+        assert_eq!(
+            schema["properties"]["idType"]["knownValues"],
+            json!([ReadState::ID_TYPE_GUID]),
+            "idType: the lexicon's known values are not what the flusher writes"
+        );
     }
 }

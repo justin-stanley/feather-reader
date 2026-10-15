@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "community.lexicon.rss.readState",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A reader's read state for one feed: a high-water mark plus two bounded exception sets. One record per feed, at a key derived from feedUrl. A writer reads and merges the existing record before writing (see docs/lexicon.md).",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["feedUrl", "updatedAt"],
+        "properties": {
+          "feedUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "The feed this record covers: the subscription's url. Ids in this record are scoped to it."
+          },
+          "readThrough": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Every item of this feed PUBLISHED at or before this instant is read, unless it is in unreadIds. An item with no publication date is never covered. Omitted when the reader has no such mark; never synthesized."
+          },
+          "readIds": {
+            "type": "array",
+            "maxLength": 1000,
+            "items": { "type": "string", "maxLength": 8192 },
+            "description": "Item ids read that readThrough does not cover: items published after it, and items with no publication date."
+          },
+          "unreadIds": {
+            "type": "array",
+            "maxLength": 1000,
+            "items": { "type": "string", "maxLength": 8192 },
+            "description": "Item ids readThrough covers that are explicitly kept unread. An id in both arrays is read."
+          },
+          "idType": {
+            "type": "string",
+            "knownValues": ["guid"],
+            "description": "What the strings in readIds and unreadIds are. \"guid\" means item ids by the rule in docs/lexicon.md: the publisher's id, else a standard.site document's at:// URI, else the item's link URL. Absent means a legacy record whose ids are private to the writer; readers ignore its id arrays and use only readThrough."
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this record's content last changed. The tie-break when two writers disagree about an item."
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "community.lexicon.rss.subscription",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "One followed feed: an RSS, Atom or JSON Feed document by URL, or a standard.site publication by its at:// URI. The source of truth for a reader's follow list. Public feeds only: a URL carrying a credential must not be written here.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["url", "createdAt"],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "The feed document's URL, or a site.standard.publication record's at:// URI."
+          },
+          "title": {
+            "type": "string",
+            "description": "Display title. A reader may override it from feed metadata."
+          },
+          "siteUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "The human-facing site the feed belongs to. Readers must not render a non-http(s) value as a link."
+          },
+          "folder": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "A community.lexicon.rss.folder record this subscription is filed under. A feed lives in at most one folder."
+          },
+          "fetchHint": {
+            "type": "string",
+            "knownValues": ["realtime", "hourly", "daily", "weekly"],
+            "description": "Polling cadence the reader may honour or ignore."
+          },
+          "private": {
+            "type": "boolean",
+            "description": "Reserved. Nothing writes it today; a reader must not change behaviour on it."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the subscription was made."
+          }
+        }
+      }
+    }
+  }
+}
