@@ -36,7 +36,9 @@ deploying is separate.
   `etag` and `last_modified` (only when it adds the column: once per
   database, never on a later boot). **Cost: one full fetch per feed, once,
   after the upgrade.** Without it an id-less item on a quiet feed would keep
-  being written as a feed-rs hash. Rolling back to 0.4.8 works: that binary never names
+  being written as a feed-rs hash. The column holds `0` (publisher id), `1`
+  (a stand-in, named by its link) or `2` (a stand-in whose link another id-less
+  item in the same fetch shares: no item id, local-only). Rolling back to 0.4.8 works: that binary never names
   the column, and SQLite fills the default. Checked by the upgrade test from a
   0.4.8 schema (`tests/fixtures/schema-v0.4.8.sql`) and by the upgrade-boot
   gate, which now seeds an entry row too.
@@ -284,6 +286,20 @@ deploying is separate.
   **Not changed:** stored guids (the dedup key) are byte-identical; `idType`
   stays `"guid"`, documented as "item id"; `saved.entryId` still writes the
   stored guid (follow-up).
+
+- **A link shared by several id-less items in one fetch is no item id (#287
+  review).** Naming an id-less item by its link collided when a feed gives many
+  items the same link (a status or notification feed linking its homepage):
+  reading one wrote the link, and every other instance marked **all** of them
+  read — an explicit unread un-read all of them. Ingest now sees each fetch
+  whole, and when two or more id-less items in it share a link, stores
+  `guid_synthesized = 2` for them: the flush leaves them out of the record and
+  an incoming record's link is never applied to them, so their read state
+  stays local. A title edit is unaffected — its old and new rows share a link
+  across fetches, not within one — and `docs/lexicon.md` states the rule for
+  other readers. Tests: per-fetch flagging and its refresh, the writer and
+  reader queries, and both directions end to end (including that no feed-rs
+  hash stands in for the dropped link).
 
 - **Compaction keeps every `unreadIds` exception (#287).** It kept only the
   ones at or below the local `readThrough`, but the written record carries

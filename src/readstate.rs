@@ -3609,6 +3609,117 @@ pub(crate) mod tests {
         }
     }
 
+    /// Feed `i` delivers two id-less items sharing `url` in ONE fetch (a feed
+    /// whose every item links the homepage). Returns their LOCAL row ids.
+    async fn synthesized_pair_in_one_fetch(state: &AppState, i: usize, url: &str) -> (i64, i64) {
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: feed(i),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let item = |guid: &str| store::NewEntry {
+            guid: guid.into(),
+            url: Some(url.into()),
+            published: Some("2026-01-01T00:00:00Z".into()),
+            guid_synthesized: true,
+            ..Default::default()
+        };
+        store::insert_entries(&state.db, feed_id, &[item("hash-a"), item("hash-b")], 0)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(DID)
+            .bind(feed_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let id = |g: &'static str| {
+            let db = state.db.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+                )
+                .bind(feed_id)
+                .bind(g)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+            }
+        };
+        (id("hash-a").await, id("hash-b").await)
+    }
+
+    /// **#287 review: a link shared by two items in one fetch is not an item
+    /// id — writing.** Reading one of them must not put the link in the
+    /// record: another instance would apply it to BOTH items.
+    #[tokio::test]
+    async fn a_link_shared_within_one_fetch_is_never_written() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let home = "https://status.example/";
+            let (a, _b) = synthesized_pair_in_one_fetch(&state, 1, home).await;
+            assert!(store::mark_read(&state.db, DID, a, true).await.unwrap());
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            let rec = pds_record(&fake, 1);
+            assert!(
+                !id_set(&rec, "readIds").contains(home),
+                "{backend:?}: the ambiguous link was written as read: {rec}"
+            );
+            assert!(
+                !id_set(&rec, "unreadIds").contains(home),
+                "{backend:?}: the ambiguous link was written as unread: {rec}"
+            );
+            for hash in ["hash-a", "hash-b"] {
+                assert!(
+                    !id_set(&rec, "readIds").contains(hash)
+                        && !id_set(&rec, "unreadIds").contains(hash),
+                    "{backend:?}: a feed-rs hash stood in for the ambiguous link: {rec}"
+                );
+            }
+            assert!(
+                id_set(&rec, "readIds").contains("pub-1"),
+                "{backend:?}: the flush did not write the record at all: {rec}"
+            );
+        }
+    }
+
+    /// **#287 review — reading.** An incoming record naming a link that two
+    /// items here share (another instance saw it alone) marks neither read.
+    #[tokio::test]
+    async fn a_link_shared_within_one_fetch_is_never_imported() {
+        for backend in BACKENDS {
+            let fake = Arc::new(Mutex::new(FakeRepo::default()));
+            let state = state_on(backend, &fake).await;
+            let home = "https://status.example/";
+            let (a, b) = synthesized_pair_in_one_fetch(&state, 1, home).await;
+            put_remote(
+                &fake,
+                1,
+                remote_guid_record(1, &[home], &[], "2026-01-01T00:00:00Z"),
+            );
+            mark_read(&state, 1, "pub-1").await;
+
+            flush_did(&state, DID)
+                .await
+                .unwrap_or_else(|e| panic!("{backend:?}: {e:#}"));
+
+            assert!(
+                !is_read(&state, a).await && !is_read(&state, b).await,
+                "{backend:?}: a remote read of the shared link marked local items read"
+            );
+        }
+    }
+
     /// **An explicit unread on ANY row sharing the link blocks an older
     /// remote read.**
     #[tokio::test]

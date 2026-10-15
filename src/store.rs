@@ -259,7 +259,9 @@ pub struct NewEntry {
     /// `feed::stable_guid`). Stored as `entries.guid_synthesized`; a flush
     /// names such a row by its `url` (#287). `false` for a publisher id, for a
     /// `featherreader:long-guid:` stand-in (the publisher DID give an id), and
-    /// for a standard.site document (its at:// URI is the id).
+    /// for a standard.site document (its at:// URI is the id). `insert_entries`
+    /// stores `2` instead of `1` when another synthesized item in the same
+    /// batch shares the link (#287 review): that link names no single item.
     pub guid_synthesized: bool,
 }
 
@@ -305,9 +307,11 @@ CREATE TABLE IF NOT EXISTS entries (
     fetched_at   TEXT NOT NULL,
     -- 1 when `guid` is a stand-in FeatherReader made because the item had no
     -- publisher id (feed-rs's link+title hash, or `featherreader:synthetic:`),
-    -- 0 when it is the publisher's id or a standard.site at:// URI. Decides
-    -- what a readState record calls the item (#287): a synthesized row is
-    -- named by its `url`. Set by ingest; refreshed on every re-poll.
+    -- 0 when it is the publisher's id or a standard.site at:// URI, 2 when it
+    -- is a stand-in AND another id-less item in the same fetch shares its
+    -- link. Decides what a readState record calls the item (#287): 1 is named
+    -- by its `url`, 2 is left out (local-only). Set by ingest; refreshed on
+    -- every re-poll.
     guid_synthesized INTEGER NOT NULL DEFAULT 0,
     UNIQUE (feed_id, guid)
 );
@@ -1781,8 +1785,26 @@ pub async fn insert_entries(
 ) -> Result<u64> {
     let mut tx = pool.begin().await.context("begin insert_entries tx")?;
     let mut count: u64 = 0;
+    // `entries` is ONE fetch of the feed (#287 review). Two id-less items that
+    // share a link in the same fetch are different items (a status feed whose
+    // every item links the homepage), so that link names neither: flag them `2`
+    // and a readState record leaves them out. A title edit is different — the
+    // old and new rows share a link across fetches, never within one — and
+    // stays `1`, named by its link. Re-evaluated on every poll.
+    let mut synthesized_links: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for e in entries.iter().filter(|e| e.guid_synthesized) {
+        if let Some(url) = e.url.as_deref() {
+            *synthesized_links.entry(url).or_default() += 1;
+        }
+    }
     for e in entries {
         let fetched_at = e.fetched_at.clone().unwrap_or_else(now_rfc3339);
+        let flag: i64 = match (e.guid_synthesized, e.url.as_deref()) {
+            (false, _) => 0,
+            (true, Some(url)) if synthesized_links.get(url).copied().unwrap_or(0) > 1 => 2,
+            (true, _) => 1,
+        };
         let res = sqlx::query(
             r#"
             INSERT INTO entries
@@ -1810,7 +1832,7 @@ pub async fn insert_entries(
         .bind(&e.content_html)
         .bind(&fetched_at)
         .bind(e.keep_stored_content)
-        .bind(e.guid_synthesized)
+        .bind(flag)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("insert entry {} failed", e.guid))?;
@@ -3768,7 +3790,8 @@ pub async fn guids_for_entry_ids(
         JOIN feeds f ON f.id = e.feed_id
         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?3
         WHERE f.url = ?1
-          AND (e.guid_synthesized = 0 OR e.url IS NOT NULL)
+          -- 2 = a link shared within one fetch: no item id, so local-only.
+          AND (e.guid_synthesized = 0 OR (e.guid_synthesized = 1 AND e.url IS NOT NULL))
         "#,
     )
     .bind(feed_url)
@@ -6062,8 +6085,134 @@ mod tests {
         Ok(())
     }
 
+    // ---- #287 review: a link shared within one fetch is no item id --------
+
+    async fn flag_of(pool: &SqlitePool, guid: &str) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT guid_synthesized FROM entries WHERE guid = ?1")
+                .bind(guid)
+                .fetch_one(pool)
+                .await?,
+        )
+    }
+
+    fn synth(guid: &str, url: Option<&str>) -> NewEntry {
+        NewEntry {
+            guid: guid.into(),
+            url: url.map(str::to_string),
+            guid_synthesized: true,
+            ..Default::default()
+        }
+    }
+
+    /// **Two id-less items sharing a link in ONE fetch are different items**
+    /// (a status feed whose every item links the homepage), so the link names
+    /// neither: both rows are flagged `2`. A publisher-id item with the same
+    /// link does not count, and does not change. The flag is per fetch: the
+    /// next fetch carrying the item alone flags it `1` again.
+    #[tokio::test]
+    async fn insert_entries_flags_a_link_shared_within_one_fetch() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://shared.example/f.xml").await?;
+        let home = Some("https://shared.example/");
+        let pub_row = NewEntry {
+            guid: "pub".into(),
+            url: home.map(str::to_string),
+            ..Default::default()
+        };
+        insert_entries(
+            &pool,
+            feed_id,
+            &[
+                synth("s1", home),
+                synth("s2", home),
+                synth("s3", Some("https://shared.example/3")),
+                synth("featherreader:synthetic:n1", None),
+                synth("featherreader:synthetic:n2", None),
+                pub_row,
+            ],
+            0,
+        )
+        .await?;
+        assert_eq!(
+            flag_of(&pool, "s1").await?,
+            2,
+            "s1 shares its link in this fetch"
+        );
+        assert_eq!(
+            flag_of(&pool, "s2").await?,
+            2,
+            "s2 shares its link in this fetch"
+        );
+        assert_eq!(
+            flag_of(&pool, "s3").await?,
+            1,
+            "a unique link is an item id"
+        );
+        assert_eq!(
+            flag_of(&pool, "featherreader:synthetic:n1").await?,
+            1,
+            "no link is not a shared link"
+        );
+        assert_eq!(
+            flag_of(&pool, "pub").await?,
+            0,
+            "a publisher id is untouched"
+        );
+
+        insert_entries(&pool, feed_id, &[synth("s1", home)], 0).await?;
+        assert_eq!(
+            flag_of(&pool, "s1").await?,
+            1,
+            "a later fetch carrying the item alone makes its link an id again"
+        );
+        Ok(())
+    }
+
+    /// The writer leaves a row whose link is ambiguous out of the record: it
+    /// is local-only, never named by a link that also names another item.
+    #[tokio::test]
+    async fn guids_for_entry_ids_leaves_an_ambiguous_link_out() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_url = "https://amb.example/f.xml";
+        let feed_id = feed_for_item_ids(&pool, feed_url).await?;
+        let home = Some("https://amb.example/");
+        insert_entries(&pool, feed_id, &[synth("h1", home), synth("h2", home)], 0).await?;
+        let (r1, r2) = (
+            row_id(&pool, feed_id, "h1").await?,
+            row_id(&pool, feed_id, "h2").await?,
+        );
+        let got = guids_for_entry_ids(&pool, "did:plc:r", feed_url, &[r1, r2]).await?;
+        assert!(got.is_empty(), "an ambiguous link named a row: {got:?}");
+        Ok(())
+    }
+
+    /// The reader never applies an incoming link to rows whose link is
+    /// ambiguous here, even if another instance saw that link alone.
+    #[tokio::test]
+    async fn entries_for_guids_does_not_match_an_ambiguous_link() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_url = "https://amb.example/f.xml";
+        let feed_id = feed_for_item_ids(&pool, feed_url).await?;
+        let home = Some("https://amb.example/");
+        insert_entries(&pool, feed_id, &[synth("h1", home), synth("h2", home)], 0).await?;
+        let got = entries_for_guids(
+            &pool,
+            "did:plc:r",
+            feed_url,
+            &["https://amb.example/".to_string()],
+        )
+        .await?;
+        assert!(got.is_empty(), "an ambiguous link matched rows: {got:?}");
+        Ok(())
+    }
+
     /// A: publisher id; B: hash, link; C: synthetic, no link; D: at:// URI;
     /// E: publisher id sharing B's link; F: second hash sharing B's link.
+    ///
+    /// F is B after a title edit, so it arrives in a LATER fetch: two id-less
+    /// items sharing a link within ONE fetch are different items, and that
+    /// link is no item id (`guid_synthesized = 2`, see the tests below).
     async fn item_id_rows(pool: &SqlitePool) -> Result<(i64, [i64; 6])> {
         let feed_url = "https://ids.example/f.xml";
         let feed_id = feed_for_item_ids(pool, feed_url).await?;
@@ -6088,7 +6237,8 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        insert_entries(pool, feed_id, &entries, 0).await?;
+        insert_entries(pool, feed_id, &entries[..5], 0).await?;
+        insert_entries(pool, feed_id, &entries[5..], 0).await?;
         let mut ids = [0; 6];
         for (i, (g, _, _)) in rows.iter().enumerate() {
             ids[i] = row_id(pool, feed_id, g).await?;

@@ -99,6 +99,15 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
    8192 bytes that ends on a UTF-8 character boundary. Compared exactly, byte
    for byte.
 
+   **A link shared within one feed document names no item.** If two or more
+   items without a publisher id carry the same link in the same fetch of the
+   feed (a status feed whose every item links its homepage), that link is not
+   an item id for any of them: they have no item id, are never written to
+   either array, and an incoming record naming that link is not applied to
+   them. A title edit is not this case: the old and new versions of an item
+   share a link across fetches, never within one, and keep the link as their
+   id. Decide per fetch; an item whose link stops being shared regains it.
+
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
 
@@ -109,8 +118,8 @@ on both sides lists the id in the array of the side whose read or unread mark
 is **most recent**. A tie, or a mark with no known time, goes to `unreadIds`.
 FeatherReader keeps the time of each read/unread mark (not of a star) for this.
 
-An item with neither an id nor a link has no item id. It is never written to
-either array; it is covered by `readThrough` when it has a publication date,
+An item with neither an id nor a link — or whose link is shared within one
+feed document (rule 3) — has no item id. It is never written to either array; it is covered by `readThrough` when it has a publication date,
 and otherwise its read state is not portable.
 
 **Long ids.** An id over 2048 bytes (rule 1) is replaced by the string
