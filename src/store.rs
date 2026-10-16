@@ -1791,18 +1791,24 @@ pub async fn insert_entries(
     // and a readState record leaves them out. A title edit is different — the
     // old and new rows share a link across fetches, never within one — and
     // stays `1`, named by its link. Re-evaluated on every poll.
-    let mut synthesized_links: std::collections::HashMap<&str, usize> =
+    // Counted as DISTINCT guids per link: a feed that repeats one id-less
+    // entry (same link and title, so the same guid) is still one item, and
+    // its link still names it (#287 review 5).
+    let mut synthesized_links: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
         std::collections::HashMap::new();
     for e in entries.iter().filter(|e| e.guid_synthesized) {
         if let Some(url) = e.url.as_deref() {
-            *synthesized_links.entry(url).or_default() += 1;
+            synthesized_links
+                .entry(url)
+                .or_default()
+                .insert(e.guid.as_str());
         }
     }
     for e in entries {
         let fetched_at = e.fetched_at.clone().unwrap_or_else(now_rfc3339);
         let flag: i64 = match (e.guid_synthesized, e.url.as_deref()) {
             (false, _) => 0,
-            (true, Some(url)) if synthesized_links.get(url).copied().unwrap_or(0) > 1 => 2,
+            (true, Some(url)) if synthesized_links.get(url).is_some_and(|g| g.len() > 1) => 2,
             (true, _) => 1,
         };
         let res = sqlx::query(
@@ -6165,6 +6171,30 @@ mod tests {
             flag_of(&pool, "s1").await?,
             1,
             "a later fetch carrying the item alone makes its link an id again"
+        );
+        Ok(())
+    }
+
+    /// **#287 review 5: one item listed twice in a fetch is still ONE item.**
+    /// A feed that repeats an id-less entry (same link and title, so the same
+    /// feed-rs guid) yields one row; its link names exactly that item, so it
+    /// keeps `1`. Only DISTINCT items sharing a link make it ambiguous.
+    #[tokio::test]
+    async fn an_item_repeated_within_one_fetch_keeps_its_link_id() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://dup.example/f.xml").await?;
+        let link = Some("https://dup.example/post");
+        insert_entries(
+            &pool,
+            feed_id,
+            &[synth("same", link), synth("same", link)],
+            0,
+        )
+        .await?;
+        assert_eq!(
+            flag_of(&pool, "same").await?,
+            1,
+            "a repeated item lost its link id"
         );
         Ok(())
     }

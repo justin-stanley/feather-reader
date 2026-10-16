@@ -38,7 +38,12 @@ deploying is separate.
   after the upgrade.** Without it an id-less item on a quiet feed would keep
   being written as a feed-rs hash. The column holds `0` (publisher id), `1`
   (a stand-in, named by its link) or `2` (a stand-in whose link another id-less
-  item in the same fetch shares: no item id, local-only). Rolling back to 0.4.8 works: that binary never names
+  *distinct* item in the same fetch shares: no item id, local-only).
+  **Deliberate exception:** rows already gone from their feed's document at
+  upgrade are never re-parsed, so they keep `0`, and an id-less one among them
+  is still named by its stored guid — a feed-rs hash — until retention removes
+  it. They cannot be told apart from rows with a real publisher id without
+  guessing from the guid's shape, and the set only shrinks. Rolling back to 0.4.8 works: that binary never names
   the column, and SQLite fills the default. Checked by the upgrade test from a
   0.4.8 schema (`tests/fixtures/schema-v0.4.8.sql`) and by the upgrade-boot
   gate, which now seeds an entry row too.
@@ -297,7 +302,10 @@ deploying is separate.
   an incoming record's link is never applied to them, so their read state
   stays local. A title edit is unaffected — its old and new rows share a link
   across fetches, not within one — and `docs/lexicon.md` states the rule for
-  other readers. Tests: per-fetch flagging and its refresh, the writer and
+  other readers. **Limit:** siblings that never share a fetch (a feed holding
+  only its latest status item) still look like one edited item and collide;
+  `docs/lexicon.md` documents it. A feed repeating one item within a fetch is
+  counted once, so it keeps its link id (review 5). Tests: per-fetch flagging and its refresh, the writer and
   reader queries, and both directions end to end (including that no feed-rs
   hash stands in for the dropped link).
 

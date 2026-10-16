@@ -100,13 +100,23 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
    for byte.
 
    **A link shared within one feed document names no item.** If two or more
-   items without a publisher id carry the same link in the same fetch of the
-   feed (a status feed whose every item links its homepage), that link is not
-   an item id for any of them: they have no item id, are never written to
-   either array, and an incoming record naming that link is not applied to
-   them. A title edit is not this case: the old and new versions of an item
-   share a link across fetches, never within one, and keep the link as their
-   id. Decide per fetch; an item whose link stops being shared regains it.
+   *distinct* items without a publisher id carry the same link in the same
+   fetch of the feed (a status feed whose every item links its homepage),
+   that link is not an item id for any of them: they have no item id, are
+   never written to either array, and an incoming record naming that link is
+   not applied to them. One item the feed lists twice is still one item. A
+   title edit is not this case: the old and new versions of an item share a
+   link across fetches, never within one, and keep the link as their id.
+   Decide per fetch; an item whose link stops being shared regains it.
+
+   **Known limit.** The rule sees one fetch at a time, so it cannot tell a
+   title edit from two different items that share a link but never appear in
+   the same fetch (a feed that only ever holds its latest status item, or a
+   short time window). Those items are treated as one: a read or unread of
+   one applies to the other on another instance. A link that once named an
+   item stays in records that already hold it, and an instance where it is
+   still unambiguous applies it. Feeds that need exact read state across
+   readers should give items a publisher id.
 
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
