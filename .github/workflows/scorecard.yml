@@ -28,7 +28,7 @@ jobs:
     # checks). Skipped on a private repo (e.g. a private fork) so it neither
     # burns Actions minutes nor fails; this repo is public, so it runs here.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted; free for this public repo
+    runs-on: ubuntu-26.04  # GitHub-hosted; free for this public repo
     permissions:
       security-events: write  # upload SARIF to the Security tab
       id-token: write         # publish results to the Scorecard API (public)

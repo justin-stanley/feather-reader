@@ -30,7 +30,7 @@ jobs:
     # where the dependency graph is always-on + free, so it runs here. Mirrors
     # the gate in scorecard.yml.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted; free for this public repo
+    runs-on: ubuntu-26.04  # GitHub-hosted; free for this public repo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

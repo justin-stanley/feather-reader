@@ -42,7 +42,7 @@ jobs:
     # fork-PR workflows) that RCE risk is gone — so this is now a POLICY choice:
     # drop this `if:` to give contributor PRs CI.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -79,7 +79,7 @@ jobs:
   cargo-deny:
     name: cargo deny (licenses + bans + sources)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -113,7 +113,7 @@ jobs:
   cargo-audit:
     name: cargo audit (RustSec)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -145,7 +145,7 @@ jobs:
   sidecar:
     name: OAuth sidecar
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     defaults:
       run:
         working-directory: oauth-sidecar
@@ -231,7 +231,7 @@ jobs:
     # `[workspace]`), so the root Rust / cargo-deny / cargo-audit jobs above NEVER
     # touch it. This job gives the bot the SAME gates as the app, scoped to `bot/`.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     defaults:
       run:
         working-directory: bot
@@ -291,7 +291,7 @@ jobs:
   secrets:
     name: Secret scan (gitleaks)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     env:
       GITLEAKS_VERSION: 8.28.0
     steps:
@@ -331,7 +331,7 @@ jobs:
     # with no on-call. The only prior check was whoever edited it running
     # `caddy validate` by hand, if they thought to.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -391,7 +391,7 @@ jobs:
     # (#257) and no check noticed. This runs it against throwaway SQLite files
     # with stubbed revoke/stop commands and pins the order and the refusals.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    runs-on: ubuntu-26.04  # GitHub-hosted: free + parallel now the repo is public
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Ensure sqlite3

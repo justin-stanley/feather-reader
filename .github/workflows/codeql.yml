@@ -52,7 +52,7 @@ jobs:
     # private fork), where the SARIF upload would fail, so it is skipped there.
     # This repo is public, so it always runs here.
     if: ${{ github.event.repository.private == false }}
-    runs-on: ubuntu-latest  # GitHub-hosted: free for this public repo; see header note
+    runs-on: ubuntu-26.04  # GitHub-hosted: free for this public repo; see header note
     permissions:
       actions: read
       contents: read
