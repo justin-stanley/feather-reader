@@ -14,8 +14,9 @@
 #
 # Steps, each a hard failure:
 #   1. previous image creates the schema on an empty volume (--migrate-auto-vacuum)
-#   2. seed rows the way the previous release stored them (an RSS feed and an
-#      at:// publication, without `kind`), so backfills run on real data
+#   2. seed rows the way the previous release stored them (an RSS feed, an
+#      at:// publication without `kind`, and an entry without
+#      `guid_synthesized`), so backfills run on real data
 #   3. candidate migrates that volume
 #   4. candidate boots fully (scheduler off, no network) and answers /health
 #   5. previous image boots fully again on the migrated volume and answers
@@ -63,6 +64,10 @@ docker run --rm --network none -v "$vol:/data" --entrypoint node "$prev" -e '
   const add = db.prepare("INSERT INTO feeds (url) VALUES (?)");
   add.run("https://example.com/feed.xml");
   add.run("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab");
+  // An entry row as 0.4.8 stored it: no guid_synthesized column (#287).
+  const feedId = db.prepare("SELECT id FROM feeds WHERE url = ?").get("https://example.com/feed.xml").id;
+  db.prepare("INSERT INTO entries (feed_id, guid, url, fetched_at) VALUES (?, ?, ?, ?)")
+    .run(feedId, "5813b43a0512aaef2750311bf4d978a", "https://n.example/post", "2026-01-01T00:00:00Z");
 ' || fail "could not seed the previous release's database"
 
 step "3/5 candidate migrates it ($cand)"

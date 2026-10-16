@@ -352,13 +352,12 @@ pub struct ReadState {
     #[serde(rename = "unreadIds", skip_serializing_if = "Vec::is_empty", default)]
     pub unread_ids: Vec<String>,
 
-    /// What the strings in `readIds` / `unreadIds` are. See docs/lexicon.md for
-    /// the item-id rule the value names. FeatherReader writes
-    /// [`ReadState::ID_TYPE_GUID`]: each is the entry's GUID as the feed
-    /// publishes it (or the stable stand-in FeatherReader derives when it does
-    /// not — `feed::stable_guid` / `feed::bound_guid`, both fixed-key hashes, so
-    /// every instance derives the same one), which means the same thing on any
-    /// instance and in any client.
+    /// What the strings in `readIds` / `unreadIds` are. FeatherReader writes
+    /// [`ReadState::ID_TYPE_GUID`], which names **item ids** by the rule in
+    /// `docs/lexicon.md`: the publisher's id, else a standard.site document's
+    /// `at://` URI, else the item's link URL. The value is `"guid"` for
+    /// historical reasons. Each is the same on every instance, and a second
+    /// implementation can compute it from the feed alone.
     ///
     /// **Absent means legacy.** Records written before #246 carried this
     /// instance's LOCAL SQLite row ids, which are meaningless anywhere else —

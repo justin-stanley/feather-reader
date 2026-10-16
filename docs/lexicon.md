@@ -80,8 +80,8 @@ For the feed `feedUrl`, an item is **read** if either:
 2. it has a publication date at or before `readThrough`, and its id is not in
    `unreadIds`.
 
-Otherwise it is unread. An id in both arrays is read (`readIds` wins). An item
-with no publication date is covered only by `readIds`.
+Otherwise it is unread. An id in both arrays is **unread** (see Item ids). An
+item with no publication date is covered only by `readIds`.
 
 ### Item ids (`idType: "guid"`)
 
@@ -99,11 +99,37 @@ The strings in `readIds` and `unreadIds` name items by this rule, in order:
    8192 bytes that ends on a UTF-8 character boundary. Compared exactly, byte
    for byte.
 
+   **A link shared within one feed document names no item.** If two or more
+   *distinct* items without a publisher id carry the same link in the same
+   fetch of the feed (a status feed whose every item links its homepage),
+   that link is not an item id for any of them: they have no item id, are
+   never written to either array, and an incoming record naming that link is
+   not applied to them. One item the feed lists twice is still one item. A
+   title edit is not this case: the old and new versions of an item share a
+   link across fetches, never within one, and keep the link as their id.
+   Decide per fetch; an item whose link stops being shared regains it.
+
+   **Known limit.** The rule sees one fetch at a time, so it cannot tell a
+   title edit from two different items that share a link but never appear in
+   the same fetch (a feed that only ever holds its latest status item, or a
+   short time window). Those items are treated as one: a read or unread of
+   one applies to the other on another instance. A link that once named an
+   item stays in records that already hold it, and an instance where it is
+   still unambiguous applies it. Feeds that need exact read state across
+   readers should give items a publisher id.
+
 Ids are scoped to the record's `feedUrl`: the same string in two records names
 two items.
 
-An item with neither an id nor a link has no item id. It is never written to
-either array; it is covered by `readThrough` when it has a publication date,
+A writer must not list an id in both `readIds` and `unreadIds`; a reader that
+sees one in both treats it as unread. Several local items can share one id (two
+entries with the same link, after a title edit): a writer that has such items
+on both sides lists the id in the array of the side whose read or unread mark
+is **most recent**. A tie, or a mark with no known time, goes to `unreadIds`.
+FeatherReader keeps the time of each read/unread mark (not of a star) for this.
+
+An item with neither an id nor a link — or whose link is shared within one
+feed document (rule 3) — has no item id. It is never written to either array; it is covered by `readThrough` when it has a publication date,
 and otherwise its read state is not portable.
 
 **Long ids.** An id over 2048 bytes (rule 1) is replaced by the string
@@ -118,11 +144,13 @@ by FeatherReader before 0.4.9 and holds that instance's private row ids: a
 reader must ignore its id arrays entirely. Its `readThrough` is still an
 instant and still merges.
 
-**Status in FeatherReader.** Before PR #287-2 (0.4.9), an item with no
+**Status in FeatherReader.** Implemented from 0.4.9. Before it, an item with no
 publisher id was written as a hash FeatherReader computed from its link and
 title (`5813b43a0512aaef2750311bf4d978a` is one). From 0.4.9 it is written as
-its link, and on read FeatherReader matches an incoming id against both the
-stored id and the link, so records written in between still resolve.
+its link, and on read an incoming id is matched against both the stored id and,
+for such items, the link, so a record written by an earlier build still
+resolves. An item whose only link is not `http(s)` has no portable id, like an
+item with no link.
 
 ### `readThrough`
 

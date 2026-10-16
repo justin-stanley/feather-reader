@@ -35,7 +35,7 @@
           "idType": {
             "type": "string",
             "knownValues": ["guid"],
-            "description": "What the strings in readIds and unreadIds are. \"guid\" means item ids by the rule in docs/lexicon.md: the publisher's id, else a standard.site document's at:// URI, else the item's link URL. Absent means a legacy record whose ids are private to the writer; readers ignore its id arrays and use only readThrough."
+            "description": "What the strings in readIds and unreadIds are. \"guid\" means item ids by the rule in docs/lexicon.md: the publisher's id, else a standard.site document's at:// URI, else the item's link URL, unless another id-less item in the same fetch of the feed shares that link (then the item has no id). Absent means a legacy record whose ids are private to the writer; readers ignore its id arrays and use only readThrough."
           },
           "updatedAt": {
             "type": "string",
