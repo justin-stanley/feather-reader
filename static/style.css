@@ -1143,8 +1143,37 @@ kbd {
   fill: currentColor;
 }
 
+/* Read is a filled disc with a heavier check — as unmistakable as the star's
+   fill. A colour shift on a thin stroke alone was too faint to read, so
+   readers clicked again and un-read the entry (#300). */
 .actionbar .actionbar-read[aria-pressed="true"] {
   color: var(--accent);
+}
+
+.actionbar .actionbar-read[aria-pressed="true"] svg {
+  box-sizing: content-box;
+  padding: 0.3rem;
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: var(--r-full);
+  stroke-width: 2.6;
+}
+
+.actionbar .actionbar-read[aria-pressed="true"]:hover svg {
+  background: var(--accent-deep);
+}
+
+/* Confirm the click: the handler's OOB render alone carries data-toggled
+   (a page load does not), so the icon pulses once after a toggle. The global
+   prefers-reduced-motion rule above cuts it to nothing. */
+.actionbar [data-toggled] svg {
+  animation: actionbar-toggle 220ms ease-out;
+}
+
+@keyframes actionbar-toggle {
+  0%   { transform: scale(0.82); }
+  60%  { transform: scale(1.12); }
+  100% { transform: scale(1); }
 }
 
 /* --------------------------------------------------------------------------

@@ -14,6 +14,23 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **The reader's read button shows whether the entry is read (#300).** On the
+  reader's action bar, the only sign of "read" was a colour shift on a thin
+  checkmark, too faint to tell apart, so readers clicked again and un-read the
+  entry. The access log of a staging soak showed it: four toggles, ending
+  unread, twice. A read entry's button is now a filled accent disc with a
+  heavier check, as distinct as the star's fill, in both themes. Both toggles
+  carry a `title` matching their `aria-label`, so the state reads on hover or
+  focus. Only the handler's out-of-band render carries `data-toggled`, which
+  the stylesheet animates once, so a click is confirmed but a page load is not.
+  `prefers-reduced-motion` turns the animation off. The list view is
+  unchanged: its row already restyles with `is-read`. Test:
+  `actionbar_read_button_shows_state_and_confirms_a_toggle`.
+
 ## 0.4.9 — 2026-10-16
 
 What you have read now carries across FeatherReader instances by ids any

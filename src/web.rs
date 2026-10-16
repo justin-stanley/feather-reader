@@ -11052,6 +11052,45 @@ mod tests {
     /// the hidden `read` input + `aria-pressed` reflect the NEW state. The list
     /// view (no reader header) instead swaps the row. This guards the reader OOB
     /// toggle wiring, which had no test.
+    /// **#300: the reader's read button shows its state, and confirms a toggle.**
+    /// The state is visible as a hover/focus tooltip (`title`, matching the
+    /// `aria-label`), and ONLY the post-toggle OOB render carries
+    /// `data-toggled`, which the stylesheet animates. A page load does not
+    /// pulse, because nothing was just clicked.
+    #[test]
+    fn actionbar_read_button_shows_state_and_confirms_a_toggle() {
+        let render = |read: bool, oob: bool| {
+            EntryActionBarTemplate {
+                id: 7,
+                read,
+                starred: false,
+                oob,
+            }
+            .render()
+            .unwrap()
+        };
+        let read_page = render(true, false);
+        assert!(
+            read_page.contains(r#"title="Mark unread (m)""#),
+            "a read entry's button must say so on hover: {read_page}"
+        );
+        let unread_page = render(false, false);
+        assert!(
+            unread_page.contains(r#"title="Mark read (m)""#),
+            "an unread entry's button must say so on hover: {unread_page}"
+        );
+        assert!(
+            !read_page.contains("data-toggled") && !unread_page.contains("data-toggled"),
+            "a page load must not play the toggle confirmation"
+        );
+        let toggled = render(true, true);
+        assert_eq!(
+            toggled.matches("data-toggled").count(),
+            2,
+            "the post-toggle OOB render marks both toggles (read and star): {toggled}"
+        );
+    }
+
     #[tokio::test]
     async fn reader_mark_read_returns_oob_actionbar_with_flipped_state() {
         let did = "did:plc:reader";
