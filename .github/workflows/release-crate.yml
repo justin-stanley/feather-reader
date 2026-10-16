@@ -73,6 +73,13 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           set -euo pipefail
+          # A pre-release tag (anything with a `-`, e.g. v0.4.9-rc.1) is never
+          # published, even dispatched by hand: rcs soak on staging (#294), and
+          # crates.io cannot take a publish back. Checked first, so it holds even
+          # if Cargo.toml ever carries the pre-release version and they match.
+          case "$RELEASE_TAG" in
+            *-*) echo "::error::$RELEASE_TAG is a pre-release tag; release candidates are never published to crates.io (#294)"; exit 1 ;;
+          esac
           tag="${RELEASE_TAG#v}"
           crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           echo "tag=v$tag  Cargo.toml=$crate"
