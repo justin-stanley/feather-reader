@@ -14,7 +14,15 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.9 — 2026-10-16
+
+What you have read now carries across FeatherReader instances by ids any
+reader can compute (#246, #287): a publisher's id, a standard.site
+document's `at://` URI, else the item's link — never a hash only
+FeatherReader knows. The `community.lexicon.rss.*` records are written down
+as Lexicon JSON with a spec (#287). Three dependencies are patched for new
+RustSec advisories (#296). Two schema columns are added; read the upgrade
+notes. Shipped as `v0.4.9-rc.1` to staging first (#294).
 
 ### Upgrade notes
 
@@ -57,6 +65,20 @@ deploying is separate.
   sides, can only say unread until those rows are marked again. Rolling back
   to 0.4.8 works: it never names the column.
 
+### Security
+
+- **`ammonia`, `rustls` and `quinn-proto` patched for new RustSec advisories
+  (#296).** `cargo audit` began failing on `main` once these were published:
+  `ammonia` 4.2.0 → 4.2.3 (RUSTSEC-2021-0157, CSS `url("")` escaping in
+  `style`; RUSTSEC-2021-0158, XSS via SVG `animate*`), `rustls` 0.23.45 →
+  0.23.46 (RUSTSEC-2026-0346 to -0349) and `quinn-proto` 0.11.16 → 0.11.19
+  (RUSTSEC-2026-0338 to -0342), the last two in the invite bot as well.
+  FeatherReader sanitizes feed HTML with `ammonia::clean`, the default
+  allowlist, which admits neither `style` attributes nor SVG, so the two
+  `ammonia` issues are not believed reachable; patched regardless.
+  Lockfile-only: nothing else moved, and `cargo audit` is clean for both
+  lockfiles.
+
 ### Added
 
 - **The `community.lexicon.rss.*` schema is written down (#287).** Lexicon
@@ -71,6 +93,17 @@ deploying is separate.
   item-id rule it states lands in #287's second PR, before 0.4.9; the
   `readThrough` basis in its third. Until then FeatherReader writes what the
   #246 entry below describes.
+
+### Changed
+
+- **Copy no longer claims portability to "any reader" (#285).** The README
+  and the landing, login, manage and beta pages said your records are
+  portable to "any reader that speaks the lexicon". FeatherReader is the
+  lexicon's only implementation, so the copy now says FeatherReader
+  instances can read them, and so can any reader that adopts the lexicon.
+  `Cargo.toml`'s description names standard.site publications, and the
+  site's meta/OG description leads with what is true today: it keeps your
+  place, and your subscriptions and reads are records in your own PDS.
 
 ### Fixed
 
