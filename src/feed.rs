@@ -2056,6 +2056,20 @@ fn entry_id(links: &[RawLink], title: &Option<Text>, _uri: Option<&str>) -> Stri
     }
 }
 
+/// Whether `e.id` is one [`entry_id`] generated, rather than the publisher's.
+///
+/// feed-rs calls the generator only for an entry whose `id` is empty
+/// (`assign_missing_ids`), before it sanitises text, and the generator is a
+/// pure function of the entry's links and title — so recomputing it tells the
+/// two apart. A publisher id equal to the 128-bit hash of the item's own link
+/// and title is the one misclassification, and not a realistic one. An
+/// id-less Atom entry whose `type="html"` title ammonia rewrites recomputes
+/// differently and reads as a publisher id; Atom requires `id`, so that entry
+/// is malformed already, and the cost is a non-portable id, not a wrong one.
+fn id_was_generated(e: &RawEntry) -> bool {
+    !e.id.is_empty() && e.id == entry_id(&e.links, &e.title, None)
+}
+
 /// Whether a link is one of the entry's own links rather than a pointer to its
 /// comments (feed-rs 3.0's `<comments>` / `wfw:commentRss`, marked by
 /// `target`). Only these are candidates for the permalink and the id, which is
@@ -2096,13 +2110,20 @@ fn entry_without_body(e: &RawEntry) -> NewEntry {
 
     // GUID may use the raw link (dedup key only, never rendered), so prefer the
     // entry's first raw link for identity even when it's not a safe href.
-    let guid = if !e.id.trim().is_empty() {
-        e.id.trim().to_string()
+    //
+    // `synthesized` says whether FeatherReader made the guid up (#287): a
+    // readState record then names the item by its `url` instead.
+    let (guid, synthesized) = if !e.id.trim().is_empty() {
+        (e.id.trim().to_string(), id_was_generated(e))
     } else if let Some(link) = raw_entry_link(e) {
-        link
+        // Unreachable with `entry_id` installed — feed-rs generates an id for
+        // every entry with a primary link, and `raw_entry_link` only looks at
+        // primary links — but kept as the fallback it was. The link IS the
+        // item id here, so it is not synthesized.
+        (link, false)
     } else {
         // Last resort: derive a stable id so re-fetches dedup rather than dupe.
-        stable_guid(e)
+        (stable_guid(e), true)
     };
 
     NewEntry {
@@ -2117,6 +2138,7 @@ fn entry_without_body(e: &RawEntry) -> NewEntry {
         content_html: None,
         fetched_at: None, // store defaults to "now".
         keep_stored_content: false,
+        guid_synthesized: synthesized,
     }
 }
 
@@ -2864,6 +2886,19 @@ mod tests {
     }
 
     #[test]
+    fn a_long_publisher_id_is_not_flagged_synthesized() {
+        let long = "g".repeat(10_000);
+        let xml = rss_with_fields("t", "l", "a", "b", &long);
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
+        let e = normalize_entry(&parsed.entries[0]);
+        assert!(e.guid.starts_with("featherreader:long-guid:"), "{}", e.guid);
+        assert!(
+            !e.guid_synthesized,
+            "the publisher DID give an id; the stand-in only bounds it"
+        );
+    }
+
+    #[test]
     fn an_ordinary_long_article_is_untouched() {
         // The largest body production held on 2026-10-03 was 86,969 bytes.
         let body = format!("<p>{}</p>", "word ".repeat(18_000));
@@ -3288,6 +3323,21 @@ mod tests {
         assert_eq!(e.url.as_deref(), Some("https://n.example/post"));
     }
 
+    /// **#287: a guid FeatherReader made up is flagged, a publisher's is not.**
+    #[test]
+    fn an_id_less_item_with_a_link_is_flagged_synthesized() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title><item><title>No guid here</title><link>https://n.example/post</link></item>
+<item><title>Comments first, guid present</title><comments>https://c.example/6#comments</comments><link>https://c.example/6</link><guid>c6</guid></item></channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        let e = normalize_entry(&parsed.entries[0]);
+        assert_eq!(e.guid, "5813b43a0512aaef2750311bf4d978a");
+        assert!(e.guid_synthesized, "the link+title hash is a stand-in");
+        assert_eq!(e.url.as_deref(), Some("https://n.example/post"));
+        let p = normalize_entry(&parsed.entries[1]);
+        assert_eq!(p.guid, "c6");
+        assert!(!p.guid_synthesized, "a publisher id is not a stand-in");
+    }
+
     /// **feed-rs 3.0 adds `<comments>` and `wfw:commentRss` to `entry.links`.**
     /// Listed before `<link>`, the comments URL became the entry's permalink,
     /// and for an id-less item it was hashed into the generated id, so the
@@ -3573,6 +3623,22 @@ mod tests {
                 "featherreader:synthetic:34b72cc7fa0a59ac".into(),
             ]
         );
+    }
+
+    #[test]
+    fn an_item_with_neither_id_nor_link_is_flagged_synthesized() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+<item><title>only a title</title><description>body</description></item>
+<item><description>no title either</description></item>
+<item><title>Tïtle wíth ünïcode</title></item>
+</channel></rss>"#;
+        let parsed = parse_feed(xml.as_bytes()).expect("parse");
+        for (i, raw) in parsed.entries.iter().enumerate() {
+            let e = normalize_entry(raw);
+            assert!(e.guid.starts_with("featherreader:synthetic:"), "{i}");
+            assert!(e.guid_synthesized, "entry {i}");
+            assert_eq!(e.url, None, "entry {i}");
+        }
     }
 
     #[test]

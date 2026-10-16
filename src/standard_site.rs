@@ -165,6 +165,8 @@ impl From<Entry> for crate::store::NewEntry {
             content_html: e.summary,
             fetched_at: None,
             keep_stored_content: false,
+            // The document's at:// URI is the item id (docs/lexicon.md), never a stand-in.
+            guid_synthesized: false,
         }
     }
 }
@@ -3156,6 +3158,19 @@ pub(crate) mod tests {
         assert_eq!(row.content_html.as_deref(), Some("body"));
         assert_eq!(row.author, None);
         assert_eq!(row.fetched_at, None);
+    }
+
+    /// #287: the document's `at://` URI is the item id, never a stand-in.
+    #[test]
+    fn a_document_row_is_never_flagged_synthesized() {
+        let records = vec![publication("p", "https://example.com")];
+        let (site, pubn) = publication_from_records("p", &records).unwrap();
+        let docs = vec![document("rk1", &site, "Hello", "/hello")];
+        let row: crate::store::NewEntry = entries_from_records(&site, &pubn, &docs)
+            .pop()
+            .unwrap()
+            .into();
+        assert!(!row.guid_synthesized);
     }
 
     /// A repo can hold several publications — measured, some do — and
