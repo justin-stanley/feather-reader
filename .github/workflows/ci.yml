@@ -398,3 +398,14 @@ jobs:
         run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
       - name: Test deploy/teardown.sh
         run: bash scripts/test-teardown.sh
+
+  release-notes:
+    name: Release notes (CHANGELOG section extraction)
+    # github-release.yml takes a final tag's notes from CHANGELOG.md with this
+    # script. Pins what it extracts and what it refuses, and that the version
+    # in Cargo.toml has a section, so a release is never cut with blank notes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test scripts/release-notes.sh
+        run: bash scripts/test-release-notes.sh
