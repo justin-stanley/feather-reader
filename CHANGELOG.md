@@ -14,7 +14,17 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.4.10 — 2026-10-17
+
+The reader's read button now shows whether an entry is read, so a second
+click no longer un-reads it by mistake (#300). A release candidate tag no
+longer dispatches the crates.io publish (#299). Routine dependency bumps. No
+schema change. Shipped as `v0.4.10-rc.1` to staging first (#294).
+
+### Upgrade notes
+
+- **None.** No schema, config or record-format change since 0.4.9; rolling
+  back to 0.4.9 is a plain image swap.
 
 ### Fixed
 
@@ -31,6 +41,22 @@ deploying is separate.
   `prefers-reduced-motion` turns the animation off. The list view is
   unchanged: its row already restyles with `is-read`. Test:
   `actionbar_read_button_shows_state_and_confirms_a_toggle`.
+- **Dependencies:** tokio 1.53.2, serde_json 1.0.154, libc 0.2.190 (#297);
+  sidecar `@atproto/api` 0.24.3, `@atproto/oauth-client-node` 0.5.9,
+  `@fastify/rate-limit` 11.2.1, oxlint 1.87.0 (#292; the sidecar is not the
+  production backend); CI action pins, including scorecard-action 2.5.0
+  (#301).
+
+### CI
+
+- **A pre-release tag never dispatches or publishes the crate (#299).**
+  `release-image`'s `dispatch-crate` job dispatched `release-crate.yml` for
+  every `v*` tag, so `v0.4.9-rc.1` left a red run, saved only by the
+  tag-vs-`Cargo.toml` version check; had `Cargo.toml` carried the rc version,
+  the rc would have reached crates.io, where a publish can only be yanked. The
+  job now skips any tag containing `-`, and `release-crate.yml` refuses one
+  itself, first, so a hand dispatch is refused too. The image is still built,
+  attested and pushed for an rc: staging deploys it.
 
 ## 0.4.9 — 2026-10-16
 

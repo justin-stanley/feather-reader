@@ -1577,6 +1577,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.4.10",
+        date: "2026-10-17",
+        summary: "The read button now shows plainly whether you've read an \
+                  entry, so a second click no longer marks it unread by \
+                  mistake.",
+    },
+    Release {
         version: "0.4.9",
         date: "2026-10-16",
         summary: "What you've read now carries across FeatherReader instances \
@@ -8412,7 +8419,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#049--2026-10-16"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#0410--2026-10-17"
         );
     }
 
