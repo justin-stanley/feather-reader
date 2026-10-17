@@ -4542,6 +4542,9 @@ pub struct PurgeCounts {
     pub beta_access: u64,
     /// `invite_codes` rows removed (codes this DID *created*).
     pub invite_codes: u64,
+    /// `oauth_state` rows removed (the DID's in-flight logins: sealed PKCE
+    /// verifier and DPoP key, #259).
+    pub oauth_state: u64,
     /// `invite_codes` rows *scrubbed* (the code this DID *redeemed* to join —
     /// its `invitee_did` back-reference cleared to NULL, row kept).
     pub invitee_scrubbed: u64,
@@ -4555,7 +4558,12 @@ impl PurgeCounts {
     /// separately — those rows belong to *other* DIDs and are redacted, not
     /// deleted — so they are excluded from the delete total.)
     pub fn total(&self) -> u64 {
-        self.entry_state + self.read_cursor + self.sub_ref + self.beta_access + self.invite_codes
+        self.entry_state
+            + self.read_cursor
+            + self.sub_ref
+            + self.beta_access
+            + self.invite_codes
+            + self.oauth_state
     }
 }
 
@@ -4567,9 +4575,10 @@ pub const REDACTED_DID: &str = "__redacted__";
 /// Delete **all** local rows owned by `did` in a single transaction: the
 /// per-DID read/star state (`entry_state`), per-feed read cursors
 /// (`read_cursor`), the subscription projection (`sub_ref`), the closed-beta
-/// seat (`beta_access`), and any invite codes this DID *created*
-/// (`invite_codes`). The shared `feeds`/`entries` cache is intentionally left
-/// intact — it is deduped and not owned by any single DID.
+/// seat (`beta_access`), any invite codes this DID *created*
+/// (`invite_codes`), and its in-flight logins (`oauth_state`, #259). The
+/// shared `feeds`/`entries` cache is intentionally left intact — it is deduped
+/// and not owned by any single DID.
 ///
 /// This is the local half of "delete my data": the caller pairs it with a
 /// sidecar `POST /internal/revoke` so the OAuth tokens + sidecar session rows
@@ -4611,6 +4620,18 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
         .execute(&mut *tx)
         .await
         .with_context(|| format!("purge invite_codes for {did}"))?
+        .rows_affected();
+
+    // In-flight logins started for this DID: a sealed PKCE verifier and DPoP key
+    // each (#259). Otherwise they outlive the account until the expiry sweep. A
+    // login still in progress in another browser fails at its callback and has
+    // to start again. `oauth_session` is not touched here: the caller's revoke
+    // path deletes it, and must, since it revokes the tokens at the PDS first.
+    let oauth_state = sqlx::query("DELETE FROM oauth_state WHERE did = ?1")
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("purge oauth_state for {did}"))?
         .rows_affected();
 
     // Scrub the DID's back-references from rows that belong to OTHER DIDs so no
@@ -4663,6 +4684,7 @@ pub async fn purge_did_data(pool: &SqlitePool, did: &str) -> Result<PurgeCounts>
         sub_ref,
         beta_access,
         invite_codes,
+        oauth_state,
         invitee_scrubbed,
         granted_by_scrubbed,
     })
@@ -7711,6 +7733,20 @@ mod tests {
             .await?;
             grant_access(&pool, did, Some("h.example"), "admin", None).await?;
             mint_code(&pool, did, 3600).await?;
+            // An in-flight login (#259). The purge never unseals the secrets, so
+            // placeholders stand in for the ciphertext.
+            sqlx::query(
+                "INSERT INTO oauth_state (state, browser_binding_hash, pkce_verifier, \
+                 dpop_key_jwk, issuer, pds_url, did, auth_method, redirect_uri, \
+                 requested_scope, request_uri, expires_at) \
+                 VALUES (?1, 'b', 'sealed', 'sealed', 'https://pds.example', \
+                 'https://pds.example', ?2, 'private_key_jwt', \
+                 'https://reader.example/oauth/callback', 'atproto', 'urn:r', 4102444800)",
+            )
+            .bind(format!("state-{did}"))
+            .bind(did)
+            .execute(&pool)
+            .await?;
         }
 
         // Purge only the victim.
@@ -7723,7 +7759,8 @@ mod tests {
         assert_eq!(counts.sub_ref, 1);
         assert_eq!(counts.beta_access, 1);
         assert_eq!(counts.invite_codes, 1);
-        assert_eq!(counts.total(), 5);
+        assert_eq!(counts.oauth_state, 1);
+        assert_eq!(counts.total(), 6);
 
         // The victim has zero rows left in every per-DID table.
         let es: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entry_state WHERE did = ?1")
@@ -7751,6 +7788,11 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(victim_codes, 0);
+        let os: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_state WHERE did = ?1")
+            .bind(victim)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(os, 0, "victim still had an in-flight login (#259)");
 
         // The bystander is untouched.
         assert!(has_beta_access(&pool, bystander).await?);
@@ -7762,6 +7804,12 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(bystander_codes, 1);
+        let bystander_logins: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oauth_state WHERE did = ?1")
+                .bind(bystander)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(bystander_logins, 1, "bystander's in-flight login survived");
 
         // The shared cache is intact.
         assert_eq!(count_feeds(&pool).await?, 1);
