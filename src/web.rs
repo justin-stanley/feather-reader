@@ -5157,8 +5157,9 @@ const DELETE_CONFIRM_PHRASE: &str = "DELETE";
 /// Confirm-gated: the form must carry `confirm=DELETE` or we bounce back to
 /// `/manage` with an explanatory flash and touch nothing. On confirmation it:
 ///   1. purges **every** local row owned by the caller DID (`entry_state`,
-///      `read_cursor`, `sub_ref`, `beta_access` seat, and any invite codes the
-///      DID created) via [`store::purge_did_data`], then
+///      `read_cursor`, `sub_ref`, `beta_access` seat, any invite codes the
+///      DID created, and its in-flight logins in `oauth_state`) via
+///      [`store::purge_did_data`], then
 ///   2. revokes the OAuth session at the PDS via `revoke_everywhere` — the
 ///      sidecar's `POST /internal/revoke {did}` and, when the Rust OAuth runtime
 ///      is configured, its RFC 7009 revocation too — then
@@ -5197,6 +5198,7 @@ async fn account_delete(
         sub_ref = counts.sub_ref,
         beta_access = counts.beta_access,
         invite_codes = counts.invite_codes,
+        oauth_state = counts.oauth_state,
         "account/delete: local rows purged"
     );
 
