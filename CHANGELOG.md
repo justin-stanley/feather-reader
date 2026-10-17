@@ -14,6 +14,22 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **Deleting your data also deletes your in-flight logins (#259).**
+  `store::purge_did_data` removed every per-DID table except `oauth_state`,
+  which holds a login in progress: its sealed PKCE verifier and DPoP key,
+  keyed by the DID. Those rows outlived the account until the expiry sweep, a
+  window of minutes. The purge now deletes them in the same transaction, and
+  `PurgeCounts` (and the `account/delete` log line) reports `oauth_state`. A
+  login still in progress in another browser fails at its callback and starts
+  again. `oauth_session` is unchanged: the revoke path deletes it after
+  revoking the tokens at the PDS. Test:
+  `purge_did_data_removes_only_the_callers_rows` now seeds an `oauth_state`
+  row for both DIDs and checks only the victim's goes.
+
 ## 0.4.10 — 2026-10-17
 
 The reader's read button now shows whether an entry is read, so a second
