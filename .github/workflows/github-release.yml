@@ -9,6 +9,10 @@ name: github-release
 # digest is then read from GHCR and must verify against release-image.yml's
 # provenance before anything is written.
 #
+# A tag on a commit from before this workflow existed gets no automatic
+# release: release-image runs the workflow files AT THE TAG. Dispatch this
+# from main for it (`gh workflow run github-release.yml -f tag=vX.Y.Z`).
+#
 # Never for a pre-release tag (`v0.4.10-rc.1`): an rc soaks on staging (#294)
 # and has no CHANGELOG section. An existing release is left alone, so hand
 # edits to its notes survive a re-run.
@@ -56,12 +60,21 @@ jobs:
           fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the tag
+      # **The workflow's own commit, not the tag.** The notes script runs from
+      # here and the CHANGELOG is read from the tag (next step), so a dispatch
+      # from main can release a tag older than the script (the v0.4.9 backfill,
+      # or a final put on an rc commit from before this workflow). Called from
+      # release-image, the workflow's commit IS the tag's.
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Read the tag's CHANGELOG
+        env:
+          TAG: ${{ inputs.tag }}
+        run: git show "refs/tags/${TAG}:CHANGELOG.md" > "$RUNNER_TEMP/CHANGELOG.md"
 
       - name: Skip if the release exists
         id: exists
@@ -112,7 +125,7 @@ jobs:
             echo "**Image:** \`${IMAGE}@${DIGEST}\` (deploy by digest; verify with \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`)."
             echo "**Crate:** [feather-reader ${VERSION}](https://crates.io/crates/feather-reader/${VERSION})."
             echo
-            scripts/release-notes.sh "$VERSION"
+            scripts/release-notes.sh "$VERSION" "$RUNNER_TEMP/CHANGELOG.md"
           } > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
 

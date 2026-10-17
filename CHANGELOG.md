@@ -29,7 +29,11 @@ deploying is separate.
   An existing release is left alone, and "Latest" goes only to the highest
   final tag, so a hotfix on an older line cannot take it. Dispatching the
   workflow with a tag backfills a missing release, reading the digest from
-  GHCR. Test: `scripts/test-release-notes.sh` (CI job `release-notes`) pins
+  GHCR. The script runs from the workflow's commit and only the CHANGELOG is
+  read from the tag, so a dispatch from `main` works for a tag older than the
+  script. A tag on a commit from before this workflow (`v0.4.9`, and
+  `v0.4.10` on its rc commit) runs that commit's `release-image`, which has no
+  release job, so it needs the dispatch. Test: `scripts/test-release-notes.sh` (CI job `release-notes`) pins
   the section extracted, the anchor, the refusals, and that the version in
   `Cargo.toml` has a section.
 
