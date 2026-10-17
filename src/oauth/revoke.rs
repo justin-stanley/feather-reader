@@ -1149,8 +1149,8 @@ mod tests {
     ///
     /// `sign_out` was fixed for this; its caller was not. The row is what every
     /// pre-AAD-change row now is, and what rotating the encryption key produces
-    /// — and since `purge_did_data` does not touch the OAuth tables, `POST
-    /// /account/delete` depends on this path to clear it.
+    /// — and since `purge_did_data` clears only `oauth_state`, never
+    /// `oauth_session`, `POST /account/delete` depends on this path to clear it.
     #[tokio::test]
     async fn the_production_sign_out_deletes_an_unreadable_session() {
         let (pool, codec) = db().await;

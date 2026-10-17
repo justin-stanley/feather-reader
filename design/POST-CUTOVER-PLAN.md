@@ -270,8 +270,8 @@ the load, which #17 establishes.
   (An earlier draft paired `oauth_nonce` with it. That half is vacuous —
   `oauth_nonce` is keyed by **origin** and has no DID column, so there is nothing
   DID-scoped in it to clear.)
-  > Still open (audited 2026-10-05): `purge_did_data` does not touch
-  > `oauth_state`. Rows go only through the expiry sweep. Tracked in issue #259.
+  > Done (#259): `purge_did_data` now deletes the DID's `oauth_state` rows in
+  > the same transaction, and `PurgeCounts` reports them.
 - **One place in the wiki credits `min_machines_running` for machine recovery**
   while `fly.toml` says it is inert under `auto_stop_machines = "off"`: the
   `container-entrypoint.sh` section of `/runbooks/featherreader-deploy` ("exit
