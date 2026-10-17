@@ -1786,6 +1786,8 @@ struct EntryTemplate {
     next_id: Option<i64>,
     /// Rendered inline (not an out-of-band swap fragment): always `false` here.
     oob: bool,
+    /// Always `""` here: a page load toggled nothing (see `EntryActionBarTemplate`).
+    toggled: &'static str,
 }
 
 /// The htmx swap fragment for a single entry row (`entry_row.html`).
@@ -1807,6 +1809,10 @@ struct EntryActionBarTemplate {
     starred: bool,
     /// Emit the `hx-swap-oob` attribute: `true` for the handler's OOB response.
     oob: bool,
+    /// Which control the handler just changed: `"read"` or `"star"`, or `""`
+    /// for a page load. Only that button gets `data-toggled`, which the
+    /// stylesheet pulses once, so the confirmation says WHICH control (#300).
+    toggled: &'static str,
 }
 
 /// The login stub (`GET /login`).
@@ -3128,6 +3134,7 @@ async fn entry_view(
         prev_id,
         next_id,
         oob: false,
+        toggled: "",
     };
     Ok(render(&tmpl))
 }
@@ -3281,6 +3288,7 @@ async fn mark_read(
             read,
             starred,
             oob: true,
+            toggled: "read",
         }));
     }
 
@@ -3374,6 +3382,7 @@ async fn toggle_star(
             read,
             starred,
             oob: true,
+            toggled: "star",
         }));
     }
 
@@ -10218,6 +10227,7 @@ mod tests {
                 prev_id: None,
                 next_id: None,
                 oob: false,
+                toggled: "",
             }
             .render()
             .unwrap()
@@ -11046,6 +11056,59 @@ mod tests {
         );
     }
 
+    /// **#300: the reader's read button shows its state, and confirms a toggle.**
+    /// The state is visible as a hover/focus tooltip (`title`, matching the
+    /// `aria-label`). Only the button the handler just changed carries
+    /// `data-toggled`, which the stylesheet pulses once. A page load pulses
+    /// nothing, and toggling one control does not pulse the other.
+    #[test]
+    fn actionbar_read_button_shows_state_and_confirms_a_toggle() {
+        let render = |read: bool, oob: bool, toggled: &'static str| {
+            EntryActionBarTemplate {
+                id: 7,
+                read,
+                starred: false,
+                oob,
+                toggled,
+            }
+            .render()
+            .unwrap()
+        };
+        // The <button> carrying `class` (each form holds exactly one).
+        let button = |html: &str, class: &str| -> String {
+            let at = html.find(class).expect("button present");
+            let open = html[..at].rfind("<button").expect("button tag");
+            let close = open + html[open..].find('>').expect("tag end");
+            html[open..=close].to_string()
+        };
+        let read_page = render(true, false, "");
+        assert!(
+            read_page.contains(r#"title="Mark unread (m)""#),
+            "a read entry's button must say so on hover: {read_page}"
+        );
+        let unread_page = render(false, false, "");
+        assert!(
+            unread_page.contains(r#"title="Mark read (m)""#),
+            "an unread entry's button must say so on hover: {unread_page}"
+        );
+        assert!(
+            !read_page.contains("data-toggled") && !unread_page.contains("data-toggled"),
+            "a page load must not play the toggle confirmation"
+        );
+        let after_read = render(true, true, "read");
+        assert!(button(&after_read, "actionbar-read").contains("data-toggled"));
+        assert!(
+            !button(&after_read, "actionbar-star").contains("data-toggled"),
+            "marking read must not pulse the star: {after_read}"
+        );
+        let after_star = render(true, true, "star");
+        assert!(button(&after_star, "actionbar-star").contains("data-toggled"));
+        assert!(
+            !button(&after_star, "actionbar-read").contains("data-toggled"),
+            "starring must not pulse the read button: {after_star}"
+        );
+    }
+
     /// Reader-view mark-read (a request tagged `X-FR-Reader: 1`) must return the
     /// out-of-band action-bar fragment with FRESHLY re-read state so a second
     /// keypress reverses the toggle: `hx-swap-oob="outerHTML"` is present, and
@@ -11130,6 +11193,28 @@ mod tests {
         assert!(
             html.contains(r#"name="read" value="false""#),
             "hidden read value must flip to false so a second tap reverses: {html}"
+        );
+        // #300: the confirmation pulse is on the control that changed: the
+        // read button, not the star.
+        assert_eq!(
+            html.matches("data-toggled").count(),
+            1,
+            "exactly one control may pulse after a mark-read: {html}"
+        );
+        // The whole <button ...> tag carrying `class`: data-toggled sits AFTER
+        // the class attribute, so a slice that stops at the class misses it.
+        let tag = |class: &str| -> &str {
+            let at = html.find(class).unwrap();
+            let open = html[..at].rfind("<button").unwrap();
+            &html[open..=open + html[open..].find('>').unwrap()]
+        };
+        assert!(
+            tag("actionbar-read").contains("data-toggled"),
+            "marking read must pulse the read button: {html}"
+        );
+        assert!(
+            !tag("actionbar-star").contains("data-toggled"),
+            "marking read must not pulse the star: {html}"
         );
 
         // A second reader mark-read (submitting the flipped `read=false`) marks

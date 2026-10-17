@@ -1,7 +1,11 @@
 {# The reader's read + star action forms. Rendered inline inside entry.html's
    actionbar, and ALSO returned standalone (with hx-swap-oob) by the mark-read /
    star handlers so the button's hidden value + aria-pressed update in place
-   after a toggle instead of going stale. `oob` selects which shape to emit. #}
+   after a toggle instead of going stale. `oob` selects which shape to emit.
+   `title` repeats the aria-label so the state reads on hover/focus. `toggled`
+   names the control the handler just changed ("read" / "star", "" on a page
+   load); only that button gets `data-toggled`, which style.css pulses once, so
+   the confirmation says which control changed (#300). #}
 <span class="actionbar-toggles" id="entry-actionbar"{% if oob %} hx-swap-oob="outerHTML"{% endif %}>
   <form class="mark-read-form" method="post" action="/entries/{{ id }}/read"
         hx-post="/entries/{{ id }}/read" hx-headers='{"X-FR-Reader": "1"}'
@@ -9,7 +13,8 @@
     <input type="hidden" name="read" value="{% if read %}false{% else %}true{% endif %}" />
     <button type="submit" class="icon-btn actionbar-read mark-read"
             aria-pressed="{% if read %}true{% else %}false{% endif %}"
-            aria-label="{% if read %}Mark unread (m){% else %}Mark read (m){% endif %}">
+            aria-label="{% if read %}Mark unread (m){% else %}Mark read (m){% endif %}"
+            title="{% if read %}Mark unread (m){% else %}Mark read (m){% endif %}"{% if toggled == "read" %} data-toggled{% endif %}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"/></svg>
     </button>
@@ -21,7 +26,8 @@
     <input type="hidden" name="starred" value="{% if starred %}false{% else %}true{% endif %}" />
     <button type="submit" class="icon-btn actionbar-star star-btn"
             aria-pressed="{% if starred %}true{% else %}false{% endif %}"
-            aria-label="{% if starred %}Unstar entry (s){% else %}Star entry (s){% endif %}">
+            aria-label="{% if starred %}Unstar entry (s){% else %}Star entry (s){% endif %}"
+            title="{% if starred %}Unstar entry (s){% else %}Star entry (s){% endif %}"{% if toggled == "star" %} data-toggled{% endif %}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
            stroke-linejoin="round" aria-hidden="true">
         <path d="M12 3.5l2.6 5.3 5.9.9-4.2 4.1 1 5.8-5.3-2.8-5.3 2.8 1-5.8L3.5 9.7l5.9-.9z"/>
