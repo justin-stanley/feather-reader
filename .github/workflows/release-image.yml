@@ -2,8 +2,9 @@ name: release-image
 
 # Build the FeatherReader container image on a version tag, run the upgrade-boot
 # gate on it, and only then push that exact image and sign SLSA build provenance
-# (and, optionally, a CycloneDX SBOM) for its DIGEST. The last job dispatches
-# release-crate.yml against the tag, so a failed gate publishes nothing anywhere.
+# (and, optionally, a CycloneDX SBOM) for its DIGEST. The last jobs dispatch
+# release-crate.yml against the tag and create the GitHub release
+# (github-release.yml), so a failed gate publishes nothing anywhere.
 # This does NOT deploy to Fly — that stays with the deploy runbook.
 #
 # Trigger: pushing a semver tag, e.g.  git tag v0.4.4 && git push origin v0.4.4
@@ -63,6 +64,8 @@ jobs:
     name: build, push, attest
     runs-on: ubuntu-latest
     if: ${{ github.event.repository.private == false }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     # Least privilege — exactly the scopes the publish + attestation need:
     #   contents:read       checkout only (no tag/release writes)
     #   packages:write      push to GHCR
@@ -241,3 +244,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run release-crate.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+
+  # The GitHub release for a final tag, with its CHANGELOG section as the notes
+  # and this run's digest on top. Same guard as the crate: never for an rc. A
+  # reusable workflow so a missing release can be backfilled by dispatching it.
+  github-release:
+    name: GitHub release
+    needs: build-push-attest
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+    permissions:
+      contents: write
+      attestations: read
+    uses: ./.github/workflows/github-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+      digest: ${{ needs.build-push-attest.outputs.digest }}

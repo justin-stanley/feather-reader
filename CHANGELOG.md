@@ -30,6 +30,28 @@ deploying is separate.
   `purge_did_data_removes_only_the_callers_rows` now seeds an `oauth_state`
   row for both DIDs and checks only the victim's goes.
 
+### CI
+
+- **A final tag creates its GitHub release.** Releases were made by hand, and
+  0.4.9 shipped without one, so the releases page still showed 0.4.8 as
+  Latest. `release-image` now ends by calling `github-release.yml` for a
+  `vX.Y.Z` tag, after the upgrade-boot gate passed and the image was pushed
+  and attested. The notes are the tag's CHANGELOG section
+  (`scripts/release-notes.sh`), under the image digest to deploy and the crate
+  version. The digest must verify against `release-image.yml`'s provenance
+  for that tag first. A release candidate gets none, as for the crate (#299).
+  An existing release is left alone, and "Latest" goes only to the highest
+  final tag, so a hotfix on an older line cannot take it. Dispatching the
+  workflow with a tag backfills a missing release, reading the digest from
+  GHCR. The script runs from the workflow's commit and only the CHANGELOG is
+  read from the tag, so a dispatch from `main` works for a tag older than the
+  script. A tag on a commit from before this workflow (`v0.4.9`, and
+  `v0.4.10` on its rc commit) runs that commit's `release-image`, which has no
+  release job, so it needs the dispatch. Test:
+  `scripts/test-release-notes.sh` (CI job `release-notes`) pins the section
+  extracted, the anchor, the refusals, and that the version in `Cargo.toml`
+  has a section.
+
 ## 0.4.10 — 2026-10-17
 
 The reader's read button now shows whether an entry is read, so a second
