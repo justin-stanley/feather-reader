@@ -17,14 +17,25 @@ deploying is separate.
 ## 0.4.10 — 2026-10-17
 
 The reader's read button now shows whether an entry is read, so a second
-click no longer un-reads it by mistake (#300). A release candidate tag no
-longer dispatches the crates.io publish (#299). Routine dependency bumps. No
+click no longer un-reads it by mistake (#300). `ammonia` is patched for a
+new RustSec advisory (#306). A release candidate tag no longer dispatches
+the crates.io publish (#299). Routine dependency bumps. No
 schema change. Shipped as `v0.4.10-rc.1` to staging first (#294).
 
 ### Upgrade notes
 
 - **None.** No schema, config or record-format change since 0.4.9; rolling
   back to 0.4.9 is a plain image swap.
+
+### Security
+
+- **`ammonia` 4.2.3 → 4.2.4 for RUSTSEC-2026-0373 (#306).** A quoted CSS
+  `url("")` was matched case-sensitively, so `URL("")` skipped URL filtering
+  in `style` attributes; `cargo audit` began failing on `main` when it was
+  published on 2026-10-16. FeatherReader sanitizes feed HTML with
+  `ammonia::clean`, the default allowlist, which admits no `style` attribute,
+  so it is not believed reachable; patched regardless. Lockfile-only, and the
+  invite bot does not depend on `ammonia`.
 
 ### Fixed
 
