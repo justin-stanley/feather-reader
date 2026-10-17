@@ -35,6 +35,16 @@ as is
 | a | b |
 | - | - |
 
+A setext
+heading
+---
+
+Hard\
+break and  
+two spaces
+then a rule
+***
+
 
 ## 0.4.1 — 2026-10-04
 
@@ -60,6 +70,14 @@ as is
 
 | a | b |
 | - | - |
+
+A setext heading
+---
+
+Hard\
+break and  
+two spaces then a rule
+***
 
 Full engineering detail: [CHANGELOG.md](https://github.com/justin-stanley/feather-reader/blob/v0.4.10/CHANGELOG.md#0410--2026-10-17).'
 [ "$out" = "$expected" ] || fail "0.4.10 notes differ:
