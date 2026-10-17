@@ -28,6 +28,27 @@ body="$(awk -v h="$heading" '
   on && /^## / { exit }
   on { print }
 ' "$changelog" | sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}')"
+
+# **Unwrap hard-wrapped lines.** GitHub renders a release body with every
+# single newline as a line break, unlike a Markdown file, so the CHANGELOG's
+# 80-column wrapping showed as ragged lines (v0.4.9). Each paragraph and list
+# item becomes one line. A heading (`#`s then a space; `#246` at the start of
+# a wrapped line is text), a blank line, a list marker, a quote or
+# a table row starts a new line, and a fenced code block passes through as is.
+body="$(printf '%s\n' "$body" | awk '
+  function flush() { if (buf != "") { print buf; buf = "" } }
+  {
+    stripped = $0
+    sub(/^[ \t]+/, "", stripped)
+    if (stripped ~ /^(```|~~~)/) { flush(); print; fence = !fence; next }
+    if (fence) { print; next }
+    if (stripped == "") { flush(); print ""; next }
+    if (stripped ~ /^#+( |$)/) { flush(); print; next }
+    if (buf == "" || stripped ~ /^([-*+] |[0-9]+[.)] |>|\|)/) { flush(); buf = $0; next }
+    buf = buf " " stripped
+  }
+  END { flush() }
+')"
 if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
   echo "release-notes.sh: the $version section of $changelog is empty" >&2
   exit 1

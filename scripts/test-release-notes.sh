@@ -16,11 +16,24 @@ cat > "$tmp/CHANGELOG.md" <<'MD'
 
 ## 0.4.10 — 2026-10-17
 
-Summary line.
+Summary
+line.
 
 ### Fixed
 
-- **A fix.**
+- **A fix**, wrapped
+  across two lines, as
+  #246 says.
+  - A nested item,
+    also wrapped.
+
+```sh
+keep   this
+as is
+```
+
+| a | b |
+| - | - |
 
 
 ## 0.4.1 — 2026-10-04
@@ -37,7 +50,16 @@ expected='Summary line.
 
 ### Fixed
 
-- **A fix.**
+- **A fix**, wrapped across two lines, as #246 says.
+  - A nested item, also wrapped.
+
+```sh
+keep   this
+as is
+```
+
+| a | b |
+| - | - |
 
 Full engineering detail: [CHANGELOG.md](https://github.com/justin-stanley/feather-reader/blob/v0.4.10/CHANGELOG.md#0410--2026-10-17).'
 [ "$out" = "$expected" ] || fail "0.4.10 notes differ:
