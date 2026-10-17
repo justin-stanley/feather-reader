@@ -4576,8 +4576,9 @@ pub const REDACTED_DID: &str = "__redacted__";
 /// per-DID read/star state (`entry_state`), per-feed read cursors
 /// (`read_cursor`), the subscription projection (`sub_ref`), the closed-beta
 /// seat (`beta_access`), any invite codes this DID *created*
-/// (`invite_codes`), and its in-flight logins (`oauth_state`, #259). The shared `feeds`/`entries` cache is intentionally left
-/// intact — it is deduped and not owned by any single DID.
+/// (`invite_codes`), and its in-flight logins (`oauth_state`, #259). The
+/// shared `feeds`/`entries` cache is intentionally left intact — it is deduped
+/// and not owned by any single DID.
 ///
 /// This is the local half of "delete my data": the caller pairs it with a
 /// sidecar `POST /internal/revoke` so the OAuth tokens + sidecar session rows
