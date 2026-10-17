@@ -50,7 +50,13 @@ deploying is separate.
   release job, so it needs the dispatch. Test:
   `scripts/test-release-notes.sh` (CI job `release-notes`) pins the section
   extracted, the anchor, the refusals, and that the version in `Cargo.toml`
-  has a section.
+  has a section. The notes unwrap the CHANGELOG's 80-column lines, one line per
+  paragraph and list item: GitHub renders every newline in a release body as
+  a line break, which made the first automatic release (the v0.4.9 backfill)
+  read as ragged lines. Rules, setext underlines and deliberate hard breaks
+  keep their lines. Checked against GitHub's own renderer: every versioned
+  section renders to the same HTML as in the file, and the release body has
+  no `<br>`.
 
 ## 0.4.10 — 2026-10-17
 
