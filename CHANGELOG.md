@@ -14,6 +14,25 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### CI
+
+- **A final tag creates its GitHub release.** Releases were made by hand, and
+  0.4.9 shipped without one, so the releases page still showed 0.4.8 as
+  Latest. `release-image` now ends by calling `github-release.yml` for a
+  `vX.Y.Z` tag, after the upgrade-boot gate passed and the image was pushed
+  and attested. The notes are the tag's CHANGELOG section
+  (`scripts/release-notes.sh`), under the image digest to deploy and the crate
+  version. The digest must verify against `release-image.yml`'s provenance
+  for that tag first. A release candidate gets none, as for the crate (#299).
+  An existing release is left alone, and "Latest" goes only to the highest
+  final tag, so a hotfix on an older line cannot take it. Dispatching the
+  workflow with a tag backfills a missing release, reading the digest from
+  GHCR. Test: `scripts/test-release-notes.sh` (CI job `release-notes`) pins
+  the section extracted, the anchor, the refusals, and that the version in
+  `Cargo.toml` has a section.
+
 ## 0.4.10 — 2026-10-17
 
 The reader's read button now shows whether an entry is read, so a second

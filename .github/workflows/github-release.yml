@@ -1,0 +1,132 @@
+name: github-release
+
+# Create the GitHub release for a FINAL version tag (vX.Y.Z), with its
+# CHANGELOG.md section as the notes and the attested image digest on top.
+#
+# Called by release-image.yml once the upgrade-boot gate passed and the image
+# was pushed and attested, so a tag that failed the gate gets no release. Can
+# be dispatched by hand with a tag to backfill a release that is missing; the
+# digest is then read from GHCR and must verify against release-image.yml's
+# provenance before anything is written.
+#
+# Never for a pre-release tag (`v0.4.10-rc.1`): an rc soaks on staging (#294)
+# and has no CHANGELOG section. An existing release is left alone, so hand
+# edits to its notes survive a re-run.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      digest:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Final tag to release, e.g. v0.4.9"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/justin-stanley/feather-reader
+
+jobs:
+  release:
+    name: create the GitHub release
+    runs-on: ubuntu-latest
+    # contents:write creates the release; attestations:read verifies the digest.
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check the tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::$TAG is not a final vX.Y.Z tag; pre-releases get no GitHub release (#294)"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Skip if the release exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::$TAG already has a GitHub release; leaving it as it is"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve and verify the image digest
+        if: steps.exists.outputs.skip == '0'
+        id: digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIVEN: ${{ inputs.digest }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          digest="$GIVEN"
+          if [ -z "$digest" ]; then
+            digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          fi
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::no image digest for ${IMAGE}:${VERSION}"; exit 1 ;;
+          esac
+          # The notes name this digest as the one to deploy, so it must carry
+          # release-image.yml's provenance for this tag. Fail-closed.
+          gh attestation verify "oci://${IMAGE}@${digest}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-image.yml" \
+            --source-ref "refs/tags/v${VERSION}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write the notes
+        if: steps.exists.outputs.skip == '0'
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**Image:** \`${IMAGE}@${DIGEST}\` (deploy by digest; verify with \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`)."
+            echo "**Crate:** [feather-reader ${VERSION}](https://crates.io/crates/feather-reader/${VERSION})."
+            echo
+            scripts/release-notes.sh "$VERSION"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the release
+        if: steps.exists.outputs.skip == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # "Latest" only when this is the highest final tag: a hotfix on an
+          # older line must not take it from a newer release.
+          highest="$(git tag -l 'v*.*.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          latest=false
+          [ "$highest" = "$TAG" ] && latest=true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest="$latest"
