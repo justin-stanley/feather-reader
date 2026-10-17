@@ -25,8 +25,9 @@ deploying is separate.
   unread, twice. A read entry's button is now a filled accent disc with a
   heavier check, as distinct as the star's fill, in both themes. Both toggles
   carry a `title` matching their `aria-label`, so the state reads on hover or
-  focus. Only the handler's out-of-band render carries `data-toggled`, which
-  the stylesheet animates once, so a click is confirmed but a page load is not.
+  focus. Only the button the handler just changed carries `data-toggled`, which
+  the stylesheet animates once. A click is confirmed on the control it changed:
+  marking read does not pulse the star, and a page load pulses nothing.
   `prefers-reduced-motion` turns the animation off. The list view is
   unchanged: its row already restyles with `is-read`. Test:
   `actionbar_read_button_shows_state_and_confirms_a_toggle`.

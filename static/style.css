@@ -1163,9 +1163,9 @@ kbd {
   background: var(--accent-deep);
 }
 
-/* Confirm the click: the handler's OOB render alone carries data-toggled
-   (a page load does not), so the icon pulses once after a toggle. The global
-   prefers-reduced-motion rule above cuts it to nothing. */
+/* Confirm the click: only the button the handler just changed carries
+   data-toggled (never on a page load), so that one icon pulses once. The
+   global prefers-reduced-motion rule above cuts it to nothing. */
 .actionbar [data-toggled] svg {
   animation: actionbar-toggle 220ms ease-out;
 }
