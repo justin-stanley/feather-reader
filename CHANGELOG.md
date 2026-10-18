@@ -128,6 +128,29 @@ deploying is separate.
 
 ### Fixed
 
+- **A rename writes nothing the reader did not change (#272).** Two narrow
+  cases from the #267/#269 work:
+  - **A subscription rename kept only the fields `lexicon::Subscription`
+    names.** It had no catch-all, so a rename's `putRecord` of the whole record
+    dropped every field another client had added. It now has
+    `#[serde(flatten)] extra`, as `Folder` got in #268. A subscription this
+    build creates writes only `$type`, `url` and `createdAt`, and a round trip
+    writes every key once.
+  - **An untouched Save of a name or title holding a line break rewrote it.**
+    A browser strips CR/LF from a text input's value but posts a hidden
+    `seen_name`/`seen_title` as written, so the two differed and the stripped
+    value was written over the stored one. The folder and subscription merges
+    now compare ignoring line breaks, so only a real edit counts; the folder
+    merge's conflict check does too, or a real edit of such a name was refused
+    as a conflict. Line breaks are not otherwise normalised: a stored name
+    keeps them.
+
+  Tests: `renaming_a_subscription_keeps_fields_this_build_does_not_know`,
+  `a_subscription_round_trips_unknown_fields_and_creates_none`,
+  `an_untouched_save_of_a_multi_line_title_keeps_it`,
+  `an_untouched_save_of_a_multi_line_folder_name_writes_nothing`,
+  `a_real_edit_of_a_multi_line_folder_name_still_lands` (mutation-checked).
+
 - **Deleting your data also deletes your in-flight logins (#259).**
   `store::purge_did_data` removed every per-DID table except `oauth_state`,
   which holds a login in progress: its sealed PKCE verifier and DPoP key,
