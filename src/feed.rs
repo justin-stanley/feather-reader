@@ -1395,29 +1395,39 @@ pub(crate) const SANITIZE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
 
 /// Of [`SANITIZE_CONCURRENCY`], the permits kept for small bodies only
-/// (#275), so abandoned sanitizes can never hold them all.
+/// (#275), so abandoned sanitizes can't hold them all.
 ///
 /// **Why:** a timed-out sanitize keeps its permit until ammonia returns, and
 /// four hostile feeds (four URL variants of one) could hold all four, deferring
-/// every other feed's poll for as long as they ran. A permit no abandoned
-/// sanitize can hold needs a body that cannot time out, and ammonia's cost is
-/// bounded by size: its worst measured shape (unclosed `<div>`s, release, on
-/// an M-series Mac) is 50 ms at 32 KiB, 186 ms at 64 KiB, 0.73 s at 128 KiB
-/// and 12.8 s at 512 KiB, roughly quadratic. At [`SANITIZE_RESERVE_MAX_BYTES`]
-/// that is ~27x under [`SANITIZE_TIMEOUT`]: room for a shared vCPU several
-/// times slower that the three abandoned threads are also running on. Nearly
-/// every real body fits (most are a few KB); production's largest, 87 KB,
-/// does not, and while the shared permits are held it defers as every body did
+/// every other feed's poll for as long as they ran. A permit abandoned
+/// sanitizes can't take needs bodies that finish well inside the timeout, and
+/// ammonia's cost grows with input size. Its worst shapes found, in release on
+/// an M-series Mac, through [`sanitize_body`]:
+///
+/// | raw body | unclosed `<div>`s | `<b id=…>` re-opened per block |
+/// |---|---|---|
+/// | 16 KiB | under 50 ms (not measured; 32 KiB was 50 ms) | 185 ms (3.6 MB before the bound) |
+/// | 32 KiB | 50 ms | 517 ms |
+/// | 64 KiB | 186 ms | 1.84 s (57 MB before the bound) |
+///
+/// The second shape, from review, is why the limit is 16 KiB and not 64: the
+/// tree builder re-opens every differently-attributed formatting element for
+/// each later block, so the output, and the time, grow far faster than the
+/// input. At [`SANITIZE_RESERVE_MAX_BYTES`] the worst found is ~27x under
+/// [`SANITIZE_TIMEOUT`], room for a shared vCPU several times slower that the
+/// three abandoned threads are also running on. **That is a bound on the shapes
+/// found, not a proof:** a sanitize that cannot be cancelled cannot be bounded
+/// by anything but its input. Nearly every real body fits (p99 17.5 KB); a
+/// bigger one, while the shared permits are held, defers as every body did
 /// before this.
 ///
-/// If one ever did time out, the reserve would be held like any other permit
-/// and the instance would be back where it was before this: starved, counted
-/// in `/stats`, never worse.
+/// If a reserved sanitize ever did time out, the instance would be starved as
+/// it was before this, counted in `/stats`, never worse.
 pub(crate) const SANITIZE_RESERVE: usize = 1;
 
 /// The largest raw body the reserved permits sanitize (#275). See
 /// [`SANITIZE_RESERVE`] for the measurement it rests on.
-pub(crate) const SANITIZE_RESERVE_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const SANITIZE_RESERVE_MAX_BYTES: usize = 16 * 1024;
 
 /// The permits behind [`SANITIZE_CONCURRENCY`] that any body may take.
 static SANITIZE_PERMITS: tokio::sync::Semaphore =
