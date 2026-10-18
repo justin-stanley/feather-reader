@@ -207,9 +207,8 @@ const KNOWN_ERRORS: [&str; 11] = [
 ///
 /// The return type is the point: `&'static str` from a fixed list, so nothing a
 /// server sent can survive into a log line or a rendered page. `pub(crate)`
-/// because `web.rs` handles the sidecar-shaped callback, which arrives at the
-/// same route with the same attacker-reachable parameters and needs the same
-/// reduction.
+/// because `web.rs` logs the callback's `error` before the login is completed,
+/// and needs the same reduction.
 pub(crate) fn known_error_slug(raw: &str) -> &'static str {
     KNOWN_ERRORS
         .iter()

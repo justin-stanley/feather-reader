@@ -51,10 +51,10 @@
 //!
 //! Per-request identity comes from a **signed session cookie** (`fr_session`)
 //! keyed by the logged-in DID, set by `oauth_callback` and read by
-//! `current_session` / `current_did`. For local runs without the sidecar,
+//! `current_session` / `current_did`. For local runs without a login,
 //! [`Config::dev_did`] (env `FEATHERREADER_DEV_DID`) supplies a fallback identity.
-//! All PDS reads and writes route through [`AppState::repo`], which dispatches to
-//! the sidecar or the Rust OAuth client by `FEATHERREADER_REPO_BACKEND`.
+//! All PDS reads and writes route through [`AppState::repo`], to the OAuth
+//! client in `oauth::xrpc`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -98,7 +98,7 @@ const SESSION_COOKIE: &str = "fr_session";
 /// Set by `POST /beta/redeem` on a valid, capacity-ok code and consumed by the
 /// OAuth callback. It reserves *intent* to redeem a specific code before the
 /// visitor ever starts the OAuth handshake, so a non-invited visitor can't burn
-/// a sidecar handshake (pre-handshake gate). It carries the invite code, HMAC-
+/// an OAuth handshake (pre-handshake gate). It carries the invite code, HMAC-
 /// signed with the same key as the session cookie.
 const INVITE_COOKIE: &str = "fr_invite";
 
@@ -388,8 +388,7 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
     // a claim token in a public URL is grabbable, so it MUST be per-IP limited
     // like the other abuse-prone entry points — not just `/login`.
     // `/oauth/callback` is a GET, is UNAUTHENTICATED, and every hit performs a
-    // real outbound round-trip — a sidecar `resolve_session` or a full token
-    // exchange against a PDS. Anyone could spend one outbound request per hit.
+    // real outbound round-trip — a full token exchange against a PDS. Anyone could spend one outbound request per hit.
     // It is the only entry point here that needs no session at all.
     if method != Method::POST
         && !(method == Method::GET
@@ -406,7 +405,7 @@ fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
         | "/opml" | "/read-all" | "/admin/invites" | "/bot/claims" | "/account/delete"
         | "/folders" => true,
         // Every per-record subscription/folder mutation (delete/rename) and the
-        // star/mark-read taps make a sidecar/PDS round-trip, so limit them too.
+        // star/mark-read taps make a PDS round-trip, so limit them too.
         p => {
             (p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")))
                 // Unsaving makes a DPoP-signed deleteRecord round-trip to the
@@ -923,9 +922,11 @@ async fn health(State(state): State<AppState>) -> Response {
     // class of facts `/stats` already publishes to anyone. "Polling is paused"
     // is that; the exact byte count is a precise internal number that adds
     // nothing an operator cannot get from `/stats` or the logs.
+    // Always `rust` since 0.5.0 removed the sidecar (#311). Kept because
+    // monitors match on it.
     body.push_str(&format!(
         "backend: {}\n",
-        state.config.repo_backend.as_str()
+        crate::metrics::Backend::Rust.as_str()
     ));
     body.push_str(&format!(
         "oauth-runtime: {}\n",
@@ -2070,7 +2071,7 @@ struct ResolvedSub {
 
 /// Pull the user's subscriptions (source of truth = PDS), ensure each has a
 /// local cache row so unread counts work, and return them resolved. Best-effort
-/// on the sidecar: a failure falls back to the local cache alone.
+/// on the PDS: a failure falls back to the local cache alone.
 async fn resolve_subscriptions(state: &AppState, did: &str) -> Vec<ResolvedSub> {
     resolve_subscriptions_noting(state, did).await.0
 }
@@ -2484,8 +2485,7 @@ async fn index(
         // see the slice below. Collected BEFORE the page is chosen because the
         // page count depends on how many there are.
         // Bounded like everything else on this page. These come from the PDS
-        // (up to the list ceiling — 20,000 on the sidecar backend, 5,000 on
-        // `backend=rust`, whose caps are a quarter of the other's) and are
+        // (up to the list ceiling, 5,000) and are
         // appended whole to the last page, so `ENTRIES_PER_PAGE` does not
         // constrain them at all. The
         // cap is generous — a reader with more saved-elsewhere records than this
@@ -4041,9 +4041,7 @@ async fn rename_subscription_once(
     // There is no single-record read on `Repo` (no `getRecord`), so this lists
     // and filters. That is one extra round trip on an action that is already
     // doing a PDS write, and it is bounded. A `get_subscription` was weighed
-    // for #149 and not added: the sidecar has no `get` action, so it would be
-    // new surface on the backend being retired, and the listing already
-    // carries each record's CID.
+    // for #149 and not added: the listing already carries each record's CID.
     //
     // **A failed read refuses the rename.** Falling back to the old
     // rebuild-from-scratch here would reinstate the data loss on exactly the
@@ -4433,8 +4431,8 @@ async fn rename_folder_once(
 ) -> RenameAttempt {
     use RenameAttempt::Done;
 
-    // No single-record read on `Repo`, as for subscriptions: the sidecar has
-    // no `get` action, and the listing already carries each record's CID.
+    // No single-record read on `Repo`, as for subscriptions: the listing
+    // already carries each record's CID.
     // A failed read refuses the rename — rebuilding the record from the form
     // is the loss this read exists to prevent.
     let found = match state.repo().list_folders_with_cids(did).await {
@@ -4560,7 +4558,7 @@ async fn resolve_feed_url(_config: &Config, input: &str) -> anyhow::Result<Strin
 }
 
 // ---------------------------------------------------------------------------
-// Login (atproto OAuth via the sidecar)
+// Login (atproto OAuth)
 // ---------------------------------------------------------------------------
 
 /// Query for `GET /login`.
@@ -4604,7 +4602,7 @@ async fn login_form(
     })
 }
 
-/// `POST /login` — the handle-form submit: redirect into the sidecar OAuth flow.
+/// `POST /login` — the handle-form submit: start the OAuth flow.
 /// Subject to the same pre-handshake invite gate as `GET /login?handle=`.
 async fn login_submit(
     State(state): State<AppState>,
@@ -4636,7 +4634,7 @@ async fn login_submit(
 /// CLOSED: a malformed/unresolvable handle, a resolution error/timeout, or a
 /// resolved DID with no seat all leave the visitor bounced to `/beta/redeem`.
 /// This keeps the anti-abuse intent — a rando now pays a cheap handle
-/// resolution instead of a burned sidecar handshake (and `/login` is already in
+/// resolution instead of a burned OAuth handshake (and `/login` is already in
 /// the rate-limited path set).
 async fn may_start_oauth(state: &AppState, headers: &HeaderMap, handle: &str) -> bool {
     // The production resolver is the app's existing atproto handle→DID path,
@@ -4692,69 +4690,52 @@ where
     }
 }
 
-/// Begin the OAuth handshake for `handle`, on whichever backend is live.
+/// Begin the OAuth handshake for `handle`: push the authorization request,
+/// hold the pending login, and set the browser-binding cookie the callback is
+/// checked against.
 ///
-/// **On `form-action 'self'` and this redirect.** The Rust arm answers a form
-/// POST with a redirect straight to the PDS — cross-origin — while the app's CSP
-/// carries `form-action 'self'`. Browsers have historically disagreed about
-/// whether that directive applies to redirects following a form submission, and
-/// if it did here, login would break in a browser while every test passed.
-///
-/// It does not, and the evidence is the SIDECAR path, which is live in
-/// production today: `POST /login` -> 303 to the same-origin `/oauth/login` ->
-/// 302 to the PDS, cross-origin, under this same CSP. A browser checking the
-/// whole redirect chain would already be blocking that. One checking only the
-/// form's action URL sees `/login` in both cases. The two arms differ only in
-/// how many same-origin hops precede the cross-origin one, so any policy that
-/// permits the sidecar flow permits this one.
-///
-/// The two arms differ in SHAPE, not just in implementation. The sidecar owns
-/// its own `/login` and its own callback, so starting a login is one redirect
-/// and nothing is stored here. The Rust backend pushes the authorization
-/// request itself, which means this app now holds the pending login — and must
-/// set the browser-binding cookie that the callback will be checked against.
+/// **On `form-action 'self'` and this redirect.** This answers a form POST with
+/// a redirect straight to the PDS — cross-origin — while the app's CSP carries
+/// `form-action 'self'`. Browsers have historically disagreed about whether
+/// that directive applies to redirects following a form submission. It does
+/// not, in practice: the Node sidecar's flow, live in production until the
+/// 2026-09-13 cutover, was `POST /login` -> 303 to the same-origin
+/// `/oauth/login` -> 302 to the PDS, cross-origin, under this same CSP, and a
+/// browser checking the whole redirect chain would have blocked that. One
+/// checking only the form's action URL sees `/login` either way.
 async fn start_oauth(state: &AppState, handle: &str) -> Response {
-    match state.config.repo_backend {
-        crate::metrics::Backend::Sidecar => {
-            let url = state.sidecar.login_url(handle, None);
-            info!(%handle, "redirecting to OAuth sidecar login");
-            Redirect::to(&url).into_response()
+    let Some(runtime) = state.oauth.as_deref() else {
+        warn!("the OAuth runtime is absent");
+        return login_error(state, "Login is not available right now.");
+    };
+    match crate::oauth::login::start(
+        runtime,
+        &state.http,
+        &state.db,
+        handle,
+        crate::store::now_unix(),
+    )
+    .await
+    {
+        Ok(started) => {
+            info!(%handle, "pushed authorization request; redirecting to the PDS");
+            let mut resp = Redirect::to(&started.authorize_url).into_response();
+            set_cookie(
+                &mut resp,
+                &cookie::sign_value(
+                    OAUTH_BINDING_COOKIE,
+                    &started.binding_token,
+                    &state.config.cookie_secret,
+                    OAUTH_BINDING_MAX_AGE_SECS,
+                ),
+            );
+            resp
         }
-        crate::metrics::Backend::Rust => {
-            let Some(runtime) = state.oauth.as_deref() else {
-                warn!("the rust backend is live but its OAuth runtime is absent");
-                return login_error(state, "Login is not available right now.");
-            };
-            match crate::oauth::login::start(
-                runtime,
-                &state.http,
-                &state.db,
-                handle,
-                crate::store::now_unix(),
-            )
-            .await
-            {
-                Ok(started) => {
-                    info!(%handle, "pushed authorization request; redirecting to the PDS");
-                    let mut resp = Redirect::to(&started.authorize_url).into_response();
-                    set_cookie(
-                        &mut resp,
-                        &cookie::sign_value(
-                            OAUTH_BINDING_COOKIE,
-                            &started.binding_token,
-                            &state.config.cookie_secret,
-                            OAUTH_BINDING_MAX_AGE_SECS,
-                        ),
-                    );
-                    resp
-                }
-                Err(err) => {
-                    // The handle the user typed is logged; the error is not shown
-                    // to them verbatim, since it can name internal hosts.
-                    warn!(%err, %handle, "could not start the OAuth login");
-                    login_error(state, "Could not start login for that handle.")
-                }
-            }
+        Err(err) => {
+            // The handle the user typed is logged; the error is not shown
+            // to them verbatim, since it can name internal hosts.
+            warn!(%err, %handle, "could not start the OAuth login");
+            login_error(state, "Could not start login for that handle.")
         }
     }
 }
@@ -4775,20 +4756,13 @@ struct LoginForm {
     handle: String,
 }
 
-/// Query for `GET /oauth/callback`.
-///
-/// Carries BOTH shapes, because the two backends deliver different things to
-/// the same URL: the sidecar hands back a one-shot `session_id` it has already
-/// exchanged, while the PDS redirects here directly with `code`/`state`/`iss`
-/// for this app to exchange itself. Which fields are populated is decided by
-/// which backend started the login, not by which is live now — so a flip with a
-/// login already in flight still lands in the right arm.
+/// Query for `GET /oauth/callback`: the PDS redirects here with
+/// `code`/`state`/`iss` for this app to exchange. (The Node sidecar's one-shot
+/// `session_id` handoff was removed with it in 0.5.0, #311; an unknown query
+/// parameter is ignored.)
 #[derive(Debug, Deserialize, Default)]
 struct CallbackQuery {
-    /// Sidecar backend: the handoff id.
-    #[serde(default)]
-    session_id: Option<String>,
-    /// Rust backend: the authorization code and its envelope.
+    /// The authorization code and its envelope.
     #[serde(default)]
     code: Option<String>,
     #[serde(default)]
@@ -4816,39 +4790,15 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    // An error response is handled by the SAME arm that would have handled a
+    // An error response is handled by the SAME path that would have handled a
     // success, not short-circuited here.
     //
-    // Returning early looks obviously right and is wrong on the Rust path: it
-    // skips `verify_callback`, which validates `iss` BEFORE reporting the error
+    // Returning early looks obviously right and is wrong: it skips
+    // `verify_callback`, which validates `iss` BEFORE reporting the error
     // precisely because RFC 9207 §2.4 says a client "MUST NOT assume that the
     // error originates from the intended AS". It also leaves the pending row
     // unconsumed, so a `state` that has already produced a callback stays usable
     // until it expires.
-    //
-    // The sidecar arm has no such check to reach, so it is short-circuited
-    // below, preserving exactly what it did before.
-    // **The arm is chosen by what the SERVER knows, not by what the caller
-    // sent.** A `session_id` in the query used to select the sidecar arm on its
-    // own — so a caller could pick which code path ran, and the sidecar arm has
-    // no browser-binding check at all. It also short-circuited the error path
-    // below, skipping the `iss` validation.
-    //
-    // Requiring the Rust runtime to be absent, or a sidecar backend to be the
-    // configured one, means the selection follows this deployment's own
-    // configuration. A login started before a flip still completes, because the
-    // Rust arm is reached whenever the Rust runtime exists and can match the
-    // `state` against a pending row it actually wrote.
-    // The sidecar hands off in TWO shapes, not one: `?session_id=…` on success
-    // and `?error=…&error_description=…` on its own failure. Keying only on
-    // `session_id` sent the failure shape down the Rust arm, which then failed
-    // with "no `state`" and replaced the specific reason with a generic one —
-    // and `error_description` is exactly what the sidecar Caddy routing matches
-    // to send that request here in the first place.
-    let sidecar_shape =
-        q.session_id.as_deref().is_some_and(|s| !s.is_empty()) || q.error_description.is_some();
-    let sidecar_handoff = sidecar_shape
-        && (state.oauth.is_none() || state.config.repo_backend == crate::metrics::Backend::Sidecar);
     if let Some(err) = q.error.clone() {
         // **Neither the code nor the description is echoed as sent.**
         //
@@ -4860,9 +4810,7 @@ async fn oauth_callback(
         // attacker-chosen copy in the product's own voice on the other.
         //
         // `oauth::flow` already decided this exact question for the Rust arm:
-        // reduce the code to a known slug, drop the description entirely. That
-        // reasoning is not specific to which arm handles the callback, and this
-        // one simply never got the same treatment. The description's LENGTH is
+        // reduce the code to a known slug, drop the description entirely. The description's LENGTH is
         // kept, because "the server sent a 4 KB explanation" is occasionally
         // worth knowing and cannot be used to inject anything.
         let slug = crate::oauth::flow::known_error_slug(&err);
@@ -4871,31 +4819,16 @@ async fn oauth_callback(
             desc_len = q.error_description.as_deref().map_or(0, str::len),
             "OAuth callback returned an error"
         );
-        if sidecar_handoff || state.oauth.is_none() {
+        if state.oauth.is_none() {
             return login_error(&state, &format!("Login failed: {slug}"));
         }
-        // Fall through: the Rust arm consumes the pending row and validates
-        // `iss` against it, and reports the failure afterwards.
+        // Fall through: completing the login consumes the pending row and
+        // validates `iss` against it, and reports the failure afterwards.
     }
 
-    // Which arm runs is decided by WHAT ARRIVED, not by which backend is
-    // currently selected: a login started before a flip must still complete.
-    let session = if sidecar_handoff {
-        let session_id = q.session_id.clone().unwrap_or_default();
-        match state.sidecar.resolve_session(&session_id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                warn!("OAuth callback session_id did not resolve (expired/unknown)");
-                return login_error(&state, "Login session expired — please try again.");
-            }
-            Err(err) => {
-                warn!(%err, "failed to resolve OAuth session via the sidecar");
-                return login_error(&state, "Login failed talking to the auth service.");
-            }
-        }
-    } else {
+    let session = {
         let Some(runtime) = state.oauth.as_deref() else {
-            warn!("an OAuth callback arrived with no sidecar session and no Rust runtime");
+            warn!("an OAuth callback arrived with no OAuth runtime");
             return login_error(&state, "Login failed: this login could not be completed.");
         };
         let params = crate::oauth::flow::CallbackParams {
@@ -5046,34 +4979,9 @@ async fn flush_before_revoke(state: &AppState, did: &str) {
     }
 }
 
+/// Revoke `did`'s OAuth session at its authorization server (RFC 7009) and
+/// delete the stored session, counting the outcome under `oauth_revoke`.
 async fn revoke_everywhere(state: &AppState, did: &str) {
-    // **Counted under Backend::Sidecar, not left uncounted.** A review found
-    // that recording only the rust arm let `oauth_revoke` report a clean success
-    // while every sidecar revocation failed — and for anyone who logged in before
-    // the cutover, the sidecar store is the ONLY one that held tokens, so the
-    // rust arm correctly returns NoSession and the metric reads all-clear while
-    // live refresh tokens sit at the PDS.
-    //
-    // Same op name, different backend: the backend column is what distinguishes
-    // them, so "no revocation failures" means checking both rows, not one.
-    let sidecar_started = std::time::Instant::now();
-    let sidecar_ok = match state.sidecar.revoke_session(did).await {
-        Ok(res) => {
-            info!(%did, revoked = res.revoked, "sidecar session revoked");
-            true
-        }
-        Err(err) => {
-            warn!(%did, %err, "sidecar revoke failed; continuing");
-            false
-        }
-    };
-    state.metrics.record(
-        crate::metrics::Backend::Sidecar,
-        "oauth_revoke",
-        sidecar_started.elapsed().as_micros() as u64,
-        sidecar_ok,
-    );
-
     if let Some(runtime) = state.oauth.as_deref() {
         let revoke_started = std::time::Instant::now();
         let outcome = crate::oauth::revoke::sign_out_discovering(
@@ -5116,16 +5024,16 @@ async fn revoke_everywhere(state: &AppState, did: &str) {
 /// `POST /logout` — end the session everywhere, not just in this browser.
 ///
 /// Clearing the cookie only stops *this* device from presenting the session;
-/// the sidecar still holds live OAuth tokens for the DID. So logout now also
-/// calls the sidecar `POST /internal/revoke {did}`, which revokes the refresh +
-/// access tokens at the PDS and drops the sidecar's session rows. The local
+/// `oauth_session` still holds live OAuth tokens for the DID. So logout also
+/// revokes them at the DID's authorization server (RFC 7009) and deletes the
+/// stored session, through `revoke_everywhere`. The local
 /// registry entry is dropped and the cookie cleared regardless of whether the
 /// revoke round-trip succeeds (best-effort — a network blip must not trap the
 /// user in a half-logged-out state).
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(user) = current_session(&state, &headers).await {
-        // Only a real cookie session (`sid` present) has sidecar-held tokens to
-        // revoke; the dev-DID fallback never handshook the sidecar.
+        // Only a real cookie session (`sid` present) has stored tokens to
+        // revoke; the dev-DID fallback never logged in.
         if let Some(sid) = user.sid {
             state.sessions.remove(&sid);
             // BEFORE the revoke: afterwards there is no session to send it with.
@@ -5160,9 +5068,8 @@ const DELETE_CONFIRM_PHRASE: &str = "DELETE";
 ///      `read_cursor`, `sub_ref`, `beta_access` seat, any invite codes the
 ///      DID created, and its in-flight logins in `oauth_state`) via
 ///      [`store::purge_did_data`], then
-///   2. revokes the OAuth session at the PDS via `revoke_everywhere` — the
-///      sidecar's `POST /internal/revoke {did}` and, when the Rust OAuth runtime
-///      is configured, its RFC 7009 revocation too — then
+///   2. revokes the OAuth session at its authorization server (RFC 7009) via
+///      `revoke_everywhere`, deleting the stored session, then
 ///   3. drops the in-memory session and clears the cookie, signing the user out.
 ///
 /// The subscription/folder/saved *records* in the user's own PDS are
@@ -5202,7 +5109,7 @@ async fn account_delete(
         "account/delete: local rows purged"
     );
 
-    // 2. Revoke the OAuth session at the sidecar/PDS (best-effort — the local
+    // 2. Revoke the OAuth session at the PDS (best-effort — the local
     //    rows are already gone; a network blip must not block the sign-out).
     revoke_everywhere(&state, &did).await;
 
@@ -5276,7 +5183,7 @@ async fn beta_redeem_form(State(state): State<AppState>) -> Response {
 /// reserving intent to redeem this code, then sends the visitor to `/login`. The
 /// OAuth callback later binds the verified DID and atomically consumes the code
 /// (`store::redeem_code`). This ordering means a non-invited visitor can never
-/// start OAuth (and burn a sidecar handshake).
+/// start OAuth (and burn a handshake).
 async fn beta_redeem_submit(
     State(state): State<AppState>,
     Form(form): Form<RedeemForm>,
@@ -5395,15 +5302,11 @@ struct MintQuery {
 ///
 /// **This URL IS the `client_id`.** The PDS fetches it during every login and
 /// caches it against every existing grant, so it must keep answering at exactly
-/// this path across the cutover — the sidecar serves the same document at the
-/// same URL today, proxied by the edge.
-///
-/// Served whatever backend is live: a request that arrives here is from a PDS
-/// resolving our identity, and it has no idea which of our two implementations
-/// is currently answering repo calls.
+/// this path, which the Node sidecar also served until 0.5.0 removed it (#311).
 async fn oauth_client_metadata(State(state): State<AppState>) -> Response {
     let Some(runtime) = state.oauth.as_deref() else {
-        // The sidecar is serving this path in front of us, or nothing is.
+        // Unreachable from `AppState::new`, which refuses to start without a
+        // runtime; answered rather than assumed.
         return (StatusCode::NOT_FOUND, "no client metadata\n").into_response();
     };
     axum::Json(crate::oauth::metadata::client_metadata(&runtime.client)).into_response()
@@ -5524,7 +5427,7 @@ async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Res
     let body = format!(
         "live backend: {}\nparked read-state DIDs: {}\n\
          feeds cached: {} (ceiling {}), of which unpollable: {}\n\n{}{}",
-        state.config.repo_backend.as_str(),
+        crate::metrics::Backend::Rust.as_str(),
         parked,
         cached,
         state.config.max_feeds_global,
@@ -6982,6 +6885,23 @@ mod tests {
         AppState::new(config, db).unwrap()
     }
 
+    /// An OAuth config whose signing key lives in a fresh temp file, for a
+    /// test state on a production-like `public_url`. Such a state is a
+    /// confidential client, which creates its key on boot (#311): left at the
+    /// default, the RELATIVE `oauth-signing-key.json`, that wrote real key
+    /// material into the working directory, which a later run then failed to
+    /// decrypt under a different key.
+    fn temp_oauth() -> crate::config::OauthConfig {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::config::OauthConfig {
+            key_path: std::env::temp_dir()
+                .join(format!("fr-web-prod-key-{}-{n}.json", std::process::id())),
+            encryption_key: Some("a".repeat(43)),
+            ..crate::config::OauthConfig::default()
+        }
+    }
+
     /// A `Cookie` header carrying a valid signed session for `sid` (the sid is
     /// looked up in the registry, so create the session first).
     fn session_cookie(state: &AppState, did: &str, handle: Option<&str>) -> String {
@@ -7238,6 +7158,7 @@ mod tests {
             beta_cap: 3,
             bot_secret: Some(bot_secret.to_string()),
             public_url: "https://feather-reader.com".to_string(),
+            oauth: temp_oauth(),
             ..Config::default()
         };
         AppState::new(config, db).unwrap()
@@ -8570,6 +8491,7 @@ mod tests {
             cookie_secret: "test-cookie-secret-000".to_string(),
             beta_cap: 3,
             public_url: "https://feather-reader.com".to_string(),
+            oauth: temp_oauth(),
             ..Config::default()
         };
         AppState::new(config, db).unwrap()
@@ -8640,6 +8562,7 @@ mod tests {
         let config = Config {
             cookie_secret: "test-cookie-secret-000".to_string(),
             public_url: "https://reader.example.org".to_string(),
+            oauth: temp_oauth(),
             ..Config::default()
         };
         let body = public_body(AppState::new(config, db).unwrap(), "/privacy").await;
@@ -9022,11 +8945,8 @@ mod tests {
     #[tokio::test]
     async fn the_sign_out_flush_settles_what_a_split_flush_landed() {
         use crate::readstate::tests as rs;
-        // Both backends while `sidecar` can still be selected (#311).
-        for backend in [
-            crate::metrics::Backend::Sidecar,
-            crate::metrics::Backend::Rust,
-        ] {
+        {
+            let backend = crate::metrics::Backend::Rust;
             let fake = std::sync::Arc::new(std::sync::Mutex::new(rs::FakeRepo::default()));
             let state = rs::state_on(backend, &fake).await;
             for i in 0..250 {
@@ -9561,19 +9481,10 @@ mod tests {
         assert_eq!(es_count, 0, "no cross-DID mutation during the outage");
     }
 
-    /// **A logout with nothing to revoke is a SUCCESS — on the arm that had
-    /// nothing. The other arm is counted separately.**
-    ///
-    /// Logout is idempotent, so `NoSession` must record as ok; counting it as an
-    /// error would make the metric noisy in exactly the case that is fine.
-    ///
-    /// But `revoke_everywhere` has TWO arms, and a review found that counting
-    /// only the rust one let `oauth_revoke` report all-clear while every sidecar
-    /// revocation failed. For anyone who logged in before the cutover the sidecar
-    /// store is the only one holding tokens, so the rust arm correctly says
-    /// NoSession and the metric said nothing was wrong. Both arms are now
-    /// recorded, distinguished by the backend column — so this test pins the
-    /// BACKEND as well as the outcome.
+    /// **A logout with nothing to revoke is a SUCCESS.** Logout is idempotent,
+    /// so `NoSession` must record as ok; counting it as an error would make the
+    /// metric noisy in exactly the case that is fine. (The sidecar's revoke arm,
+    /// counted under its own backend, went with it in 0.5.0, #311.)
     #[tokio::test]
     async fn a_logout_with_no_session_counts_as_success() {
         let did = "did:plc:aaaa";
@@ -9591,21 +9502,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("no oauth_revoke row for {b:?}"))
         };
 
-        // Rust arm: nothing stored for this DID, so NoSession -> ok.
+        // Nothing stored for this DID, so NoSession -> ok.
         let rust = find(crate::metrics::Backend::Rust);
         assert_eq!(
             rust.stats.err_count, 0,
             "NoSession was counted as a failure; logout is idempotent",
         );
         assert_eq!(rust.stats.ok_count, 1);
-
-        // Sidecar arm: unreachable in a test, so it must be recorded as an
-        // ERROR under its own backend — not silently dropped, and not folded
-        // into the rust row.
-        let sidecar = find(crate::metrics::Backend::Sidecar);
         assert_eq!(
-            sidecar.stats.err_count, 1,
-            "a failed sidecar revoke was not counted",
+            rows.iter().filter(|r| r.op == "oauth_revoke").count(),
+            1,
+            "one revoke, one row: {rows:?}"
         );
     }
 
@@ -11653,7 +11560,6 @@ mod tests {
             allowed_dids: dids,
             cookie_secret: "test-cookie-secret-000".to_string(),
             beta_cap: 3,
-            repo_backend: crate::metrics::Backend::Rust,
             oauth: crate::config::OauthConfig {
                 // Per test, never the relative default — see `repo::tests`.
                 key_path: std::env::temp_dir().join(format!(
@@ -12717,7 +12623,7 @@ mod tests {
     /// Serve `repo` as both a sidecar (`/internal/repo`) and a PDS (`/xrpc/*`),
     /// so one fixture drives either backend. Returns the sidecar base URL and
     /// the PDS audience a Rust-backend session should carry.
-    async fn serve_swap_repo(repo: std::sync::Arc<std::sync::Mutex<SwapRepo>>) -> (String, String) {
+    async fn serve_swap_repo(repo: std::sync::Arc<std::sync::Mutex<SwapRepo>>) -> String {
         use axum::response::IntoResponse as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12734,31 +12640,13 @@ mod tests {
                     (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response()
                 };
                 let mut repo = repo.lock().unwrap();
-                match (parts.uri.path(), body["action"].as_str()) {
-                    ("/internal/repo", Some("list")) if repo.fail_list => reply(
-                        502,
-                        serde_json::json!({
-                            "ok": false, "error": "UpstreamFailure", "message": "down", "status": 502,
-                        }),
-                    ),
-                    ("/internal/repo", Some("list")) => {
-                        reply(200, serde_json::json!({ "ok": true, "data": repo.page() }))
-                    }
-                    ("/internal/repo", Some("put")) => match repo.put(&body) {
-                        Ok(data) => reply(200, serde_json::json!({ "ok": true, "data": data })),
-                        Err((status, error)) => reply(
-                            status,
-                            serde_json::json!({
-                                "ok": false, "error": error, "message": "refused", "status": status,
-                            }),
-                        ),
-                    },
-                    ("/xrpc/com.atproto.repo.listRecords", _) if repo.fail_list => reply(
+                match parts.uri.path() {
+                    "/xrpc/com.atproto.repo.listRecords" if repo.fail_list => reply(
                         502,
                         serde_json::json!({ "error": "UpstreamFailure", "message": "down" }),
                     ),
-                    ("/xrpc/com.atproto.repo.listRecords", _) => reply(200, repo.page()),
-                    ("/xrpc/com.atproto.repo.putRecord", _) => match repo.put(&body) {
+                    "/xrpc/com.atproto.repo.listRecords" => reply(200, repo.page()),
+                    "/xrpc/com.atproto.repo.putRecord" => match repo.put(&body) {
                         Ok(data) => reply(200, data),
                         Err((status, error)) => reply(
                             status,
@@ -12770,29 +12658,25 @@ mod tests {
             }
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (
-            format!("http://{addr}"),
-            format!("http://{host}:{}", addr.port()),
-        )
+        format!("http://{host}:{}", addr.port())
     }
 
     /// An `AppState` on `backend`, pointed at `repo` — the sidecar through its
     /// internal URL, the Rust client through a live OAuth session whose `aud`
     /// is the fake.
     async fn race_state(
-        backend: crate::metrics::Backend,
+        _backend: crate::metrics::Backend,
         repo: &std::sync::Arc<std::sync::Mutex<SwapRepo>>,
     ) -> AppState {
-        let (sidecar, aud) = serve_swap_repo(std::sync::Arc::clone(repo)).await;
+        let aud = serve_swap_repo(std::sync::Arc::clone(repo)).await;
         let db = store::init_url("sqlite::memory:").await.unwrap();
         store::ensure_seed(&db, &[RACE_DID.to_string()])
             .await
             .unwrap();
-        let mut config = Config {
+        let config = Config {
             allowed_dids: vec![RACE_DID.to_string()],
             cookie_secret: "test-cookie-secret-000".to_string(),
             beta_cap: 3,
-            repo_backend: backend,
             oauth: crate::config::OauthConfig {
                 // Per test, never the relative default — see `repo::tests`.
                 key_path: std::env::temp_dir().join(format!(
@@ -12805,10 +12689,8 @@ mod tests {
             },
             ..Config::default()
         };
-        config.sidecar.public_url = sidecar.clone();
-        config.sidecar.internal_url = sidecar;
         let state = AppState::new(config, db).unwrap();
-        if backend == crate::metrics::Backend::Rust {
+        {
             let runtime = state.oauth.as_deref().expect("oauth runtime");
             crate::oauth::store::put_session(
                 &state.db,
@@ -12872,13 +12754,10 @@ mod tests {
             .to_string()
     }
 
-    /// The backends the race tests run on: both, while `sidecar` can still be
-    /// selected. Rust is the default (#311); this drops to Rust when 0.5.0
-    /// removes the sidecar, with [`serve_swap_repo`]'s sidecar half.
-    const RACE_BACKENDS: [crate::metrics::Backend; 2] = [
-        crate::metrics::Backend::Sidecar,
-        crate::metrics::Backend::Rust,
-    ];
+    /// The backends the race tests run on: Rust, the only one since 0.5.0
+    /// removed the sidecar (#311). Kept as a list because the assertions name
+    /// the backend.
+    const RACE_BACKENDS: [crate::metrics::Backend; 1] = [crate::metrics::Backend::Rust];
 
     /// **The key test of #149: a rename that loses a race keeps the other
     /// client's change AND lands its own.**

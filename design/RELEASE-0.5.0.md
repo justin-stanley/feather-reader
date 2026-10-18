@@ -150,6 +150,13 @@ tests of sidecar code itself (its revoke arm's metric, `SidecarClient`).
 - Delete the sidecar-only tests (backend parsing, sidecar secret refusals,
   `SidecarClient` tests, `spawn_revoke_sidecar`).
 
+**Done** (this PR). `Backend` is kept with one variant: it labels the metric
+rows and `/health`'s `backend:` line. `oauth` on `AppState` is still an
+`Option`, always `Some`, so handlers did not all change in this step. Found on
+the way: with the signing key now always created for a confidential client,
+three web tests on a production-like URL wrote real key material to the
+relative default path; they use a temp key.
+
 ### 4. Remove it from the image, deploy and CI
 
 - **Dockerfile:** drop the node-build stage and the sidecar copy; new runtime
