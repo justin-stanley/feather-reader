@@ -1,19 +1,15 @@
-flowchart LR
+flowchart TB
     Browser["Browser"] -->|"HTTPS"| CF["Cloudflare<br/>TLS · proxy · cache<br/>injects X-Origin-Auth"]
+    CF -->|"X-Origin-Auth"| Caddy
     subgraph Fly["Fly.io — one machine, one container (tini + gosu)"]
+        direction LR
         Caddy["Caddy :8080<br/>origin lock · the only public listener"]
         App["featherreader (Rust, axum, askama)<br/>127.0.0.1:8082"]
-        Side["Node OAuth sidecar<br/>127.0.0.1:8081<br/>started only on the sidecar backend"]
         Vol[("/data volume<br/>SQLite cache · OAuth sessions · signing key")]
-        Caddy -->|"everything (and /oauth/* on the rust backend)"| App
-        Caddy -.->|"/oauth/* on the sidecar backend"| Side
+        Caddy -->|"everything, /oauth/* included"| App
         App --- Vol
-        App -.->|"/internal/* over loopback"| Side
-        Side -.- Vol
     end
-    CF -->|"X-Origin-Auth"| Caddy
     App -->|"conditional GET · SSRF-guarded"| Feeds[("RSS / Atom hosts")]
-    App <-->|"OAuth · com.atproto.repo.*"| PDS[("Your PDS")]
+    App <-->|"OAuth · repo calls"| PDS[("Your PDS")]
     App -->|"anonymous listRecords"| Pubs[("Publishers' PDSes")]
-    App -->|"did:plc resolution"| PLC[("plc.directory")]
-    Side -.->|"OAuth · repo calls"| PDS
+    App -->|"did:plc"| PLC[("plc.directory")]

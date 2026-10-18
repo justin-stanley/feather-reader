@@ -99,6 +99,14 @@ deploying is separate.
   CodeQL check-run, #313); the Caddyfile job validates the one file.
   `.gitleaks.toml` keeps the sidecar's lockfile allowlisted, because the scan
   covers history.
+- **The sidecar, from the docs and copy (#311, 0.5.0 step 5).** The README
+  describes one process and a Rust-only build, drops `FEATHERREADER_REPO_BACKEND`
+  from the settings table, and replaces "Choosing an OAuth backend" with
+  "Upgrading from the sidecar backend" (what to set first, what to keep for a
+  rollback, what to delete). CONTRIBUTING and SECURITY drop the sidecar; the
+  about and terms pages say "a single static binary". The runtime diagram
+  (`design/architecture/runtime.mmd` and its PNGs) shows one app process,
+  re-laid out top to bottom so no edge label overlaps another.
 
 ### Changed
 

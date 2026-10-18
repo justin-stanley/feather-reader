@@ -12,8 +12,9 @@
 > (PR #120), 1b is partly done (PR #122, PR #135), 1c is done (PR #127), 1d was
 > resolved by supporting `at://` publications in 0.4.0, and both observability
 > gaps closed (PR #113). The `href` defence shipped in v0.3.3 (PR #111, PR #152).
-> **Still open:** the soak sign-off (not recorded anywhere), #18, #17 and #19,
-> and the `oauth_state` purge. The wiki sentence in §3 is corrected. Whether the
+> **Still open:** the soak sign-off (not recorded anywhere), #17 and #19.
+> Since then: the `oauth_state` purge is done (#259), and #18, the sidecar's
+> removal, is done for 0.5.0 (#311). The wiki sentence in §3 is corrected. Whether the
 > Cloudflare tokens were revoked can't be verified.
 
 Where things stand after 2026-09-13, and what to do next in what order.
