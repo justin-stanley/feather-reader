@@ -5,10 +5,14 @@
 # pinned running. Cloudflare (Full-strict) fronts Fly; Fly still forces HTTPS.
 #
 # One 1GB volume at /data holds ALL persistent state:
-#   * FEATHERREADER_DB   (/data/featherreader.db)  — the Rust app's SQLite cache
-#   * SIDECAR_DB         (/data/oauth-sidecar.db)  — the OAuth token/session store
-#   * the sidecar signing JWK (/data/oauth-sidecar.db.jwk.json) — persisted BESIDE
-#     the sidecar DB by oauth-sidecar/src/oauth.ts (see deploy/teardown.md).
+#   * FEATHERREADER_DB   (/data/featherreader.db)  — the SQLite cache, including
+#     the OAuth sessions (`oauth_session`)
+#   * FEATHERREADER_OAUTH_KEY_PATH (/data/oauth-signing-key.json) — the OAuth
+#     client's signing key
+#   * Caddy's state (/data/caddy)
+# Left behind by the Node sidecar, removed in 0.5.0 (#311), and read by nothing:
+# /data/oauth-sidecar.db and /data/oauth-sidecar.db.jwk.json. Delete them once
+# a rollback to 0.4.x is no longer wanted (see deploy/teardown.md).
 # The container entrypoint chowns /data to the app uid on first boot (a fresh Fly
 # volume is root:root), so the non-root app can create these files.
 #
@@ -41,23 +45,23 @@
 # REQUIRED SECRETS (set once, NEVER in this file or the image):
 #   fly secrets set \
 #     FEATHERREADER_COOKIE_SECRET="$(openssl rand -base64 48)" \
-#     SIDECAR_INTERNAL_SECRET="$(openssl rand -base64 48)" \
-#     SIDECAR_ENC_KEY="$(openssl rand -base64 32)" \
+#     FEATHERREADER_OAUTH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 #     FEATHERREADER_PUBLIC_URL="https://feather-reader.com" \
-#     SIDECAR_PUBLIC_URL="https://feather-reader.com/oauth" \
-#     SIDECAR_APP_CALLBACK_URL="https://feather-reader.com/oauth/callback" \
 #     FEATHERREADER_ALLOWED_DIDS="did:plc:..."
+# Without FEATHERREADER_OAUTH_ENCRYPTION_KEY, config.rs::validate_secrets()
+# REFUSES TO BOOT: `oauth_session` holds every user's access token, refresh token
+# and DPoP private key, and without it the codec is a no-op and all three sit in
+# plaintext in SQLite on the same volume (and in every snapshot of it) as the
+# feed cache. Rotating it strands existing sessions: the old ciphertext will not
+# decrypt, and every reader must log in again.
 #
-# REQUIRED ON THE RUST OAUTH BACKEND (see "BACKEND CUTOVER" below):
-#   fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY="$(openssl rand -base64 32)"
-# Unset on FEATHERREADER_REPO_BACKEND=rust, config.rs::validate_secrets() REFUSES
-# TO BOOT — the app owns the OAuth flow there, so `oauth_session` holds every
-# user's access token, refresh token and DPoP private key, and without this key
-# the codec is a no-op and all three sit in plaintext in SQLite on the same
-# volume (and in every snapshot of it) as the feed cache. Not read at all on the
-# sidecar backend, which never writes those tables — so a rollback to `sidecar`
-# does not need it. Rotating it strands existing sessions: the old ciphertext
-# will not decrypt, and every reader must log in again.
+# THE SIDECAR'S SECRETS ARE ROLLBACK STATE, NOT CONFIG (0.5.0, #311). 0.5.0
+# reads no SIDECAR_* and warns at boot while any is set. But 0.4.x on the rust
+# backend still REFUSES TO BOOT in production without a strong
+# SIDECAR_INTERNAL_SECRET, so unsetting it before you are done with the option
+# of rolling back would turn a rollback into a boot loop. Once it is no longer
+# wanted: `fly secrets unset SIDECAR_INTERNAL_SECRET SIDECAR_ENC_KEY
+# SIDECAR_PUBLIC_URL SIDECAR_APP_CALLBACK_URL`.
 #
 # OPTIONAL SECRET — only if running the follow→invite bot (POST /bot/claims):
 #   fly secrets set FEATHERREADER_BOT_SECRET="$(openssl rand -base64 48)"
@@ -65,34 +69,12 @@
 # instance it must be strong (>= 32 bytes, not a dev default) or boot fails. The
 # bot host must be given the SAME value (see bot/README.md). Optionally also
 #   FEATHERREADER_CLAIM_TTL_SECS   (default 1209600 = 14 days)
-# SIDECAR_PUBLIC_URL is the BROWSER-facing value (client_id/redirect_uri). The
-# server-to-server SIDECAR_INTERNAL_URL is a NON-secret loopback value baked into
-# the image + set in [env] below, so /internal/* calls never egress the edge.
-# config.rs::validate_secrets() and the sidecar config FAIL LOUD at boot if the
-# cookie / internal / enc secrets are missing or weak on this (public) instance.
+# config.rs::validate_secrets() FAILS LOUD at boot if the cookie or encryption
+# secret is missing or weak on this (public) instance.
 #
-# BACKEND CUTOVER (sidecar -> rust). FEATHERREADER_REPO_BACKEND in [env] selects
-# which implementation performs the atproto calls and owns /oauth/*. Flipping it
-# is a TWO-part change and both parts must land in the same deploy:
-#   1. `fly secrets set FEATHERREADER_OAUTH_ENCRYPTION_KEY=...` (above) FIRST.
-#      Flipping the backend without it is an immediate, permanent boot loop.
-#   2. Change FEATHERREADER_REPO_BACKEND to "rust" in [env] and deploy.
-# The entrypoint reads the SAME variable to pick the Caddy OAuth routing and to
-# decide whether to start the Node sidecar at all, so it must be image/[env]
-# state, not a secret — the two cannot share /oauth/callback, and a mismatch
-# breaks every login. Rolling back is the same edit in reverse; the encryption
-# key can stay set, since the sidecar path never reads it.
-#
-# THE CUTOVER LOGS EVERY USER OUT. Nothing under src/ reads SIDECAR_DB: the rust
-# backend keeps its own `oauth_session` table inside FEATHERREADER_DB, separate
-# from the sidecar's /data/oauth-sidecar.db. No access token, refresh token or
-# DPoP key crosses the flip, so every signed-in reader must log in again — and
-# rolling BACK logs them out a second time, because the sidecar's store has gone
-# stale in the meantime. This is not the same cause as the key-rotation re-login
-# noted above; it happens even on a first flip with a freshly-set key. Prefer low
-# traffic and warn the cohort. Related and UNVERIFIED: the two backends publish
-# JWKS from different signing keys, so if a PDS caches our JWKS across the flip,
-# the first login after it may fail for that reason rather than for a code bug.
+# THE BACKEND. The Node sidecar served the OAuth flow and repo calls until the
+# 2026-09-13 cutover to rust, and 0.5.0 removed it (#311). Its history (the
+# cutover, why it logged everyone out) is in CHANGELOG.md and the deploy runbook.
 
 app = "featherreader"
 primary_region = "ord"
@@ -119,15 +101,14 @@ kill_timeout = "45s"
 
 [env]
   # Non-secret runtime wiring. In-container ports: Caddy 8080 (public), Rust app
-  # 127.0.0.1:8082, sidecar 127.0.0.1:8081.
+  # 127.0.0.1:8082.
   FEATHERREADER_BIND = "127.0.0.1:8082"
   FEATHERREADER_DB = "/data/featherreader.db"
   FEATHERREADER_ENV = "prod"
-  # Which implementation serves com.atproto.repo.* and owns /oauth/* — "sidecar"
-  # (Node, two processes) or "rust" (in-process, one). Stated explicitly rather
-  # than left to the default so the live backend is visible in this file and the
-  # cutover is a one-line edit. See "BACKEND CUTOVER" in the header: "rust"
-  # additionally REQUIRES FEATHERREADER_OAUTH_ENCRYPTION_KEY as a secret.
+  # Rust is the only backend since 0.5.0 (#311), which accepts this and changes
+  # nothing. KEPT FOR ROLLBACK: a rollback deploys an older image with THIS
+  # file, and on 0.4.x an unset variable means the removed sidecar, so dropping
+  # the line would make a rollback to 0.4.x sign everyone out and break login.
   FEATHERREADER_REPO_BACKEND = "rust"
   # standard.site publications may be STORED: pasted into the subscribe form, or
   # imported. Stored ones are polled either way; this gates storage, not reading.
@@ -139,17 +120,9 @@ kill_timeout = "45s"
   # Keep the poller from filling a 1GB volume: pause new fetches below the volume
   # size (see the startup watermark-vs-disk check in src/main.rs).
   FEATHERREADER_DB_SIZE_WATERMARK_BYTES = "805306368"  # 768 MiB (< 1GB volume)
-  # Same reasoning as FEATHERREADER_TRUSTED_IP_HEADER above: the sidecar's public
-  # OAuth routes are rate-limited per client IP, and behind Caddy the socket peer
-  # is always loopback. Authoritative ONLY with the CF-only origin lock in place.
-  SIDECAR_TRUSTED_IP_HEADER = "cf-connecting-ip"
-  SIDECAR_HOST = "127.0.0.1"
-  SIDECAR_PORT = "8081"
-  # Loopback base the Rust app uses for the sidecar's /internal/* API. DISTINCT
-  # from the (secret) browser-facing SIDECAR_PUBLIC_URL; keeps server-to-server
-  # calls inside the container.
-  SIDECAR_INTERNAL_URL = "http://127.0.0.1:8081"
-  SIDECAR_DB = "/data/oauth-sidecar.db"
+  # No SIDECAR_* here since 0.5.0 (#311): nothing reads them, and the app warns
+  # at boot while one is set. A rollback to 0.4.x does not need them from this
+  # file: those images bake their own loopback SIDECAR_* defaults.
   RUST_LOG = "info"
   # Background loops wait 30/45/60/75/90 s (and the relay probe 5 min) before their
   # FIRST tick, so a crash-looping machine does not re-run every sweep on every

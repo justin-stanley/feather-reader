@@ -8,15 +8,6 @@
 target
 **/target
 
-# --- Node build output + deps (rebuilt inside the image) ------------------
-oauth-sidecar/node_modules
-oauth-sidecar/dist
-oauth-sidecar/dist-test
-
-# --- Test-only sources (not copied into any image stage) ------------------
-oauth-sidecar/test
-oauth-sidecar/tsconfig.test.json
-
 # --- Secrets / env: NEVER copy these into a layer -------------------------
 *.env
 .env
@@ -33,7 +24,7 @@ secrets
 # suffix so a rename or a copy in a subdirectory stays out of the context too.
 **/oauth-signing-key*.json
 
-# --- Local runtime state (SQLite DBs + the sidecar signing JWK) -----------
+# --- Local runtime state (SQLite DBs, and a 0.4.x sidecar's signing JWK) ---
 *.db
 *.db-wal
 *.db-shm

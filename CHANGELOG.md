@@ -33,8 +33,22 @@ deploying is separate.
     grants stay live at the readers' PDSes until they expire.
   - **`SIDECAR_PUBLIC_URL`, `SIDECAR_INTERNAL_URL` and
     `SIDECAR_INTERNAL_SECRET` are no longer read.** The server warns at boot
-    while any is set. `SIDECAR_INTERNAL_SECRET` is no longer required in
-    production; unset it.
+    while any is set. **But keep the secrets until you no longer want a
+    rollback:** 0.4.x on the rust backend refuses to boot in production without
+    a strong `SIDECAR_INTERNAL_SECRET`, so unsetting it first turns a rollback
+    into a boot loop. Then `fly secrets unset SIDECAR_INTERNAL_SECRET
+    SIDECAR_ENC_KEY SIDECAR_PUBLIC_URL SIDECAR_APP_CALLBACK_URL` (or your
+    equivalent), and delete the sidecar's leftover `/data/oauth-sidecar.db*` and
+    `/data/oauth-sidecar.db.jwk.json`.
+  - **Keep `FEATHERREADER_REPO_BACKEND=rust` set** (as feather-reader.com's
+    `fly.toml` does) for the same reason: a rollback runs the older image with
+    the current environment, and on 0.4.x an unset variable means the sidecar.
+  - **The image is `debian:bookworm-slim`**, not `node:24-bookworm-slim`, with
+    no Node and no sidecar in it; Caddy routes `/oauth/*` to the app, with no
+    routing chosen at start. `deploy/teardown.sh` no longer revokes sidecar
+    sessions, refuses `FEATHERREADER_REPO_BACKEND=sidecar` (use the 0.4.x
+    script there), and wipes a leftover sidecar store unrevoked, with a
+    warning.
   - **Rolling back to 0.4.10 signs everyone out again**: there an unset
     variable means the sidecar, which never reads the Rust sessions. Set
     `FEATHERREADER_REPO_BACKEND=rust` on the release you roll back to.
@@ -67,8 +81,24 @@ deploying is separate.
   - The image no longer bakes `SIDECAR_TRUSTED_IP_HEADER`, `SIDECAR_HOST`,
     `SIDECAR_PORT`, `SIDECAR_INTERNAL_URL` or `SIDECAR_DB`: nothing reads
     them, and a baked value would trip the leftover-variable warning on every
-    start with nothing the operator could unset. The rest of the sidecar
-    leaves the image in step 4 (Dockerfile, entrypoint, Caddy, CI).
+    start with nothing the operator could unset.
+- **The sidecar, from the image, deploy and CI (#311, 0.5.0 step 4).**
+  `oauth-sidecar/` is deleted (about 3,000 lines of TypeScript and its tests).
+  The Dockerfile drops the Node build stage and the sidecar copy, and its
+  runtime base is `debian:bookworm-slim` (the builder's Debian release; tini,
+  gosu, bash and ca-certificates as before). The entrypoint no longer chooses
+  a backend, starts Node or installs a routing: Caddy's `/oauth/*` rule is
+  inline in `deploy/Caddyfile`, `caddy-oauth-{rust,sidecar}.conf` are deleted,
+  and the `/internal/*` block that guarded the sidecar's API goes with it.
+  `fly.toml` drops the `SIDECAR_*` `[env]` and the cutover notes, and keeps
+  `FEATHERREADER_REPO_BACKEND = "rust"` for rollback. `deploy/teardown.sh`
+  loses its sidecar revoke step (see the upgrade notes); its tests pin the
+  refusal and that a leftover store is found at the default path
+  (mutation-checked). CI loses the `OAuth sidecar` job, the npm Dependabot
+  group and CodeQL's `javascript-typescript` leg (Rust carries the per-PR
+  CodeQL check-run, #313); the Caddyfile job validates the one file.
+  `.gitleaks.toml` keeps the sidecar's lockfile allowlisted, because the scan
+  covers history.
 
 ### Changed
 

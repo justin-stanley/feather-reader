@@ -4,40 +4,13 @@
 # TLS is terminated by Cloudflare (Full-strict) + Fly's force_https in front, so
 # Caddy itself serves plain HTTP on :8080 with automatic HTTPS turned off.
 #
-# Routing (grounded in the source):
-#   * OAuth routing is SPLIT into two importable files, one per backend, chosen
-#     by FEATHERREADER_REPO_BACKEND at container start
-#     (deploy/caddy-oauth-sidecar.conf and deploy/caddy-oauth-rust.conf). The
-#     notes below describe the sidecar variant, which is the default.
-#   * The sidecar's PUBLIC OAuth endpoints live at its ROOT (/login, /callback,
-#     /client-metadata.json, /jwks.json). In prod SIDECAR_PUBLIC_URL is
-#     https://feather-reader.com/oauth, so client_id/redirect_uri are under
-#     /oauth/* — Caddy proxies /oauth/* to the sidecar with the /oauth prefix
-#     STRIPPED.
-#   * The Rust app owns everything else (the htmx UI, /health, /static/*, and its
-#     OWN post-login callback route /oauth/callback).
-#   * COLLISION: both the sidecar's atproto redirect_uri and the Rust app's
-#     callback are the literal path /oauth/callback. They are disambiguated by
-#     query param (grounded in oauth-sidecar/src/server.ts):
-#       - PDS  -> SIDECAR (/callback):  code=&state=  (success)  OR  error=&state=
-#         (user denied / OAuth error). NEITHER carries session_id or
-#         error_description. This MUST reach the sidecar — only it holds the
-#         per-request PKCE/state row and can call oauthClient.callback().
-#       - SIDECAR -> RUST APP:  ?session_id=<id>  on success (the `/callback` handler), or
-#         ?error=OAuthCallbackFailed&error_description=<msg>  on the sidecar's own
-#         failure hand-off (its `catch` arm). Both are app-bound.
-#     So we route /oauth/callback to the APP when it carries `session_id` OR
-#     `error_description` (the sidecar->app hop markers), and let everything else
-#     under /oauth/callback (crucially the PDS's `?error=&state=` deny path) fall
-#     through to the sidecar. Handled BEFORE the generic /oauth/* rule.
-#   * /internal/* is the sidecar's shared-secret server-to-server API and MUST
-#     NOT be publicly reachable. In this topology the Rust app reaches it over
-#     loopback (SIDECAR_INTERNAL_URL=http://127.0.0.1:8081), so it never needs to
-#     be edge-routable. We block BOTH the bare /internal/* AND the prefixed
-#     /oauth/internal/* (which would otherwise fall through handle_path /oauth/*
-#     and reach the sidecar's /internal/* after prefix strip). Combined with the
-#     sidecar binding loopback-only and its own X-Internal-Secret guard, the
-#     internal API is genuinely unreachable from outside the container.
+# Routing: the Rust app owns everything — the htmx UI, /health, /static/*, and
+# the OAuth paths under /oauth/* (client metadata, JWKS, callback), which it
+# serves literally, with NO prefix strip: the published client_id IS
+# https://<host>/oauth/client-metadata.json and every URL in that document is
+# built from the same /oauth base. (Until 0.5.0 removed the Node sidecar, #311,
+# /oauth/* could instead go to the sidecar, chosen at container start, and its
+# loopback /internal/* API was blocked here.)
 
 {
 	# Cloudflare + Fly terminate TLS; no ACME here.
@@ -81,7 +54,6 @@
 				request>uri query {
 					replace code REDACTED
 					replace state REDACTED
-					replace session_id REDACTED
 				}
 			}
 		}
@@ -128,8 +100,7 @@
 	# filtered — they name the issuer and say why a handshake failed, they are
 	# not secrets, and they are most of the diagnostic value of these lines.
 	#
-	# This is a LOG filter and touches nothing else: the `/oauth/callback`
-	# routing below still matches on `session_id`/`error_description` as before.
+	# This is a LOG filter and touches nothing else.
 	log {
 		output stdout
 		format filter {
@@ -140,7 +111,6 @@
 				request>uri query {
 					replace code REDACTED
 					replace state REDACTED
-					replace session_id REDACTED
 				}
 			}
 		}
@@ -193,8 +163,7 @@
 	# above does not fire, and the request is proxied. Measured with the secret
 	# unset: no header -> 403, junk -> 403, but `X-Origin-Auth:` with no value
 	# -> **200**. The comment below claimed the opposite for months, and
-	# `oauth-sidecar/src/client-ip.ts` founds the whole `cf-connecting-ip` trust
-	# model on that claim.
+	# the whole `cf-connecting-ip` trust model was founded on that claim.
 	#
 	# This makes the documented property true: an empty value is refused
 	# regardless of what the secret is, so a missing or mistyped
@@ -207,22 +176,13 @@
 		respond 403
 	}
 
-	# --- Hard block: the sidecar's internal API is never edge-routable --------
-	# Matches the bare path AND the /oauth-prefixed path (the latter would else
-	# fall through handle_path /oauth/* -> sidecar /internal/*). This block is
-	# placed FIRST so nothing below can route to it.
-	@internal path /internal /internal/* /oauth/internal /oauth/internal/*
-	handle @internal {
-		respond 404
+	# --- OAuth: the Rust app, path unchanged --------------------------------
+	# Served literally (no prefix strip), for the client_id reason in the header.
+	handle /oauth/* {
+		reverse_proxy 127.0.0.1:8082 {
+			header_up -X-Origin-Auth
+		}
 	}
-
-	# --- OAuth routing: selected by FEATHERREADER_REPO_BACKEND ----------------
-	# container-entrypoint.sh installs ONE of deploy/caddy-oauth-{sidecar,rust}.conf
-	# as /etc/caddy/oauth-routes.conf before Caddy starts. The two backends cannot
-	# share /oauth/callback -- the PDS sends identical `?code=&state=&iss=` to both,
-	# so nothing in the request distinguishes them and one process must own the
-	# path. See either conf file for the full reasoning.
-	import /etc/caddy/oauth-routes.conf
 
 	# --- Everything else: the Rust featherreader app --------------------------
 	# The UI, /health, and /static/* all live here.

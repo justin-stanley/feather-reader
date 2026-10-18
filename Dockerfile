@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
 # FeatherReader — single-container image: Caddy (public edge) + the Rust
-# `featherreader` app + the Node atproto OAuth sidecar, under tini as PID1.
+# `featherreader` app, under tini as PID1. (The Node atproto OAuth sidecar was
+# removed in 0.5.0, #311; Rust is the only OAuth client.)
 #
 # Grounded in the source tree (read, not guessed):
 #   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021 / rust 1.94
@@ -17,23 +18,15 @@
 #   * askama templates are compiled into the binary, BUT `static/` is served at
 #     RUNTIME via `ServeDir::new("static")` — a RELATIVE path (src/web.rs). So the
 #     runtime WORKDIR MUST contain `static/`. (Miss this and every /static/* 404s.)
-#   * The sidecar imports Node's built-in `node:sqlite` (oauth-sidecar/src/
-#     stores.ts `import { DatabaseSync } from 'node:sqlite'`). That module is
-#     STABLE + FLAGLESS from Node 24 (on Node 22 it needs --experimental-sqlite
-#     and throws ERR_UNKNOWN_BUILTIN_MODULE without it). => the runtime base is
-#     Node 24, and package.json engines is >=24. CI runs `npm test` on Node 24 so
-#     a node:sqlite load failure is caught before release.
-#   * The sidecar is run as `node dist/server.js` (built to dist/).
 #
-# Runtime base is `node:24-bookworm-slim` (glibc), NOT bare debian-slim: it gives
-# a supported, correctly-linked `node` (no fragile hand-copy of the node binary
-# or its libstdc++6/libgcc-s1 deps into a bare base), and its glibc ABI matches
-# the rust:1.94-bookworm builder so the Rust binary + the (static) Caddy binary
-# both run on it unchanged.
+# Runtime base is `debian:bookworm-slim` (glibc): the same Debian release as the
+# rust:1.94-bookworm builder, so the Rust binary + the (static) Caddy binary run
+# on it unchanged. It was `node:24-bookworm-slim` — itself Debian bookworm —
+# until 0.5.0 removed the Node sidecar; nothing else in the image needs Node.
 #
 # Base images are pinned by @sha256. Digests are the multi-arch INDEX digests and
 # drift as upstream republishes tags; re-resolve with e.g.
-# `docker buildx imagetools inspect node:24-bookworm-slim` if a pull ever fails
+# `docker buildx imagetools inspect debian:bookworm-slim` if a pull ever fails
 # the digest check.
 
 # ---------------------------------------------------------------------------
@@ -74,34 +67,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     strip /build/featherreader
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Node builder: compile the TypeScript OAuth sidecar to dist/.
-# ---------------------------------------------------------------------------
-FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS node-build
-
-WORKDIR /sidecar
-
-# `npm ci` needs the lockfile + manifest; copy them first for layer caching.
-COPY oauth-sidecar/package.json oauth-sidecar/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
-
-# Build TS -> dist/ (tsconfig outDir=dist). Then prune to production deps so
-# only what `node dist/server.js` needs is carried into the runtime.
-COPY oauth-sidecar/tsconfig.json ./
-COPY oauth-sidecar/src ./src
-RUN set -eux; \
-    npm run build; \
-    npm prune --omit=dev
-
-# ---------------------------------------------------------------------------
-# Stage 3 — Caddy binary source (static CGO_ENABLED=0 Go binary; libc-agnostic).
+# Stage 2 — Caddy binary source (static CGO_ENABLED=0 Go binary; libc-agnostic).
 # ---------------------------------------------------------------------------
 FROM caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 AS caddy-src
 
 # ---------------------------------------------------------------------------
-# Stage 4 — Runtime: node:24-bookworm-slim (glibc; supported node interpreter).
+# Stage 3 — Runtime: debian:bookworm-slim (glibc, matching the builder).
 # ---------------------------------------------------------------------------
-FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 # tini for correct PID1 semantics (zombie reaping + signal forwarding);
 # ca-certificates for outbound HTTPS (feed fetch + atproto — rustls ships its own
@@ -136,38 +109,24 @@ WORKDIR /app
 COPY --from=rust-build --chown=app:app /build/featherreader /app/featherreader
 COPY --chown=app:app static /app/static
 
-# The sidecar: dist/ + its pruned production node_modules + manifest.
-COPY --from=node-build --chown=app:app /sidecar/dist /app/oauth-sidecar/dist
-COPY --from=node-build --chown=app:app /sidecar/node_modules /app/oauth-sidecar/node_modules
-COPY --from=node-build --chown=app:app /sidecar/package.json /app/oauth-sidecar/package.json
-
 # Caddy config + the multi-process supervisor.
 COPY --chown=app:app deploy/Caddyfile /etc/caddy/Caddyfile
-# Both OAuth routing variants ship; the entrypoint installs the one matching
-# FEATHERREADER_REPO_BACKEND as /etc/caddy/oauth-routes.conf at start-up. Both
-# are present in every image so a rollback is an env change and a restart, with
-# no rebuild.
-COPY --chown=app:app deploy/caddy-oauth-sidecar.conf /etc/caddy/caddy-oauth-sidecar.conf
-COPY --chown=app:app deploy/caddy-oauth-rust.conf /etc/caddy/caddy-oauth-rust.conf
 COPY --chown=app:app deploy/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
 
 # --- Runtime env (NON-secret defaults only; secrets come from `fly secrets`) --
-# In-container wiring: Caddy owns the single public port 8080; the Rust app and
-# the sidecar bind loopback-only, so /internal/* is physically unreachable from
-# outside the container even before Caddy's routing rules.
+# In-container wiring: Caddy owns the single public port 8080; the Rust app
+# binds loopback-only.
 #
-# No SIDECAR_* is baked any more: the app does not read them since 0.5.0
-# removed the sidecar backend (#311), and warns at boot when one is set, so a
-# baked value would warn on every start with nothing the operator could unset.
-# The rest of the sidecar leaves the image in step 4.
+# No SIDECAR_* is baked: the app does not read them since 0.5.0 removed the
+# sidecar (#311), and warns at boot when one is set.
 #
 # FEATHERREADER_OAUTH_KEY_PATH MUST be on the volume. Its default is the
 # RELATIVE path `oauth-signing-key.json`, and the entrypoint runs the app from
 # /app — the image's ephemeral layer. Unset, the client's ES256 key is therefore
-# destroyed by every redeploy, and since a backend flip IS a redeploy, the rust
-# backend would mint a FRESH client key on each one: the published JWKS changes,
-# and every grant a PDS holds against the old key stops verifying.
+# destroyed by every redeploy, and the app would mint a FRESH client key on
+# each one: the published JWKS changes, and every grant a PDS holds against the
+# old key stops verifying.
 ENV FEATHERREADER_BIND=127.0.0.1:8082 \
     FEATHERREADER_DB=/data/featherreader.db \
     FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json \
@@ -178,24 +137,19 @@ ENV FEATHERREADER_BIND=127.0.0.1:8082 \
     XDG_CONFIG_HOME=/data/caddy
 #
 # NOT set here (delivered at runtime via `fly secrets set`, never baked):
-#   FEATHERREADER_COOKIE_SECRET, SIDECAR_INTERNAL_SECRET, SIDECAR_ENC_KEY,
-#   FEATHERREADER_OAUTH_ENCRYPTION_KEY (required by FEATHERREADER_REPO_BACKEND=rust;
-#     without it the stored access tokens, refresh tokens and DPoP keys are
-#     plaintext, and validate_secrets() refuses to boot that combination),
-#   FEATHERREADER_PUBLIC_URL, SIDECAR_PUBLIC_URL (prod .../oauth — browser-facing),
-#   SIDECAR_APP_CALLBACK_URL, FEATHERREADER_ALLOWED_DIDS, etc.
-# config.rs::validate_secrets() and the sidecar's config.ts FAIL LOUD at boot if
-# the required secrets are missing/weak on a non-loopback (prod) instance.
-#
-# NOTE: SIDECAR_PUBLIC_URL is deliberately NOT baked. The sidecar auto-infers its
-# `dev` client shape from a localhost PUBLIC_URL; baking a loopback default here
-# would mask the missing-prod-config error instead of failing it loudly.
+#   FEATHERREADER_COOKIE_SECRET,
+#   FEATHERREADER_OAUTH_ENCRYPTION_KEY (without it the stored access tokens,
+#     refresh tokens and DPoP keys are plaintext, and validate_secrets() refuses
+#     to boot),
+#   FEATHERREADER_PUBLIC_URL, FEATHERREADER_ALLOWED_DIDS, etc.
+# config.rs::validate_secrets() FAILS LOUD at boot if the required secrets are
+# missing/weak on a non-loopback (prod) instance.
 
 # Caddy is the only listener bound off-loopback; it is the Fly internal_port.
 EXPOSE 8080
 
 # tini as PID1 -> the supervisor. The entrypoint starts as ROOT (to chown the
 # Fly volume that overlays /data at runtime) and then drops to `app` via gosu
-# before launching the three children (see deploy/container-entrypoint.sh).
+# before launching the two children (see deploy/container-entrypoint.sh).
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/container-entrypoint.sh"]
 

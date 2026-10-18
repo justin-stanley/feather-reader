@@ -10,23 +10,23 @@
 #   PHASE 1 (ROOT): fix ownership of the /data volume. A fresh Fly volume mounts
 #     at /data owned root:root at RUNTIME, masking the image's build-time chown.
 #     The children run as the unprivileged `app` user (uid 10001) and each
-#     open files under /data (the Rust DB, the sidecar DB + signing JWK, Caddy's
+#     open files under /data (the Rust DB, the OAuth signing key, Caddy's
 #     XDG_DATA_HOME). Without this chown they get EACCES on a virgin volume and
 #     crash-loop. We do it ONCE as root, then drop privileges.
 #   PHASE 2 (app via gosu): run under tini (PID1), which reaps zombies and
 #     forwards SIGTERM/SIGINT to us; we fan those out to the supervised children.
 #
 # This is a deliberate, tiny alternative to s6-overlay/supervisord: for this app
-# a dead proxy, dead poller, or dead OAuth sidecar all mean "broken", so the
+# a dead proxy or a dead app both mean "broken", so the
 # correct behaviour is to bring the WHOLE container down and let Fly restart the
 # machine (min_machines_running=1) rather than serve a half-dead instance.
 #
 # Processes (ports chosen so only Caddy is reachable off-loopback):
 #   caddy         :8080          public edge (= Fly internal_port)
 #   featherreader 127.0.0.1:8082 Rust app (loopback only)
-#   node sidecar  127.0.0.1:8081 OAuth sidecar (loopback only; /internal/* here)
-#                                — ONLY on FEATHERREADER_REPO_BACKEND=sidecar.
-#                                The rust backend runs two processes, not three.
+# (The Node OAuth sidecar on 127.0.0.1:8081 was removed in 0.5.0, #311. A
+# leftover FEATHERREADER_REPO_BACKEND=sidecar reaches the app, which refuses to
+# start and says why, taking the container down with it.)
 set -eu
 
 DATA_DIR="${DATA_DIR:-/data}"
@@ -55,25 +55,6 @@ term() {
     for p in ${pids}; do kill -TERM "${p}" 2>/dev/null || true; done
 }
 trap term TERM INT
-
-# --- Which OAuth backend? -------------------------------------------------
-# Resolved ONCE, up front, because it decides two things that must agree: which
-# processes run, and how Caddy routes /oauth/*. Deciding them separately is how
-# they drift.
-#
-# An unrecognised value is fatal, matching the Rust side: silently defaulting to
-# the sidecar while the app served the rust backend would break every login, and
-# the symptom would look like a PDS outage.
-# Unset means rust, the default since #311, as in `Config::default()`.
-backend="${FEATHERREADER_REPO_BACKEND:-rust}"
-case "${backend}" in
-    sidecar) oauth_routes=/etc/caddy/caddy-oauth-sidecar.conf ;;
-    rust)    oauth_routes=/etc/caddy/caddy-oauth-rust.conf ;;
-    *)
-        echo "[entrypoint] FEATHERREADER_REPO_BACKEND must be 'sidecar' or 'rust', got '${backend}'" 1>&2
-        exit 64
-        ;;
-esac
 
 # --- Origin lock secret ---------------------------------------------------
 # Caddy refuses every non-/health request whose `X-Origin-Auth` does not equal
@@ -120,37 +101,9 @@ cd /app
 fr_pid=$!
 pids="${pids} ${fr_pid}"
 
-# --- OAuth sidecar (only on the sidecar backend) --------------------------
-# NOT started on the rust backend. Leaving it running there would keep a second
-# process alive holding its own SQLite of PDS tokens and serving its /internal
-# API on loopback -- an idle store of live credentials and an attack surface, for
-# a component nothing routes to. It would also make the supervisor treat that
-# unused process's death as a reason to tear the container down.
-#
-# Node 24: `node:sqlite` is stable + flagless, so no --experimental-sqlite here.
-if [ "${backend}" = "sidecar" ]; then
-    node /app/oauth-sidecar/dist/server.js &
-    sc_pid=$!
-    pids="${pids} ${sc_pid}"
-else
-    echo "[entrypoint] rust OAuth backend: not starting the Node sidecar" 1>&2
-fi
-
-# --- OAuth edge routing: pick the file matching the selected backend -------
-# The two backends cannot share /oauth/callback: the PDS redirects to it with
-# identical `?code=&state=&iss=` in both cases, so the edge cannot tell them
-# apart and one process has to own the path. The flag and the routing therefore
-# have to agree, and they are made to agree HERE rather than by hand.
-#
-# An unrecognised value is fatal, matching the Rust side: silently defaulting to
-# the sidecar routing while the app served the Rust backend would break every
-# login, and the symptom would look like a PDS outage.
-cp "${oauth_routes}" /etc/caddy/oauth-routes.conf
-echo "[entrypoint] oauth routing: $(basename "${oauth_routes}")" 1>&2
-
 # --- Caddy (public edge) --------------------------------------------------
 # Validated before `run`: a bad adapt here would otherwise take the whole
-# container down on boot with the failure buried among three children's output.
+# container down on boot with the failure buried among the children's output.
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 cy_pid=$!

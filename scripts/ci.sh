@@ -25,12 +25,5 @@ else
   echo "== teardown script: skipped (no sqlite3) =="
 fi
 
-if [ -d oauth-sidecar ] && command -v npm >/dev/null 2>&1; then
-  echo "== oauth-sidecar (npm ci + build + typecheck) =="
-  ( cd oauth-sidecar && npm ci && npm run build && npm run typecheck )
-else
-  echo "== oauth-sidecar: skipped (no npm / no sidecar) =="
-fi
-
 echo ""
 echo "ALL CI CHECKS PASSED (local)"
