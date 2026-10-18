@@ -367,54 +367,67 @@ fn static_header_layer(
 // Per-IP rate limiting (token bucket, self-contained — no extra crate)
 // ---------------------------------------------------------------------------
 
-/// The abuse-prone paths the rate limiter guards (429 over the limit): the OAuth
-/// kick-off and callback, the invite redeem, logout, the mutating write
-/// endpoints, and mark-read/star/mark-all. Plain read-only navigation is
-/// intentionally *not* limited.
+/// The routes the rate limiter does NOT guard, as `(GET or HEAD, route
+/// template)`. **Everything else is limited (429 over the limit): every POST,
+/// and every GET not listed here** — a new route is throttled unless it is
+/// exempted on purpose (#261).
 ///
-/// The criterion is **does this path make an outbound request**, not "does it
-/// mutate" — the two diverge, and every miss so far has been on the outbound
-/// side. This is an allowlist a new route has to be added to by hand, which is
-/// exactly why it has now been missed three times: `/saved/` (fixed), then
-/// `/oauth/callback` and `/logout`. The callback was the bad one — it is the
-/// only path here reachable with no session at all.
+/// It was the other way round: an allowlist of limited paths a new route had to
+/// be added to by hand, which was missed three times (`/saved/`, then
+/// `/oauth/callback` and `/logout`). The criterion for the limiter is **does
+/// this path make an outbound request**, not "does it mutate", and every miss
+/// was on the outbound side.
 ///
-/// Known and deliberate gaps: `GET /`, `GET /manage` and `GET /opml/export` each
-/// make PDS calls but are ordinary authenticated navigation, and throttling them
-/// would degrade normal reading. They are bounded by needing a valid session.
-fn is_rate_limited_path(path: &str, method: &axum::http::Method) -> bool {
+/// What is exempt is read-only navigation and public documents. Known and
+/// deliberate: `GET /`, `GET /manage` and `GET /opml/export` each make PDS calls
+/// but are ordinary authenticated navigation, and throttling them would degrade
+/// normal reading; they are bounded by needing a valid session. `GET /login`,
+/// `GET /claim` and `GET /oauth/callback` are NOT here: the first resolves a
+/// handle, the second consumes a reservation, and the callback exchanges a code
+/// with no session at all. `/favicon.ico` is a served file. `/static/*` needs
+/// no entry: a nested service sets no `MatchedPath`, so its requests are reads
+/// that matched no route (measured, and pinned by
+/// `the_limiter_keys_on_the_matched_route_through_the_router`).
+///
+/// `rate_limit_exemptions_match_the_router` keeps this in step with
+/// [`router`]: an entry naming no route, or a GET route left unclassified,
+/// fails it.
+const RATE_LIMIT_EXEMPT_READS: &[&str] = &[
+    "/health",
+    "/about",
+    "/standard-site",
+    "/stats",
+    "/privacy",
+    "/terms",
+    "/manage",
+    "/",
+    "/entries/{id}",
+    "/opml/export",
+    "/beta/redeem",
+    "/admin/metrics",
+    "/oauth/client-metadata.json",
+    "/oauth/jwks.json",
+    "/favicon.ico",
+];
+
+/// The GET routes that ARE limited, for `rate_limit_exemptions_match_the_router`:
+/// every GET route is in exactly one of this and [`RATE_LIMIT_EXEMPT_READS`].
+#[cfg(test)]
+const RATE_LIMITED_READS: &[&str] = &["/login", "/claim", "/oauth/callback"];
+
+/// Whether a request is rate-limited, by its method and the route template it
+/// matched (`None` when it matched no route). See [`RATE_LIMIT_EXEMPT_READS`].
+///
+/// `HEAD` is a read like `GET`: axum answers it by running the GET handler, so
+/// `HEAD /login?handle=…` resolves a handle exactly as `GET` does. A read that
+/// matched no route (a 404: `/robots.txt`, a touch icon a browser guesses at)
+/// is not limited, so it costs a real visitor nothing; any other method is.
+fn is_rate_limited(method: &axum::http::Method, route: Option<&str>) -> bool {
     use axum::http::Method;
-    // `/claim` is a GET (a link the bot posts), but it consumes a reservation and
-    // a claim token in a public URL is grabbable, so it MUST be per-IP limited
-    // like the other abuse-prone entry points — not just `/login`.
-    // `/oauth/callback` is a GET, is UNAUTHENTICATED, and every hit performs a
-    // real outbound round-trip — a full token exchange against a PDS. Anyone could spend one outbound request per hit.
-    // It is the only entry point here that needs no session at all.
-    if method != Method::POST
-        && !(method == Method::GET
-            && (path == "/login" || path == "/claim" || path == "/oauth/callback"))
-    {
-        return false;
-    }
-    match path {
-        // `/logout` and `/oauth/callback` are here because they make outbound
-        // calls, not because they mutate: logout revokes at the PDS (up to two
-        // round-trips) and the callback exchanges a code. The list is by
-        // *network cost*, which is what the limiter is actually for.
-        "/login" | "/claim" | "/oauth/callback" | "/logout" | "/beta/redeem" | "/subscriptions"
-        | "/opml" | "/read-all" | "/admin/invites" | "/bot/claims" | "/account/delete"
-        | "/folders" => true,
-        // Every per-record subscription/folder mutation (delete/rename) and the
-        // star/mark-read taps make a PDS round-trip, so limit them too.
-        p => {
-            (p.starts_with("/entries/") && (p.ends_with("/read") || p.ends_with("/star")))
-                // Unsaving makes a DPoP-signed deleteRecord round-trip to the
-                // PDS, which is exactly the reason the neighbours above are
-                // limited. It was added as a new route and not added here.
-                || p.starts_with("/saved/")
-                || p.starts_with("/subscriptions/")
-                || p.starts_with("/folders/")
-        }
+    let read = method == Method::GET || method == Method::HEAD;
+    match route {
+        None => !read,
+        Some(r) => !(read && RATE_LIMIT_EXEMPT_READS.contains(&r)),
     }
 }
 
@@ -604,7 +617,11 @@ async fn rate_limit(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    if is_rate_limited_path(&path, &method) {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    if is_rate_limited(&method, route.as_deref()) {
         let conn = req
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -7062,22 +7079,145 @@ mod tests {
     }
 
     #[test]
-    fn rate_limited_paths_match_expected() {
+    fn rate_limited_routes_match_expected() {
         use axum::http::Method;
-        assert!(is_rate_limited_path("/login", &Method::GET));
-        assert!(is_rate_limited_path("/login", &Method::POST));
-        assert!(is_rate_limited_path("/beta/redeem", &Method::POST));
-        assert!(is_rate_limited_path("/subscriptions", &Method::POST));
-        assert!(is_rate_limited_path("/opml", &Method::POST));
-        assert!(is_rate_limited_path("/read-all", &Method::POST));
-        assert!(is_rate_limited_path("/admin/invites", &Method::POST));
-        assert!(is_rate_limited_path("/entries/42/read", &Method::POST));
-        assert!(is_rate_limited_path("/entries/42/star", &Method::POST));
-        // Read-only navigation is NOT limited.
-        assert!(!is_rate_limited_path("/", &Method::GET));
-        assert!(!is_rate_limited_path("/about", &Method::GET));
-        assert!(!is_rate_limited_path("/entries/42", &Method::GET));
-        assert!(!is_rate_limited_path("/login", &Method::HEAD));
+        // Every POST, a new one included.
+        for route in [
+            "/login",
+            "/beta/redeem",
+            "/subscriptions",
+            "/opml",
+            "/read-all",
+            "/admin/invites",
+            "/entries/{id}/read",
+            "/entries/{id}/star",
+            "/saved/{rkey}/delete",
+            "/a/route/added/tomorrow",
+        ] {
+            assert!(is_rate_limited(&Method::POST, Some(route)), "POST {route}");
+        }
+        // The GETs that make an outbound call, and their HEADs.
+        for route in ["/login", "/claim", "/oauth/callback"] {
+            assert!(is_rate_limited(&Method::GET, Some(route)), "GET {route}");
+            assert!(is_rate_limited(&Method::HEAD, Some(route)), "HEAD {route}");
+        }
+        // A GET route nobody exempted is limited by default (#261).
+        assert!(is_rate_limited(
+            &Method::GET,
+            Some("/a/route/added/tomorrow")
+        ));
+        // Read-only navigation and served files are not.
+        for route in ["/", "/about", "/entries/{id}", "/favicon.ico"] {
+            assert!(!is_rate_limited(&Method::GET, Some(route)), "GET {route}");
+        }
+        // A read that matched no route costs nothing; a write that did not is
+        // still limited.
+        assert!(!is_rate_limited(&Method::GET, None));
+        assert!(is_rate_limited(&Method::POST, None));
+    }
+
+    /// The `(method, path)` routes [`router`] registers, read from this file's
+    /// own source: `.route("…", get(…).post(…))` and `.route_service` (a GET).
+    /// `.nest_service` is left out: it sets no `MatchedPath`, so the limiter sees
+    /// its requests as unmatched reads (see [`is_rate_limited`]). There is no API
+    /// to list an axum `Router`'s routes, so the router's text is the route table.
+    fn router_routes() -> Vec<(&'static str, String)> {
+        let src = include_str!("web.rs");
+        let start = src
+            .find("pub fn router(state: AppState) -> Router {")
+            .expect("router()");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("end of router()")];
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(".route") {
+            rest = &rest[at..];
+            let kind = if rest.starts_with(".route_service(") {
+                "service"
+            } else if rest.starts_with(".route(") {
+                "route"
+            } else {
+                rest = &rest[1..];
+                continue;
+            };
+            // The call's text, to its matching `)`.
+            let open = rest.find('(').unwrap();
+            let mut depth = 0usize;
+            let mut end = open;
+            for (k, c) in rest[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let call = &rest[open + 1..end];
+            let path = call.split('"').nth(1).expect("a route path").to_string();
+            if kind == "service" {
+                out.push(("GET", path));
+            } else {
+                let handlers = &call[call.find(',').unwrap()..];
+                for (needle, method) in [("get(", "GET"), ("post(", "POST")] {
+                    if handlers.contains(needle) {
+                        out.push((method, path.clone()));
+                    }
+                }
+            }
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    /// **Every GET route is classified, and every exemption names a route**
+    /// (#261). A new GET route fails this until it is put in one list or the
+    /// other; a POST needs nothing, because every POST is limited. An exemption
+    /// left behind by a removed route fails it too.
+    #[test]
+    fn rate_limit_exemptions_match_the_router() {
+        let routes = router_routes();
+        assert!(
+            routes
+                .iter()
+                .any(|(m, p)| *m == "POST" && p == "/entries/{id}/star"),
+            "the route scan found nothing usable: {routes:?}"
+        );
+        let gets: std::collections::BTreeSet<&str> = routes
+            .iter()
+            .filter(|(m, _)| *m == "GET")
+            .map(|(_, p)| p.as_str())
+            .collect();
+        for get in &gets {
+            let exempt = RATE_LIMIT_EXEMPT_READS.contains(get);
+            let limited = RATE_LIMITED_READS.contains(get);
+            assert!(
+                exempt != limited,
+                "GET {get} must be in exactly one of RATE_LIMIT_EXEMPT_READS and \
+                 RATE_LIMITED_READS (exempt={exempt}, limited={limited})"
+            );
+        }
+        for listed in RATE_LIMIT_EXEMPT_READS.iter().chain(RATE_LIMITED_READS) {
+            assert!(
+                gets.contains(listed),
+                "{listed} is listed but is not a GET route"
+            );
+        }
+        // And the limiter agrees with the lists, route by route.
+        for (method, path) in &routes {
+            let method: axum::http::Method = method.parse().unwrap();
+            let expect = !(method == axum::http::Method::GET
+                && RATE_LIMIT_EXEMPT_READS.contains(&path.as_str()));
+            assert_eq!(
+                is_rate_limited(&method, Some(path)),
+                expect,
+                "{method} {path}"
+            );
+        }
     }
 
     #[test]
@@ -8861,6 +9001,58 @@ mod tests {
             saw_429,
             "rotating a forged X-Forwarded-For minted fresh buckets: the limiter is keyed on an attacker-chosen header"
         );
+    }
+
+    /// **The limiter classifies by the route the request MATCHED, end to end**
+    /// (#261): through the real router, with a real peer, `RATE_BURST + 5`
+    /// requests each. Served files, a templated navigation route and a 404 read
+    /// never trip it; a templated POST and `GET /login` do. This is what pins
+    /// the templates `MatchedPath` actually reports (a `/static` nest included)
+    /// to the ones the exemption list is written in.
+    #[tokio::test]
+    async fn the_limiter_keys_on_the_matched_route_through_the_router() {
+        let app = router(test_state(&[]).await);
+        let mut last_octet = 10u8;
+        let mut trips = |method: &'static str, uri: &'static str| {
+            last_octet += 1;
+            let peer = std::net::SocketAddr::from(([203, 0, 113, last_octet], 40000));
+            let app = app.clone();
+            async move {
+                for _ in 0..(RATE_BURST as usize + 5) {
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(method)
+                                .uri(uri)
+                                .extension(axum::extract::ConnectInfo(peer))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+        for (method, uri) in [
+            ("GET", "/static/style.css"),
+            ("GET", "/favicon.ico"),
+            ("GET", "/entries/1"),
+            ("GET", "/about"),
+            ("GET", "/robots.txt"),
+        ] {
+            assert!(!trips(method, uri).await, "{method} {uri} was rate-limited");
+        }
+        for (method, uri) in [("POST", "/entries/1/read"), ("GET", "/login")] {
+            assert!(
+                trips(method, uri).await,
+                "{method} {uri} was never rate-limited"
+            );
+        }
     }
 
     // -- OPML import body cap (DefaultBodyLimit → 413) -------------------------
@@ -16252,13 +16444,13 @@ mod tests {
     }
 
     /// Unsaving makes a DPoP-signed PDS round-trip, which is the stated reason
-    /// its neighbours are limited. It was added as a route and not added here.
+    /// its neighbours are limited. It was added as a route and not added to the
+    /// old allowlist; every POST is limited now (#261).
     #[test]
     fn the_unsave_route_is_rate_limited() {
         use axum::http::Method;
-        assert!(is_rate_limited_path("/saved/3abc/delete", &Method::POST));
-        // And the neighbours still are.
-        assert!(is_rate_limited_path("/entries/1/star", &Method::POST));
+        assert!(is_rate_limited(&Method::POST, Some("/saved/{rkey}/delete")));
+        assert!(is_rate_limited(&Method::POST, Some("/entries/{id}/star")));
     }
 
     /// **The probe detects a broken database — asserted through `/health`
