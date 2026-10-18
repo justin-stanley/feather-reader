@@ -176,6 +176,11 @@ impl VettedSaved {
 /// - [`FeedUrl::vetted`] runs both checks;
 /// - [`FeedUrl::of_row`] takes the URL of a row already in the table, which
 ///   was vetted on its way in (the poll paths re-upserting what they polled).
+///   That holds because a [`crate::store::Feed`] has a private field: only
+///   `store.rs` can build one, and it does so only from rows (`FromRow`).
+///   That is the one module that could break this, and it is the module that
+///   writes rows; it is stated here so a hand-built `Feed` there is seen for
+///   what it is.
 ///
 /// A vetted URL is accepted:
 ///
@@ -202,6 +207,26 @@ impl VettedSaved {
 ///
 /// let url = FeedUrl("https://example.com/feed.xml".to_string());
 /// let _row = NewFeed::new(url);
+/// ```
+///
+/// nor by dressing it up as a row (found in review):
+///
+/// ```compile_fail,E0451
+/// use feather_reader::store::{Feed, FeedUrl, NewFeed};
+///
+/// let fake = Feed {
+///     id: 0,
+///     url: "https://example.com/feed.xml".to_string(),
+///     title: None,
+///     site_url: None,
+///     etag: None,
+///     last_modified: None,
+///     last_polled: None,
+///     next_poll: None,
+///     consecutive_errors: 0,
+///     _from_table: (),
+/// };
+/// let _row = NewFeed::new(FeedUrl::of_row(&fake));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedUrl(String);

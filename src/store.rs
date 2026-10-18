@@ -57,6 +57,9 @@ pub type Pool = SqlitePool;
 /// This mirrors the PDS-side `community.lexicon.rss.subscription.url`; the row is
 /// created/updated by the poller, never owned by a single user.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+// Not `#[non_exhaustive]`: that only stops OTHER crates building a `Feed`, and
+// the bypass `_from_table` closes is inside this one (#260).
+#[allow(clippy::manual_non_exhaustive)]
 pub struct Feed {
     pub id: i64,
     pub url: String,
@@ -74,6 +77,13 @@ pub struct Feed {
     /// exponential poll backoff (reset to 0 on any success or 304).
     #[sqlx(default)]
     pub consecutive_errors: i64,
+    /// **Private, so a `Feed` can't be built outside this module (#260).**
+    /// [`FeedUrl::of_row`] trusts a `Feed`'s URL as already vetted, which holds
+    /// only while every `Feed` came out of the table; with all-`pub` fields any
+    /// module could build one around an untrusted URL and pass it in (found in
+    /// review). This module builds them only through `FromRow`.
+    #[sqlx(skip)]
+    _from_table: (),
 }
 
 /// A cached article/item belonging to a [`Feed`]. Shared cache (not per-DID).
@@ -1283,9 +1293,9 @@ pub async fn bump_feed_errors(
 /// backoff horizon for up to 24h. One implementation, two callers.
 ///
 /// **An `UPDATE`, never an insert (#260).** It was an upsert, so rescheduling a
-/// URL with no row created one, past both of the checks a new row needs
-/// ([`FeedUrl`]); and a feed deleted between its poll and this call came back.
-/// Every caller reschedules a row it just read. Only `next_poll` is written.
+/// URL with no row would have created one, past both of the checks a new row
+/// needs ([`FeedUrl`]). Every caller reschedules a row it just read, so nothing
+/// relied on the insert. Only `next_poll` is written.
 pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Duration) -> Result<()> {
     let next = chrono::Utc::now()
         + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));

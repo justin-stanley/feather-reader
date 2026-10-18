@@ -132,10 +132,12 @@ deploying is separate.
   so production code builds one with `NewFeed::new(url)`. The subscribe, OPML
   import, subscription-resolve and rename paths use `vetted` in place of their
   hand-written pair, with the same refusals and messages.
-  `set_next_poll` was an upsert, so rescheduling a URL with no row created one,
-  past both checks, and a feed deleted between its poll and its reschedule came
-  back; it is now an `UPDATE`. Compile-fail doctests pin that a string can't
-  become a `FeedUrl` by conversion or construction; dropping either check from
+  `Feed` gained a private field, so only `store.rs` (which builds them from rows)
+  can make one, and `of_row` can't be handed a URL dressed up as a row (found
+  in review). `set_next_poll` was an upsert, so rescheduling a URL with no row
+  would have created one past both checks; every caller reschedules a row it
+  just read, and it is now an `UPDATE`. Compile-fail doctests pin that a string can't
+  become a `FeedUrl` by conversion, construction, or a hand-built `Feed`; dropping either check from
   `vetted`, or letting `set_next_poll` insert, fails the tests.
 
 
