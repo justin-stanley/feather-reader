@@ -129,6 +129,13 @@ in order; 5–7 are independent and land as they are ready.
 
 No behaviour change for feather-reader.com: it already sets `rust`.
 
+**Done** (this PR): the default, the entrypoint and teardown; the sidecar-faked
+web tests on a Rust fake PDS (`spawn_pds`), the revoke paths over real TLS; the
+dual-backend loops (`readstate` `BACKENDS`, `web` `RACE_BACKENDS`) Rust only;
+`SidecarSession` renamed `LoginSession`. The fixtures' sidecar halves, and the
+tests of sidecar code itself (its revoke arm's metric, `SidecarClient`), go in
+step 3 with the code.
+
 ### 3. Remove the sidecar from the Rust code
 
 - Delete `SidecarClient`, `SidecarSession`'s old uses, `RevokeResult`,

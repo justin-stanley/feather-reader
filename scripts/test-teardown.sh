@@ -331,6 +331,17 @@ check "order is rust-revoke stop rust-revoke (got: $(order))" \
 check "the app DB and key are wiped" '[ ! -e "$APP_DB" ] && [ ! -e "$KEY" ]'
 teardown_sandbox
 
+echo "== an unset backend is rust, the app's default (#311)"
+setup
+rm -f "$SC_DB" "$SC_DB.jwk.json"
+run FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits 0, needing no sidecar variables" '[ "$CODE" = 0 ]'
+check "order is rust-revoke stop rust-revoke (got: $(order))" \
+      '[ "$(order)" = "rust-revoke stop rust-revoke" ]'
+check "the app DB and key are wiped" '[ ! -e "$APP_DB" ] && [ ! -e "$KEY" ]'
+teardown_sandbox
+
 echo "== sidecar backend still requires the sidecar variables"
 setup
 run FEATHERREADER_REPO_BACKEND=sidecar FR_REVOKE_CMD="$T/bin/revoke-stub"

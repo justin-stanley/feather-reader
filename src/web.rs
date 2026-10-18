@@ -4921,7 +4921,7 @@ async fn oauth_callback(
         )
         .await
         {
-            Ok(done) => crate::atproto::SidecarSession {
+            Ok(done) => crate::atproto::LoginSession {
                 did: done.did,
                 handle: done.handle,
             },
@@ -7748,21 +7748,25 @@ mod tests {
                     .uri("/login")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header(header::COOKIE, cookie)
-                    .body(Body::from("handle=alice.bsky.social"))
+                    // `.invalid` (RFC 6761): resolution fails at once, with no
+                    // real handle looked up and no PDS contacted.
+                    .body(Body::from("handle=alice.handle.invalid"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        // Redirects into the sidecar login (not to /beta/redeem).
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let loc = resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
+        // Past the invite gate and into the login itself, which cannot resolve
+        // the handle: the login page's error, not the redirect to /beta/redeem
+        // a refused invite gets.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
             .unwrap();
-        assert!(loc.contains("/login"), "loc = {loc}");
-        assert_ne!(loc, "/beta/redeem");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Could not start login for that handle."),
+            "the login was not started: {body}"
+        );
     }
 
     /// A resolver that always fails — proves the fast paths short-circuit BEFORE
@@ -8938,8 +8942,8 @@ mod tests {
     #[tokio::test]
     async fn opml_import_skips_a_private_feed_without_storing_or_publishing_it() {
         let did = "did:plc:renamer4";
-        let (sidecar, bodies) = spawn_logging_sidecar().await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, bodies) = spawn_logging_pds().await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let tokened = "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4";
         let opml = format!(
             "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
@@ -9010,68 +9014,6 @@ mod tests {
         );
     }
 
-    /// A sidecar fake that answers every request `ok` and records the PATH of
-    /// each in arrival order, plus every body — for asserting what was sent,
-    /// and in what order.
-    async fn spawn_logging_sidecar() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = log.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut raw: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let text = loop {
-                    let Ok(n) = sock.read(&mut chunk).await else {
-                        break String::new();
-                    };
-                    if n == 0 {
-                        break String::from_utf8_lossy(&raw).to_string();
-                    }
-                    raw.extend_from_slice(&chunk[..n]);
-                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let (head, body) = raw.split_at(split + 4);
-                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    });
-                    if want.is_none_or(|w| body.len() >= w) {
-                        break String::from_utf8_lossy(&raw).to_string();
-                    }
-                };
-                let path = text
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                let body_text = text
-                    .split_once("\r\n\r\n")
-                    .map(|(_, b)| b)
-                    .unwrap_or("")
-                    .to_string();
-                sink.lock().unwrap().push(format!("{path} {body_text}"));
-                let body = serde_json::json!({ "ok": true, "did": "did:plc:x", "revoked": true, "hadSession": true, "data": {"uri": "at://did:plc:x/c/r", "cid": "bafy"} }).to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{addr}"), log)
-    }
-
     /// **The sign-out flush settles a split flush's landed prefix too.** It is
     /// `readstate::flush_did` under a timeout, so it shares the fix — pinned
     /// here so a sign-out path that grew its own flush would not silently lose
@@ -9080,10 +9022,8 @@ mod tests {
     #[tokio::test]
     async fn the_sign_out_flush_settles_what_a_split_flush_landed() {
         use crate::readstate::tests as rs;
-        for backend in [
-            crate::metrics::Backend::Sidecar,
-            crate::metrics::Backend::Rust,
-        ] {
+        {
+            let backend = crate::metrics::Backend::Rust;
             let fake = std::sync::Arc::new(std::sync::Mutex::new(rs::FakeRepo::default()));
             let state = rs::state_on(backend, &fake).await;
             for i in 0..250 {
@@ -9114,12 +9054,14 @@ mod tests {
     /// "drops that to zero", which was false — the handler was never run.
     /// Deleting the call left the suite green: #117 regressing in full, with
     /// the test named after it still passing. Now `POST /logout` is driven and
-    /// the sidecar's log must show a repo write BEFORE the revoke.
+    /// the PDS's log must show a repo call BEFORE the revocation request.
     #[tokio::test]
     async fn signing_out_flushes_before_it_revokes_through_the_route() {
         let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let (sidecar, log) = spawn_logging_sidecar().await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, issuer, log) = spawn_revoking_pds().await;
+        let state = test_state_on_pds(&[did], &pds).await;
+        // Replaces the session `test_state_on_pds` stored, naming the real issuer.
+        put_pds_session_at(&state, did, &pds, &issuer).await;
         crate::store::upsert_cursor(
             &state.db,
             &crate::store::ReadCursor {
@@ -9149,13 +9091,17 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
-        let entries = log.lock().unwrap().clone();
+        // Request lines, in arrival order.
+        let entries: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().next().unwrap_or_default().to_string())
+            .collect();
         let flush = entries
             .iter()
-            .position(|e| e.starts_with("/internal/repo "));
-        let revoke = entries
-            .iter()
-            .position(|e| e.starts_with("/internal/revoke "));
+            .position(|e| e.contains(" /xrpc/com.atproto.repo."));
+        let revoke = entries.iter().position(|e| e.starts_with("POST /revoke "));
         assert!(revoke.is_some(), "sign-out did not revoke: {entries:?}");
         assert!(
             flush.is_some(),
@@ -9352,89 +9298,15 @@ mod tests {
 
     // -- delete-my-data (POST /account/delete) --------------------------------
 
-    /// A one-shot mock sidecar: binds a loopback port, answers exactly one
-    /// `POST /internal/revoke` with `{ok:true,…}`, and reports (via the returned
-    /// channel) the DID it was asked to revoke. Enough to prove the delete
-    /// handler triggers the sidecar revoke without pulling in an HTTP-mock crate.
-    async fn spawn_revoke_sidecar() -> (String, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            // Pull the DID out of the JSON body (last line of the request).
-            let did = req
-                .split("\r\n\r\n")
-                .nth(1)
-                .and_then(|body| {
-                    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-                    v.get("did")?.as_str().map(str::to_string)
-                })
-                .unwrap_or_default();
-            let is_revoke = req.starts_with("POST /internal/revoke");
-            let body = serde_json::json!({
-                "ok": true, "did": did, "revoked": true, "hadSession": true
-            })
-            .to_string();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            sock.write_all(resp.as_bytes()).await.unwrap();
-            sock.flush().await.unwrap();
-            let _ = tx.send(if is_revoke { did } else { String::new() });
-        });
-        (format!("http://{addr}"), rx)
-    }
-
-    /// Build an [`AppState`] whose sidecar points at `sidecar_url`.
-    async fn test_state_with_sidecar(allowed: &[&str], sidecar_url: &str) -> AppState {
-        let defaults = Config::default();
-        test_state_with_sidecar_and(
-            allowed,
-            sidecar_url,
-            defaults.standard_site,
-            defaults.max_feeds_global,
-        )
-        .await
-    }
-
-    /// [`test_state_with_sidecar`] with the standard.site flag and the global
-    /// feeds ceiling chosen — the two settings the at:// paths branch on.
-    async fn test_state_with_sidecar_and(
-        allowed: &[&str],
-        sidecar_url: &str,
-        standard_site: bool,
-        max_feeds_global: i64,
-    ) -> AppState {
-        let db = store::init_url("sqlite::memory:").await.unwrap();
-        let dids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
-        store::ensure_seed(&db, &dids).await.unwrap();
-        let mut config = Config {
-            allowed_dids: dids,
-            cookie_secret: "test-cookie-secret-000".to_string(),
-            beta_cap: 3,
-            standard_site,
-            max_feeds_global,
-            ..Config::default()
-        };
-        config.sidecar.public_url = sidecar_url.to_string();
-        config.sidecar.internal_url = sidecar_url.to_string();
-        AppState::new(config, db).unwrap()
-    }
-
-    /// A confirmed `POST /account/delete` purges the caller's local rows, calls
-    /// the sidecar revoke for that DID, and clears the session cookie.
+    /// A confirmed `POST /account/delete` purges the caller's local rows,
+    /// revokes the DID's session at its authorization server (deleting the
+    /// stored session), and clears the session cookie.
     #[tokio::test]
     async fn account_delete_purges_rows_and_triggers_revoke() {
-        let (sidecar_url, revoke_rx) = spawn_revoke_sidecar().await;
+        let (pds, issuer, log) = spawn_revoking_pds().await;
         let did = "did:plc:leaver";
-        let state = test_state_with_sidecar(&[], &sidecar_url).await;
+        let state = test_state_on_pds(&[], &pds).await;
+        put_pds_session_at(&state, did, &pds, &issuer).await;
 
         // Seed the DID with local rows across the per-DID tables.
         store::grant_access(&state.db, did, Some("leaver.example"), "test", None)
@@ -9477,19 +9349,33 @@ mod tests {
             .unwrap();
         assert!(set_cookie.contains("Max-Age=0"), "cookie must be cleared");
 
-        // The sidecar revoke was called for exactly this DID.
-        //
-        // BOUNDED. A bare `await` here meant a broken `revoke_everywhere` — one
-        // that simply never called the sidecar — hung this test forever instead
-        // of failing it: a wedged CI job rather than a red one, which is the
-        // worse of the two signals because nobody reads it as a defect.
-        let revoked_did = tokio::time::timeout(std::time::Duration::from_secs(10), revoke_rx)
-            .await
-            .expect("the sidecar revoke never fired; revoke_everywhere did not call it")
-            .unwrap();
+        // The DID's tokens were revoked at its authorization server, and the
+        // stored session is gone. The handler awaits the revoke, so both are
+        // settled by the time it answered.
+        let revokes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /revoke "))
+            .cloned()
+            .collect();
         assert_eq!(
-            revoked_did, did,
-            "sidecar revoke must fire for the caller DID"
+            revokes.len(),
+            1,
+            "expected one revocation request: {revokes:?}"
+        );
+        assert!(
+            revokes[0].contains("token=rt"),
+            "the revocation did not carry the DID's refresh token: {}",
+            revokes[0]
+        );
+        let runtime = state.oauth.as_deref().unwrap();
+        assert!(
+            crate::oauth::store::get_session(&state.db, &runtime.codec, did)
+                .await
+                .unwrap()
+                .is_none(),
+            "the stored session survived the account deletion"
         );
 
         // Local rows are gone.
@@ -9540,9 +9426,9 @@ mod tests {
         assert!(store::has_beta_access(&state.db, did).await.unwrap());
     }
 
-    /// PDS-outage authorization: when the sidecar is unreachable (as it is in
-    /// this harness — the default sidecar URL is not served), a DID must STILL
-    /// be unable to read or mutate an entry in a feed it does not subscribe to.
+    /// PDS-outage authorization: when the reader's PDS is unreachable (here a
+    /// session at [`dead_pds`]), a DID must STILL be unable to read or mutate an
+    /// entry in a feed it does not subscribe to.
     /// This guards the `resolve_subscriptions` fallback: it must fail CLOSED
     /// (serve only the DID's own `sub_ref`), never widen the caller's surface to
     /// every cached feed.
@@ -9553,6 +9439,7 @@ mod tests {
         store::grant_access(&state.db, did_a, None, "test", None)
             .await
             .unwrap();
+        put_pds_session(&state, did_a, &dead_pds().await).await;
 
         // Shared cache: feed_a (A subscribes) + feed_b (A does NOT). An entry
         // lives in feed_b — the one A must never touch during the outage.
@@ -9833,8 +9720,8 @@ mod tests {
     #[tokio::test]
     async fn a_saved_record_with_a_hostile_url_renders_no_anchor() {
         let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let sidecar = spawn_saved_sidecar("javascript:alert(1)", "Hostile record").await;
-        let mut state = test_state_with_sidecar(&[did], &sidecar).await;
+        let pds = spawn_saved_pds("javascript:alert(1)", "Hostile record").await;
+        let mut state = test_state_on_pds(&[did], &pds).await;
         std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(did.to_string());
 
         let resp = router(state)
@@ -10303,6 +10190,7 @@ mod tests {
         store::grant_access(&state.db, did_a, None, "test", None)
             .await
             .unwrap();
+        put_pds_session(&state, did_a, &dead_pds().await).await;
 
         let feed_a = store::upsert_feed(
             &state.db,
@@ -10352,88 +10240,55 @@ mod tests {
 
     // -- #203: a big shrink of sub_ref is corroborated before it is applied --
 
-    /// A sidecar that answers the `n`th subscription listing with
-    /// `listings[n]` (the last one repeats), one page each, no cursor, and
-    /// counts how many listings it served.
-    /// In a `spawn_listing_sidecar` listing: serve a malformed record there.
+    /// In a `spawn_listing_pds` listing: serve a malformed record there.
     const MALFORMED_LISTING: &str = "<malformed>";
 
-    async fn spawn_listing_sidecar(
+    /// A fake PDS that answers the `n`th subscription listing with
+    /// `listings[n]` (the last one repeats), one page each, no cursor, and
+    /// counts how many listings it served. Other collections list empty.
+    async fn spawn_listing_pds(
         listings: Vec<Vec<String>>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = served.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                // Drain head and declared body, so closing does not RST.
-                let mut req = Vec::new();
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = sock.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    req.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&req).to_string();
-                    let Some(head_end) = text.find("\r\n\r\n") else {
-                        continue;
-                    };
-                    let len = text[..head_end]
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if req.len() >= head_end + 4 + len {
-                        break;
-                    }
-                }
-                let req = String::from_utf8_lossy(&req).to_string();
-                let records = if req.contains("subscription") {
-                    let i = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let urls = &listings[i.min(listings.len() - 1)];
-                    urls.iter()
-                        .enumerate()
-                        .map(|(j, url)| {
-                            // A record no client could have meant: the walk
-                            // refuses the whole listing (`MalformedRecords`).
-                            if url == MALFORMED_LISTING {
-                                return serde_json::json!({ "uri": 7 });
+        let (pds, _log) = spawn_pds(move |call| {
+            assert_eq!(
+                call.nsid, "com.atproto.repo.listRecords",
+                "the listing fake only lists"
+            );
+            let is_subscriptions = call
+                .query
+                .get("collection")
+                .is_some_and(|c| c == lexicon::nsid::SUBSCRIPTION);
+            let records = if is_subscriptions {
+                let i = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let urls = &listings[i.min(listings.len() - 1)];
+                urls.iter()
+                    .enumerate()
+                    .map(|(j, url)| {
+                        // A record no client could have meant: the walk
+                        // refuses the whole listing (`MalformedRecords`).
+                        if url == MALFORMED_LISTING {
+                            return serde_json::json!({ "uri": 7 });
+                        }
+                        serde_json::json!({
+                            "uri": format!("at://did:plc:x/{}/3lab{j}", lexicon::nsid::SUBSCRIPTION),
+                            "cid": "bafy",
+                            "value": {
+                                "$type": lexicon::nsid::SUBSCRIPTION,
+                                "url": url,
+                                "createdAt": "2026-01-01T00:00:00Z"
                             }
-                            serde_json::json!({
-                                "uri": format!("at://did:plc:x/{}/3lab{j}", lexicon::nsid::SUBSCRIPTION),
-                                "cid": "bafy",
-                                "value": {
-                                    "$type": lexicon::nsid::SUBSCRIPTION,
-                                    "url": url,
-                                    "createdAt": "2026-01-01T00:00:00Z"
-                                }
-                            })
                         })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                let body =
-                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{addr}"), served)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (200, serde_json::json!({ "records": records }))
+        })
+        .await;
+        (pds, served)
     }
 
     fn shrink_feed_urls(n: usize) -> Vec<String> {
@@ -10442,7 +10297,7 @@ mod tests {
             .collect()
     }
 
-    /// A state whose sidecar serves `listings`, with `did`'s `sub_ref` seeded
+    /// A state whose PDS serves `listings`, with `did`'s `sub_ref` seeded
     /// to the first `subscribed` of five cached feeds. Returns the state, the
     /// listing counter, and the five feed ids.
     async fn shrink_state(
@@ -10454,8 +10309,8 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         Vec<i64>,
     ) {
-        let (url, served) = spawn_listing_sidecar(listings).await;
-        let state = test_state_with_sidecar(&[did], &url).await;
+        let (pds, served) = spawn_listing_pds(listings).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let mut ids = Vec::new();
         for u in shrink_feed_urls(5) {
             ids.push(
@@ -10666,15 +10521,15 @@ mod tests {
         );
     }
 
-    /// POST an OPML of `n` feeds as `did` against a strict fake PDS behind the
-    /// sidecar, and return the flash it redirected with plus the fake's log.
+    /// POST an OPML of `n` feeds as `did` against a strict fake PDS, and return
+    /// the flash it redirected with plus the fake's log.
     async fn import_against_strict_pds(
         did: &str,
         n: usize,
         fail_call: Option<usize>,
     ) -> (String, crate::atproto::tests::ApplyWritesLog) {
-        let (sidecar, log) = crate::atproto::tests::serve_apply_writes(fail_call).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (fake, log) = crate::atproto::tests::serve_apply_writes(fail_call).await;
+        let state = test_state_on_pds(&[did], &routed(&fake)).await;
         let cookie = session_cookie(&state, did, None);
         let (ct, body) = opml_multipart(opml_with_feeds(n).as_bytes());
         let resp = router(state)
@@ -10793,8 +10648,8 @@ mod tests {
     #[tokio::test]
     async fn opml_import_reports_entries_this_instance_cannot_store() {
         let did = "did:plc:renamer4";
-        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, _puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         assert!(!state.config.standard_site);
         let opml = format!(
             "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
@@ -11446,9 +11301,13 @@ mod tests {
     #[tokio::test]
     async fn rename_to_new_url_refused_at_global_feeds_cap() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
         // Global cap 1; pre-fill it with one feed so headroom is 0.
-        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = false;
+            c.max_feeds_global = 1;
+        })
+        .await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -11505,8 +11364,12 @@ mod tests {
     #[tokio::test]
     async fn rename_to_existing_url_allowed_at_global_feeds_cap() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = false;
+            c.max_feeds_global = 1;
+        })
+        .await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -11589,73 +11452,273 @@ mod tests {
         );
     }
 
-    /// A sidecar mock that serves ONE existing subscription record and captures
-    /// every `put` body a rename produces.
-    ///
-    /// **Reads to `content-length` rather than taking one `read`.** A single
-    /// read gets whatever one segment carried; if the head and body land
-    /// separately the capture holds no record and every field assertion below
-    /// passes for the wrong reason. Each captured body must also mention the
-    /// collection, so an empty capture fails loudly instead of quietly.
-    async fn spawn_rename_sidecar(
-        existing: serde_json::Value,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    // ── a fake PDS for the Rust backend ──────────────────────────────────────
+
+    /// One call a [`spawn_pds`] fake received: the XRPC method, its query, and
+    /// its JSON body (`Null` for a GET).
+    #[derive(Clone, Debug)]
+    struct XrpcCall {
+        nsid: String,
+        query: std::collections::HashMap<String, String>,
+        body: serde_json::Value,
+    }
+
+    /// Every call a [`spawn_pds`] fake received, in arrival order.
+    type XrpcLog = std::sync::Arc<std::sync::Mutex<Vec<XrpcCall>>>;
+
+    /// A fake PDS for the Rust backend: `/xrpc/<nsid>` calls are logged and
+    /// answered by `handler` as `(status, json)`. Returns the PDS URL a session's
+    /// `aud` should carry, under a test hostname routed to the loopback listener
+    /// (the SSRF guard refuses loopback itself), and the log.
+    async fn spawn_pds<F>(handler: F) -> (String, XrpcLog)
+    where
+        F: Fn(&XrpcCall) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    {
+        use axum::response::IntoResponse as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        // Unique per server: the override table is process-wide.
+        let host = format!("pds-{port}.web.test");
+        crate::net::test_host_override(&host, addr);
+        let log: XrpcLog = Default::default();
+        let sink = log.clone();
+        let handler = std::sync::Arc::new(handler);
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let (handler, sink) = (handler.clone(), sink.clone());
+            async move {
+                let (parts, body) = req.into_parts();
+                let raw = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let nsid = parts
+                    .uri
+                    .path()
+                    .strip_prefix("/xrpc/")
+                    .unwrap_or_else(|| panic!("the fake PDS got a non-XRPC request: {}", parts.uri))
+                    .to_string();
+                let query = url::form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes())
+                    .into_owned()
+                    .collect();
+                let body = if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&raw).expect("an XRPC request body is JSON")
+                };
+                let call = XrpcCall { nsid, query, body };
+                sink.lock().unwrap().push(call.clone());
+                let (status, json) = handler(&call);
+                (StatusCode::from_u16(status).unwrap(), axum::Json(json)).into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{host}:{port}"), log)
+    }
+
+    /// A loopback fake's URL (`http://127.0.0.1:<port>`) under a test hostname
+    /// routed back to it, so the Rust backend's guarded client will call it.
+    fn routed(loopback: &str) -> String {
+        let addr: std::net::SocketAddr = loopback
+            .strip_prefix("http://")
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("not a loopback fake URL: {loopback}"));
+        let host = format!("fake-{}.web.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        format!("http://{host}:{}", addr.port())
+    }
+
+    /// A PDS and its authorization server on one real-TLS loopback server, the
+    /// metadata advertising `/revoke`, which answers `200`. The Rust backend's
+    /// revocation is RFC 7009 at the DISCOVERED `revocation_endpoint`, so
+    /// discovery has to work for a revoke to be sent at all. Returns the PDS
+    /// URL, the issuer, and every request received, in order.
+    async fn spawn_revoking_pds() -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (addr, log) = crate::net::spawn_tls(|addr| {
+            let port = addr.port();
+            let pds = format!("https://pds-e2e.test:{port}");
+            let issuer = format!("https://as-e2e.test:{port}");
+            let json =
+                |v: serde_json::Value| vec![crate::net::TestResponse::json(200, v.to_string())];
+            std::collections::HashMap::from([
+                (
+                    "/.well-known/oauth-protected-resource".to_string(),
+                    json(serde_json::json!({ "resource": pds, "authorization_servers": [issuer] })),
+                ),
+                (
+                    "/.well-known/oauth-authorization-server".to_string(),
+                    json(serde_json::json!({
+                        "issuer": issuer,
+                        "pushed_authorization_request_endpoint": format!("{issuer}/par"),
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "revocation_endpoint": format!("{issuer}/revoke"),
+                        "protected_resources": [pds],
+                        "client_id_metadata_document_supported": true,
+                        "require_pushed_authorization_requests": true,
+                        "authorization_response_iss_parameter_supported": true,
+                        "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+                        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+                        "dpop_signing_alg_values_supported": ["ES256"],
+                        "scopes_supported": ["atproto"],
+                        "response_types_supported": ["code"],
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                        "code_challenge_methods_supported": ["S256"],
+                    })),
+                ),
+                (
+                    "/revoke".to_string(),
+                    vec![crate::net::TestResponse::json(200, "")],
+                ),
+            ])
+        })
+        .await;
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            crate::net::test_host_override(h, addr);
+        }
+        let port = addr.port();
+        (
+            format!("https://pds-e2e.test:{port}"),
+            format!("https://as-e2e.test:{port}"),
+            log,
+        )
+    }
+
+    /// A PDS URL nothing answers: the port was bound and released, so a call
+    /// is refused — a PDS outage, through the guarded client.
+    async fn dead_pds() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        routed(&dead)
+    }
+
+    /// Store a live Rust-backend session for `did` whose PDS is `pds`.
+    async fn put_pds_session(state: &AppState, did: &str, pds: &str) {
+        put_pds_session_at(state, did, pds, "https://auth.invalid").await;
+    }
+
+    /// [`put_pds_session`] with the session's authorization server named.
+    async fn put_pds_session_at(state: &AppState, did: &str, pds: &str, issuer: &str) {
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        crate::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &crate::oauth::store::OAuthSession {
+                sub: did.into(),
+                issuer: issuer.into(),
+                aud: pds.into(),
+                dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// [`test_state`] on the Rust backend, with a session at `pds` for every
+    /// DID in `allowed`.
+    async fn test_state_on_pds(allowed: &[&str], pds: &str) -> AppState {
+        test_state_on_pds_and(allowed, pds, |_| {}).await
+    }
+
+    /// [`test_state_on_pds`] with the config adjusted first (the standard.site
+    /// flag, the feeds ceiling: the settings the at:// paths branch on).
+    async fn test_state_on_pds_and(
+        allowed: &[&str],
+        pds: &str,
+        adjust: impl FnOnce(&mut Config),
+    ) -> AppState {
+        let db = store::init_url("sqlite::memory:").await.unwrap();
+        let dids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        store::ensure_seed(&db, &dids).await.unwrap();
+        let mut config = Config {
+            allowed_dids: dids,
+            cookie_secret: "test-cookie-secret-000".to_string(),
+            beta_cap: 3,
+            repo_backend: crate::metrics::Backend::Rust,
+            oauth: crate::config::OauthConfig {
+                // Per test, never the relative default — see `repo::tests`.
+                key_path: std::env::temp_dir().join(format!(
+                    "fr-web-oauth-key-{}-{}.json",
+                    std::process::id(),
+                    pds.rsplit(':').next().unwrap_or("0")
+                )),
+                encryption_key: Some("a".repeat(43)),
+                ..crate::config::OauthConfig::default()
+            },
+            ..Config::default()
+        };
+        adjust(&mut config);
+        let state = AppState::new(config, db).unwrap();
+        for did in allowed {
+            put_pds_session(&state, did, pds).await;
+        }
+        state
+    }
+
+    /// A fake PDS that answers every repo call with success and records each as
+    /// `"<nsid> <body>"`, in arrival order: for asserting what was sent.
+    async fn spawn_logging_pds() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let (pds, _log) = spawn_pds(move |call| {
+            sink.lock()
+                .unwrap()
+                .push(format!("{} {}", call.nsid, call.body));
+            let reply = match call.nsid.as_str() {
+                "com.atproto.repo.listRecords" => serde_json::json!({ "records": [] }),
+                "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord" => {
+                    serde_json::json!({ "uri": "at://did:plc:x/c/r", "cid": "bafy" })
+                }
+                "com.atproto.repo.applyWrites" => serde_json::json!({ "results": [] }),
+                "com.atproto.repo.deleteRecord" => serde_json::json!({}),
+                other => panic!("the logging fake got an unexpected call to {other}"),
+            };
+            (200, reply)
+        })
+        .await;
+        (pds, sent)
+    }
+
+    /// A fake PDS that serves ONE existing subscription record and captures the
+    /// body of every `putRecord` a rename produces. `applyWrites` and
+    /// `createRecord` succeed without being captured.
+    async fn spawn_rename_pds(
+        existing: serde_json::Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let puts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = puts.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut raw: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let body_text = loop {
-                    let Ok(n) = sock.read(&mut chunk).await else {
-                        break String::new();
-                    };
-                    if n == 0 {
-                        break String::from_utf8_lossy(&raw).to_string();
-                    }
-                    raw.extend_from_slice(&chunk[..n]);
-                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let (head, body) = raw.split_at(split + 4);
-                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    });
-                    if want.is_none_or(|want| body.len() >= want) {
-                        break String::from_utf8_lossy(body).to_string();
-                    }
-                };
-
-                // `"action":"put"` is the rename write; anything else is the read.
-                let is_put = body_text.contains("\"action\":\"put\"");
-                let data = if is_put {
-                    sink.lock().unwrap().push(body_text.clone());
+        let (pds, _log) = spawn_pds(move |call| match call.nsid.as_str() {
+            "com.atproto.repo.listRecords" => {
+                (200, serde_json::json!({ "records": [existing.clone()] }))
+            }
+            "com.atproto.repo.putRecord" => {
+                sink.lock().unwrap().push(call.body.to_string());
+                (
+                    200,
                     serde_json::json!({
                         "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk-keep",
                         "cid": "bafyreiafter"
-                    })
-                } else {
-                    serde_json::json!({ "records": [existing.clone()] })
-                };
-                let body = serde_json::json!({ "ok": true, "data": data }).to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
+                    }),
+                )
             }
-        });
-        (format!("http://{addr}"), puts)
+            "com.atproto.repo.createRecord" => (
+                200,
+                serde_json::json!({ "uri": "at://did:plc:x/c/r", "cid": "bafy" }),
+            ),
+            "com.atproto.repo.applyWrites" => (200, serde_json::json!({ "results": [] })),
+            other => panic!("the rename fake got an unexpected call to {other}"),
+        })
+        .await;
+        (pds, puts)
     }
 
     /// The existing record a rename must not destroy.
@@ -11710,8 +11773,8 @@ mod tests {
     #[tokio::test]
     async fn retitling_an_existing_at_uri_subscription_survives_the_flag_being_off() {
         let did = "did:plc:renamer5";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_at_uri_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         assert!(
             !state.config.standard_site,
             "the flag must be off for this test"
@@ -11761,8 +11824,8 @@ mod tests {
     #[tokio::test]
     async fn repointing_a_subscription_at_an_at_uri_is_refused_with_the_flag_off() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
         let resp = router(state.clone())
             .oneshot(
@@ -11836,8 +11899,8 @@ mod tests {
         let other = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/app.bsky.feed.generator/whats-hot";
         let other_enc =
             "at%3A%2F%2Fdid%3Aplc%3Aohutz6x5acjmpuulp3x7wxxc%2Fapp.bsky.feed.generator%2Fwhats-hot";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(other)).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription_with_url(other)).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let loc = retitle_unchanged(&state, did, other_enc).await;
         assert_eq!(loc, "/", "the retitle was refused: {loc}");
         let bodies = puts.lock().unwrap().clone();
@@ -11853,8 +11916,8 @@ mod tests {
     #[tokio::test]
     async fn repointing_a_subscription_at_a_private_feed_is_refused() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
         let resp = router(state.clone())
             .oneshot(
@@ -11902,9 +11965,13 @@ mod tests {
     #[tokio::test]
     async fn retitling_an_uncached_at_uri_subscription_is_not_refused_at_feed_capacity() {
         let did = "did:plc:renamer5";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
+        let (pds, puts) = spawn_rename_pds(seeded_at_uri_subscription()).await;
         // Ceiling 1, and one real feed already fills it.
-        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = false;
+            c.max_feeds_global = 1;
+        })
+        .await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -11984,9 +12051,13 @@ mod tests {
     #[tokio::test]
     async fn a_well_formed_at_uri_paste_is_subscribed_with_the_flag_on() {
         let did = "did:plc:renamer5";
-        let (sidecar, log) = spawn_logging_sidecar().await;
+        let (pds, log) = spawn_logging_pds().await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
             },
@@ -12030,9 +12101,13 @@ mod tests {
             ],
         )
         .await;
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.oauth.plc_directory = plc;
             },
@@ -12061,10 +12136,14 @@ mod tests {
     async fn a_handle_form_paste_is_stored_by_its_did() {
         let did = "did:plc:renamer5";
         let author = "did:plc:ohutz6x5acjmpuulp3x7wxxc";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let resolver = serve_resolver(author).await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.resolver_base = resolver;
                 c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
@@ -12117,10 +12196,14 @@ mod tests {
     #[tokio::test]
     async fn an_over_cap_handle_paste_makes_no_outbound_request() {
         let did = "did:plc:renamer5";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let (resolver, hits) = serve_counting_resolver("did:plc:ohutz6x5acjmpuulp3x7wxxc").await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.resolver_base = resolver;
                 c.max_subs_per_did = 1;
@@ -12161,10 +12244,14 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_did_paste_is_unsupported_with_the_flag_on() {
         let did = "did:plc:renamer5";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let (resolver, hits) = serve_counting_resolver("did:plc:ohutz6x5acjmpuulp3x7wxxc").await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.resolver_base = resolver;
             },
@@ -12197,9 +12284,13 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_handle_paste_is_refused() {
         let did = "did:plc:renamer5";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.resolver_base = "http://resolver.nowhere.invalid".into();
             },
@@ -12221,8 +12312,12 @@ mod tests {
     #[tokio::test]
     async fn a_non_publication_at_uri_paste_is_refused() {
         let did = "did:plc:renamer5";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
+        let (pds, _log) = spawn_logging_pds().await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = true;
+            c.max_feeds_global = 0;
+        })
+        .await;
         let loc = subscribe(
             &state,
             did,
@@ -12241,9 +12336,13 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_case_at_scheme_paste_is_stored_canonically() {
         let did = "did:plc:renamer5";
-        let (sidecar, _log) = spawn_logging_sidecar().await;
+        let (pds, _log) = spawn_logging_pds().await;
         let state = with_config(
-            test_state_with_sidecar_and(&[did], &sidecar, true, 0).await,
+            test_state_on_pds_and(&[did], &pds, |c| {
+                c.standard_site = true;
+                c.max_feeds_global = 0;
+            })
+            .await,
             |c| {
                 c.oauth.plc_directory = "http://plc.nowhere.invalid".into();
             },
@@ -12261,8 +12360,12 @@ mod tests {
     #[tokio::test]
     async fn opml_import_stores_an_at_uri_entry_with_the_flag_on() {
         let did = "did:plc:renamer5";
-        let (sidecar, _puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 0).await;
+        let (pds, _puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = true;
+            c.max_feeds_global = 0;
+        })
+        .await;
         let opml = format!(
             "<?xml version=\"1.0\"?>\n<opml version=\"2.0\"><head><title>t</title></head><body>\n\
              <outline type=\"rss\" text=\"Real\" xmlUrl=\"https://real.example/feed.xml\"/>\n\
@@ -12320,8 +12423,8 @@ mod tests {
         let tokened = "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4";
         let tokened_enc =
             "https%3A%2F%2Fwww.patreon.com%2Frss%2Fauthor%3Fauth%3DZm9vYmFyc2VjcmV0dG9rZW4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(tokened)).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription_with_url(tokened)).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let loc = retitle_unchanged(&state, did, tokened_enc).await;
         assert_eq!(loc, "/", "the retitle was refused: {loc}");
         assert_eq!(
@@ -12345,8 +12448,8 @@ mod tests {
     #[tokio::test]
     async fn repointing_at_a_malformed_at_uri_is_refused_as_unsupported() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
         let resp = router(state.clone())
             .oneshot(
@@ -12383,8 +12486,12 @@ mod tests {
     #[tokio::test]
     async fn repointing_at_an_at_uri_at_capacity_is_refused_as_unsupported_not_capacity() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, false, 1).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = false;
+            c.max_feeds_global = 1;
+        })
+        .await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -12433,8 +12540,8 @@ mod tests {
     async fn retitling_a_record_whose_url_carries_whitespace_is_not_a_repoint() {
         let did = "did:plc:renamer5";
         let padded = format!("{AT_URI_SUB} ");
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription_with_url(&padded)).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription_with_url(&padded)).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         // The manage row posts the record's URL verbatim, padding included.
         let loc = retitle_unchanged(&state, did, &format!("{AT_URI_SUB_ENC}%20")).await;
         assert_eq!(
@@ -12458,8 +12565,12 @@ mod tests {
     #[tokio::test]
     async fn retitling_an_uncached_record_at_capacity_inserts_no_row() {
         let did = "did:plc:renamer5";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_at_uri_subscription()).await;
-        let state = test_state_with_sidecar_and(&[did], &sidecar, true, 1).await;
+        let (pds, puts) = spawn_rename_pds(seeded_at_uri_subscription()).await;
+        let state = test_state_on_pds_and(&[did], &pds, |c| {
+            c.standard_site = true;
+            c.max_feeds_global = 1;
+        })
+        .await;
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
@@ -12751,10 +12862,10 @@ mod tests {
             .to_string()
     }
 
-    const RACE_BACKENDS: [crate::metrics::Backend; 2] = [
-        crate::metrics::Backend::Sidecar,
-        crate::metrics::Backend::Rust,
-    ];
+    /// The backends the race tests run on. Rust only since it became the
+    /// default (#311); the sidecar half of [`serve_swap_repo`] goes with the
+    /// sidecar.
+    const RACE_BACKENDS: [crate::metrics::Backend; 1] = [crate::metrics::Backend::Rust];
 
     /// **The key test of #149: a rename that loses a race keeps the other
     /// client's change AND lands its own.**
@@ -13782,8 +13893,8 @@ mod tests {
     #[tokio::test]
     async fn renaming_preserves_the_fields_the_form_never_carries() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
 
         let resp = router(state.clone())
@@ -13844,8 +13955,8 @@ mod tests {
     #[tokio::test]
     async fn repointing_a_feed_drops_the_old_feeds_properties_but_keeps_the_subscriptions() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
 
         let resp = router(state.clone())
@@ -13908,8 +14019,8 @@ mod tests {
     async fn renaming_an_unknown_rkey_writes_nothing() {
         let did = "did:plc:renamer4";
         // The sidecar serves exactly one record, at rkey `rk-keep`.
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
 
         let resp = router(state.clone())
@@ -13961,8 +14072,8 @@ mod tests {
     #[tokio::test]
     async fn a_client_supplied_site_url_reaches_the_record() {
         let did = "did:plc:renamer4";
-        let (sidecar, puts) = spawn_rename_sidecar(seeded_subscription()).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let (pds, puts) = spawn_rename_pds(seeded_subscription()).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
 
         let resp = router(state.clone())
@@ -14008,12 +14119,8 @@ mod tests {
     #[tokio::test]
     async fn a_rename_whose_read_fails_writes_nothing() {
         let did = "did:plc:renamer5";
-        // A port that accepts nothing: the read cannot succeed.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-
-        let state = test_state_with_sidecar(&[did], &dead).await;
+        // A PDS that accepts nothing: the read cannot succeed.
+        let state = test_state_on_pds(&[did], &dead_pds().await).await;
         let cookie = session_cookie(&state, did, None);
         let before = store::count_feeds(&state.db).await.unwrap();
 
@@ -15377,115 +15484,93 @@ mod tests {
         assert_eq!(humanise_ago(Some(11_460)), "3h 11m ago");
     }
 
-    /// A sidecar mock that answers `/internal/repo` listRecords with one saved
-    /// record, and anything else with an empty list. Serves repeatedly.
-    async fn spawn_saved_sidecar(saved_url: &str, saved_title: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (url, title) = (saved_url.to_string(), saved_title.to_string());
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = vec![0u8; 8192];
-                let Ok(n) = sock.read(&mut buf).await else {
-                    continue;
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let wants_saved = req.contains("community.lexicon.rss.saved");
-                let records = if wants_saved {
-                    serde_json::json!([{
-                        "uri": "at://did:plc:x/community.lexicon.rss.saved/rk1",
-                        "cid": "bafy",
-                        "value": {
-                            "$type": "community.lexicon.rss.saved",
-                            "url": url,
-                            "title": title,
-                            "createdAt": "2026-01-01T00:00:00Z"
-                        }
-                    }])
-                } else {
-                    serde_json::json!([])
-                };
-                let body = serde_json::json!({
-                    "ok": true, "data": { "records": records }
-                })
-                .to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
+    /// A fake PDS answering `listRecords` by collection: `records(collection)`
+    /// is the page (one page, no cursor), or `None` for a `500` — the shape a
+    /// refused (short or unreadable) walk takes at this boundary.
+    async fn spawn_collections_pds<F>(records: F) -> String
+    where
+        F: Fn(&str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    {
+        let (pds, _log) = spawn_pds(move |call| {
+            assert_eq!(
+                call.nsid, "com.atproto.repo.listRecords",
+                "this fake only lists"
+            );
+            let collection = call
+                .query
+                .get("collection")
+                .map(String::as_str)
+                .unwrap_or("");
+            match records(collection) {
+                Some(page) => (200, serde_json::json!({ "records": page })),
+                None => (500, serde_json::json!({ "error": "ShortList" })),
             }
-        });
-        format!("http://{addr}")
+        })
+        .await;
+        pds
     }
 
-    /// A sidecar mock serving `n` distinct saved records, none of them cached
+    /// A fake PDS listing one saved record, and every other collection empty.
+    async fn spawn_saved_pds(saved_url: &str, saved_title: &str) -> String {
+        let (url, title) = (saved_url.to_string(), saved_title.to_string());
+        spawn_collections_pds(move |collection| {
+            Some(if collection == "community.lexicon.rss.saved" {
+                serde_json::json!([{
+                    "uri": "at://did:plc:x/community.lexicon.rss.saved/rk1",
+                    "cid": "bafy",
+                    "value": {
+                        "$type": "community.lexicon.rss.saved",
+                        "url": url,
+                        "title": title,
+                        "createdAt": "2026-01-01T00:00:00Z"
+                    }
+                }])
+            } else {
+                serde_json::json!([])
+            })
+        })
+        .await
+    }
+
+    /// A fake PDS serving `n` distinct saved records, none of them cached
     /// locally — the shape that exercises the uncached-row append.
-    async fn spawn_saved_sidecar_many(n: usize, subscribed_feed: &str) -> String {
+    async fn spawn_saved_pds_many(n: usize, subscribed_feed: &str) -> String {
         let feed = subscribed_feed.to_string();
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = vec![0u8; 8192];
-                let Ok(read) = sock.read(&mut buf).await else {
-                    continue;
-                };
-                let req = String::from_utf8_lossy(&buf[..read]).to_string();
-                let records = if req.contains("community.lexicon.rss.saved") {
-                    serde_json::Value::Array(
-                        (0..n)
-                            .map(|i| {
-                                serde_json::json!({
-                                    "uri": format!("at://did:plc:x/community.lexicon.rss.saved/rk{i}"),
-                                    "cid": "bafy",
-                                    "value": {
-                                        "$type": "community.lexicon.rss.saved",
-                                        "url": format!("https://elsewhere.example/{i}"),
-                                        "title": format!("Elsewhere {i}"),
-                                        "createdAt": "2026-01-01T00:00:00Z"
-                                    }
-                                })
+        spawn_collections_pds(move |collection| {
+            Some(match collection {
+                "community.lexicon.rss.saved" => serde_json::Value::Array(
+                    (0..n)
+                        .map(|i| {
+                            serde_json::json!({
+                                "uri": format!("at://did:plc:x/community.lexicon.rss.saved/rk{i}"),
+                                "cid": "bafy",
+                                "value": {
+                                    "$type": "community.lexicon.rss.saved",
+                                    "url": format!("https://elsewhere.example/{i}"),
+                                    "title": format!("Elsewhere {i}"),
+                                    "createdAt": "2026-01-01T00:00:00Z"
+                                }
                             })
-                            .collect(),
-                    )
-                } else if req.contains("community.lexicon.rss.subscription") {
-                    // Without this the handler's `sync_sub_refs` would REPLACE
-                    // sub_ref with an empty set on every render, and every
-                    // sub_ref-scoped read — including the cached starred list
-                    // this test is about — would come back empty.
-                    serde_json::json!([{
-                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/sub1",
-                        "cid": "bafy",
-                        "value": {
-                            "$type": "community.lexicon.rss.subscription",
-                            "url": feed,
-                            "createdAt": "2026-01-01T00:00:00Z"
-                        }
-                    }])
-                } else {
-                    serde_json::json!([])
-                };
-                let body =
-                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        format!("http://{addr}")
+                        })
+                        .collect(),
+                ),
+                // Without this the handler's `sync_sub_refs` would REPLACE
+                // sub_ref with an empty set on every render, and every
+                // sub_ref-scoped read — including the cached starred list
+                // this test is about — would come back empty.
+                "community.lexicon.rss.subscription" => serde_json::json!([{
+                    "uri": "at://did:plc:x/community.lexicon.rss.subscription/sub1",
+                    "cid": "bafy",
+                    "value": {
+                        "$type": "community.lexicon.rss.subscription",
+                        "url": feed,
+                        "createdAt": "2026-01-01T00:00:00Z"
+                    }
+                }]),
+                _ => serde_json::json!([]),
+            })
+        })
+        .await
     }
 
     /// **The pager must not advertise a page the clamp cannot reach.**
@@ -15498,8 +15583,9 @@ mod tests {
     #[tokio::test]
     async fn the_starred_pager_does_not_advertise_an_unreachable_page() {
         let did = "did:plc:pagerloop";
-        let sidecar = spawn_saved_sidecar_many(80, "https://loop.example/feed.xml").await;
-        let state = test_state_with_sidecar(&[], &sidecar).await;
+        let pds = spawn_saved_pds_many(80, "https://loop.example/feed.xml").await;
+        let state = test_state_on_pds(&[], &pds).await;
+        put_pds_session(&state, did, &pds).await;
         store::grant_access(&state.db, did, None, "test", None)
             .await
             .unwrap();
@@ -15672,9 +15758,8 @@ mod tests {
     #[tokio::test]
     async fn a_saved_record_with_no_cached_entry_is_shown_as_a_link() {
         let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let sidecar =
-            spawn_saved_sidecar("https://elsewhere.example/article", "Starred elsewhere").await;
-        let mut state = test_state_with_sidecar(&[did], &sidecar).await;
+        let pds = spawn_saved_pds("https://elsewhere.example/article", "Starred elsewhere").await;
+        let mut state = test_state_on_pds(&[did], &pds).await;
         std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(did.to_string());
 
         let resp = router(state)
@@ -15801,107 +15886,57 @@ mod tests {
         );
     }
 
-    /// A sidecar mock for the OPML export: serves one subscription and one
-    /// folder, except for the collection named in `fail_on`, which answers
-    /// `500` — the shape a refused (short or unreadable) walk takes at this
-    /// boundary.
-    async fn spawn_export_sidecar(fail_on: Option<&'static str>) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = vec![0u8; 8192];
-                let Ok(n) = sock.read(&mut buf).await else {
-                    continue;
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let wants = |c: &str| req.contains(c);
-                if fail_on.is_some_and(wants) {
-                    let body = r#"{"ok":false,"error":"ShortList"}"#;
-                    let resp = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.flush().await;
-                    continue;
-                }
-                let records = if wants(crate::lexicon::nsid::SUBSCRIPTION) {
-                    serde_json::json!([{
-                        "uri": "at://did:plc:exporter/community.lexicon.rss.subscription/sub1",
-                        "cid": "bafy",
-                        "value": {
-                            "$type": crate::lexicon::nsid::SUBSCRIPTION,
-                            "url": "https://kept.example/feed.xml",
-                            "title": "Kept",
-                            // Inside the folder, so the healthy export has to
-                            // carry BOTH walks' results: an exporter that lost
-                            // the folder list would flatten this outline out of
-                            // its group with nothing else changing.
-                            "folder": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
-                            "createdAt": "2026-01-01T00:00:00Z"
-                        }
-                    }])
-                } else if wants(crate::lexicon::nsid::FOLDER) {
-                    serde_json::json!([{
-                        "uri": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
-                        "cid": "bafy",
-                        "value": {
-                            "$type": crate::lexicon::nsid::FOLDER,
-                            "name": "Kept folder",
-                            "createdAt": "2026-01-01T00:00:00Z"
-                        }
-                    }])
-                } else {
-                    serde_json::json!([])
-                };
-                let body =
-                    serde_json::json!({ "ok": true, "data": { "records": records } }).to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
+    /// A fake PDS for the OPML export: serves one subscription and one folder,
+    /// except for the collection named in `fail_on`, which answers `500` — the
+    /// shape a refused (short or unreadable) walk takes at this boundary.
+    async fn spawn_export_pds(fail_on: Option<&'static str>) -> String {
+        spawn_collections_pds(move |collection| {
+            if fail_on == Some(collection) {
+                return None;
             }
-        });
-        format!("http://{addr}")
+            Some(if collection == crate::lexicon::nsid::SUBSCRIPTION {
+                serde_json::json!([{
+                    "uri": "at://did:plc:exporter/community.lexicon.rss.subscription/sub1",
+                    "cid": "bafy",
+                    "value": {
+                        "$type": crate::lexicon::nsid::SUBSCRIPTION,
+                        "url": "https://kept.example/feed.xml",
+                        "title": "Kept",
+                        // Inside the folder, so the healthy export has to
+                        // carry BOTH walks' results: an exporter that lost
+                        // the folder list would flatten this outline out of
+                        // its group with nothing else changing.
+                        "folder": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
+                        "createdAt": "2026-01-01T00:00:00Z"
+                    }
+                }])
+            } else if collection == crate::lexicon::nsid::FOLDER {
+                serde_json::json!([{
+                    "uri": "at://did:plc:exporter/community.lexicon.rss.folder/fold1",
+                    "cid": "bafy",
+                    "value": {
+                        "$type": crate::lexicon::nsid::FOLDER,
+                        "name": "Kept folder",
+                        "createdAt": "2026-01-01T00:00:00Z"
+                    }
+                }])
+            } else {
+                serde_json::json!([])
+            })
+        })
+        .await
     }
 
-    /// A sidecar whose every `listRecords` page carries one good record and
+    /// A fake PDS whose every `listRecords` page carries one good record and
     /// one with no `uri` — the #177 shape — for any collection.
-    async fn spawn_malformed_sidecar() -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = vec![0u8; 8192];
-                let _ = sock.read(&mut buf).await;
-                let body = serde_json::json!({ "ok": true, "data": { "records": [
-                    { "uri": "at://did:plc:alerted/c/3labGOOD", "cid": "bafy", "value": {} },
-                    { "cid": "bafy", "value": {} },
-                ]}})
-                .to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        format!("http://{addr}")
+    async fn spawn_malformed_pds() -> String {
+        spawn_collections_pds(|_| {
+            Some(serde_json::json!([
+                { "uri": "at://did:plc:alerted/c/3labGOOD", "cid": "bafy", "value": {} },
+                { "cid": "bafy", "value": {} },
+            ]))
+        })
+        .await
     }
 
     async fn page_body(state: AppState, did: &str, uri: &str) -> (StatusCode, String) {
@@ -15999,8 +16034,8 @@ mod tests {
     async fn a_malformed_subscription_record_raises_an_alert() {
         let did = "did:plc:alerted";
         for page in ["/", "/manage"] {
-            let sidecar = spawn_malformed_sidecar().await;
-            let state = test_state_with_sidecar(&[did], &sidecar).await;
+            let pds = spawn_malformed_pds().await;
+            let state = test_state_on_pds(&[did], &pds).await;
             let (status, body) = page_body(state, did, page).await;
             assert_eq!(status, StatusCode::OK, "{page} did not render");
             assert!(
@@ -16018,8 +16053,8 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_subscription_listing_raises_no_alert() {
         let did = "did:plc:exporter";
-        let sidecar = spawn_export_sidecar(None).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let pds = spawn_export_pds(None).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let (status, body) = page_body(state, did, "/").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -16033,8 +16068,8 @@ mod tests {
         fail_on: Option<&'static str>,
     ) -> (StatusCode, HeaderMap, String) {
         let did = "did:plc:exporter";
-        let sidecar = spawn_export_sidecar(fail_on).await;
-        let state = test_state_with_sidecar(&[did], &sidecar).await;
+        let pds = spawn_export_pds(fail_on).await;
+        let state = test_state_on_pds(&[did], &pds).await;
         let cookie = session_cookie(&state, did, None);
         let resp = router(state)
             .oneshot(

@@ -101,7 +101,8 @@ command -v sqlite3 >/dev/null || { echo "FATAL: sqlite3 not found" >&2; exit 2; 
 # from an EnvironmentFile can carry a stray CR/LF, which the app ignores; an
 # exact compare here would misread `rust` as the sidecar backend.
 backend="$(printf '%s' "${FEATHERREADER_REPO_BACKEND:-}" | tr -d '[:space:]')"
-backend="${backend:-sidecar}"
+# Unset means rust, the app's default since 0.5.0 (#311).
+backend="${backend:-rust}"
 
 # The sidecar step runs unless this is the rust backend with no sidecar store.
 sidecar_step=1

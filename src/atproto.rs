@@ -1808,10 +1808,12 @@ pub struct SidecarClient {
     internal_secret: Arc<str>,
 }
 
-/// The `{did, handle}` a session-id resolves to (the sidecar's
-/// `/internal/session/:id` body).
+/// The `{did, handle}` a completed login yields: what the Rust callback
+/// returns, and the body of the sidecar's `/internal/session/:id` until the
+/// sidecar is removed (#311). Named for what it is, not where it came from,
+/// because it outlives the sidecar.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SidecarSession {
+pub struct LoginSession {
     /// The account DID that logged in.
     pub did: String,
     /// The account handle at login time.
@@ -1930,7 +1932,7 @@ impl SidecarClient {
 
     /// Resolve a one-shot `session_id` (from the sidecar's post-OAuth redirect)
     /// to the `{did, handle}` that logged in. `Ok(None)` on `404 SessionNotFound`.
-    pub async fn resolve_session(&self, session_id: &str) -> Result<Option<SidecarSession>> {
+    pub async fn resolve_session(&self, session_id: &str) -> Result<Option<LoginSession>> {
         let url = format!(
             "{}/internal/session/{}",
             self.internal_url,
@@ -1949,7 +1951,7 @@ impl SidecarClient {
             return Err(xrpc_error_from(resp).await.into());
         }
         let raw = crate::net::read_capped(resp).await?;
-        let session: SidecarSession =
+        let session: LoginSession =
             serde_json::from_slice(&raw).context("parsing /internal/session response")?;
         Ok(Some(session))
     }

@@ -1830,7 +1830,9 @@ pub(crate) mod tests {
         fake.lock().unwrap().records[&read_state_rkey(&feed(i))]["readIds"].clone()
     }
 
-    const BACKENDS: [Backend; 2] = [Backend::Sidecar, Backend::Rust];
+    /// The backends these run on. Rust only since it became the default
+    /// (#311); the sidecar half of [`serve_fake`] goes with the sidecar.
+    const BACKENDS: [Backend; 1] = [Backend::Rust];
 
     /// **(1) A lost success response converges.** The applyWrites that created
     /// the record landed, but its answer never arrived, so `pds_created` is still
@@ -2831,7 +2833,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn at_the_cap_unresolved_remote_guids_are_dropped_first() {
         let fake = Arc::new(Mutex::new(FakeRepo::default()));
-        let state = state_on(Backend::Sidecar, &fake).await;
+        let state = state_on(Backend::Rust, &fake).await;
         let remote: Vec<String> = (0..ReadState::MAX_IDS)
             .map(|i| format!("r-{i:04}"))
             .collect();
@@ -2871,7 +2873,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn compaction_still_bounds_a_merged_record() {
         let fake = Arc::new(Mutex::new(FakeRepo::default()));
-        let state = state_on(Backend::Sidecar, &fake).await;
+        let state = state_on(Backend::Rust, &fake).await;
         put_remote(
             &fake,
             1,

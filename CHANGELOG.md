@@ -16,6 +16,36 @@ deploying is separate.
 
 ## Unreleased
 
+### Upgrade notes
+
+- **An unset `FEATHERREADER_REPO_BACKEND` now means `rust` (#311).** It
+  selected the sidecar. Only an instance that leaves it unset is affected;
+  feather-reader.com sets `rust`. Such an instance, on upgrading:
+  - **refuses to start on a production-like bind without
+    `FEATHERREADER_OAUTH_ENCRYPTION_KEY`**, which the Rust backend requires
+    (at least 32 random bytes); set it first;
+  - **signs every reader out once**: the sidecar's sessions live in
+    `SIDECAR_DB`, which the Rust backend never reads, and nothing revokes
+    them, so those grants stay live at the readers' PDSes until they expire.
+    To keep the current sign-ins, set `FEATHERREADER_REPO_BACKEND=sidecar`
+    until 0.5.0, which removes the sidecar.
+
+### Changed
+
+- **Rust is the default backend (#311, 0.5.0 step 2).** `Config::default()`,
+  the container entrypoint and `deploy/teardown.sh` read an unset
+  `FEATHERREADER_REPO_BACKEND` as `rust`. `sidecar` still selects the sidecar
+  until 0.5.0 removes it. The tests that drove the app through sidecar fakes
+  (`/internal/repo`) now drive it through a fake PDS on the Rust backend
+  (`spawn_pds`, and a real-TLS PDS and issuer for the revoke paths), so the
+  rename, listing, shrink, import, export, saved, sign-out and account-deletion
+  tests exercise the backend production runs. The sign-out and account-deletion
+  tests now prove an RFC 7009 revocation reached the issuer, not that the
+  sidecar was called. Tests that meant "the PDS is down" use a session at a
+  PDS that refuses connections; they had relied on the default sidecar URL
+  being unserved. `atproto::SidecarSession` is `LoginSession`: the Rust login
+  callback returns it, and it outlives the sidecar.
+
 ### Fixed
 
 - **Deleting your data also deletes your in-flight logins (#259).**
