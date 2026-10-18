@@ -167,17 +167,32 @@ two will disagree about which items a `readThrough` covers.
 The date a reader first fetched an item is never the basis: it differs between
 instances, so a mark computed from it would mean something different everywhere.
 
+**A reader applies a record's `readThrough` only to items the writer could have
+seen.** The writer advanced it over the items it had; a post that appears later
+with an older publication date (a scheduled or back-dated post, or one a slow
+poll found late) was never among them, and marking it read would hide a post
+nobody read. So a reader covers an item only if it fetched the item at or
+before the record's `updatedAt`, or in its own first fetch of the feed (its
+starting backlog, which is what lets a fresh reader import someone's reads).
+An item outside both is left as the reader has it. Fetch times are used here
+only to bound what a record could have meant, never as the basis of the mark.
+
 A writer **omits** `readThrough` until it has a real mark; it never synthesizes
 one from the current time, which would assert the whole backlog read. A writer
 advances it only to an instant with no unread dated item at or before it, and
 never moves it backwards: when merging, the later of the two marks is kept.
 
-**Status in FeatherReader.** Before PR #287-3, FeatherReader's own compaction
-compared against `published`, else the fetch time, and never applied a record's
-`readThrough` to its local items. From that PR the basis is `published` only,
-undated reads stay in `readIds`, and a record's `readThrough` marks the reader's
-dated local items read, except items in `unreadIds` and items the reader marked
-unread more recently than the record's `updatedAt`.
+**Status in FeatherReader.** Implemented from 0.5.0 (#287). Before it,
+FeatherReader's own compaction compared against `published`, else the fetch
+time, and never applied a record's `readThrough` to its local items. Now the
+basis is `published` only, undated reads stay in `readIds`, and a record's
+`readThrough` marks the reader's dated local items read, except items in
+`unreadIds` and items the reader marked unread more recently than the record's
+`updatedAt` (a tie goes to the reader's own state), and only items it fetched by
+the record's `updatedAt` or in its first fetch of the feed. A `readThrough`
+with fractional seconds is compared at whole seconds, rounded down. On upgrade,
+each stored watermark is recomputed on the published basis and the reads it no
+longer covers are written back as ids.
 
 ### Caps
 
