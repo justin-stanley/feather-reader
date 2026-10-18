@@ -244,6 +244,14 @@ async fn try_revoke(
         },
     )
     .await?;
+    // Every response, not just failures: a 2xx here is the evidence that
+    // revocation ran against a live server (#262).
+    super::client_auth::log_evidence(
+        "revoke",
+        super::client_auth::evidence(&params),
+        endpoint,
+        outcome.status,
+    );
 
     // RFC 7009 §2.2: a 200 also means "we did not recognise that token", which
     // is success for our purposes — the grant is not usable either way.
@@ -1340,6 +1348,71 @@ mod tests {
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         assert!(report.no_session.is_empty());
         assert_eq!(session_rows(&pool).await, 0, "rows survived a revoke-all");
+    }
+
+    /// A buffer the test's tracing subscriber writes to.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// **Every revocation response is logged as evidence, with no secret
+    /// (#262).** Revocation used to log only its failures, so a working one left
+    /// nothing to show it ran against a live server. The line carries the step,
+    /// the client-auth method, the endpoint's host and the status; never a token,
+    /// the assertion, or the endpoint's path.
+    #[tokio::test]
+    async fn every_revocation_response_is_logged_without_secrets() {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (pool, codec) = db().await;
+        let (pds, issuer, _log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+        revoke_all(&runtime(), &reqwest::Client::new(), &pool, || NOW)
+            .await
+            .expect("listing the sessions");
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let evidence: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("oauth client authentication"))
+            .collect();
+        assert_eq!(
+            evidence.len(),
+            SUBS.len(),
+            "one evidence line per revocation:\n{logs}"
+        );
+        for line in &evidence {
+            assert!(line.contains("step=\"revoke\""), "{line}");
+            assert!(line.contains("status=200"), "{line}");
+            assert!(line.contains("client_auth=\"none\""), "{line}");
+            assert!(line.contains("endpoint_host="), "{line}");
+            for secret in ["refresh-", "access-abc", "client_assertion=", "/revoke"] {
+                assert!(!line.contains(secret), "{secret:?} in the evidence: {line}");
+            }
+        }
     }
 
     /// **One server failing does not stop the rest — and its row still goes.**
