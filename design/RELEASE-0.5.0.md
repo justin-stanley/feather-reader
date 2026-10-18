@@ -229,6 +229,12 @@ Staging runs in a container with the same 512 MiB limit as the Fly machine
 The result goes into the registration decision (D4). Changed defaults, if any,
 go in the upgrade notes.
 
+Decided 2026-10-18: staging reaches the synthetic server through a **public
+hostname via Cloudflare Tunnel** (the SSRF guard refuses private addresses and
+has no runtime bypass, so no code change), and the measurement runs on staging
+on **`v0.5.0-rc.1`**, after the rc's functional soak checks. The bench and the
+run procedure are in `bench/` (README).
+
 ### Hardening that lands in 0.5.0 if ready
 
 #261 (rate-limit new routes by default), #260 (a validated feed-URL type for

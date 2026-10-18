@@ -205,6 +205,58 @@ jobs:
         # `-D warnings` promotes unmaintained/unsound advisories to failures too.
         run: cargo audit -D warnings
 
+  bench:
+    name: Capacity bench (build + test + lint + deny + audit)
+    # The capacity bench (#263) is a STANDALONE workspace like the bot
+    # (bench/Cargo.toml has its own `[workspace]`), so the root jobs never touch
+    # it. Same gates as the bot job, scoped to `bench/`.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)
+    runs-on: ubuntu-latest  # GitHub-hosted: free + parallel now the repo is public
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable toolchain (clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable  # required — SHA-pinned, so the @ref no longer selects the toolchain
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: bench  # cache the bench workspace's target/
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo-deny (licenses + bans + sources)
+        run: cargo-deny check bans licenses sources
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: cargo audit
+        run: cargo audit -D warnings
+
   secrets:
     name: Secret scan (gitleaks)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}  # fork-PR guard (see rust job)

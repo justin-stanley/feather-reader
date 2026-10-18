@@ -1,0 +1,33 @@
+# The capacity bench (#263) is a STANDALONE crate, like `bot/`: not a member of
+# the app's build, so the app's Cargo.lock and its `cargo deny` / `cargo audit`
+# gates never see this dependency tree. The empty `[workspace]` pins this
+# directory as its own workspace root. See bench/README.md.
+[workspace]
+
+[package]
+name = "feather-reader-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Synthetic feed server for measuring what one FeatherReader machine sustains (#263)."
+authors = ["Justin Stanley"]
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "synthfeeds"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "time", "signal", "net"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+# The app's feed parser, to check the documents parse as the app sees them.
+feed-rs = "3.0"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
