@@ -1747,9 +1747,10 @@ async fn sanitize_off_runtime(
             if starved >= STARVED_ALERT_SECS {
                 tracing::error!(
                     starved_secs = starved,
-                    "ingest is stalled: no sanitize permit has come free for {}m, so every \
-                     poll is deferred and nothing is stored (#226: slow bodies' abandoned \
-                     sanitizes hold them all)",
+                    "ingest is stalled: no shared sanitize permit has come free for {}m, so \
+                     every poll with a body over the reserve limit is deferred and stores \
+                     nothing (#226: slow bodies' abandoned sanitizes hold them; #275: small \
+                     bodies still go through the reserve)",
                     starved / 60
                 );
             }
