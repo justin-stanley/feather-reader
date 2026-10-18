@@ -157,11 +157,10 @@ RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
 # the sidecar bind loopback-only, so /internal/* is physically unreachable from
 # outside the container even before Caddy's routing rules.
 #
-# SIDECAR_INTERNAL_URL is the loopback base the Rust app uses for /internal/*
-# (session/revoke/repo). It is DISTINCT from SIDECAR_PUBLIC_URL, which in prod is
-# the edge value (https://feather-reader.com/oauth) delivered via
-# `fly secrets` and used only for the browser /login + OAuth client_id/redirect_uri.
-# Baking the loopback INTERNAL url here keeps server-to-server calls off the edge.
+# No SIDECAR_* is baked any more: the app does not read them since 0.5.0
+# removed the sidecar backend (#311), and warns at boot when one is set, so a
+# baked value would warn on every start with nothing the operator could unset.
+# The rest of the sidecar leaves the image in step 4.
 #
 # FEATHERREADER_OAUTH_KEY_PATH MUST be on the volume. Its default is the
 # RELATIVE path `oauth-signing-key.json`, and the entrypoint runs the app from
@@ -174,11 +173,6 @@ ENV FEATHERREADER_BIND=127.0.0.1:8082 \
     FEATHERREADER_OAUTH_KEY_PATH=/data/oauth-signing-key.json \
     FEATHERREADER_ENV=prod \
     FEATHERREADER_TRUSTED_IP_HEADER=cf-connecting-ip \
-    SIDECAR_TRUSTED_IP_HEADER=cf-connecting-ip \
-    SIDECAR_HOST=127.0.0.1 \
-    SIDECAR_PORT=8081 \
-    SIDECAR_INTERNAL_URL=http://127.0.0.1:8081 \
-    SIDECAR_DB=/data/oauth-sidecar.db \
     RUST_LOG=info \
     XDG_DATA_HOME=/data/caddy \
     XDG_CONFIG_HOME=/data/caddy

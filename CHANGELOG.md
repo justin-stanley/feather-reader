@@ -64,8 +64,11 @@ deploying is separate.
     URL now use a temporary signing key: a confidential client creates one on
     boot, and the relative default had put real key material in the working
     directory.
-  - The image still carries the sidecar until step 4 removes it from the
-    Dockerfile, entrypoint and CI.
+  - The image no longer bakes `SIDECAR_TRUSTED_IP_HEADER`, `SIDECAR_HOST`,
+    `SIDECAR_PORT`, `SIDECAR_INTERNAL_URL` or `SIDECAR_DB`: nothing reads
+    them, and a baked value would trip the leftover-variable warning on every
+    start with nothing the operator could unset. The rest of the sidecar
+    leaves the image in step 4 (Dockerfile, entrypoint, Caddy, CI).
 
 ### Changed
 

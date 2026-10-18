@@ -168,7 +168,11 @@ relative default path; they use a temp key.
 - **`fly.toml`:** drop `FEATHERREADER_REPO_BACKEND` and the `SIDECAR_*` env;
   rewrite the comments.
 - **Teardown:** `deploy/teardown.sh`, `deploy/teardown.md` and
-  `scripts/test-teardown.sh` lose the sidecar revoke path and backend default.
+  `scripts/test-teardown.sh` lose the sidecar revoke path and backend default. Since
+  step 3 the image no longer bakes `SIDECAR_DB`, so teardown skips its
+  sidecar step unless the operator sets it (feather-reader.com's `fly.toml`
+  still does); whether teardown should still wipe a leftover
+  `/data/oauth-sidecar.db` is decided here.
 - **CI:** delete the `sidecar` job and the npm group in `dependabot.yml`; drop
   the npm block in `scripts/ci.sh`; drop CodeQL's `javascript-typescript` leg,
   leaving `rust` (PR #313).
