@@ -1,0 +1,10 @@
+/Users/homelab/feather-reader/.claude/worktrees/fix-275/target-rel/release/deps/compression_core-a2eb16c274ea2453.d: /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/lib.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/level.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/unshared.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/util.rs
+
+/Users/homelab/feather-reader/.claude/worktrees/fix-275/target-rel/release/deps/libcompression_core-a2eb16c274ea2453.rlib: /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/lib.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/level.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/unshared.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/util.rs
+
+/Users/homelab/feather-reader/.claude/worktrees/fix-275/target-rel/release/deps/libcompression_core-a2eb16c274ea2453.rmeta: /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/lib.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/level.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/unshared.rs /Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/util.rs
+
+/Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/lib.rs:
+/Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/level.rs:
+/Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/unshared.rs:
+/Users/homelab/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/compression-core-0.4.32/src/util.rs:

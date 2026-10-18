@@ -156,6 +156,27 @@ deploying is separate.
 
 ### Fixed
 
+- **Hostile feeds can no longer stop ordinary feeds from being stored (#275).**
+  A timed-out sanitize can't be cancelled and keeps its permit until ammonia
+  returns, which for a hostile body can be minutes; four hostile feeds (four
+  URL variants of one) held all four, and every other poll deferred until they
+  finished. Now one of the four permits is reserved for bodies of at most
+  64 KiB (`SANITIZE_RESERVE_MAX_BYTES`), and a bigger body never takes it, so
+  at most three permits can be held by abandoned sanitizes. Small bodies take
+  whichever permit comes free first. The limit rests on a measurement: ammonia's
+  worst shape found (unclosed `<div>`s, release, M-series Mac) is roughly
+  quadratic, at 50 ms for 32 KiB, 186 ms for 64 KiB, 0.73 s for 128 KiB and
+  12.8 s for 512 KiB, so 64 KiB is ~27x under the 5 s timeout, leaving room for
+  a slower shared vCPU also running the three abandoned threads. Real bodies fit
+  (production's largest is 87 KB; nearly all are a few KB); in the starved state
+  a feed with a bigger body still defers, as before. If a reserved sanitize ever
+  did time out, the instance would be starved as it was before this, counted in
+  `/stats`, never worse. `hostile_feeds_cannot_hold_every_permit` makes four
+  hostile feeds hang their sanitizes (three hold every shared permit, the fourth
+  defers) and an ordinary feed then stores all its bodies; with the reserve off,
+  the same poll defers. Letting big bodies take the reserve, or never using it,
+  each fails the test.
+
 - **The last publication refusals are filed under what the PDS sent (#280).**
   Three refusals were still plain strings, so a publication read filed them as
   `Fetch` ("the request never produced a response"), and `/stats` showed a

@@ -1394,9 +1394,37 @@ pub(crate) const SANITIZE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`sanitize_off_runtime`] for why that wait is bounded too.
 pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
 
-/// The permits behind [`SANITIZE_CONCURRENCY`].
+/// Of [`SANITIZE_CONCURRENCY`], the permits kept for small bodies only
+/// (#275), so abandoned sanitizes can never hold them all.
+///
+/// **Why:** a timed-out sanitize keeps its permit until ammonia returns, and
+/// four hostile feeds (four URL variants of one) could hold all four, deferring
+/// every other feed's poll for as long as they ran. A permit no abandoned
+/// sanitize can hold needs a body that cannot time out, and ammonia's cost is
+/// bounded by size: its worst measured shape (unclosed `<div>`s, release, on
+/// an M-series Mac) is 50 ms at 32 KiB, 186 ms at 64 KiB, 0.73 s at 128 KiB
+/// and 12.8 s at 512 KiB, roughly quadratic. At [`SANITIZE_RESERVE_MAX_BYTES`]
+/// that is ~27x under [`SANITIZE_TIMEOUT`]: room for a shared vCPU several
+/// times slower that the three abandoned threads are also running on. Real
+/// bodies fit (production's largest is 87 KB; nearly all are a few KB).
+///
+/// If one ever did time out, the reserve would be held like any other permit
+/// and the instance would be back where it was before this: starved, counted
+/// in `/stats`, never worse.
+pub(crate) const SANITIZE_RESERVE: usize = 1;
+
+/// The largest raw body the reserved permits sanitize (#275). See
+/// [`SANITIZE_RESERVE`] for the measurement it rests on.
+pub(crate) const SANITIZE_RESERVE_MAX_BYTES: usize = 64 * 1024;
+
+/// The permits behind [`SANITIZE_CONCURRENCY`] that any body may take.
 static SANITIZE_PERMITS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(SANITIZE_CONCURRENCY);
+    tokio::sync::Semaphore::const_new(SANITIZE_CONCURRENCY - SANITIZE_RESERVE);
+
+/// The permits behind [`SANITIZE_RESERVE`], for bodies up to
+/// [`SANITIZE_RESERVE_MAX_BYTES`].
+static SANITIZE_RESERVE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SANITIZE_RESERVE);
 
 /// The feeds with a sanitize still running, and how many of those a poll has
 /// **given up on** (#226).
@@ -1587,7 +1615,12 @@ static IN_FLIGHT: InFlight = InFlight::new();
 /// up another.
 #[derive(Clone, Copy)]
 pub(crate) struct SanitizeLimits {
+    /// Permits any body may take.
     pub(crate) permits: &'static tokio::sync::Semaphore,
+    /// Permits only a body of at most `reserve_max_bytes` may take (#275).
+    pub(crate) reserve: &'static tokio::sync::Semaphore,
+    /// The largest raw body `reserve` sanitizes.
+    pub(crate) reserve_max_bytes: usize,
     pub(crate) in_flight: &'static InFlight,
     pub(crate) timeout: Duration,
     /// Where permit starvation is recorded: [`SANITIZE_STARVATION`] in
@@ -1600,9 +1633,12 @@ pub(crate) struct SanitizeLimits {
 }
 
 impl SanitizeLimits {
-    /// [`SANITIZE_PERMITS`], [`IN_FLIGHT`] and [`SANITIZE_TIMEOUT`].
+    /// [`SANITIZE_PERMITS`], [`SANITIZE_RESERVE_PERMITS`], [`IN_FLIGHT`] and
+    /// [`SANITIZE_TIMEOUT`].
     pub(crate) const PRODUCTION: SanitizeLimits = SanitizeLimits {
         permits: &SANITIZE_PERMITS,
+        reserve: &SANITIZE_RESERVE_PERMITS,
+        reserve_max_bytes: SANITIZE_RESERVE_MAX_BYTES,
         in_flight: &IN_FLIGHT,
         timeout: SANITIZE_TIMEOUT,
         starvation: &SANITIZE_STARVATION,
@@ -1651,6 +1687,11 @@ enum SanitizeGaveUp {
 /// graceful shutdown, which drains the polls in flight, past Fly's
 /// `kill_timeout`. So one entry costs a poll at most two timeouts.
 ///
+/// **A small body may also take a reserved permit** ([`SANITIZE_RESERVE`]),
+/// which a body too big to be sure of finishing never gets, so a set of
+/// hostile feeds cannot hold every permit (#275). It takes whichever comes
+/// free first, preferring the shared ones.
+///
 /// **A feed with a sanitize still running is refused before any of that** —
 /// no permit, no thread — until that sanitize finishes; see [`InFlight`].
 async fn sanitize_off_runtime(
@@ -1663,7 +1704,19 @@ async fn sanitize_off_runtime(
     // dropped before the spawn, the guard drops and the count goes with it.
     let guard = AbandonGuard::register(limits.in_flight, feed)?;
     let state = std::sync::Arc::clone(&guard.state);
-    let permit = match tokio::time::timeout(limits.timeout, limits.permits.acquire()).await {
+    let small = raw.len() <= limits.reserve_max_bytes;
+    let acquire = async {
+        if small {
+            tokio::select! {
+                biased;
+                p = limits.permits.acquire() => p,
+                p = limits.reserve.acquire() => p,
+            }
+        } else {
+            limits.permits.acquire().await
+        }
+    };
+    let permit = match tokio::time::timeout(limits.timeout, acquire).await {
         Ok(Ok(permit)) => {
             limits.starvation.record_permit();
             permit
@@ -4444,10 +4497,13 @@ mod sanitize_off_runtime_tests {
         Box::leak(Box::new(Semaphore::new(n)))
     }
 
-    /// `permits` and `timeout`, with an in-flight set of the call's own.
+    /// `permits` and `timeout`, with an in-flight set of the call's own and no
+    /// reserve.
     fn limits(permits: &'static Semaphore, timeout: Duration) -> SanitizeLimits {
         SanitizeLimits {
             permits,
+            reserve: self::permits(0),
+            reserve_max_bytes: 0,
             in_flight: Box::leak(Box::new(InFlight::new())),
             timeout,
             starvation: Box::leak(Box::new(Starvation::new())),
@@ -4870,6 +4926,134 @@ mod sanitize_off_runtime_tests {
         );
     }
 
+    /// Held shut until [`hostile_feeds_cannot_hold_every_permit`] releases it:
+    /// what [`sanitize_or_hang`] waits on for a big body.
+    static HANG_UNTIL: AtomicBool = AtomicBool::new(false);
+
+    /// The largest body [`sanitize_or_hang`] sanitizes at once.
+    const HANG_OVER: usize = 1024;
+
+    /// A sanitizer that cannot finish a big body: it hangs, the way ammonia
+    /// does on a hostile one, until the test lets it go. Small bodies are
+    /// sanitized normally.
+    fn sanitize_or_hang(raw: &str) -> String {
+        while raw.len() > HANG_OVER && !HANG_UNTIL.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sanitize_body(raw)
+    }
+
+    /// **Hostile feeds cannot stop ordinary ones from being stored (#275).**
+    /// Each hostile feed's big body hangs its sanitize, which is abandoned and
+    /// keeps its permit. Three of them hold every shared permit; a fourth gets
+    /// none and defers, because a body too big to be sure of finishing never
+    /// takes the reserve. An ordinary feed's small bodies then take the
+    /// reserve and are stored, while the hostile sanitizes are still running.
+    ///
+    /// The control: with no reserve, the same ordinary poll defers, which is
+    /// the starvation this fixes.
+    #[tokio::test]
+    async fn hostile_feeds_cannot_hold_every_permit() {
+        // Lets the hung sanitizes go however the test ends: a failed assert
+        // left them spinning, and the runtime's shutdown waited on them
+        // forever (found by the mutation check).
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                HANG_UNTIL.store(true, Ordering::SeqCst);
+            }
+        }
+        let release = Release;
+        let shared = permits(3);
+        let base = SanitizeLimits {
+            permits: shared,
+            reserve: permits(1),
+            reserve_max_bytes: HANG_OVER,
+            in_flight: Box::leak(Box::new(InFlight::new())),
+            timeout: SHORT,
+            starvation: Box::leak(Box::new(Starvation::new())),
+            sanitize: sanitize_or_hang,
+        };
+        let client = build_client().unwrap();
+        let hostile = format!("<p>{}</p>", "x".repeat(4 * HANG_OVER));
+        let mut outcomes = Vec::new();
+        for n in 0..4 {
+            let (pool, feed, _) = fixture(&format!("hostile-{n}.test"), rss(&hostile)).await;
+            outcomes.push(
+                poll_feed_with(&pool, &client, &feed, 0, base)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            outcomes[..3].iter().all(|o| matches!(
+                o,
+                PollOutcome::Failed {
+                    kind: FailureKind::Body,
+                    ..
+                }
+            )),
+            "the first three hostile polls did not time out: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes[3],
+            PollOutcome::Deferred,
+            "a fourth hostile body took the reserve"
+        );
+        assert_eq!(
+            shared.available_permits(),
+            0,
+            "the hostile sanitizes hold the shared permits"
+        );
+        assert_eq!(
+            base.reserve.available_permits(),
+            1,
+            "a hostile sanitize holds the reserve"
+        );
+
+        // The control: no reserve, so the ordinary feed is starved.
+        let (pool, feed, _) = fixture("ordinary-starved.test", rss(ORDINARY_B)).await;
+        let unreserved = SanitizeLimits {
+            reserve_max_bytes: 0,
+            ..base
+        };
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, unreserved)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PollOutcome::Deferred,
+            "the control was not starved"
+        );
+
+        let (pool, feed, _) = fixture("ordinary-reserved.test", rss(ORDINARY_B)).await;
+        let outcome = poll_feed_with(&pool, &client, &feed, 0, base)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Updated { .. }),
+            "the ordinary feed was not stored: {outcome:?}"
+        );
+        assert_eq!(
+            bodies(&pool).await,
+            vec![
+                ("urn:a".to_owned(), clean(ORDINARY_A)),
+                ("urn:b".to_owned(), clean(ORDINARY_B)),
+                ("urn:bare".to_owned(), None),
+                ("urn:slow".to_owned(), clean(ORDINARY_B)),
+            ],
+            "the ordinary feed's bodies were not all stored"
+        );
+        assert_eq!(
+            shared.available_permits(),
+            0,
+            "the hostile sanitizes finished early"
+        );
+
+        drop(release);
+        wait_for_permits(shared, 3).await;
+    }
+
     /// Wait (bounded) until every one of `sem`'s `n` permits is free again —
     /// i.e. every abandoned sanitize holding one has finished.
     async fn wait_for_permits(sem: &Semaphore, n: usize) {
@@ -4898,6 +5082,8 @@ mod sanitize_off_runtime_tests {
         let set: &'static InFlight = Box::leak(Box::new(InFlight::new()));
         let short = SanitizeLimits {
             permits: sem,
+            reserve: permits(0),
+            reserve_max_bytes: 0,
             in_flight: set,
             timeout: SHORT,
             starvation: Box::leak(Box::new(Starvation::new())),
@@ -5167,6 +5353,8 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
         let set: &'static InFlight = Box::leak(Box::new(InFlight::new()));
         let generous = SanitizeLimits {
             permits: sem,
+            reserve: permits(0),
+            reserve_max_bytes: 0,
             in_flight: set,
             timeout: GENEROUS,
             starvation: Box::leak(Box::new(Starvation::new())),
