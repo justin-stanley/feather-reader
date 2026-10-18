@@ -2495,11 +2495,17 @@ async fn index(
         match state.repo().list_saved_sorted(&did).await {
             Ok(saved) if identities_ok => {
                 for (rkey, item) in saved {
+                    // `entryId` is an item id (#290): a cached row's guid —
+                    // including a stand-in an older build wrote — or, for a
+                    // row FeatherReader named by its link, that link. Matched
+                    // against every cached link rather than only synthesized
+                    // rows': a false match only hides an uncached row, the
+                    // fail-closed direction here.
                     let known = cached_urls.contains(item.url.as_str())
                         || item
                             .entry_id
                             .as_deref()
-                            .is_some_and(|g| cached_guids.contains(g));
+                            .is_some_and(|g| cached_guids.contains(g) || cached_urls.contains(g));
                     if known {
                         continue;
                     }
@@ -3352,20 +3358,51 @@ async fn toggle_star(
     if let Ok(Some(entry)) = get_entry_by_id(pool, &did, id).await {
         let entry_url = entry.url.clone().unwrap_or_default();
         if !entry_url.is_empty() {
+            // **The item's id, by the item-id rule (#290)**, the one a
+            // readState record names items by (`docs/lexicon.md`): the
+            // publisher's id, a standard.site URI, else the link, never a
+            // stand-in FeatherReader made up, which no other reader can
+            // compute. The same query the read-state flush uses, so the two
+            // cannot name one item differently. `None` for an item with no
+            // portable id (a link shared within one fetch); `url` is still
+            // there to match on.
+            let feed_url = feed_url_for_id(pool, entry.feed_id).await;
+            let item_id = match &feed_url {
+                Some(feed_url) => store::guids_for_entry_ids(pool, &did, feed_url, &[entry.id])
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!(%err, %did, "could not name the saved item; omitting entryId");
+                        Default::default()
+                    })
+                    .remove(&entry.id)
+                    .map(|item| item.id),
+                None => None,
+            };
             if starred {
                 let mut saved = Saved::new(entry_url.clone(), now_rfc3339());
                 saved.title = entry.title.clone();
-                saved.feed_url = feed_url_for_id(pool, entry.feed_id).await;
-                saved.entry_id = Some(entry.guid.clone());
+                saved.feed_url = feed_url;
+                saved.entry_id = item_id;
                 match state.repo().add_saved(&did, &saved).await {
                     Ok(rkey) => info!(%did, url = %entry_url, %rkey, "wrote saved record to PDS"),
                     Err(err) => warn!(%err, %did, "PDS saved write failed (starred locally)"),
                 }
             } else {
-                // Un-star: find and delete the matching saved record by URL.
+                // Un-star: delete every saved record naming this item, by the
+                // same identities the starred view matches it on (#290): its
+                // URL, or an `entryId` that is its guid (an older build's
+                // stand-in included) or its item id. Matched by URL alone, a
+                // record whose `url` differs (tracking parameters another
+                // client kept) survived, and came back as an uncached row.
+                let names_it = |r: &Saved| {
+                    r.url == entry_url
+                        || r.entry_id
+                            .as_deref()
+                            .is_some_and(|e| e == entry.guid || Some(e) == item_id.as_deref())
+                };
                 match state.repo().list_saved(&did).await {
                     Ok(records) => {
-                        for (rkey, _rec) in records.iter().filter(|(_, r)| r.url == entry_url) {
+                        for (rkey, _rec) in records.iter().filter(|(_, r)| names_it(r)) {
                             if let Err(err) = state.repo().remove_saved(&did, rkey).await {
                                 warn!(%err, %did, %rkey, "PDS saved delete failed");
                             }
@@ -11625,6 +11662,378 @@ mod tests {
         })
         .await;
         (pds, sent)
+    }
+
+    // ── #290: `saved.entryId` follows the item-id rule ───────────────────────
+
+    const STAR_DID: &str = "did:plc:starrer290";
+    const STAR_FEED: &str = "https://star.example/feed.xml";
+
+    /// A fake PDS listing one subscription (to [`STAR_FEED`]), no saved records,
+    /// and capturing every `createRecord` body: what starring writes.
+    async fn spawn_star_pds() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let created = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = created.clone();
+        let (pds, _log) = spawn_pds(move |call| match call.nsid.as_str() {
+            "com.atproto.repo.listRecords" => {
+                let records = if call.query.get("collection").map(String::as_str)
+                    == Some(lexicon::nsid::SUBSCRIPTION)
+                {
+                    serde_json::json!([{
+                        "uri": format!("at://{STAR_DID}/{}/sub1", lexicon::nsid::SUBSCRIPTION),
+                        "cid": "bafy",
+                        "value": {
+                            "$type": lexicon::nsid::SUBSCRIPTION,
+                            "url": STAR_FEED,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                (200, serde_json::json!({ "records": records }))
+            }
+            "com.atproto.repo.createRecord" => {
+                sink.lock().unwrap().push(call.body.clone());
+                (
+                    200,
+                    serde_json::json!({ "uri": "at://did:plc:x/c/r", "cid": "bafy" }),
+                )
+            }
+            other => panic!("the star fake got an unexpected call to {other}"),
+        })
+        .await;
+        (pds, created)
+    }
+
+    /// Star the entry `guid` of `entries` (inserted together, as one fetch)
+    /// through `POST /entries/{id}/star`, and return the saved record written.
+    async fn saved_record_for(entries: &[store::NewEntry], guid: &str) -> serde_json::Value {
+        let (pds, created) = spawn_star_pds().await;
+        let state = test_state_on_pds(&[STAR_DID], &pds).await;
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: STAR_FEED.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(&state.db, feed_id, entries, 0)
+            .await
+            .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE guid = ?1")
+            .bind(guid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{id}/star"))
+                    .header(header::COOKIE, session_cookie(&state, STAR_DID, None))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("starred=true"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success() || resp.status().is_redirection(),
+            "{}",
+            resp.status()
+        );
+        let created = created.lock().unwrap().clone();
+        assert_eq!(created.len(), 1, "expected one saved record: {created:?}");
+        assert_eq!(created[0]["collection"], "community.lexicon.rss.saved");
+        created[0]["record"].clone()
+    }
+
+    /// **A saved record names a cached item by an item id — its guid, an old
+    /// stand-in, or its link — even where the record's `url` differs** (#290).
+    /// Unmatched, a cached starred article renders a second time as an
+    /// "uncached" row whose un-save button deletes the PDS record.
+    #[tokio::test]
+    async fn a_saved_record_matches_its_cached_item_by_item_id() {
+        let stand_in = "5813b43a0512aaef2750311bf4d978a";
+        let saved = |rk: &str, url: &str, entry_id: &str| {
+            serde_json::json!({
+                "uri": format!("at://{STAR_DID}/community.lexicon.rss.saved/{rk}"),
+                "cid": "bafy",
+                "value": {
+                    "$type": "community.lexicon.rss.saved",
+                    "url": url,
+                    "entryId": entry_id,
+                    "title": format!("saved {rk}"),
+                    "createdAt": "2026-01-01T00:00:00Z"
+                }
+            })
+        };
+        let records = serde_json::json!([
+            // The link FeatherReader names a link-only item by now.
+            saved(
+                "rk-link",
+                "https://star.example/b?utm=x",
+                "https://star.example/b"
+            ),
+            // The stand-in a build before #290 wrote.
+            saved("rk-hash", "https://star.example/c?utm=x", stand_in),
+        ]);
+        let pds = spawn_collections_pds(move |collection| {
+            Some(match collection {
+                "community.lexicon.rss.saved" => records.clone(),
+                c if c == lexicon::nsid::SUBSCRIPTION => serde_json::json!([{
+                    "uri": format!("at://{STAR_DID}/{}/sub1", lexicon::nsid::SUBSCRIPTION),
+                    "cid": "bafy",
+                    "value": { "$type": lexicon::nsid::SUBSCRIPTION, "url": STAR_FEED, "createdAt": "2026-01-01T00:00:00Z" }
+                }]),
+                _ => serde_json::json!([]),
+            })
+        })
+        .await;
+        let mut state = test_state_on_pds(&[STAR_DID], &pds).await;
+        std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(STAR_DID.to_string());
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: STAR_FEED.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[
+                star_entry("other-stand-in", "https://star.example/b", true),
+                star_entry(stand_in, "https://star.example/c", true),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&state.db, STAR_DID, &[feed_id])
+            .await
+            .unwrap();
+        for id in sqlx::query_scalar::<_, i64>("SELECT id FROM entries")
+            .fetch_all(&state.db)
+            .await
+            .unwrap()
+        {
+            assert!(store::mark_starred(&state.db, STAR_DID, id, true)
+                .await
+                .unwrap());
+        }
+
+        let (status, body) = page_body(state, STAR_DID, "/?view=starred").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("entry-uncached"),
+            "a cached starred item was rendered again as uncached: {body}"
+        );
+    }
+
+    /// **Un-saving clears the local star through a link `entryId`** (#290).
+    #[tokio::test]
+    async fn unsaving_by_a_link_entry_id_clears_the_link_only_items_star() {
+        let pool = store::init_url("sqlite::memory:").await.unwrap();
+        let feed_id = store::upsert_feed(
+            &pool,
+            &store::NewFeed {
+                url: STAR_FEED.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &pool,
+            feed_id,
+            &[star_entry("stand-in", "https://star.example/d", true)],
+            0,
+        )
+        .await
+        .unwrap();
+        store::replace_sub_refs(&pool, STAR_DID, &[feed_id])
+            .await
+            .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(store::mark_starred(&pool, STAR_DID, id, true)
+            .await
+            .unwrap());
+
+        // The record's url differs; only its entryId names the item.
+        let cleared = store::clear_star_by_identity(
+            &pool,
+            STAR_DID,
+            Some("https://star.example/d?utm=x"),
+            Some("https://star.example/d"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared, 1,
+            "the link entryId did not reach the link-only item"
+        );
+    }
+
+    /// **Un-starring deletes a saved record that names the item only by its
+    /// item id** (review of #322): the starred view matches a record by a link
+    /// `entryId` even when its `url` differs, so un-starring must delete it on
+    /// the same terms, or it survives and comes back as an uncached row.
+    #[tokio::test]
+    async fn unstarring_deletes_a_saved_record_matched_by_its_entry_id() {
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = deleted.clone();
+        let (pds, _log) = spawn_pds(move |call| match call.nsid.as_str() {
+            "com.atproto.repo.listRecords" => {
+                let collection = call.query.get("collection").map(String::as_str).unwrap_or("");
+                let records = if collection == lexicon::nsid::SUBSCRIPTION {
+                    serde_json::json!([{
+                        "uri": format!("at://{STAR_DID}/{}/sub1", lexicon::nsid::SUBSCRIPTION),
+                        "cid": "bafy",
+                        "value": { "$type": lexicon::nsid::SUBSCRIPTION, "url": STAR_FEED, "createdAt": "2026-01-01T00:00:00Z" }
+                    }])
+                } else if collection == "community.lexicon.rss.saved" {
+                    serde_json::json!([
+                        { "uri": format!("at://{STAR_DID}/community.lexicon.rss.saved/rk-other"), "cid": "bafy",
+                          "value": { "$type": "community.lexicon.rss.saved", "url": "https://star.example/other",
+                                     "createdAt": "2026-01-01T00:00:00Z" } },
+                        { "uri": format!("at://{STAR_DID}/community.lexicon.rss.saved/rk-link"), "cid": "bafy",
+                          "value": { "$type": "community.lexicon.rss.saved", "url": "https://star.example/e?utm=x",
+                                     "entryId": "https://star.example/e", "createdAt": "2026-01-01T00:00:00Z" } },
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                (200, serde_json::json!({ "records": records }))
+            }
+            "com.atproto.repo.deleteRecord" => {
+                sink.lock().unwrap().push(call.body["rkey"].as_str().unwrap_or_default().to_string());
+                (200, serde_json::json!({}))
+            }
+            other => panic!("unexpected call to {other}"),
+        })
+        .await;
+        let state = test_state_on_pds(&[STAR_DID], &pds).await;
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: STAR_FEED.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[star_entry("stand-in", "https://star.example/e", true)],
+            0,
+        )
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, STAR_DID, &[feed_id])
+            .await
+            .unwrap();
+        assert!(store::mark_starred(&state.db, STAR_DID, id, true)
+            .await
+            .unwrap());
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{id}/star"))
+                    .header(header::COOKIE, session_cookie(&state, STAR_DID, None))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("starred=false"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success() || resp.status().is_redirection(),
+            "{}",
+            resp.status()
+        );
+
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["rk-link".to_string()],
+            "un-starring must delete the record naming the item, and only it"
+        );
+    }
+
+    fn star_entry(guid: &str, url: &str, synthesized: bool) -> store::NewEntry {
+        store::NewEntry {
+            guid: guid.into(),
+            url: Some(url.into()),
+            title: Some("t".into()),
+            guid_synthesized: synthesized,
+            ..Default::default()
+        }
+    }
+
+    /// **The publisher's id is written as is**, and so is a standard.site
+    /// document's `at://` URI, which is its stored guid.
+    #[tokio::test]
+    async fn starring_writes_the_publishers_id_as_entry_id() {
+        for guid in [
+            "tag:star.example,2026:1",
+            "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.document/3lab",
+        ] {
+            let rec =
+                saved_record_for(&[star_entry(guid, "https://star.example/a", false)], guid).await;
+            assert_eq!(rec["entryId"], guid, "{guid}");
+            assert_eq!(rec["url"], "https://star.example/a");
+        }
+    }
+
+    /// **A link-only item writes its LINK, not FeatherReader's stand-in.** The
+    /// stand-in (a feed-rs hash here) is a name no other reader can compute, so
+    /// a second reader matching saved records by `entryId` missed every
+    /// id-less item starred here.
+    #[tokio::test]
+    async fn starring_a_link_only_item_writes_its_link_as_entry_id() {
+        let stand_in = "5813b43a0512aaef2750311bf4d978a";
+        let rec = saved_record_for(
+            &[star_entry(stand_in, "https://star.example/b", true)],
+            stand_in,
+        )
+        .await;
+        assert_eq!(rec["entryId"], "https://star.example/b");
+        assert_ne!(rec["entryId"], stand_in);
+    }
+
+    /// **An item with no portable id omits `entryId`**: a link two id-less
+    /// items of one fetch share names neither (`guid_synthesized = 2`). `url`
+    /// still identifies the saved article.
+    #[tokio::test]
+    async fn starring_an_item_with_no_portable_id_omits_entry_id() {
+        let rec = saved_record_for(
+            &[
+                star_entry("stand-in-1", "https://star.example/shared", true),
+                star_entry("stand-in-2", "https://star.example/shared", true),
+            ],
+            "stand-in-1",
+        )
+        .await;
+        assert!(rec.get("entryId").is_none(), "{rec}");
+        assert_eq!(rec["url"], "https://star.example/shared");
     }
 
     /// A fake PDS that serves ONE existing subscription record and captures the

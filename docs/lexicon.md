@@ -51,12 +51,13 @@ rename) must write back fields it does not know.
 An item kept for later. Key: `tid`. `url` and `createdAt` are required. `url` is
 the permalink; `feedUrl` and `entryId` are soft references that let a reader
 match the record to a cached item (FeatherReader matches on `url` or `entryId`).
-`entryId` is meant to follow the item-id rule below.
+`entryId` follows the item-id rule below; a writer omits it for an item with no
+item id.
 
-**Status in FeatherReader.** FeatherReader writes `entryId` as its stored
-entry id, which for an item with no publisher id is its own stand-in (a hash,
-or `featherreader:synthetic:…`) rather than the link. A reader matching saved
-records by `entryId` will not match those items; match on `url` instead.
+**Status in FeatherReader.** From 0.5.0 (#290). Before it, FeatherReader wrote
+its stored entry id, which for an item with no publisher id is its own stand-in
+(a hash, or `featherreader:synthetic:…`), not the link. It still matches those
+records, by the stand-in as well as by `url`.
 
 ## `community.lexicon.rss.readState`
 
