@@ -10790,7 +10790,8 @@ mod tests {
             "pre-condition: a {version} entry_state table has read_marked_at iff it is 0.4.9 or later"
         );
 
-        // One row of each kind, inserted the way the old binary did: without `kind`.
+        // One row of each kind, inserted without `kind`: the way a release before
+        // 0.3.9 stored them, and a test that `init_schema` derives it either way.
         let publication = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
         for u in ["https://example.com/feed.xml", publication] {
             sqlx::query("INSERT INTO feeds (url) VALUES (?)")
@@ -10927,7 +10928,7 @@ mod tests {
     }
 
     /// 0.4.10 is what 0.5.0 upgrades from (#311): the last release with the
-    /// sidecar, and the first whose schema has both #287 columns.
+    /// sidecar. Its schema has both #287 columns, which 0.4.9 added.
     #[tokio::test]
     async fn a_v0_4_10_database_upgrades_to_the_current_schema() -> Result<()> {
         assert_upgrades_from(
