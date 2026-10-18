@@ -110,6 +110,21 @@ deploying is separate.
 
 ### Changed
 
+- **Rate limiting is on by default for every route (#261).** It was an
+  allowlist of limited paths that a new route had to be added to by hand, which
+  was missed three times (`/saved/`, `/oauth/callback`, `/logout`). Now the
+  limiter classifies the route a request MATCHED (`MatchedPath`), and every
+  POST, and every GET not on `RATE_LIMIT_EXEMPT_READS`, is limited. The
+  exemptions are read-only navigation and public documents. A read that matched
+  no route, a 404 or a `/static` file, is not limited, so it costs a visitor
+  nothing. `HEAD` counts as `GET`, so `HEAD /login`, `/claim` and
+  `/oauth/callback` are now limited like their GETs; nothing else changed for
+  existing routes. `rate_limit_exemptions_match_the_router` reads the route
+  table from `router()`'s source and fails on an unclassified GET route or a
+  stale exemption (checked by adding one), and
+  `the_limiter_keys_on_the_matched_route_through_the_router` drives the real
+  router with a real peer, which is how the `/static` case was measured.
+
 - **Rust is the default backend (#311, 0.5.0 step 2).** (Superseded by its
   removal, above; kept for the history of the test move.) `Config::default()`,
   the container entrypoint and `deploy/teardown.sh` read an unset
