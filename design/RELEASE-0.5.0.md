@@ -89,8 +89,9 @@ Rust backend it leaves behind.
 7. **CodeQL has nothing left to scan.** Its only leg is `javascript-typescript`,
    for the sidecar. Rust was dropped because the extractor (then in beta) failed
    on every file. OSSF Scorecard's SAST score expects a CodeQL check-run on every
-   PR. Re-try the Rust extractor; if it works, it replaces the JS leg; if not,
-   decide what keeps the check-run (open question 1).
+   PR. **Retried 2026-10-18 (PR #313): the Rust extractor works.** On CodeQL
+   2.27.2 all 47 files extract without error, 30 rules run, 0 results, about
+   5.5 min per run. The Rust leg stays, and replaces the JS leg in step 4.
 8. **The test harness defaults to the sidecar.** `web.rs`'s `test_state` uses
    `..Config::default()`, which is the sidecar backend, and about 87 tests use
    sidecar fakes (`/internal/repo`). Those tests cover rename, saved, export,
@@ -115,7 +116,8 @@ in order; 5–7 are independent and land as they are ready.
 - `scripts/upgrade-boot.sh`: health-check the candidate without Node (risk 4).
 - Add a 0.4.10 schema fixture (`tests/fixtures/schema-v0.4.10.sql`) for the
   upgrade test.
-- Retry CodeQL's Rust extractor on a branch; record the result (risk 7).
+- ~~Retry CodeQL's Rust extractor on a branch; record the result (risk 7).~~
+  **Done** (PR #313): it works; the Rust leg is re-added.
 
 ### 2. Rust is the default; tests move to it
 
@@ -154,7 +156,8 @@ No behaviour change for feather-reader.com: it already sets `rust`.
 - **Teardown:** `deploy/teardown.sh`, `deploy/teardown.md` and
   `scripts/test-teardown.sh` lose the sidecar revoke path and backend default.
 - **CI:** delete the `sidecar` job and the npm group in `dependabot.yml`; drop
-  the npm block in `scripts/ci.sh`; CodeQL per step 1's result.
+  the npm block in `scripts/ci.sh`; drop CodeQL's `javascript-typescript` leg,
+  leaving `rust` (PR #313).
 - Delete `oauth-sidecar/`, and its lines in `.dockerignore`, `.gitignore` and
   `.gitleaks.toml`.
 - The production secret `SIDECAR_INTERNAL_SECRET` is unset with
@@ -242,9 +245,7 @@ fields). None blocks the release.
 
 ## Open questions
 
-1. **CodeQL.** If the Rust extractor still fails, what keeps a CodeQL
-   check-run on every PR for Scorecard: a trivial JS leg over the remaining
-   scripts, or accepting the lower score?
+1. ~~**CodeQL.**~~ Resolved: the Rust extractor works (PR #313).
 2. **Image base.** `debian:bookworm-slim`, or a smaller base that still has bash
    for the entrypoint?
 3. **Old variable names.** Should `SIDECAR_*` set in an environment warn once
