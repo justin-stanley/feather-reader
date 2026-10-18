@@ -47,7 +47,7 @@
 #   [1] Optional when FEATHERREADER_REPO_BACKEND=rust and no SIDECAR_DB file
 #       exists; required on the sidecar backend.
 # Optional:
-#   FEATHERREADER_REPO_BACKEND  `rust` or `sidecar` (the app's default)
+#   FEATHERREADER_REPO_BACKEND  `rust` (the app's default) or `sidecar`
 #   FEATHERREADER_OAUTH_KEY_PATH  the Rust client's signing key; removed if set
 #   FR_REVOKE_CMD="..."       the Rust revoke. Default:
 #                             `featherreader --revoke-all-sessions` when
@@ -101,7 +101,7 @@ command -v sqlite3 >/dev/null || { echo "FATAL: sqlite3 not found" >&2; exit 2; 
 # from an EnvironmentFile can carry a stray CR/LF, which the app ignores; an
 # exact compare here would misread `rust` as the sidecar backend.
 backend="$(printf '%s' "${FEATHERREADER_REPO_BACKEND:-}" | tr -d '[:space:]')"
-# Unset means rust, the app's default since 0.5.0 (#311).
+# Unset means rust, the app's default since #311.
 backend="${backend:-rust}"
 
 # The sidecar step runs unless this is the rust backend with no sidecar store.

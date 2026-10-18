@@ -29,6 +29,10 @@ deploying is separate.
     them, so those grants stay live at the readers' PDSes until they expire.
     To keep the current sign-ins, set `FEATHERREADER_REPO_BACKEND=sidecar`
     until 0.5.0, which removes the sidecar.
+  - **Rolling back signs everyone out again**, for the same reason in
+    reverse: on 0.4.10 an unset variable means the sidecar, which never reads
+    the Rust sessions, and its sign-out does not revoke them. Set
+    `FEATHERREADER_REPO_BACKEND=rust` on the release you roll back to.
 
 ### Changed
 
@@ -42,8 +46,9 @@ deploying is separate.
   tests exercise the backend production runs. The sign-out and account-deletion
   tests now prove an RFC 7009 revocation reached the issuer, not that the
   sidecar was called. Tests that meant "the PDS is down" use a session at a
-  PDS that refuses connections; they had relied on the default sidecar URL
-  being unserved. `atproto::SidecarSession` is `LoginSession`: the Rust login
+  PDS that drops every connection; they had relied on the default sidecar URL
+  being unserved. The read-state and rename-race tests still run on both
+  backends while `sidecar` can be selected. `atproto::SidecarSession` is `LoginSession`: the Rust login
   callback returns it, and it outlives the sidecar.
 
 ### Fixed

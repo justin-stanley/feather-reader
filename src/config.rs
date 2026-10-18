@@ -184,9 +184,10 @@ pub struct Config {
     /// is served as this DID (local runs without the OAuth sidecar). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
-    /// Which repo implementation serves `com.atproto.repo.*` — the cutover
-    /// switch. Defaults to the sidecar, so deploying the Rust client changes
-    /// nothing until this is set deliberately.
+    /// Which repo implementation serves `com.atproto.repo.*`. Defaults to Rust
+    /// (#311): an unset variable selected the sidecar, whose OAuth client guards
+    /// none of its fetches (#258). A production-like Rust instance refuses to
+    /// start without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`.
     pub repo_backend: crate::metrics::Backend,
     /// Whether an `at://` standard.site publication subscription may be
     /// **stored** — pasted into the subscribe form (a handle is resolved to its

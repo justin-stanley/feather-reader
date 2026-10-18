@@ -4,7 +4,8 @@ The small TypeScript/Node component that owns the atproto **OAuth confidential-c
 handshake (PAR / PKCE / DPoP / token refresh) via
 [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node),
 so the Rust server (`featherreader`) never touches any of it **when
-`FEATHERREADER_REPO_BACKEND=sidecar`** (the default).
+`FEATHERREADER_REPO_BACKEND=sidecar`**. It is no longer the default (#311),
+and 0.5.0 removes it.
 
 > **Not the production backend.** Since 0.3.0 the Rust server has its own
 > atproto OAuth client (`FEATHERREADER_REPO_BACKEND=rust`), and the hosted

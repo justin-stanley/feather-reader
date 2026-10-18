@@ -9022,8 +9022,11 @@ mod tests {
     #[tokio::test]
     async fn the_sign_out_flush_settles_what_a_split_flush_landed() {
         use crate::readstate::tests as rs;
-        {
-            let backend = crate::metrics::Backend::Rust;
+        // Both backends while `sidecar` can still be selected (#311).
+        for backend in [
+            crate::metrics::Backend::Sidecar,
+            crate::metrics::Backend::Rust,
+        ] {
             let fake = std::sync::Arc::new(std::sync::Mutex::new(rs::FakeRepo::default()));
             let state = rs::state_on(backend, &fake).await;
             for i in 0..250 {
@@ -11585,13 +11588,20 @@ mod tests {
         )
     }
 
-    /// A PDS URL nothing answers: the port was bound and released, so a call
-    /// is refused — a PDS outage, through the guarded client.
+    /// A PDS that answers nothing: it accepts each connection and drops it
+    /// unread, so every call fails at the transport — a PDS outage, through the
+    /// guarded client. The listener is KEPT, not released: a released port can
+    /// be handed to another test's fake while its test hostname still routes
+    /// here, and the "outage" would then reach a live server.
     async fn dead_pds() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        routed(&dead)
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        });
+        routed(&addr)
     }
 
     /// Store a live Rust-backend session for `did` whose PDS is `pds`.
@@ -12862,10 +12872,13 @@ mod tests {
             .to_string()
     }
 
-    /// The backends the race tests run on. Rust only since it became the
-    /// default (#311); the sidecar half of [`serve_swap_repo`] goes with the
-    /// sidecar.
-    const RACE_BACKENDS: [crate::metrics::Backend; 1] = [crate::metrics::Backend::Rust];
+    /// The backends the race tests run on: both, while `sidecar` can still be
+    /// selected. Rust is the default (#311); this drops to Rust when 0.5.0
+    /// removes the sidecar, with [`serve_swap_repo`]'s sidecar half.
+    const RACE_BACKENDS: [crate::metrics::Backend; 2] = [
+        crate::metrics::Backend::Sidecar,
+        crate::metrics::Backend::Rust,
+    ];
 
     /// **The key test of #149: a rename that loses a race keeps the other
     /// client's change AND lands its own.**

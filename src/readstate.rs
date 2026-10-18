@@ -1830,9 +1830,10 @@ pub(crate) mod tests {
         fake.lock().unwrap().records[&read_state_rkey(&feed(i))]["readIds"].clone()
     }
 
-    /// The backends these run on. Rust only since it became the default
-    /// (#311); the sidecar half of [`serve_fake`] goes with the sidecar.
-    const BACKENDS: [Backend; 1] = [Backend::Rust];
+    /// The backends these run on: both, while `sidecar` can still be selected.
+    /// Rust is the default (#311); this drops to Rust when 0.5.0 removes the
+    /// sidecar, with [`serve_fake`]'s sidecar half.
+    const BACKENDS: [Backend; 2] = [Backend::Sidecar, Backend::Rust];
 
     /// **(1) A lost success response converges.** The applyWrites that created
     /// the record landed, but its answer never arrived, so `pds_created` is still
