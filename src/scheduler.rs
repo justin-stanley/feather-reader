@@ -30,7 +30,7 @@
 //! scans the store for **dirty** per-feed read cursors ([`store::dirty_cursors`])
 //! across every DID, coalesces each DID's dirty cursors into **one**
 //! `com.atproto.repo.applyWrites` batch via
-//! `SidecarClient::flush_read_states` (sent as several calls past 200 cursors
+//! `Repo::flush_read_states` (sent as several calls past 200 cursors
 //! or 128 KiB — `atproto::apply_writes_chunked`), and — only on success — clears the
 //! `dirty` flag ([`store::clear_cursor_dirty`]). Dozens of articles read in one
 //! sitting collapse into one write per feed (one record per feed, keyed by a
@@ -2215,7 +2215,6 @@ mod tests {
         let db = store::init_url("sqlite::memory:").await.unwrap();
         AppState::new(
             feather_reader::config::Config {
-                repo_backend: feather_reader::metrics::Backend::Rust,
                 oauth: feather_reader::config::OauthConfig {
                     key_path: std::env::temp_dir().join(format!(
                         "fr-sched-oauth-key-{}-{:p}.json",

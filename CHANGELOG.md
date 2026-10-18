@@ -18,25 +18,62 @@ deploying is separate.
 
 ### Upgrade notes
 
-- **An unset `FEATHERREADER_REPO_BACKEND` now means `rust` (#311).** It
-  selected the sidecar. Only an instance that leaves it unset is affected;
-  feather-reader.com sets `rust`. Such an instance, on upgrading:
-  - **refuses to start on a production-like bind without
-    `FEATHERREADER_OAUTH_ENCRYPTION_KEY`**, which the Rust backend requires
-    (at least 32 random bytes); set it first;
-  - **signs every reader out once**: the sidecar's sessions live in
-    `SIDECAR_DB`, which the Rust backend never reads, and nothing revokes
-    them, so those grants stay live at the readers' PDSes until they expire.
-    To keep the current sign-ins, set `FEATHERREADER_REPO_BACKEND=sidecar`
-    until 0.5.0, which removes the sidecar.
-  - **Rolling back signs everyone out again**, for the same reason in
-    reverse: on 0.4.10 an unset variable means the sidecar, which never reads
-    the Rust sessions, and its sign-out does not revoke them. Set
+- **The Node OAuth sidecar is removed (#311). Rust is the only backend.**
+  feather-reader.com has run `rust` since the 2026-09-13 cutover and sees no
+  change. An instance on the sidecar, i.e. with `FEATHERREADER_REPO_BACKEND`
+  unset (which selected it until now) or set to `sidecar`:
+  - **`FEATHERREADER_REPO_BACKEND=sidecar` refuses to start**, with a message
+    naming this release. Unset it or set it to `rust`. `rust` is accepted and
+    changes nothing; any other value is refused, as before.
+  - **A production-like bind refuses to start without
+    `FEATHERREADER_OAUTH_ENCRYPTION_KEY`** (at least 32 random bytes;
+    `openssl rand -hex 32`). Set it first.
+  - **Every reader signs in again once.** The sidecar's sessions live in
+    `SIDECAR_DB`, which nothing reads, and nothing revokes them, so those
+    grants stay live at the readers' PDSes until they expire.
+  - **`SIDECAR_PUBLIC_URL`, `SIDECAR_INTERNAL_URL` and
+    `SIDECAR_INTERNAL_SECRET` are no longer read.** The server warns at boot
+    while any is set. `SIDECAR_INTERNAL_SECRET` is no longer required in
+    production; unset it.
+  - **Rolling back to 0.4.10 signs everyone out again**: there an unset
+    variable means the sidecar, which never reads the Rust sessions. Set
     `FEATHERREADER_REPO_BACKEND=rust` on the release you roll back to.
+  - Metric rows 0.4.x recorded under the `sidecar` backend stay in the
+    database and are skipped when read.
+
+### Removed
+
+- **The sidecar backend, from the Rust code (#311, 0.5.0 step 3).**
+  `atproto::SidecarClient` and its types (`RevokeResult`, `RepoAction`,
+  `WriteOp::to_sidecar_json`), `config::SidecarConfig` and every `SIDECAR_*`
+  read, the `repo_backend` setting and `Backend::Sidecar`, the sidecar arms of
+  `repo::dispatch!`, `has_session`, `start_oauth`, the OAuth callback (the
+  `session_id` handoff) and `revoke_everywhere`. The OAuth runtime is built
+  unconditionally, and failing to build it is fatal; the client signing key
+  is always loaded or created for a confidential client. **Kept on purpose:**
+  the at-rest encryption domain string `featherreader-sidecar-enc:v1:` and the
+  key file format, which every stored session and the signing key were sealed
+  with. `/health` still prints `backend: rust`, which monitors match.
+  - **Tests:** those of sidecar code went with it (the `SidecarClient` walk,
+    envelope and chunking tests; sidecar config validation; the sidecar
+    revoke metric); each had an equivalent on the OAuth client in
+    `oauth::xrpc`, or one was added. The bulk-import one-chunk failure message
+    test moved there. The vet-on-the-wire tests (a hostile `siteUrl` or saved
+    URL never reaches the PDS) now capture what the Rust backend sends. The
+    dual-backend loops run Rust only. Three web tests on a production-like
+    URL now use a temporary signing key: a confidential client creates one on
+    boot, and the relative default had put real key material in the working
+    directory.
+  - The image no longer bakes `SIDECAR_TRUSTED_IP_HEADER`, `SIDECAR_HOST`,
+    `SIDECAR_PORT`, `SIDECAR_INTERNAL_URL` or `SIDECAR_DB`: nothing reads
+    them, and a baked value would trip the leftover-variable warning on every
+    start with nothing the operator could unset. The rest of the sidecar
+    leaves the image in step 4 (Dockerfile, entrypoint, Caddy, CI).
 
 ### Changed
 
-- **Rust is the default backend (#311, 0.5.0 step 2).** `Config::default()`,
+- **Rust is the default backend (#311, 0.5.0 step 2).** (Superseded by its
+  removal, above; kept for the history of the test move.) `Config::default()`,
   the container entrypoint and `deploy/teardown.sh` read an unset
   `FEATHERREADER_REPO_BACKEND` as `rust`. `sidecar` still selects the sidecar
   until 0.5.0 removes it. The tests that drove the app through sidecar fakes

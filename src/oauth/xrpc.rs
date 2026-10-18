@@ -914,7 +914,7 @@ mod tests {
     /// budget: the walk must refuse, and must say it kept two.
     #[tokio::test]
     async fn the_live_walk_spends_its_budget_across_pages() {
-        let (bodies, per_page) = crate::atproto::tests::paged_bodies(3, 4096, false);
+        let (bodies, per_page) = crate::atproto::tests::paged_bodies(3, 4096);
         let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
         let port: u16 = base
             .trim_end_matches('/')
@@ -1606,6 +1606,34 @@ mod tests {
             "chunk 3 must NOT be sent"
         );
         assert!(format!("{err:#}").contains("boom"), "{err:#}");
+    }
+
+    /// **A one-call batch that fails reads as it always did.** The progress
+    /// note ("applyWrites call N of M; K of T writes had landed") is for a
+    /// split batch; on a single call there is no progress to report. Moved here
+    /// from the sidecar client's tests when 0.5.0 removed it (#311).
+    ///
+    /// The sidecar's version also required the cause to print ONCE in `{:#}`.
+    /// This client's does not hold that: its context keeps `Display`
+    /// byte-for-byte what it was ("… failed: status 500 (Error: message)")
+    /// while the typed rejection is the source, so the alternate chain names
+    /// the cause twice. That is the trade `send` documents, so this asserts the
+    /// cause is there, not how often.
+    #[tokio::test]
+    async fn a_single_chunk_failure_reads_as_it_always_did() {
+        let (s, pool, _log) = strict_pds(Some(1)).await;
+        let (http, key) = (Client::new(), SigningKey::generate("k"));
+        let err = repo(&http, &pool, &s, &key)
+            .add_subscriptions_bulk(&subs(3))
+            .await
+            .expect_err("refused");
+        let progress = crate::atproto::ApplyWritesIncomplete::of(&err).expect("progress");
+        assert_eq!((progress.landed, progress.in_doubt), (0, 3));
+        assert!(
+            !err.to_string().contains("applyWrites call"),
+            "a one-call batch has no progress to report: {err}"
+        );
+        assert!(err.to_string().contains("boom"), "the cause is lost: {err}");
     }
 
     /// **The byte bound splits a read-state flush well under 200 ops.** Ten

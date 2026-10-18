@@ -17,13 +17,11 @@
 //! - [`feed`]    — polite fetching (conditional GET, backoff), feed-rs parsing,
 //!   and ammonia sanitization.
 //! - [`atproto`] — the atproto identity + PDS record layer (subscriptions,
-//!   folders, saved, batched read-state sync), including the Node sidecar's
-//!   client ([`atproto::SidecarClient`]).
-//! - [`oauth`]   — the Rust-native atproto OAuth client (the `rust` repo
-//!   backend, which production runs).
-//! - [`repo`]    — the one dispatcher every `com.atproto.repo.*` call goes
-//!   through, choosing the sidecar or the Rust client by
-//!   `FEATHERREADER_REPO_BACKEND`.
+//!   folders, saved, batched read-state sync).
+//! - [`oauth`]   — the Rust-native atproto OAuth client, the only one since
+//!   0.5.0 removed the Node sidecar (#311).
+//! - [`repo`]    — the one boundary every `com.atproto.repo.*` call goes
+//!   through, and is timed at.
 //! - [`standard_site`] — reading standard.site publications from their
 //!   authors' repos.
 //! - [`network`] — read-only queries against the *public* atproto network (the
@@ -57,11 +55,11 @@ pub mod web;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use atproto::SidecarClient;
+use anyhow::Context as _;
 use config::Config;
 use store::Pool;
 
-/// One logged-in identity, resolved from the OAuth sidecar and keyed by DID.
+/// One logged-in identity, resolved from the OAuth login and keyed by DID.
 ///
 /// The DID is the primary key for everything local; the handle is carried for
 /// display. This is what the signed session cookie resolves to.
@@ -81,7 +79,7 @@ pub struct Session {
 /// HMAC secret *and* to guess a 256-bit random sid that only exists server-side.
 /// Sessions are therefore also **revocable** (drop the sid → the cookie is dead)
 /// and are cleared on restart (every client re-logs in; the durable OAuth
-/// session still lives in the sidecar's store).
+/// session still lives in `oauth_session`).
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     inner: Arc<RwLock<HashMap<String, Session>>>,
@@ -151,9 +149,8 @@ fn new_session_id() -> String {
 /// Shared application state handed to every axum handler.
 ///
 /// Holds the resolved [`Config`], the SQLite pool, a shared `reqwest::Client`
-/// (feed fetch + sidecar calls), the [`SidecarClient`] (the live atproto
-/// `com.atproto.repo.*` path), and the in-memory [`SessionRegistry`] (DID ↔
-/// handle, resolved via the sidecar's `/internal/session`). It is `Clone` (cheap
+/// (feed fetch, PDS and OAuth calls), the OAuth runtime, and the in-memory
+/// [`SessionRegistry`] (DID ↔ handle, from a completed login). It is `Clone` (cheap
 /// — everything is behind `Arc`/handles) and is cloned into each request. It
 /// lives in the library so both [`web`] and the `featherreader` binary share it.
 #[derive(Clone)]
@@ -162,19 +159,16 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// The per-DID SQLite cache pool.
     pub db: Pool,
-    /// Shared HTTP client (feed fetch + sidecar internal API).
+    /// Shared HTTP client (feed fetch, PDS and OAuth calls).
     pub http: reqwest::Client,
-    /// The atproto OAuth sidecar client — the repo-op path when
-    /// [`Config::repo_backend`] selects `Sidecar`. Production selects `Rust`.
-    pub sidecar: SidecarClient,
     /// DID ↔ handle session registry (cookie-resolved identity).
     pub sessions: SessionRegistry,
     /// Repo-op latency for BOTH backends, for reading the two side by side
     /// across a cutover flip.
     pub metrics: Arc<metrics::RepoMetrics>,
-    /// The Rust OAuth client's runtime. `None` when it could not be built —
-    /// tolerated only while the sidecar is the selected backend, and refused at
-    /// startup otherwise.
+    /// The OAuth client's runtime. Always `Some` from [`AppState::new`], which
+    /// refuses to start without one; an `Option` because handlers and tests
+    /// still read it that way.
     pub oauth: Option<Arc<oauth::runtime::OauthRuntime>>,
     /// What the background loops are doing right now — the poll heartbeat and
     /// the watermark pause. Written by the scheduler, read by `/health` and
@@ -190,44 +184,23 @@ pub struct AppState {
 impl AppState {
     /// Assemble the shared state from config + an initialized store pool.
     ///
-    /// Builds the shared HTTP client and the [`SidecarClient`] from the config's
-    /// [`crate::config::SidecarConfig`], and starts with an empty session
-    /// registry. The binary's `main` calls this after opening the store.
+    /// Builds the shared HTTP client and the OAuth runtime, and starts with an
+    /// empty session registry. The binary's `main` calls this after opening the store.
     pub fn new(config: Config, db: Pool) -> anyhow::Result<Self> {
         let http = build_http_client()?;
 
-        // Built whatever the backend, so a bad OAuth config is caught on every
-        // deploy rather than at the moment the switch is thrown. With the
-        // sidecar selected a failure is only a warning; with the Rust backend
-        // selected it is fatal, because there would be nothing to serve with.
-        let oauth = match oauth::runtime::OauthRuntime::new(&config) {
-            Ok(runtime) => Some(Arc::new(runtime)),
-            Err(err) if config.repo_backend == metrics::Backend::Sidecar => {
-                tracing::warn!(
-                    %err,
-                    "the Rust OAuth runtime could not be built; the sidecar backend is \
-                     unaffected, but FEATHERREADER_REPO_BACKEND=rust would refuse to start"
-                );
-                None
-            }
-            Err(err) => return Err(err.context(
-                "FEATHERREADER_REPO_BACKEND=rust, but the Rust OAuth runtime could not be built",
-            )),
-        };
-        let sidecar = SidecarClient::new(
-            http.clone(),
-            config.sidecar.public_url.clone(),
-            config.sidecar.internal_url.clone(),
-            config.sidecar.internal_secret.clone(),
-        );
+        // Fatal if it cannot be built: it is the only OAuth client and repo
+        // backend since 0.5.0 removed the sidecar (#311), so there would be
+        // nothing to serve with.
+        let oauth = oauth::runtime::OauthRuntime::new(&config)
+            .context("the OAuth runtime could not be built")?;
         Ok(Self {
             config: Arc::new(config),
             db,
             http,
-            sidecar,
             sessions: SessionRegistry::new(),
             metrics: Arc::new(metrics::RepoMetrics::new()),
-            oauth,
+            oauth: Some(Arc::new(oauth)),
             runtime_health: Arc::new(runtime_health::RuntimeHealth::new()),
             sanitize_starvation: &feed::SANITIZE_STARVATION,
         })

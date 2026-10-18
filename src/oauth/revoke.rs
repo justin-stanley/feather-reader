@@ -1102,7 +1102,6 @@ mod tests {
     /// readable. Loopback public URL => a public client, so no key file.
     fn runtime() -> super::super::runtime::OauthRuntime {
         super::super::runtime::OauthRuntime::new(&crate::config::Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: "http://127.0.0.1:8080".into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(KEY.to_string()),
@@ -1423,7 +1422,6 @@ mod tests {
     /// signing key in a per-test temp file rather than the working directory.
     fn confidential_runtime(tag: &str) -> super::super::runtime::OauthRuntime {
         super::super::runtime::OauthRuntime::new(&crate::config::Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: "https://feather-reader.com".into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(KEY.to_string()),
@@ -2058,7 +2056,6 @@ mod tests {
     #[tokio::test]
     async fn a_null_codec_runtime_is_refused_even_when_the_rest_passes() {
         let rt = super::super::runtime::OauthRuntime::new(&crate::config::Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: "https://feather-reader.com".into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: None,

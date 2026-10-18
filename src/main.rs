@@ -6,7 +6,7 @@
 //! 1. Load [`Config`] from the environment (with sane defaults).
 //! 2. Initialize tracing (respecting `RUST_LOG`).
 //! 3. Open + migrate the per-DID SQLite cache via [`store::init`].
-//! 4. Build the shared [`AppState`] (pool + HTTP client + atproto sidecar).
+//! 4. Build the shared [`AppState`] (pool + HTTP client + OAuth runtime).
 //! 5. Spawn the background schedulers — the RSS and publication **pollers**,
 //!    the **read-state flusher**, the sweepers, the adoption probe and the
 //!    metrics flusher — as `tokio` tasks, behind a config flag so tests/dev can
@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use feather_reader::config::Config;
 use feather_reader::{store, web, AppState, VERSION};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 // The background schedulers (pollers, flushers, sweepers, adoption probe) live in
@@ -75,6 +75,17 @@ async fn run() -> Result<()> {
     init_tracing();
 
     info!(version = VERSION, bind = %config.bind, db = %config.db_path.display(), "starting featherreader");
+    // Nothing reads these since 0.5.0 removed the sidecar (#311). A warning,
+    // not a refusal: a stale environment is a sign the upgrade notes went
+    // unread, and they are where the one thing that matters is said.
+    let leftover = feather_reader::config::leftover_sidecar_vars();
+    if !leftover.is_empty() {
+        warn!(
+            vars = ?leftover,
+            "these sidecar variables are set but no longer read: the Node sidecar was \
+             removed in 0.5.0 (see the upgrade notes); unset them"
+        );
+    }
 
     // 3. SQLite cache — open the pool and run embedded migrations.
     let db = store::init(&config)
@@ -107,7 +118,7 @@ async fn run() -> Result<()> {
         Err(err) => return Err(err).context("seeding admin beta_access DIDs"),
     }
 
-    // 4. Shared application state — pool + HTTP client + atproto sidecar +
+    // 4. Shared application state — pool + HTTP client + OAuth runtime +
     //    session registry.
     let bind = config.bind;
     let state = AppState::new(config, db).context("building application state")?;
@@ -847,7 +858,6 @@ mod tests {
     fn confidential_config(dir: &std::path::Path) -> Config {
         Config {
             db_path: dir.join("featherreader.db"),
-            repo_backend: feather_reader::metrics::Backend::Rust,
             public_url: "https://feather-reader.com".into(),
             oauth: feather_reader::config::OauthConfig {
                 encryption_key: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
@@ -996,16 +1006,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A confidential client WITHOUT its key (the sidecar backend, no key file
-    /// on disk — `new` then neither loads nor creates one) cannot sign a single
-    /// client assertion, so it is not fit either.
+    /// A confidential client WITHOUT its key cannot sign a single client
+    /// assertion, so it is not fit either. `new` always loads or creates the
+    /// key since 0.5.0 (#311), so the state is built by hand: the check must
+    /// still refuse it, whatever constructor produced it.
     #[test]
     fn a_confidential_client_without_its_key_is_not_fit() {
         let dir = scratch("nokeyfit");
-        let mut config = confidential_config(&dir);
-        config.repo_backend = feather_reader::metrics::Backend::Sidecar;
-        let rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
-        assert!(rt.client_key.is_none(), "precondition: no key loaded");
+        let config = confidential_config(&dir);
+        let mut rt = feather_reader::oauth::runtime::OauthRuntime::new(&config).unwrap();
+        rt.client_key = None;
         let err = fit_to_revoke(&rt).expect_err("a keyless confidential client was accepted");
         assert!(format!("{err:#}").contains("signing key"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);

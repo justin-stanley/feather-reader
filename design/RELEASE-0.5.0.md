@@ -150,6 +150,13 @@ tests of sidecar code itself (its revoke arm's metric, `SidecarClient`).
 - Delete the sidecar-only tests (backend parsing, sidecar secret refusals,
   `SidecarClient` tests, `spawn_revoke_sidecar`).
 
+**Done** (this PR). `Backend` is kept with one variant: it labels the metric
+rows and `/health`'s `backend:` line. `oauth` on `AppState` is still an
+`Option`, always `Some`, so handlers did not all change in this step. Found on
+the way: with the signing key now always created for a confidential client,
+three web tests on a production-like URL wrote real key material to the
+relative default path; they use a temp key.
+
 ### 4. Remove it from the image, deploy and CI
 
 - **Dockerfile:** drop the node-build stage and the sidecar copy; new runtime
@@ -161,7 +168,11 @@ tests of sidecar code itself (its revoke arm's metric, `SidecarClient`).
 - **`fly.toml`:** drop `FEATHERREADER_REPO_BACKEND` and the `SIDECAR_*` env;
   rewrite the comments.
 - **Teardown:** `deploy/teardown.sh`, `deploy/teardown.md` and
-  `scripts/test-teardown.sh` lose the sidecar revoke path and backend default.
+  `scripts/test-teardown.sh` lose the sidecar revoke path and backend default. Since
+  step 3 the image no longer bakes `SIDECAR_DB`, so teardown skips its
+  sidecar step unless the operator sets it (feather-reader.com's `fly.toml`
+  still does); whether teardown should still wipe a leftover
+  `/data/oauth-sidecar.db` is decided here.
 - **CI:** delete the `sidecar` job and the npm group in `dependabot.yml`; drop
   the npm block in `scripts/ci.sh`; drop CodeQL's `javascript-typescript` leg,
   leaving `rust` (PR #313).

@@ -1,15 +1,10 @@
-//! The one place the two repo backends are chosen between, and timed.
+//! The one place every `com.atproto.repo.*` call the reader makes goes
+//! through, and is timed.
 //!
-//! Every `com.atproto.repo.*` call the reader makes goes through here, so the
-//! cutover is a single `match` rather than a swap at every call site — and,
-//! just as importantly, both backends are measured at the same boundary by the
-//! same wrapper. Timers placed separately on each path would be comparing the
-//! timers.
-//!
-//! The method list mirrors [`crate::atproto::SidecarClient`]'s reader surface
-//! exactly, because that is what `web.rs` already calls. Anything that had to be
-//! reshaped to fit would be a divergence between the two clients, and those
-//! belong in `xrpc.rs` where both can share the fix.
+//! It chose between two backends until 0.5.0 removed the Node sidecar (#311);
+//! the Rust client in `oauth::xrpc` is now the only one. The single boundary
+//! stays: it is where every repo call is measured by the same wrapper, and the
+//! method list is the reader surface `web.rs` calls.
 
 use anyhow::{Context as _, Result};
 
@@ -33,7 +28,7 @@ impl AppState {
 
 impl Repo<'_> {
     fn backend(&self) -> Backend {
-        self.state.config.repo_backend
+        Backend::Rust
     }
 
     /// The Rust client's runtime, or a clear error naming what is missing.
@@ -60,24 +55,13 @@ impl Repo<'_> {
     /// refresh path is exactly what `session()` will do about it. The question
     /// being answered is narrower — is there anything at all to work with, or
     /// is this DID parked until the user signs in again?
-    ///
-    /// **The sidecar arm answers `true` unconditionally**, preserving today's
-    /// behaviour on that backend rather than guessing. The sidecar owns its own
-    /// session store and answering honestly would mean a loopback round trip per
-    /// DID per minute; prod runs `rust`, and that arm is deleted by #18.
     pub async fn has_session(&self, did: &str) -> Result<bool> {
-        match self.backend() {
-            Backend::Sidecar => Ok(true),
-            Backend::Rust => {
-                let found: Option<(i64,)> =
-                    sqlx::query_as("SELECT 1 FROM oauth_session WHERE sub = ?1")
-                        .bind(did)
-                        .fetch_optional(&self.state.db)
-                        .await
-                        .with_context(|| format!("checking for an OAuth session for {did}"))?;
-                Ok(found.is_some())
-            }
-        }
+        let found: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM oauth_session WHERE sub = ?1")
+            .bind(did)
+            .fetch_optional(&self.state.db)
+            .await
+            .with_context(|| format!("checking for an OAuth session for {did}"))?;
+        Ok(found.is_some())
     }
 
     /// Load a usable session for `did`, refreshing only when it is actually
@@ -249,25 +233,19 @@ macro_rules! dispatch {
         $(#[$meta:meta])*
         $vis:vis $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
         label: $label:expr,
-        sidecar: $sidecar:ident,
         rust: $rust:ident
     ) => {
         $(#[$meta])*
         $vis async fn $name(&self, did: &str $(, $arg: $ty)*) -> Result<$ret> {
             timed(&self.state.metrics, self.backend(), $label, async {
-                match self.backend() {
-                    Backend::Sidecar => self.state.sidecar.$sidecar(did $(, $arg)*).await,
-                    Backend::Rust => {
-                        let (session, key) = self.rust_parts(did).await?;
-                        let repo = oauth::xrpc::Repo {
-                            http: &self.state.http,
-                            pool: &self.state.db,
-                            session: &session,
-                            key: &key,
-                        };
-                        repo.$rust($($arg),*).await
-                    }
-                }
+                let (session, key) = self.rust_parts(did).await?;
+                let repo = oauth::xrpc::Repo {
+                    http: &self.state.http,
+                    pool: &self.state.db,
+                    session: &session,
+                    key: &key,
+                };
+                repo.$rust($($arg),*).await
             })
             .await
         }
@@ -279,14 +257,12 @@ macro_rules! dispatch {
     (
         $(#[$meta:meta])*
         $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty,
-        sidecar: $sidecar:ident,
         rust: $rust:ident
     ) => {
         dispatch! {
             $(#[$meta])*
             pub $name ( $( $arg : $ty ),* ) -> $ret,
             label: stringify!($name),
-            sidecar: $sidecar,
             rust: $rust
         }
     };
@@ -298,7 +274,6 @@ impl Repo<'_> {
     dispatch! {
         /// The reader's feed list, in display order.
         list_subscriptions_sorted() -> Vec<(String, Subscription)>,
-        sidecar: list_subscriptions_sorted,
         rust: list_subscriptions_sorted
     }
 
@@ -308,7 +283,6 @@ impl Repo<'_> {
         /// (#149). `list_subscriptions_sorted` is unchanged for every caller
         /// that only displays the list.
         list_subscriptions_with_cids() -> Vec<(String, Option<String>, Subscription)>,
-        sidecar: list_subscriptions_with_cids,
         rust: list_subscriptions_with_cids
     }
 
@@ -316,7 +290,6 @@ impl Repo<'_> {
         /// Raw subscribe. Private: reach it through [`Repo::add_subscription`].
         add_subscription_unvetted(sub: &crate::vetted::VettedSubscription) -> String,
         label: "add_subscription",
-        sidecar: add_subscription,
         rust: add_subscription
     }
 
@@ -331,7 +304,6 @@ impl Repo<'_> {
     dispatch! {
         /// Unsubscribe by rkey.
         remove_subscription(rkey: &str) -> (),
-        sidecar: remove_subscription,
         rust: remove_subscription
     }
 
@@ -343,7 +315,6 @@ impl Repo<'_> {
             swap_record: Option<&str>
         ) -> crate::atproto::WriteResult,
         label: "update_subscription",
-        sidecar: update_subscription,
         rust: update_subscription
     }
 
@@ -365,7 +336,6 @@ impl Repo<'_> {
         /// Raw bulk add. Private: reach it through [`Repo::add_subscriptions_bulk`].
         add_subscriptions_bulk_unvetted(subs: &[crate::vetted::VettedSubscription]) -> Vec<String>,
         label: "add_subscriptions_bulk",
-        sidecar: add_subscriptions_bulk,
         rust: add_subscriptions_bulk
     }
 
@@ -389,7 +359,6 @@ impl Repo<'_> {
     dispatch! {
         /// Folders in display order.
         list_folders_sorted() -> Vec<(String, Folder)>,
-        sidecar: list_folders_sorted,
         rust: list_folders_sorted
     }
 
@@ -397,14 +366,12 @@ impl Repo<'_> {
         /// Folders with the CID each record was listed at, unsorted — the read
         /// half of a rename that puts with `swapRecord` (#268).
         list_folders_with_cids() -> Vec<(String, Option<String>, Folder)>,
-        sidecar: list_folders_with_cids,
         rust: list_folders_with_cids
     }
 
     dispatch! {
         /// Create a folder. Returns its rkey.
         add_folder(folder: &Folder) -> String,
-        sidecar: add_folder,
         rust: add_folder
     }
 
@@ -416,14 +383,12 @@ impl Repo<'_> {
             folder: &Folder,
             swap_record: Option<&str>
         ) -> crate::atproto::WriteResult,
-        sidecar: rename_folder,
         rust: rename_folder
     }
 
     dispatch! {
         /// Delete a folder.
         remove_folder(rkey: &str) -> (),
-        sidecar: remove_folder,
         rust: remove_folder
     }
 
@@ -432,7 +397,6 @@ impl Repo<'_> {
     dispatch! {
         /// Saved items, newest first.
         list_saved_sorted() -> Vec<(String, Saved)>,
-        sidecar: list_saved_sorted,
         rust: list_saved_sorted
     }
 
@@ -440,7 +404,6 @@ impl Repo<'_> {
         /// Raw save. Private: reach it through [`Repo::add_saved`].
         add_saved_unvetted(saved: &crate::vetted::VettedSaved) -> String,
         label: "add_saved",
-        sidecar: add_saved,
         rust: add_saved
     }
 
@@ -461,14 +424,12 @@ impl Repo<'_> {
         /// Saved items in PDS order — the un-star path, which matches by URL and
         /// does not care about display order.
         list_saved() -> Vec<(String, Saved)>,
-        sidecar: list_saved,
         rust: list_saved
     }
 
     dispatch! {
         /// Unsave by rkey.
         remove_saved(rkey: &str) -> (),
-        sidecar: remove_saved,
         rust: remove_saved
     }
 
@@ -477,7 +438,6 @@ impl Repo<'_> {
     dispatch! {
         /// Every read cursor.
         list_read_states() -> Vec<(String, ReadState)>,
-        sidecar: list_read_states,
         rust: list_read_states
     }
 
@@ -486,7 +446,6 @@ impl Repo<'_> {
         /// EXIST, which the typed listers cannot answer: they skip a record
         /// this build cannot parse, and a skipped record reads as a missing one.
         list_all_records(collection: &str) -> Vec<crate::atproto::RecordEntry>,
-        sidecar: list_all_records,
         rust: list_all_records
     }
 
@@ -495,7 +454,6 @@ impl Repo<'_> {
         /// A failure part-way leaves a prefix written; see
         /// [`crate::atproto::ApplyWritesIncomplete`].
         flush_read_states(cursors: &[(String, ReadState, bool)]) -> (),
-        sidecar: flush_read_states,
         rust: flush_read_states
     }
 }
@@ -507,11 +465,10 @@ mod tests {
 
     const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
 
-    async fn state_with(backend: Backend, public_url: &str) -> anyhow::Result<AppState> {
+    async fn state_with(public_url: &str) -> anyhow::Result<AppState> {
         let db = crate::store::init_url("sqlite::memory:").await?;
         AppState::new(
             Config {
-                repo_backend: backend,
                 public_url: public_url.to_string(),
                 oauth: crate::config::OauthConfig {
                     // **A unique path per test, not the default.**
@@ -538,87 +495,72 @@ mod tests {
         )
     }
 
-    /// A state pointed at a mock sidecar, so a repo write actually goes out.
-    async fn sidecar_state(internal_url: &str) -> anyhow::Result<AppState> {
-        let db = crate::store::init_url("sqlite::memory:").await?;
-        AppState::new(
-            Config {
-                repo_backend: Backend::Sidecar,
-                public_url: "http://localhost:8080".to_string(),
-                sidecar: crate::config::SidecarConfig {
-                    public_url: internal_url.to_string(),
-                    internal_url: internal_url.to_string(),
-                    internal_secret: "test-secret".to_string(),
-                },
-                ..Config::default()
-            },
-            db,
-        )
-    }
-
-    /// A sidecar mock that keeps the body of the first repo write it is sent.
+    /// A fake PDS that keeps the body of every repo write it is sent.
     ///
     /// The assertion has to be made on the BYTES ON THE WIRE. Checking the
     /// `Subscription` we passed in would pass just as happily with the vet
-    /// deleted — the record only becomes safe on the way out.
-    async fn spawn_capturing_sidecar() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    /// deleted — the record only becomes safe on the way out. axum hands the
+    /// handler the whole body, so a capture cannot be cut short by a TCP
+    /// segment boundary.
+    async fn spawn_capturing_pds() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse as _;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let sink = seen.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                // **Read until the body is complete, not until the first
-                // syscall returns.** A single `read` gets whatever one TCP
-                // segment carried; if headers and body arrive separately, the
-                // "body" is empty and every `!contains(...)` assertion below
-                // passes for the wrong reason — a false green in the one test
-                // the mutation argument rests on.
-                let mut raw: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 4096];
-                while let Ok(n) = sock.read(&mut chunk).await {
-                    if n == 0 {
-                        break;
-                    }
-                    raw.extend_from_slice(&chunk[..n]);
-                    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
+        // A test hostname routed to the loopback listener: the guarded client
+        // refuses loopback itself.
+        let host = format!("capture-{}.repo.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let sink = sink.clone();
+                async move {
+                    let reply = match uri.path().trim_start_matches("/xrpc/") {
+                        "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord" => {
+                            serde_json::json!({
+                                "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk1",
+                                "cid": "bafyreiabc"
+                            })
+                        }
+                        "com.atproto.repo.applyWrites" => serde_json::json!({ "results": [] }),
+                        other => panic!("the capturing PDS got an unexpected call to {other}"),
                     };
-                    let (head, body) = raw.split_at(split + 4);
-                    let want = String::from_utf8_lossy(head).lines().find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    });
-                    if want.is_none_or(|want| body.len() >= want) {
-                        sink.lock()
-                            .unwrap()
-                            .push(String::from_utf8_lossy(body).to_string());
-                        break;
-                    }
+                    sink.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body).to_string());
+                    axum::Json(reply).into_response()
                 }
-                let body = serde_json::json!({
-                    "ok": true,
-                    "data": {
-                        "uri": "at://did:plc:x/community.lexicon.rss.subscription/rk1",
-                        "cid": "bafyreiabc"
-                    }
-                })
-                .to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{addr}"), seen)
+            });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{host}:{}", addr.port()), seen)
+    }
+
+    /// A state with a live session for [`DID`] at `pds`, so a repo write
+    /// actually goes out.
+    async fn pds_state(pds: &str) -> AppState {
+        let state = state_with("http://localhost:8080").await.expect("state");
+        let runtime = state.oauth.as_deref().expect("oauth runtime");
+        crate::oauth::store::put_session(
+            &state.db,
+            &runtime.codec,
+            &crate::oauth::store::OAuthSession {
+                sub: DID.into(),
+                issuer: "https://auth.invalid".into(),
+                aud: pds.into(),
+                dpop_key_jwk: crate::oauth::keys::SigningKey::generate("session-dpop")
+                    .to_jwk_json()
+                    .unwrap(),
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                token_type: "DPoP".into(),
+                granted_scope: "atproto".into(),
+                expires_at: Some(crate::store::now_unix() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+        state
     }
 
     fn sub_with_site(site: &str) -> Subscription {
@@ -640,8 +582,8 @@ mod tests {
             "  javascript:alert(1)  ",
             "vbscript:msgbox(1)",
         ] {
-            let (url, seen) = spawn_capturing_sidecar().await;
-            let state = sidecar_state(&url).await.expect("sidecar state");
+            let (pds, seen) = spawn_capturing_pds().await;
+            let state = pds_state(&pds).await;
             let sub = sub_with_site(hostile);
 
             let _ = state.repo().add_subscription(DID, &sub).await;
@@ -703,8 +645,8 @@ mod tests {
             "data:text/html;base64,PHNjcmlwdD4=",
             "vbscript:msgbox(1)",
         ] {
-            let (url, seen) = spawn_capturing_sidecar().await;
-            let state = sidecar_state(&url).await.expect("sidecar state");
+            let (pds, seen) = spawn_capturing_pds().await;
+            let state = pds_state(&pds).await;
             let mut saved = Saved::new(hostile, "2026-01-01T00:00:00.000Z");
             saved.title = Some("Hostile".to_string());
 
@@ -723,8 +665,8 @@ mod tests {
     /// The guard must not eat the ordinary case.
     #[tokio::test]
     async fn a_legitimate_site_url_is_published_unchanged() {
-        let (url, seen) = spawn_capturing_sidecar().await;
-        let state = sidecar_state(&url).await.expect("sidecar state");
+        let (pds, seen) = spawn_capturing_pds().await;
+        let state = pds_state(&pds).await;
         let sub = sub_with_site("https://example.com/blog");
 
         let _ = state.repo().add_subscription(DID, &sub).await;
@@ -736,50 +678,6 @@ mod tests {
             "a perfectly good site link was dropped: {}",
             bodies[0]
         );
-    }
-
-    /// **Both arms must record under the SAME operation name.**
-    ///
-    /// The comparison is two rows in one table keyed by (backend, operation). If
-    /// the arms tagged their calls differently — a rename on one side, a typo on
-    /// the other — the table would show two half-populated sets of rows and no
-    /// pair would ever line up. The macro derives the name from the method via
-    /// `stringify!` precisely so this cannot drift, and this pins it.
-    ///
-    /// Neither call can succeed here (there is no sidecar and no session), which
-    /// is the point: the name is recorded either way, and a failed call is what
-    /// the error columns exist to show.
-    #[tokio::test]
-    async fn both_backends_record_under_the_same_operation_name() {
-        let sidecar = state_with(Backend::Sidecar, "http://localhost:8080")
-            .await
-            .expect("sidecar state");
-        let _ = sidecar.repo().list_subscriptions_sorted(DID).await;
-
-        let rust = state_with(Backend::Rust, "http://localhost:8080")
-            .await
-            .expect("rust state");
-        let _ = rust.repo().list_subscriptions_sorted(DID).await;
-
-        let sidecar_rows = sidecar.metrics.snapshot();
-        let rust_rows = rust.metrics.snapshot();
-        let names: Vec<&str> = sidecar_rows
-            .iter()
-            .chain(rust_rows.iter())
-            .map(|row| row.op.as_str())
-            .collect();
-
-        assert_eq!(
-            names.len(),
-            2,
-            "each backend should record exactly one call"
-        );
-        assert_eq!(
-            names[0], names[1],
-            "the two backends tagged the same operation differently, so their rows \
-             can never be compared"
-        );
-        assert_eq!(names[0], "list_subscriptions_sorted");
     }
 
     /// **The three hand-typed metric labels must stay what they say.**
@@ -800,7 +698,7 @@ mod tests {
     /// is recorded either way.
     #[tokio::test]
     async fn the_three_hand_typed_labels_are_what_they_claim() {
-        let state = state_with(Backend::Rust, "http://localhost:8080")
+        let state = state_with("http://localhost:8080")
             .await
             .expect("rust state");
         let sub = Subscription::new("https://example.com/feed.xml", "2026-01-01T00:00:00.000Z");
@@ -837,7 +735,7 @@ mod tests {
     /// A failed call is still recorded — as a FAILURE, not as a fast success.
     #[tokio::test]
     async fn a_failed_call_is_recorded_in_the_error_column() {
-        let state = state_with(Backend::Rust, "http://localhost:8080")
+        let state = state_with("http://localhost:8080")
             .await
             .expect("rust state");
         let result = state.repo().list_subscriptions_sorted(DID).await;
@@ -854,35 +752,26 @@ mod tests {
         assert_eq!(stats.percentile(50.0), None, "no successes, so no p50");
     }
 
-    /// **Selecting the Rust backend with an unusable OAuth config must not boot.**
+    /// **An unusable OAuth config must not boot.**
     ///
     /// The alternative is a server that starts cleanly and then fails every
     /// single repo call at request time — which looks like a PDS outage rather
     /// than a configuration error, on a path the operator has just switched to.
     #[tokio::test]
-    async fn the_rust_backend_refuses_to_start_on_an_unusable_oauth_config() {
+    async fn an_unusable_oauth_config_refuses_to_start() {
         // A public URL with a path is rejected by `ClientConfig::new` (it would
         // publish a doubled client_id).
-        let err = match state_with(Backend::Rust, "https://feather-reader.com/oauth").await {
+        let err = match state_with("https://feather-reader.com/oauth").await {
             Err(err) => err,
-            Ok(_) => panic!("the rust backend booted with an unusable OAuth config"),
+            Ok(_) => panic!("the server booted with an unusable OAuth config"),
         };
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("FEATHERREADER_REPO_BACKEND=rust"),
-            "the error must name the switch that caused it: {rendered}"
+            rendered.contains("the OAuth runtime could not be built"),
+            "the error must say what failed: {rendered}"
         );
     }
 
-    /// The same bad config with the SIDECAR selected still boots: the Rust
-    /// runtime is unused, and refusing to start would block a rollback.
-    #[tokio::test]
-    async fn the_sidecar_backend_still_boots_with_an_unusable_oauth_config() {
-        let state = state_with(Backend::Sidecar, "https://feather-reader.com/oauth")
-            .await
-            .expect("the sidecar path must not be blocked by Rust-only config");
-        assert!(state.oauth.is_none());
-    }
     /// **A refresh that fails in DISCOVERY must be counted.**
     ///
     /// Regression test for the defect a review found in the first version of
@@ -898,7 +787,7 @@ mod tests {
     /// exact situation this work set out to end.
     #[tokio::test]
     async fn a_refresh_that_fails_in_discovery_is_counted() {
-        let state = state_with(Backend::Rust, "https://feather-reader.com")
+        let state = state_with("https://feather-reader.com")
             .await
             .expect("state");
         let runtime = state.oauth.as_deref().expect("oauth runtime");
@@ -943,7 +832,7 @@ mod tests {
     /// keeps the metric meaningful, since `session()` runs on every repo call.
     #[tokio::test]
     async fn a_fresh_session_records_no_refresh() {
-        let state = state_with(Backend::Rust, "https://feather-reader.com")
+        let state = state_with("https://feather-reader.com")
             .await
             .expect("state");
         let runtime = state.oauth.as_deref().expect("oauth runtime");

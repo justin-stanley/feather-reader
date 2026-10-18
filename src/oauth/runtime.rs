@@ -19,7 +19,8 @@ use super::session::RefreshLocks;
 ///
 /// Published in the JWKS and echoed in every client assertion's header, so a
 /// server that has cached our JWKS looks the key up by this. It matches the
-/// sidecar's so a rollback finds the same key under the same name.
+/// Node sidecar's (removed in 0.5.0, #311), so existing key files keep their
+/// name.
 pub const CLIENT_KID: &str = "featherreader-oauth-1";
 
 /// Everything the Rust OAuth client needs that outlives a request.
@@ -32,9 +33,7 @@ pub struct OauthRuntime {
     /// invites a divergence between what we send and what we publish.
     pub client_id: String,
     /// The ES256 client key. `None` for the dev client, which is a public
-    /// client and publishes no JWKS — and for a confidential client whose
-    /// backend is not selected and which has no key file yet, since creating one
-    /// it will never use is key material at rest for nothing.
+    /// client and publishes no JWKS.
     pub client_key: Option<SigningKey>,
     /// How this client authenticates to the authorization server.
     pub auth_method: AuthMethod,
@@ -55,18 +54,11 @@ impl OauthRuntime {
     /// public URL means atproto's localhost development client: a public client
     /// with no JWKS.
     ///
-    /// The signing key is loaded (or created) only for a confidential client
-    /// **that is actually going to use it** — i.e. when the Rust backend is the
-    /// selected one. Two reasons, and the second is the one that bit:
-    ///
-    /// * a dev client is public, so a key there is never used and never
-    ///   published, and later reads as "the key exists, so it must be in play";
-    /// * the runtime is built on EVERY start so configuration errors surface
-    ///   early, including when the sidecar is serving. Creating the key as part
-    ///   of that validation meant a sidecar deployment wrote an ES256 private
-    ///   key it would never use — key material at rest, for nothing. In tests it
-    ///   also meant any `AppState` built with a production-like `public_url`
-    ///   dropped a private key into the working directory.
+    /// The signing key is loaded (or created) only for a confidential client.
+    /// A dev client is public, so a key there would never be used or
+    /// published, and would later read as "the key exists, so it must be in
+    /// play". (Until 0.5.0 it was also skipped while the Node sidecar was the
+    /// selected backend, #311.)
     pub fn new(cfg: &crate::config::Config) -> Result<Self> {
         let dev = is_loopback_url(&cfg.public_url);
         let client = ClientConfig::new(&cfg.public_url, &cfg.oauth.scope, dev)
@@ -76,24 +68,8 @@ impl OauthRuntime {
         let codec = Codec::new(cfg.oauth.encryption_key.as_deref())
             .context("building the at-rest encryption codec")?;
 
-        // CREATION is gated on the backend; LOADING is not.
-        //
-        // Gating both was wrong, and dangerously so: `revoke_everywhere` signs a
-        // user out of BOTH backends on purpose, because after a flip their
-        // tokens can be in either store. With the sidecar selected and a key
-        // already on disk from a previous rust deployment, refusing to load it
-        // left `auth_method` as `private_key_jwt` with no key — so revocation
-        // bailed while the local row was deleted anyway, and the PDS-side
-        // refresh token stayed live forever with no local record left to retry
-        // from. An in-flight rust login completing after a flip died the same
-        // way.
-        //
-        // So: create a key only for the backend that will use it, but adopt one
-        // that already exists whatever the backend.
-        let creates_key = cfg.repo_backend == crate::metrics::Backend::Rust;
-        let key_exists = cfg.oauth.key_path.exists();
         let client_key = match auth_method {
-            AuthMethod::PrivateKeyJwt if creates_key || key_exists => Some(
+            AuthMethod::PrivateKeyJwt => Some(
                 super::keys::load_or_create(Path::new(&cfg.oauth.key_path), &codec, CLIENT_KID)
                     .with_context(|| {
                         format!(
@@ -102,9 +78,8 @@ impl OauthRuntime {
                         )
                     })?,
             ),
-            // Either a public client, or a confidential one whose backend is not
-            // selected AND which has no key on disk to adopt.
-            AuthMethod::PrivateKeyJwt | AuthMethod::None => None,
+            // A public client (dev) signs nothing.
+            AuthMethod::None => None,
         };
 
         Ok(Self {
@@ -210,13 +185,8 @@ mod tests {
 mod key_creation_tests {
     use super::*;
 
-    fn cfg(
-        backend: crate::metrics::Backend,
-        public_url: &str,
-        key_path: &std::path::Path,
-    ) -> crate::config::Config {
+    fn cfg(public_url: &str, key_path: &std::path::Path) -> crate::config::Config {
         crate::config::Config {
-            repo_backend: backend,
             public_url: public_url.to_string(),
             oauth: crate::config::OauthConfig {
                 key_path: key_path.to_path_buf(),
@@ -230,46 +200,15 @@ mod key_creation_tests {
         std::env::temp_dir().join(format!("fr-test-key-{name}-{}.json", std::process::id()))
     }
 
-    /// **Building the runtime must not write a key the deployment will not use.**
-    ///
-    /// The runtime is constructed on every start, whatever the backend, so
-    /// configuration errors surface early. Creating the signing key as part of
-    /// that meant a SIDECAR deployment — the default — wrote an ES256 private
-    /// key it never touches: key material at rest for nothing.
-    ///
-    /// It surfaced as a unit test dropping a private key into the repo root,
-    /// because any `AppState` built with a production-like `public_url` did it.
+    /// A production URL is a confidential client, which needs the key and
+    /// creates it.
     #[test]
-    fn the_sidecar_backend_writes_no_signing_key() {
-        let path = temp_key_path("sidecar");
-        let _ = std::fs::remove_file(&path);
-
-        let runtime = OauthRuntime::new(&cfg(
-            crate::metrics::Backend::Sidecar,
-            "https://feather-reader.com",
-            &path,
-        ))
-        .expect("must build");
-
-        assert!(runtime.client_key.is_none());
-        assert!(
-            !path.exists(),
-            "the sidecar backend wrote a signing key it will never use"
-        );
-    }
-
-    /// The Rust backend on a production URL DOES need the key, and creates it.
-    #[test]
-    fn the_rust_backend_creates_its_signing_key() {
+    fn a_production_deployment_creates_its_signing_key() {
         let path = temp_key_path("rust");
         let _ = std::fs::remove_file(&path);
 
-        let runtime = OauthRuntime::new(&cfg(
-            crate::metrics::Backend::Rust,
-            "https://feather-reader.com",
-            &path,
-        ))
-        .expect("must build");
+        let runtime =
+            OauthRuntime::new(&cfg("https://feather-reader.com", &path)).expect("must build");
 
         assert!(
             runtime.client_key.is_some(),
@@ -279,54 +218,13 @@ mod key_creation_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **An EXISTING key is adopted even when the backend will not create one.**
-    ///
-    /// This is the flip-back case. `revoke_everywhere` signs a user out of both
-    /// backends deliberately, because after a flip their tokens can be in either
-    /// store. Refusing to load a key that is already on disk left the sidecar
-    /// deployment with `private_key_jwt` and no key, so revocation bailed while
-    /// the local row was deleted regardless — the PDS-side refresh token then
-    /// stayed live with nothing left to retry from.
-    #[test]
-    fn an_existing_key_is_adopted_on_the_sidecar_backend() {
-        let path = temp_key_path("adopt");
-        let _ = std::fs::remove_file(&path);
-
-        // A previous rust deployment left a key behind.
-        OauthRuntime::new(&cfg(
-            crate::metrics::Backend::Rust,
-            "https://feather-reader.com",
-            &path,
-        ))
-        .expect("must build");
-        assert!(path.exists(), "precondition: the key was created");
-
-        // Flip back to the sidecar. The key must still be loaded.
-        let runtime = OauthRuntime::new(&cfg(
-            crate::metrics::Backend::Sidecar,
-            "https://feather-reader.com",
-            &path,
-        ))
-        .expect("must build");
-        assert!(
-            runtime.client_key.is_some(),
-            "an existing key was ignored, so rust sessions could never be revoked"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A loopback deployment is a PUBLIC client: no key, on either backend.
+    /// A loopback deployment is a PUBLIC client: no key.
     #[test]
     fn a_loopback_deployment_is_public_and_keyless() {
         let path = temp_key_path("dev");
         let _ = std::fs::remove_file(&path);
 
-        let runtime = OauthRuntime::new(&cfg(
-            crate::metrics::Backend::Rust,
-            "http://localhost:8080",
-            &path,
-        ))
-        .expect("must build");
+        let runtime = OauthRuntime::new(&cfg("http://localhost:8080", &path)).expect("must build");
 
         assert_eq!(runtime.auth_method, AuthMethod::None);
         assert!(runtime.client_key.is_none());

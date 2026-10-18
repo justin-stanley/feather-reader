@@ -1,11 +1,9 @@
 //! The browser-facing halves of the OAuth flow: starting a login and finishing
 //! one.
 //!
-//! This is the part of the cutover that **inverts** rather than swapping. Under
-//! the sidecar the app redirects to *its* `/login`, the sidecar owns the
-//! callback, and the app receives a one-shot `session_id` to exchange for an
-//! identity. Here the app owns both ends: it performs PAR itself, and the PDS
-//! redirects the browser straight back to the app with a `code`.
+//! The app owns both ends: it performs PAR itself, and the PDS redirects the
+//! browser straight back to the app with a `code`. (The Node sidecar, removed
+//! in 0.5.0, owned the callback and handed the app a one-shot `session_id`.)
 //!
 //! The logic lives here rather than in `web.rs` so it can be tested without an
 //! HTTP server, and so the handler stays a thin shell that does cookies and
@@ -899,7 +897,6 @@ mod tests {
     /// A runtime serving `public_url`, with the same codec key as the pool.
     fn runtime_at(public_url: &str) -> crate::oauth::runtime::OauthRuntime {
         crate::oauth::runtime::OauthRuntime::new(&crate::config::Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: public_url.into(),
             oauth: crate::config::OauthConfig {
                 encryption_key: Some(TEST_KEY.to_string()),

@@ -1498,10 +1498,9 @@ pub(crate) mod tests {
         std::panic::resume_unwind(Box::new("fake PDS hung up"))
     }
 
-    /// Serve `fake` as BOTH a sidecar (`/internal/repo`) and a PDS (`/xrpc/*`),
-    /// so one fixture drives either backend. Returns the sidecar base URL and
-    /// the PDS audience a session should carry.
-    async fn serve_fake(fake: Arc<Mutex<FakeRepo>>) -> (String, String) {
+    /// Serve `fake` as a PDS (`/xrpc/*`). Returns the audience a session
+    /// should carry.
+    async fn serve_fake(fake: Arc<Mutex<FakeRepo>>) -> String {
         use axum::http::StatusCode;
         use axum::response::IntoResponse as _;
 
@@ -1526,54 +1525,16 @@ pub(crate) mod tests {
                 };
                 let mut fake = fake.lock().unwrap();
                 match parts.uri.path() {
-                    "/internal/repo" => {
-                        let req: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-                        match req["action"].as_str() {
-                            Some("list") => {
-                                let page = fake.page(
-                                    req["limit"].as_u64().map(|l| l as usize),
-                                    req["cursor"].as_str(),
-                                );
-                                if fake.list_refused(req["cursor"].as_str()) {
-                                    return reply(
-                                        503,
-                                        serde_json::json!({ "ok": false, "error": "PartitionUnavailable", "status": 503 }),
-                                    );
-                                }
-                                reply(200, serde_json::json!({ "ok": true, "data": page }))
-                            }
-                            Some("applyWrites") => {
-                                match fake.apply(req["writes"].as_array().unwrap()) {
-                                    Err(f) if f.status == HANG_UP.status => {
-                                        drop(fake);
-                                        hang_up()
-                                    }
-                                    Ok(()) => {
-                                        reply(200, serde_json::json!({ "ok": true, "data": {} }))
-                                    }
-                                    // The sidecar's envelope, carrying the PDS's
-                                    // status and error name through.
-                                    Err(f) => reply(
-                                        f.status,
-                                        serde_json::json!({
-                                            "ok": false,
-                                            "error": f.error,
-                                            "message": "Internal Server Error",
-                                            "status": f.status,
-                                        }),
-                                    ),
-                                }
-                            }
-                            other => panic!("unexpected sidecar action {other:?}"),
-                        }
-                    }
                     "/xrpc/com.atproto.repo.listRecords" => {
                         let page = fake.page(
                             query.get("limit").and_then(|l| l.parse().ok()),
                             query.get("cursor").map(String::as_str),
                         );
                         if fake.list_refused(query.get("cursor").map(String::as_str)) {
-                            return reply(503, serde_json::json!({ "error": "PartitionUnavailable" }));
+                            return reply(
+                                503,
+                                serde_json::json!({ "error": "PartitionUnavailable" }),
+                            );
                         }
                         reply(200, page)
                     }
@@ -1599,23 +1560,17 @@ pub(crate) mod tests {
             }
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), format!("http://{host}:{port}"))
+        format!("http://{host}:{port}")
     }
 
-    /// An `AppState` on `backend`, pointed at the fake — the sidecar through its
-    /// internal URL, the Rust client through a live session whose `aud` is it.
-    pub(crate) async fn state_on(backend: Backend, fake: &Arc<Mutex<FakeRepo>>) -> AppState {
-        let (sidecar, aud) = serve_fake(Arc::clone(fake)).await;
+    /// An `AppState` on `backend` (Rust, the only one), with a live session
+    /// whose `aud` is the fake.
+    pub(crate) async fn state_on(_backend: Backend, fake: &Arc<Mutex<FakeRepo>>) -> AppState {
+        let aud = serve_fake(Arc::clone(fake)).await;
         let db = store::init_url("sqlite::memory:").await.unwrap();
         let state = AppState::new(
             crate::config::Config {
-                repo_backend: backend,
                 public_url: "http://localhost:8080".into(),
-                sidecar: crate::config::SidecarConfig {
-                    public_url: sidecar.clone(),
-                    internal_url: sidecar,
-                    internal_secret: "test-secret".into(),
-                },
                 oauth: crate::config::OauthConfig {
                     // Per test, never the relative default — see `repo::tests`.
                     key_path: std::env::temp_dir().join(format!(
@@ -1631,7 +1586,7 @@ pub(crate) mod tests {
             db,
         )
         .unwrap();
-        if backend == Backend::Rust {
+        {
             let runtime = state.oauth.as_deref().expect("oauth runtime");
             crate::oauth::store::put_session(
                 &state.db,
@@ -1830,10 +1785,9 @@ pub(crate) mod tests {
         fake.lock().unwrap().records[&read_state_rkey(&feed(i))]["readIds"].clone()
     }
 
-    /// The backends these run on: both, while `sidecar` can still be selected.
-    /// Rust is the default (#311); this drops to Rust when 0.5.0 removes the
-    /// sidecar, with [`serve_fake`]'s sidecar half.
-    const BACKENDS: [Backend; 2] = [Backend::Sidecar, Backend::Rust];
+    /// The backends these run on: Rust, the only one since 0.5.0 removed the
+    /// sidecar (#311). Kept as a list because the assertions name the backend.
+    const BACKENDS: [Backend; 1] = [Backend::Rust];
 
     /// **(1) A lost success response converges.** The applyWrites that created
     /// the record landed, but its answer never arrived, so `pds_created` is still

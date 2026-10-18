@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Which repo implementation served a call.
+/// Which repo implementation served a call. One since 0.5.0 removed the Node
+/// sidecar (#311); kept as a type because it labels every metric row and the
+/// `/health` `backend:` line, which monitors match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Backend {
-    /// The Node `@atproto/oauth-client` sidecar.
-    Sidecar,
     /// The Rust-native OAuth client.
     Rust,
 }
@@ -28,8 +28,9 @@ impl Backend {
     /// version does not know, so a row from a newer build is skipped rather
     /// than failing the whole table.
     pub fn parse(raw: &str) -> Option<Self> {
+        // `sidecar` rows, persisted before 0.5.0, are skipped like any other
+        // backend this version does not know.
         match raw {
-            "sidecar" => Some(Backend::Sidecar),
             "rust" => Some(Backend::Rust),
             _ => None,
         }
@@ -37,7 +38,6 @@ impl Backend {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Backend::Sidecar => "sidecar",
             Backend::Rust => "rust",
         }
     }
@@ -463,32 +463,6 @@ mod tests {
         assert_eq!(stats.percentile(100.0), Some(WINDOW as u64 + 9));
     }
 
-    /// Both backends land in one table under the same operation name, which is
-    /// what makes the two rows comparable.
-    #[test]
-    fn the_two_backends_are_recorded_side_by_side() {
-        let metrics = RepoMetrics::new();
-        metrics.record(Backend::Sidecar, "list_subscriptions", 5_000, true);
-        metrics.record(Backend::Rust, "list_subscriptions", 2_000, true);
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.len(), 2);
-        let sidecar = snapshot
-            .iter()
-            .find(|r| r.backend == Backend::Sidecar)
-            .expect("the sidecar row");
-        let rust = snapshot
-            .iter()
-            .find(|r| r.backend == Backend::Rust)
-            .expect("the rust row");
-        assert_eq!(
-            sidecar.op, rust.op,
-            "the same operation name, or the rows cannot be compared"
-        );
-        assert_eq!(sidecar.stats.percentile(50.0), Some(5_000));
-        assert_eq!(rust.stats.percentile(50.0), Some(2_000));
-    }
-
     /// An absent measurement renders as `-`, never `0.0`. A zero in a latency
     /// column is indistinguishable from "the fastest thing here" at a glance,
     /// which is the wrong reading of "never succeeded".
@@ -541,48 +515,35 @@ mod tests {
         crate::store::init_url("sqlite::memory:").await.unwrap()
     }
 
-    /// **The whole point.** A backend flip is a RESTART, so the outgoing
-    /// backend's numbers exist only if they were written down. Two processes
-    /// are simulated by two `RepoMetrics` sharing one database, which is exactly
-    /// what a flip produces.
-    ///
-    /// Without persistence the table can only ever show the backend currently
-    /// running, which is not a comparison.
+    /// **Rows a release before 0.5.0 wrote under `sidecar` are skipped, not
+    /// fatal** (#311). An upgraded database still holds them; the table must
+    /// read past them rather than fail, and must not credit them to Rust.
     #[tokio::test]
-    async fn a_backend_flip_keeps_the_earlier_backends_rows() {
+    async fn rows_persisted_under_the_removed_sidecar_backend_are_skipped() {
         let pool = pool().await;
-
-        // Process 1: the sidecar backend serves some traffic.
         let before = RepoMetrics::new();
         for _ in 0..5 {
-            before.record(Backend::Sidecar, "list_subscriptions_sorted", 9_000, true);
+            before.record(Backend::Rust, "list_subscriptions_sorted", 9_000, true);
+            before.record(Backend::Rust, "add_subscription", 4_000, true);
         }
         flush(&before, &pool, 1_700_000_000).await.unwrap();
-
-        // ... the operator flips the flag and restarts. New process, new table.
-        let after = RepoMetrics::new();
-        for _ in 0..5 {
-            after.record(Backend::Rust, "list_subscriptions_sorted", 3_000, true);
-        }
-        flush(&after, &pool, 1_700_000_100).await.unwrap();
-
-        assert_eq!(
-            after.snapshot().len(),
-            1,
-            "in-process memory only ever holds the running backend"
-        );
+        // What 0.4.x wrote for the sidecar backend: the same shape, its name.
+        sqlx::query("UPDATE repo_timing SET backend = 'sidecar' WHERE op = 'add_subscription'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE repo_timing_total SET backend = 'sidecar' WHERE op = 'add_subscription'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let rows = persisted_rows(&pool).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "both backends must survive the flip: {rows:?}"
-        );
-        let sidecar = rows.iter().find(|r| r.backend == Backend::Sidecar).unwrap();
-        let rust = rows.iter().find(|r| r.backend == Backend::Rust).unwrap();
-        assert_eq!(sidecar.stats.percentile(50.0), Some(9_000));
-        assert_eq!(rust.stats.percentile(50.0), Some(3_000));
-        assert_eq!(sidecar.op, rust.op, "rows must be comparable by operation");
+        assert_eq!(rows.len(), 1, "the sidecar row was not skipped: {rows:?}");
+        assert_eq!(rows[0].backend, Backend::Rust);
+        assert_eq!(rows[0].op, "list_subscriptions_sorted");
+        assert_eq!(rows[0].stats.percentile(50.0), Some(9_000));
     }
 
     /// Successes and failures are timed apart in the DATABASE too, not just in
@@ -694,9 +655,9 @@ mod tests {
     /// which would put another deployment's numbers in your comparison.
     #[test]
     fn an_unknown_backend_name_is_not_guessed() {
-        assert_eq!(Backend::parse("sidecar"), Some(Backend::Sidecar));
         assert_eq!(Backend::parse("rust"), Some(Backend::Rust));
-        for unknown in ["", "RUST", "postgres", "rust "] {
+        // `sidecar`, which 0.4.x persisted, is unknown since 0.5.0 (#311).
+        for unknown in ["", "RUST", "postgres", "rust ", "sidecar"] {
             assert_eq!(Backend::parse(unknown), None, "guessed at {unknown:?}");
         }
     }

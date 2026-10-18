@@ -44,24 +44,23 @@
 //!
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
-//! | `FEATHERREADER_REPO_BACKEND`      | `rust`              | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
+//! | `FEATHERREADER_REPO_BACKEND`      | `rust`              | Accepted for compatibility: `rust` is the only backend since 0.5.0 removed the Node sidecar (#311). `sidecar` FAILS startup with a message saying so, and any other value fails as it always has: a configuration that no longer means what the operator thinks must not boot quietly. |
 //! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — pasted into the subscribe form (a handle is resolved to its DID), imported via OPML, or written by another client. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
-//! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
-//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
+//! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the `enc.v1` format the removed Node sidecar wrote, kept so existing key files still load (#311). |
+//! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned: it is the key derivation every stored secret was sealed with), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
 //! | `FEATHERREADER_PLC_DIRECTORY`     | `https://plc.directory` | Directory used to resolve `did:plc` documents. |
 //! | `FEATHERREADER_OAUTH_SCOPE`       | `atproto transition:generic` | Scope requested at login. Part of the dev `client_id`, so changing it changes the client's identity in dev. |
 //!
-//! The atproto OAuth sidecar (`@atproto/oauth-client-node`) is configured with a
-//! second small block — the base URL the Rust server reaches it on and the shared
-//! secret gating its internal API (see [`SidecarConfig`]):
+//! Sessions:
 //!
 //! | Variable                       | Default                   | Meaning |
 //! |--------------------------------|---------------------------|---------|
-//! | `SIDECAR_PUBLIC_URL`           | `http://127.0.0.1:8081`   | Public base URL of the OAuth sidecar (its browser-facing `/login`, plus the OAuth `client_id`/`redirect_uri`). |
-//! | `SIDECAR_INTERNAL_URL`         | *(= `SIDECAR_PUBLIC_URL`)* | Loopback base URL the Rust server reaches the sidecar's `/internal/*` API on. Defaults to the public URL for single-URL local dev. |
-//! | `SIDECAR_INTERNAL_SECRET`      | *(dev fallback)*          | Shared `X-Internal-Secret` for the sidecar's `/internal/*` API. |
 //! | `FEATHERREADER_COOKIE_SECRET`  | *(dev fallback)*          | HMAC key used to sign the session cookie. |
-//! | `FEATHERREADER_DEV_DID`        | *(unset)*                 | When set, a request with no session cookie acts as this DID (local runs without the sidecar). |
+//! | `FEATHERREADER_DEV_DID`        | *(unset)*                 | When set, a request with no session cookie acts as this DID (local runs without a login). |
+//!
+//! The sidecar's `SIDECAR_PUBLIC_URL`, `SIDECAR_INTERNAL_URL` and
+//! `SIDECAR_INTERNAL_SECRET` are no longer read (#311); the server warns at
+//! boot if any is still set, so a stale environment is noticed.
 //!
 //! `FEATHERREADER_BIND` also accepts the design's `FEATHERREADER_ADDR` spelling
 //! as a fallback for compatibility.
@@ -170,25 +169,16 @@ pub struct Config {
     /// crash. `0` disables the watermark. From `FEATHERREADER_DB_SIZE_WATERMARK_BYTES`,
     /// default 2 GiB.
     pub db_size_watermark_bytes: i64,
-    /// The atproto OAuth sidecar wiring (base URL + shared internal secret).
-    pub sidecar: SidecarConfig,
-    /// The Rust-native OAuth client's own wiring. Read whatever the backend, so
-    /// a misconfiguration is caught at startup rather than at the moment the
-    /// switch is thrown.
+    /// The Rust-native OAuth client's wiring.
     pub oauth: OauthConfig,
     /// HMAC key used to sign the session cookie. In production this MUST be set
     /// (`FEATHERREADER_COOKIE_SECRET`); a stable dev fallback is used otherwise
     /// so local runs work without configuration.
     pub cookie_secret: String,
     /// Optional dev-only DID: when set, a request with no valid session cookie
-    /// is served as this DID (local runs without the OAuth sidecar). Unset in a
+    /// is served as this DID (local runs without a login). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
-    /// Which repo implementation serves `com.atproto.repo.*`. Defaults to Rust
-    /// (#311): an unset variable selected the sidecar, whose OAuth client guards
-    /// none of its fetches (#258). A production-like Rust instance refuses to
-    /// start without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`.
-    pub repo_backend: crate::metrics::Backend,
     /// Whether an `at://` standard.site publication subscription may be
     /// **stored** — pasted into the subscribe form (a handle is resolved to its
     /// DID first), imported via OPML, or written by another client.
@@ -208,8 +198,8 @@ pub struct Config {
     pub resolver_base: String,
     /// Shared bearer secret gating the headless bot mint endpoint (`POST
     /// /bot/claims`), sent by the follow→invite bot as `X-Bot-Secret`. When empty
-    /// the endpoint is DISABLED (503) — a bot can't mint. Like the cookie/sidecar
-    /// secrets it MUST be set on a production-like instance (fail-loud at boot);
+    /// the endpoint is DISABLED (503) — a bot can't mint. Like the cookie secret,
+    /// it MUST be set on a production-like instance (fail-loud at boot);
     /// on a loopback/dev instance it stays unset so `/bot/claims` is simply off
     /// until an operator opts in. From `FEATHERREADER_BOT_SECRET`.
     pub bot_secret: Option<String>,
@@ -241,41 +231,16 @@ pub struct Config {
     pub show_adoption: bool,
 }
 
-/// Configuration for the atproto OAuth sidecar (`@atproto/oauth-client-node`).
-///
-/// The Rust server drives the sidecar over two surfaces:
-/// * the **public** `${public_url}/login` URL the browser is redirected to (and
-///   which anchors the sidecar's OAuth `client_id`/`redirect_uri`), and
-/// * the **internal** `${internal_url}/internal/*` API (session lookup + the authed
-///   `com.atproto.repo.*` proxy), gated by the shared [`SidecarConfig::internal_secret`] sent as
-///   the `X-Internal-Secret` header.
-///
-/// The two URLs differ in a split deployment (public = the edge origin, internal =
-/// a loopback address the app reaches the sidecar on); they collapse to the same
-/// value in single-URL local dev.
-#[derive(Debug, Clone)]
-pub struct SidecarConfig {
-    /// Public base URL of the sidecar (no trailing slash), e.g.
-    /// `https://feather-reader.com/oauth`. Anchors the browser `/login` redirect.
-    pub public_url: String,
-    /// Loopback base URL for the sidecar's `/internal/*` API (no trailing slash),
-    /// e.g. `http://127.0.0.1:8081`. Defaults to `public_url` in single-URL dev.
-    pub internal_url: String,
-    /// Shared secret for the sidecar's internal API (`X-Internal-Secret`).
-    pub internal_secret: String,
-}
-
 /// Wiring for the Rust-native OAuth client.
 #[derive(Debug, Clone)]
 pub struct OauthConfig {
     /// Path to the client's ES256 signing key. Encrypted at rest with
-    /// `encryption_key`, in the SAME `enc.v1` format the sidecar writes, so the
-    /// two can share one file and a rollback finds the key it expects.
+    /// `encryption_key`, in the `enc.v1` format the Node sidecar used to write:
+    /// kept, because existing key files are in it (#311).
     pub key_path: PathBuf,
     /// Passphrase for the at-rest encryption of the signing key and the stored
     /// sessions. `None` leaves them in PLAINTEXT, which `validate_secrets`
-    /// refuses on a production-like instance when the Rust backend is selected
-    /// — that is the only configuration in which these tables are written.
+    /// refuses on a production-like instance.
     pub encryption_key: Option<String>,
     /// The PLC directory used to resolve `did:plc` documents.
     pub plc_directory: String,
@@ -288,7 +253,7 @@ pub struct OauthConfig {
 const DEFAULT_PLC_DIRECTORY: &str = "https://plc.directory";
 
 /// The scope the reader needs: `atproto` for identity, `transition:generic` for
-/// the `com.atproto.repo.*` writes. Matches the sidecar's.
+/// the `com.atproto.repo.*` writes.
 const DEFAULT_OAUTH_SCOPE: &str = "atproto transition:generic";
 
 impl Default for OauthConfig {
@@ -301,13 +266,6 @@ impl Default for OauthConfig {
         }
     }
 }
-
-/// The sidecar's own dev fallback for the shared secret (matches the sidecar's
-/// `dev-internal-secret-change-me`) so a fully-local dev stack works untouched.
-const DEV_INTERNAL_SECRET: &str = "dev-internal-secret-change-me";
-
-/// The default sidecar base URL — loopback, matching the sidecar's own default.
-const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8081";
 
 /// A stable, clearly-marked dev cookie key. Overridden by
 /// `FEATHERREADER_COOKIE_SECRET` in any real deployment.
@@ -322,45 +280,36 @@ const DEFAULT_CLAIM_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 /// per day is the entire network cost of the feature.
 const DEFAULT_ADOPTION_INTERVAL: Duration = Duration::from_secs(86_400);
 
-impl Default for SidecarConfig {
-    fn default() -> Self {
-        Self {
-            public_url: DEFAULT_SIDECAR_URL.to_string(),
-            internal_url: DEFAULT_SIDECAR_URL.to_string(),
-            internal_secret: DEV_INTERNAL_SECRET.to_string(),
-        }
-    }
-}
-
-impl SidecarConfig {
-    /// The sidecar's public `/login` URL (the browser redirect target).
-    pub fn login_url(&self) -> String {
-        format!("{}/login", self.public_url)
-    }
-
-    /// The sidecar's `/internal/session/:id` URL (loopback internal API).
-    pub fn session_url(&self, session_id: &str) -> String {
-        format!("{}/internal/session/{}", self.internal_url, session_id)
-    }
-
-    /// The sidecar's `/internal/repo` URL (the authed `com.atproto.repo.*` proxy).
-    pub fn repo_url(&self) -> String {
-        format!("{}/internal/repo", self.internal_url)
-    }
-}
-
-/// Parse the cutover switch. Unknown values are an ERROR rather than a silent
-/// fall back to the default: a typo in `FEATHERREADER_REPO_BACKEND=rsut` that
-/// quietly kept the sidecar live would make the whole comparison a measurement
-/// of the sidecar against itself.
-fn parse_repo_backend(raw: &str) -> Result<crate::metrics::Backend> {
+/// Check `FEATHERREADER_REPO_BACKEND`, which selects nothing since 0.5.0
+/// removed the sidecar (#311). `rust` is accepted. `sidecar` is REFUSED rather
+/// than quietly served as Rust: that instance's readers are signed in to the
+/// sidecar's store, and its operator must learn the backend changed before they
+/// find everyone logged out. Any other value is refused, as it always was.
+fn check_repo_backend(raw: &str) -> Result<()> {
     match raw.trim() {
-        "sidecar" => Ok(crate::metrics::Backend::Sidecar),
-        "rust" => Ok(crate::metrics::Backend::Rust),
-        other => anyhow::bail!(
-            "FEATHERREADER_REPO_BACKEND: expected \"sidecar\" or \"rust\", got {other:?}"
+        "rust" => Ok(()),
+        "sidecar" => anyhow::bail!(
+            "FEATHERREADER_REPO_BACKEND=sidecar: the Node OAuth sidecar was removed in \
+             FeatherReader 0.5.0, and Rust is the only backend. Unset the variable (or set \
+             it to \"rust\") and set FEATHERREADER_OAUTH_ENCRYPTION_KEY. Every reader signs \
+             in again once; see the 0.5.0 upgrade notes in CHANGELOG.md."
         ),
+        other => anyhow::bail!("FEATHERREADER_REPO_BACKEND: expected \"rust\", got {other:?}"),
     }
+}
+
+/// The sidecar's variables that are still set, though nothing reads them since
+/// 0.5.0 (#311). The caller warns once at boot: a stale environment is a sign
+/// the operator has not read the upgrade notes, not a reason to refuse.
+pub fn leftover_sidecar_vars() -> Vec<&'static str> {
+    [
+        "SIDECAR_PUBLIC_URL",
+        "SIDECAR_INTERNAL_URL",
+        "SIDECAR_INTERNAL_SECRET",
+    ]
+    .into_iter()
+    .filter(|v| env::var_os(v).is_some())
+    .collect()
 }
 
 impl Default for Config {
@@ -384,10 +333,8 @@ impl Default for Config {
             max_feeds_global: 10_000,
             max_entries_per_feed: 2_000,
             db_size_watermark_bytes: 2 * 1024 * 1024 * 1024,
-            sidecar: SidecarConfig::default(),
             oauth: OauthConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
-            repo_backend: crate::metrics::Backend::Rust,
             // Off by default. The flag gates STORING an at:// feed; a stored
             // publication is polled whatever it says (see `feed::FeedKind`).
             standard_site: false,
@@ -549,23 +496,6 @@ impl Config {
             None => defaults.db_size_watermark_bytes,
         };
 
-        // --- atproto OAuth sidecar --------------------------------------
-        let sidecar_url = env_opt("SIDECAR_PUBLIC_URL")
-            .map(|u| u.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| defaults.sidecar.public_url.clone());
-        // The internal API is reached over loopback in a split deployment; it
-        // falls back to the resolved public URL so single-URL local dev works.
-        let internal_url = env_opt("SIDECAR_INTERNAL_URL")
-            .map(|u| u.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| sidecar_url.clone());
-        let internal_secret = env_opt("SIDECAR_INTERNAL_SECRET")
-            .unwrap_or_else(|| defaults.sidecar.internal_secret.clone());
-        let sidecar = SidecarConfig {
-            public_url: sidecar_url,
-            internal_url,
-            internal_secret,
-        };
-
         let cookie_secret = env_opt("FEATHERREADER_COOKIE_SECRET")
             .unwrap_or_else(|| defaults.cookie_secret.clone());
 
@@ -625,10 +555,9 @@ impl Config {
             scope: env_opt("FEATHERREADER_OAUTH_SCOPE").unwrap_or(defaults.oauth.scope),
         };
 
-        let repo_backend = match env_opt("FEATHERREADER_REPO_BACKEND") {
-            Some(raw) => parse_repo_backend(&raw)?,
-            None => defaults.repo_backend,
-        };
+        if let Some(raw) = env_opt("FEATHERREADER_REPO_BACKEND") {
+            check_repo_backend(&raw)?;
+        }
 
         let standard_site = parse_standard_site(
             env_opt("FEATHERREADER_STANDARD_SITE").as_deref(),
@@ -644,7 +573,6 @@ impl Config {
 
         let config = Self {
             oauth,
-            repo_backend,
             standard_site,
             bind,
             db_path,
@@ -662,7 +590,6 @@ impl Config {
             max_feeds_global,
             max_entries_per_feed,
             db_size_watermark_bytes,
-            sidecar,
             cookie_secret,
             dev_did,
             resolver_base,
@@ -750,55 +677,26 @@ impl Config {
             &self.cookie_secret,
             DEV_COOKIE_SECRET,
         )?;
-        check_secret(
-            "SIDECAR_INTERNAL_SECRET",
-            &self.sidecar.internal_secret,
-            DEV_INTERNAL_SECRET,
-        )?;
         // The bot secret is OPTIONAL (unset => `/bot/claims` disabled, which is a
         // safe default). But if it IS set on a production-like instance it must be
         // strong — a weak/short shared bearer would let anyone mint claim codes.
         if let Some(bot_secret) = &self.bot_secret {
             check_secret("FEATHERREADER_BOT_SECRET", bot_secret, "")?;
         }
-        // With the Rust backend live, `oauth_session` holds every user's access
-        // token, refresh token and DPoP PRIVATE KEY. An unset encryption key
-        // makes the codec a no-op and leaves all three in the clear in SQLite —
-        // on the same mounted volume as the feed cache, and in every snapshot
-        // and backup of it. Gated on the backend because the sidecar path never
-        // writes these tables, and blocking a rollback over a key that path does
-        // not read would be the wrong failure.
-        if self.repo_backend == crate::metrics::Backend::Rust {
-            match self.oauth.encryption_key.as_deref() {
-                Some(key) => check_secret("FEATHERREADER_OAUTH_ENCRYPTION_KEY", key, "")?,
-                None => anyhow::bail!(
-                    "FEATHERREADER_REPO_BACKEND=rust on a production-like instance requires \
-                     FEATHERREADER_OAUTH_ENCRYPTION_KEY: without it every stored access token, \
-                     refresh token and DPoP private key is written to SQLite in plaintext. \
-                     Set it to a random secret of at least {MIN_SECRET_BYTES} bytes."
-                ),
-            }
+        // `oauth_session` holds every user's access token, refresh token and
+        // DPoP PRIVATE KEY. An unset encryption key makes the codec a no-op and
+        // leaves all three in the clear in SQLite — on the same mounted volume
+        // as the feed cache, and in every snapshot and backup of it.
+        match self.oauth.encryption_key.as_deref() {
+            Some(key) => check_secret("FEATHERREADER_OAUTH_ENCRYPTION_KEY", key, "")?,
+            None => anyhow::bail!(
+                "a production-like instance requires FEATHERREADER_OAUTH_ENCRYPTION_KEY: \
+                 without it every stored access token, refresh token and DPoP private key \
+                 is written to SQLite in plaintext. Set it to a random secret of at least \
+                 {MIN_SECRET_BYTES} bytes."
+            ),
         }
 
-        // Split-deploy footgun: on a production-like instance, if the sidecar's
-        // INTERNAL base equals its PUBLIC base and that base is non-loopback, the
-        // Rust server would send the `X-Internal-Secret` + all session/repo
-        // traffic to the PUBLIC edge URL over the network (SIDECAR_INTERNAL_URL
-        // was left unset and fell back to SIDECAR_PUBLIC_URL). The canonical
-        // container bakes SIDECAR_INTERNAL_URL to loopback; a bare-binary deploy
-        // must set it explicitly. Refuse to boot rather than leak the secret.
-        if self.sidecar.internal_url == self.sidecar.public_url
-            && public_url_is_non_loopback(&self.sidecar.public_url)
-        {
-            anyhow::bail!(
-                "SIDECAR_INTERNAL_URL is unset (defaulting to the public \
-                 SIDECAR_PUBLIC_URL '{}') on a production-like instance: the internal \
-                 API secret and all session/repo traffic would traverse the public \
-                 network. Set SIDECAR_INTERNAL_URL to the sidecar's loopback/private \
-                 address (e.g. http://127.0.0.1:8081).",
-                self.sidecar.public_url
-            );
-        }
         Ok(())
     }
 
@@ -1170,14 +1068,8 @@ mod tests {
     #[test]
     fn a_production_rust_backend_refuses_to_boot_without_an_encryption_key() {
         let cfg = Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: "https://feather-reader.com".into(),
             cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
-            sidecar: SidecarConfig {
-                internal_secret: "a-long-enough-production-internal-secret".into(),
-                internal_url: "http://127.0.0.1:8081".into(),
-                ..SidecarConfig::default()
-            },
             oauth: OauthConfig {
                 encryption_key: None,
                 ..OauthConfig::default()
@@ -1194,42 +1086,13 @@ mod tests {
         );
     }
 
-    /// The SIDECAR backend is unaffected: it stores nothing in these tables, and
-    /// blocking a rollback over a key that path never reads would be the wrong
-    /// failure.
-    #[test]
-    fn the_sidecar_backend_boots_without_an_oauth_encryption_key() {
-        let cfg = Config {
-            repo_backend: crate::metrics::Backend::Sidecar,
-            public_url: "https://feather-reader.com".into(),
-            cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
-            sidecar: SidecarConfig {
-                internal_secret: "a-long-enough-production-internal-secret".into(),
-                internal_url: "http://127.0.0.1:8081".into(),
-                ..SidecarConfig::default()
-            },
-            oauth: OauthConfig {
-                encryption_key: None,
-                ..OauthConfig::default()
-            },
-            ..Config::default()
-        };
-        assert!(cfg.validate_secrets().is_ok());
-    }
-
     /// A weak key is refused on the same terms as every other secret — a short
     /// passphrase is stretched into an AES key, so its entropy is the ceiling.
     #[test]
     fn a_weak_oauth_encryption_key_is_refused_in_production() {
         let cfg = Config {
-            repo_backend: crate::metrics::Backend::Rust,
             public_url: "https://feather-reader.com".into(),
             cookie_secret: "a-long-enough-production-cookie-secret-value".into(),
-            sidecar: SidecarConfig {
-                internal_secret: "a-long-enough-production-internal-secret".into(),
-                internal_url: "http://127.0.0.1:8081".into(),
-                ..SidecarConfig::default()
-            },
             oauth: OauthConfig {
                 encryption_key: Some("short".into()),
                 ..OauthConfig::default()
@@ -1239,50 +1102,42 @@ mod tests {
         assert!(cfg.validate_secrets().is_err());
     }
 
-    /// **A typo must fail loudly.**
-    ///
-    /// `FEATHERREADER_REPO_BACKEND=rsut` falling back to the default would leave
-    /// the sidecar serving every request while the operator believed the Rust
-    /// path was live. Every number in the comparison would then be the sidecar
-    /// measured against itself, and the cutover would look flawless right up
-    /// until the flag was removed.
+    /// **An unknown value is an error, not a silent default.** A typo must not
+    /// boot as though it meant something.
     #[test]
     fn an_unknown_repo_backend_is_an_error_rather_than_a_silent_default() {
-        let err = parse_repo_backend("rsut").expect_err("a typo must not be ignored");
+        let err = check_repo_backend("rsut").expect_err("a typo must not be ignored");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("rsut"),
             "the message must name the bad value: {rendered}"
         );
-        assert!(rendered.contains("sidecar") && rendered.contains("rust"));
     }
 
-    /// Both spellings parse, and surrounding whitespace (a stray newline in a
-    /// compose file or secret) does not change the backend.
+    /// `rust` is accepted, surrounding whitespace (a stray newline in a compose
+    /// file or secret) included: an instance that set it explicitly, as
+    /// feather-reader.com's `fly.toml` does, boots unchanged.
     #[test]
-    fn the_two_backends_parse_including_stray_whitespace() {
-        assert_eq!(
-            parse_repo_backend("sidecar").unwrap(),
-            crate::metrics::Backend::Sidecar
-        );
-        assert_eq!(
-            parse_repo_backend("rust").unwrap(),
-            crate::metrics::Backend::Rust
-        );
-        assert_eq!(
-            parse_repo_backend(" rust\n").unwrap(),
-            crate::metrics::Backend::Rust
-        );
+    fn rust_is_accepted_including_stray_whitespace() {
+        assert!(check_repo_backend("rust").is_ok());
+        assert!(check_repo_backend(" rust\n").is_ok());
     }
 
-    /// The default is RUST (0.5.0, #311). The sidecar's OAuth client guards
-    /// none of its fetches (#258), and an unset variable used to select it.
+    /// **`sidecar` refuses to start, naming the release and what to do** (#311).
+    /// Served quietly as Rust, every reader on that instance would be signed out
+    /// with nothing telling the operator why.
     #[test]
-    fn the_default_backend_is_rust() {
-        assert_eq!(
-            Config::default().repo_backend,
-            crate::metrics::Backend::Rust
-        );
+    fn the_removed_sidecar_backend_is_refused_with_the_upgrade_path() {
+        let err = check_repo_backend(" sidecar\r\n").expect_err("sidecar must not boot");
+        let rendered = format!("{err:#}");
+        for needle in [
+            "removed in",
+            "0.5.0",
+            "FEATHERREADER_OAUTH_ENCRYPTION_KEY",
+            "upgrade notes",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle:?}: {rendered}");
+        }
     }
 
     #[test]
@@ -1416,27 +1271,10 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_with_dev_sidecar_secret_refuses_boot() {
-        let c = Config {
-            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
-            // Strong cookie secret, but sidecar secret still the dev default.
-            cookie_secret: "x".repeat(48),
-            ..Config::default()
-        };
-        let err = c.validate_secrets().unwrap_err().to_string();
-        assert!(err.contains("SIDECAR_INTERNAL_SECRET"), "{err}");
-    }
-
-    #[test]
     fn public_bind_with_strong_secrets_boots() {
         let c = Config {
             bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
             cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_secret: "b".repeat(48),
-            },
             // The Rust backend, the default, requires it on a public bind.
             oauth: OauthConfig {
                 encryption_key: Some("k".repeat(48)),
@@ -1445,44 +1283,6 @@ mod tests {
             ..Config::default()
         };
         assert!(c.is_prod_like());
-        assert!(c.validate_secrets().is_ok());
-    }
-
-    #[test]
-    fn public_sidecar_url_without_internal_url_refuses_boot() {
-        // Strong secrets, but the sidecar internal URL fell back to a
-        // non-loopback public URL → the internal secret would go over the wire.
-        let c = Config {
-            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
-            cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: "https://feather-reader.com/oauth".to_string(),
-                internal_url: "https://feather-reader.com/oauth".to_string(),
-                internal_secret: "b".repeat(48),
-            },
-            // Sidecar-only validation, removed with the sidecar (#311).
-            repo_backend: crate::metrics::Backend::Sidecar,
-            ..Config::default()
-        };
-        let err = c.validate_secrets().unwrap_err().to_string();
-        assert!(err.contains("SIDECAR_INTERNAL_URL"), "{err}");
-    }
-
-    #[test]
-    fn public_sidecar_url_with_loopback_internal_url_boots() {
-        // Same public sidecar URL, but an explicit loopback internal URL: safe.
-        let c = Config {
-            bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
-            cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: "https://feather-reader.com/oauth".to_string(),
-                internal_url: "http://127.0.0.1:8081".to_string(),
-                internal_secret: "b".repeat(48),
-            },
-            // Sidecar-only validation, removed with the sidecar (#311).
-            repo_backend: crate::metrics::Backend::Sidecar,
-            ..Config::default()
-        };
         assert!(c.validate_secrets().is_ok());
     }
 
@@ -1526,11 +1326,6 @@ mod tests {
         let c = Config {
             bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
             cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_secret: "b".repeat(48),
-            },
             bot_secret: Some("too-short".to_string()),
             ..Config::default()
         };
@@ -1543,11 +1338,6 @@ mod tests {
         let c = Config {
             bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
             cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_secret: "b".repeat(48),
-            },
             bot_secret: Some("c".repeat(48)),
             // The Rust backend, the default, requires it on a public bind.
             oauth: OauthConfig {
@@ -1565,11 +1355,6 @@ mod tests {
         let c = Config {
             bind: SocketAddr::from(([203, 0, 113, 5], 8080)),
             cookie_secret: "a".repeat(48),
-            sidecar: SidecarConfig {
-                public_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_url: DEFAULT_SIDECAR_URL.to_string(),
-                internal_secret: "b".repeat(48),
-            },
             bot_secret: None,
             // The Rust backend, the default, requires it on a public bind.
             oauth: OauthConfig {

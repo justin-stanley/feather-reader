@@ -27,28 +27,22 @@
 //!    types (list/create [`Subscription`]/[`Folder`]/[`Saved`], put
 //!    [`ReadState`], batch-flush many `ReadState` cursors).
 //!
-//! ## Auth — the OAuth sidecar is the live path
+//! ## Auth — the OAuth client is the live path
 //!
 //! Auth is a **trait/enum boundary** so the mechanism can vary without touching
-//! call sites. There are three paths:
+//! call sites:
 //!
-//! * **The live path — the atproto OAuth confidential client, via [`SidecarClient`].**
-//!   atproto OAuth (DPoP, PAR, token refresh) is fiddly and is **not** hand-rolled
-//!   in Rust: it runs in a small, supported `@atproto/oauth-client-node` sidecar.
-//!   The Rust server never holds
-//!   PDS tokens — it POSTs every `com.atproto.repo.*` op to the sidecar's
-//!   `/internal/repo` endpoint (gated by a shared `X-Internal-Secret`), and the
-//!   sidecar restores the DID's OAuth session (transparent DPoP + token refresh)
-//!   and runs the matching XRPC call. [`SidecarClient`] is that client; the typed
-//!   convenience wrappers (list/create/put/delete subscriptions, batch-flush
-//!   read-state) live on it and map 1:1 to the old [`PdsClient`] surface.
-//! * **The interim path — [`Auth::Session`] (app password).** A session obtained
-//!   from `com.atproto.server.createSession`. Kept behind the [`Auth`] seam, but
-//!   it is **no longer the live path**: [`PdsClient`] and
-//!   [`login_with_app_password`] remain for tests, while [`SidecarClient`] is
-//!   what the web layer routes through.
+//! * **The live path — the atproto OAuth confidential client in
+//!   [`crate::oauth`].** Every authed `com.atproto.repo.*` call the web layer
+//!   makes goes through [`crate::repo`] to `oauth::xrpc::Repo`, DPoP-bound with
+//!   transparent refresh. (Until 0.5.0 a Node `@atproto/oauth-client-node`
+//!   sidecar could serve this instead; it was removed, #311.)
+//! * **The direct path — [`Auth::Session`] (app password).** A session obtained
+//!   from `com.atproto.server.createSession`. [`PdsClient`] and
+//!   [`login_with_app_password`] remain for tests and the invite bot's shape;
+//!   the web layer does not route through them.
 //!
-//!   ⚠️ **This is no longer a working "local runs without the sidecar" fallback,
+//!   ⚠️ **This is not a working "local runs without OAuth" fallback,
 //!   and the docs used to claim otherwise.** Since v0.2.8 every [`PdsClient`]
 //!   request goes through the SSRF guard, which refuses loopback, RFC1918, ULA
 //!   and `100.64/10` (Tailscale). So pointing this at `http://localhost:2583`
@@ -517,8 +511,7 @@ pub enum DidResolutionCause {
 ///
 /// **Matched on the structured rejection, by error name.** Every client
 /// surfaces a PDS refusal as [`AtProtoError::Xrpc`]: the direct client at the
-/// root, the Rust OAuth client under a context, the sidecar client with the
-/// PDS's name carried through `/internal/repo`. `InvalidSwap` is the reference
+/// root, the Rust OAuth client under a context. `InvalidSwap` is the reference
 /// PDS's own name for a compare-and-swap mismatch and is answered 400; the
 /// name is the signal rather than the status, because the name is what says
 /// "someone else wrote this" and a 400 alone says nothing of the kind. A
@@ -526,8 +519,8 @@ pub enum DidResolutionCause {
 ///
 /// The cause of an [`ApplyWritesIncomplete`] is walked explicitly, as
 /// `readstate::may_be_existence_mismatch` does: that wrapper's `source()`
-/// continues from its cause's SOURCE, so on the sidecar client — whose cause
-/// IS the `AtProtoError` — `err.chain()` alone would step over it.
+/// continues from its cause's SOURCE, so on a client whose cause IS the
+/// `AtProtoError`, `err.chain()` alone would step over it.
 pub fn is_invalid_swap(err: &anyhow::Error) -> bool {
     let wrapped = ApplyWritesIncomplete::of(err).map(|p| p.cause().chain());
     err.chain()
@@ -577,13 +570,13 @@ pub trait TokenSource: Send + Sync {
 pub enum Auth {
     /// A bearer access token from a `com.atproto.server.createSession`
     /// (app-password) session. This is the direct-PDS auth used by local runs
-    /// and tests; the live web path authenticates via the OAuth sidecar instead
-    /// (see [`SidecarClient`]).
+    /// and tests; the live web path authenticates via the OAuth client in
+    /// [`crate::oauth`] instead.
     Session(SessionAuth),
 
-    /// The atproto OAuth confidential-client path is handled entirely by the
-    /// `@atproto/oauth-client` sidecar ([`SidecarClient`]), which mints, DPoP-binds,
-    /// and refreshes tokens. The direct [`PdsClient`] does not carry OAuth tokens;
+    /// The atproto OAuth confidential-client path is handled entirely by
+    /// [`crate::oauth`], which mints, DPoP-binds and refreshes tokens. The
+    /// direct [`PdsClient`] does not carry OAuth tokens;
     /// this variant is a placeholder so the `Auth` enum documents that the OAuth
     /// path lives elsewhere.
     Oauth(OauthPlaceholder),
@@ -606,8 +599,8 @@ impl Auth {
     /// The bearer access token to present on `com.atproto.repo.*` calls.
     ///
     /// Only [`Auth::Session`] carries a token (the session's `accessJwt`).
-    /// [`Auth::Oauth`] carries none — the sidecar owns the OAuth path — so it
-    /// returns an error pointing callers at [`SidecarClient`]. [`Auth::Anonymous`]
+    /// [`Auth::Oauth`] carries none — [`crate::oauth`] owns the OAuth path — so
+    /// it returns an error pointing callers there. [`Auth::Anonymous`]
     /// carries none by construction, which is what makes an anonymous client
     /// read-only.
     pub fn bearer(&self) -> Result<&str> {
@@ -615,13 +608,13 @@ impl Auth {
             Auth::Session(s) => Ok(&s.access_jwt),
             Auth::Oauth(_) => anyhow::bail!(
                 "the direct PdsClient does not carry OAuth tokens — atproto OAuth is \
-                 handled by the @atproto/oauth-client sidecar (SidecarClient); \
+                 handled by the oauth module (oauth::xrpc::Repo); \
                  use Auth::Session (app-password) for the direct-PDS path"
             ),
             Auth::Anonymous => anyhow::bail!(
                 "this PdsClient is anonymous (unauthenticated public read) and carries no \
                  bearer token — authenticated repo writes require Auth::Session or the \
-                 SidecarClient"
+                 OAuth client"
             ),
         }
     }
@@ -641,7 +634,7 @@ pub struct SessionAuth {
     pub access_jwt: String,
     /// The refresh token, exchanged via `com.atproto.server.refreshSession`.
     /// The direct-PDS refresh flow is not implemented here; the live web path
-    /// refreshes via the OAuth sidecar instead.
+    /// refreshes through the OAuth client instead.
     #[serde(rename = "refreshJwt", default)]
     pub refresh_jwt: Option<String>,
 }
@@ -649,7 +642,7 @@ pub struct SessionAuth {
 /// Placeholder for the OAuth variant of [`Auth`].
 ///
 /// Intentionally empty: the OAuth session material (DPoP key handle, token
-/// references) is held entirely by the sidecar, not by the direct [`PdsClient`].
+/// references) is held by [`crate::oauth`], not by the direct [`PdsClient`].
 /// This type exists only so [`Auth::Oauth`] is a real variant and the split is
 /// visible in the type system.
 #[derive(Clone, Debug, Default)]
@@ -821,8 +814,8 @@ impl DidDocument {
 /// Create a session with an **app password** via
 /// `com.atproto.server.createSession`.
 ///
-/// This is the direct-PDS path that makes [`PdsClient`] usable without the OAuth
-/// sidecar (local runs and tests). `pds_base` is the account's PDS (resolve it
+/// This is the direct-PDS path that makes [`PdsClient`] usable without OAuth
+/// (local runs and tests). `pds_base` is the account's PDS (resolve it
 /// first with [`resolve_handle`] + [`resolve_did_to_pds`], or pass the entryway
 /// like `https://bsky.social`, which will service-proxy). `identifier` is a
 /// handle or DID; `app_password` is an app-password (never the main password).
@@ -1783,824 +1776,17 @@ impl PdsClient {
 }
 
 // ---------------------------------------------------------------------------
-// The OAuth sidecar client — the LIVE com.atproto.repo.* path
+// A completed login
 // ---------------------------------------------------------------------------
 
-/// A client for the atproto OAuth sidecar's **internal** API.
-///
-/// This is the live path for every authed repo operation. Rather than the Rust
-/// server holding PDS tokens, it POSTs `{did, action, …}` to the sidecar's
-/// `/internal/repo` endpoint (gated by the shared `X-Internal-Secret`); the
-/// sidecar `restore(did)`s the OAuth session — transparent DPoP + token refresh —
-/// and runs the matching XRPC call via `@atproto/api`. The `did` (plus the shared
-/// secret) is what authorizes the call; there is no bearer token on the Rust side.
-///
-/// It also fronts `/internal/session/:id`, the one-shot handoff the Rust callback
-/// uses to turn a `session_id` (from the sidecar's browser redirect) into the
-/// `{did, handle}` it keys its own signed cookie by.
-///
-/// Cheap to clone (shared `reqwest::Client` + `Arc`'d config).
-#[derive(Clone)]
-pub struct SidecarClient {
-    http: Client,
-    public_url: Arc<str>,
-    internal_url: Arc<str>,
-    internal_secret: Arc<str>,
-}
-
-/// The `{did, handle}` a completed login yields: what the Rust callback
-/// returns, and the body of the sidecar's `/internal/session/:id` until the
-/// sidecar is removed (#311). Named for what it is, not where it came from,
-/// because it outlives the sidecar.
-#[derive(Debug, Clone, Deserialize)]
+/// The `{did, handle}` a completed login yields: what the OAuth callback
+/// keys the reader's signed session cookie by.
+#[derive(Debug, Clone)]
 pub struct LoginSession {
     /// The account DID that logged in.
     pub did: String,
     /// The account handle at login time.
-    #[serde(default)]
     pub handle: Option<String>,
-}
-
-/// The sidecar's `/internal/revoke` response body:
-/// `{ ok:true, did, revoked, hadSession }`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RevokeResult {
-    /// The DID that was revoked.
-    #[serde(default)]
-    pub did: String,
-    /// Whether the OAuth token revocation at the PDS succeeded. `false` means
-    /// the local rows were still purged (best-effort), but the PDS-side tokens
-    /// may not have been invalidated (network failure).
-    #[serde(default)]
-    pub revoked: bool,
-    /// Whether the sidecar actually had a stored session for the DID.
-    #[serde(default, rename = "hadSession")]
-    pub had_session: bool,
-}
-
-/// The action verbs the sidecar's `/internal/repo` endpoint dispatches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepoAction {
-    /// `com.atproto.repo.listRecords`.
-    List,
-    /// `com.atproto.repo.createRecord`.
-    Create,
-    /// `com.atproto.repo.putRecord`.
-    Put,
-    /// `com.atproto.repo.deleteRecord`.
-    Delete,
-    /// `com.atproto.repo.applyWrites` (batch).
-    ApplyWrites,
-}
-
-impl RepoAction {
-    fn as_str(self) -> &'static str {
-        match self {
-            RepoAction::List => "list",
-            RepoAction::Create => "create",
-            RepoAction::Put => "put",
-            RepoAction::Delete => "delete",
-            RepoAction::ApplyWrites => "applyWrites",
-        }
-    }
-}
-
-/// The `/internal/repo` success envelope: `{ ok:true, data:<raw XRPC JSON> }`.
-#[derive(Debug, Deserialize)]
-struct RepoOk {
-    #[serde(default)]
-    data: Value,
-}
-
-/// `/internal/repo`'s ok envelope for a **listing**, typed all the way down.
-///
-/// `data` absent is not `data` empty, the same distinction `records` carries: it
-/// is what a proxy makes of an unexpected upstream body.
-#[derive(Debug, Deserialize)]
-struct RepoOkList {
-    /// The sidecar's own `ok`, which it can set false on a 200.
-    #[serde(default)]
-    ok: Option<bool>,
-    /// And its own `error` — a different envelope from the PDS's, one layer out.
-    #[serde(default)]
-    error: Option<Value>,
-    #[serde(default)]
-    data: Option<ListRecordsBody>,
-}
-
-/// The `/internal/repo` error envelope: `{ ok:false, error, message, status? }`.
-#[derive(Debug, Deserialize)]
-struct RepoErr {
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    status: Option<u16>,
-}
-
-impl SidecarClient {
-    /// Build a sidecar client from the shared `reqwest::Client` and the
-    /// resolved public + internal base URLs + internal secret (from
-    /// [`crate::config::SidecarConfig`]). `public_url` anchors the browser
-    /// `/login` redirect; `internal_url` is the loopback base for the `/internal/*`
-    /// API (they collapse to the same value in single-URL local dev).
-    pub fn new(
-        http: Client,
-        public_url: impl Into<String>,
-        internal_url: impl Into<String>,
-        internal_secret: impl Into<String>,
-    ) -> Self {
-        Self {
-            http,
-            public_url: Arc::from(public_url.into().trim_end_matches('/')),
-            internal_url: Arc::from(internal_url.into().trim_end_matches('/')),
-            internal_secret: Arc::from(internal_secret.into()),
-        }
-    }
-
-    /// The sidecar's public `/login` URL for a handle, round-tripping an opaque
-    /// `return` value through OAuth state (used to bounce the browser back to a
-    /// specific place after login). The browser is redirected here.
-    pub fn login_url(&self, handle: &str, return_to: Option<&str>) -> String {
-        let mut url = format!("{}/login?handle={}", self.public_url, urlencode(handle));
-        if let Some(r) = return_to {
-            url.push_str(&format!("&return={}", urlencode(r)));
-        }
-        url
-    }
-
-    /// Resolve a one-shot `session_id` (from the sidecar's post-OAuth redirect)
-    /// to the `{did, handle}` that logged in. `Ok(None)` on `404 SessionNotFound`.
-    pub async fn resolve_session(&self, session_id: &str) -> Result<Option<LoginSession>> {
-        let url = format!(
-            "{}/internal/session/{}",
-            self.internal_url,
-            urlencode(session_id)
-        );
-        let resp = self
-            .http
-            .get(&url)
-            .header("X-Internal-Secret", self.internal_secret.as_ref())
-            .send()
-            .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            return Err(xrpc_error_from(resp).await.into());
-        }
-        let raw = crate::net::read_capped(resp).await?;
-        let session: LoginSession =
-            serde_json::from_slice(&raw).context("parsing /internal/session response")?;
-        Ok(Some(session))
-    }
-
-    /// Revoke a DID's OAuth session at the sidecar: `POST /internal/revoke`.
-    ///
-    /// This revokes the refresh + access tokens at the PDS **and** purges the
-    /// sidecar's stored `oauth_session` + `app_session` rows for the DID. It is
-    /// idempotent — revoking a DID with no live session returns
-    /// `had_session: false`. Called on `/logout` (so the cookie clear isn't the
-    /// only thing that ends the session) and on `/account/delete`.
-    pub async fn revoke_session(&self, did: &str) -> Result<RevokeResult> {
-        let url = format!("{}/internal/revoke", self.internal_url);
-        let resp = self
-            .http
-            .post(&url)
-            .header("X-Internal-Secret", self.internal_secret.as_ref())
-            .json(&json!({ "did": did }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(xrpc_error_from(resp).await.into());
-        }
-        let raw = crate::net::read_capped(resp).await?;
-        let result: RevokeResult =
-            serde_json::from_slice(&raw).context("parsing /internal/revoke response")?;
-        Ok(result)
-    }
-
-    /// POST one op to `/internal/repo` and return the raw XRPC `data` payload.
-    ///
-    /// `body` must already carry `did` + `action` + the action's required fields
-    /// (the typed wrappers below build these). Maps the sidecar's error envelope
-    /// to [`AtProtoError`]: `404 SessionNotFound` → `Xrpc{error:"SessionNotFound"}`
-    /// so callers can treat it as "re-login required".
-    async fn repo(&self, body: Value) -> Result<Value> {
-        let raw = self.repo_bytes(body).await?;
-        // **The same guard as the listing path, twelve lines below.** This is
-        // the response path for every write — create, put, delete, applyWrites —
-        // and `RepoOk.data` is an unbounded `Value`. Measured without it: the
-        // identical 8 MB attack retains 786 MB. The listing had the guard and
-        // this did not, which is the drift a shared helper exists to prevent.
-        refuse_a_structure_explosion(&raw, "the /internal/repo body")?;
-        let ok: RepoOk = serde_json::from_slice(&raw).context("parsing /internal/repo ok body")?;
-        Ok(ok.data)
-    }
-
-    /// [`repo`](Self::repo) without the `Value`.
-    ///
-    /// The listing path needs the bytes: a `serde_json::Map` resolves a repeated
-    /// key last-wins, so a body carrying a second, empty `records` array read as
-    /// a successful empty page — and an empty page here is `replace_sub_refs`
-    /// deleting every `sub_ref` the reader has. serde refuses a duplicated field
-    /// outright, but only if it sees the bytes.
-    async fn repo_bytes(&self, body: Value) -> Result<Vec<u8>> {
-        let url = format!("{}/internal/repo", self.internal_url);
-        let resp = self
-            .http
-            .post(&url)
-            .header("X-Internal-Secret", self.internal_secret.as_ref())
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        // **Capped, like every other body this codebase reads.** `resp.json()`
-        // buffers whatever arrives; `/internal/repo` proxies the account's PDS,
-        // so that length is chosen by a host the reader picked and we did not.
-        // The 8 MB ceiling that bounds the direct client did not exist here,
-        // and the sidecar is the default backend — so the one path with no byte
-        // bound at all was the one most deployments run.
-        let raw = crate::net::read_capped(resp).await;
-        if status.is_success() {
-            return raw;
-        }
-        // Error path: parse the sidecar's `{ok:false,error,message,status}` shape.
-        //
-        // **A body we could not read must not cost us the status.** Reading
-        // before the branch was the obvious shape and it swallowed the HTTP
-        // status on an over-cap or truncated error body, turning a `404
-        // SessionNotFound` into a bare "body exceeded the cap". `xrpc_error_from`
-        // already makes the opposite choice deliberately, for the same reason.
-        let err: RepoErr = raw
-            .ok()
-            .and_then(|body| serde_json::from_slice(&body).ok())
-            .unwrap_or(RepoErr {
-                error: None,
-                message: None,
-                status: None,
-            });
-        let mapped = err
-            .status
-            .and_then(|s| StatusCode::from_u16(s).ok())
-            .unwrap_or(status);
-        Err(AtProtoError::Xrpc {
-            status: mapped,
-            error: err.error.unwrap_or_else(|| "Unknown".to_string()),
-            message: err.message,
-        }
-        .into())
-    }
-
-    // -- raw com.atproto.repo.* over the sidecar -----------------------------
-
-    /// `list` — one page of a collection's records for `did`.
-    pub async fn list_records(
-        &self,
-        did: &str,
-        collection: &str,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<ListRecordsResponse> {
-        let mut body = json!({
-            "did": did,
-            "action": RepoAction::List.as_str(),
-            "collection": collection,
-        });
-        if let Some(limit) = limit {
-            body["limit"] = json!(limit);
-        }
-        if let Some(cursor) = cursor {
-            body["cursor"] = json!(cursor);
-        }
-        // Straight into the shared wire struct, one parse, no `Value` between —
-        // so this client gets the same guards as the other two, including the
-        // duplicated-key refusal that only serde can make.
-        let raw = self.repo_bytes(body).await?;
-        refuse_a_structure_explosion(&raw, "the sidecar listRecords body")?;
-        let envelope: RepoOkList =
-            serde_json::from_slice(&raw).context("parsing sidecar listRecords data")?;
-        // **Two envelope layers here, not one.** `page_from_body` guards the
-        // PDS's, which arrives inside `data`; this is the sidecar's own, and it
-        // can say `{"ok":false,"error":"ExpiredToken"}` on a 200 while still
-        // carrying a `data` that reads as a perfectly good empty page.
-        if envelope.ok == Some(false) {
-            let name = envelope
-                .error
-                .as_ref()
-                .and_then(envelope_error_name)
-                .unwrap_or_else(|| "unspecified".to_string());
-            anyhow::bail!("the sidecar answered 2xx with ok:false ({name})");
-        }
-        if let Some(name) = envelope.error.as_ref().and_then(envelope_error_name) {
-            anyhow::bail!("the sidecar answered 2xx with an error envelope: {name}");
-        }
-        let Some(data) = envelope.data else {
-            return Err(UnreadableListing::NoRecords.into());
-        };
-        page_from_body(data).context("parsing sidecar listRecords data")
-    }
-
-    /// Page through **all** records in a collection for `did`.
-    ///
-    /// Bounded by `MAX_LIST_PAGES` and cursor-repetition detection, same as
-    /// [`PdsClient::list_all_records`] — the sidecar proxies to the account's
-    /// PDS, so the page count is ultimately remote-controlled here too. Both
-    /// refuse rather than return a short list (#203).
-    pub async fn list_all_records(&self, did: &str, collection: &str) -> Result<Vec<RecordEntry>> {
-        self.list_all_records_within(did, collection, &mut ByteBudget::new(MAX_LIST_BYTES))
-            .await
-    }
-
-    /// [`list_all_records`](Self::list_all_records) against a caller's budget.
-    pub(crate) async fn list_all_records_within(
-        &self,
-        did: &str,
-        collection: &str,
-        budget: &mut ByteBudget,
-    ) -> Result<Vec<RecordEntry>> {
-        let mut out = Vec::new();
-        let max_bytes = budget.max();
-        let mut cursor: Option<String> = None;
-        let mut more_offered = false;
-        for _ in 0..MAX_LIST_PAGES {
-            let page = self
-                .list_records(did, collection, Some(100), cursor.as_deref())
-                .await?;
-            refuse_malformed(&page, collection)?;
-            let got = page.records.len();
-            // The sidecar proxies the account's PDS, so this walk's size is as
-            // remote-controlled as the direct client's. It carried no budget at
-            // all until a review noticed it was the default backend.
-            if !budget.admit(&page.records) {
-                return Err(ListingTooLarge::Bytes {
-                    collection: collection.to_string(),
-                    max_bytes,
-                    held: out.len(),
-                    charged: budget.used(),
-                }
-                .into());
-            }
-            extend_bounded(&mut out, page.records, MAX_LIST_RECORDS, collection)?;
-            match page.cursor {
-                // Same two exits as `walk_all_within`: a repeated cursor on a
-                // non-empty page is refused (#203); a cursor on an empty page
-                // ends the walk, as a real PDS's last page does.
-                Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
-                    anyhow::bail!(
-                        "listRecords for {collection} returned a repeated cursor on a \
-                         non-empty page ({} held) — refusing a list the server did not finish",
-                        out.len(),
-                    );
-                }
-                Some(next) if got > 0 => {
-                    cursor = Some(next);
-                    more_offered = true;
-                }
-                _ => {
-                    more_offered = false;
-                    break;
-                }
-            }
-        }
-        // **Running out of pages is a refusal, not a short answer.** Falling out
-        // of the loop used to return `Ok(out)`, so a repo bigger than the page
-        // budget produced a truncated list indistinguishable from a complete
-        // one — and `resolve_subscriptions` needs an `Err` for its fail-closed
-        // branch. Given `Ok`, it hands the short list to `replace_sub_refs`,
-        // which DELETEs the reader's whole `sub_ref` projection and reinserts
-        // only what it was given. `extend_bounded` cannot catch this either:
-        // `MAX_LIST_PAGES` x the 100 we request is `MAX_LIST_RECORDS`, so the
-        // page budget runs out first.
-        //
-        // **The cap is on REQUESTS, so where it bites in RECORDS is the server's
-        // choice and not ours.** We ask for 100 a page; a PDS MAY answer with
-        // fewer, and only one that honours the limit puts the boundary anywhere
-        // near `MAX_LIST_PAGES` x 100. Halve the page size and the same budget
-        // reaches half as many records; a server that returns MORE than asked
-        // trips `extend_bounded` first, which is the case the sentence above does
-        // not cover. Said this way because an earlier version of this comment
-        // named a fixed record window as though our own constants decided it.
-        //
-        // **And at the boundary the refusal is a FALSE one.** Terminating costs
-        // one extra request, because a short page can still carry a cursor — this
-        // project's own PDS does exactly that — so a walk that fills its last
-        // allowed page is holding every record it was ever going to hold and
-        // refuses anyway, on the strength of a cursor it never followed. With
-        // `limit=100` honoured that window is a repo of roughly 19 901 to 20 000
-        // records. The direction is safe and the alternative is deleting feeds,
-        // but it is a false refusal and not a clean boundary.
-        if more_offered {
-            return Err(ListingTooLarge::Pages {
-                collection: collection.to_string(),
-                pages: MAX_LIST_PAGES,
-                held: out.len(),
-            }
-            .into());
-        }
-        Ok(out)
-    }
-
-    /// `create` — create a record (server-assigned rkey). Returns its strong ref.
-    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
-    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
-    /// the general case of the hole `create_subscriptions_batch` was one
-    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
-    /// points. `pub(crate)` was tried first and stops nothing that matters — a
-    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
-    /// a fact rather than a convention, and it costs nothing: nothing outside
-    /// this module ever called it.
-    async fn create_record<T: Serialize>(
-        &self,
-        did: &str,
-        collection: &str,
-        record: &T,
-    ) -> Result<WriteResult> {
-        let body = json!({
-            "did": did,
-            "action": RepoAction::Create.as_str(),
-            "collection": collection,
-            "record": record,
-        });
-        let data = self.repo(body).await?;
-        serde_json::from_value(data).context("parsing sidecar createRecord data")
-    }
-
-    /// `put` — upsert a record at a known rkey. Returns its strong ref.
-    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
-    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
-    /// the general case of the hole `create_subscriptions_batch` was one
-    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
-    /// points. `pub(crate)` was tried first and stops nothing that matters — a
-    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
-    /// a fact rather than a convention, and it costs nothing: nothing outside
-    /// this module ever called it.
-    async fn put_record<T: Serialize>(
-        &self,
-        did: &str,
-        collection: &str,
-        rkey: &str,
-        record: &T,
-        swap_record: Option<&str>,
-    ) -> Result<WriteResult> {
-        let mut body = json!({
-            "did": did,
-            "action": RepoAction::Put.as_str(),
-            "collection": collection,
-            "rkey": rkey,
-            "record": record,
-        });
-        // The sidecar validates it as a CID and passes it to `putRecord`; its
-        // `InvalidSwap` comes back through `repo`'s error envelope with the
-        // PDS's status and name intact (#149).
-        if let Some(cid) = swap_record {
-            body["swapRecord"] = json!(cid);
-        }
-        let data = self.repo(body).await?;
-        serde_json::from_value(data).context("parsing sidecar putRecord data")
-    }
-
-    /// `delete` — delete a record by collection + rkey.
-    pub async fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<()> {
-        let body = json!({
-            "did": did,
-            "action": RepoAction::Delete.as_str(),
-            "collection": collection,
-            "rkey": rkey,
-        });
-        // A 200 carrying an error envelope is not a delete: this reported
-        // success while the record stayed in the reader's repo, and the UI
-        // showed them unsubscribed from a feed they still had.
-        self.repo(body)
-            .await
-            .and_then(|data| reject_error_envelope(&data))?;
-        Ok(())
-    }
-
-    /// `applyWrites` — a batch of create/update/delete ops in one round-trip.
-    /// **Private, not `pub` — and not `pub(crate)`.** This is generic over
-    /// `T: Serialize`, so it will happily write a raw `lexicon::Subscription`:
-    /// the general case of the hole `create_subscriptions_batch` was one
-    /// instance of. The vetted wrappers in this `impl` are the sanctioned entry
-    /// points. `pub(crate)` was tried first and stops nothing that matters — a
-    /// handler in `web.rs` is in this crate. Private is what makes the wrappers
-    /// a fact rather than a convention, and it costs nothing: nothing outside
-    /// this module ever called it.
-    ///
-    /// Sent in chunks within the PDS's limits — see [`apply_writes_chunked`]
-    /// for what a failure part-way means. **Chunked here, not in the sidecar**,
-    /// although the sidecar is what calls the PDS: it answers one
-    /// `/internal/repo` request with one result, which has no way to say that
-    /// half a batch landed, and this client is its only caller. Chunking here
-    /// also keeps the hop itself under the sidecar's 1 MiB Fastify body limit.
-    async fn apply_writes(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
-        apply_writes_chunked(writes, |chunk| self.apply_writes_once(did, chunk)).await
-    }
-
-    /// One `/internal/repo` `applyWrites`, unchunked. Reached only through
-    /// [`apply_writes`](Self::apply_writes).
-    async fn apply_writes_once(&self, did: &str, writes: &[WriteOp]) -> Result<()> {
-        let ops: Vec<Value> = writes.iter().map(WriteOp::to_sidecar_json).collect();
-        let body = json!({
-            "did": did,
-            "action": RepoAction::ApplyWrites.as_str(),
-            "writes": ops,
-        });
-        self.repo(body)
-            .await
-            .and_then(|data| reject_error_envelope(&data))?;
-        Ok(())
-    }
-
-    // -- typed lexicon wrappers (mirror the old PdsClient surface) ------------
-
-    /// List every [`Subscription`] record in `did`'s repo (paged fully).
-    pub async fn list_subscriptions(&self, did: &str) -> Result<Vec<(String, Subscription)>> {
-        self.list_typed(did, lexicon::nsid::SUBSCRIPTION).await
-    }
-
-    /// Every [`Subscription`] with the CID it was listed at, unsorted — the
-    /// read half of a read-modify-write that puts with `swapRecord` (#149).
-    pub async fn list_subscriptions_with_cids(
-        &self,
-        did: &str,
-    ) -> Result<Vec<(String, Option<String>, Subscription)>> {
-        self.list_typed_with_cids(did, lexicon::nsid::SUBSCRIPTION)
-            .await
-    }
-
-    /// Create a [`Subscription`] record (subscribe to a feed).
-    pub async fn create_subscription(
-        &self,
-        did: &str,
-        sub: &crate::vetted::VettedSubscription,
-    ) -> Result<WriteResult> {
-        self.create_record(did, lexicon::nsid::SUBSCRIPTION, sub)
-            .await
-    }
-
-    /// Delete a [`Subscription`] record by rkey (unsubscribe).
-    pub async fn delete_subscription(&self, did: &str, rkey: &str) -> Result<()> {
-        self.delete_record(did, lexicon::nsid::SUBSCRIPTION, rkey)
-            .await
-    }
-
-    /// List every [`Folder`] record in `did`'s repo.
-    pub async fn list_folders(&self, did: &str) -> Result<Vec<(String, Folder)>> {
-        self.list_typed(did, lexicon::nsid::FOLDER).await
-    }
-
-    /// Every [`Folder`] with the CID it was listed at, unsorted (#268).
-    pub async fn list_folders_with_cids(
-        &self,
-        did: &str,
-    ) -> Result<Vec<(String, Option<String>, Folder)>> {
-        self.list_typed_with_cids(did, lexicon::nsid::FOLDER).await
-    }
-
-    /// List every [`Saved`] record in `did`'s repo.
-    pub async fn list_saved(&self, did: &str) -> Result<Vec<(String, Saved)>> {
-        self.list_typed(did, lexicon::nsid::SAVED).await
-    }
-
-    /// List every [`ReadState`] cursor in `did`'s repo (the read side a
-    /// login-time read-state merge would consume).
-    pub async fn list_read_states(&self, did: &str) -> Result<Vec<(String, ReadState)>> {
-        self.list_typed(did, lexicon::nsid::READ_STATE).await
-    }
-
-    /// Upsert a single [`ReadState`] cursor at its feed-derived rkey.
-    pub async fn put_read_state(
-        &self,
-        did: &str,
-        rkey: &str,
-        state: &ReadState,
-    ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::READ_STATE, rkey, state, None)
-            .await
-    }
-
-    /// Batch-flush many dirty [`ReadState`] cursors via `applyWrites` (chunked).
-    ///
-    /// Each `(rkey, state, pds_created)` becomes a `create` op at the feed-derived
-    /// rkey when the record does NOT yet exist (`pds_created == false`), and an
-    /// `update` op when it does. This is what makes the FIRST flush of a feed
-    /// succeed: `applyWrites#update` errors on a record that does not pre-exist,
-    /// and `applyWrites` is atomic per-repo, so a single not-yet-created cursor
-    /// would otherwise drop the whole DID batch. Both kinds ride the SAME
-    /// `applyWrites` batch so batching is preserved.
-    pub async fn flush_read_states(
-        &self,
-        did: &str,
-        cursors: &[(String, ReadState, bool)],
-    ) -> Result<()> {
-        if cursors.is_empty() {
-            return Ok(());
-        }
-        let writes = read_state_write_ops(cursors)?;
-        self.apply_writes(did, &writes).await
-    }
-
-    // -- reader-facing record CRUD (the surface the web layer calls) ----------
-    //
-    // These are the typed convenience methods `web.rs` uses to manage a user's
-    // feeds/folders/saved items *as records in their PDS*. They mirror the
-    // create/list surface above but use the reader vocabulary
-    // (add/remove/rename) and, for the `add_*` verbs, return the server-assigned
-    // rkey so the caller can address the new record without a re-list. Ordering
-    // is made deterministic where it matters (see [`list_subscriptions_sorted`]
-    // etc.) so the server-rendered HTML is stable between reads.
-
-    // -- subscriptions -------------------------------------------------------
-
-    /// Add a subscription (subscribe to a feed) — `createRecord`, server-assigned
-    /// `tid` rkey. Returns the new record's **rkey** so the web layer can offer
-    /// unsubscribe/rename immediately.
-    pub async fn add_subscription(
-        &self,
-        did: &str,
-        sub: &crate::vetted::VettedSubscription,
-    ) -> Result<String> {
-        Ok(self.create_subscription(did, sub).await?.into_rkey())
-    }
-
-    /// Remove a subscription (unsubscribe) by rkey — `deleteRecord`. Alias of
-    /// [`delete_subscription`](Self::delete_subscription) in the reader vocabulary.
-    pub async fn remove_subscription(&self, did: &str, rkey: &str) -> Result<()> {
-        self.delete_subscription(did, rkey).await
-    }
-
-    /// Update / rename a subscription in place at a known rkey — `putRecord`.
-    ///
-    /// The whole record is replaced (retitle, move to a folder, change the
-    /// fetch hint …). Upsert semantics: it also creates the record if the rkey
-    /// is somehow absent, so it is safe as a general "write this exact record".
-    pub async fn update_subscription(
-        &self,
-        did: &str,
-        rkey: &str,
-        sub: &crate::vetted::VettedSubscription,
-        swap_record: Option<&str>,
-    ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::SUBSCRIPTION, rkey, sub, swap_record)
-            .await
-    }
-
-    /// List every subscription, **sorted deterministically** — by display title
-    /// (case-insensitive), then feed URL, then rkey as the final tiebreaker — so
-    /// the rendered feed list is stable across reads regardless of PDS return
-    /// order. Untitled feeds sort by their URL.
-    pub async fn list_subscriptions_sorted(
-        &self,
-        did: &str,
-    ) -> Result<Vec<(String, Subscription)>> {
-        let mut subs = self.list_subscriptions(did).await?;
-        // The comparator is SHARED with the Rust-native client so the two
-        // cannot order the list differently across the cutover.
-        subs.sort_by(lexicon::sort::subscriptions);
-        Ok(subs)
-    }
-
-    /// Batch-add many subscriptions via `applyWrites` (chunked) — the OPML-import path.
-    ///
-    /// Each feed becomes one `create` op. Client-side monotonic `tid`
-    /// rkeys are assigned so the batch is deterministic and the imported feeds
-    /// keep OPML order (server-assigned tids would also be monotonic, but pinning
-    /// them here makes the whole import reproducible and testable offline).
-    /// Returns the assigned rkeys in input order.
-    ///
-    /// More than [`APPLY_WRITES_MAX_OPS`] feeds is more than one call, so the
-    /// import can part-land: on an error, [`ApplyWritesIncomplete::of`] gives
-    /// `landed`, and the first `landed` of `subs` are in the repo.
-    pub async fn add_subscriptions_bulk(
-        &self,
-        did: &str,
-        subs: &[crate::vetted::VettedSubscription],
-    ) -> Result<Vec<String>> {
-        let mut gen = TidGenerator::new();
-        let mut rkeys = Vec::with_capacity(subs.len());
-        let mut writes = Vec::with_capacity(subs.len());
-        for sub in subs {
-            let rkey = gen.next();
-            writes.push(WriteOp::Create {
-                collection: lexicon::nsid::SUBSCRIPTION.to_string(),
-                rkey: Some(rkey.clone()),
-                value: serde_json::to_value(sub)?,
-            });
-            rkeys.push(rkey);
-        }
-        self.apply_writes(did, &writes).await?;
-        Ok(rkeys)
-    }
-
-    // -- folders -------------------------------------------------------------
-
-    /// Add a folder — `createRecord`, server-assigned `tid` rkey. Returns the
-    /// new folder's rkey (subscriptions reference it by its `at://` URI).
-    pub async fn add_folder(&self, did: &str, folder: &Folder) -> Result<String> {
-        Ok(self
-            .create_record(did, lexicon::nsid::FOLDER, folder)
-            .await?
-            .into_rkey())
-    }
-
-    /// Remove a folder by rkey — `deleteRecord`. (Subscriptions referencing it
-    /// are left untouched; a dangling `folder` ref reads as "unfiled".)
-    pub async fn remove_folder(&self, did: &str, rkey: &str) -> Result<()> {
-        self.delete_record(did, lexicon::nsid::FOLDER, rkey).await
-    }
-
-    /// Rename / update a folder in place at a known rkey — `putRecord`
-    /// (rename, or change its `position` sort hint).
-    ///
-    /// Replaces the WHOLE record, so `folder` must be the record as read with
-    /// only the intended change. `swap_record` is the CID it was read at: the
-    /// PDS refuses the write with `InvalidSwap` if the record has moved since
-    /// (#268). `None` writes unconditionally.
-    pub async fn rename_folder(
-        &self,
-        did: &str,
-        rkey: &str,
-        folder: &Folder,
-        swap_record: Option<&str>,
-    ) -> Result<WriteResult> {
-        self.put_record(did, lexicon::nsid::FOLDER, rkey, folder, swap_record)
-            .await
-    }
-
-    /// List every folder, **sorted deterministically** — by `position` (the
-    /// lexicon's sort hint; unset sorts last), then name (case-insensitive),
-    /// then rkey — so the sidebar order is stable.
-    pub async fn list_folders_sorted(&self, did: &str) -> Result<Vec<(String, Folder)>> {
-        let mut folders = self.list_folders(did).await?;
-        folders.sort_by(lexicon::sort::folders);
-        Ok(folders)
-    }
-
-    // -- saved / starred -----------------------------------------------------
-
-    /// Add a saved (starred / save-for-later) entry — `createRecord`,
-    /// server-assigned `tid` rkey. Returns the new record's rkey.
-    pub async fn add_saved(&self, did: &str, saved: &crate::vetted::VettedSaved) -> Result<String> {
-        Ok(self
-            .create_record(did, lexicon::nsid::SAVED, saved)
-            .await?
-            .into_rkey())
-    }
-
-    /// Remove a saved entry by rkey — `deleteRecord` (un-star).
-    pub async fn remove_saved(&self, did: &str, rkey: &str) -> Result<()> {
-        self.delete_record(did, lexicon::nsid::SAVED, rkey).await
-    }
-
-    /// List every saved entry, **sorted deterministically** — newest first by
-    /// `createdAt` (RFC-3339 sorts lexicographically), then rkey — so the
-    /// "saved for later" list reads most-recent-first and is stable.
-    pub async fn list_saved_sorted(&self, did: &str) -> Result<Vec<(String, Saved)>> {
-        let mut saved = self.list_saved(did).await?;
-        saved.sort_by(lexicon::sort::saved);
-        Ok(saved)
-    }
-
-    /// List a collection for `did` and parse each record's value into `T`,
-    /// pairing it with its rkey. Unparseable records are skipped with a warning
-    /// (forward-compat).
-    async fn list_typed<T: DeserializeOwned>(
-        &self,
-        did: &str,
-        collection: &str,
-    ) -> Result<Vec<(String, T)>> {
-        Ok(self
-            .list_typed_with_cids(did, collection)
-            .await?
-            .into_iter()
-            .map(|(rkey, _cid, value)| (rkey, value))
-            .collect())
-    }
-
-    /// [`list_typed`](Self::list_typed), keeping each record's CID (#149).
-    async fn list_typed_with_cids<T: DeserializeOwned>(
-        &self,
-        did: &str,
-        collection: &str,
-    ) -> Result<Vec<(String, Option<String>, T)>> {
-        let records = self.list_all_records(did, collection).await?;
-        let mut out = Vec::with_capacity(records.len());
-        for rec in records {
-            let rkey = rec.rkey().unwrap_or_default().to_string();
-            match rec.parse::<T>() {
-                Ok(value) => out.push((rkey, rec.cid, value)),
-                Err(e) => tracing::warn!(
-                    collection,
-                    uri = %rec.uri,
-                    error = %e,
-                    "skipping unparseable record in collection"
-                ),
-            }
-        }
-        Ok(out)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2615,7 +1801,7 @@ impl SidecarClient {
 /// missing record errors, and `applyWrites` is atomic per-repo, so a single
 /// not-yet-created cursor in the batch would drop the whole DID's flush. Emitting
 /// a `create` for those makes a feed's first flush succeed while keeping every
-/// op in ONE batch. Shared by both the sidecar and direct-PDS flush paths.
+/// op in ONE batch.
 pub(crate) fn read_state_write_ops(cursors: &[(String, ReadState, bool)]) -> Result<Vec<WriteOp>> {
     cursors
         .iter()
@@ -2658,14 +1844,12 @@ pub const APPLY_WRITES_MAX_OPS: usize = 200;
 /// atproto#4989 (2026-05-21) raised the record methods to `1_000_000` bytes.
 /// Self-hosted PDSes run older releases for months, so the 150 KiB figure is
 /// the live one for some readers. The other limits on this path are all
-/// larger: the newer reference PDS's 1,000,000 bytes, the sidecar hop's Fastify
-/// default `bodyLimit` of 1 MiB, and vlpds's coalesced commit of "up to 200
+/// larger: the newer reference PDS's 1,000,000 bytes, and vlpds's coalesced commit of "up to 200
 /// operations or 1 MB of record bytes".
 ///
 /// 128 KiB leaves 22 KiB under 150 KiB for what this does not count — the
 /// `{"repo": …, "writes": [ ]}` envelope, around a hundred bytes — and is
-/// measured on the PDS-shaped op (`WriteOp::to_json`), which is also what the
-/// sidecar forwards and is larger than the sidecar's own request shape.
+/// measured on the PDS-shaped op (`WriteOp::to_json`).
 ///
 /// What it costs, measured: 200 subscriptions with a title and site URL each
 /// are ~76 KB, so an ordinary OPML import is still one call per 200 feeds. A
@@ -2709,8 +1893,8 @@ pub(crate) fn chunk_writes(writes: &[WriteOp]) -> Vec<std::ops::Range<usize>> {
 /// stopping at the first that fails.
 ///
 /// **Every client's `apply_writes` goes through this**, so no caller can send
-/// an oversized call: the OAuth client ([`crate::oauth::xrpc::Repo`]), the
-/// sidecar client ([`SidecarClient`]) and the direct client ([`PdsClient`]).
+/// an oversized call: the OAuth client ([`crate::oauth::xrpc::Repo`]) and the
+/// direct client ([`PdsClient`]).
 /// `send` is that client's single-call primitive.
 ///
 /// **The batch is no longer atomic.** `applyWrites` is atomic per CALL, so a
@@ -2890,44 +2074,6 @@ impl WriteOp {
             }),
         }
     }
-
-    /// Render this op in the shape the OAuth sidecar's `/internal/repo`
-    /// `applyWrites` expects: `{action, collection, rkey?, value?}` (the sidecar
-    /// maps `action` → the `com.atproto.repo.applyWrites#<kind>` union member).
-    fn to_sidecar_json(&self) -> Value {
-        match self {
-            WriteOp::Create {
-                collection,
-                rkey,
-                value,
-            } => {
-                let mut op = json!({
-                    "action": "create",
-                    "collection": collection,
-                    "value": value,
-                });
-                if let Some(rkey) = rkey {
-                    op["rkey"] = json!(rkey);
-                }
-                op
-            }
-            WriteOp::Update {
-                collection,
-                rkey,
-                value,
-            } => json!({
-                "action": "update",
-                "collection": collection,
-                "rkey": rkey,
-                "value": value,
-            }),
-            WriteOp::Delete { collection, rkey } => json!({
-                "action": "delete",
-                "collection": collection,
-                "rkey": rkey,
-            }),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,7 +2092,7 @@ const S32_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 /// bit is always 0). Encoded in the ascending `s32` alphabet, TIDs sort
 /// lexicographically in creation order — which is exactly what we want for a
 /// batched OPML import: assigning the rkeys ourselves keeps the imported feeds
-/// in input order and makes [`add_subscriptions_bulk`](SidecarClient::add_subscriptions_bulk)
+/// in input order and makes the bulk subscription import
 /// fully reproducible/testable without a live PDS.
 ///
 /// Monotonicity within one generator is guaranteed by tracking the last value
@@ -3920,66 +3066,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// **The sidecar's body is capped like every other body we read.**
-    ///
-    /// `/internal/repo` proxies whatever the account's PDS returned, so its
-    /// size is remote-controlled by a host the reader chose and we did not.
-    /// Every other response in this codebase goes through
-    /// [`crate::net::read_capped`]; this one buffered the whole thing with
-    /// `resp.json()`, so the 8 MB ceiling that bounds the direct PDS client
-    /// simply did not exist on the sidecar backend — which is the default.
-    #[tokio::test]
-    async fn the_sidecar_client_caps_the_body_it_will_buffer() {
-        // Well-formed, and past the cap. The guard has to fire on size, not
-        // on the shape being wrong.
-        let filler = "x".repeat(crate::net::MAX_BODY_BYTES);
-        let body = format!(r#"{{"ok":true,"data":{{"records":[],"pad":"{filler}"}}}}"#);
-        assert!(body.len() > crate::net::MAX_BODY_BYTES);
-        let base = crate::net::tests::serve_body(body.into_bytes()).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_records(
-                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                "app.feather.subscription",
-                None,
-                None,
-            )
-            .await
-            .expect_err("an oversized sidecar body was buffered whole");
-        assert!(
-            format!("{err:#}").contains("cap"),
-            "failed for the wrong reason: {err:#}"
-        );
-    }
-
-    /// The sidecar path needs the records guard too, not only the envelope
-    /// one: `{"ok":true,"data":{}}` is what a proxy makes of an empty or
-    /// unexpected upstream body.
-    #[tokio::test]
-    async fn the_sidecar_client_refuses_a_data_object_without_records() {
-        // `data: {}` reaches `page_from_body`; no `data` at all is refused
-        // before it, by the sidecar client itself. Both are the same refusal.
-        for body in [&br#"{"ok":true,"data":{}}"#[..], &br#"{"ok":true}"#[..]] {
-            let base = crate::net::tests::serve_body(body.to_vec()).await;
-            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-            let err = client
-                .list_records(
-                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                    "app.feather.subscription",
-                    None,
-                    None,
-                )
-                .await
-                .expect_err("a data object without records was read as an empty repo");
-            assert!(format!("{err:#}").contains("no records field"), "{err:#}");
-            assert_eq!(
-                crate::feed::publication_failure_kind(&err),
-                crate::feed::FailureKind::Parse,
-                "{err:#}"
-            );
-        }
-    }
-
     /// An exactly-full final page dropped nothing, so it must not warn that it
     /// did: `>=` reported truncation whenever the last page landed flush.
     #[test]
@@ -4055,63 +3141,6 @@ pub(crate) mod tests {
         assert!(
             err.is_ok() || format!("{:#}", err.unwrap_err()).contains("cap"),
             "the sub_ref walk must keep its refusal"
-        );
-    }
-
-    /// **A write is not "succeeded" because the status was 200.** The sidecar's
-    /// `delete_record` and `apply_writes` discard the body entirely, so a
-    /// `200 {"error": …}` reported success: the UI showed a reader
-    /// unsubscribed while the record was still in their repo, and a whole
-    /// batch of writes vanished silently.
-    #[tokio::test]
-    async fn the_sidecar_client_refuses_a_200_error_envelope_on_writes() {
-        let base = crate::net::tests::serve_body(
-            br#"{"ok":true,"data":{"error":"InvalidRequest","message":"nope"}}"#.to_vec(),
-        )
-        .await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-        let err = client
-            .delete_subscription(did, "rk1")
-            .await
-            .expect_err("a failed delete was reported as success");
-        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
-
-        let err = client
-            .apply_writes(
-                did,
-                &[WriteOp::Delete {
-                    collection: lexicon::nsid::SUBSCRIPTION.to_string(),
-                    rkey: "rk1".to_string(),
-                }],
-            )
-            .await
-            .expect_err("a failed batch was reported as success");
-        assert!(format!("{err:#}").contains("InvalidRequest"), "{err:#}");
-    }
-
-    /// The sidecar proxies the PDS's body, so the same 2xx envelope arrives
-    /// through `RepoOk.data` — a defaulted `Value` that deserialised into an
-    /// empty page just as happily. Driven through the real client.
-    #[tokio::test]
-    async fn the_sidecar_client_refuses_a_200_error_envelope() {
-        let base = crate::net::tests::serve_body(
-            br#"{"ok":true,"data":{"error":"InvalidRequest","message":"nope"}}"#.to_vec(),
-        )
-        .await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_records(
-                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                "app.feather.subscription",
-                None,
-                None,
-            )
-            .await
-            .expect_err("an error envelope was read as an empty page");
-        assert!(
-            format!("{err:#}").contains("InvalidRequest"),
-            "failed for the wrong reason: {err:#}"
         );
     }
 
@@ -4678,65 +3707,6 @@ pub(crate) mod tests {
 
     // -- reader-facing CRUD: bulk applyWrites shape (OPML import) ------------
 
-    /// **Bulk subscribe, through the real client, asserted on the bytes it
-    /// sent.** The test this replaces built the `WriteOp::Create` ops itself
-    /// ("mirror what `add_subscriptions_bulk` builds") and asserted on its own
-    /// construction; the function was never called, and writing every feed
-    /// into the wrong collection with server-assigned rkeys left the suite
-    /// green. Three atproto sort tests that re-implemented the comparator
-    /// inline are deleted alongside — `lexicon::sort_tests` fails their
-    /// mutation, and they added nothing but a misleading name.
-    #[tokio::test]
-    async fn bulk_subscribe_writes_client_assigned_ordered_rkeys_to_the_right_collection() {
-        let (base, log) =
-            crate::net::tests::serve_json_capturing(br#"{"ok":true,"data":{}}"#.to_vec()).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let subs: Vec<crate::vetted::VettedSubscription> = (0..3)
-            .map(|i| {
-                crate::vetted::VettedSubscription::new(&lexicon::Subscription::new(
-                    format!("https://f{i}.example/feed.xml"),
-                    "2026-07-12T00:00:00.000Z",
-                ))
-            })
-            .collect();
-
-        let rkeys = client
-            .add_subscriptions_bulk("did:plc:ewvi7nxzyoun6zhxrhs64oiz", &subs)
-            .await
-            .expect("bulk write failed");
-
-        let sent = log.lock().unwrap().clone();
-        assert_eq!(
-            sent.len(),
-            1,
-            "expected one applyWrites request, got {sent:?}"
-        );
-        let body: Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap())
-            .expect("request body is JSON");
-        let writes = body["writes"].as_array().expect("writes array");
-        assert_eq!(writes.len(), 3);
-        for (i, w) in writes.iter().enumerate() {
-            assert_eq!(
-                w["collection"],
-                lexicon::nsid::SUBSCRIPTION,
-                "write {i} went to the wrong collection"
-            );
-            assert_eq!(
-                w["rkey"].as_str(),
-                Some(rkeys[i].as_str()),
-                "write {i} does not carry the rkey the client returned"
-            );
-        }
-        let mut sorted = rkeys.clone();
-        sorted.sort();
-        assert_eq!(rkeys, sorted, "client-assigned rkeys must ascend");
-        assert_eq!(
-            rkeys.iter().collect::<std::collections::HashSet<_>>().len(),
-            3,
-            "rkeys must be distinct"
-        );
-    }
-
     /// **The walk refuses a repeated cursor (#203).** A PDS that echoes the
     /// same cursor forever would otherwise be walked for 200 pages, so the
     /// walk must not follow it — but it must not return what it has either.
@@ -4777,56 +3747,6 @@ pub(crate) mod tests {
             format!("{err:#}").contains("repeated cursor"),
             "refused for the wrong reason: {err:#}"
         );
-    }
-
-    /// Twin of `list_all_records_refuses_a_repeated_cursor` for the sidecar
-    /// walk, the default backend.
-    #[tokio::test]
-    async fn the_sidecar_walk_refuses_a_repeated_cursor() {
-        let body = serde_json::json!({
-            "ok": true,
-            "data": {
-                "records": [{ "uri": "at://did:plc:x/c/3labONE", "value": {} }],
-                "cursor": "same-every-time",
-            }
-        })
-        .to_string()
-        .into_bytes();
-        let base = crate::net::tests::serve_body(body).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
-            .await
-            .expect_err("a repeated cursor ended the walk with a short list");
-        assert!(
-            format!("{err:#}").contains("repeated cursor"),
-            "refused for the wrong reason: {err:#}"
-        );
-    }
-
-    /// **A cursor on an EMPTY page still ends the walk normally.** This
-    /// project's own PDS returns a cursor alongside its last page, so the
-    /// repeated-cursor refusal must not reach a page with no records.
-    #[tokio::test]
-    async fn the_sidecar_walk_ends_on_an_empty_page_that_carries_a_cursor() {
-        let bodies = vec![
-            serde_json::json!({ "ok": true, "data": {
-                "records": [{ "uri": "at://did:plc:x/c/3labONE", "value": {} }],
-                "cursor": "p1",
-            }})
-            .to_string()
-            .into_bytes(),
-            serde_json::json!({ "ok": true, "data": { "records": [], "cursor": "p1" }})
-                .to_string()
-                .into_bytes(),
-        ];
-        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let records = client
-            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
-            .await
-            .expect("an empty page with a cursor is how a real PDS ends a list");
-        assert_eq!(records.len(), 1);
     }
 
     // -- bounding the parse before it allocates -----------------------------
@@ -4932,29 +3852,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The write path takes the same guard as the listing path.
-    #[tokio::test]
-    async fn the_write_path_refuses_a_node_explosion() {
-        let mut data = String::from(r#"{"ok":true,"data":{"records":["#);
-        for _ in 0..700_000 {
-            data.push_str("{},");
-        }
-        data.push_str(r#"{}]}}"#);
-        let base = crate::net::tests::serve_body(data.into_bytes()).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .delete_record("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c", "r")
-            .await
-            .expect_err("a node explosion reached the parser on the write path");
-        assert!(
-            format!("{err:#}").contains("structural characters"),
-            "failed for the wrong reason: {err:#}"
-        );
-    }
-
     #[test]
     fn an_ordinary_page_is_nowhere_near_the_structure_bound() {
-        // **A page, not a record.** This served `paged_bodies(1, 17_000, false)` —
+        // **A page, not a record.** This served `paged_bodies(1, 17_000)` —
         // ONE page holding ONE record — which counts about eleven characters, so
         // the old `< 1_000` assertion held by three orders of magnitude and would
         // have passed with the cap at 1 000. It also made the doc comment's "a
@@ -5027,26 +3927,6 @@ pub(crate) mod tests {
         assert!(
             count_structural_chars(br#"["a","b","c"]"#) > count_structural_chars(br#"[1,1,1]"#),
             "strings were not counted, so an array of them looks free"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_sidecar_refuses_a_node_explosion_too() {
-        let mut data =
-            String::from(r#"{"ok":true,"data":{"records":[{"uri":"at://d/c/r","value":["#);
-        for _ in 0..1_200_000 {
-            data.push_str("{},");
-        }
-        data.push_str(r#"{}]}]}}"#);
-        let base = crate::net::tests::serve_body(data.into_bytes()).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c", None, None)
-            .await
-            .expect_err("a node explosion reached the parser");
-        assert!(
-            format!("{err:#}").contains("structural characters"),
-            "failed for the wrong reason: {err:#}"
         );
     }
 
@@ -5220,11 +4100,7 @@ pub(crate) mod tests {
     /// twice is refused by its repeated-cursor guard, so every test built on the
     /// fixed-body server refuses on page one and never exercises accumulation
     /// at all — which is how a per-page budget once passed a whole suite.
-    pub(crate) fn paged_bodies(
-        pages: usize,
-        bytes: usize,
-        envelope: bool,
-    ) -> (Vec<Vec<u8>>, usize) {
+    pub(crate) fn paged_bodies(pages: usize, bytes: usize) -> (Vec<Vec<u8>>, usize) {
         let record = |i: usize| {
             serde_json::json!({
                 "uri": format!("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/c/3lab{i}"),
@@ -5237,9 +4113,6 @@ pub(crate) mod tests {
                 let mut page = serde_json::json!({ "records": [record(i)] });
                 if i + 1 < pages {
                     page["cursor"] = serde_json::json!(format!("p{}", i + 1));
-                }
-                if envelope {
-                    page = serde_json::json!({ "ok": true, "data": page });
                 }
                 page.to_string().into_bytes()
             })
@@ -5521,29 +4394,6 @@ pub(crate) mod tests {
         assert_eq!(refused.collection, "c");
     }
 
-    #[tokio::test]
-    async fn the_sidecar_walk_refuses_a_page_with_a_malformed_record() {
-        let body = serde_json::json!({
-            "ok": true,
-            "data": { "records": [
-                { "uri": "at://did:plc:x/c/3labGOOD", "value": {} },
-                { "cid": "bafy", "value": {} },
-            ]}
-        })
-        .to_string()
-        .into_bytes();
-        let base = crate::net::tests::serve_bodies_in_sequence(vec![body]).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_all_records("did:plc:x", "c")
-            .await
-            .expect_err("a page with a malformed record was accepted");
-        assert!(
-            err.downcast_ref::<MalformedRecords>().is_some(),
-            "refused for the wrong reason: {err:#}"
-        );
-    }
-
     /// A stranger's publication: skipping is right here, and the walk must keep
     /// paging past a page whose ONLY records were malformed — that page is not
     /// the end of the collection.
@@ -5587,7 +4437,7 @@ pub(crate) mod tests {
     /// 200x weaker and effectively inert — passed every test in the suite.
     #[tokio::test]
     async fn a_refusing_walk_spends_its_budget_across_pages() {
-        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (bodies, per_page) = paged_bodies(3, 4096);
         let (base, _) = host_for(bodies, "budget-accumulate.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
@@ -5610,7 +4460,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_truncating_walk_keeps_the_pages_that_fit() {
-        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (bodies, per_page) = paged_bodies(3, 4096);
         let (base, _) = host_for(bodies, "budget-accumulate-trunc.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
@@ -5710,108 +4560,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A walk that finishes cleanly across several pages still returns `Ok`.**
-    ///
-    /// The refusal's dangerous direction. Removing the flag's reset makes *every*
-    /// multi-page walk refuse, which puts a reader with more than one page of
-    /// records permanently into the fail-closed branch — and a review found that
-    /// mutation surviving on the sidecar walk, which is the default backend,
-    /// because nothing walked it to a clean finish and asserted success.
-    #[tokio::test]
-    async fn the_sidecar_walk_that_finishes_cleanly_returns_the_records() {
-        let mut bodies: Vec<Vec<u8>> = (0..3)
-            .map(|i| {
-                serde_json::json!({
-                    "ok": true,
-                    "data": {
-                        "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
-                        "cursor": format!("p{}", i + 1),
-                    }
-                })
-                .to_string()
-                .into_bytes()
-            })
-            .collect();
-        // **The terminator CARRIES a record.** Ending on an empty page left a
-        // second mutation alive: drop the last page's records and the assertion
-        // below still counts three, because the last page had none to drop. A
-        // real PDS ends on a partial page, and that page's records are the ones
-        // an off-by-one loses.
-        bodies.push(
-            serde_json::json!({
-                "ok": true,
-                "data": { "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }] }
-            })
-            .to_string()
-            .into_bytes(),
-        );
-        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let records = client
-            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
-            .await
-            .expect("a walk that ran out of records is not a short list");
-        assert_eq!(
-            records.len(),
-            4,
-            "the pages that were served were not all kept"
-        );
-        assert!(
-            records.iter().any(|r| r.uri.ends_with("3labLAST")),
-            "the LAST page's records were dropped — the walk kept the right \
-             count only because every page held one: {:?}",
-            records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
-        );
-    }
-
-    /// **The page cap is pinned exactly, not to within one.**
-    ///
-    /// `the_sidecar_walk_that_runs_out_of_pages_refuses` serves
-    /// `MAX_LIST_PAGES + 1` pages, so a budget one page SHORT refuses too and
-    /// that mutation survives it. A walk whose last allowed request is the
-    /// terminating one must come back `Ok` — which fails the moment the loop
-    /// allows one page fewer, and is the direction that costs a reader their
-    /// subscriptions.
-    #[tokio::test]
-    async fn a_sidecar_walk_that_terminates_on_its_last_allowed_page_succeeds() {
-        let mut bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES - 1)
-            .map(|i| {
-                serde_json::json!({
-                    "ok": true,
-                    "data": {
-                        "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
-                        "cursor": format!("p{}", i + 1),
-                    }
-                })
-                .to_string()
-                .into_bytes()
-            })
-            .collect();
-        // Request number `MAX_LIST_PAGES` — the last the loop allows — is the one
-        // that terminates, and it carries a record of its own.
-        bodies.push(
-            serde_json::json!({
-                "ok": true,
-                "data": { "records": [{ "uri": "at://did:plc:x/c/3labLAST", "value": {} }] }
-            })
-            .to_string()
-            .into_bytes(),
-        );
-        assert_eq!(bodies.len(), MAX_LIST_PAGES);
-        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-
-        let records = client
-            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
-            .await
-            .expect("a walk that terminated inside its budget is not a short list");
-        assert_eq!(
-            records.len(),
-            MAX_LIST_PAGES,
-            "a walk that used its whole page budget and finished lost records",
-        );
-    }
-
     /// **The direct walk's page cap, pinned exactly.**
     ///
     /// Twin of `a_sidecar_walk_that_terminates_on_its_last_allowed_page_succeeds`
@@ -5904,39 +4652,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The sidecar walk refuses a short list too — and it is the default backend.
-    #[tokio::test]
-    async fn the_sidecar_walk_that_runs_out_of_pages_refuses() {
-        let bodies: Vec<Vec<u8>> = (0..MAX_LIST_PAGES + 1)
-            .map(|i| {
-                serde_json::json!({
-                    "ok": true,
-                    "data": {
-                        "records": [{ "uri": format!("at://did:plc:x/c/3lab{i}"), "value": {} }],
-                        "cursor": format!("p{}", i + 1),
-                    }
-                })
-                .to_string()
-                .into_bytes()
-            })
-            .collect();
-        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_all_records("did:plc:ewvi7nxzyoun6zhxrhs64oiz", "c")
-            .await
-            .expect_err("a truncated list was returned as a complete one");
-        assert!(
-            format!("{err:#}").contains("did not finish"),
-            "failed for the wrong reason: {err:#}"
-        );
-        assert_eq!(
-            crate::feed::publication_failure_kind(&err),
-            crate::feed::FailureKind::Body,
-            "{err:#}"
-        );
-    }
-
     /// **A budget passed to two walks is spent by both of them.**
     ///
     /// The reason it is passed rather than constructed: a publication read runs
@@ -5945,7 +4660,7 @@ pub(crate) mod tests {
     /// the budget and the second finds it spent.
     #[tokio::test]
     async fn two_walks_sharing_a_budget_do_not_each_get_the_whole_of_it() {
-        let (bodies, per_page) = paged_bodies(4, 4096, false);
+        let (bodies, per_page) = paged_bodies(4, 4096);
         let (base, _) = host_for(bodies, "budget-shared.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
         let mut budget = ByteBudget::new(per_page * 3);
@@ -5975,7 +4690,7 @@ pub(crate) mod tests {
     /// only the remaining-budget comparison can.
     #[tokio::test]
     async fn a_transient_page_must_fit_what_is_left_not_the_ceiling() {
-        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (bodies, per_page) = paged_bodies(3, 4096);
         let (base, _) = host_for(bodies, "budget-remaining.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
@@ -6010,7 +4725,7 @@ pub(crate) mod tests {
     /// bound stands between that and the box.
     #[tokio::test]
     async fn a_filter_that_keeps_nothing_still_cannot_outrun_the_budget() {
-        let (bodies, per_page) = paged_bodies(3, 4096, false);
+        let (bodies, per_page) = paged_bodies(3, 4096);
         let (base, _) = host_for(bodies, "budget-filtered.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
 
@@ -6025,33 +4740,6 @@ pub(crate) mod tests {
             "a page too large to hold was walked past because the filter dropped it"
         );
         assert!(walk.records.is_empty(), "the filter kept nothing");
-    }
-
-    #[tokio::test]
-    async fn the_sidecar_walk_spends_its_budget_across_pages() {
-        let (bodies, per_page) = paged_bodies(3, 4096, true);
-        let base = crate::net::tests::serve_bodies_in_sequence(bodies).await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-
-        let err = client
-            .list_all_records_within(
-                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                "app.feather.subscription",
-                &mut ByteBudget::new(per_page * 2),
-            )
-            .await
-            .expect_err("the sidecar walk was the one with no budget at all");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("byte cap"), "wrong bound reported: {msg}");
-        assert!(
-            msg.contains("2 held"),
-            "did not accumulate across pages: {msg}"
-        );
-        assert_eq!(
-            crate::feed::publication_failure_kind(&err),
-            crate::feed::FailureKind::Body,
-            "{msg}"
-        );
     }
 
     /// **Shapes that used to read as a healthy empty page.**
@@ -6165,63 +4853,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `data` absent is not `data` empty, on the sidecar envelope too.
-    ///
-    /// `{"ok":true}` is what a proxy makes of an unexpected upstream body, and
-    /// reading it as a page of zero records is the wipe this whole family of
-    /// guards exists to prevent.
-    #[tokio::test]
-    async fn the_sidecar_refuses_an_envelope_with_no_data() {
-        for body in [&br#"{"ok":true}"#[..], &br#"{"ok":true,"data":{}}"#[..]] {
-            let base = crate::net::tests::serve_body(body.to_vec()).await;
-            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-            let err = client
-                .list_records(
-                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                    "app.feather.subscription",
-                    None,
-                    None,
-                )
-                .await
-                .expect_err("an envelope without a listing was read as an empty page");
-            assert!(
-                format!("{err:#}").contains("no records"),
-                "{} failed for the wrong reason: {err:#}",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
-
-    /// **The sidecar gets the duplicated-key refusal too.**
-    ///
-    /// It was the one client still reading a listing through a `Value`, where a
-    /// repeated key resolves last-wins — so a body carrying a second, empty
-    /// `records` array read as a successful empty page, and an empty page on this
-    /// path is `replace_sub_refs` deleting every `sub_ref` the reader has. It is
-    /// also the default backend, so it was the one that mattered most.
-    #[tokio::test]
-    async fn the_sidecar_refuses_a_duplicated_records_key() {
-        let base = crate::net::tests::serve_body(
-            br#"{"ok":true,"data":{"records":[{"uri":"at://d/c/r","value":{}}],"records":[]}}"#
-                .to_vec(),
-        )
-        .await;
-        let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-        let err = client
-            .list_records(
-                "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                "app.feather.subscription",
-                None,
-                None,
-            )
-            .await
-            .expect_err("a duplicated records key was read as an empty page");
-        assert!(
-            format!("{err:#}").contains("duplicate"),
-            "failed for the wrong reason: {err:#}"
-        );
-    }
-
     /// A non-string `message` must not fail an otherwise good page.
     /// **A listing has to be an object.**
     ///
@@ -6278,39 +4909,6 @@ pub(crate) mod tests {
         }
         // Short inputs pass through untouched.
         assert_eq!(truncate_for_message("Boom"), "Boom");
-    }
-
-    /// **The sidecar has two envelope layers, and both are guards.**
-    ///
-    /// `page_from_body` covers the PDS's, which arrives inside `data`. The
-    /// sidecar's own can say `ok:false` or carry its own `error` on a 200 while
-    /// `data` still holds something that reads as a perfectly good empty page —
-    /// and an empty page here is `replace_sub_refs` deleting every feed.
-    #[tokio::test]
-    async fn the_sidecar_refuses_its_own_error_envelope_on_a_2xx() {
-        for body in [
-            &br#"{"ok":false,"error":"ExpiredToken","data":{"records":[]}}"#[..],
-            &br#"{"ok":true,"error":"ExpiredToken","data":{"records":[]}}"#[..],
-            &br#"{"ok":false,"data":{"records":[]}}"#[..],
-        ] {
-            let base = crate::net::tests::serve_body(body.to_vec()).await;
-            let client = SidecarClient::new(Client::new(), base.clone(), base, "secret");
-            let err = client
-                .list_records(
-                    "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-                    "app.feather.subscription",
-                    None,
-                    None,
-                )
-                .await
-                .expect_err("the sidecar's own envelope was read as a page");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("sidecar answered 2xx"),
-                "{} failed for the wrong reason: {msg}",
-                String::from_utf8_lossy(body)
-            );
-        }
     }
 
     /// **An unknown field's contents are still validated.**
@@ -6632,10 +5230,8 @@ pub(crate) mod tests {
     /// Every `applyWrites` call a fake saw, as the `writes` array it carried.
     pub(crate) type ApplyWritesLog = Arc<std::sync::Mutex<Vec<Vec<Value>>>>;
 
-    /// A fake that answers `applyWrites` the way a strict PDS does, on BOTH
-    /// shapes this crate sends it in: the PDS's own
-    /// `/xrpc/com.atproto.repo.applyWrites` (the direct and OAuth clients) and
-    /// the sidecar's `/internal/repo` (`action: "applyWrites"`).
+    /// A fake that answers `/xrpc/com.atproto.repo.applyWrites` the way a strict
+    /// PDS does, for the direct and OAuth clients.
     ///
     /// It refuses what the reference PDS refuses — more than 200 writes
     /// (`InvalidRequest: Too many writes. Max: 200`, from
@@ -6648,23 +5244,18 @@ pub(crate) mod tests {
     /// chunk was never SENT. `fail_call` (1-based) answers that call with a 500.
     pub(crate) async fn serve_apply_writes(fail_call: Option<usize>) -> (String, ApplyWritesLog) {
         use axum::body::Bytes;
-        use axum::http::{StatusCode as Status, Uri};
+        use axum::http::StatusCode as Status;
         use axum::response::IntoResponse;
 
         const PRE_4989_JSON_LIMIT: usize = 150 * 1024;
         let log: ApplyWritesLog = Arc::default();
         let sink = Arc::clone(&log);
         let app = axum::Router::new()
-            .fallback(move |uri: Uri, body: Bytes| {
+            .fallback(move |body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
-                    let sidecar = uri.path() == "/internal/repo";
                     let reply = |status: Status, error: &str, message: &str| {
-                        let body = if sidecar {
-                            json!({ "ok": false, "error": error, "message": message, "status": status.as_u16() })
-                        } else {
-                            json!({ "error": error, "message": message })
-                        };
+                        let body = json!({ "error": error, "message": message });
                         (status, axum::Json(body)).into_response()
                     };
                     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -6672,12 +5263,7 @@ pub(crate) mod tests {
                     // listing, say) is answered empty and not logged, so the
                     // log and `fail_call` count `applyWrites` calls only.
                     let Some(writes) = parsed["writes"].as_array().cloned() else {
-                        let empty = json!({ "records": [] });
-                        return if sidecar {
-                            axum::Json(json!({ "ok": true, "data": empty })).into_response()
-                        } else {
-                            axum::Json(empty).into_response()
-                        };
+                        return axum::Json(json!({ "records": [] })).into_response();
                     };
                     let call = {
                         let mut calls = sink.lock().unwrap();
@@ -6699,19 +5285,11 @@ pub(crate) mod tests {
                         );
                     }
                     if fail_call == Some(call) {
-                        return reply(
-                            Status::INTERNAL_SERVER_ERROR,
-                            "InternalServerError",
-                            "boom",
-                        );
+                        return reply(Status::INTERNAL_SERVER_ERROR, "InternalServerError", "boom");
                     }
                     let data =
                         json!({ "commit": { "cid": "bafycommit", "rev": "3l" }, "results": [] });
-                    if sidecar {
-                        axum::Json(json!({ "ok": true, "data": data })).into_response()
-                    } else {
-                        axum::Json(data).into_response()
-                    }
+                    axum::Json(data).into_response()
                 }
             })
             // The fake must see an oversized body to refuse it, not have axum
@@ -6721,18 +5299,6 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), log)
-    }
-
-    /// `n` distinct vetted subscriptions, in a known order.
-    fn vetted_subs(n: usize) -> Vec<crate::vetted::VettedSubscription> {
-        (0..n)
-            .map(|i| {
-                crate::vetted::VettedSubscription::new(&lexicon::Subscription::new(
-                    format!("https://f{i}.example/feed.xml"),
-                    "2026-07-12T00:00:00.000Z",
-                ))
-            })
-            .collect()
     }
 
     /// The `rkey` of every write a run of calls carried, flattened in send order.
@@ -6751,126 +5317,6 @@ pub(crate) mod tests {
     }
 
     const CHUNK_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
-
-    fn chunk_sidecar(base: &str) -> SidecarClient {
-        SidecarClient::new(Client::new(), base, base, "secret")
-    }
-
-    /// **201 writes are two calls, 200 then 1, in order.** The OPML import used
-    /// to send every feed in one `applyWrites`, which the reference PDS refuses
-    /// past 200 — so any import over 200 feeds failed outright.
-    #[tokio::test]
-    async fn sidecar_bulk_add_of_201_is_two_calls_in_order() {
-        let (base, log) = serve_apply_writes(None).await;
-        let rkeys = chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(201))
-            .await
-            .expect("a 201-feed import must succeed against a PDS that caps at 200");
-
-        assert_eq!(call_sizes(&log), vec![200, 1]);
-        let urls: Vec<String> = log
-            .lock()
-            .unwrap()
-            .iter()
-            .flatten()
-            .map(|w| w["value"]["url"].as_str().unwrap().to_string())
-            .collect();
-        let expected: Vec<String> = (0..201)
-            .map(|i| format!("https://f{i}.example/feed.xml"))
-            .collect();
-        assert_eq!(urls, expected, "ops must keep input order across chunks");
-        assert_eq!(
-            sent_rkeys(&log),
-            rkeys,
-            "the returned rkeys are the ones written, in order"
-        );
-    }
-
-    /// 500 — the default per-DID cap, so the largest import a stock instance
-    /// sends — is three calls.
-    #[tokio::test]
-    async fn sidecar_bulk_add_of_500_is_three_calls() {
-        let (base, log) = serve_apply_writes(None).await;
-        chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(500))
-            .await
-            .expect("bulk write");
-        assert_eq!(call_sizes(&log), vec![200, 200, 100]);
-    }
-
-    /// Exactly the limit is ONE call: chunking must not split a batch that fits.
-    #[tokio::test]
-    async fn sidecar_bulk_add_of_exactly_200_is_one_call() {
-        let (base, log) = serve_apply_writes(None).await;
-        chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(200))
-            .await
-            .expect("bulk write");
-        assert_eq!(call_sizes(&log), vec![200]);
-    }
-
-    /// Nothing to write is no call at all — the behaviour both live clients
-    /// already had (the sidecar refuses an empty `writes[]` with a 400).
-    #[tokio::test]
-    async fn sidecar_bulk_add_of_nothing_sends_nothing() {
-        let (base, log) = serve_apply_writes(None).await;
-        let rkeys = chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &[])
-            .await
-            .expect("an empty import is not an error");
-        assert!(rkeys.is_empty());
-        assert!(
-            call_sizes(&log).is_empty(),
-            "an empty batch must not be sent"
-        );
-    }
-
-    /// **A failed chunk stops the run.** Chunk 2 of 3 fails: the call returns
-    /// an error, and chunk 3 is never sent — sending it would commit writes
-    /// after a gap, which no caller could describe as a prefix.
-    #[tokio::test]
-    async fn sidecar_bulk_add_stops_at_the_first_failed_chunk() {
-        let (base, log) = serve_apply_writes(Some(2)).await;
-        let err = chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(500))
-            .await
-            .expect_err("a failed chunk must fail the call");
-        assert_eq!(call_sizes(&log), vec![200, 200], "chunk 3 must NOT be sent");
-        assert!(
-            format!("{err:#}").contains("boom"),
-            "the PDS's reason was lost: {err:#}"
-        );
-        let progress = ApplyWritesIncomplete::of(&err).expect("the error says how far it got");
-        assert_eq!(
-            (progress.landed, progress.in_doubt, progress.total),
-            (200, 200, 500),
-            "chunk 1 landed, chunk 2 is in doubt, chunk 3 was never sent"
-        );
-        // A plain `%err` log line still names the PDS's reason.
-        assert!(err.to_string().contains("boom"), "{err}");
-    }
-
-    /// A batch that fit in one call fails exactly as it did before chunking:
-    /// the same message, and nothing landed.
-    #[tokio::test]
-    async fn a_single_chunk_failure_reads_as_it_always_did() {
-        let (base, _log) = serve_apply_writes(Some(1)).await;
-        let err = chunk_sidecar(&base)
-            .add_subscriptions_bulk(CHUNK_DID, &vetted_subs(3))
-            .await
-            .expect_err("refused");
-        let progress = ApplyWritesIncomplete::of(&err).expect("progress");
-        assert_eq!((progress.landed, progress.in_doubt), (0, 3));
-        assert!(
-            !err.to_string().contains("applyWrites call"),
-            "a one-call batch has no progress to report: {err}"
-        );
-        assert_eq!(
-            format!("{err:#}").matches("boom").count(),
-            1,
-            "the cause must not print twice in the chain: {err:#}"
-        );
-    }
 
     fn create_ops(n: usize, value_bytes: usize) -> Vec<WriteOp> {
         (0..n)
@@ -6955,45 +5401,6 @@ pub(crate) mod tests {
         let mut ops = create_ops(3, 8);
         ops.insert(1, create_ops(1, APPLY_WRITES_MAX_BYTES + 1).remove(0));
         assert_eq!(chunk_writes(&ops), vec![0..1, 1..2, 2..4]);
-    }
-
-    /// Read-state cursors as large as the lexicon allows: 1,000 ids each.
-    fn big_cursors(n: usize) -> Vec<(String, ReadState, bool)> {
-        (0..n)
-            .map(|i| {
-                let mut state = ReadState::new(
-                    format!("https://f{i}.example/feed.xml"),
-                    None,
-                    "2026-07-12T00:00:00.000Z",
-                );
-                state.read_ids = (0..ReadState::MAX_IDS)
-                    .map(|j| format!("https://f{i}.example/posts/{j:04}/an-entry-permalink"))
-                    .collect();
-                (format!("rk{i:04}"), state, i % 2 == 0)
-            })
-            .collect()
-    }
-
-    /// **The byte bound splits a batch well under 200 ops.** Ten full cursors
-    /// are ~500 KB: under the op cap, over every older reference PDS's 150 KiB
-    /// body limit. Each call must fit, and together they must carry every
-    /// cursor, once, in order.
-    #[tokio::test]
-    async fn sidecar_read_state_flush_splits_on_bytes_under_200_ops() {
-        let (base, log) = serve_apply_writes(None).await;
-        let cursors = big_cursors(10);
-        chunk_sidecar(&base)
-            .flush_read_states(CHUNK_DID, &cursors)
-            .await
-            .expect("a byte-heavy flush must succeed in chunks");
-
-        let sizes = call_sizes(&log);
-        assert!(
-            sizes.len() > 1,
-            "a ~500 KB flush went out as one call: {sizes:?}"
-        );
-        let want: Vec<String> = cursors.iter().map(|(rkey, _, _)| rkey.clone()).collect();
-        assert_eq!(sent_rkeys(&log), want, "every cursor, once, in order");
     }
 
     /// The direct (app-password) client gets the same chunking: its
@@ -7137,50 +5544,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// The same, for the sidecar client — whose body is the sidecar's own
-    /// `/internal/repo` shape, not XRPC's.
-    #[tokio::test]
-    async fn sidecar_put_sends_swap_record_only_when_given() {
-        let (base, _, log) =
-            serve_status_json(200, json!({ "ok": true, "data": write_ok() })).await;
-        let client = SidecarClient::new(Client::new(), &base, &base, "secret");
-
-        client
-            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
-            .await
-            .expect("put with a swap");
-        client
-            .update_subscription(SWAP_DID, "rk", &swap_sub(), None)
-            .await
-            .expect("put without a swap");
-
-        let sent = log.lock().unwrap().clone();
-        assert_eq!(sent.len(), 2, "{sent:?}");
-        assert_eq!(
-            sent[0]["action"], "put",
-            "captured no usable body: {sent:?}"
-        );
-        assert_eq!(sent[0]["swapRecord"], OLD_CID, "{}", sent[0]);
-        assert_eq!(sent[1]["action"], "put");
-        assert!(sent[1].get("swapRecord").is_none(), "{}", sent[1]);
-    }
-
     /// What the reference PDS answers a stale `swapRecord` with.
     pub(crate) fn invalid_swap_xrpc() -> Value {
         json!({ "error": "InvalidSwap", "message": format!("Record was at {OLD_CID}") })
     }
 
-    /// The same refusal, after the sidecar has wrapped it.
-    pub(crate) fn invalid_swap_sidecar() -> Value {
-        json!({
-            "ok": false,
-            "error": "InvalidSwap",
-            "message": format!("Record was at {OLD_CID}"),
-            "status": 400,
-        })
-    }
-
-    /// **A refused swap is recognised from each client's real error.** Driven
+    /// **A refused swap is recognised from the client's real error.** (The
+    /// OAuth client's is pinned in `oauth::xrpc`.) Driven
     /// through the clients against a server answering what the PDS answers,
     /// not built by hand, so a client that changes how it wraps a rejection
     /// breaks this rather than the rename that depends on it.
@@ -7197,13 +5567,6 @@ pub(crate) mod tests {
             .await
             .expect_err("the PDS refused the swap");
         assert!(is_invalid_swap(&err), "direct client: {err:#}");
-
-        let (base, _, _) = serve_status_json(400, invalid_swap_sidecar()).await;
-        let err = SidecarClient::new(Client::new(), &base, &base, "secret")
-            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
-            .await
-            .expect_err("the PDS refused the swap");
-        assert!(is_invalid_swap(&err), "sidecar client: {err:#}");
     }
 
     /// **Every other failure is NOT a lost race.** Reading one of these as
@@ -7239,14 +5602,27 @@ pub(crate) mod tests {
             assert!(!is_invalid_swap(&err), "{status} {body}: {err:#}");
         }
 
-        // A transport failure: nothing listening.
+        // A transport failure: a server that drops every connection unread.
+        // It keeps its port, so no other test's fake can be given it while
+        // this hostname still routes there.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let err = SidecarClient::new(Client::new(), &dead, &dead, "secret")
-            .update_subscription(SWAP_DID, "rk", &swap_sub(), Some(OLD_CID))
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        });
+        let host = format!("swap-dead-{}.atproto.test", addr.port());
+        crate::net::test_host_override(&host, addr);
+        let err = swap_direct_client(&format!("http://{host}:{}", addr.port()))
+            .put_record(
+                lexicon::nsid::SUBSCRIPTION,
+                "rk",
+                &swap_sub(),
+                Some(OLD_CID),
+            )
             .await
-            .expect_err("nothing is listening");
+            .expect_err("the connection was dropped");
         assert!(!is_invalid_swap(&err), "transport: {err:#}");
 
         // A string that merely SAYS it is not a typed refusal.
@@ -7370,38 +5746,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn both_clients_list_folders_with_the_cid_each_was_read_at() {
+    async fn the_direct_client_lists_folders_with_the_cid_each_was_read_at() {
         let (_, pds, _) = serve_status_json(200, two_folders_page()).await;
         let listed = swap_direct_client(&pds)
             .list_folders_with_cids()
             .await
             .expect("direct listing");
         assert_folders_listed_with_cids(&listed);
-
-        let (base, _, _) =
-            serve_status_json(200, json!({ "ok": true, "data": two_folders_page() })).await;
-        let listed = SidecarClient::new(Client::new(), &base, &base, "secret")
-            .list_folders_with_cids(SWAP_DID)
-            .await
-            .expect("sidecar listing");
-        assert_folders_listed_with_cids(&listed);
     }
 
     #[tokio::test]
-    async fn both_clients_list_subscriptions_with_the_cid_each_was_read_at() {
+    async fn the_direct_client_lists_subscriptions_with_the_cid_each_was_read_at() {
         let (_, pds, _) = serve_status_json(200, two_subs_page()).await;
         let listed = swap_direct_client(&pds)
             .list_subscriptions_with_cids()
             .await
             .expect("direct listing");
-        assert_listed_with_cids(&listed);
-
-        let (base, _, _) =
-            serve_status_json(200, json!({ "ok": true, "data": two_subs_page() })).await;
-        let listed = SidecarClient::new(Client::new(), &base, &base, "secret")
-            .list_subscriptions_with_cids(SWAP_DID)
-            .await
-            .expect("sidecar listing");
         assert_listed_with_cids(&listed);
     }
 }
