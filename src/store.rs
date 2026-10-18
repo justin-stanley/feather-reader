@@ -287,7 +287,13 @@ CREATE TABLE IF NOT EXISTS feeds (
     last_error         TEXT,
     -- What the poller does with this row; see `feed::FeedKind`. Written by the
     -- Rust side at insert so SQL never re-derives it from the URL.
-    kind               TEXT NOT NULL DEFAULT 'rss'
+    kind               TEXT NOT NULL DEFAULT 'rss',
+    -- The latest fetch time in this instance's FIRST non-empty fetch of the
+    -- feed: its starting backlog (#287 PR 3). A remote `readThrough` covers an
+    -- entry fetched by then even if the record was written earlier, which is
+    -- what lets a fresh database show reads compacted elsewhere; a back-dated
+    -- post arriving in a later poll is never covered. Set once, never moved.
+    first_fetched_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feeds_next_poll ON feeds (next_poll);
 -- NOTE: `idx_feeds_kind` is created in `apply_migrations`, AFTER `kind` is
@@ -377,6 +383,10 @@ CREATE TABLE IF NOT EXISTS read_cursor (
     dirty        INTEGER NOT NULL DEFAULT 0,
     pds_created  INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL,
+    -- What `read_through` is measured against: always 'published' (#287 PR 3).
+    -- Its presence marks that the one-time 0.5.0 step in `apply_migrations`
+    -- ran on this database; nothing reads the value.
+    watermark_basis TEXT NOT NULL DEFAULT 'published',
     PRIMARY KEY (did, feed_url)
 );
 CREATE INDEX IF NOT EXISTS idx_read_cursor_dirty ON read_cursor (did, dirty);
@@ -879,6 +889,113 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         tx.commit()
             .await
             .context("commit the guid_synthesized migration")?;
+    }
+
+    // read_cursor.watermark_basis — `read_through` is a PUBLISHED date from
+    // 0.5.0 (#287 PR 3). Before, compaction measured it on
+    // `COALESCE(published, fetched_at)`, so a stored watermark may be an
+    // undated entry's FETCH time, close to "now", and undated reads folded
+    // into it were dropped from `read_ids`. In the step that adds the column,
+    // once per database and in one transaction (a crash between would leave
+    // the marker without the repair, for good):
+    //
+    // 1. **Recompute** each watermark on the published basis, never above the
+    //    old one: the latest published date at or below it that is also below
+    //    the oldest UNREAD dated entry, which is the rule compaction applies.
+    //    A fetch-time mark could sit above an unread entry fetched after it.
+    // 2. **Restore** to `read_ids` every entry this DID has READ (from
+    //    `entry_state`, what the reader actually read) that the new watermark
+    //    does not cover: undated ones, which no watermark covers any more, and
+    //    dated ones above it, which the old mark had absorbed. The cursor is
+    //    dirtied so the next flush writes them to the PDS.
+    let has_basis = sqlx::query("PRAGMA table_info(read_cursor)")
+        .fetch_all(pool)
+        .await
+        .context("PRAGMA table_info(read_cursor) failed")?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "watermark_basis");
+    if !has_basis {
+        let mut tx = pool
+            .begin()
+            .await
+            .context("begin the watermark_basis migration")?;
+        sqlx::query(
+            "ALTER TABLE read_cursor ADD COLUMN watermark_basis TEXT NOT NULL DEFAULT 'published'",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("adding column watermark_basis")?;
+        // 3. **`feeds.first_fetched_at`**, back-filled with the earliest fetch
+        //    time still stored: the true first batch is unknown, and an
+        //    existing instance's older entries are covered anyway by being
+        //    fetched before any record it imports from now on.
+        sqlx::query("ALTER TABLE feeds ADD COLUMN first_fetched_at TEXT")
+            .execute(&mut *tx)
+            .await
+            .context("adding column first_fetched_at")?;
+        sqlx::query(
+            "UPDATE feeds SET first_fetched_at = \
+                 (SELECT MIN(fetched_at) FROM entries WHERE feed_id = feeds.id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("back-filling first_fetched_at")?;
+        sqlx::query(
+            r#"
+            UPDATE read_cursor SET read_through = (
+                SELECT MAX(e.published) FROM entries e JOIN feeds f ON f.id = e.feed_id
+                WHERE f.url = read_cursor.feed_url
+                  AND e.published IS NOT NULL AND e.published <= read_cursor.read_through
+                  AND e.published < COALESCE((
+                      SELECT MIN(u.published) FROM entries u
+                      JOIN feeds uf ON uf.id = u.feed_id
+                      LEFT JOIN entry_state us ON us.entry_id = u.id AND us.did = read_cursor.did
+                      WHERE uf.url = read_cursor.feed_url
+                        AND u.published IS NOT NULL AND COALESCE(us.read, 0) = 0
+                  ), '9999')
+            )
+            WHERE read_through IS NOT NULL
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .context("recomputing read_through on the published basis")?;
+        sqlx::query(
+            r#"
+            UPDATE read_cursor SET
+                read_ids = (
+                    SELECT json_group_array(v) FROM (
+                        SELECT v FROM (
+                            SELECT j.value AS v FROM json_each(read_cursor.read_ids) j
+                            UNION
+                            SELECT CAST(e.id AS TEXT) FROM entries e
+                            JOIN feeds f ON f.id = e.feed_id
+                            JOIN entry_state s ON s.entry_id = e.id AND s.did = read_cursor.did
+                            WHERE f.url = read_cursor.feed_url AND s.read = 1
+                              AND (e.published IS NULL OR read_cursor.read_through IS NULL
+                                   OR e.published > read_cursor.read_through)
+                        )
+                        ORDER BY CAST(v AS INTEGER)
+                    )
+                ),
+                dirty = 1
+            WHERE EXISTS (
+                SELECT 1 FROM entries e
+                JOIN feeds f ON f.id = e.feed_id
+                JOIN entry_state s ON s.entry_id = e.id AND s.did = read_cursor.did
+                WHERE f.url = read_cursor.feed_url AND s.read = 1
+                  AND (e.published IS NULL OR read_cursor.read_through IS NULL
+                       OR e.published > read_cursor.read_through)
+                  AND CAST(e.id AS TEXT) NOT IN (SELECT value FROM json_each(read_cursor.read_ids))
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .context("restoring uncovered reads to read_ids")?;
+        tx.commit()
+            .await
+            .context("commit the watermark_basis migration")?;
     }
     Ok(())
 }
@@ -1914,6 +2031,19 @@ pub async fn insert_entries(
     if max_entries_per_feed > 0 {
         prune_orphan_cursor_ids_tx(&mut tx, Some(feed_id)).await?;
     }
+
+    // The feed's starting backlog, once (see `feeds.first_fetched_at`): the
+    // latest fetch time in its first non-empty batch, so the whole batch is in
+    // it. A batch that inserted nothing leaves it unset for the next one.
+    sqlx::query(
+        "UPDATE feeds SET first_fetched_at = \
+             (SELECT MAX(fetched_at) FROM entries WHERE feed_id = ?1) \
+         WHERE id = ?1 AND first_fetched_at IS NULL",
+    )
+    .bind(feed_id)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("recording feed {feed_id}'s first fetch"))?;
 
     tx.commit().await.context("commit insert_entries tx")?;
     Ok(count)
@@ -3902,16 +4032,21 @@ pub async fn entries_for_guids(
 }
 
 /// `did`'s UNREAD dated entries on `feed_url` published at or before
-/// `read_through`, each with its `read_marked_at` (when it was last marked read
-/// or unread here; `None` if never). What a remote record's `readThrough`
-/// covers (#287 PR 3): it is compared against the published date only, so an
-/// undated entry is never among them. `read_through` must be in the stored
-/// form, second-precision UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+/// `read_through`, each with its `read_marked_at` (when it was last marked
+/// read or unread here; `None` if never). What a remote record's
+/// `readThrough` covers (#287 PR 3): it is compared against the published date
+/// only, so an undated entry is never among them; and only an entry the
+/// writer can have seen — fetched here at or before `known_at` (the record's
+/// `updatedAt`), or in this instance's first fetch of the feed
+/// (`feeds.first_fetched_at`, its starting backlog, which is what lets a fresh
+/// database import). A back-dated post that arrives in a LATER poll is never
+/// covered. Both bounds are in the stored form, second-precision UTC.
 pub async fn unread_entries_published_through(
     pool: &SqlitePool,
     did: &str,
     feed_url: &str,
     read_through: &str,
+    known_at: &str,
 ) -> Result<Vec<(GuidEntry, Option<String>)>> {
     let rows: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
@@ -3921,6 +4056,7 @@ pub async fn unread_entries_published_through(
         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
         WHERE f.url = ?2
           AND e.published IS NOT NULL AND e.published <= ?3
+          AND (e.fetched_at <= ?4 OR e.fetched_at <= f.first_fetched_at)
           AND COALESCE(s.read, 0) = 0
         ORDER BY e.id
         "#,
@@ -3928,6 +4064,7 @@ pub async fn unread_entries_published_through(
     .bind(did)
     .bind(feed_url)
     .bind(read_through)
+    .bind(known_at)
     .fetch_all(pool)
     .await
     .with_context(|| format!("unread_entries_published_through failed for {did}/{feed_url}"))?;
@@ -10992,6 +11129,88 @@ mod tests {
             false,
         )
         .await
+    }
+
+    /// **The 0.5.0 step repairs what a fetch-time watermark left (#287 PR 3)**,
+    /// once, on a database 0.4.10 made: a watermark that is an undated entry's
+    /// fetch time is clamped to the latest published date below it, the
+    /// undated read it had absorbed goes back into `read_ids` (dirtying the
+    /// cursor), and the feed's first fetch is back-filled. A second boot
+    /// changes nothing.
+    #[tokio::test]
+    async fn the_upgrade_repairs_a_fetch_time_watermark() -> Result<()> {
+        let pool = upgrade_test_pool().await?;
+        sqlx::raw_sql(include_str!("../tests/fixtures/schema-v0.4.10.sql"))
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO feeds (id, url) VALUES (1, 'https://w.example/f.xml')")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO entries (id, feed_id, guid, url, published, fetched_at) VALUES \
+             (10, 1, 'g-dated', 'https://w.example/a', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), \
+             (11, 1, 'g-undated', 'https://w.example/b', NULL, '2026-01-15T00:00:00Z'), \
+             (12, 1, 'g-later', 'https://w.example/c', '2026-01-10T00:00:00Z', '2026-01-20T00:00:00Z'), \
+             (13, 1, 'g-mid', 'https://w.example/d', '2026-01-12T00:00:00Z', '2026-01-12T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO entry_state (did, entry_id, read, starred, updated_at) VALUES \
+             ('did:plc:u', 10, 1, 0, '2026-01-15T00:00:00Z'), ('did:plc:u', 11, 1, 0, '2026-01-15T00:00:00Z'), \
+             ('did:plc:u', 13, 1, 0, '2026-01-15T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+        // What 0.4.x compaction left: the watermark is g-undated's FETCH time,
+        // and the reads of g-undated and g-mid were folded into it rather than
+        // kept as ids. g-later, published under it but fetched after, is
+        // unread.
+        sqlx::query(
+            "INSERT INTO read_cursor (did, feed_url, read_through, read_ids, unread_ids, dirty, updated_at) \
+             VALUES ('did:plc:u', 'https://w.example/f.xml', '2026-01-15T00:00:00Z', '[]', '[]', 0, '2026-01-15T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+
+        init_schema(&pool).await?;
+
+        let row: (Option<String>, String, bool) = sqlx::query_as(
+            "SELECT read_through, read_ids, dirty FROM read_cursor WHERE did = 'did:plc:u'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.0.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "the watermark must be the last published date below the oldest unread \
+             (g-later), never covering it"
+        );
+        assert_eq!(
+            row.1, r#"["11","13"]"#,
+            "the reads the new watermark does not cover were not restored as ids"
+        );
+        assert!(
+            row.2,
+            "the cursor was not dirtied, so the restore never reaches the PDS"
+        );
+        let first: Option<String> =
+            sqlx::query_scalar("SELECT first_fetched_at FROM feeds WHERE id = 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(first.as_deref(), Some("2026-01-01T00:00:00Z"));
+
+        // Once: a later boot leaves a cursor the reader has since changed alone.
+        sqlx::query("UPDATE read_cursor SET read_ids = '[]', dirty = 0")
+            .execute(&pool)
+            .await?;
+        init_schema(&pool).await?;
+        let again: (String, bool) =
+            sqlx::query_as("SELECT read_ids, dirty FROM read_cursor WHERE did = 'did:plc:u'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(again, ("[]".to_string(), false), "the step ran again");
+        Ok(())
     }
 
     async fn validators(pool: &SqlitePool) -> Result<Vec<(Option<String>, Option<String>)>> {

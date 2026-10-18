@@ -18,6 +18,16 @@ deploying is separate.
 
 ### Upgrade notes
 
+- **Schema: `read_cursor.watermark_basis` and `feeds.first_fetched_at` (#287
+  PR 3).** Added by `ALTER TABLE` on first boot, in one transaction with a
+  one-time repair of every read cursor: its `readThrough` is recomputed on the
+  published basis (never above the old value, never over an unread dated
+  entry), and every read entry the new watermark does not cover is put back in
+  `readIds`, dirtying the cursor so the next flush writes it. **Cost: a write
+  per such cursor on the first flush after the upgrade.** `first_fetched_at` is
+  back-filled from the earliest fetch time stored. Rolling back to 0.4.10
+  works: it never names either column.
+
 - **The Node OAuth sidecar is removed (#311). Rust is the only backend.**
   feather-reader.com has run `rust` since the 2026-09-13 cutover and sees no
   change. An instance on the sidecar, i.e. with `FEATHERREADER_REPO_BACKEND`
@@ -137,16 +147,27 @@ deploying is separate.
   stated). Now compaction builds the watermark from published dates only, an
   undated read always stays in `readIds`, and an import marks every unread
   local entry published at or before the record's `readThrough` read, except
-  one the record lists in `unreadIds` and one marked unread here more recently
-  than the record's `updatedAt` (a tie goes to local). The record format is
-  unchanged; `docs/lexicon.md` already specified this. A record 0.4.x wrote is
-  safe to apply: every entry it covered by published date was read there.
-  Tests: `an_undated_read_stays_an_id_through_compaction`,
+  one the record lists in `unreadIds`, one the id path's conflict rule keeps
+  unread, and one marked unread here more recently than the record's
+  `updatedAt` (a tie goes to local). **It covers only entries the writer could
+  have seen:** fetched here at or before the record's `updatedAt`, or in this
+  instance's first fetch of the feed (`feeds.first_fetched_at`, its starting
+  backlog, so a fresh database still imports). A back-dated or late-found post
+  fetched in a later poll stays unread; `docs/lexicon.md` now says readers do
+  this. The record format is unchanged. A watermark 0.4.x stored on fetch time
+  is recomputed on upgrade, and the reads it had absorbed are restored as ids
+  (see the upgrade notes): without that, an undated read folded into it, or a
+  dated one above the recomputed mark, would exist only locally.
+  Feeds with no publication dates cannot compact, so past 1000 reads their
+  oldest drop off the record, as the spec's Caps section states; the reads stay
+  correct locally. Tests: `an_undated_read_stays_an_id_through_compaction`,
   `a_remote_read_through_marks_dated_entries_read_and_leaves_undated_ones`,
   `a_read_through_spares_the_records_unread_ids_and_a_newer_local_unread`,
-  `a_fresh_database_shows_reads_compacted_elsewhere` (each mutation-checked:
-  keeping the old `fetched_at` basis, ignoring the remote `readThrough`, and
-  ignoring a newer local unread each fail one).
+  `a_newer_records_read_through_covers_an_older_local_unread`,
+  `a_read_through_does_not_override_the_id_paths_conflict_decision`,
+  `a_read_through_skips_a_post_fetched_after_the_record`,
+  `a_fresh_database_shows_reads_compacted_elsewhere`,
+  `the_upgrade_repairs_a_fetch_time_watermark` (each mutation-checked).
 
 - **Deleting your data also deletes your in-flight logins (#259).**
   `store::purge_did_data` removed every per-DID table except `oauth_state`,

@@ -489,14 +489,28 @@ async fn plan_guid_merge(
     // **The remote `readThrough`, applied to dated local entries (#287 PR 3).**
     // It is a published date, the one date every reader of the feed computes
     // alike, so it covers the same entries everywhere: every unread entry
-    // published at or before it is read there. Two exceptions keep an entry
-    // unread: the record itself lists it in `unreadIds` (`unread_rows`), or it
-    // was marked unread HERE more recently than the record was written (a tie
-    // goes to local, as for ids). An undated entry is never covered.
-    if let Some(rt) = theirs.read_through.as_deref().and_then(stored_instant) {
+    // published at or before it is read there — of the entries that existed
+    // when the record was written: only those fetched here at or before its
+    // `updatedAt` (a back-dated post fetched later was never seen by the
+    // writer). Exceptions keep an entry unread: the record itself lists it in
+    // `unreadIds` (`unread_rows`), the id path's conflict rule refuses it, or
+    // it was marked unread HERE more recently than the record was written (a
+    // tie goes to local, as for ids). An undated entry is never covered.
+    let bounds = theirs
+        .read_through
+        .as_deref()
+        .and_then(stored_instant)
+        .zip(stored_instant(&theirs.updated_at));
+    if let Some((rt, known_at)) = bounds {
         let planned: HashSet<i64> = to_read.iter().map(|e| e.id).collect();
-        let covered =
-            store::unread_entries_published_through(&state.db, did, &cursor.feed_url, &rt).await?;
+        let covered = store::unread_entries_published_through(
+            &state.db,
+            did,
+            &cursor.feed_url,
+            &rt,
+            &known_at,
+        )
+        .await?;
         for (e, marked_at) in covered {
             if unread_rows.contains(&e.id) || planned.contains(&e.id) {
                 continue;
@@ -2826,8 +2840,8 @@ pub(crate) mod tests {
     }
 
     /// **What keeps a covered entry unread: the record's own `unreadIds`, and
-    /// a local unread newer than the record.** An unread marked here BEFORE the
-    /// record was written is older news and is covered like any other entry.
+    /// a local unread newer than the record.** Here the cursor is newer than
+    /// the record too, so the id path's rule (local wins) agrees.
     #[tokio::test]
     async fn a_read_through_spares_the_records_unread_ids_and_a_newer_local_unread() {
         let fake = Arc::new(Mutex::new(FakeRepo::default()));
@@ -2835,20 +2849,12 @@ pub(crate) mod tests {
         let plain = entry_at(&state, 1, "g-plain", "2026-01-01T00:00:00Z").await;
         let listed = entry_at(&state, 1, "g-listed", "2026-01-01T00:00:00Z").await;
         let newer_local = entry_at(&state, 1, "g-newer", "2026-01-01T00:00:00Z").await;
-        let older_local = entry_at(&state, 1, "g-older", "2026-01-01T00:00:00Z").await;
-        for id in [newer_local, older_local] {
-            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
-            assert!(store::mark_read(&state.db, DID, id, false).await.unwrap());
-        }
-        // `newer_local` was marked unread now, after the record (2026-06-01);
-        // `older_local` before it.
-        sqlx::query("UPDATE entry_state SET read_marked_at = ?1 WHERE did = ?2 AND entry_id = ?3")
-            .bind("2026-05-01T00:00:00Z")
-            .bind(DID)
-            .bind(older_local)
-            .execute(&state.db)
+        assert!(store::mark_read(&state.db, DID, newer_local, true)
             .await
-            .unwrap();
+            .unwrap());
+        assert!(store::mark_read(&state.db, DID, newer_local, false)
+            .await
+            .unwrap());
         let mut record = remote_guid_record(1, &[], &["g-listed"], "2026-06-01T00:00:00Z");
         record["readThrough"] = serde_json::json!("2026-02-01T00:00:00Z");
         put_remote(&fake, 1, record);
@@ -2867,9 +2873,75 @@ pub(crate) mod tests {
             !is_read(&state, newer_local).await,
             "a local unread newer than the record was overridden"
         );
+    }
+
+    /// **A record newer than the local unread covers it.** The reverse of the
+    /// above: the reader marked it unread here, then read elsewhere later; the
+    /// newer side wins, as for ids.
+    #[tokio::test]
+    async fn a_newer_records_read_through_covers_an_older_local_unread() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        let older_local = entry_at(&state, 1, "g-older", "2026-01-01T00:00:00Z").await;
+        assert!(store::mark_read(&state.db, DID, older_local, true)
+            .await
+            .unwrap());
+        assert!(store::mark_read(&state.db, DID, older_local, false)
+            .await
+            .unwrap());
+        let mut record = remote_guid_record(1, &[], &[], "2099-01-01T00:00:00Z");
+        record["readThrough"] = serde_json::json!("2026-02-01T00:00:00Z");
+        put_remote(&fake, 1, record);
+
+        flush_did(&state, DID).await.unwrap();
+
         assert!(
             is_read(&state, older_local).await,
-            "a local unread OLDER than the record survived its readThrough"
+            "a newer record did not cover an older local unread"
+        );
+    }
+
+    /// **A back-dated post fetched after the record, in a later poll, is never
+    /// covered** (review of #321): the writer cannot have read an item that did
+    /// not exist when it wrote the record. An entry from this instance's FIRST
+    /// fetch of the feed is, which is what lets a fresh database import.
+    #[tokio::test]
+    async fn a_read_through_skips_a_post_fetched_after_the_record() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        let backlog = entry_at(&state, 1, "g-backlog", "2026-01-01T00:00:00Z").await;
+        // The first fetch was at 2026-03-01; the record at 2026-04-01; the
+        // back-dated post arrived in a poll at 2026-05-01.
+        sqlx::query("UPDATE entries SET fetched_at = '2026-03-01T00:00:00Z' WHERE id = ?1")
+            .bind(backlog)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE feeds SET first_fetched_at = '2026-03-01T00:00:00Z' WHERE url = ?1")
+            .bind(feed(1))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let late = entry_at(&state, 1, "g-late", "2026-01-15T00:00:00Z").await;
+        sqlx::query("UPDATE entries SET fetched_at = '2026-05-01T00:00:00Z' WHERE id = ?1")
+            .bind(late)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut record = remote_guid_record(1, &[], &[], "2026-04-01T00:00:00Z");
+        record["readThrough"] = serde_json::json!("2026-02-01T00:00:00Z");
+        put_remote(&fake, 1, record);
+
+        mark_read(&state, 2, "g2").await;
+        flush_did(&state, DID).await.unwrap();
+
+        assert!(
+            is_read(&state, backlog).await,
+            "the backlog was not covered"
+        );
+        assert!(
+            !is_read(&state, late).await,
+            "a post fetched after the record was covered"
         );
     }
 
@@ -2953,6 +3025,16 @@ pub(crate) mod tests {
             ids
         };
         let new = entry_at(&b, 1, "g-new", "2026-02-01T00:00:00Z").await;
+        // B fetched its backlog long after A wrote the record: only B's FIRST
+        // fetch of the feed lets the watermark cover it.
+        sqlx::query("UPDATE entries SET fetched_at = '2099-01-01T00:00:00Z'")
+            .execute(&b.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE feeds SET first_fetched_at = '2099-01-01T00:00:00Z'")
+            .execute(&b.db)
+            .await
+            .unwrap();
         mark_read(&b, 2, "g2").await;
         flush_did(&b, DID).await.unwrap();
 
