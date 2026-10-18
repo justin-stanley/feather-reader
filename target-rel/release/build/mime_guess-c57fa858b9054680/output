@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/homelab/feather-reader/.claude/worktrees/fix-275/target-rel/release/build/mime_guess-c57fa858b9054680/out/mime_types_generated.rs

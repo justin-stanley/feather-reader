@@ -1,4 +1,6 @@
 /target
+# Any other target dir, e.g. a release benchmark build (`target-rel`).
+/target-*
 
 # Runtime artefacts written into the WORKING DIRECTORY by the documented
 # defaults. These are ignored because the defaults are relative paths, so a

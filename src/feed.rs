@@ -1405,8 +1405,10 @@ pub(crate) const SANITIZE_CONCURRENCY: usize = 4;
 /// an M-series Mac) is 50 ms at 32 KiB, 186 ms at 64 KiB, 0.73 s at 128 KiB
 /// and 12.8 s at 512 KiB, roughly quadratic. At [`SANITIZE_RESERVE_MAX_BYTES`]
 /// that is ~27x under [`SANITIZE_TIMEOUT`]: room for a shared vCPU several
-/// times slower that the three abandoned threads are also running on. Real
-/// bodies fit (production's largest is 87 KB; nearly all are a few KB).
+/// times slower that the three abandoned threads are also running on. Nearly
+/// every real body fits (most are a few KB); production's largest, 87 KB,
+/// does not, and while the shared permits are held it defers as every body did
+/// before this.
 ///
 /// If one ever did time out, the reserve would be held like any other permit
 /// and the instance would be back where it was before this: starved, counted
@@ -1705,20 +1707,28 @@ async fn sanitize_off_runtime(
     let guard = AbandonGuard::register(limits.in_flight, feed)?;
     let state = std::sync::Arc::clone(&guard.state);
     let small = raw.len() <= limits.reserve_max_bytes;
+    // Which pool the permit came from, with it.
     let acquire = async {
         if small {
             tokio::select! {
                 biased;
-                p = limits.permits.acquire() => p,
-                p = limits.reserve.acquire() => p,
+                p = limits.permits.acquire() => p.map(|p| (p, true)),
+                p = limits.reserve.acquire() => p.map(|p| (p, false)),
             }
         } else {
-            limits.permits.acquire().await
+            limits.permits.acquire().await.map(|p| (p, true))
         }
     };
     let permit = match tokio::time::timeout(limits.timeout, acquire).await {
-        Ok(Ok(permit)) => {
-            limits.starvation.record_permit();
+        Ok(Ok((permit, shared))) => {
+            // **Only a shared permit says the instance isn't starved.** The
+            // reserve is taken exactly while the shared ones are held, by small
+            // bodies that never stop coming: counted as relief, it reset the
+            // clock on every small poll, so a big body deferred forever never
+            // raised the alert or showed in `/stats` (found in review).
+            if shared {
+                limits.starvation.record_permit();
+            }
             permit
         }
         // `Ok(Err(_))` is a closed semaphore, which this never does.
@@ -5048,6 +5058,12 @@ mod sanitize_off_runtime_tests {
             shared.available_permits(),
             0,
             "the hostile sanitizes finished early"
+        );
+        // Still starved, as far as a big body is concerned: taking the reserve
+        // is not a permit coming free.
+        assert!(
+            base.starvation.snapshot().1.is_some(),
+            "the reserve cleared the starvation the fourth hostile feed recorded"
         );
 
         drop(release);

@@ -167,9 +167,12 @@ deploying is separate.
   worst shape found (unclosed `<div>`s, release, M-series Mac) is roughly
   quadratic, at 50 ms for 32 KiB, 186 ms for 64 KiB, 0.73 s for 128 KiB and
   12.8 s for 512 KiB, so 64 KiB is ~27x under the 5 s timeout, leaving room for
-  a slower shared vCPU also running the three abandoned threads. Real bodies fit
-  (production's largest is 87 KB; nearly all are a few KB); in the starved state
-  a feed with a bigger body still defers, as before. If a reserved sanitize ever
+  a slower shared vCPU also running the three abandoned threads. Nearly every
+  real body fits (most are a few KB); production's largest, 87 KB, does not, and
+  in the starved state a feed with a bigger body still defers, as before. Only a
+  shared permit clears the starvation clock, so that deferral still raises the
+  alert and shows in `/stats`; counting the reserve as relief hid it (found in
+  review). If a reserved sanitize ever
   did time out, the instance would be starved as it was before this, counted in
   `/stats`, never worse. `hostile_feeds_cannot_hold_every_permit` makes four
   hostile feeds hang their sanitizes (three hold every shared permit, the fourth
