@@ -282,11 +282,11 @@ impl Repo<'_> {
                 // REFUSED rather than ended on (#203): stopping there hands
                 // `replace_sub_refs` a list the server said was unfinished.
                 Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
-                    anyhow::bail!(
-                        "listRecords for {collection} returned a repeated cursor on a \
-                         non-empty page ({} held) — refusing a list the server did not finish",
-                        out.len(),
-                    );
+                    return Err(crate::atproto::UnreadableListing::RepeatedCursor {
+                        collection: collection.to_string(),
+                        held: out.len(),
+                    }
+                    .into());
                 }
                 Some(next) if got > 0 => {
                     cursor = Some(next);
@@ -1199,8 +1199,17 @@ mod tests {
             .await
             .expect_err("a repeated cursor ended the walk with a short list");
         assert!(
-            format!("{err:#}").contains("repeated cursor"),
+            matches!(
+                err.downcast_ref::<crate::atproto::UnreadableListing>(),
+                Some(crate::atproto::UnreadableListing::RepeatedCursor { .. })
+            ),
             "refused for the wrong reason: {err:#}"
+        );
+        // The server answered: filed as an unwalkable answer, not as one that
+        // never arrived (#280).
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Parse
         );
     }
 

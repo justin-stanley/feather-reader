@@ -1716,14 +1716,16 @@ pub(crate) mod tests {
 
     /// A PLC directory and PDS on one port that answer however the test says:
     /// the PLC lookup with `plc_status` (200 serves a DID document), and every
-    /// `listRecords` with `(status, body)` after `delay` — or, when `endless`,
-    /// a fresh page of one sibling document, forever.
+    /// `listRecords` with `(status, body)` after `delay`. [`Answer::Endless`]
+    /// serves a fresh page of one sibling document, forever, in its place, and
+    /// [`Answer::CutShort`] announces more bytes than the body holds, so the
+    /// read fails part-way.
     async fn serve_answering(
         did: &'static str,
         plc_status: u16,
         pds: (u16, &'static str),
         delay: std::time::Duration,
-        endless: bool,
+        answer: Answer,
     ) -> String {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1737,7 +1739,42 @@ pub(crate) mod tests {
         crate::net::test_host_override(&plc_host, addr);
         crate::net::test_host_override(&pds_host, addr);
         let pages = Arc::new(AtomicUsize::new(0));
-        let endpoint = format!("http://{pds_host}:{port}");
+        let mut endpoint = format!("http://{pds_host}:{port}");
+        if answer == Answer::CutShort {
+            // Raw TCP, because hyper will not send a body short of its own
+            // Content-Length: the headers promise more than arrives, and the
+            // connection closes.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let raw_addr = raw.local_addr().unwrap();
+            let raw_host = format!("cut-{}.answer.test", raw_addr.port());
+            crate::net::test_host_override(&raw_host, raw_addr);
+            endpoint = format!("http://{raw_host}:{}", raw_addr.port());
+            tokio::spawn(async move {
+                while let Ok((mut conn, _)) = raw.accept().await {
+                    // Read the whole request head before answering: closing
+                    // with request bytes unread can make the client see a
+                    // reset (Fetch) instead of a short body (Body).
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        pds.0,
+                        pds.1.len() + 1024
+                    );
+                    let _ = conn.write_all(head.as_bytes()).await;
+                    let _ = conn.write_all(pds.1.as_bytes()).await;
+                    let _ = conn.shutdown().await;
+                }
+            });
+        }
         let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let pages = Arc::clone(&pages);
             let endpoint = endpoint.clone();
@@ -1750,7 +1787,7 @@ pub(crate) mod tests {
                     return (status, axum::Json(doc)).into_response();
                 }
                 tokio::time::sleep(delay).await;
-                if endless {
+                if answer == Answer::Endless {
                     let n = pages.fetch_add(1, Ordering::SeqCst);
                     let body = json!({ "records": [{
                         "uri": format!("at://{did}/{}/3lend{n:08}", nsid::STANDARD_DOCUMENT),
@@ -1766,6 +1803,17 @@ pub(crate) mod tests {
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{plc_host}:{port}")
+    }
+
+    /// How [`serve_answering`] answers `listRecords`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Answer {
+        /// The given `(status, body)`, whole.
+        Once,
+        /// A fresh page of one sibling document, forever.
+        Endless,
+        /// The given body, with a `Content-Length` it does not reach.
+        CutShort,
     }
 
     async fn poll_publication_at(
@@ -1816,7 +1864,7 @@ pub(crate) mod tests {
             200,
             (200, ""),
             std::time::Duration::from_millis(50),
-            true,
+            Answer::Endless,
         )
         .await;
         let started = std::time::Instant::now();
@@ -1841,7 +1889,7 @@ pub(crate) mod tests {
     async fn a_publication_failure_is_filed_under_what_happened() {
         let zero = std::time::Duration::ZERO;
         const GONE: &str = "did:plc:tombstonedaaaaaaaaaaaaaa";
-        let plc = serve_answering(GONE, 404, (200, ""), zero, false).await;
+        let plc = serve_answering(GONE, 404, (200, ""), zero, Answer::Once).await;
         let outcome = poll_publication_at(GONE, plc, None).await;
         assert_eq!(
             kind_of(&outcome),
@@ -1855,7 +1903,7 @@ pub(crate) mod tests {
             200,
             (400, r#"{"error":"RepoNotFound"}"#),
             zero,
-            false,
+            Answer::Once,
         )
         .await;
         let outcome = poll_publication_at(NOREPO, plc, None).await;
@@ -1866,7 +1914,14 @@ pub(crate) mod tests {
         );
 
         const GARBLED: &str = "did:plc:garbledaaaaaaaaaaaaaaaaa";
-        let plc = serve_answering(GARBLED, 200, (200, r#"{"records":"x"}"#), zero, false).await;
+        let plc = serve_answering(
+            GARBLED,
+            200,
+            (200, r#"{"records":"x"}"#),
+            zero,
+            Answer::Once,
+        )
+        .await;
         let outcome = poll_publication_at(GARBLED, plc, None).await;
         assert_eq!(
             kind_of(&outcome),
@@ -1886,45 +1941,64 @@ pub(crate) mod tests {
         // a `'static` body, and this is one allocation per test run.
         let oversized: &'static str =
             Box::leak("x".repeat(crate::net::MAX_BODY_BYTES + 1).into_boxed_str());
+        // Past MAX_LIST_STRUCTURAL_CHARS and well under the cap on the wire.
+        let exploded: &'static str = Box::leak(
+            "[".repeat(crate::atproto::MAX_LIST_STRUCTURAL_CHARS + 1)
+                .into_boxed_str(),
+        );
         let mut misfiled = Vec::new();
-        for (did, (status, body), endless, want, label) in [
+        for (did, (status, body), answer, want, label) in [
             (
                 "did:plc:emptybodyaaaaaaaaaaaaaaa",
                 (200, ""),
-                false,
+                Answer::Once,
                 FailureKind::Parse,
                 "a 200 with an empty body",
             ),
             (
                 "did:plc:norecordsaaaaaaaaaaaaaaa",
                 (200, "{}"),
-                false,
+                Answer::Once,
                 FailureKind::Parse,
                 "a 200 with no records field",
             ),
             (
                 "did:plc:envelopeaaaaaaaaaaaaaaaa",
                 (200, r#"{"error":"RepoDeactivated"}"#),
-                false,
+                Answer::Once,
                 FailureKind::Status,
                 "a 200 carrying an error envelope",
             ),
             (
                 "did:plc:endlessaaaaaaaaaaaaaaaaa",
                 (200, ""),
-                true,
+                Answer::Endless,
                 FailureKind::Body,
                 "more pages than MAX_LIST_PAGES",
             ),
             (
                 "did:plc:oversizedaaaaaaaaaaaaaaa",
                 (200, oversized),
-                false,
+                Answer::Once,
                 FailureKind::Body,
                 "a body over read_capped's cap",
             ),
+            (
+                "did:plc:explodedaaaaaaaaaaaaaaaa",
+                (200, exploded),
+                Answer::Once,
+                FailureKind::Parse,
+                "a body past the structure bound",
+            ),
+            (
+                "did:plc:cutshortaaaaaaaaaaaaaaaa",
+                (200, r#"{"records":["#),
+                Answer::CutShort,
+                FailureKind::Body,
+                "a body that stopped part-way",
+            ),
         ] {
-            let plc = serve_answering(did, 200, (status, body), zero, endless).await;
+            let plc = serve_answering(did, 200, (status, body), zero, answer).await;
             let outcome = poll_publication_at(did, plc, None).await;
             if kind_of(&outcome) != Some(want) {
                 misfiled.push(format!("{label}: want {want:?}, got {outcome:?}"));

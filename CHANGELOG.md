@@ -156,6 +156,23 @@ deploying is separate.
 
 ### Fixed
 
+- **The last publication refusals are filed under what the PDS sent (#280).**
+  Three refusals were still plain strings, so a publication read filed them as
+  `Fetch` ("the request never produced a response"), and `/stats` showed a
+  server that had answered as unreachable. Each is now a typed error with its
+  log text unchanged, and `publication_failure_kind` maps it: a body past the
+  structure bound (`StructureExplosion`) is `Parse`, a body that stopped
+  part-way (`net::BodyReadFailed`, which wraps only the chunk read, so a
+  connection that never answered stays `Fetch`) is `Body`, and a repeated
+  cursor (`UnreadableListing::RepeatedCursor`, raised by both walks that refuse
+  one) is `Parse`, as an answer no one can walk. Publication reads don't reach
+  the repeated-cursor refusal today (theirs report themselves partial instead),
+  so it is typed for when one does. The issue's sidecar row went with the
+  sidecar. #279's table test gained the two reachable cases, served by a
+  listing past the bound and by a raw socket that promises more bytes than it
+  sends; the repeated-cursor tests assert the variant and its kind. Each new
+  arm and each raising site was mutated and the tests failed.
+
 - **`readThrough` means a published date, here and on import (#287 PR 3).**
   Compaction compared it against `COALESCE(published, fetched_at)`, and
   `fetched_at` is when THIS instance first saw an entry, so the same watermark

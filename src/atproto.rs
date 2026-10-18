@@ -968,6 +968,36 @@ pub enum UnreadableListing {
         /// Its `message`, already truncated for a log line.
         message: Option<String>,
     },
+    /// A non-empty page whose cursor is the one that fetched it (#203): the
+    /// server said it had more, and following it would never end. An answer
+    /// that is not a listing anyone can walk, so `Parse` rather than `Body`,
+    /// which is for a listing too big or a read cut short (#280).
+    #[error(
+        "listRecords for {collection} returned a repeated cursor on a \
+         non-empty page ({held} held) — refusing a list the server did not finish"
+    )]
+    RepeatedCursor {
+        /// The collection being listed.
+        collection: String,
+        /// Records held when the walk refused.
+        held: usize,
+    },
+}
+
+/// A body refused before parsing for carrying more JSON structure than
+/// `MAX_LIST_STRUCTURAL_CHARS`. The server answered with something no honest
+/// listing or document looks like, so a publication read files it as `Parse`
+/// (#280).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{what} counts at least {counted} structural characters, over the \
+     {MAX_LIST_STRUCTURAL_CHARS} cap — refusing before parsing it"
+)]
+pub struct StructureExplosion {
+    /// What the body was, for the log line.
+    pub what: String,
+    /// How many structural characters were counted.
+    pub counted: usize,
 }
 
 /// **A walk refused to read further because the listing is too big** (#227):
@@ -1312,11 +1342,11 @@ impl PdsClient {
                 // `replace_sub_refs` a list the server itself said was
                 // unfinished, which deletes everything past it.
                 Some(next) if got > 0 && Some(&next) == cursor.as_ref() => {
-                    anyhow::bail!(
-                        "listRecords for {collection} returned a repeated cursor on a \
-                         non-empty page ({} held) — refusing a list the server did not finish",
-                        out.len(),
-                    );
+                    return Err(UnreadableListing::RepeatedCursor {
+                        collection: collection.to_string(),
+                        held: out.len(),
+                    }
+                    .into());
                 }
                 // A cursor on an EMPTY page ends the walk: a real PDS (this
                 // project's own) returns one alongside its last page.
@@ -2361,11 +2391,13 @@ pub(crate) fn count_structural_chars(body: &[u8]) -> usize {
 /// [`MAX_LIST_STRUCTURAL_CHARS`].
 pub(crate) fn refuse_a_structure_explosion(body: &[u8], what: &str) -> Result<()> {
     let counted = count_structural_chars(body);
-    anyhow::ensure!(
-        counted <= MAX_LIST_STRUCTURAL_CHARS,
-        "{what} counts at least {counted} structural characters, over the \
-         {MAX_LIST_STRUCTURAL_CHARS} cap — refusing before parsing it"
-    );
+    if counted > MAX_LIST_STRUCTURAL_CHARS {
+        return Err(StructureExplosion {
+            what: what.to_string(),
+            counted,
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -3744,8 +3776,17 @@ pub(crate) mod tests {
             .await
             .expect_err("a repeated cursor ended the walk with a short list");
         assert!(
-            format!("{err:#}").contains("repeated cursor"),
+            matches!(
+                err.downcast_ref::<crate::atproto::UnreadableListing>(),
+                Some(crate::atproto::UnreadableListing::RepeatedCursor { .. })
+            ),
             "refused for the wrong reason: {err:#}"
+        );
+        // The server answered: filed as an unwalkable answer, not as one that
+        // never arrived (#280).
+        assert_eq!(
+            crate::feed::publication_failure_kind(&err),
+            crate::feed::FailureKind::Parse
         );
     }
 

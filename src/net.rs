@@ -1351,13 +1351,24 @@ pub struct BodyTooLarge {
     pub cap: usize,
 }
 
+/// A response body that failed part-way through [`read_capped`]: the server
+/// answered, and the body did not arrive whole.
+///
+/// Typed so a publication read files it as `Body`, not `Fetch` (#280). Only
+/// this read is wrapped: a `reqwest::Error` from sending the request is a
+/// server that never answered, and stays `Fetch`. The source is kept, so a
+/// caller can still ask the `reqwest::Error` whether it was a timeout.
+#[derive(Debug, thiserror::Error)]
+#[error("reading response body chunk")]
+pub struct BodyReadFailed(#[source] pub reqwest::Error);
+
 /// Read a response body, streaming chunk-by-chunk and **aborting** the moment
 /// the accumulated size would exceed [`MAX_BODY_BYTES`]. Never trusts
 /// `Content-Length` (gzip strips it) and never fully buffers an over-cap body —
 /// this is the decompression-bomb / OOM guard.
 pub async fn read_capped(mut resp: Response) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-    while let Some(chunk) = resp.chunk().await.context("reading response body chunk")? {
+    while let Some(chunk) = resp.chunk().await.map_err(BodyReadFailed)? {
         if buf.len() + chunk.len() > MAX_BODY_BYTES {
             return Err(BodyTooLarge {
                 cap: MAX_BODY_BYTES,
