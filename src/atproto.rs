@@ -915,10 +915,18 @@ pub struct ListRecordsResponse {
     #[serde(skip)]
     pub malformed: usize,
     /// The page's size on the wire, where the client knows it (0 otherwise).
-    /// A walk that SKIPS malformed records charges this to its budget, since
-    /// the skipped records are invisible to the per-record accounting.
+    /// A walk that keeps EVERY record and skips malformed ones
+    /// (`walk_all_within`) charges this to its budget, since the skipped
+    /// records are invisible to the per-record accounting. A walk that filters
+    /// charges [`Self::malformed_bytes`] instead (#284).
     #[serde(skip)]
     pub wire_bytes: usize,
+    /// What the malformed records on this page retain, by the same measure as
+    /// `approx_bytes` (#284). A walk that keeps only some of a page's records
+    /// charges these, and not the page's wire size, for the skipped ones: the
+    /// wire size also counts the good records it drops.
+    #[serde(skip)]
+    pub malformed_bytes: usize,
 }
 
 /// **A reader's own repo holds records this server cannot read** (#177).
@@ -1491,13 +1499,10 @@ impl PdsClient {
             // number. A page of records the filter rejects entirely charges
             // nothing against the total and can still hold hundreds of
             // megabytes, so no single page may exceed the walk's budget alone.
-            // On a page that skipped records, the transient is the larger of
-            // its wire size and its parsed records: the skipped ones are
-            // invisible to the per-record sum.
-            let mut page_cost: usize = page.records.iter().map(approx_bytes).sum();
-            if wire_charged {
-                page_cost = page_cost.max(page.wire_bytes);
-            }
+            // On a page that skipped records, the skipped ones count too, by
+            // their own size (#284).
+            let page_cost: usize =
+                page.records.iter().map(approx_bytes).sum::<usize>() + page.malformed_bytes;
             if page_cost > budget.remaining() {
                 let mut w = RecordWalk::partial(out);
                 w.out_of_budget = true;
@@ -1510,10 +1515,16 @@ impl PdsClient {
             // a subset of it. Written as `if !admit(…) { return }` it reads as a
             // second stopping rule, and a reader would look for the case that
             // trips it. There isn't one — the call is the bookkeeping.
-            // A page that skipped records also pays for the skipped bytes,
-            // once: the larger of its wire size and what it keeps.
+            // A page that skipped records also pays for the skipped records,
+            // by their own size, and for nothing else it dropped (#284). It used
+            // to pay its whole wire size, which counts the siblings' documents
+            // the filter rejected: in a repo where several publications share
+            // one walk, a malformed record on every page charged every
+            // sibling's documents, and a quiet publication ran out of budget
+            // long before its own documents did. A page of only junk still
+            // costs what the junk retains, so junk pages can't walk for free.
             let charged = if wire_charged {
-                budget.charge(page.wire_bytes.max(kept.iter().map(approx_bytes).sum()))
+                budget.charge(kept.iter().map(approx_bytes).sum::<usize>() + page.malformed_bytes)
             } else {
                 budget.admit(&kept)
             };
@@ -2446,10 +2457,14 @@ fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
     let entries = parsed.records.ok_or(UnreadableListing::NoRecords)?;
     let mut records = Vec::with_capacity(entries.len());
     let mut malformed = 0;
+    let mut malformed_bytes = 0;
     for entry in entries {
         match entry {
             MaybeRecord::Record(r) => records.push(r),
-            MaybeRecord::Malformed(_) => malformed += 1,
+            MaybeRecord::Malformed(v) => {
+                malformed += 1;
+                malformed_bytes += json_bytes(&v);
+            }
         }
     }
     Ok(ListRecordsResponse {
@@ -2457,6 +2472,7 @@ fn page_from_body(parsed: ListRecordsBody) -> Result<ListRecordsResponse> {
         cursor: parsed.cursor,
         malformed,
         wire_bytes: 0,
+        malformed_bytes,
     })
 }
 
@@ -2500,7 +2516,10 @@ struct ListRecordsBody {
 #[serde(untagged)]
 enum MaybeRecord {
     Record(RecordEntry),
-    Malformed(serde::de::IgnoredAny),
+    /// Kept as a `Value` so its size can be charged (#284). Bounded: the whole
+    /// body passed [`refuse_a_structure_explosion`] before it was parsed, and the
+    /// value is dropped as soon as it is measured.
+    Malformed(Value),
 }
 
 /// Refuse a page that skipped records, for a walk that must not drop any.
@@ -4261,6 +4280,12 @@ pub(crate) mod tests {
             !walk.complete,
             "40 pages of junk were walked to the end under a 1 MiB budget"
         );
+        // And stopped BY the budget: an incomplete walk alone passed with junk
+        // charged nothing, ended by the stub running out of pages (#284).
+        assert!(
+            walk.out_of_budget,
+            "the junk walk ended without the budget stopping it"
+        );
 
         let (base, _) = host_for(junk_pages(40, 256 * 1024), "junk-skipping.test").await;
         let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
@@ -4324,6 +4349,51 @@ pub(crate) mod tests {
             "one tiny malformed record per page cut short a walk that fits"
         );
         assert_eq!(walk.records.len(), clean_records.len());
+    }
+
+    /// **A malformed record charges only itself, not its siblings' documents
+    /// (#284).** Several publications in one repo share one walk, and the
+    /// filter keeps only the requested one's documents. A page holding one
+    /// malformed record used to be charged its whole wire size, which counts
+    /// every sibling document the filter dropped, so a malformed record on each
+    /// page beside a big sibling ran a quiet publication out of budget long
+    /// before its own documents did. It is now charged what it keeps, plus what
+    /// the malformed record itself retains.
+    #[tokio::test]
+    async fn a_malformed_record_does_not_charge_its_siblings_documents() {
+        const PAGES: usize = 5;
+        let page = |i: usize| {
+            let mut body = serde_json::json!({ "records": [
+                { "uri": format!("at://did:plc:x/c/quiet{i}"), "value": "q".repeat(1_000) },
+                { "uri": format!("at://did:plc:x/c/busy{i}"), "value": "b".repeat(200_000) },
+                { "cid": "bafy", "value": {} },
+            ]});
+            if i + 1 < PAGES {
+                body["cursor"] = serde_json::json!(format!("p{}", i + 1));
+            }
+            body.to_string().into_bytes()
+        };
+        // Room for every page's transient (one busy document at a time) and
+        // the quiet documents, but not for five busy documents' wire bytes.
+        let budget = 300_000;
+        let (base, _) = host_for((0..PAGES).map(page).collect(), "sibling-charge.test").await;
+        let client = PdsClient::anonymous(ssrf_test_client(), base, "did:plc:x");
+        let walk = client
+            .list_recent_matching_within("c", 100, &mut ByteBudget::new(budget), 25, |r| {
+                r.uri.contains("/quiet")
+            })
+            .await
+            .unwrap();
+        assert!(
+            !walk.out_of_budget && walk.complete,
+            "the siblings' documents ran the quiet publication out of budget"
+        );
+        assert_eq!(
+            walk.records.len(),
+            PAGES,
+            "the quiet publication was cut short"
+        );
+        assert_eq!(walk.malformed, PAGES);
     }
 
     /// Third review of #224: charging a page that skipped a record only its

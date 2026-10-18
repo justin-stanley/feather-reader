@@ -156,6 +156,25 @@ deploying is separate.
 
 ### Fixed
 
+- **A malformed record no longer charges its siblings' documents to a shared
+  read (#284).** Several publications in one repo share one walk of its
+  documents (`standard_site::fetch_repo`), and the filter keeps only the
+  requested ones. A page holding a malformed record was charged its whole wire
+  size, which counts every sibling document the filter dropped, so a handful
+  of malformed records across pages could run a quiet publication out of
+  budget long before its own documents did; its re-read alone (#281) saw the
+  same pages and stopped in the same place. Such a page is now charged what it
+  keeps plus what its malformed records retain, measured the same way as kept
+  records (`json_bytes`): the parser keeps each malformed entry as a value
+  long enough to size it (the whole body has already passed the structure
+  bound). A page of only junk still costs its junk, so junk pages still can't
+  walk for free; the test for that now asserts the walk was stopped by the
+  budget, since it also passed with junk charged nothing (the stub ran out of
+  pages). `a_malformed_record_does_not_charge_its_siblings_documents` reads five
+  pages of a quiet document, a 200 KB sibling and a malformed record under a
+  300 KB budget in full; the old charge cut it short.
+
+
 - **Hostile feeds can no longer simply hold every sanitize permit (#275).**
   A timed-out sanitize can't be cancelled and keeps its permit until ammonia
   returns, which for a hostile body can be minutes; four hostile feeds (four
