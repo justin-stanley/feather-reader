@@ -44,7 +44,7 @@
 //!
 //! | Variable                          | Default             | Meaning |
 //! |-----------------------------------|---------------------|---------|
-//! | `FEATHERREADER_REPO_BACKEND`      | `sidecar`           | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
+//! | `FEATHERREADER_REPO_BACKEND`      | `rust`              | Which implementation serves `com.atproto.repo.*`: `sidecar` or `rust`. An unrecognised value FAILS startup rather than defaulting, since a silent fallback would make every side-by-side measurement a comparison of the sidecar with itself. The container entrypoint reads the same variable to install the matching Caddy OAuth routing — the two cannot share `/oauth/callback`, so they must agree. |
 //! | `FEATHERREADER_STANDARD_SITE`     | `false`             | Whether an `at://…/site.standard.publication/…` subscription may be **stored** — pasted into the subscribe form (a handle is resolved to its DID), imported via OPML, or written by another client. A stored publication **is polled** whatever this says: the flag gates storage, not reading (see `feed::FeedKind`). |
 //! | `FEATHERREADER_OAUTH_KEY_PATH`    | `oauth-signing-key.json` | The client's ES256 signing key, encrypted at rest in the SAME format the sidecar writes so one file serves both and a rollback finds what it expects. |
 //! | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for the signing key and stored sessions. Generate it, do not choose it — `openssl rand -hex 32`. The value is stretched with a single SHA-256 (pinned for byte-compatibility with the sidecar's format), so its entropy is the ceiling, and the adversary this protects against is someone holding a volume snapshot with all the time in the world. |
@@ -184,9 +184,10 @@ pub struct Config {
     /// is served as this DID (local runs without the OAuth sidecar). Unset in a
     /// real deployment — no session then means "logged out".
     pub dev_did: Option<String>,
-    /// Which repo implementation serves `com.atproto.repo.*` — the cutover
-    /// switch. Defaults to the sidecar, so deploying the Rust client changes
-    /// nothing until this is set deliberately.
+    /// Which repo implementation serves `com.atproto.repo.*`. Defaults to Rust
+    /// (#311): an unset variable selected the sidecar, whose OAuth client guards
+    /// none of its fetches (#258). A production-like Rust instance refuses to
+    /// start without `FEATHERREADER_OAUTH_ENCRYPTION_KEY`.
     pub repo_backend: crate::metrics::Backend,
     /// Whether an `at://` standard.site publication subscription may be
     /// **stored** — pasted into the subscribe form (a handle is resolved to its
@@ -386,8 +387,7 @@ impl Default for Config {
             sidecar: SidecarConfig::default(),
             oauth: OauthConfig::default(),
             cookie_secret: DEV_COOKIE_SECRET.to_string(),
-            // The sidecar stays the live path until the switch is thrown.
-            repo_backend: crate::metrics::Backend::Sidecar,
+            repo_backend: crate::metrics::Backend::Rust,
             // Off by default. The flag gates STORING an at:// feed; a stored
             // publication is polled whatever it says (see `feed::FeedKind`).
             standard_site: false,
@@ -1275,13 +1275,13 @@ mod tests {
         );
     }
 
-    /// The default is the SIDECAR. Deploying this branch must not move anyone
-    /// onto the new path by merely shipping; the switch has to be thrown.
+    /// The default is RUST (0.5.0, #311). The sidecar's OAuth client guards
+    /// none of its fetches (#258), and an unset variable used to select it.
     #[test]
-    fn the_default_backend_is_the_sidecar() {
+    fn the_default_backend_is_rust() {
         assert_eq!(
             Config::default().repo_backend,
-            crate::metrics::Backend::Sidecar
+            crate::metrics::Backend::Rust
         );
     }
 
@@ -1437,6 +1437,11 @@ mod tests {
                 internal_url: DEFAULT_SIDECAR_URL.to_string(),
                 internal_secret: "b".repeat(48),
             },
+            // The Rust backend, the default, requires it on a public bind.
+            oauth: OauthConfig {
+                encryption_key: Some("k".repeat(48)),
+                ..OauthConfig::default()
+            },
             ..Config::default()
         };
         assert!(c.is_prod_like());
@@ -1455,6 +1460,8 @@ mod tests {
                 internal_url: "https://feather-reader.com/oauth".to_string(),
                 internal_secret: "b".repeat(48),
             },
+            // Sidecar-only validation, removed with the sidecar (#311).
+            repo_backend: crate::metrics::Backend::Sidecar,
             ..Config::default()
         };
         let err = c.validate_secrets().unwrap_err().to_string();
@@ -1472,6 +1479,8 @@ mod tests {
                 internal_url: "http://127.0.0.1:8081".to_string(),
                 internal_secret: "b".repeat(48),
             },
+            // Sidecar-only validation, removed with the sidecar (#311).
+            repo_backend: crate::metrics::Backend::Sidecar,
             ..Config::default()
         };
         assert!(c.validate_secrets().is_ok());
@@ -1540,6 +1549,11 @@ mod tests {
                 internal_secret: "b".repeat(48),
             },
             bot_secret: Some("c".repeat(48)),
+            // The Rust backend, the default, requires it on a public bind.
+            oauth: OauthConfig {
+                encryption_key: Some("k".repeat(48)),
+                ..OauthConfig::default()
+            },
             ..Config::default()
         };
         assert!(c.validate_secrets().is_ok());
@@ -1557,6 +1571,11 @@ mod tests {
                 internal_secret: "b".repeat(48),
             },
             bot_secret: None,
+            // The Rust backend, the default, requires it on a public bind.
+            oauth: OauthConfig {
+                encryption_key: Some("k".repeat(48)),
+                ..OauthConfig::default()
+            },
             ..Config::default()
         };
         assert!(c.validate_secrets().is_ok());

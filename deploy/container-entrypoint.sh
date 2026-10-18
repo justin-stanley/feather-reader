@@ -64,7 +64,8 @@ trap term TERM INT
 # An unrecognised value is fatal, matching the Rust side: silently defaulting to
 # the sidecar while the app served the rust backend would break every login, and
 # the symptom would look like a PDS outage.
-backend="${FEATHERREADER_REPO_BACKEND:-sidecar}"
+# Unset means rust, the default since #311, as in `Config::default()`.
+backend="${FEATHERREADER_REPO_BACKEND:-rust}"
 case "${backend}" in
     sidecar) oauth_routes=/etc/caddy/caddy-oauth-sidecar.conf ;;
     rust)    oauth_routes=/etc/caddy/caddy-oauth-rust.conf ;;

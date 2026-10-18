@@ -1830,6 +1830,9 @@ pub(crate) mod tests {
         fake.lock().unwrap().records[&read_state_rkey(&feed(i))]["readIds"].clone()
     }
 
+    /// The backends these run on: both, while `sidecar` can still be selected.
+    /// Rust is the default (#311); this drops to Rust when 0.5.0 removes the
+    /// sidecar, with [`serve_fake`]'s sidecar half.
     const BACKENDS: [Backend; 2] = [Backend::Sidecar, Backend::Rust];
 
     /// **(1) A lost success response converges.** The applyWrites that created
@@ -2831,7 +2834,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn at_the_cap_unresolved_remote_guids_are_dropped_first() {
         let fake = Arc::new(Mutex::new(FakeRepo::default()));
-        let state = state_on(Backend::Sidecar, &fake).await;
+        let state = state_on(Backend::Rust, &fake).await;
         let remote: Vec<String> = (0..ReadState::MAX_IDS)
             .map(|i| format!("r-{i:04}"))
             .collect();
@@ -2871,7 +2874,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn compaction_still_bounds_a_merged_record() {
         let fake = Arc::new(Mutex::new(FakeRepo::default()));
-        let state = state_on(Backend::Sidecar, &fake).await;
+        let state = state_on(Backend::Rust, &fake).await;
         put_remote(
             &fake,
             1,

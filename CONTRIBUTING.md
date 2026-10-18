@@ -18,8 +18,9 @@ contributions — bug reports, fixes, docs, and design discussion — are welcom
 ## Building
 
 FeatherReader is the Rust server, plus a small Node OAuth sidecar when
-`FEATHERREADER_REPO_BACKEND=sidecar` (the default). On the `rust` backend the
-server owns the OAuth flow itself and no Node is involved. CI builds and checks
+`FEATHERREADER_REPO_BACKEND=sidecar`. On the `rust` backend, the default, the
+server owns the OAuth flow itself and no Node is involved. 0.5.0 removes the
+sidecar (#311). CI builds and checks
 both, so build both when working on either.
 
 ```sh

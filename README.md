@@ -260,7 +260,7 @@ npm run build
 | `FEATHERREADER_PUBLIC_URL` | `http://localhost:8080` | The public origin. Used for the OAuth callback and client metadata, and for the absolute URLs in link cards. |
 | `FEATHERREADER_COOKIE_SECRET` | *(dev fallback)* | HMAC key for the session cookie. Required, and at least 32 bytes, on a production-like instance (non-loopback bind or public URL, or `FEATHERREADER_ENV=prod`). |
 | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)* | Login allow-list of DIDs. Also the admin seed for the invite gate: these DIDs get a beta seat and can mint invite codes. |
-| `FEATHERREADER_REPO_BACKEND` | `sidecar` | `sidecar` or `rust`. Which implementation owns `/oauth/*` and `com.atproto.repo.*`. An unrecognised value fails startup. |
+| `FEATHERREADER_REPO_BACKEND` | `rust` | `rust` or `sidecar`. Which implementation owns `/oauth/*` and `com.atproto.repo.*`. An unrecognised value fails startup. |
 | `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for OAuth sessions and the signing key on the `rust` backend. Generate it: `openssl rand -hex 32`. Required there on a production-like instance. |
 | `FEATHERREADER_OAUTH_KEY_PATH` | `oauth-signing-key.json` | The client's ES256 signing key. Relative by default; in a container put it on the volume, or every redeploy mints a new key and changes your published JWKS. |
 | `FEATHERREADER_STANDARD_SITE` | `false` | Whether a standard.site publication subscription may be stored. Stored ones are polled regardless. |
@@ -277,19 +277,21 @@ production secrets rather than running with the published dev defaults.
 `FEATHERREADER_REPO_BACKEND` selects which implementation performs the atproto
 OAuth handshake and every `com.atproto.repo.*` call:
 
-| | `sidecar` (default) | `rust` |
+| | `sidecar` | `rust` (default) |
 |---|---|---|
 | Processes | Rust server + Node sidecar | Rust server only |
 | OAuth client | `@atproto/oauth-client-node` | built in |
 | Runtime deps | Node.js | none |
 | Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY`, plus `SIDECAR_INTERNAL_SECRET` in production |
 
-The default stays `sidecar` so an existing deployment keeps its topology until
-you choose otherwise. **The hosted instance has run `rust` since the 2026-09-13
-cutover** ([`fly.toml`](fly.toml) sets it explicitly), and a measured latency
-comparison of the two is in the [0.3.7 README](https://github.com/justin-stanley/feather-reader/blob/v0.3.7/README.md#choosing-an-oauth-backend). The intent
-is to remove the sidecar in a later release once the Rust path has enough
-production time; `sidecar` will be announced as deprecated before it is removed.
+**The default is `rust`** (#311): an unset variable used to select the
+sidecar, whose OAuth client guards none of its outbound fetches (#258). The
+hosted instance has run `rust` since the 2026-09-13 cutover ([`fly.toml`](fly.toml)
+sets it explicitly), and a measured latency comparison of the two is in the
+[0.3.7 README](https://github.com/justin-stanley/feather-reader/blob/v0.3.7/README.md#choosing-an-oauth-backend).
+**0.5.0 removes the sidecar** ([`design/RELEASE-0.5.0.md`](design/RELEASE-0.5.0.md)),
+with no separate deprecation release; its upgrade notes are the notice. Until
+then `sidecar` still selects it.
 
 What switching costs, in either direction:
 
