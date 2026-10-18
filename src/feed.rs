@@ -34,7 +34,7 @@ use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 use url::Url;
 
-use crate::store::{self, Feed, NewEntry, NewFeed};
+use crate::store::{self, Feed, NewEntry};
 
 /// The privacy classification of a feed URL — the output of
 /// [`classify_feed_privacy`].
@@ -1215,9 +1215,10 @@ pub(crate) async fn poll_publication_group_with(
     };
 
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
-    let store = |url: store::FeedUrl, read: crate::standard_site::PublicationRead| async move {
+    let store = |feed_id: i64, url: String, read: crate::standard_site::PublicationRead| async move {
         crate::standard_site::store_publication(
             pool,
+            feed_id,
             &url,
             read,
             config.max_entries_per_feed,
@@ -1236,7 +1237,7 @@ pub(crate) async fn poll_publication_group_with(
                 if read.cut_short_by_group {
                     cut_short.push((i, read.entries.len()));
                 }
-                store(store::FeedUrl::of_row(feed), read).await
+                store(feed.id, feed.url.clone(), read).await
             }
             (Some(Err(err)), _) => failed(publication_failure_kind(&err), format!("{err:#}")),
             (None, Some((kind, detail))) if readable.contains(&i) => failed(*kind, detail.clone()),
@@ -1327,7 +1328,7 @@ pub(crate) async fn poll_publication_group_with(
             Ok(Ok(mut per)) => match per.pop() {
                 Some(Ok(read)) => {
                     let better = read.complete || read.entries.len() > group_kept;
-                    match store(store::FeedUrl::of_row(feed), read).await {
+                    match store(feed.id, feed.url.clone(), read).await {
                         Ok(outcome) => {
                             if better {
                                 improved += 1;
@@ -2002,20 +2003,22 @@ async fn poll_feed_with(
     } else {
         (new_etag, new_last_modified)
     };
-    let new_feed = NewFeed {
+    // next_poll: the scheduler owns cadence; it sets next_poll.
+    let polled = store::PolledFeed {
         title,
         site_url,
         etag,
         last_modified,
         last_polled: Some(now_rfc3339()),
-        // next_poll: the scheduler owns cadence; leave it to set next_poll.
-        ..NewFeed::new(store::FeedUrl::of_row(feed))
     };
 
     // --- store (a store failure IS a real error) -----------------------------
-    let feed_id = store::upsert_feed(pool, &new_feed)
+    // By id: the row was read to be polled, so this re-stamps it and never
+    // needs a vetted URL (#260).
+    let feed_id = feed.id;
+    store::record_poll(pool, feed_id, &polled)
         .await
-        .with_context(|| format!("upsert_feed for {}", feed.url))?;
+        .with_context(|| format!("record_poll for {}", feed.url))?;
     let n = store::insert_entries(pool, feed_id, &entries, max_entries_per_feed)
         .await
         .with_context(|| format!("insert_entries for {}", feed.url))?;
@@ -2049,14 +2052,13 @@ async fn touch_polled(
     // unconditionally; the read-modify-write is gone now that the upsert is
     // honest, and with it a race where a concurrent poll's validators could be
     // read here and written back stale.
-    let nf = NewFeed {
+    let polled = store::PolledFeed {
         etag,
         last_modified,
         last_polled: Some(now_rfc3339()),
-        ..NewFeed::new(store::FeedUrl::of_row(feed))
+        ..Default::default()
     };
-    store::upsert_feed(pool, &nf).await?;
-    Ok(())
+    store::record_poll(pool, feed.id, &polled).await
 }
 
 /// Extract `(title, site_url)` from a parsed feed. `site_url` prefers an
@@ -4609,7 +4611,7 @@ mod sanitize_off_runtime_tests {
         let pool = crate::store::init_url("sqlite::memory:").await.unwrap();
         crate::store::upsert_feed(
             &pool,
-            &NewFeed {
+            &store::NewFeed {
                 url: url.clone().into(),
                 ..Default::default()
             },

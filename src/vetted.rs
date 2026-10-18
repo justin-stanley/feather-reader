@@ -172,15 +172,12 @@ impl VettedSaved {
 /// row is written — an unvetted URL reaching [`crate::store::upsert_feed`] is
 /// a compile error.
 ///
-/// Two ways in, and no others:
-/// - [`FeedUrl::vetted`] runs both checks;
-/// - [`FeedUrl::of_row`] takes the URL of a row already in the table, which
-///   was vetted on its way in (the poll paths re-upserting what they polled).
-///   That holds because a [`crate::store::Feed`] has a private field: only
-///   `store.rs` can build one, and it does so only from rows (`FromRow`).
-///   That is the one module that could break this, and it is the module that
-///   writes rows; it is stated here so a hand-built `Feed` there is seen for
-///   what it is.
+/// **One way in: [`FeedUrl::vetted`]**, which runs both checks. A poll, which
+/// re-stamps a row already in the table, needs no `FeedUrl` at all: it writes
+/// by id ([`crate::store::record_poll`]). An earlier draft had a second
+/// constructor taking a `store::Feed`'s URL as already vetted; review showed
+/// a `Feed` can't vouch for that (its fields are `pub`, it is `Clone`, and
+/// `FromRow` builds one from any `SELECT`), so it is gone.
 ///
 /// A vetted URL is accepted:
 ///
@@ -208,26 +205,7 @@ impl VettedSaved {
 /// let url = FeedUrl("https://example.com/feed.xml".to_string());
 /// let _row = NewFeed::new(url);
 /// ```
-///
-/// nor by dressing it up as a row (found in review):
-///
-/// ```compile_fail,E0451
-/// use feather_reader::store::{Feed, FeedUrl, NewFeed};
-///
-/// let fake = Feed {
-///     id: 0,
-///     url: "https://example.com/feed.xml".to_string(),
-///     title: None,
-///     site_url: None,
-///     etag: None,
-///     last_modified: None,
-///     last_polled: None,
-///     next_poll: None,
-///     consecutive_errors: 0,
-///     _from_table: (),
-/// };
-/// let _row = NewFeed::new(FeedUrl::of_row(&fake));
-/// ```
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedUrl(String);
 
@@ -251,11 +229,6 @@ impl FeedUrl {
             return Err(FeedUrlRefusal::Private(reason));
         }
         Ok(FeedUrl(url.to_owned()))
-    }
-
-    /// The URL of a row already in `feeds`.
-    pub fn of_row(feed: &crate::store::Feed) -> Self {
-        FeedUrl(feed.url.clone())
     }
 
     pub fn as_str(&self) -> &str {

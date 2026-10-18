@@ -57,9 +57,6 @@ pub type Pool = SqlitePool;
 /// This mirrors the PDS-side `community.lexicon.rss.subscription.url`; the row is
 /// created/updated by the poller, never owned by a single user.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
-// Not `#[non_exhaustive]`: that only stops OTHER crates building a `Feed`, and
-// the bypass `_from_table` closes is inside this one (#260).
-#[allow(clippy::manual_non_exhaustive)]
 pub struct Feed {
     pub id: i64,
     pub url: String,
@@ -77,13 +74,6 @@ pub struct Feed {
     /// exponential poll backoff (reset to 0 on any success or 304).
     #[sqlx(default)]
     pub consecutive_errors: i64,
-    /// **Private, so a `Feed` can't be built outside this module (#260).**
-    /// [`FeedUrl::of_row`] trusts a `Feed`'s URL as already vetted, which holds
-    /// only while every `Feed` came out of the table; with all-`pub` fields any
-    /// module could build one around an untrusted URL and pass it in (found in
-    /// review). This module builds them only through `FromRow`.
-    #[sqlx(skip)]
-    _from_table: (),
 }
 
 /// A cached article/item belonging to a [`Feed`]. Shared cache (not per-DID).
@@ -269,6 +259,54 @@ impl NewFeed {
             next_poll: None,
         }
     }
+}
+
+/// What a poll learned about a feed already in the table, for [`record_poll`].
+/// `None` leaves the stored value alone, as in [`upsert_feed`].
+///
+/// **No URL (#260):** a poll re-stamps the row it polled, by id, so it never
+/// needs a [`FeedUrl`]. An earlier draft let the poll paths turn a `Feed`'s URL
+/// back into a `FeedUrl`, and review showed twice over that a `Feed` can't
+/// vouch for its URL: its fields are `pub`, it is `Clone`, and `FromRow` builds
+/// one from any `SELECT`.
+#[derive(Debug, Clone, Default)]
+pub struct PolledFeed {
+    pub title: Option<String>,
+    pub site_url: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub last_polled: Option<String>,
+}
+
+/// Write what a poll learned to feed `feed_id`. An `UPDATE` by id: it never
+/// creates a row (only [`upsert_feed`], with a vetted [`FeedUrl`], does), and a
+/// feed that is not in the table is an error, not a new row.
+pub async fn record_poll(pool: &SqlitePool, feed_id: i64, polled: &PolledFeed) -> Result<()> {
+    let done = sqlx::query(
+        r#"
+        UPDATE feeds SET
+            title         = COALESCE(?2, title),
+            site_url      = COALESCE(?3, site_url),
+            etag          = COALESCE(?4, etag),
+            last_modified = COALESCE(?5, last_modified),
+            last_polled   = COALESCE(?6, last_polled)
+        WHERE id = ?1
+        "#,
+    )
+    .bind(feed_id)
+    .bind(&polled.title)
+    .bind(&polled.site_url)
+    .bind(&polled.etag)
+    .bind(&polled.last_modified)
+    .bind(&polled.last_polled)
+    .execute(pool)
+    .await
+    .with_context(|| format!("record_poll failed for feed {feed_id}"))?;
+    anyhow::ensure!(
+        done.rows_affected() == 1,
+        "record_poll: feed {feed_id} is not in the table"
+    );
+    Ok(())
 }
 
 /// New-entry payload for [`insert_entries`] (id is assigned by SQLite,
@@ -12524,6 +12562,55 @@ mod tests {
             row.next_poll.is_some(),
             "the existing row was not rescheduled"
         );
+        assert_eq!(count_feeds(&pool).await?, 1);
+        Ok(())
+    }
+
+    /// **A poll re-stamps its row by id and never creates one (#260).** The
+    /// poll paths used to upsert by URL, which needed a URL a `Feed` cannot
+    /// vouch for; `record_poll` writes by id, keeps unset columns, and refuses
+    /// a feed that is not there.
+    #[tokio::test]
+    async fn record_poll_updates_by_id_and_never_inserts() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        assert!(
+            record_poll(&pool, 42, &PolledFeed::default())
+                .await
+                .is_err(),
+            "a missing feed was not an error"
+        );
+        assert_eq!(count_feeds(&pool).await?, 0, "record_poll created a row");
+
+        let id = upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://poll.example/feed.xml".into(),
+                title: Some("Before".into()),
+                etag: Some("\"v1\"".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        record_poll(
+            &pool,
+            id,
+            &PolledFeed {
+                title: Some("After".into()),
+                last_polled: Some("2026-10-18T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let row = get_feed_by_url(&pool, "https://poll.example/feed.xml")
+            .await?
+            .expect("row");
+        assert_eq!(row.title.as_deref(), Some("After"));
+        assert_eq!(
+            row.etag.as_deref(),
+            Some("\"v1\""),
+            "an unset column was cleared"
+        );
+        assert_eq!(row.last_polled.as_deref(), Some("2026-10-18T00:00:00Z"));
         assert_eq!(count_feeds(&pool).await?, 1);
         Ok(())
     }
