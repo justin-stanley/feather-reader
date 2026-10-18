@@ -32,6 +32,23 @@ deploying is separate.
 
 ### CI
 
+- **The upgrade-boot gate runs no Node in an image (#311).** It health-checked
+  the candidate with `docker exec … node -e fetch(…)` and seeded the previous
+  release's database with `node:sqlite` from the previous image. 0.5.0 removes
+  Node from the image, so a 0.5.0 candidate would fail step 4, and 0.5.0 as the
+  release upgraded from would fail step 2. The database is now a host directory
+  bind-mounted at `/data`, seeded with the host's `sqlite3` (installed by both
+  workflows that run the gate), and checked: the seed must land, or the gate
+  fails. `/health` is read over bash's `/dev/tcp` in the container; the
+  containers run as the invoking user. Checked by running the gate from 0.4.9 to
+  0.4.10 with Node deleted from **both** images: the new script passes, and the
+  old one fails at step 4 with `exec: "node": executable file not found`.
+- **An upgrade test from a 0.4.10 database (#311).** `schema-v0.4.10.sql` is
+  dumped from the v0.4.10 binary, the release 0.5.0 upgrades from.
+  `assert_upgrades_from` takes whether the release predates the #287 columns,
+  and requires the fixture to agree, so a mislabelled fixture fails instead of
+  skipping the check.
+
 - **A final tag creates its GitHub release.** Releases were made by hand, and
   0.4.9 shipped without one, so the releases page still showed 0.4.8 as
   Latest. `release-image` now ends by calling `github-release.yml` for a

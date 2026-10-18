@@ -66,6 +66,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The gate seeds the previous release's database with the host's sqlite3
+      # (no Node in the images, #311).
+      - name: Ensure sqlite3
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+
       - name: Upgrade, boot, roll back
         run: |
           prev="ghcr.io/justin-stanley/feather-reader:$(tr -d '[:space:]' < deploy/upgrade-from)"

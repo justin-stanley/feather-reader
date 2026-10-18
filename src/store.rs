@@ -10755,7 +10755,15 @@ mod tests {
     /// Load `fixture`, seed rows the way an old binary inserted them, run the
     /// current `init_schema`, and require the result to be indistinguishable
     /// in shape from a fresh database, with `kind` back-filled correctly.
-    async fn assert_upgrades_from(version: &str, fixture: &'static str) -> Result<()> {
+    ///
+    /// `predates_287` says whether the release is older than 0.4.9, which added
+    /// `entries.guid_synthesized` and `entry_state.read_marked_at`. The fixture
+    /// must agree, so a mislabelled fixture cannot pass by skipping the check.
+    async fn assert_upgrades_from(
+        version: &str,
+        fixture: &'static str,
+        predates_287: bool,
+    ) -> Result<()> {
         let pool = upgrade_test_pool().await?;
         sqlx::raw_sql(fixture).execute(&pool).await?;
 
@@ -10771,13 +10779,15 @@ mod tests {
                     == 1,
             )
         };
-        assert!(
-            !has_column(pool.clone(), "entries", "guid_synthesized").await?,
-            "pre-condition: a {version} entries table has no guid_synthesized column"
+        assert_eq!(
+            has_column(pool.clone(), "entries", "guid_synthesized").await?,
+            !predates_287,
+            "pre-condition: a {version} entries table has guid_synthesized iff it is 0.4.9 or later"
         );
-        assert!(
-            !has_column(pool.clone(), "entry_state", "read_marked_at").await?,
-            "pre-condition: a {version} entry_state table has no read_marked_at column"
+        assert_eq!(
+            has_column(pool.clone(), "entry_state", "read_marked_at").await?,
+            !predates_287,
+            "pre-condition: a {version} entry_state table has read_marked_at iff it is 0.4.9 or later"
         );
 
         // One row of each kind, inserted the way the old binary did: without `kind`.
@@ -10901,6 +10911,7 @@ mod tests {
         assert_upgrades_from(
             "v0.3.8",
             include_str!("../tests/fixtures/schema-v0.3.8.sql"),
+            true,
         )
         .await
     }
@@ -10910,6 +10921,19 @@ mod tests {
         assert_upgrades_from(
             "v0.4.8",
             include_str!("../tests/fixtures/schema-v0.4.8.sql"),
+            true,
+        )
+        .await
+    }
+
+    /// 0.4.10 is what 0.5.0 upgrades from (#311): the last release with the
+    /// sidecar, and the first whose schema has both #287 columns.
+    #[tokio::test]
+    async fn a_v0_4_10_database_upgrades_to_the_current_schema() -> Result<()> {
+        assert_upgrades_from(
+            "v0.4.10",
+            include_str!("../tests/fixtures/schema-v0.4.10.sql"),
+            false,
         )
         .await
     }
@@ -10983,6 +11007,7 @@ mod tests {
         assert_upgrades_from(
             "v0.2.0",
             include_str!("../tests/fixtures/schema-v0.2.0.sql"),
+            true,
         )
         .await
     }
