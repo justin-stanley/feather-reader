@@ -17,22 +17,15 @@ contributions — bug reports, fixes, docs, and design discussion — are welcom
 
 ## Building
 
-FeatherReader is the Rust server, plus a small Node OAuth sidecar when
-`FEATHERREADER_REPO_BACKEND=sidecar`. On the `rust` backend, the default, the
-server owns the OAuth flow itself and no Node is involved. 0.5.0 removes the
-sidecar (#311). CI builds and checks
-both, so build both when working on either.
+FeatherReader is one Rust server, including its atproto OAuth client. (A Node
+OAuth sidecar could serve that until 0.5.0 removed it, #311.)
 
 ```sh
-# Rust server
 cargo build --all-targets
-
-# OAuth sidecar
-cd oauth-sidecar && npm ci && npm run build
 ```
 
-See the [README](README.md) for how the two are configured (environment variables
-only; no config file) and how to run them.
+See the [README](README.md) for how it is configured (environment variables
+only; no config file) and how to run it.
 
 The repo also contains an optional standalone **`bot/`** crate — the follow→invite
 bot for the closed beta. It's its **own** Cargo workspace (not built by the app's
@@ -49,10 +42,9 @@ hosted minutes:
 ```
 
 This runs `rustfmt --check`, a locked build, the Rust test suite, `clippy` with
-`-D warnings`, and the sidecar's `npm ci` + build + typecheck. **Please make sure
+`-D warnings`, and the teardown script's tests. **Please make sure
 it passes before pushing.** CI also runs gates the script does not: rustdoc with
-`-D warnings`, `cargo deny`, `cargo audit`, the sidecar's tests, lint, format
-check and `npm audit`, the invite bot's gates, gitleaks, the Caddyfile
+`-D warnings`, `cargo deny`, `cargo audit`, the invite bot's gates, gitleaks, the Caddyfile
 validation and, for changes to the app, the upgrade-boot gate. The commands are
 in the README's [Development](README.md#development) section. You can wire the
 script up as a pre-push gate with:
