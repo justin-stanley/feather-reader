@@ -3213,6 +3213,9 @@ pub async fn clear_star_by_identity(
               SELECT id FROM entries
               WHERE (?2 IS NOT NULL AND url = ?2)
                  OR (?3 IS NOT NULL AND guid = ?3)
+                 -- An item id names a row FeatherReader made the stand-in for
+                 -- by its link (#290, the item-id rule in docs/lexicon.md).
+                 OR (?3 IS NOT NULL AND guid_synthesized = 1 AND url = ?3)
           )
         "#,
     )
