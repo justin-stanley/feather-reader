@@ -22,27 +22,37 @@
 #   5. previous image boots fully again on the migrated volume and answers
 #      /health (rollback)
 #
-# Needs only docker. Runs as root inside the container with --network none.
+# Needs docker, and sqlite3 on the host. **Nothing runs Node in an image**: the
+# database is a host directory bind-mounted at /data, seeded with the host's
+# sqlite3, and /health is read with bash's /dev/tcp inside the container. Both
+# used `node` from the images until 0.5.0 removed Node from them (#311): a
+# Node-free candidate failed step 4, and a Node-free PREVIOUS release (0.5.0,
+# once it is the one upgraded from) would have failed step 2. Containers run as
+# the invoking user with --network none, so the host can write the files they
+# create.
 set -euo pipefail
 
 prev="${1:?usage: upgrade-boot.sh <previous-image> <candidate-image>}"
 cand="${2:?usage: upgrade-boot.sh <previous-image> <candidate-image>}"
 
-vol="fr-upgrade-boot-$$"
+command -v sqlite3 >/dev/null || { echo "upgrade-boot.sh: needs sqlite3 on the host" >&2; exit 2; }
+
+data="$(mktemp -d)"
 box="fr-upgrade-boot-$$"
 cleanup() {
   docker rm -f "$box" >/dev/null 2>&1 || true
-  docker volume rm -f "$vol" >/dev/null 2>&1 || true
+  rm -rf "$data"
 }
 trap cleanup EXIT
-docker volume create "$vol" >/dev/null
+db="$data/featherreader.db"
+as_me=(--user "$(id -u):$(id -g)")
 
 # The image bakes FEATHERREADER_ENV=prod, which refuses to start without the
 # production secrets. dev skips that; the schema path is identical.
 run() { # image, then args for the binary
   local image="$1"
   shift
-  docker run --rm --network none -v "$vol:/data" \
+  docker run --rm --network none "${as_me[@]}" -v "$data:/data" \
     -e FEATHERREADER_ENV=dev -e FEATHERREADER_DB=/data/featherreader.db \
     --entrypoint /app/featherreader "$image" "$@"
 }
@@ -58,17 +68,18 @@ step "1/5 previous release creates the database ($prev)"
 run "$prev" --migrate-auto-vacuum || fail "the previous release could not create a database"
 
 step "2/5 seed rows the way the previous release stored them"
-docker run --rm --network none -v "$vol:/data" --entrypoint node "$prev" -e '
-  const { DatabaseSync } = require("node:sqlite");
-  const db = new DatabaseSync("/data/featherreader.db");
-  const add = db.prepare("INSERT INTO feeds (url) VALUES (?)");
-  add.run("https://example.com/feed.xml");
-  add.run("at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab");
-  // An entry row as 0.4.8 stored it: no guid_synthesized column (#287).
-  const feedId = db.prepare("SELECT id FROM feeds WHERE url = ?").get("https://example.com/feed.xml").id;
-  db.prepare("INSERT INTO entries (feed_id, guid, url, fetched_at) VALUES (?, ?, ?, ?)")
-    .run(feedId, "5813b43a0512aaef2750311bf4d978a", "https://n.example/post", "2026-01-01T00:00:00Z");
-' || fail "could not seed the previous release's database"
+# The columns named are ones every release since 0.2.0 has, so the seed does not
+# depend on which release is "previous"; the backfills fill the rest.
+sqlite3 "$db" <<'SQL' || fail "could not seed the previous release's database"
+INSERT INTO feeds (url) VALUES ('https://example.com/feed.xml');
+INSERT INTO feeds (url) VALUES ('at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab');
+-- An entry row as 0.4.8 stored it: no guid_synthesized column (#287).
+INSERT INTO entries (feed_id, guid, url, fetched_at)
+  SELECT id, '5813b43a0512aaef2750311bf4d978a', 'https://n.example/post', '2026-01-01T00:00:00Z'
+  FROM feeds WHERE url = 'https://example.com/feed.xml';
+SQL
+seeded="$(sqlite3 "$db" "SELECT (SELECT COUNT(*) FROM feeds) || ' ' || (SELECT COUNT(*) FROM entries)")"
+[ "$seeded" = "2 1" ] || fail "the seed did not land (feeds, entries: ${seeded:-none})"
 
 step "3/5 candidate migrates it ($cand)"
 run "$cand" --migrate-auto-vacuum || fail "the candidate could not migrate a database the previous release created"
@@ -76,7 +87,7 @@ run "$cand" --migrate-auto-vacuum || fail "the candidate could not migrate a dat
 # A full boot — not just the schema path — that must answer /health with 200.
 boot_and_check_health() { # image, label
   local image="$1" label="$2" health=""
-  docker run -d --name "$box" --network none -v "$vol:/data" \
+  docker run -d --name "$box" --network none "${as_me[@]}" -v "$data:/data" \
     -e FEATHERREADER_ENV=dev -e FEATHERREADER_DB=/data/featherreader.db \
     -e FEATHERREADER_BIND=127.0.0.1:8082 -e FEATHERREADER_DISABLE_SCHEDULER=1 \
     --entrypoint /app/featherreader "$image" >/dev/null
@@ -85,10 +96,14 @@ boot_and_check_health() { # image, label
       docker logs "$box" 2>&1 | tail -20 >&2
       fail "the $label exited during boot"
     fi
-    health="$(docker exec "$box" node -e '
-      fetch("http://127.0.0.1:8082/health")
-        .then(async r => { process.stdout.write(r.status + " " + await r.text()); })
-        .catch(() => process.exit(1));' 2>/dev/null || true)"
+    # An HTTP/1.0 GET over bash's /dev/tcp, printed as "<status> <body>", the
+    # shape the case below matches. bash is in every release's image.
+    health="$(docker exec "$box" bash -c '
+      exec 3<>/dev/tcp/127.0.0.1/8082 || exit 1
+      printf "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3
+      IFS=" " read -r _ status _ <&3 || exit 1
+      while IFS= read -r line <&3 && [ "${line%$'"'"'\r'"'"'}" != "" ]; do :; done
+      printf "%s " "$status"; cat <&3' 2>/dev/null || true)"
     [ -n "$health" ] && break
     sleep 1
   done
