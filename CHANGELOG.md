@@ -128,6 +128,26 @@ deploying is separate.
 
 ### Fixed
 
+- **`readThrough` means a published date, here and on import (#287 PR 3).**
+  Compaction compared it against `COALESCE(published, fetched_at)`, and
+  `fetched_at` is when THIS instance first saw an entry, so the same watermark
+  covered different entries on different instances; for the same reason a
+  record's `readThrough` was never applied on import, and reads another
+  instance had compacted into its watermark never arrived (the limit #286
+  stated). Now compaction builds the watermark from published dates only, an
+  undated read always stays in `readIds`, and an import marks every unread
+  local entry published at or before the record's `readThrough` read, except
+  one the record lists in `unreadIds` and one marked unread here more recently
+  than the record's `updatedAt` (a tie goes to local). The record format is
+  unchanged; `docs/lexicon.md` already specified this. A record 0.4.x wrote is
+  safe to apply: every entry it covered by published date was read there.
+  Tests: `an_undated_read_stays_an_id_through_compaction`,
+  `a_remote_read_through_marks_dated_entries_read_and_leaves_undated_ones`,
+  `a_read_through_spares_the_records_unread_ids_and_a_newer_local_unread`,
+  `a_fresh_database_shows_reads_compacted_elsewhere` (each mutation-checked:
+  keeping the old `fetched_at` basis, ignoring the remote `readThrough`, and
+  ignoring a newer local unread each fail one).
+
 - **Deleting your data also deletes your in-flight logins (#259).**
   `store::purge_did_data` removed every per-DID table except `oauth_state`,
   which holds a login in progress: its sealed PKCE verifier and DPoP key,

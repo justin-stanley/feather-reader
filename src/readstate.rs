@@ -319,9 +319,11 @@ fn later(a: &str, b: &str) -> bool {
 /// - **Every remote GUID that did not lose that conflict** is carried into the
 ///   record (see [`Carry`]), whether or not it has a local entry.
 ///
-/// Remote `readThrough` is NOT applied to local entries: undated entries
-/// compare by `fetched_at`, which is instance-local, so the same water-mark
-/// would mark different entries read on different instances.
+/// - **The remote `readThrough`** marks every unread local entry PUBLISHED at
+///   or before it read, except one the record lists in `unreadIds` and one
+///   marked unread here more recently than the record's `updatedAt` (#287
+///   PR 3). Undated entries are never covered: the watermark is a published
+///   date, so it means the same entries on every instance.
 ///
 /// Any failure is logged and leaves the cursor as given with nothing carried
 /// — the pre-#246 behaviour for that one feed, not a failed flush.
@@ -483,11 +485,48 @@ async fn plan_guid_merge(
             }
         }
     }
+
+    // **The remote `readThrough`, applied to dated local entries (#287 PR 3).**
+    // It is a published date, the one date every reader of the feed computes
+    // alike, so it covers the same entries everywhere: every unread entry
+    // published at or before it is read there. Two exceptions keep an entry
+    // unread: the record itself lists it in `unreadIds` (`unread_rows`), or it
+    // was marked unread HERE more recently than the record was written (a tie
+    // goes to local, as for ids). An undated entry is never covered.
+    if let Some(rt) = theirs.read_through.as_deref().and_then(stored_instant) {
+        let planned: HashSet<i64> = to_read.iter().map(|e| e.id).collect();
+        let covered =
+            store::unread_entries_published_through(&state.db, did, &cursor.feed_url, &rt).await?;
+        for (e, marked_at) in covered {
+            if unread_rows.contains(&e.id) || planned.contains(&e.id) {
+                continue;
+            }
+            if marked_at
+                .as_deref()
+                .is_some_and(|m| !later(&theirs.updated_at, m))
+            {
+                continue;
+            }
+            to_read.push(e);
+        }
+    }
     Ok(MergePlan {
         carry,
         to_read,
         to_unread,
         remote_updated_at: theirs.updated_at.clone(),
+    })
+}
+
+/// `raw` (RFC 3339) as the stored form entry dates are compared in:
+/// second-precision UTC, `YYYY-MM-DDTHH:MM:SSZ`. Rounded DOWN, which is the
+/// safe direction for a `readThrough`: an entry published at `08:00:00` is at
+/// or before `08:00:00.5`. `None` for anything unparseable, which then covers
+/// nothing.
+fn stored_instant(raw: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| {
+        t.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     })
 }
 
@@ -1710,6 +1749,45 @@ pub(crate) mod tests {
         id
     }
 
+    /// An UNDATED entry `guid` in feed `i` (no published date), which a
+    /// `readThrough` never covers (#287 PR 3), first seen here at
+    /// `fetched_at`. Returns its local row id.
+    async fn undated_entry(state: &AppState, i: usize, guid: &str, fetched_at: &str) -> i64 {
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: feed(i),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[store::NewEntry {
+                guid: guid.into(),
+                fetched_at: Some(fetched_at.into()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO sub_ref (did, feed_id) VALUES (?1, ?2)")
+            .bind(DID)
+            .bind(feed_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2")
+            .bind(feed_id)
+            .bind(guid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+
     /// Whether [`DID`] has entry `id` read locally — `entry_state`, which is
     /// what every local view reads.
     async fn is_read(state: &AppState, id: i64) -> bool {
@@ -2657,6 +2735,191 @@ pub(crate) mod tests {
                 "{backend:?}: the clean feed was written"
             );
         }
+    }
+
+    // ── #287 PR 3: `readThrough` is a published date ─────────────────────────
+
+    /// **An undated read stays an id through compaction.** The watermark is
+    /// the latest published date below the oldest unread dated entry; an
+    /// undated entry is never covered by it, so its read must stay in
+    /// `readIds`. On `fetched_at`, an undated entry fetched before the
+    /// watermark was covered and its id dropped, by a date no other instance
+    /// has.
+    #[tokio::test]
+    async fn an_undated_read_stays_an_id_through_compaction() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        for (g, at) in [
+            ("g-1", "2026-01-01T00:00:00Z"),
+            ("g-2", "2026-02-01T00:00:00Z"),
+        ] {
+            let id = entry_at(&state, 1, g, at).await;
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+        }
+        let unread = entry_at(&state, 1, "g-3", "2026-03-01T00:00:00Z").await;
+        // Fetched here BEFORE the watermark: on `fetched_at`, the watermark
+        // covered it and its id was dropped, by a date no other instance has.
+        let undated = undated_entry(&state, 1, "g-undated", "2026-01-15T00:00:00Z").await;
+        assert!(store::mark_read(&state.db, DID, undated, true)
+            .await
+            .unwrap());
+
+        let mark = store::compact_cursor(&state.db, DID, &feed(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mark.as_deref(),
+            Some("2026-02-01T00:00:00Z"),
+            "the watermark must be the last dated read below the oldest dated unread"
+        );
+        let c = cursor(&state, 1).await;
+        assert_eq!(
+            parse_id_array(&c.read_ids),
+            vec![undated.to_string()],
+            "the undated read must stay an id, and only it"
+        );
+        assert!(!is_read(&state, unread).await, "fixture: g-3 is unread");
+    }
+
+    /// **A remote `readThrough` marks dated local entries read, and leaves
+    /// undated ones alone.** It used to be ignored on import, so reads another
+    /// instance had compacted never arrived here. Its fractional seconds are
+    /// rounded down to the stored form; an entry published after it stays
+    /// unread.
+    #[tokio::test]
+    async fn a_remote_read_through_marks_dated_entries_read_and_leaves_undated_ones() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        let before = entry_at(&state, 1, "g-before", "2026-01-01T00:00:00Z").await;
+        let at = entry_at(&state, 1, "g-at", "2026-02-01T00:00:00Z").await;
+        let after = entry_at(&state, 1, "g-after", "2026-03-01T00:00:00Z").await;
+        // Fetched here before the remote watermark, so a basis of
+        // `fetched_at` would have covered it.
+        let undated = undated_entry(&state, 1, "g-undated", "2026-01-15T00:00:00Z").await;
+        let mut record = remote_guid_record(1, &[], &[], "2099-01-01T00:00:00Z");
+        record["readThrough"] = serde_json::json!("2026-02-01T00:00:00.900Z");
+        put_remote(&fake, 1, record);
+
+        mark_read(&state, 2, "g2").await;
+        flush_did(&state, DID).await.unwrap();
+
+        assert!(
+            is_read(&state, before).await,
+            "an older dated entry was not covered"
+        );
+        assert!(
+            is_read(&state, at).await,
+            "an entry published AT the watermark was not covered"
+        );
+        assert!(!is_read(&state, after).await, "a later entry was covered");
+        assert!(
+            !is_read(&state, undated).await,
+            "an undated entry was covered"
+        );
+    }
+
+    /// **What keeps a covered entry unread: the record's own `unreadIds`, and
+    /// a local unread newer than the record.** An unread marked here BEFORE the
+    /// record was written is older news and is covered like any other entry.
+    #[tokio::test]
+    async fn a_read_through_spares_the_records_unread_ids_and_a_newer_local_unread() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        let plain = entry_at(&state, 1, "g-plain", "2026-01-01T00:00:00Z").await;
+        let listed = entry_at(&state, 1, "g-listed", "2026-01-01T00:00:00Z").await;
+        let newer_local = entry_at(&state, 1, "g-newer", "2026-01-01T00:00:00Z").await;
+        let older_local = entry_at(&state, 1, "g-older", "2026-01-01T00:00:00Z").await;
+        for id in [newer_local, older_local] {
+            assert!(store::mark_read(&state.db, DID, id, true).await.unwrap());
+            assert!(store::mark_read(&state.db, DID, id, false).await.unwrap());
+        }
+        // `newer_local` was marked unread now, after the record (2026-06-01);
+        // `older_local` before it.
+        sqlx::query("UPDATE entry_state SET read_marked_at = ?1 WHERE did = ?2 AND entry_id = ?3")
+            .bind("2026-05-01T00:00:00Z")
+            .bind(DID)
+            .bind(older_local)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut record = remote_guid_record(1, &[], &["g-listed"], "2026-06-01T00:00:00Z");
+        record["readThrough"] = serde_json::json!("2026-02-01T00:00:00Z");
+        put_remote(&fake, 1, record);
+
+        flush_did(&state, DID).await.unwrap();
+
+        assert!(
+            is_read(&state, plain).await,
+            "a plain unread entry was not covered"
+        );
+        assert!(
+            !is_read(&state, listed).await,
+            "the record's own unread id was covered"
+        );
+        assert!(
+            !is_read(&state, newer_local).await,
+            "a local unread newer than the record was overridden"
+        );
+        assert!(
+            is_read(&state, older_local).await,
+            "a local unread OLDER than the record survived its readThrough"
+        );
+    }
+
+    /// **A fresh database shows reads compacted elsewhere.** The limit #286
+    /// stated: reads one instance had folded into its watermark before they
+    /// were written as ids never reached another. Now the watermark itself is
+    /// imported.
+    #[tokio::test]
+    async fn a_fresh_database_shows_reads_compacted_elsewhere() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let a = state_on(Backend::Rust, &fake).await;
+        let dates = [
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        ];
+        for (n, at) in dates.iter().enumerate() {
+            let id = entry_at(&a, 1, &format!("g-{n}"), at).await;
+            assert!(store::mark_read(&a.db, DID, id, true).await.unwrap());
+        }
+        entry_at(&a, 1, "g-new", "2026-02-01T00:00:00Z").await;
+        store::compact_cursor(&a.db, DID, &feed(1)).await.unwrap();
+        assert_eq!(
+            parse_id_array(&cursor(&a, 1).await.read_ids),
+            Vec::<String>::new(),
+            "fixture: every read is folded into the watermark, none written as an id"
+        );
+        flush_did(&a, DID).await.unwrap();
+        assert_eq!(
+            pds_record(&fake, 1)["readThrough"],
+            serde_json::json!("2026-01-03T00:00:00Z"),
+            "fixture: the record carries the watermark"
+        );
+
+        let b = state_on(Backend::Rust, &fake).await;
+        let ids: Vec<i64> = {
+            let mut ids = Vec::new();
+            for (n, at) in dates.iter().enumerate() {
+                ids.push(entry_at(&b, 1, &format!("g-{n}"), at).await);
+            }
+            ids
+        };
+        let new = entry_at(&b, 1, "g-new", "2026-02-01T00:00:00Z").await;
+        mark_read(&b, 2, "g2").await;
+        flush_did(&b, DID).await.unwrap();
+
+        for id in ids {
+            assert!(
+                is_read(&b, id).await,
+                "a read compacted on the other instance did not arrive"
+            );
+        }
+        assert!(
+            !is_read(&b, new).await,
+            "an entry past the watermark arrived as read"
+        );
     }
 
     /// **A legacy record — no `idType` — has instance-local row ids.** They

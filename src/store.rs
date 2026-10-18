@@ -3060,15 +3060,23 @@ pub async fn compact_cursor(
     let mut tx = pool.begin().await.context("begin compact_cursor tx")?;
     let (read_through, read_ids, unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
 
-    // The oldest entry on this feed that `did` has NOT read. `NULL` = nothing
-    // unread, in which case the watermark can cover the whole feed.
+    // **The watermark is a PUBLISHED date (#287 PR 3).** It is compared, here
+    // and on every instance that reads the record, against an entry's
+    // published date only: that is the one date every reader of the feed
+    // computes alike. `fetched_at` is when THIS instance first saw an entry, so
+    // a watermark built on it covered different entries on different
+    // instances. An undated entry is never covered: its read stays an id.
+    //
+    // The oldest DATED entry on this feed that `did` has NOT read. `NULL` =
+    // nothing dated unread, in which case the watermark can cover every dated
+    // entry.
     let oldest_unread: Option<String> = sqlx::query_scalar(
         r#"
-        SELECT MIN(COALESCE(e.published, e.fetched_at))
+        SELECT MIN(e.published)
         FROM entries e
         JOIN feeds f ON f.id = e.feed_id
         LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
-        WHERE f.url = ?2 AND COALESCE(s.read, 0) = 0
+        WHERE f.url = ?2 AND e.published IS NOT NULL AND COALESCE(s.read, 0) = 0
         "#,
     )
     .bind(did)
@@ -3080,9 +3088,9 @@ pub async fn compact_cursor(
     let watermark: Option<String> = match &oldest_unread {
         Some(oldest) => sqlx::query_scalar(
             r#"
-            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            SELECT MAX(e.published)
             FROM entries e JOIN feeds f ON f.id = e.feed_id
-            WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) < ?2
+            WHERE f.url = ?1 AND e.published IS NOT NULL AND e.published < ?2
             "#,
         )
         .bind(feed_url)
@@ -3092,9 +3100,9 @@ pub async fn compact_cursor(
         .with_context(|| format!("compact_cursor: watermark for {did}/{feed_url}"))?,
         None => sqlx::query_scalar(
             r#"
-            SELECT MAX(COALESCE(e.published, e.fetched_at))
+            SELECT MAX(e.published)
             FROM entries e JOIN feeds f ON f.id = e.feed_id
-            WHERE f.url = ?1
+            WHERE f.url = ?1 AND e.published IS NOT NULL
             "#,
         )
         .bind(feed_url)
@@ -3157,8 +3165,10 @@ async fn ids_published_after(
     watermark: &str,
 ) -> Result<String> {
     let live: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(
+        // Undated entries are never covered by the watermark, so their reads
+        // are always kept as ids (#287 PR 3).
         "SELECT e.id FROM entries e JOIN feeds f ON f.id = e.feed_id \
-         WHERE f.url = ?1 AND COALESCE(e.published, e.fetched_at) > ?2",
+         WHERE f.url = ?1 AND (e.published IS NULL OR e.published > ?2)",
     )
     .bind(feed_url)
     .bind(watermark)
@@ -3889,6 +3899,51 @@ pub async fn entries_for_guids(
         });
     }
     Ok(out)
+}
+
+/// `did`'s UNREAD dated entries on `feed_url` published at or before
+/// `read_through`, each with its `read_marked_at` (when it was last marked read
+/// or unread here; `None` if never). What a remote record's `readThrough`
+/// covers (#287 PR 3): it is compared against the published date only, so an
+/// undated entry is never among them. `read_through` must be in the stored
+/// form, second-precision UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+pub async fn unread_entries_published_through(
+    pool: &SqlitePool,
+    did: &str,
+    feed_url: &str,
+    read_through: &str,
+) -> Result<Vec<(GuidEntry, Option<String>)>> {
+    let rows: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT e.id, COALESCE(s.read, 0), s.updated_at, s.read_marked_at
+        FROM entries e
+        JOIN feeds f ON f.id = e.feed_id
+        LEFT JOIN entry_state s ON s.entry_id = e.id AND s.did = ?1
+        WHERE f.url = ?2
+          AND e.published IS NOT NULL AND e.published <= ?3
+          AND COALESCE(s.read, 0) = 0
+        ORDER BY e.id
+        "#,
+    )
+    .bind(did)
+    .bind(feed_url)
+    .bind(read_through)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("unread_entries_published_through failed for {did}/{feed_url}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, read, updated_at, marked)| {
+            (
+                GuidEntry {
+                    id,
+                    read: read == 1,
+                    updated_at,
+                },
+                marked,
+            )
+        })
+        .collect())
 }
 
 /// Apply read / unread state learned from the PDS to `did`'s entries on

@@ -172,12 +172,14 @@ one from the current time, which would assert the whole backlog read. A writer
 advances it only to an instant with no unread dated item at or before it, and
 never moves it backwards: when merging, the later of the two marks is kept.
 
-**Status in FeatherReader.** Before PR #287-3, FeatherReader's own compaction
-compared against `published`, else the fetch time, and never applied a record's
-`readThrough` to its local items. From that PR the basis is `published` only,
-undated reads stay in `readIds`, and a record's `readThrough` marks the reader's
-dated local items read, except items in `unreadIds` and items the reader marked
-unread more recently than the record's `updatedAt`.
+**Status in FeatherReader.** Implemented from 0.5.0 (#287). Before it,
+FeatherReader's own compaction compared against `published`, else the fetch
+time, and never applied a record's `readThrough` to its local items. Now the
+basis is `published` only, undated reads stay in `readIds`, and a record's
+`readThrough` marks the reader's dated local items read, except items in
+`unreadIds` and items the reader marked unread more recently than the record's
+`updatedAt` (a tie goes to the reader's own state). A `readThrough` with
+fractional seconds is compared at whole seconds, rounded down.
 
 ### Caps
 
