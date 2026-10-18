@@ -50,9 +50,8 @@ self-hosted.
   algorithm, no "discover" tab. Every feature has to earn its place against
   "does this make the calm reading experience better, or just bigger?"
 - **Single binary, self-hostable.** Rust + an embedded SQLite cache (no Postgres
-  to run). The atproto OAuth client is built in, so a self-host can be **one
-  process** — or keep the Node sidecar if you prefer. Easy to run yourself
-  either way.
+  to run). The atproto OAuth client is built in, so a self-host is **one
+  process**. Easy to run yourself.
 
 ## Features
 
@@ -135,24 +134,22 @@ data lives, what the background loops do, and how a release ships.
 ### Architecture
 
 One container on one Fly machine, fronted by Cloudflare. Caddy is the only
-listener reachable off loopback; the Rust app and the optional Node sidecar
-bind `127.0.0.1`. Ports and components are from [`fly.toml`](fly.toml), the
+listener reachable off loopback; the Rust app binds `127.0.0.1`. Ports and components are from [`fly.toml`](fly.toml), the
 [`Dockerfile`](Dockerfile) and [`deploy/Caddyfile`](deploy/Caddyfile).
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="design/architecture/runtime-dark.png">
-    <img alt="Request path: browser to Cloudflare (which injects X-Origin-Auth) to Caddy on :8080 in one Fly container, then the Rust app on 127.0.0.1:8082 (and the Node OAuth sidecar on :8081 on the sidecar backend), with a /data volume; outbound to RSS hosts, your PDS, publishers' PDSes and plc.directory." src="design/architecture/runtime-light.png" width="820">
+    <img alt="Request path: browser to Cloudflare (which injects X-Origin-Auth) to Caddy on :8080 in one Fly container, then the Rust app on 127.0.0.1:8082, with a /data volume; outbound to RSS hosts, your PDS, publishers' PDSes and plc.directory." src="design/architecture/runtime-light.png" width="820">
   </picture>
 </p>
 
 <sub>Source: [`design/architecture/runtime.mmd`](design/architecture/runtime.mmd). Images, not inline Mermaid, so they show on every GitHub surface, the mobile app included.</sub>
 
-Dashed links exist only on `FEATHERREADER_REPO_BACKEND=sidecar`; on `rust` the
-app owns the OAuth flow and the sidecar process is not started (see
-[Choosing an OAuth backend](#choosing-an-oauth-backend)). The entrypoint
-installs the matching Caddy `/oauth/*` routing from the same variable, so the
-two cannot disagree. Caddy refuses any non-`/health` request that does not
+The app owns the OAuth flow; Caddy proxies `/oauth/*` to it like everything
+else. (Until 0.5.0 a Node OAuth sidecar could do that instead; see
+[Upgrading from the sidecar backend](#upgrading-from-the-sidecar-backend).)
+Caddy refuses any non-`/health` request that does not
 carry the `X-Origin-Auth` secret Cloudflare injects, which is what makes
 `cf-connecting-ip` trustworthy for rate limiting. An
 [optional follow→invite bot](#invite-bot-optional) runs *outside* this
@@ -223,35 +220,24 @@ permissioned ("private") records ship.
 
 ## Self-hosting
 
-FeatherReader is a single static Rust binary (optionally plus the Node OAuth
-sidecar), an embedded SQLite cache, and no external database. Everything is
+FeatherReader is a single static Rust binary, an embedded SQLite cache, and no
+external database. Everything is
 configured through environment variables; there is no config file, and every
 knob has a default, so a bare `./featherreader` boots on `127.0.0.1:8080`.
 
 ### Build & run
 
 **Prerequisites:** a stable Rust toolchain at or above `rust-version` in
-[`Cargo.toml`](Cargo.toml) (1.94), plus Node.js **24 or newer only if** you run
-the sidecar backend (it uses the built-in `node:sqlite`, stable and flagless
-from 24).
+[`Cargo.toml`](Cargo.toml) (1.94). Nothing else: no Node, no system SQLite or
+OpenSSL.
 
 ```sh
-# 1. Build the server (always)
 cargo build --release          # -> target/release/featherreader
-
-# 2. Build the OAuth sidecar (only for FEATHERREADER_REPO_BACKEND=sidecar)
-cd oauth-sidecar
-npm ci
-npm run build
 ```
 
 - The **server** reads `FEATHERREADER_*` variables. **The table at the top of
   [`src/config.rs`](src/config.rs) is the complete, authoritative list**, with
   defaults and meanings; the ones you will set first are below.
-- The **sidecar** reads `SIDECAR_*` variables — see
-  [`oauth-sidecar/.env.example`](oauth-sidecar/.env.example). On the `rust`
-  backend the sidecar is not run, but the server still requires
-  `SIDECAR_INTERNAL_SECRET` (≥32 bytes) on a production-like instance.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -260,8 +246,7 @@ npm run build
 | `FEATHERREADER_PUBLIC_URL` | `http://localhost:8080` | The public origin. Used for the OAuth callback and client metadata, and for the absolute URLs in link cards. |
 | `FEATHERREADER_COOKIE_SECRET` | *(dev fallback)* | HMAC key for the session cookie. Required, and at least 32 bytes, on a production-like instance (non-loopback bind or public URL, or `FEATHERREADER_ENV=prod`). |
 | `FEATHERREADER_ALLOWED_DIDS` | *(empty = open)* | Login allow-list of DIDs. Also the admin seed for the invite gate: these DIDs get a beta seat and can mint invite codes. |
-| `FEATHERREADER_REPO_BACKEND` | `rust` | `rust` or `sidecar`. Which implementation owns `/oauth/*` and `com.atproto.repo.*`. An unrecognised value fails startup. |
-| `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for OAuth sessions and the signing key on the `rust` backend. Generate it: `openssl rand -hex 32`. Required there on a production-like instance. |
+| `FEATHERREADER_OAUTH_ENCRYPTION_KEY` | *(unset = plaintext)* | At-rest encryption for OAuth sessions and the signing key. Generate it: `openssl rand -hex 32`. Required on a production-like instance. |
 | `FEATHERREADER_OAUTH_KEY_PATH` | `oauth-signing-key.json` | The client's ES256 signing key. Relative by default; in a container put it on the volume, or every redeploy mints a new key and changes your published JWKS. |
 | `FEATHERREADER_STANDARD_SITE` | `false` | Whether a standard.site publication subscription may be stored. Stored ones are polled regardless. |
 | `FEATHERREADER_POLL_INTERVAL` | `3600` | Default per-feed poll interval in seconds. `0` is refused. |
@@ -272,47 +257,37 @@ On a production-like instance (non-loopback bind or public URL, or
 `FEATHERREADER_ENV=prod`) the server **refuses to start** with missing or weak
 production secrets rather than running with the published dev defaults.
 
-### Choosing an OAuth backend
+### Upgrading from the sidecar backend
 
-`FEATHERREADER_REPO_BACKEND` selects which implementation performs the atproto
-OAuth handshake and every `com.atproto.repo.*` call:
+Until 0.5.0 the atproto OAuth flow and repo calls could be served by a Node
+sidecar (`@atproto/oauth-client-node`) instead of the built-in client, and an
+unset `FEATHERREADER_REPO_BACKEND` selected it. **0.5.0 removed it** (#311):
+its OAuth client guarded none of its outbound fetches (#258), and the hosted
+instance had run the built-in client since the 2026-09-13 cutover. The
+[0.3.7 README](https://github.com/justin-stanley/feather-reader/blob/v0.3.7/README.md#choosing-an-oauth-backend)
+has the measured comparison of the two.
 
-| | `sidecar` | `rust` (default) |
-|---|---|---|
-| Processes | Rust server + Node sidecar | Rust server only |
-| OAuth client | `@atproto/oauth-client-node` | built in |
-| Runtime deps | Node.js | none |
-| Needs | `SIDECAR_*` | `FEATHERREADER_OAUTH_ENCRYPTION_KEY`, plus `SIDECAR_INTERNAL_SECRET` in production |
+An instance that ran the sidecar:
 
-**The default is `rust`** (#311): an unset variable used to select the
-sidecar, whose OAuth client guards none of its outbound fetches (#258). The
-hosted instance has run `rust` since the 2026-09-13 cutover ([`fly.toml`](fly.toml)
-sets it explicitly), and a measured latency comparison of the two is in the
-[0.3.7 README](https://github.com/justin-stanley/feather-reader/blob/v0.3.7/README.md#choosing-an-oauth-backend).
-**0.5.0 removes the sidecar** ([`design/RELEASE-0.5.0.md`](design/RELEASE-0.5.0.md)),
-with no separate deprecation release; its upgrade notes are the notice. Until
-then `sidecar` still selects it.
+- **Set `FEATHERREADER_OAUTH_ENCRYPTION_KEY`** before upgrading; a
+  production-like instance refuses to start without it.
+- **Unset `FEATHERREADER_REPO_BACKEND`, or set it to `rust`.** `sidecar` now
+  refuses to start, with a message saying so. Keep it set to `rust` if you may
+  roll back: on 0.4.x an unset variable means the sidecar.
+- **Every reader signs in again once.** The sidecar's sessions are in
+  `SIDECAR_DB`, which nothing reads, and they cannot be revoked any more; they
+  expire at their PDSes.
+- **`SIDECAR_*` variables are ignored**, with a warning at boot while any is
+  set. Keep `SIDECAR_INTERNAL_SECRET` while a rollback to 0.4.x is still an
+  option (0.4.x requires it in production), then unset them and delete the
+  leftover `oauth-sidecar.db*` and `oauth-sidecar.db.jwk.json`.
 
-What switching costs, in either direction:
-
-- **Everyone signs in again.** The two backends keep separate session stores
-  (the Rust backend's `oauth_session` table lives inside `FEATHERREADER_DB`;
-  nothing under `src/` reads `SIDECAR_DB`), so no token crosses the flip — and
-  rolling back logs people out a second time.
-- **`/oauth/*` routing must match the backend.** The two cannot share
-  `/oauth/callback`: the PDS redirects there with identical parameters in both
-  cases, so one process has to own the path. The supplied container installs
-  the matching Caddy routing from the same variable. A bare-binary deployment
-  must route `/oauth/*` itself: to the app on `rust`, to the sidecar on
-  `sidecar`.
-- **Rolling back is unsetting the variable and restarting.** Both Caddy
-  routings ship in every image; nothing is migrated or destroyed.
+The full notes are under 0.5.0 in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### The container image
 
 `ghcr.io/justin-stanley/feather-reader` is the image the hosted instance runs:
-Caddy + the Rust app (+ the Node sidecar, started only on
-`FEATHERREADER_REPO_BACKEND=sidecar`) under tini, non-root, with the Rust app
+Caddy + the Rust app under tini, non-root, on `debian:bookworm-slim`, with the Rust app
 on `127.0.0.1:8082` and Caddy on `:8080` as the only public listener. Build it
 yourself with `docker build -t feather-reader .`. Two things to know before
 running it:
@@ -355,16 +330,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked   # dangling intra-doc l
 cargo deny check bans licenses sources    # deny.toml: AGPL-compatible licences, crates.io only
 cargo audit -D warnings                   # RustSec, unmaintained advisories included
 
-# OAuth sidecar (Node 24)
-cd oauth-sidecar && npm ci && npm run build && npm run typecheck && npm test \
-  && npm run lint && npm run format:check && npm audit --omit=dev --audit-level=high
-
 # Invite bot (its own workspace): build/test/clippy/fmt plus cargo deny + cargo audit, run in bot/
 ```
 
 Three more jobs: **gitleaks** scans the tree and the full history with
 [`.gitleaks.toml`](.gitleaks.toml), **Caddyfile** validates
-[`deploy/Caddyfile`](deploy/Caddyfile) with both OAuth routings, in Docker,
+[`deploy/Caddyfile`](deploy/Caddyfile), in Docker,
 against the exact Caddy digest the Dockerfile pins, and **teardown** runs
 `bash scripts/test-teardown.sh` — [`deploy/teardown.sh`](deploy/teardown.sh)
 against throwaway SQLite files, pinning its revoke order and refusals. A pull request that touches `src/`,
@@ -373,7 +344,7 @@ against throwaway SQLite files, pinning its revoke order and refusals. A pull re
 see [Releasing](#releasing) for what it proves.
 
 Locally, [`scripts/ci.sh`](scripts/ci.sh) runs the fmt, build, test and clippy
-steps plus the sidecar's `npm ci`, build and typecheck; the rustdoc, deny,
+steps plus the teardown tests; the rustdoc, deny,
 audit, gitleaks and Caddy steps are not in it. Wire it up as a pre-push hook
 with `git config core.hooksPath .githooks`. Workflow notes and the local
 commands for the security scanners are in
