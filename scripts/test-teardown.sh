@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 #
 # Tests for deploy/teardown.sh, run against throwaway SQLite files in a temp
-# directory. Nothing real is touched: the sidecar is a `curl` stub on PATH, the
-# Rust revoke is a stub FR_REVOKE_CMD, and the stop command only logs.
+# directory. Nothing real is touched: the revoke is a stub FR_REVOKE_CMD, and
+# the stop command only logs.
 #
 # What is pinned (issue #257):
-#   * the order: sidecar revoke -> Rust revoke (app still running) -> stop ->
-#     Rust revoke sweep -> wipe;
-#   * on the rust backend (or with Rust sessions stored) and no revoke command,
-#     the script refuses BEFORE doing anything irreversible;
+#   * the order: revoke (app still running) -> stop -> revoke sweep -> wipe;
+#   * with no revoke command the script refuses BEFORE doing anything
+#     irreversible;
 #   * the wipe proceeds only after a revoke that exited 0 or 3 AND printed the
 #     binary's sentinel line, agreeing with the exit code (3 warns). Anything
 #     else — 2, 1 (an older binary ignoring the flag, a failing wrapper), or a
 #     missing/contradictory sentinel — aborts with every file still present;
-#   * the sidecar variables are optional on the rust backend.
+#   * since 0.5.0 (#311): FEATHERREADER_REPO_BACKEND=sidecar is refused before
+#     anything, and a sidecar store left over from 0.4.x is wiped, never
+#     revoked (there is no sidecar to revoke through), with a warning.
 #
 # Usage: bash scripts/test-teardown.sh   (needs bash and sqlite3)
 #
@@ -36,8 +37,8 @@ ok()   { pass=$((pass + 1)); echo "  ok   - $1"; }
 bad()  { fail=$((fail + 1)); echo "  FAIL - $1"; [ -n "${OUT:-}" ] && sed 's/^/         | /' <<<"$OUT"; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-# A fresh sandbox: an app DB with Rust sessions, a sidecar DB with sidecar
-# sessions, the sidecar JWK, the Rust signing key, and the stubs.
+# A fresh sandbox: an app DB with Rust sessions, a sidecar DB left over from
+# 0.4.x with sidecar sessions and its JWK, the signing key, and the stubs.
 setup() {
   T="$(mktemp -d "${TMPDIR:-/tmp}/fr-teardown-test.XXXXXX")"
   mkdir -p "$T/bin"
@@ -53,16 +54,6 @@ setup() {
   echo '{}' >"$SC_DB.jwk.json"
   echo '{}' >"$KEY"
 
-  # The sidecar's /internal/revoke, as seen through curl.
-  cat >"$T/bin/curl" <<EOF
-#!/usr/bin/env bash
-body=""
-while [ \$# -gt 0 ]; do
-  case "\$1" in -d) body="\$2"; shift ;; esac
-  shift
-done
-echo "sidecar-revoke \$body" >>"$LOG"
-EOF
   # The Rust revoke. Successive calls take successive lines of $T/revoke-exits
   # (the last repeats), each "CODE SENTINEL [EOL [del]]":
   #   CODE      the exit code;
@@ -94,7 +85,7 @@ case "\$sentinel" in
 esac
 exit "\${code:-0}"
 EOF
-  chmod +x "$T/bin/curl" "$T/bin/revoke-stub"
+  chmod +x "$T/bin/revoke-stub"
   echo "0 f0" >"$T/revoke-exits"
 }
 
@@ -108,21 +99,24 @@ run() {
   CODE=$?
 }
 
-# The `kind` of each log line, in order: sidecar-revoke / rust-revoke / stop.
+# The `kind` of each log line, in order: rust-revoke / stop / sweep-cmd.
 order() { awk '{print $1}' "$LOG" | uniq | paste -sd' ' -; }
 all_present() { [ -f "$APP_DB" ] && [ -f "$SC_DB" ] && [ -f "$SC_DB.jwk.json" ] && [ -f "$KEY" ]; }
 none_present() { [ ! -e "$APP_DB" ] && [ ! -e "$SC_DB" ] && [ ! -e "$SC_DB.jwk.json" ] && [ ! -e "$KEY" ]; }
 
+# A 0.4.x environment, as an upgraded instance may still carry: only SIDECAR_DB
+# is read, to find the leftover store to wipe.
 sidecar_env() { SIDECAR=(SIDECAR_DB="$SC_DB" SIDECAR_PUBLIC_URL=http://127.0.0.1:9 SIDECAR_INTERNAL_SECRET=s); }
 
-echo "== rust backend: sidecar revoke -> rust revoke -> stop -> rust sweep -> wipe"
+echo "== rust revoke -> stop -> rust sweep -> wipe, the leftover sidecar store wiped unrevoked"
 setup; sidecar_env
 run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "exits 0" '[ "$CODE" = 0 ]'
-check "order is sidecar-revoke rust-revoke stop rust-revoke (got: $(order))" \
-      '[ "$(order)" = "sidecar-revoke rust-revoke stop rust-revoke" ]'
-check "the sidecar DID was revoked" 'grep -q "did:plc:side1" "$LOG"'
+check "order is rust-revoke stop rust-revoke (got: $(order))" \
+      '[ "$(order)" = "rust-revoke stop rust-revoke" ]'
+check "the leftover sidecar store is named as unrevokable" \
+      'grep -q "cannot" <<<"$OUT" && grep -q "oauth-sidecar.db" <<<"$OUT"'
 check "both rust passes ran before the wipe, against FEATHERREADER_DB" \
       '[ "$(grep -c "^rust-revoke db-present $APP_DB\$" "$LOG")" = 2 ]'
 check "every file is wiped, the Rust signing key included" 'none_present'
@@ -143,66 +137,39 @@ setup
 run FEATHERREADER_REPO_BACKEND=$' rust\r\n' FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
     FR_STOP_CMD="echo stop >>'$LOG'"
 check "exits non-zero (rust, no revoke command)" '[ "$CODE" != 0 ]'
-check "it is the rust refusal, not a SIDECAR_DB requirement" \
-      'grep -q "teardown.md" <<<"$OUT" && ! grep -q "SIDECAR_DB is required" <<<"$OUT"'
+check "it is the no-revoke-command refusal, not a backend one" \
+      'grep -q "teardown.md" <<<"$OUT" && ! grep -q "0.4.x" <<<"$OUT"'
 check "every file is still present" 'all_present'
 teardown_sandbox
 
-echo "== sidecar backend, but Rust sessions stored and no revoke command: refuse"
+echo "== sidecar backend: refused before anything, pointing at the 0.4.x teardown (#311)"
 setup; sidecar_env
-run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FR_STOP_CMD="echo stop >>'$LOG'"
-check "exits non-zero" '[ "$CODE" != 0 ]'
-check "every file is still present" 'all_present'
-teardown_sandbox
-
-echo "== sidecar backend, no Rust sessions, no revoke command: proceeds"
-setup; sidecar_env
-"$SQLITE3" "$APP_DB" "DELETE FROM oauth_session;"
-run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FR_STOP_CMD="echo stop >>'$LOG'"
-check "exits 0" '[ "$CODE" = 0 ]'
-check "order is sidecar-revoke stop (got: $(order))" '[ "$(order)" = "sidecar-revoke stop" ]'
-check "both DBs are wiped" '[ ! -e "$APP_DB" ] && [ ! -e "$SC_DB" ]'
-teardown_sandbox
-
-# On the sidecar backend a revoke command being AVAILABLE is not a reason to
-# run it: with no app DB (or no Rust sessions in it) the binary would refuse
-# with 2 ("no database") and abort a teardown that has nothing Rust to revoke.
-# An app DB sqlite3 cannot read (corrupt, locked, wrong permissions) is NOT "no
-# Rust sessions": reading it as 0 skipped the Rust step on the sidecar backend
-# and wiped whatever tokens it held unrevoked.
-echo "== sidecar backend, unreadable app DB, no revoke command: refuse"
-setup; sidecar_env
-echo "not a sqlite database" >"$APP_DB"
-run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FR_STOP_CMD="echo stop >>'$LOG'"
+run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "exits non-zero" '[ "$CODE" != 0 ]'
 check "every file is still present" 'all_present'
 check "nothing was revoked or stopped (log: $(order))" '[ ! -s "$LOG" ]'
+check "the refusal points at the 0.4.x teardown" 'grep -q "0.4.x" <<<"$OUT"'
 teardown_sandbox
 
-echo "== sidecar backend, unreadable app DB, revoke command available: rust step runs"
-setup; sidecar_env
+# An app DB sqlite3 cannot read (corrupt, locked, wrong permissions) is NOT "no
+# sessions": reading it as 0 would skip work the revoke has to do.
+echo "== an unreadable app DB still runs the revoke"
+setup
 echo "not a sqlite database" >"$APP_DB"
-run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" \
+run FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "the rust revoke ran (got: $(order))" 'grep -q "^rust-revoke" "$LOG"'
 teardown_sandbox
 
-for variant in "no app DB" "app DB without Rust sessions"; do
-  echo "== sidecar backend, revoke command available, $variant: rust step skipped"
-  setup; sidecar_env
-  if [ "$variant" = "no app DB" ]; then
-    rm -f "$APP_DB"
-  else
-    "$SQLITE3" "$APP_DB" "DELETE FROM oauth_session;"
-  fi
-  echo "2 -" >"$T/revoke-exits"
-  run FEATHERREADER_REPO_BACKEND=sidecar "${SIDECAR[@]}" \
-      FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
-  check "exits 0" '[ "$CODE" = 0 ]'
-  check "order is sidecar-revoke stop (got: $(order))" '[ "$(order)" = "sidecar-revoke stop" ]'
-  check "the sidecar DB is wiped" '[ ! -e "$SC_DB" ]'
-  teardown_sandbox
-done
+echo "== a leftover sidecar store at the default path is found without SIDECAR_DB"
+setup
+run FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
+    FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
+check "exits 0" '[ "$CODE" = 0 ]'
+check "the leftover store and its JWK are wiped" '[ ! -e "$SC_DB" ] && [ ! -e "$SC_DB.jwk.json" ]'
+check "it warned that those sessions cannot be revoked" 'grep -q "cannot" <<<"$OUT"'
+teardown_sandbox
 
 # Outcomes of the FIRST pass that must abort with nothing stopped or wiped.
 # Only (0 + sentinel failed=0) and (3 + sentinel failed>0) may proceed.
@@ -253,8 +220,8 @@ printf '0 f0 lf del\n1 -\n' >"$T/revoke-exits"
 run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH="$KEY" \
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub"
 check "exits 0" '[ "$CODE" = 0 ]'
-check "order is sidecar-revoke rust-revoke stop (got: $(order))" \
-      '[ "$(order)" = "sidecar-revoke rust-revoke stop" ]'
+check "order is rust-revoke stop (got: $(order))" \
+      '[ "$(order)" = "rust-revoke stop" ]'
 check "says the sweep was skipped" 'grep -qi "sweep skipped" <<<"$OUT"'
 check "every file is wiped" 'none_present'
 teardown_sandbox
@@ -276,8 +243,8 @@ run FEATHERREADER_REPO_BACKEND=rust "${SIDECAR[@]}" FEATHERREADER_OAUTH_KEY_PATH
     FR_STOP_CMD="echo stop >>'$LOG'" FR_REVOKE_CMD="$T/bin/revoke-stub" \
     FR_SWEEP_CMD="echo sweep-cmd >>'$LOG'; $T/bin/revoke-stub"
 check "exits 0" '[ "$CODE" = 0 ]'
-check "order is sidecar-revoke rust-revoke stop sweep-cmd rust-revoke (got: $(order))" \
-      '[ "$(order)" = "sidecar-revoke rust-revoke stop sweep-cmd rust-revoke" ]'
+check "order is rust-revoke stop sweep-cmd rust-revoke (got: $(order))" \
+      '[ "$(order)" = "rust-revoke stop sweep-cmd rust-revoke" ]'
 check "every file is wiped" 'none_present'
 teardown_sandbox
 
@@ -340,14 +307,6 @@ check "exits 0, needing no sidecar variables" '[ "$CODE" = 0 ]'
 check "order is rust-revoke stop rust-revoke (got: $(order))" \
       '[ "$(order)" = "rust-revoke stop rust-revoke" ]'
 check "the app DB and key are wiped" '[ ! -e "$APP_DB" ] && [ ! -e "$KEY" ]'
-teardown_sandbox
-
-echo "== sidecar backend still requires the sidecar variables"
-setup
-run FEATHERREADER_REPO_BACKEND=sidecar FR_REVOKE_CMD="$T/bin/revoke-stub"
-check "exits non-zero" '[ "$CODE" != 0 ]'
-check "names the missing variable" 'grep -q "SIDECAR_DB" <<<"$OUT"'
-check "every file is still present" '[ -f "$APP_DB" ] && [ -f "$SC_DB" ]'
 teardown_sandbox
 
 echo "== the default revoke command is featherreader --revoke-all-sessions on PATH"

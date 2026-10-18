@@ -20,7 +20,8 @@
 /featherreader.db-shm
 /featherreader.db-wal
 
-# The Node sidecar's own store and signing key (SIDECAR_DB), same reasoning.
+# The Node sidecar's own store (SIDECAR_DB), same reasoning: the sidecar was
+# removed in 0.5.0 (#311), but a checkout used before then may still hold one.
 /oauth-sidecar.db
 /oauth-sidecar.db-shm
 /oauth-sidecar.db-wal

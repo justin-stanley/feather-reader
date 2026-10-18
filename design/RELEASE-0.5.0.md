@@ -178,8 +178,13 @@ relative default path; they use a temp key.
   leaving `rust` (PR #313).
 - Delete `oauth-sidecar/`, and its lines in `.dockerignore`, `.gitignore` and
   `.gitleaks.toml`.
-- The production secret `SIDECAR_INTERNAL_SECRET` is unset with
-  `fly secrets unset` after 0.5.0 is live, not before.
+- The production `SIDECAR_*` secrets are unset with `fly secrets unset` only
+  once a rollback to 0.4.x is no longer wanted: 0.4.x refuses to boot in
+  production without `SIDECAR_INTERNAL_SECRET`. For the same reason `fly.toml`
+  keeps `FEATHERREADER_REPO_BACKEND = "rust"`.
+
+**Done** (this PR), plus: the required status check `OAuth sidecar` has to be
+removed from `main`'s branch protection, since its job is gone.
 
 ### 5. Docs and copy
 

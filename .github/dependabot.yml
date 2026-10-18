@@ -17,18 +17,6 @@ updates:
       cargo-minor-patch:
         update-types: [minor, patch]
 
-  # --- OAuth sidecar (Node/npm) --------------------------------------------
-  - package-ecosystem: npm
-    directory: "/oauth-sidecar"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "deps(npm)"
-    groups:
-      npm-minor-patch:
-        update-types: [minor, patch]
-
   # --- GitHub Actions (workflow `uses:` pins) ------------------------------
   - package-ecosystem: github-actions
     directory: "/"
@@ -43,7 +31,7 @@ updates:
 
   # --- Docker ---------------------------------------------------------------
   # NOT ENABLED. The Dockerfile is at the repo root (directory "/"), and its
-  # base images (rust, node, caddy) are pinned by digest and bumped by hand;
+  # base images (rust, debian, caddy) are pinned by digest and bumped by hand;
   # ci.yml's Caddyfile job validates against the caddy digest the Dockerfile
   # pins. Left in as a placeholder so the wiring is one uncomment away.
   # - package-ecosystem: docker
