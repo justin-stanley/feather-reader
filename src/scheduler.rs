@@ -1476,12 +1476,11 @@ mod tests {
     /// A feed row that is due right now (`next_poll` NULL), plus its store.
     async fn due_feed(url: &str) -> (Pool, Feed) {
         let pool = store::init_url("sqlite::memory:").await.unwrap();
+        // The binary's tests link the library's non-test build, so the URL is
+        // vetted for real.
         store::upsert_feed(
             &pool,
-            &store::NewFeed {
-                url: url.to_string(),
-                ..Default::default()
-            },
+            &store::NewFeed::new(store::FeedUrl::vetted(url, true).expect("a test feed URL")),
         )
         .await
         .unwrap();
@@ -1859,12 +1858,11 @@ mod tests {
     async fn state_with_due(urls: &[&str]) -> AppState {
         let state = rust_state().await;
         for url in urls {
+            // The binary's tests link the library's non-test build, so the URL is
+            // vetted for real.
             store::upsert_feed(
                 &state.db,
-                &store::NewFeed {
-                    url: url.to_string(),
-                    ..Default::default()
-                },
+                &store::NewFeed::new(store::FeedUrl::vetted(url, true).expect("a test feed URL")),
             )
             .await
             .unwrap();

@@ -1215,7 +1215,7 @@ pub(crate) async fn poll_publication_group_with(
     };
 
     let (retention_days, retention_hard_days) = config.retention_for(FeedKind::Publication);
-    let store = |url: String, read: crate::standard_site::PublicationRead| async move {
+    let store = |url: store::FeedUrl, read: crate::standard_site::PublicationRead| async move {
         crate::standard_site::store_publication(
             pool,
             &url,
@@ -1236,7 +1236,7 @@ pub(crate) async fn poll_publication_group_with(
                 if read.cut_short_by_group {
                     cut_short.push((i, read.entries.len()));
                 }
-                store(feed.url.clone(), read).await
+                store(store::FeedUrl::of_row(feed), read).await
             }
             (Some(Err(err)), _) => failed(publication_failure_kind(&err), format!("{err:#}")),
             (None, Some((kind, detail))) if readable.contains(&i) => failed(*kind, detail.clone()),
@@ -1327,7 +1327,7 @@ pub(crate) async fn poll_publication_group_with(
             Ok(Ok(mut per)) => match per.pop() {
                 Some(Ok(read)) => {
                     let better = read.complete || read.entries.len() > group_kept;
-                    match store(feed.url.clone(), read).await {
+                    match store(store::FeedUrl::of_row(feed), read).await {
                         Ok(outcome) => {
                             if better {
                                 improved += 1;
@@ -1939,7 +1939,7 @@ async fn poll_feed_with(
     if status == StatusCode::NOT_MODIFIED {
         tracing::debug!(feed = %feed.url, "feed not modified (304)");
         // Bump last_polled/next_poll only; leave validators + entries untouched.
-        touch_polled(pool, &feed.url, None, None)
+        touch_polled(pool, feed, None, None)
             .await
             .with_context(|| format!("touch_polled after 304 for {}", feed.url))?;
         return Ok(PollOutcome::NotModified);
@@ -2003,13 +2003,13 @@ async fn poll_feed_with(
         (new_etag, new_last_modified)
     };
     let new_feed = NewFeed {
-        url: feed.url.clone(),
         title,
         site_url,
         etag,
         last_modified,
         last_polled: Some(now_rfc3339()),
-        next_poll: None, // the scheduler owns cadence; leave it to set next_poll.
+        // next_poll: the scheduler owns cadence; leave it to set next_poll.
+        ..NewFeed::new(store::FeedUrl::of_row(feed))
     };
 
     // --- store (a store failure IS a real error) -----------------------------
@@ -2039,7 +2039,7 @@ async fn poll_feed_with(
 /// used on the `304 Not Modified` path.
 async fn touch_polled(
     pool: &SqlitePool,
-    url: &str,
+    feed: &Feed,
     etag: Option<String>,
     last_modified: Option<String>,
 ) -> Result<()> {
@@ -2050,11 +2050,10 @@ async fn touch_polled(
     // honest, and with it a race where a concurrent poll's validators could be
     // read here and written back stale.
     let nf = NewFeed {
-        url: url.to_string(),
         etag,
         last_modified,
         last_polled: Some(now_rfc3339()),
-        ..Default::default()
+        ..NewFeed::new(store::FeedUrl::of_row(feed))
     };
     store::upsert_feed(pool, &nf).await?;
     Ok(())
@@ -3654,7 +3653,7 @@ mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: url.clone(),
+                url: url.clone().into(),
                 ..Default::default()
             },
         )
@@ -4069,7 +4068,7 @@ mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -4611,7 +4610,7 @@ mod sanitize_off_runtime_tests {
         crate::store::upsert_feed(
             &pool,
             &NewFeed {
-                url: url.clone(),
+                url: url.clone().into(),
                 ..Default::default()
             },
         )

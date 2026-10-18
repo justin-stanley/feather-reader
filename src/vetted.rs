@@ -157,6 +157,126 @@ impl VettedSaved {
     }
 }
 
+/// A feed URL that may be written to the shared `feeds` table (#260).
+///
+/// **Why a type:** the URL of every new row comes from outside — a URL the
+/// reader typed and autodiscovery resolved, an OPML `xmlUrl`, a subscription
+/// record any atproto client can write — and two checks must pass before it is
+/// stored: [`crate::feed::is_storable_feed_url`] (an http(s) URL, or an at-URI
+/// when standard.site is on) and [`crate::feed::classify_feed_privacy`] (no
+/// secret in it; a private feed URL is never stored). Those checks were
+/// enforced by convention at each caller, and convention drifted: this
+/// project's review found guards like these missed in turn at the paths that
+/// had to remember them (design/REVIEW-BACKLOG.md, "The structural theme").
+/// With the field private — to this module, not to `store.rs`, where every
+/// row is written — an unvetted URL reaching [`crate::store::upsert_feed`] is
+/// a compile error.
+///
+/// Two ways in, and no others:
+/// - [`FeedUrl::vetted`] runs both checks;
+/// - [`FeedUrl::of_row`] takes the URL of a row already in the table, which
+///   was vetted on its way in (the poll paths re-upserting what they polled).
+///
+/// A vetted URL is accepted:
+///
+/// ```
+/// use feather_reader::store::{FeedUrl, NewFeed};
+///
+/// let url = FeedUrl::vetted("https://example.com/feed.xml", false).unwrap();
+/// let _row = NewFeed::new(url);
+/// ```
+///
+/// A raw string is not, by conversion:
+///
+/// ```compile_fail,E0277
+/// use feather_reader::store::{FeedUrl, NewFeed};
+///
+/// let url: FeedUrl = "https://example.com/feed.xml".into();
+/// let _row = NewFeed::new(url);
+/// ```
+///
+/// nor by construction:
+///
+/// ```compile_fail,E0423
+/// use feather_reader::store::{FeedUrl, NewFeed};
+///
+/// let url = FeedUrl("https://example.com/feed.xml".to_string());
+/// let _row = NewFeed::new(url);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedUrl(String);
+
+/// Why [`FeedUrl::vetted`] refused a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedUrlRefusal {
+    /// Not an http(s) URL, or an at-URI with standard.site off.
+    NotStorable,
+    /// The URL carries a secret; the reason, for the log and the skip report.
+    Private(String),
+}
+
+impl FeedUrl {
+    /// `url`, if it may be stored: storable, then not private. `allow_at_uri`
+    /// is `config.standard_site`.
+    pub fn vetted(url: &str, allow_at_uri: bool) -> Result<Self, FeedUrlRefusal> {
+        if !crate::feed::is_storable_feed_url(url, allow_at_uri) {
+            return Err(FeedUrlRefusal::NotStorable);
+        }
+        if let crate::feed::FeedPrivacy::Private(reason) = crate::feed::classify_feed_privacy(url) {
+            return Err(FeedUrlRefusal::Private(reason));
+        }
+        Ok(FeedUrl(url.to_owned()))
+    }
+
+    /// The URL of a row already in `feeds`.
+    pub fn of_row(feed: &crate::store::Feed) -> Self {
+        FeedUrl(feed.url.clone())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FeedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Tests write fixture URLs directly: test builds only, so production code
+/// cannot use it.
+#[cfg(test)]
+impl From<&str> for FeedUrl {
+    fn from(url: &str) -> Self {
+        FeedUrl(url.to_owned())
+    }
+}
+
+#[cfg(test)]
+impl From<String> for FeedUrl {
+    fn from(url: String) -> Self {
+        FeedUrl(url)
+    }
+}
+
+#[cfg(test)]
+impl From<&String> for FeedUrl {
+    fn from(url: &String) -> Self {
+        FeedUrl(url.clone())
+    }
+}
+
+/// An empty URL, for test fixtures' `..Default::default()`. Test builds only:
+/// in production a `NewFeed` is built from a [`FeedUrl`] with
+/// [`crate::store::NewFeed::new`].
+#[cfg(test)]
+impl Default for FeedUrl {
+    fn default() -> Self {
+        FeedUrl(String::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +373,45 @@ mod tests {
         let vetted = VettedSaved::new(&saved).expect("a plain https url is publishable");
         let rendered = serde_json::to_value(&vetted).unwrap();
         assert_eq!(rendered["url"], "https://example.com/post");
+    }
+
+    // -- FeedUrl (#260) ------------------------------------------------------
+
+    /// Both checks run, and each refusal says which.
+    #[test]
+    fn a_feed_url_is_vetted_for_storability_then_privacy() {
+        use super::{FeedUrl, FeedUrlRefusal};
+        assert_eq!(
+            FeedUrl::vetted("https://example.com/feed.xml", false)
+                .unwrap()
+                .as_str(),
+            "https://example.com/feed.xml"
+        );
+        for raw in ["javascript:alert(1)", "file:///etc/passwd", "not a url", ""] {
+            assert_eq!(
+                FeedUrl::vetted(raw, true),
+                Err(FeedUrlRefusal::NotStorable),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://author.substack.com/feed/private/deadbeefcafe1234",
+            "https://www.patreon.com/rss/author?auth=Zm9vYmFyc2VjcmV0dG9rZW4",
+        ] {
+            assert!(
+                matches!(FeedUrl::vetted(raw, true), Err(FeedUrlRefusal::Private(_))),
+                "{raw}"
+            );
+        }
+    }
+
+    /// An at-URI is storable only with standard.site on, as
+    /// `is_storable_feed_url` says.
+    #[test]
+    fn an_at_uri_feed_url_follows_the_standard_site_flag() {
+        use super::{FeedUrl, FeedUrlRefusal};
+        let at = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
+        assert_eq!(FeedUrl::vetted(at, true).unwrap().as_str(), at);
+        assert_eq!(FeedUrl::vetted(at, false), Err(FeedUrlRefusal::NotStorable));
     }
 }

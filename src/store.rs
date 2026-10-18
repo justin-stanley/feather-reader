@@ -223,16 +223,42 @@ pub struct NetworkStat {
     pub observed_at: String,
 }
 
+/// The vetted URL a new `feeds` row needs, and why one was refused: defined in
+/// [`crate::vetted`] so its field is private to a module nothing else lives in
+/// (#260).
+pub use crate::vetted::{FeedUrl, FeedUrlRefusal};
+
 /// New-feed payload for [`upsert_feed`] (id is assigned by SQLite).
-#[derive(Debug, Clone, Default)]
+///
+/// Not `Default` outside tests: there is no default [`FeedUrl`], so a
+/// production `NewFeed` starts from [`NewFeed::new`].
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct NewFeed {
-    pub url: String,
+    pub url: FeedUrl,
     pub title: Option<String>,
     pub site_url: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub last_polled: Option<String>,
     pub next_poll: Option<String>,
+}
+
+impl NewFeed {
+    /// `url`, with every other column left alone (`None`: the upsert keeps the
+    /// stored value). Fill the rest with struct-update syntax:
+    /// `NewFeed { title, ..NewFeed::new(url) }`.
+    pub fn new(url: FeedUrl) -> Self {
+        NewFeed {
+            url,
+            title: None,
+            site_url: None,
+            etag: None,
+            last_modified: None,
+            last_polled: None,
+            next_poll: None,
+        }
+    }
 }
 
 /// New-entry payload for [`insert_entries`] (id is assigned by SQLite,
@@ -1063,7 +1089,7 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
         RETURNING id
         "#,
     )
-    .bind(&feed.url)
+    .bind(feed.url.as_str())
     .bind(&feed.title)
     .bind(&feed.site_url)
     .bind(&feed.etag)
@@ -1071,7 +1097,7 @@ pub async fn upsert_feed(pool: &SqlitePool, feed: &NewFeed) -> Result<i64> {
     .bind(&feed.last_polled)
     .bind(&feed.next_poll)
     // Decided once, in Rust, and never re-derived from the URL by SQL.
-    .bind(crate::feed::FeedKind::of(&feed.url).as_str())
+    .bind(crate::feed::FeedKind::of(feed.url.as_str()).as_str())
     .fetch_one(pool)
     .await
     .with_context(|| format!("upsert_feed failed for {}", feed.url))?;
@@ -1256,18 +1282,21 @@ pub async fn bump_feed_errors(
 /// never rescheduled, so a re-subscribed working feed stayed parked on its stale
 /// backoff horizon for up to 24h. One implementation, two callers.
 ///
-/// `upsert_feed` COALESCEs unset fields, so supplying only url + next_poll bumps
-/// the schedule without clobbering title/validators/last_polled.
+/// **An `UPDATE`, never an insert (#260).** It was an upsert, so rescheduling a
+/// URL with no row created one, past both of the checks a new row needs
+/// ([`FeedUrl`]); and a feed deleted between its poll and this call came back.
+/// Every caller reschedules a row it just read. Only `next_poll` is written.
 pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Duration) -> Result<()> {
     let next = chrono::Utc::now()
         + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
     let next_poll = next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let nf = NewFeed {
-        url: url.to_string(),
-        next_poll: Some(next_poll),
-        ..Default::default()
-    };
-    upsert_feed(pool, &nf).await.map(|_| ())
+    sqlx::query("UPDATE feeds SET next_poll = ?1 WHERE url = ?2")
+        .bind(next_poll)
+        .bind(url)
+        .execute(pool)
+        .await
+        .with_context(|| format!("set_next_poll failed for {url}"))?;
+    Ok(())
 }
 
 /// [`due_feeds`] for one kind only. The RSS poller and the publication poller
@@ -5114,7 +5143,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url,
+                    url: url.into(),
                     ..Default::default()
                 },
             )
@@ -5173,7 +5202,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url,
+                    url: url.into(),
                     ..Default::default()
                 },
             )
@@ -5216,7 +5245,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/f.xml".to_string(),
+                url: "https://example.com/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5263,7 +5292,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 etag: Some("\"abc123\"".to_string()),
                 last_modified: Some("Wed, 01 Jan 2026 00:00:00 GMT".to_string()),
                 ..Default::default()
@@ -5275,7 +5304,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 next_poll: Some("2026-07-12T00:00:00Z".to_string()),
                 ..Default::default()
             },
@@ -5310,7 +5339,7 @@ mod tests {
             let feed_id = upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: "https://example.com/f.xml".to_string(),
+                    url: "https://example.com/f.xml".to_string().into(),
                     ..Default::default()
                 },
             )
@@ -5380,7 +5409,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/f.xml".to_string(),
+                url: "https://example.com/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5443,7 +5472,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/f.xml".to_string(),
+                url: "https://example.com/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5481,7 +5510,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/f.xml".to_string(),
+                url: "https://example.com/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5524,7 +5553,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/feed.xml".to_string(),
+                url: "https://example.com/feed.xml".to_string().into(),
                 title: Some("Example".to_string()),
                 site_url: Some("https://example.com".to_string()),
                 next_poll: Some("2026-07-12T00:00:00Z".to_string()),
@@ -5546,7 +5575,7 @@ mod tests {
         let feed_id2 = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/feed.xml".to_string(),
+                url: "https://example.com/feed.xml".to_string().into(),
                 title: Some("Example (renamed)".to_string()),
                 ..Default::default()
             },
@@ -5686,7 +5715,7 @@ mod tests {
         let feed_id = upsert_feed(
             pool,
             &NewFeed {
-                url: "https://example.com/big.xml".to_string(),
+                url: "https://example.com/big.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5792,7 +5821,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://undated.example/f.xml".to_string(),
+                url: "https://undated.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -5974,7 +6003,7 @@ mod tests {
             let feed_id = upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: format!("https://wide{i}.example/f.xml"),
+                    url: format!("https://wide{i}.example/f.xml").into(),
                     ..Default::default()
                 },
             )
@@ -6029,7 +6058,7 @@ mod tests {
         let other = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://other.example/f.xml".to_string(),
+                url: "https://other.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -6109,7 +6138,7 @@ mod tests {
         let b = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://b.example/f.xml".to_string(),
+                url: "https://b.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -6162,7 +6191,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -6222,7 +6251,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -6267,7 +6296,7 @@ mod tests {
         upsert_feed(
             pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -6777,7 +6806,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -6842,7 +6871,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -7113,7 +7142,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 title: Some("Example".to_string()),
                 ..Default::default()
             },
@@ -7235,7 +7264,7 @@ mod tests {
         let feed_a = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://a.example/feed.xml".to_string(),
+                url: "https://a.example/feed.xml".to_string().into(),
                 title: Some("A".to_string()),
                 ..Default::default()
             },
@@ -7244,7 +7273,7 @@ mod tests {
         let feed_b = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://b.example/feed.xml".to_string(),
+                url: "https://b.example/feed.xml".to_string().into(),
                 title: Some("B".to_string()),
                 ..Default::default()
             },
@@ -7385,7 +7414,7 @@ mod tests {
         let feed_a = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://a.example/feed.xml".to_string(),
+                url: "https://a.example/feed.xml".to_string().into(),
                 title: Some("A".to_string()),
                 ..Default::default()
             },
@@ -7396,7 +7425,7 @@ mod tests {
         let feed_orphan = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://orphan.example/feed.xml".to_string(),
+                url: "https://orphan.example/feed.xml".to_string().into(),
                 title: Some("Orphan".to_string()),
                 ..Default::default()
             },
@@ -7727,7 +7756,7 @@ mod tests {
             let id = upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: format!("https://f{i}.example/feed.xml"),
+                    url: format!("https://f{i}.example/feed.xml").into(),
                     ..Default::default()
                 },
             )
@@ -7749,7 +7778,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://firehose.example/feed.xml".to_string(),
+                url: "https://firehose.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -7791,7 +7820,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://undated.example/feed.xml".to_string(),
+                url: "https://undated.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -7881,7 +7910,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://example.com/feed.xml".to_string(),
+                url: "https://example.com/feed.xml".to_string().into(),
                 title: Some("Example".to_string()),
                 ..Default::default()
             },
@@ -8130,7 +8159,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -8192,7 +8221,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -8217,7 +8246,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -8284,7 +8313,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -8345,7 +8374,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -8452,7 +8481,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -8973,7 +9002,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://none.example/f.xml".to_string(),
+                url: "https://none.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9040,7 +9069,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://bulk.example/feed.xml".to_string(),
+                url: "https://bulk.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9194,7 +9223,7 @@ mod tests {
         let rss = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://aged.example/feed.xml".to_string(),
+                url: "https://aged.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9202,8 +9231,7 @@ mod tests {
         let publication = upsert_feed(
             &pool,
             &NewFeed {
-                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
-                    .to_string(),
+                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab".into(),
                 ..Default::default()
             },
         )
@@ -9279,7 +9307,7 @@ mod tests {
         let rss = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://not-swept.example/feed.xml".to_string(),
+                url: "https://not-swept.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9287,8 +9315,7 @@ mod tests {
         let publication = upsert_feed(
             &pool,
             &NewFeed {
-                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab"
-                    .to_string(),
+                url: "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab".into(),
                 ..Default::default()
             },
         )
@@ -9394,7 +9421,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://absurd.example/feed.xml".to_string(),
+                url: "https://absurd.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9466,7 +9493,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://ret.example/feed.xml".to_string(),
+                url: "https://ret.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9561,7 +9588,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -9634,7 +9661,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -9705,7 +9732,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://bulk.example/f.xml".to_string(),
+                url: "https://bulk.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9856,7 +9883,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://busy.example/f.xml".to_string(),
+                url: "https://busy.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -9979,7 +10006,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://calm.example/f.xml".to_string(),
+                url: "https://calm.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10060,7 +10087,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://lock.example/f.xml".to_string(),
+                url: "https://lock.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10464,7 +10491,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://shared.example/f.xml".to_string(),
+                url: "https://shared.example/f.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10575,7 +10602,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -10656,7 +10683,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: feed_url.to_string(),
+                url: feed_url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -10719,7 +10746,7 @@ mod tests {
         let feed_id = upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://bulk.example/feed.xml".to_string(),
+                url: "https://bulk.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -11599,7 +11626,7 @@ mod tests {
         upsert_feed(
             pool,
             &NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 last_polled: last_polled.map(str::to_string),
                 next_poll: next_poll.map(str::to_string),
                 ..Default::default()
@@ -11736,7 +11763,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -11769,7 +11796,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -11839,7 +11866,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -12041,7 +12068,7 @@ mod tests {
         let pool = init_url("sqlite::memory:").await?;
         let url = "https://real.example/feed.xml";
         let feed = NewFeed {
-            url: url.to_string(),
+            url: url.to_string().into(),
             ..Default::default()
         };
         upsert_feed(&pool, &feed).await?;
@@ -12072,7 +12099,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: "https://looks-ordinary.example/feed.xml".to_string(),
+                url: "https://looks-ordinary.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -12123,7 +12150,7 @@ mod tests {
         upsert_feed(
             &pool,
             &NewFeed {
-                url: odd.to_string(),
+                url: odd.to_string().into(),
                 ..Default::default()
             },
         )
@@ -12168,7 +12195,7 @@ mod tests {
             upsert_feed(
                 &pool,
                 &NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     ..Default::default()
                 },
             )
@@ -12450,6 +12477,44 @@ mod tests {
             vec!["starred-1".to_string(), "starred-2".to_string()],
             "the trim spared the wrong starred entries"
         );
+        Ok(())
+    }
+
+    /// **Rescheduling never creates a row (#260).** `set_next_poll` was an
+    /// upsert, so a URL with no row got one, unvetted; now it only updates.
+    #[tokio::test]
+    async fn set_next_poll_updates_and_never_inserts() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        set_next_poll(
+            &pool,
+            "https://nobody.example/feed.xml",
+            std::time::Duration::from_secs(60),
+        )
+        .await?;
+        assert_eq!(count_feeds(&pool).await?, 0, "rescheduling created a row");
+
+        upsert_feed(
+            &pool,
+            &NewFeed {
+                url: "https://some.example/feed.xml".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        set_next_poll(
+            &pool,
+            "https://some.example/feed.xml",
+            std::time::Duration::from_secs(60),
+        )
+        .await?;
+        let row = get_feed_by_url(&pool, "https://some.example/feed.xml")
+            .await?
+            .expect("row");
+        assert!(
+            row.next_poll.is_some(),
+            "the existing row was not rescheduled"
+        );
+        assert_eq!(count_feeds(&pool).await?, 1);
         Ok(())
     }
 }
