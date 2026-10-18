@@ -27,8 +27,8 @@
   and Capability 3 (§7). This instance indexes no one's subscription records,
   so the consent model in §7.2 describes nothing that runs today.
 - **Overtaken premises:** the Rust OAuth client (v0.3.0, PR #101) has been the
-  production backend since v0.3.3 (PR #110); the Node sidecar is optional and
-  not started on feather-reader.com. Since v0.4.0 the standard.site publication
+  production backend since v0.3.3 (PR #110), and the Node sidecar was removed
+  in 0.5.0 (#311). Since v0.4.0 the standard.site publication
   poller reads publishers' PDSes unauthenticated, through the same guard (§8).
   §10.1's release train is superseded; the current one is in the README's
   [Releasing](../README.md#releasing) section.
