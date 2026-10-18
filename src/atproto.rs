@@ -985,7 +985,7 @@ pub enum UnreadableListing {
 }
 
 /// A body refused before parsing for carrying more JSON structure than
-/// [`MAX_LIST_STRUCTURAL_CHARS`]. The server answered with something no honest
+/// `MAX_LIST_STRUCTURAL_CHARS`. The server answered with something no honest
 /// listing or document looks like, so a publication read files it as `Parse`
 /// (#280).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
