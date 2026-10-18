@@ -3974,9 +3974,13 @@ fn merge_rename(
         Some(seen) => form_value(Some(seen)),
         None => base.title.clone(),
     };
-    if posted_title != seen_title {
+    let same = |a: &Option<String>, b: &Option<String>| match (a, b) {
+        (Some(a), Some(b)) => same_ignoring_line_breaks(a, b),
+        (a, b) => a == b,
+    };
+    if !same(&posted_title, &seen_title) {
         edited += 1;
-        if sub.title == posted_title {
+        if same(&sub.title, &posted_title) {
             // Already there.
         } else if sub.title != base.title {
             return Err(RenameConflict("title"));
@@ -4458,19 +4462,38 @@ fn merge_folder_rename(
 ) -> Result<FolderMerge, RenameConflict> {
     let posted = posted.trim();
     let ancestor = seen.unwrap_or(&base.name).trim();
-    if posted == ancestor {
+    if same_ignoring_line_breaks(posted, ancestor) {
         return Ok(FolderMerge::Unchanged);
     }
     let current = fresh.name.trim();
-    if current == posted {
+    if same_ignoring_line_breaks(current, posted) {
         return Ok(FolderMerge::AlreadySaved);
     }
-    if current != ancestor {
+    if !same_ignoring_line_breaks(current, ancestor) {
         return Err(RenameConflict("name"));
     }
     let mut folder = fresh;
     folder.name = posted.to_string();
     Ok(FolderMerge::Write(folder))
+}
+
+/// Whether a value a form posted and one it was rendered with are the same
+/// once line breaks are ignored (#272).
+///
+/// A browser strips CR and LF from a text input's value, but posts a hidden
+/// input's value as written. So a name or title another client stored with a
+/// line break, saved untouched, arrives as the visible field WITHOUT the break
+/// and the `seen_*` field WITH it. Compared exactly, the two differ, the merge
+/// reads it as the reader's edit, and the stripped value is written back over
+/// what the other client stored. Ignoring line breaks on both sides counts only
+/// a real edit.
+fn same_ignoring_line_breaks(a: &str, b: &str) -> bool {
+    let no_breaks = |s: &str| {
+        s.chars()
+            .filter(|c| !matches!(c, '\r' | '\n'))
+            .collect::<String>()
+    };
+    a == b || no_breaks(a) == no_breaks(b)
 }
 
 /// One attempt at [`rename_folder`]: read the folder and its CID, merge the
@@ -13824,6 +13847,112 @@ mod tests {
             );
             assert_eq!(repo.value, first, "{backend:?}");
         }
+    }
+
+    // -- #272: a rename writes nothing the reader did not change -------------
+
+    /// **A subscription rename keeps a field this build does not know.**
+    /// `lexicon::Subscription` had no catch-all, so a rename's `putRecord` of
+    /// the whole record dropped every field another client had added, the bug
+    /// #268 fixed for folders.
+    #[tokio::test]
+    async fn renaming_a_subscription_keeps_fields_this_build_does_not_know() {
+        let mut seed = race_seed();
+        seed["tags"] = serde_json::json!(["x"]);
+        seed["readerNote"] = serde_json::json!({ "pinned": true });
+        let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+            value: seed.clone(),
+            ..SwapRepo::default()
+        }));
+        let state = race_state(crate::metrics::Backend::Rust, &repo).await;
+
+        let loc = post_race_rename_body(
+            &state,
+            "url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+             &seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+             &seen_title=Old+title&title=New+title",
+        )
+        .await;
+
+        let repo = repo.lock().unwrap();
+        assert_eq!(loc, "/", "{loc}");
+        assert_eq!(repo.puts.len(), 1, "{:?}", repo.puts);
+        let mut want = seed;
+        want["title"] = serde_json::json!("New title");
+        assert_eq!(
+            repo.puts[0]["record"], want,
+            "the put did not keep the record whole"
+        );
+    }
+
+    /// **An untouched save of a title holding a line break keeps it.** A
+    /// browser strips CR/LF from the visible text input and posts the hidden
+    /// `seen_title` as written (with form encoding's CRLF), so the two used to
+    /// differ and the stripped title was written over the stored one. (A Save
+    /// with no edits still puts the record, as it always has: what it must not
+    /// do is change it.)
+    #[tokio::test]
+    async fn an_untouched_save_of_a_multi_line_title_keeps_it() {
+        let mut seed = race_seed();
+        seed["title"] = serde_json::json!("Two\nlines");
+        let repo = std::sync::Arc::new(std::sync::Mutex::new(SwapRepo {
+            value: seed.clone(),
+            ..SwapRepo::default()
+        }));
+        let state = race_state(crate::metrics::Backend::Rust, &repo).await;
+
+        let loc = post_race_rename_body(
+            &state,
+            "url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+             &seen_url=https%3A%2F%2Fexample.com%2Ffeed.xml\
+             &seen_title=Two%0D%0Alines&title=Twolines",
+        )
+        .await;
+
+        let repo = repo.lock().unwrap();
+        assert_eq!(loc, "/", "{loc}");
+        for put in &repo.puts {
+            assert_eq!(
+                put["record"], seed,
+                "an untouched save changed the record: {put}"
+            );
+        }
+        assert_eq!(repo.value["title"], "Two\nlines");
+    }
+
+    /// **The same for a folder name** (#272), the case the issue was raised for.
+    #[tokio::test]
+    async fn an_untouched_save_of_a_multi_line_folder_name_writes_nothing() {
+        let mut seed = folder_seed();
+        seed["name"] = serde_json::json!("Two\nlines");
+        let repo = std::sync::Arc::new(std::sync::Mutex::new(folder_repo(seed)));
+        let state = race_state(crate::metrics::Backend::Rust, &repo).await;
+
+        let loc = post_folder_rename(&state, "name=Twolines&seen_name=Two%0D%0Alines").await;
+
+        let repo = repo.lock().unwrap();
+        assert!(
+            repo.puts.is_empty(),
+            "an untouched save was written: {:?}",
+            repo.puts
+        );
+        assert_eq!(repo.value["name"], "Two\nlines");
+        assert_eq!(loc, "/", "{loc}");
+    }
+
+    /// And a real edit of such a name still lands.
+    #[tokio::test]
+    async fn a_real_edit_of_a_multi_line_folder_name_still_lands() {
+        let mut seed = folder_seed();
+        seed["name"] = serde_json::json!("Two\nlines");
+        let repo = std::sync::Arc::new(std::sync::Mutex::new(folder_repo(seed)));
+        let state = race_state(crate::metrics::Backend::Rust, &repo).await;
+
+        post_folder_rename(&state, "name=Renamed&seen_name=Two%0D%0Alines").await;
+
+        let repo = repo.lock().unwrap();
+        assert_eq!(repo.puts.len(), 1, "{:?}", repo.puts);
+        assert_eq!(repo.value["name"], "Renamed");
     }
 
     // -- #268: renaming a folder edits the record, it does not replace it ----

@@ -189,6 +189,19 @@ pub struct Subscription {
     /// Record creation time (ISO-8601 datetime). Required.
     #[serde(rename = "createdAt")]
     pub created_at: String,
+
+    /// Every field of the record this build does not know, kept as it was read
+    /// so a put of the record writes them back (#272), as [`Folder::extra`]
+    /// does for folders (#268).
+    ///
+    /// The collection is shared with every other `community.lexicon.rss`
+    /// client, and a rename is a `putRecord` of the WHOLE record: without this,
+    /// a field another client added was erased by every rename here. The named
+    /// fields above are consumed by name before anything lands in this map, so
+    /// it never holds one of them and a serialized record never carries a key
+    /// twice. Empty for a subscription this build creates.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn subscription_type() -> String {
@@ -207,6 +220,7 @@ impl Subscription {
             fetch_hint: None,
             private: None,
             created_at: created_at.into(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -741,6 +755,43 @@ mod tests {
 /// a way no test comparing the clients' *data* would catch.
 pub mod sort {
     use super::{Folder, Saved, Subscription};
+
+    /// **A subscription round-trips a field this build does not know, with
+    /// every key written once** (#272), and one this build creates writes only
+    /// its own keys.
+    #[test]
+    fn a_subscription_round_trips_unknown_fields_and_creates_none() {
+        let raw = r#"{"$type":"community.lexicon.rss.subscription","url":"https://e.example/f.xml","title":"T","createdAt":"2026-01-01T00:00:00Z","tags":["x"],"readerNote":{"pinned":true}}"#;
+        let sub: Subscription = serde_json::from_str(raw).unwrap();
+        assert_eq!(sub.title.as_deref(), Some("T"));
+        let out = serde_json::to_string(&sub).unwrap();
+        for key in [
+            "\"$type\"",
+            "\"url\"",
+            "\"title\"",
+            "\"createdAt\"",
+            "\"tags\"",
+            "\"readerNote\"",
+        ] {
+            assert_eq!(out.matches(key).count(), 1, "{key} in {out}");
+        }
+        let back: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let want: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(back, want);
+
+        let fresh = serde_json::to_value(Subscription::new(
+            "https://e.example/f.xml",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+        let keys: std::collections::BTreeSet<&str> = fresh
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["$type", "createdAt", "url"].into_iter().collect());
+    }
     use std::cmp::Ordering;
 
     /// Subscriptions: display title (case-insensitive), then URL, then rkey.
