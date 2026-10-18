@@ -501,6 +501,12 @@ async fn plan_guid_merge(
             if unread_rows.contains(&e.id) || planned.contains(&e.id) {
                 continue;
             }
+            // The id path's own conflict rule first, so the two cannot decide
+            // one entry differently: explicitly unread here (in the cursor's
+            // `unread_ids`) and the record not newer than the cursor.
+            if local_unread.contains(&e.id) && !remote_wins {
+                continue;
+            }
             if marked_at
                 .as_deref()
                 .is_some_and(|m| !later(&theirs.updated_at, m))
@@ -2864,6 +2870,46 @@ pub(crate) mod tests {
         assert!(
             is_read(&state, older_local).await,
             "a local unread OLDER than the record survived its readThrough"
+        );
+    }
+
+    /// **The `readThrough` path keeps the id path's conflict rule** (review of
+    /// #321): an entry explicitly unread here, under a cursor newer than the
+    /// record, stays unread when the record both lists it in `readIds` and
+    /// covers it with `readThrough`. The id path refused it; the watermark path
+    /// compared only the entry's own mark time and read it anyway.
+    #[tokio::test]
+    async fn a_read_through_does_not_override_the_id_paths_conflict_decision() {
+        let fake = Arc::new(Mutex::new(FakeRepo::default()));
+        let state = state_on(Backend::Rust, &fake).await;
+        let x = entry_at(&state, 1, "g-x", "2026-01-01T00:00:00Z").await;
+        assert!(store::mark_read(&state.db, DID, x, true).await.unwrap());
+        assert!(store::mark_read(&state.db, DID, x, false).await.unwrap());
+        // X marked unread at 01:00; the cursor last moved at 03:00 (another
+        // entry read); the record was written at 02:00.
+        sqlx::query(
+            "UPDATE entry_state SET read_marked_at = '2026-01-01T01:00:00Z' WHERE entry_id = ?1",
+        )
+        .bind(x)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE read_cursor SET updated_at = '2026-01-01T03:00:00Z' WHERE feed_url = ?1",
+        )
+        .bind(feed(1))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let mut record = remote_guid_record(1, &["g-x"], &[], "2026-01-01T02:00:00Z");
+        record["readThrough"] = serde_json::json!("2026-01-01T00:30:00Z");
+        put_remote(&fake, 1, record);
+
+        flush_did(&state, DID).await.unwrap();
+
+        assert!(
+            !is_read(&state, x).await,
+            "the watermark overrode the id path's refusal"
         );
     }
 
