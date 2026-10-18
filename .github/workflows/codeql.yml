@@ -12,11 +12,14 @@ name: CodeQL
 # schedule. See .github/workflows/README.md.
 #
 # ── LANGUAGES ─────────────────────────────────────────────────────────────────
-#   * javascript-typescript — the OAuth sidecar (oauth-sidecar/).
-#   * rust — DROPPED: CodeQL's Rust extractor (public beta) errored on ALL source
-#     files here (0 extracted OK / 11 with errors), producing no usable analysis.
-#     Rust is covered by clippy (-D warnings) + cargo-deny + cargo-audit. Re-add
-#     the `rust` matrix entry once GitHub GA's a working Rust pack.
+#   * javascript-typescript — the OAuth sidecar (oauth-sidecar/). Goes when 0.5.0
+#     removes the sidecar (#311); `rust` then carries the per-PR check-run.
+#   * rust — re-added 2026-10-18 (#311). It was dropped when the extractor (then
+#     in beta) errored on every source file (0 OK / 11 with errors). On CodeQL
+#     2.27.2 all 47 files extract without error, the security-and-quality suite
+#     runs 30 Rust rules, and it found nothing. About 5.5 min per run, against
+#     about 1 min for javascript-typescript. Clippy (-D warnings), cargo-deny and
+#     cargo-audit still run in CI.
 
 # ── TRIGGERS / SCORECARD SAST COVERAGE ────────────────────────────────────────
 # Runs on EVERY pull_request targeting `main` (so every merged PR carries a
@@ -26,7 +29,8 @@ name: CodeQL
 # samples recent merged PRs and expects a CodeQL check-run on each — including
 # config-only PRs (e.g. a lone Cargo.toml / *.yml change). A path filter would
 # skip those, drop the check-run, and regress the Scorecard SAST score. The
-# single javascript-typescript leg is cheap (~1 min) and always produces the run.
+# javascript-typescript leg is cheap (~1 min) and always produces the run; after
+# 0.5.0 the rust leg (~5.5 min) is the only one, and produces it alone.
 on:
   push:
     branches: [main]
@@ -60,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript, rust]  # rust re-tried for 0.5.0 (#311)
+        language: [javascript-typescript, rust]  # see header; javascript-typescript goes with the sidecar (#311)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -73,7 +77,7 @@ jobs:
           queries: security-and-quality
 
       # Rust + TypeScript are both no-build (CodeQL extracts from source /
-      # autobuilds). If the Rust extractor ever needs a real build, replace this
+      # autobuilds; Rust ran in build-mode none on 2.27.2). If the Rust extractor ever needs a real build, replace this
       # with an explicit `cargo build` step guarded on matrix.language == rust.
       - name: Autobuild
         uses: github/codeql-action/autobuild@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
