@@ -18,6 +18,16 @@ deploying is separate.
 
 ### Upgrade notes
 
+- **Schema: `read_cursor.watermark_basis` and `feeds.first_fetched_at` (#287
+  PR 3).** Added by `ALTER TABLE` on first boot, in one transaction with a
+  one-time repair of every read cursor: its `readThrough` is recomputed on the
+  published basis (never above the old value, never over an unread dated
+  entry), and every read entry the new watermark does not cover is put back in
+  `readIds`, dirtying the cursor so the next flush writes it. **Cost: a write
+  per such cursor on the first flush after the upgrade.** `first_fetched_at` is
+  back-filled from the earliest fetch time stored. Rolling back to 0.4.10
+  works: it never names either column.
+
 - **The Node OAuth sidecar is removed (#311). Rust is the only backend.**
   feather-reader.com has run `rust` since the 2026-09-13 cutover and sees no
   change. An instance on the sidecar, i.e. with `FEATHERREADER_REPO_BACKEND`
@@ -128,6 +138,37 @@ deploying is separate.
 
 ### Fixed
 
+- **`readThrough` means a published date, here and on import (#287 PR 3).**
+  Compaction compared it against `COALESCE(published, fetched_at)`, and
+  `fetched_at` is when THIS instance first saw an entry, so the same watermark
+  covered different entries on different instances; for the same reason a
+  record's `readThrough` was never applied on import, and reads another
+  instance had compacted into its watermark never arrived (the limit #286
+  stated). Now compaction builds the watermark from published dates only, an
+  undated read always stays in `readIds`, and an import marks every unread
+  local entry published at or before the record's `readThrough` read, except
+  one the record lists in `unreadIds`, one the id path's conflict rule keeps
+  unread, and one marked unread here more recently than the record's
+  `updatedAt` (a tie goes to local). **It covers only entries the writer could
+  have seen:** fetched here at or before the record's `updatedAt`, or in this
+  instance's first fetch of the feed (`feeds.first_fetched_at`, its starting
+  backlog, so a fresh database still imports). A back-dated or late-found post
+  fetched in a later poll stays unread; `docs/lexicon.md` now says readers do
+  this. The record format is unchanged. A watermark 0.4.x stored on fetch time
+  is recomputed on upgrade, and the reads it had absorbed are restored as ids
+  (see the upgrade notes): without that, an undated read folded into it, or a
+  dated one above the recomputed mark, would exist only locally.
+  Feeds with no publication dates cannot compact, so past 1000 reads their
+  oldest drop off the record, as the spec's Caps section states; the reads stay
+  correct locally. Tests: `an_undated_read_stays_an_id_through_compaction`,
+  `a_remote_read_through_marks_dated_entries_read_and_leaves_undated_ones`,
+  `a_read_through_spares_the_records_unread_ids_and_a_newer_local_unread`,
+  `a_newer_records_read_through_covers_an_older_local_unread`,
+  `a_read_through_does_not_override_the_id_paths_conflict_decision`,
+  `a_read_through_skips_a_post_fetched_after_the_record`,
+  `a_fresh_database_shows_reads_compacted_elsewhere`,
+  `the_upgrade_repairs_a_fetch_time_watermark` (each mutation-checked).
+
 - **`saved.entryId` follows the item-id rule (#290).** Starring wrote the
   stored entry id, which for an item with no publisher id is FeatherReader's
   own stand-in (a feed-rs hash or `featherreader:synthetic:…`): a name no other
@@ -137,13 +178,16 @@ deploying is separate.
   flush names items with (`store::guids_for_entry_ids`), and omitted for an
   item with no portable id (a link two id-less items of one fetch share).
   Reading, a record's `entryId` also matches a cached item's link in the
-  starred view and when un-saving clears the local star, and old stand-ins
-  still match, so records already written keep resolving. `docs/lexicon.md`'s
+  starred view, when un-saving clears the local star, and when un-starring
+  deletes the saved records naming the item (by `url`, or an `entryId` that is
+  its guid or item id), and old stand-ins still match, so records already
+  written keep resolving. `docs/lexicon.md`'s
   status note is updated. Tests: `starring_writes_the_publishers_id_as_entry_id`,
   `starring_a_link_only_item_writes_its_link_as_entry_id`,
   `starring_an_item_with_no_portable_id_omits_entry_id`,
   `a_saved_record_matches_its_cached_item_by_item_id`,
-  `unsaving_by_a_link_entry_id_clears_the_link_only_items_star` (each
+  `unsaving_by_a_link_entry_id_clears_the_link_only_items_star`,
+  `unstarring_deletes_a_saved_record_matched_by_its_entry_id` (each
   mutation-checked).
 
 - **Deleting your data also deletes your in-flight logins (#259).**

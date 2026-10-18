@@ -3358,38 +3358,51 @@ async fn toggle_star(
     if let Ok(Some(entry)) = get_entry_by_id(pool, &did, id).await {
         let entry_url = entry.url.clone().unwrap_or_default();
         if !entry_url.is_empty() {
+            // **The item's id, by the item-id rule (#290)**, the one a
+            // readState record names items by (`docs/lexicon.md`): the
+            // publisher's id, a standard.site URI, else the link, never a
+            // stand-in FeatherReader made up, which no other reader can
+            // compute. The same query the read-state flush uses, so the two
+            // cannot name one item differently. `None` for an item with no
+            // portable id (a link shared within one fetch); `url` is still
+            // there to match on.
+            let feed_url = feed_url_for_id(pool, entry.feed_id).await;
+            let item_id = match &feed_url {
+                Some(feed_url) => store::guids_for_entry_ids(pool, &did, feed_url, &[entry.id])
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!(%err, %did, "could not name the saved item; omitting entryId");
+                        Default::default()
+                    })
+                    .remove(&entry.id)
+                    .map(|item| item.id),
+                None => None,
+            };
             if starred {
                 let mut saved = Saved::new(entry_url.clone(), now_rfc3339());
                 saved.title = entry.title.clone();
-                saved.feed_url = feed_url_for_id(pool, entry.feed_id).await;
-                // **`entryId` follows the item-id rule (#290)**, the one a
-                // readState record names items by (`docs/lexicon.md`): the
-                // publisher's id, a standard.site URI, else the link — never a
-                // stand-in FeatherReader made up, which no other reader can
-                // compute. The same query the read-state flush uses, so the two
-                // cannot name one item differently. An item with no portable
-                // id (a link shared within one fetch) omits it; `url` is still
-                // there to match on.
-                saved.entry_id = match &saved.feed_url {
-                    Some(feed_url) => store::guids_for_entry_ids(pool, &did, feed_url, &[entry.id])
-                        .await
-                        .unwrap_or_else(|err| {
-                            warn!(%err, %did, "could not name the saved item; omitting entryId");
-                            Default::default()
-                        })
-                        .remove(&entry.id)
-                        .map(|item| item.id),
-                    None => None,
-                };
+                saved.feed_url = feed_url;
+                saved.entry_id = item_id;
                 match state.repo().add_saved(&did, &saved).await {
                     Ok(rkey) => info!(%did, url = %entry_url, %rkey, "wrote saved record to PDS"),
                     Err(err) => warn!(%err, %did, "PDS saved write failed (starred locally)"),
                 }
             } else {
-                // Un-star: find and delete the matching saved record by URL.
+                // Un-star: delete every saved record naming this item, by the
+                // same identities the starred view matches it on (#290): its
+                // URL, or an `entryId` that is its guid (an older build's
+                // stand-in included) or its item id. Matched by URL alone, a
+                // record whose `url` differs (tracking parameters another
+                // client kept) survived, and came back as an uncached row.
+                let names_it = |r: &Saved| {
+                    r.url == entry_url
+                        || r.entry_id
+                            .as_deref()
+                            .is_some_and(|e| e == entry.guid || Some(e) == item_id.as_deref())
+                };
                 match state.repo().list_saved(&did).await {
                     Ok(records) => {
-                        for (rkey, _rec) in records.iter().filter(|(_, r)| r.url == entry_url) {
+                        for (rkey, _rec) in records.iter().filter(|(_, r)| names_it(r)) {
                             if let Err(err) = state.repo().remove_saved(&did, rkey).await {
                                 warn!(%err, %did, %rkey, "PDS saved delete failed");
                             }
@@ -11847,6 +11860,98 @@ mod tests {
         assert_eq!(
             cleared, 1,
             "the link entryId did not reach the link-only item"
+        );
+    }
+
+    /// **Un-starring deletes a saved record that names the item only by its
+    /// item id** (review of #322): the starred view matches a record by a link
+    /// `entryId` even when its `url` differs, so un-starring must delete it on
+    /// the same terms, or it survives and comes back as an uncached row.
+    #[tokio::test]
+    async fn unstarring_deletes_a_saved_record_matched_by_its_entry_id() {
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = deleted.clone();
+        let (pds, _log) = spawn_pds(move |call| match call.nsid.as_str() {
+            "com.atproto.repo.listRecords" => {
+                let collection = call.query.get("collection").map(String::as_str).unwrap_or("");
+                let records = if collection == lexicon::nsid::SUBSCRIPTION {
+                    serde_json::json!([{
+                        "uri": format!("at://{STAR_DID}/{}/sub1", lexicon::nsid::SUBSCRIPTION),
+                        "cid": "bafy",
+                        "value": { "$type": lexicon::nsid::SUBSCRIPTION, "url": STAR_FEED, "createdAt": "2026-01-01T00:00:00Z" }
+                    }])
+                } else if collection == "community.lexicon.rss.saved" {
+                    serde_json::json!([
+                        { "uri": format!("at://{STAR_DID}/community.lexicon.rss.saved/rk-other"), "cid": "bafy",
+                          "value": { "$type": "community.lexicon.rss.saved", "url": "https://star.example/other",
+                                     "createdAt": "2026-01-01T00:00:00Z" } },
+                        { "uri": format!("at://{STAR_DID}/community.lexicon.rss.saved/rk-link"), "cid": "bafy",
+                          "value": { "$type": "community.lexicon.rss.saved", "url": "https://star.example/e?utm=x",
+                                     "entryId": "https://star.example/e", "createdAt": "2026-01-01T00:00:00Z" } },
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                (200, serde_json::json!({ "records": records }))
+            }
+            "com.atproto.repo.deleteRecord" => {
+                sink.lock().unwrap().push(call.body["rkey"].as_str().unwrap_or_default().to_string());
+                (200, serde_json::json!({}))
+            }
+            other => panic!("unexpected call to {other}"),
+        })
+        .await;
+        let state = test_state_on_pds(&[STAR_DID], &pds).await;
+        let feed_id = store::upsert_feed(
+            &state.db,
+            &store::NewFeed {
+                url: STAR_FEED.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store::insert_entries(
+            &state.db,
+            feed_id,
+            &[star_entry("stand-in", "https://star.example/e", true)],
+            0,
+        )
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        store::replace_sub_refs(&state.db, STAR_DID, &[feed_id])
+            .await
+            .unwrap();
+        assert!(store::mark_starred(&state.db, STAR_DID, id, true)
+            .await
+            .unwrap());
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{id}/star"))
+                    .header(header::COOKIE, session_cookie(&state, STAR_DID, None))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("starred=false"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success() || resp.status().is_redirection(),
+            "{}",
+            resp.status()
+        );
+
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["rk-link".to_string()],
+            "un-starring must delete the record naming the item, and only it"
         );
     }
 
