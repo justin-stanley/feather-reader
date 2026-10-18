@@ -1042,18 +1042,29 @@ pub async fn poll_feed_by_kind(
 /// as `Fetch`, a deleted account read as its server being down (found in
 /// review). A listing refusal is typed for the same reason (#227): a 200 with
 /// no `records` is `Parse`, a 200 error envelope is `Status`, and a listing or
-/// body over its cap is `Body`.
+/// body over its cap is `Body`. So are the rest (#280): a repeated cursor or a
+/// structure explosion is `Parse`, and a body that failed part-way is `Body`.
 pub(crate) fn publication_failure_kind(err: &anyhow::Error) -> FailureKind {
-    use crate::atproto::{AtProtoError, DidResolutionCause, ListingTooLarge, UnreadableListing};
+    use crate::atproto::{
+        AtProtoError, DidResolutionCause, ListingTooLarge, StructureExplosion, UnreadableListing,
+    };
     for cause in err.chain() {
-        if cause.is::<crate::standard_site::NotAPublication>() || cause.is::<serde_json::Error>() {
+        if cause.is::<crate::standard_site::NotAPublication>()
+            || cause.is::<serde_json::Error>()
+            || cause.is::<StructureExplosion>()
+        {
             return FailureKind::Parse;
         }
-        if cause.is::<ListingTooLarge>() || cause.is::<crate::net::BodyTooLarge>() {
+        if cause.is::<ListingTooLarge>()
+            || cause.is::<crate::net::BodyTooLarge>()
+            || cause.is::<crate::net::BodyReadFailed>()
+        {
             return FailureKind::Body;
         }
         match cause.downcast_ref::<UnreadableListing>() {
-            Some(UnreadableListing::NoRecords) => return FailureKind::Parse,
+            Some(UnreadableListing::NoRecords | UnreadableListing::RepeatedCursor { .. }) => {
+                return FailureKind::Parse
+            }
             Some(UnreadableListing::ErrorEnvelope { .. }) => return FailureKind::Status,
             None => {}
         }
