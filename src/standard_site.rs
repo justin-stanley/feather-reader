@@ -1752,8 +1752,17 @@ pub(crate) mod tests {
             endpoint = format!("http://{raw_host}:{}", raw_addr.port());
             tokio::spawn(async move {
                 while let Ok((mut conn, _)) = raw.accept().await {
-                    let mut request = [0u8; 4096];
-                    let _ = conn.read(&mut request).await;
+                    // Read the whole request head before answering: closing
+                    // with request bytes unread can make the client see a
+                    // reset (Fetch) instead of a short body (Body).
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                     let head = format!(
                         "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n",
