@@ -128,8 +128,11 @@ deploying is separate.
   exemptions are read-only navigation and public documents. A read that matched
   no route, a 404 or a `/static` file, is not limited, so it costs a visitor
   nothing. `HEAD` counts as `GET`, so `HEAD /login`, `/claim` and
-  `/oauth/callback` are now limited like their GETs; nothing else changed for
-  existing routes. `rate_limit_exemptions_match_the_router` reads the route
+  `/oauth/callback` are now limited like their GETs. So is any request that is
+  neither an exempt read nor a no-route read: a GET to a POST-only route (which
+  then answers 405), any other method (`OPTIONS`, `PUT`), and a POST that
+  matched no route. Each costs only its caller's tokens, and nothing the
+  reader's pages send changes. `rate_limit_exemptions_match_the_router` reads the route
   table from `router()`'s source and fails on an unclassified GET route or a
   stale exemption (checked by adding one), and
   `the_limiter_keys_on_the_matched_route_through_the_router` drives the real
