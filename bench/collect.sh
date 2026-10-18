@@ -22,7 +22,7 @@ for tool in docker sqlite3 curl jq; do
 done
 [ -r "$db" ] || { echo "collect.sh: cannot read $db" >&2; exit 1; }
 
-echo "ts,mem_bytes,mem_limit_bytes,cpu_pct,db_bytes,wal_bytes,feeds,due_overdue_5m,polled_10m,erroring,entries,synth_requests,synth_ok,synth_304,synth_errors,synth_bytes"
+echo "ts,mem_bytes,mem_limit_bytes,cpu_pct,db_bytes,wal_bytes,feeds,due_overdue_5m,ok_polled_10m,erroring,entries,synth_requests,synth_ok,synth_304,synth_errors,synth_bytes"
 
 to_bytes() {
   # docker stats prints e.g. "212.3MiB"; normalise to bytes.
@@ -34,13 +34,24 @@ to_bytes() {
 
 while :; do
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  read -r mem cpu < <(docker stats --no-stream --format '{{.MemUsage}} {{.CPUPerc}}' "$container" \
-    | awk '{ print $1 "|" $3, $4 }')
-  used=$(to_bytes "${mem%%|*}")
-  limit=$(to_bytes "${mem##*|}")
-  cpu=${cpu%\%}
-  db_bytes=$(stat -c %s "$db")
+  # Every read falls back to empty fields: one failed sample (the container
+  # restarting, SQLITE_BUSY through a checkpoint) must not end the whole run
+  # under `set -e` (found in review).
+  stats=$(docker stats --no-stream --format '{{.MemUsage}} {{.CPUPerc}}' "$container" 2>/dev/null \
+    | awk '{ print $1 "|" $3, $4 }' || true)
+  if [ -n "$stats" ]; then
+    read -r mem cpu <<<"$stats"
+    used=$(to_bytes "${mem%%|*}")
+    limit=$(to_bytes "${mem##*|}")
+    cpu=${cpu%\%}
+  else
+    used= limit= cpu=
+  fi
+  db_bytes=$(stat -c %s "$db" 2>/dev/null || echo "")
   wal_bytes=$(stat -c %s "$db-wal" 2>/dev/null || echo 0)
+  # `ok_polled_10m` counts polls that succeeded (200 or 304), the only ones that
+  # stamp `last_polled`; failures don't. Throughput is the change in
+  # `synth_requests` between rows (found in review).
   sql=$(sqlite3 -readonly -cmd '.timeout 5000' -separator , "$db" "
     SELECT
       (SELECT COUNT(*) FROM feeds),
@@ -48,7 +59,7 @@ while :; do
          AND next_poll < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 minutes')),
       (SELECT COUNT(*) FROM feeds WHERE last_polled >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')),
       (SELECT COUNT(*) FROM feeds WHERE consecutive_errors > 0),
-      (SELECT COUNT(*) FROM entries);")
+      (SELECT COUNT(*) FROM entries);" 2>/dev/null || echo ",,,,")
   synth_csv=$(curl -fsS --max-time 5 "$synth/stats" \
     | jq -r '[.requests, .ok, .not_modified, .errors, .bytes] | @csv' 2>/dev/null || echo ",,,,")
   echo "$ts,$used,$limit,$cpu,$db_bytes,$wal_bytes,$sql,$synth_csv"

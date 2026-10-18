@@ -64,8 +64,13 @@ On apps, with the owner's go for the tunnel entry and the staging changes:
    or PDS record is needed, and nothing sweeps unsubscribed feeds.
 5. **Collect**: `bench/collect.sh featherreader-staging <db> http://127.0.0.1:8263 15 > N-cpus.csv`
    for at least two poll intervals after the first spread hour, plus a light
-   `GET /` latency probe alongside.
-6. **Repeat** for N = 100, 1,000, 5,000, 10,000, and sweep
+   `GET /` latency probe alongside. **Throughput is the change in
+   `synth_requests` per interval**, which counts every poll, failed or not;
+   `ok_polled_10m` counts only the ones that succeeded (a failed poll doesn't
+   stamp `last_polled`).
+6. **Repeat** for N = 100, 1,000, 5,000, 10,000, **restoring the snapshot
+   before each size** (step 1's copy), so no size starts on the last one's
+   entries, schedule or backoff; the seed also resets any row it finds. Sweep
    `FEATHERREADER_POLL_CONCURRENCY` 4 / 8 / 16 at the size where throughput
    flattens, for memory per concurrent poll.
 7. **DB growth**: one run with `SYNTH_TIME_SCALE=24` and the app's poll

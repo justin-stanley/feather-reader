@@ -429,6 +429,12 @@ async fn stats(State(app): State<App>) -> Json<serde_json::Value> {
 /// SQL registering feeds `0..n` at `base`, with first polls spread evenly over
 /// `spread_secs` from now (FeatherReader makes every never-polled row due at
 /// once otherwise, which is a burst no real instance sees).
+///
+/// **A row that already exists is reset, not skipped** (found in review): its
+/// schedule, error count and validators go back to a fresh feed's, so a
+/// re-seed for the next size doesn't inherit past-due rows and backoff from
+/// the last run. Its stored entries stay; restore the snapshot between sizes
+/// for a clean database (bench/README.md).
 fn seed_sql(base: &str, n: u64, spread_secs: u64, now: DateTime<Utc>) -> String {
     let base = base.trim_end_matches('/');
     let mut out = String::from("BEGIN;\n");
@@ -436,12 +442,40 @@ fn seed_sql(base: &str, n: u64, spread_secs: u64, now: DateTime<Utc>) -> String 
         let at = now + chrono::Duration::seconds((i * spread_secs / n.max(1)) as i64);
         let _ = writeln!(
             out,
-            "INSERT OR IGNORE INTO feeds (url, kind, next_poll) VALUES ('{base}/f/{i}.xml', 'rss', '{}');",
+            "INSERT INTO feeds (url, kind, next_poll) VALUES ('{base}/f/{i}.xml', 'rss', '{}') \
+             ON CONFLICT (url) DO UPDATE SET next_poll = excluded.next_poll, \
+             consecutive_errors = 0, last_error_kind = NULL, last_error = NULL, \
+             etag = NULL, last_modified = NULL;",
             at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         );
     }
     out.push_str("COMMIT;\n");
     out
+}
+
+/// Ctrl-C, or SIGTERM: in the container this is PID 1 with no init, and a
+/// PID 1 without a handler ignores the SIGTERM `docker stop` sends, so every
+/// stop waited out the timeout and was killed (found in review).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn usage() -> ! {
@@ -490,9 +524,7 @@ async fn main() -> Result<()> {
         config.feeds, config.seed, config.time_scale, config.bind
     );
     axum::serve(listener, router(app))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
@@ -695,7 +727,8 @@ mod tests {
     fn seed_sql_spreads_first_polls() {
         let now = Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, 0).unwrap();
         let sql = seed_sql("https://synth.example/", 4, 3_600, now);
-        assert_eq!(sql.matches("INSERT OR IGNORE").count(), 4);
+        assert_eq!(sql.matches("INSERT INTO feeds").count(), 4);
+        assert_eq!(sql.matches("ON CONFLICT (url) DO UPDATE").count(), 4);
         assert!(sql.contains("'https://synth.example/f/0.xml', 'rss', '2026-10-18T00:00:00Z'"));
         assert!(sql.contains("'https://synth.example/f/3.xml', 'rss', '2026-10-18T00:45:00Z'"));
     }
