@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript]  # rust dropped — see header (extractor beta errors on all files)
+        language: [javascript-typescript, rust]  # rust re-tried for 0.5.0 (#311)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
