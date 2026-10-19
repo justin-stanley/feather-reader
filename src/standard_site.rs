@@ -423,6 +423,7 @@ fn ingest_floor(
 /// can report 30.
 pub async fn store_publication(
     pool: &sqlx::SqlitePool,
+    feed_id: i64,
     url: &str,
     read: PublicationRead,
     max_entries_per_feed: i64,
@@ -482,10 +483,11 @@ pub async fn store_publication(
         );
     }
 
-    let feed_id = crate::store::upsert_feed(
+    // By id: the publication's row was read to be polled (#260).
+    crate::store::record_poll(
         pool,
-        &crate::store::NewFeed {
-            url: url.to_string(),
+        feed_id,
+        &crate::store::PolledFeed {
             title: read.publication.name.clone(),
             site_url: Some(read.publication.url.clone()),
             last_polled: Some(crate::feed::fmt_time(chrono::Utc::now())),
@@ -960,6 +962,14 @@ pub(crate) mod tests {
 
     const PUB_URL: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
 
+    /// [`PUB_URL`]'s row, inserted if it is not there yet, as subscribing
+    /// would: `store_publication` re-stamps a row by id and never creates one.
+    async fn pub_row(pool: &sqlx::SqlitePool) -> i64 {
+        crate::store::upsert_feed(pool, &crate::store::NewFeed::new(PUB_URL.into()))
+            .await
+            .unwrap()
+    }
+
     async fn pool() -> sqlx::SqlitePool {
         crate::store::init_url("sqlite::memory:").await.unwrap()
     }
@@ -974,7 +984,7 @@ pub(crate) mod tests {
             ],
             true,
         );
-        let outcome = store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        let outcome = store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         assert!(
@@ -1001,9 +1011,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_incomplete_read_that_offered_nothing_is_a_failure() {
         let pool = pool().await;
-        let outcome = store_publication(&pool, PUB_URL, read_of(vec![], false), 0, 14, 180)
-            .await
-            .unwrap();
+        let outcome = store_publication(
+            &pool,
+            pub_row(&pool).await,
+            PUB_URL,
+            read_of(vec![], false),
+            0,
+            14,
+            180,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(outcome, crate::feed::PollOutcome::Failed { .. }),
             "a truncated read that produced nothing is not a healthy poll: {outcome:?}"
@@ -1017,7 +1035,7 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/old", Some(&days_ago(900)))],
             false,
         );
-        let outcome = store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        let outcome = store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         assert!(
@@ -1030,9 +1048,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failed_read_does_not_stamp_last_polled() {
         let pool = pool().await;
-        let outcome = store_publication(&pool, PUB_URL, read_of(vec![], false), 0, 14, 180)
-            .await
-            .unwrap();
+        let outcome = store_publication(
+            &pool,
+            pub_row(&pool).await,
+            PUB_URL,
+            read_of(vec![], false),
+            0,
+            14,
+            180,
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, crate::feed::PollOutcome::Failed { .. }));
         let stamped: Option<String> =
             sqlx::query_scalar("SELECT last_polled FROM feeds WHERE url = ?1")
@@ -1057,7 +1083,7 @@ pub(crate) mod tests {
             ],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         let guids: Vec<String> = sqlx::query_scalar("SELECT guid FROM entries ORDER BY guid")
@@ -1085,7 +1111,7 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/ancient", Some(&days_ago(900)))],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, 0, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 0, 180)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1111,7 +1137,7 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/hundred", Some(&days_ago(100)))],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1246,7 +1272,7 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/hundred", Some(&days_ago(100)))],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, 180, 30)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 180, 30)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1268,9 +1294,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_complete_read_of_nothing_is_not_a_failure() {
         let pool = pool().await;
-        let outcome = store_publication(&pool, PUB_URL, read_of(vec![], true), 0, 14, 180)
-            .await
-            .unwrap();
+        let outcome = store_publication(
+            &pool,
+            pub_row(&pool).await,
+            PUB_URL,
+            read_of(vec![], true),
+            0,
+            14,
+            180,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(
                 outcome,
@@ -1287,7 +1321,7 @@ pub(crate) mod tests {
     async fn a_successful_read_stamps_last_polled() {
         let pool = pool().await;
         let read = read_of(vec![entry_dated("at://d/c/1", Some(&days_ago(1)))], true);
-        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         let stamped: Option<String> =
@@ -1316,9 +1350,17 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/ancient", Some(&days_ago(10_000)))],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, u32::MAX, u32::MAX)
-            .await
-            .expect("a huge window is a wide floor, not a crash");
+        store_publication(
+            &pool,
+            pub_row(&pool).await,
+            PUB_URL,
+            read,
+            0,
+            u32::MAX,
+            u32::MAX,
+        )
+        .await
+        .expect("a huge window is a wide floor, not a crash");
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
             .fetch_one(&pool)
             .await
@@ -1343,7 +1385,7 @@ pub(crate) mod tests {
                 .collect(),
             true,
         );
-        store_publication(&pool, PUB_URL, read, 2, 0, 0)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 2, 0, 0)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1364,7 +1406,7 @@ pub(crate) mod tests {
             vec![entry_dated("at://d/c/ancient", Some(&days_ago(900)))],
             true,
         );
-        store_publication(&pool, PUB_URL, read, 0, 0, 0)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 0, 0)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1382,9 +1424,17 @@ pub(crate) mod tests {
     async fn an_absurd_retention_window_does_not_panic() {
         let pool = pool().await;
         let read = read_of(vec![entry_dated("at://d/c/x", Some(&days_ago(1)))], true);
-        store_publication(&pool, PUB_URL, read, 0, u32::MAX, u32::MAX)
-            .await
-            .expect("a huge window is a wide floor, not a crash");
+        store_publication(
+            &pool,
+            pub_row(&pool).await,
+            PUB_URL,
+            read,
+            0,
+            u32::MAX,
+            u32::MAX,
+        )
+        .await
+        .expect("a huge window is a wide floor, not a crash");
     }
 
     /// The feed row learns the publication's name and homepage — the only reason
@@ -1394,7 +1444,7 @@ pub(crate) mod tests {
     async fn the_feed_row_learns_the_publications_name_and_site() {
         let pool = pool().await;
         let read = read_of(vec![entry_dated("at://d/c/1", Some(&days_ago(1)))], true);
-        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         let (title, site): (Option<String>, Option<String>) =
@@ -1422,7 +1472,7 @@ pub(crate) mod tests {
     async fn an_undated_entry_is_stored_rather_than_dropped() {
         let pool = pool().await;
         let read = read_of(vec![entry_dated("at://d/c/undated", None)], true);
-        store_publication(&pool, PUB_URL, read, 0, 14, 180)
+        store_publication(&pool, pub_row(&pool).await, PUB_URL, read, 0, 14, 180)
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
@@ -1637,7 +1687,7 @@ pub(crate) mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: url.clone(),
+                url: url.clone().into(),
                 ..Default::default()
             },
         )
@@ -1686,7 +1736,7 @@ pub(crate) mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: site.clone(),
+                url: site.clone().into(),
                 ..Default::default()
             },
         )
@@ -1826,7 +1876,7 @@ pub(crate) mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: site.clone(),
+                url: site.clone().into(),
                 ..Default::default()
             },
         )
@@ -2026,7 +2076,7 @@ pub(crate) mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: site.clone(),
+                url: site.clone().into(),
                 ..Default::default()
             },
         )
@@ -2283,7 +2333,7 @@ pub(crate) mod tests {
             crate::store::upsert_feed(
                 pool,
                 &crate::store::NewFeed {
-                    url: url.clone(),
+                    url: url.clone().into(),
                     ..Default::default()
                 },
             )
@@ -3071,7 +3121,7 @@ pub(crate) mod tests {
             crate::store::upsert_feed(
                 &pool,
                 &crate::store::NewFeed {
-                    url: url.clone(),
+                    url: url.clone().into(),
                     ..Default::default()
                 },
             )
@@ -3144,7 +3194,7 @@ pub(crate) mod tests {
         crate::store::upsert_feed(
             &pool,
             &crate::store::NewFeed {
-                url: site.clone(),
+                url: site.clone().into(),
                 ..Default::default()
             },
         )

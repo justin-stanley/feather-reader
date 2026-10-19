@@ -1680,7 +1680,7 @@ pub(crate) mod tests {
         let feed_id = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: feed(i),
+                url: feed(i).into(),
                 ..Default::default()
             },
         )
@@ -1723,7 +1723,7 @@ pub(crate) mod tests {
         let feed_id = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: feed(i),
+                url: feed(i).into(),
                 ..Default::default()
             },
         )
@@ -1776,7 +1776,7 @@ pub(crate) mod tests {
         let feed_id = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: feed(i),
+                url: feed(i).into(),
                 ..Default::default()
             },
         )
@@ -3963,7 +3963,7 @@ pub(crate) mod tests {
         let feed_id = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: feed(i),
+                url: feed(i).into(),
                 ..Default::default()
             },
         )

@@ -142,6 +142,110 @@ pub fn client_assertion(
     )
 }
 
+/// What a request's client authentication was, read from the form it sent:
+/// the method, and the assertion TYPE (never the assertion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAuthEvidence<'a> {
+    /// `private_key_jwt` when the form carries an assertion type, else `none`.
+    pub method: &'static str,
+    /// The `client_assertion_type` sent, if any.
+    pub assertion_type: Option<&'a str>,
+}
+
+/// [`ClientAuthEvidence`] for a form about to be sent. Read from the form
+/// itself, not from the configured method, so the evidence is what went on
+/// the wire (#262).
+pub fn evidence<'a>(params: &'a [(&str, String)]) -> ClientAuthEvidence<'a> {
+    let assertion_type = params
+        .iter()
+        .find(|(k, _)| *k == "client_assertion_type")
+        .map(|(_, v)| v.as_str());
+    ClientAuthEvidence {
+        method: if assertion_type.is_some() {
+            AuthMethod::PrivateKeyJwt.as_str()
+        } else {
+            AuthMethod::None.as_str()
+        },
+        assertion_type,
+    }
+}
+
+/// Log a client-authenticated request's evidence and the status it got (#262).
+///
+/// **Why:** a login that succeeds does not show that `private_key_jwt` was the
+/// method used (design/ROLLOUT-0.3.0.md, Stage 4), and revocation logged only
+/// its failures, so neither could be shown from production. This line is the
+/// evidence: the method and assertion type sent, the endpoint's host, and the
+/// status the server answered. A `2xx` with `private_key_jwt` means the
+/// server fetched our client metadata and JWKS and verified the assertion.
+///
+/// **No secret is logged:** not the assertion, the code, the verifier, a
+/// token, or the DPoP key; only the host of the endpoint, never its path or
+/// query.
+pub fn log_evidence(step: &'static str, evidence: ClientAuthEvidence<'_>, url: &str, status: u16) {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    tracing::info!(
+        step,
+        client_auth = evidence.method,
+        assertion_type = evidence.assertion_type.unwrap_or("-"),
+        endpoint_host = %host,
+        status,
+        "oauth client authentication"
+    );
+    #[cfg(test)]
+    EVIDENCE_SEEN.with(|seen| {
+        if let Some(seen) = seen.borrow_mut().as_mut() {
+            seen.push(LoggedEvidence {
+                step,
+                client_auth: evidence.method,
+                assertion_type: evidence.assertion_type.map(str::to_owned),
+                endpoint_host: host.clone(),
+                status,
+            });
+        }
+    });
+}
+
+/// One [`log_evidence`] call's fields, exactly as logged: what a test reads
+/// back through [`record_evidence`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoggedEvidence {
+    pub step: &'static str,
+    pub client_auth: &'static str,
+    pub assertion_type: Option<String>,
+    pub endpoint_host: String,
+    pub status: u16,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVIDENCE_SEEN: std::cell::RefCell<Option<Vec<LoggedEvidence>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record every [`log_evidence`] call on this thread while `f` runs, and
+/// return them with `f`'s output.
+///
+/// **Not a tracing subscriber**: `tracing` caches, per call site and
+/// process-wide, whether anyone listens, and other tests reaching the same line
+/// on threads with no subscriber made a thread-local capture see nothing in CI
+/// (it passed locally). This sees exactly the calls the code made, on this
+/// thread, which a `#[tokio::test]` (current-thread) runtime keeps every task
+/// on.
+#[cfg(test)]
+pub(crate) async fn record_evidence<F: std::future::Future>(
+    f: F,
+) -> (F::Output, Vec<LoggedEvidence>) {
+    EVIDENCE_SEEN.with(|seen| *seen.borrow_mut() = Some(Vec::new()));
+    let out = f.await;
+    let seen = EVIDENCE_SEEN.with(|seen| seen.borrow_mut().take().unwrap_or_default());
+    (out, seen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +399,29 @@ mod tests {
         let jws = client_assertion(&key, CLIENT_ID, ISSUER, NOW).unwrap();
         assert_eq!(part(&jws, 0)["kid"], "some-other-kid");
         assert_eq!(part(&jws, 0)["kid"], key.kid());
+    }
+
+    /// The evidence is read from the form: an assertion type means
+    /// `private_key_jwt`, its absence `none`, and the assertion itself is not
+    /// part of it.
+    #[test]
+    fn evidence_is_read_from_the_form_sent() {
+        let jwt = credential_params(AuthMethod::PrivateKeyJwt, CLIENT_ID, Some("the-jws")).unwrap();
+        let e = evidence(&jwt);
+        assert_eq!(e.method, "private_key_jwt");
+        assert_eq!(e.assertion_type, Some(JWT_BEARER));
+        assert!(
+            !format!("{e:?}").contains("the-jws"),
+            "the assertion leaked into the evidence"
+        );
+
+        let public = credential_params(AuthMethod::None, CLIENT_ID, None).unwrap();
+        assert_eq!(
+            evidence(&public),
+            ClientAuthEvidence {
+                method: "none",
+                assertion_type: None
+            }
+        );
     }
 }

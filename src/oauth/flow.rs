@@ -261,6 +261,9 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
     if iss != expected_issuer {
         bail!("authorization response `iss` is {iss:?}, expected {expected_issuer:?}");
     }
+    // Evidence that the check ran on a live response, not just in tests (#262).
+    // The issuer is public metadata; nothing secret is in this line.
+    tracing::info!(issuer = %iss, "authorization response `iss` matched (RFC 9207)");
 
     // An error wins over a code: a response carrying both is not one to
     // interpret. Only a KNOWN code is echoed, and the free-form
