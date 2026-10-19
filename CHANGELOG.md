@@ -134,7 +134,6 @@ deploying is separate.
   recorded (check 4); checks 1 and 2 are captured on staging at
   `v0.5.0-rc.1`.
 
-
 - **Rate limiting is on by default for every route (#261).** It was an
   allowlist of limited paths that a new route had to be added to by hand, which
   was missed three times (`/saved/`, `/oauth/callback`, `/logout`). Now the
