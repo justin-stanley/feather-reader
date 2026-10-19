@@ -2516,9 +2516,11 @@ struct ListRecordsBody {
 #[serde(untagged)]
 enum MaybeRecord {
     Record(RecordEntry),
-    /// Kept as a `Value` so its size can be charged (#284). Bounded: the whole
-    /// body passed [`refuse_a_structure_explosion`] before it was parsed, and the
-    /// value is dropped as soon as it is measured.
+    /// Kept as a `Value` so its size can be charged (#284). Bounded the way a
+    /// real record's value is: the whole body passed
+    /// [`refuse_a_structure_explosion`] before it was parsed. (Every entry of a
+    /// page is parsed before any is measured, so a malformed value lives as long
+    /// as the page's parse, not just its own measurement.)
     Malformed(Value),
 }
 

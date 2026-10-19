@@ -174,7 +174,6 @@ deploying is separate.
   pages of a quiet document, a 200 KB sibling and a malformed record under a
   300 KB budget in full; the old charge cut it short.
 
-
 - **Hostile feeds can no longer simply hold every sanitize permit (#275).**
   A timed-out sanitize can't be cancelled and keeps its permit until ammonia
   returns, which for a hostile body can be minutes; four hostile feeds (four
