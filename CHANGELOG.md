@@ -120,6 +120,29 @@ deploying is separate.
 
 ### Changed
 
+- **A feed URL can't reach the `feeds` table unvetted (#260).** Every new row's
+  URL comes from outside (a typed URL after autodiscovery, an OPML `xmlUrl`, a
+  subscription record any atproto client can write), and two checks must pass
+  first: storable (http(s), or an at-URI with standard.site on) and not private.
+  Each caller ran them by hand. `NewFeed.url` is now a `FeedUrl`, whose only
+  constructor is `FeedUrl::vetted` (both checks, with a typed refusal). It lives
+  in `vetted.rs`, so its field is private to a module nothing else is in, not to
+  `store.rs`, where rows are written. `NewFeed` has no `Default` outside tests,
+  so production code builds one with `NewFeed::new(url)`. The subscribe, OPML
+  import, subscription-resolve and rename paths use `vetted` in place of their
+  hand-written pair, with the same refusals and messages.
+  The poll paths (RSS, the 304 path, publications) re-stamped the row they had
+  polled with an upsert by URL; they now write by id with `store::record_poll`,
+  which never creates a row, so a poll needs no `FeedUrl` at all. A first draft
+  let them turn a `Feed`'s URL back into a `FeedUrl`, and review showed twice
+  that a `Feed` can't vouch for its URL (its fields are `pub`, it is `Clone`,
+  and `FromRow` builds one from any `SELECT`), so that constructor is gone.
+  `set_next_poll` was an upsert too, so rescheduling a URL with no row would
+  have created one past both checks; every caller reschedules a row it just
+  read, and it is now an `UPDATE`. Compile-fail doctests pin that a string can't
+  become a `FeedUrl` by conversion or construction; dropping either check from
+  `vetted`, or letting `set_next_poll` or `record_poll` insert, fails the tests.
+
 - **Rate limiting is on by default for every route (#261).** It was an
   allowlist of limited paths that a new route had to be added to by hand, which
   was missed three times (`/saved/`, `/oauth/callback`, `/logout`). Now the
