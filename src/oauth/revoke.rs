@@ -244,6 +244,14 @@ async fn try_revoke(
         },
     )
     .await?;
+    // Every response, not just failures: a 2xx here is the evidence that
+    // revocation ran against a live server (#262).
+    super::client_auth::log_evidence(
+        "revoke",
+        super::client_auth::evidence(&params),
+        endpoint,
+        outcome.status,
+    );
 
     // RFC 7009 §2.2: a 200 also means "we did not recognise that token", which
     // is success for our purposes — the grant is not usable either way.
@@ -1340,6 +1348,54 @@ mod tests {
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         assert!(report.no_session.is_empty());
         assert_eq!(session_rows(&pool).await, 0, "rows survived a revoke-all");
+    }
+
+    /// **Every revocation response is logged as evidence, with no secret
+    /// (#262).** Revocation used to log only its failures, so a working one left
+    /// nothing to show it ran against a live server. The line carries the step,
+    /// the client-auth method, the endpoint's host and the status; never a token,
+    /// the assertion, or the endpoint's path.
+    ///
+    /// Read back through `client_auth::record_evidence`, not a tracing
+    /// subscriber: a thread-local subscriber saw nothing in CI, because tracing
+    /// caches each call site's interest process-wide and other tests reach this
+    /// line in parallel with no subscriber.
+    #[tokio::test]
+    async fn every_revocation_response_is_logged_without_secrets() {
+        let (pool, codec) = db().await;
+        let (pds, issuer, _log) =
+            revoking_server(vec![crate::net::TestResponse::json(200, "{}")]).await;
+        store_sessions(&pool, &codec, &pds, &issuer).await;
+        let (report, evidence) = super::super::client_auth::record_evidence(revoke_all(
+            &runtime(),
+            &reqwest::Client::new(),
+            &pool,
+            || NOW,
+        ))
+        .await;
+        report.expect("listing the sessions");
+
+        assert_eq!(
+            evidence.len(),
+            SUBS.len(),
+            "one evidence line per revocation: {evidence:#?}"
+        );
+        for e in &evidence {
+            assert_eq!(e.step, "revoke", "{e:?}");
+            assert_eq!(e.status, 200, "{e:?}");
+            assert_eq!(e.client_auth, "none", "{e:?}");
+            assert_eq!(e.assertion_type, None, "{e:?}");
+            assert!(!e.endpoint_host.is_empty(), "{e:?}");
+            // Not named `secret`: CodeQL reads that name as sensitive and flags
+            // the assert message as logging one; these are fixture strings.
+            let shown = format!("{e:?}");
+            for forbidden in ["refresh-", "access-abc", "client_assertion=", "/revoke"] {
+                assert!(
+                    !shown.contains(forbidden),
+                    "{forbidden:?} in the evidence: {shown}"
+                );
+            }
+        }
     }
 
     /// **One server failing does not stop the rest — and its row still goes.**

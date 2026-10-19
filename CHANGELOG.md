@@ -143,6 +143,19 @@ deploying is separate.
   become a `FeedUrl` by conversion or construction; dropping either check from
   `vetted`, or letting `set_next_poll` or `record_poll` insert, fails the tests.
 
+- **OAuth client authentication and `iss` checks leave evidence in the log
+  (#262).** A successful login didn't show that `private_key_jwt` was the method
+  used, and revocation logged only its failures, so neither could be shown from
+  production (design/ROLLOUT-0.3.0.md, Stage 4). Every PAR, token, refresh and
+  revocation request now logs `oauth client authentication` with its `step`, the
+  `client_auth` method and `assertion_type` read from the form actually sent
+  (never the assertion), the endpoint's host (never its path) and the status;
+  the callback logs when the authorization response's `iss` matched (RFC 9207).
+  A test recording every evidence call checks a revocation's line carries its
+  status and no token, assertion or path, and fails with the line removed. The
+  `live_pds` discovery run against `justin-stanley.com` was re-run and recorded
+  (check 4); checks 1 and 2 are captured on staging at `v0.5.0-rc.1`.
+
 - **Rate limiting is on by default for every route (#261).** It was an
   allowlist of limited paths that a new route had to be added to by hand, which
   was missed three times (`/saved/`, `/oauth/callback`, `/logout`). Now the
@@ -2167,7 +2180,6 @@ them.
   that sweep deletes nothing — the one pass it runs is scoped to kinds that
   instance has no rows for.
 
-
 ### Security
 
 - **Two advisories in the sidecar's dependency graph, four days apart, both
@@ -2453,7 +2465,6 @@ them.
   page of a thousand records outright. The name is also truncated before it
   reaches a log, because the PDS chooses it and the log already carries the DID.
 
-
 - **Every response body in the atproto layer is now capped. Five were not.**
   `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
   which reads whatever arrives. That endpoint proxies the account's PDS, so the
@@ -2595,7 +2606,6 @@ them.
   agreeing — so this ends a disagreement where unrepresentable meant "store
   everything" on one side and "panic" on the other. Found reviewing #206, which
   added the third knob and therefore a third way in.
-
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
@@ -2749,7 +2759,6 @@ them.
   load-sensitive TLS failure filed as #195. Measured on the merged branch, not
   carried forward — drafts of this line have said 877, 884, 885, 888, 889, 891
   and 893, none of them measured when written.
-
 
 - **A mock that serves a different body per request**, which this suite did not
   have. The fixed-body servers answer every request identically, so a paging
