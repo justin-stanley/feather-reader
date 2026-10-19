@@ -235,6 +235,87 @@ has no runtime bypass, so no code change), and the measurement runs on staging
 on **`v0.5.0-rc.1`**, after the rc's functional soak checks. The bench and the
 run procedure are in `bench/` (README).
 
+#### Results (2026-10-19, staging at `v0.5.0-rc.1`)
+
+**Method.** `synthfeeds` (`bench/`) on apps, reached through
+`https://synth.feather-reader.com` on staging's own Cloudflare tunnel, so every
+fetch took the real path (DNS, TLS, the SSRF guard); `cf-cache-status: DYNAMIC`
+confirmed nothing was cached at the edge. Each run: staging stopped, its
+database restored from a snapshot, N feeds seeded with first polls spread over
+an hour (or 30 minutes, to saturate), a CPU cap set with `docker update
+--cpus` (memory stayed at 512 MiB), then 30 minutes sampled every 15 s:
+container memory and CPU, the database read-only (feeds polled, overdue,
+erroring, entries, file size), `synthfeeds`' own request counters, and the
+latency of `GET /` and `GET /stats` probed inside the container's network
+namespace. Throughput is the change in requests `synthfeeds` served.
+
+**At the shipped defaults** (batch 50 per 60 s tick, concurrency 4, watermark
+768 MiB):
+
+| feeds | CPU | polls / 30 min | overdue at end | DB at end | peak memory | CPU avg / peak | `/stats` max |
+|---|---|---|---|---|---|---|---|
+| 100 | 1 | 50 | 0 | 33 MB | 41 MiB | 0.1% / 2% | 1 ms |
+| 1,000 | 1 | 509 | 0 | 256 MB | 67 MiB | 0.4% / 16% | 2 ms |
+| 5,000 | 1 | 1,493 | 622, rising | 797 MB | 88 MiB | 0.9% / 6% | 4 ms |
+| 10,000 | 1 | 1,492 | 2,708, rising | 804 MB | 92 MiB | 0.9% / 6% | 5 ms |
+| 1,000 | 0.25 | 511 | 0 | 256 MB | 74 MiB | 0.4% / 13% | 2 ms |
+| 5,000 | 0.25 | 1,493 | 622, rising | 798 MB | 93 MiB | 0.9% / 7% | 4 ms |
+
+**At batch 200, concurrency 8** (watermark raised to 8 GiB for these runs only,
+so they measure throughput rather than the pause):
+
+| feeds | CPU | arriving / min | polls / 30 min | overdue at end | DB at end | peak memory | CPU avg / peak | `/stats` max |
+|---|---|---|---|---|---|---|---|---|
+| 10,000 | 1 | ~167 | 5,017 | 0 | 2.56 GB | 104 MiB | 3% / 17% | 6 ms |
+| 10,000 | 1 | ~333 | 5,905 | 2,544, rising | 3.04 GB | 121 MiB | 4% / 21% | 6 ms |
+| 10,000 | 0.25 | ~333 | 5,910 | 2,546, rising | 3.05 GB | 133 MiB | 4% / 16% | 73 ms |
+
+**Findings.**
+
+1. **Throughput is set by the poll batch, not the machine.** It is 50 polls a
+   minute at batch 50 (about 3,000 feeds an hour at a 1-hour interval) and
+   ~197 a minute at batch 200 (about 11,800 an hour), the same at a quarter
+   CPU as at a full one. Past the ceiling the backlog grows steadily and
+   nothing else degrades. Memory never passed 133 MiB of 512; CPU averaged
+   ≤ 4%; `/stats` stayed ≤ 6 ms, 73 ms at a quarter CPU.
+2. **Storage is the binding constraint.** Every run gave ~510 KB of database
+   per feed on first fetch, so the 768 MiB watermark holds ~1,500 feeds of
+   this mix: `max_feeds_global` (10,000) is about seven times what the volume
+   holds, and below the watermark it is throughput (batch 50) that binds next,
+   at ~3,000.
+3. **What the runs logged** was the designed misbehaviour (404, 500, over-cap
+   bodies), one `slow statement` on `UPDATE feeds SET next_poll` with a 3 GB
+   database, and one "the WAL could not be truncated after reclaim (busy)",
+   probably the collector's own read-only connection.
+
+**Caveats.**
+
+- **The mix is heavier than real feeds.** Synthetic bodies average ~12 KB, plus
+  1% of 2,000-item feeds. Real bodies measured 2.7 KB on staging's own
+  entries, 6.3 KB across 53 public feeds (#336's spike) and 11.9 KB in an
+  earlier production sample. So ~510 KB per feed is a pessimistic figure; a
+  read-only size check of the production database would pin the real one.
+- **`docker --cpus` is a hard quota, not Fly's credit model.** Fly's
+  `shared-cpu-1x` guarantees ~1/16 of a core and bursts on credit. Average use
+  (≤ 4%) is under that baseline; bursts (16–21%) would draw on credit.
+- Concurrency and batch were not swept beyond 8 and 200.
+
+**Proposed** (not in 0.5.0, whose upgrade notes promise unchanged capacity
+defaults; for the release after, with the measurement re-run):
+
+- `FEATHERREADER_POLL_BATCH` 200 and `FEATHERREADER_POLL_CONCURRENCY` 8:
+  measured safe here, about four times the throughput.
+- `max_feeds_global` set from storage rather than 10,000: either lower it to
+  what the volume holds, or grow the Fly volume (about $0.15 per GB-month;
+  10 GB holds roughly ten times as many feeds), after which throughput binds.
+- Compress stored bodies (#336): deflate-6 measured 2.78× on real bodies,
+  about 1.9× more feeds per GB, in two releases so every rollback stays
+  seamless.
+
+**For D4 (registration):** at the shipped defaults the instance holds about
+1,500 feeds of this mix before polling pauses, and serves about 3,000 an hour;
+both rise with the proposals above.
+
 ### Hardening that lands in 0.5.0 if ready
 
 #261 (rate-limit new routes by default), #260 (a validated feed-URL type for

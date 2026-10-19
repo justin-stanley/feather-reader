@@ -492,6 +492,8 @@ to a high-water mark and drop the ids below it. That is what the field is for.
 ### T4.6 Capacity constants do not match the machine
 
 > Still open (audited 2026-10-05): `max_feeds_global` defaults to 10,000, the poll batch to 50 per tick, and the watermark is 768 MiB. Tracked in issue #263.
+>
+> **Measured 2026-10-19** on staging (design/RELEASE-0.5.0.md §7): throughput is set by the batch (50/min at batch 50, ~197/min at batch 200, the same at a quarter CPU; memory ≤ 133 MiB), and storage binds first (~510 KB per feed of the synthetic mix, so the 768 MiB watermark holds ~1,500 feeds). The defaults change after 0.5.0; #336 compresses bodies.
 
 `max_feeds_global = 10_000` against a poller that manages 50 feeds per 60 s tick
 = **3,000 feeds/hour** at `poll_interval = 3600 s`. The global ceiling is 3.3×
