@@ -147,15 +147,14 @@ deploying is separate.
   (#262).** A successful login didn't show that `private_key_jwt` was the method
   used, and revocation logged only its failures, so neither could be shown from
   production (design/ROLLOUT-0.3.0.md, Stage 4). Every PAR, token, refresh and
-  revocation request now logs `oauth client authentication` with its `step`,
-  the `client_auth` method and `assertion_type` read from the form actually
-  sent (never the assertion), the endpoint's host (never its path) and the
-  status; the callback logs when the authorization response's `iss` matched
-  (RFC 9207). A captured-log test checks a revocation's line carries its
-  status and no token, assertion or path, and fails with the line removed.
-  The `live_pds` discovery run against `justin-stanley.com` was re-run and
-  recorded (check 4); checks 1 and 2 are captured on staging at
-  `v0.5.0-rc.1`.
+  revocation request now logs `oauth client authentication` with its `step`, the
+  `client_auth` method and `assertion_type` read from the form actually sent
+  (never the assertion), the endpoint's host (never its path) and the status;
+  the callback logs when the authorization response's `iss` matched (RFC 9207).
+  A test recording every evidence call checks a revocation's line carries its
+  status and no token, assertion or path, and fails with the line removed. The
+  `live_pds` discovery run against `justin-stanley.com` was re-run and recorded
+  (check 4); checks 1 and 2 are captured on staging at `v0.5.0-rc.1`.
 
 - **Rate limiting is on by default for every route (#261).** It was an
   allowlist of limited paths that a new route had to be added to by hand, which

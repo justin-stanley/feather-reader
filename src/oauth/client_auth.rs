@@ -195,6 +195,55 @@ pub fn log_evidence(step: &'static str, evidence: ClientAuthEvidence<'_>, url: &
         status,
         "oauth client authentication"
     );
+    #[cfg(test)]
+    EVIDENCE_SEEN.with(|seen| {
+        if let Some(seen) = seen.borrow_mut().as_mut() {
+            seen.push(LoggedEvidence {
+                step,
+                client_auth: evidence.method,
+                assertion_type: evidence.assertion_type.map(str::to_owned),
+                endpoint_host: host.clone(),
+                status,
+            });
+        }
+    });
+}
+
+/// One [`log_evidence`] call's fields, exactly as logged: what a test reads
+/// back through [`record_evidence`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoggedEvidence {
+    pub step: &'static str,
+    pub client_auth: &'static str,
+    pub assertion_type: Option<String>,
+    pub endpoint_host: String,
+    pub status: u16,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVIDENCE_SEEN: std::cell::RefCell<Option<Vec<LoggedEvidence>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record every [`log_evidence`] call on this thread while `f` runs, and
+/// return them with `f`'s output.
+///
+/// **Not a tracing subscriber**: `tracing` caches, per call site and
+/// process-wide, whether anyone listens, and other tests reaching the same line
+/// on threads with no subscriber made a thread-local capture see nothing in CI
+/// (it passed locally). This sees exactly the calls the code made, on this
+/// thread, which a `#[tokio::test]` (current-thread) runtime keeps every task
+/// on.
+#[cfg(test)]
+pub(crate) async fn record_evidence<F: std::future::Future>(
+    f: F,
+) -> (F::Output, Vec<LoggedEvidence>) {
+    EVIDENCE_SEEN.with(|seen| *seen.borrow_mut() = Some(Vec::new()));
+    let out = f.await;
+    let seen = EVIDENCE_SEEN.with(|seen| seen.borrow_mut().take().unwrap_or_default());
+    (out, seen)
 }
 
 #[cfg(test)]
