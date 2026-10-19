@@ -563,8 +563,11 @@ on the evidence it is a good one.
 
 - `private_key_jwt` against production.
   > Unverified (audited 2026-10-05): prod has used the rust backend since PR #110,
-  > but no captured `client_assertion_type` is recorded anywhere.
+  > but no captured `client_assertion_type` is recorded anywhere. Now logged as
+  > evidence on every token request; capture on staging at `v0.5.0-rc.1`
+  > (design/ROLLOUT-0.3.0.md, Stage 4; issue #262).
 - Revocation against a live PDS.
-  > Unverified: no recorded revocation-endpoint response.
+  > Unverified: no recorded revocation-endpoint response. Every response is now
+  > logged with its status; capture as above.
 - The full container has never been started.
   > Done: the container has run in production since v0.3.0.

@@ -280,6 +280,12 @@ async fn refresh_locked(
         },
     )
     .await?;
+    super::client_auth::log_evidence(
+        "refresh",
+        super::client_auth::evidence(&params),
+        ctx.token_endpoint,
+        outcome.status,
+    );
 
     if outcome.is_success() {
         let response = super::token::parse_token_response(&outcome.json()?)?;

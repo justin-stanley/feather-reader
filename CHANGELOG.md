@@ -120,6 +120,42 @@ deploying is separate.
 
 ### Changed
 
+- **A feed URL can't reach the `feeds` table unvetted (#260).** Every new row's
+  URL comes from outside (a typed URL after autodiscovery, an OPML `xmlUrl`, a
+  subscription record any atproto client can write), and two checks must pass
+  first: storable (http(s), or an at-URI with standard.site on) and not private.
+  Each caller ran them by hand. `NewFeed.url` is now a `FeedUrl`, whose only
+  constructor is `FeedUrl::vetted` (both checks, with a typed refusal). It lives
+  in `vetted.rs`, so its field is private to a module nothing else is in, not to
+  `store.rs`, where rows are written. `NewFeed` has no `Default` outside tests,
+  so production code builds one with `NewFeed::new(url)`. The subscribe, OPML
+  import, subscription-resolve and rename paths use `vetted` in place of their
+  hand-written pair, with the same refusals and messages.
+  The poll paths (RSS, the 304 path, publications) re-stamped the row they had
+  polled with an upsert by URL; they now write by id with `store::record_poll`,
+  which never creates a row, so a poll needs no `FeedUrl` at all. A first draft
+  let them turn a `Feed`'s URL back into a `FeedUrl`, and review showed twice
+  that a `Feed` can't vouch for its URL (its fields are `pub`, it is `Clone`,
+  and `FromRow` builds one from any `SELECT`), so that constructor is gone.
+  `set_next_poll` was an upsert too, so rescheduling a URL with no row would
+  have created one past both checks; every caller reschedules a row it just
+  read, and it is now an `UPDATE`. Compile-fail doctests pin that a string can't
+  become a `FeedUrl` by conversion or construction; dropping either check from
+  `vetted`, or letting `set_next_poll` or `record_poll` insert, fails the tests.
+
+- **OAuth client authentication and `iss` checks leave evidence in the log
+  (#262).** A successful login didn't show that `private_key_jwt` was the method
+  used, and revocation logged only its failures, so neither could be shown from
+  production (design/ROLLOUT-0.3.0.md, Stage 4). Every PAR, token, refresh and
+  revocation request now logs `oauth client authentication` with its `step`, the
+  `client_auth` method and `assertion_type` read from the form actually sent
+  (never the assertion), the endpoint's host (never its path) and the status;
+  the callback logs when the authorization response's `iss` matched (RFC 9207).
+  A test recording every evidence call checks a revocation's line carries its
+  status and no token, assertion or path, and fails with the line removed. The
+  `live_pds` discovery run against `justin-stanley.com` was re-run and recorded
+  (check 4); checks 1 and 2 are captured on staging at `v0.5.0-rc.1`.
+
 - **Rate limiting is on by default for every route (#261).** It was an
   allowlist of limited paths that a new route had to be added to by hand, which
   was missed three times (`/saved/`, `/oauth/callback`, `/logout`). Now the
@@ -155,6 +191,24 @@ deploying is separate.
   callback returns it, and it outlives the sidecar.
 
 ### Fixed
+
+- **A malformed record no longer charges its siblings' documents to a shared
+  read (#284).** Several publications in one repo share one walk of its
+  documents (`standard_site::fetch_repo`), and the filter keeps only the
+  requested ones. A page holding a malformed record was charged its whole wire
+  size, which counts every sibling document the filter dropped, so a handful
+  of malformed records across pages could run a quiet publication out of
+  budget long before its own documents did; its re-read alone (#281) saw the
+  same pages and stopped in the same place. Such a page is now charged what it
+  keeps plus what its malformed records retain, measured the same way as kept
+  records (`json_bytes`): the parser keeps each malformed entry as a value
+  long enough to size it (the whole body has already passed the structure
+  bound). A page of only junk still costs its junk, so junk pages still can't
+  walk for free; the test for that now asserts the walk was stopped by the
+  budget, since it also passed with junk charged nothing (the stub ran out of
+  pages). `a_malformed_record_does_not_charge_its_siblings_documents` reads five
+  pages of a quiet document, a 200 KB sibling and a malformed record under a
+  300 KB budget in full; the old charge cut it short.
 
 - **`GET /static` and `GET /static/` are no longer rate-limited (review of
   #323).** The limiter keys on the route a request matched, and files under a
@@ -2155,7 +2209,6 @@ them.
   that sweep deletes nothing — the one pass it runs is scoped to kinds that
   instance has no rows for.
 
-
 ### Security
 
 - **Two advisories in the sidecar's dependency graph, four days apart, both
@@ -2441,7 +2494,6 @@ them.
   page of a thousand records outright. The name is also truncated before it
   reaches a log, because the PDS chooses it and the log already carries the DID.
 
-
 - **Every response body in the atproto layer is now capped. Five were not.**
   `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
   which reads whatever arrives. That endpoint proxies the account's PDS, so the
@@ -2583,7 +2635,6 @@ them.
   agreeing — so this ends a disagreement where unrepresentable meant "store
   everything" on one side and "panic" on the other. Found reviewing #206, which
   added the third knob and therefore a third way in.
-
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
@@ -2737,7 +2788,6 @@ them.
   load-sensitive TLS failure filed as #195. Measured on the merged branch, not
   carried forward — drafts of this line have said 877, 884, 885, 888, 889, 891
   and 893, none of them measured when written.
-
 
 - **A mock that serves a different body per request**, which this suite did not
   have. The fixed-body servers answer every request identically, so a paging

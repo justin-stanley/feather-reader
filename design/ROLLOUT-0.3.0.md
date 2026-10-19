@@ -286,6 +286,26 @@ sidecar path never reads it.
 > and sync has used the rust backend since PR #110. No captured evidence is
 > recorded for 1 (`client_assertion_type`), 2 (revocation response status) or 4
 > (a post-cutover `live_pds` run); tracked in issue #262.
+>
+> **4 — captured 2026-10-18** (`cargo test --lib -- --ignored --nocapture
+> live_pds`, against `justin-stanley.com`): resolved to
+> `did:plc:ohutz6x5acjmpuulp3x7wxxc` on `https://pds.justin-stanley.com`; AS
+> metadata issuer `https://pds.justin-stanley.com`; "mix-up defence: refused a
+> mismatched issuer, by `same_issuer`"; revocation advertised at
+> `https://pds.justin-stanley.com/oauth/revoke`. Test passed.
+>
+> **1 and 2 — instrumented, capture pending.** Every client-authenticated
+> request now logs its evidence: `oauth client authentication` with `step`
+> (`par`, `token`, `refresh`, `revoke`), `client_auth` and `assertion_type`
+> read from the form actually sent, `endpoint_host` and `status`; and the
+> callback logs `authorization response \`iss\` matched (RFC 9207)`. No
+> secret is in either line. To capture: once staging runs `v0.5.0-rc.1`, sign
+> in and out with the staging test account, then
+> `docker logs featherreader-staging 2>&1 | grep -E "oauth client authentication|iss. matched"`.
+> Expected: `step="par"` and `step="token"` with
+> `client_auth="private_key_jwt"`, the jwt-bearer `assertion_type` and
+> `status=2xx` (1); `step="revoke"` with `status=200` (2). Record the lines here
+> and close #262.
 
 These are the two claims that have been unverifiable from a dev box all along,
 because both require a real PDS to fetch our client metadata at the real

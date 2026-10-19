@@ -2163,9 +2163,8 @@ async fn resolve_subscriptions_noting(
                 // `…/feed/private/<token>` into the SHARED `feeds` table breaks
                 // that promise even though `net::guarded_get` still refuses to
                 // fetch it.
-                if !feed::is_storable_feed_url(&sub.url, state.config.standard_site)
-                    || feed::classify_feed_privacy(&sub.url).is_private()
-                {
+                let Ok(feed_url) = store::FeedUrl::vetted(&sub.url, state.config.standard_site)
+                else {
                     warn!(
                         %did,
                         "skipping cache row for a subscription URL that is private or not http(s)"
@@ -2176,7 +2175,7 @@ async fn resolve_subscriptions_noting(
                         feed: None,
                     });
                     continue;
-                }
+                };
                 // Upsert a cache row so the sidebar reflects the real follow-list.
                 //
                 // A silent failure here is a support ticket with no evidence: no
@@ -2187,10 +2186,9 @@ async fn resolve_subscriptions_noting(
                 if let Err(err) = store::upsert_feed(
                     pool,
                     &store::NewFeed {
-                        url: sub.url.clone(),
                         title: sub.title.clone(),
                         site_url: sub.site_url.clone(),
-                        ..Default::default()
+                        ..store::NewFeed::new(feed_url)
                     },
                 )
                 .await
@@ -3696,24 +3694,29 @@ async fn add_subscription(
     // Defensive: resolution may have discovered a feed URL that itself carries a
     // secret (e.g. a public site page linking a tokened feed). Re-check the
     // resolved URL and refuse before storing/writing anything.
-    if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&feed_url) {
-        info!(url = %feed_url, %reason, %did, "refused private/paid feed after resolution (not stored)");
-        return Ok(
-            Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
-        );
-    }
-
+    //
     // The URL about to be STORED is what must be storable — not the one the
     // user typed. Autodiscovery already yields only http(s), but this is the
     // path that writes the row and the PDS record, so the check lives here too:
-    // the same gate the OPML and rename paths apply, on the same terms.
-    if !feed::is_storable_feed_url(&feed_url, state.config.standard_site) {
-        info!(url = %feed_url, %did, "refused unsupported feed URL after resolution (not stored)");
-        return Ok(
-            Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
-                .into_response(),
-        );
-    }
+    // the same gate the OPML and rename paths apply, on the same terms. Both
+    // checks are the vetted `FeedUrl` (#260), which the row cannot be written
+    // without.
+    let vetted_url = match store::FeedUrl::vetted(&feed_url, state.config.standard_site) {
+        Ok(url) => url,
+        Err(store::FeedUrlRefusal::Private(reason)) => {
+            info!(url = %feed_url, %reason, %did, "refused private/paid feed after resolution (not stored)");
+            return Ok(
+                Redirect::to(&format!("/?flash={}", qenc(PRIVATE_FEED_REFUSAL))).into_response(),
+            );
+        }
+        Err(store::FeedUrlRefusal::NotStorable) => {
+            info!(url = %feed_url, %did, "refused unsupported feed URL after resolution (not stored)");
+            return Ok(
+                Redirect::to(&format!("/?flash={}", qenc(UNSUPPORTED_FEED_URL_REFUSAL)))
+                    .into_response(),
+            );
+        }
+    };
 
     // Global feeds ceiling: a brand-new distinct feed is refused once the shared
     // cache is full (an existing/duplicate feed URL is always fine — it adds no
@@ -3736,14 +3739,7 @@ async fn add_subscription(
         }
     }
 
-    store::upsert_feed(
-        pool,
-        &store::NewFeed {
-            url: feed_url.clone(),
-            ..Default::default()
-        },
-    )
-    .await?;
+    store::upsert_feed(pool, &store::NewFeed::new(vetted_url)).await?;
 
     if let Ok(client) = feed::build_client() {
         if let Some(feed_row) = store::get_feed_by_url(pool, &feed_url).await? {
@@ -4311,24 +4307,35 @@ async fn rename_subscription_once(
     //
     // A failed lookup skips the cache rather than failing the request: the
     // rename has already landed, and the reader must be told so.
-    let cache_write = storable
-        && (url_changed
-            || match store::get_feed_by_url(&state.db, &sub.url).await {
-                Ok(row) => row.is_some(),
-                Err(err) => {
-                    warn!(%err, %did, url = %sub.url, "could not look up the cached feed row after a rename");
-                    false
-                }
-            });
-    if !cache_write {
+    //
+    // `storable` is in the vetted `FeedUrl` (#260), which also refuses a
+    // private URL: both gates ran above for a repoint, and an unchanged private
+    // URL has no row, so the type changes nothing here but where the rule lives.
+    let cache_url = match store::FeedUrl::vetted(&sub.url, state.config.standard_site) {
+        Ok(url)
+            if url_changed
+                || match store::get_feed_by_url(&state.db, &sub.url).await {
+                    Ok(row) => row.is_some(),
+                    Err(err) => {
+                        warn!(%err, %did, url = %sub.url, "could not look up the cached feed row after a rename");
+                        false
+                    }
+                } =>
+        {
+            Some(url)
+        }
+        _ => None,
+    };
+    let Some(cache_url) = cache_url else {
         info!(%did, %rkey, url = %sub.url, "renamed a subscription without touching the cache");
-    } else if let Err(err) = store::upsert_feed(
+        return Ok(Done(Redirect::to("/").into_response()));
+    };
+    if let Err(err) = store::upsert_feed(
         &state.db,
         &store::NewFeed {
-            url: sub.url.clone(),
             title: sub.title.clone(),
             site_url: sub.site_url.clone(),
-            ..Default::default()
+            ..store::NewFeed::new(cache_url)
         },
     )
     .await
@@ -6105,25 +6112,31 @@ async fn import_opml(
         // cached, and published as records to the user's PUBLIC repo. Note that
         // `classify_feed_privacy` does not catch these: both parse cleanly, and
         // it returns `Public` for anything unparseable by design.
-        if !feed::is_storable_feed_url(&f.feed_url, state.config.standard_site) {
-            info!(
-                %did,
-                "skipped an OPML entry whose xmlUrl is not a storable feed URL"
-            );
-            skipped_unsupported += 1;
-            continue;
-        }
-        if let feed::FeedPrivacy::Private(reason) = feed::classify_feed_privacy(&f.feed_url) {
-            info!(feed = %f.feed_url, %reason, %did, "skipped private/paid feed on OPML import (not stored)");
-            // Report by title where we have one, else the (public-safe) host.
-            let label = f
-                .title
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| private_feed_label(&f.feed_url));
-            skipped_private.push(label);
-            continue;
-        }
+        //
+        // Both checks are the vetted `FeedUrl` (#260), which the cache row
+        // below cannot be written without.
+        let vetted_url = match store::FeedUrl::vetted(&f.feed_url, state.config.standard_site) {
+            Ok(url) => url,
+            Err(store::FeedUrlRefusal::NotStorable) => {
+                info!(
+                    %did,
+                    "skipped an OPML entry whose xmlUrl is not a storable feed URL"
+                );
+                skipped_unsupported += 1;
+                continue;
+            }
+            Err(store::FeedUrlRefusal::Private(reason)) => {
+                info!(feed = %f.feed_url, %reason, %did, "skipped private/paid feed on OPML import (not stored)");
+                // Report by title where we have one, else the (public-safe) host.
+                let label = f
+                    .title
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| private_feed_label(&f.feed_url));
+                skipped_private.push(label);
+                continue;
+            }
+        };
 
         // Over-cap: stop importing once headroom is exhausted (count the rest so
         // we can tell the user how many were dropped).
@@ -6179,10 +6192,9 @@ async fn import_opml(
         if let Err(err) = store::upsert_feed(
             pool,
             &store::NewFeed {
-                url: f.feed_url.clone(),
                 title: f.title.clone(),
                 site_url: f.site_url.clone(),
-                ..Default::default()
+                ..store::NewFeed::new(vetted_url)
             },
         )
         .await
@@ -9643,7 +9655,7 @@ mod tests {
         let feed_a = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://a.example/feed.xml".to_string(),
+                url: "https://a.example/feed.xml".to_string().into(),
                 title: Some("A".to_string()),
                 ..Default::default()
             },
@@ -9653,7 +9665,7 @@ mod tests {
         let feed_b = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://b.example/feed.xml".to_string(),
+                url: "https://b.example/feed.xml".to_string().into(),
                 title: Some("B".to_string()),
                 ..Default::default()
             },
@@ -9966,7 +9978,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://href.example/feed.xml".to_string(),
+                url: "https://href.example/feed.xml".to_string().into(),
                 title: Some("Href".to_string()),
                 ..Default::default()
             },
@@ -10111,7 +10123,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://body.example/feed.xml".to_string(),
+                url: "https://body.example/feed.xml".to_string().into(),
                 title: Some("Body".to_string()),
                 ..Default::default()
             },
@@ -10379,7 +10391,7 @@ mod tests {
         let feed_a = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://a.example/feed.xml".to_string(),
+                url: "https://a.example/feed.xml".to_string().into(),
                 title: Some("A".to_string()),
                 ..Default::default()
             },
@@ -10389,7 +10401,7 @@ mod tests {
         let _feed_b = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://b.example/feed.xml".to_string(),
+                url: "https://b.example/feed.xml".to_string().into(),
                 title: Some("B".to_string()),
                 ..Default::default()
             },
@@ -10501,7 +10513,7 @@ mod tests {
                 store::upsert_feed(
                     &state.db,
                     &store::NewFeed {
-                        url: u,
+                        url: u.into(),
                         ..Default::default()
                     },
                 )
@@ -10887,7 +10899,7 @@ mod tests {
         let existing_a = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://have-a.example/feed.xml".to_string(),
+                url: "https://have-a.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10896,7 +10908,7 @@ mod tests {
         let existing_b = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://have-b.example/feed.xml".to_string(),
+                url: "https://have-b.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10937,7 +10949,7 @@ mod tests {
         let f = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://have.example/feed.xml".to_string(),
+                url: "https://have.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -10989,7 +11001,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://pager.example/feed.xml".to_string(),
+                url: "https://pager.example/feed.xml".to_string().into(),
                 title: Some("Pager".to_string()),
                 ..Default::default()
             },
@@ -11173,7 +11185,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://reader.example/feed.xml".to_string(),
+                url: "https://reader.example/feed.xml".to_string().into(),
                 title: Some("Reader".to_string()),
                 ..Default::default()
             },
@@ -11308,7 +11320,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://list.example/feed.xml".to_string(),
+                url: "https://list.example/feed.xml".to_string().into(),
                 title: Some("List".to_string()),
                 ..Default::default()
             },
@@ -11495,7 +11507,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://existing.example/feed.xml".to_string(),
+                url: "https://existing.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -11557,7 +11569,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://existing.example/feed.xml".to_string(),
+                url: "https://existing.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -12537,7 +12549,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://filler.example/feed.xml".to_string(),
+                url: "https://filler.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -13057,7 +13069,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://filler.example/feed.xml".to_string(),
+                url: "https://filler.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -13136,7 +13148,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://filler.example/feed.xml".to_string(),
+                url: "https://filler.example/feed.xml".to_string().into(),
                 ..Default::default()
             },
         )
@@ -13735,7 +13747,7 @@ mod tests {
                     store::upsert_feed(
                         &state.db,
                         &store::NewFeed {
-                            url: OLD_URL.to_string(),
+                            url: OLD_URL.to_string().into(),
                             title: Some("Cached title".to_string()),
                             ..Default::default()
                         },
@@ -14964,7 +14976,7 @@ mod tests {
             store::upsert_feed(
                 &state.db,
                 &store::NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     // Pushed forward, exactly as backoff does — so none of these
                     // are counted as `overdue`.
                     next_poll: Some("2099-01-01T00:00:00Z".to_string()),
@@ -15101,7 +15113,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -15192,7 +15204,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -15279,7 +15291,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -15343,7 +15355,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: url.to_string(),
+                url: url.to_string().into(),
                 ..Default::default()
             },
         )
@@ -15411,7 +15423,7 @@ mod tests {
             store::upsert_feed(
                 &state.db,
                 &store::NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     next_poll: Some("2099-01-01T00:00:00Z".to_string()),
                     ..Default::default()
                 },
@@ -15428,7 +15440,7 @@ mod tests {
         store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://known.example/f.xml".to_string(),
+                url: "https://known.example/f.xml".to_string().into(),
                 next_poll: Some("2099-01-01T00:00:00Z".to_string()),
                 ..Default::default()
             },
@@ -15486,7 +15498,7 @@ mod tests {
             store::upsert_feed(
                 &state.db,
                 &store::NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     next_poll: Some("2099-01-01T00:00:00Z".to_string()),
                     ..Default::default()
                 },
@@ -15568,7 +15580,7 @@ mod tests {
             store::upsert_feed(
                 &state.db,
                 &store::NewFeed {
-                    url: url.to_string(),
+                    url: url.to_string().into(),
                     next_poll: Some("2099-01-01T00:00:00Z".to_string()),
                     ..Default::default()
                 },
@@ -16236,7 +16248,7 @@ mod tests {
         let feed = store::upsert_feed(
             &state.db,
             &store::NewFeed {
-                url: "https://loop.example/feed.xml".to_string(),
+                url: "https://loop.example/feed.xml".to_string().into(),
                 title: Some("Loop".to_string()),
                 ..Default::default()
             },
