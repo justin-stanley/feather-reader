@@ -159,6 +159,10 @@ where
         &runtime.client_id,
         assertion.as_deref(),
     )?);
+    let (sent_method, sent_type) = {
+        let e = client_auth::evidence(&params);
+        (e.method, e.assertion_type.map(str::to_owned))
+    };
 
     // `Arc` so the transport can be handed the real key rather than a recipe
     // for one, while `put_pending` below still stores from the same value.
@@ -171,6 +175,15 @@ where
         retry: request::Retry::Allowed,
     })
     .await?;
+    client_auth::log_evidence(
+        "par",
+        client_auth::ClientAuthEvidence {
+            method: sent_method,
+            assertion_type: sent_type.as_deref(),
+        },
+        &server.par_endpoint,
+        outcome.status,
+    );
     let par = accept_par_response(&outcome)?;
 
     store::put_pending(
@@ -398,6 +411,10 @@ where
     // The AAD protects the column from local tampering; only this protects it
     // from a network re-read.
     let token_params = token_exchange_params(runtime, &pending, &code, auth_method, now)?;
+    let (sent_method, sent_type) = {
+        let e = client_auth::evidence(&token_params);
+        (e.method, e.assertion_type.map(str::to_owned))
+    };
 
     let outcome = post(TokenPost {
         url: server.token_endpoint.clone(),
@@ -410,6 +427,15 @@ where
         retry: request::Retry::Allowed,
     })
     .await?;
+    client_auth::log_evidence(
+        "token",
+        client_auth::ClientAuthEvidence {
+            method: sent_method,
+            assertion_type: sent_type.as_deref(),
+        },
+        &server.token_endpoint,
+        outcome.status,
+    );
 
     let did = accept_token_response(pool, &runtime.codec, &pending, &outcome, now).await?;
 
