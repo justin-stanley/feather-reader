@@ -120,6 +120,29 @@ deploying is separate.
 
 ### Changed
 
+- **A feed URL can't reach the `feeds` table unvetted (#260).** Every new row's
+  URL comes from outside (a typed URL after autodiscovery, an OPML `xmlUrl`, a
+  subscription record any atproto client can write), and two checks must pass
+  first: storable (http(s), or an at-URI with standard.site on) and not private.
+  Each caller ran them by hand. `NewFeed.url` is now a `FeedUrl`, whose only
+  constructor is `FeedUrl::vetted` (both checks, with a typed refusal). It lives
+  in `vetted.rs`, so its field is private to a module nothing else is in, not to
+  `store.rs`, where rows are written. `NewFeed` has no `Default` outside tests,
+  so production code builds one with `NewFeed::new(url)`. The subscribe, OPML
+  import, subscription-resolve and rename paths use `vetted` in place of their
+  hand-written pair, with the same refusals and messages.
+  The poll paths (RSS, the 304 path, publications) re-stamped the row they had
+  polled with an upsert by URL; they now write by id with `store::record_poll`,
+  which never creates a row, so a poll needs no `FeedUrl` at all. A first draft
+  let them turn a `Feed`'s URL back into a `FeedUrl`, and review showed twice
+  that a `Feed` can't vouch for its URL (its fields are `pub`, it is `Clone`,
+  and `FromRow` builds one from any `SELECT`), so that constructor is gone.
+  `set_next_poll` was an upsert too, so rescheduling a URL with no row would
+  have created one past both checks; every caller reschedules a row it just
+  read, and it is now an `UPDATE`. Compile-fail doctests pin that a string can't
+  become a `FeedUrl` by conversion or construction; dropping either check from
+  `vetted`, or letting `set_next_poll` or `record_poll` insert, fails the tests.
+
 - **OAuth client authentication and `iss` checks leave evidence in the log
   (#262).** A successful login didn't show that `private_key_jwt` was the method
   used, and revocation logged only its failures, so neither could be shown from
@@ -2158,7 +2181,6 @@ them.
   that sweep deletes nothing — the one pass it runs is scoped to kinds that
   instance has no rows for.
 
-
 ### Security
 
 - **Two advisories in the sidecar's dependency graph, four days apart, both
@@ -2444,7 +2466,6 @@ them.
   page of a thousand records outright. The name is also truncated before it
   reaches a log, because the PDS chooses it and the log already carries the DID.
 
-
 - **Every response body in the atproto layer is now capped. Five were not.**
   `SidecarClient::repo` buffered `/internal/repo` with `resp.json()`,
   which reads whatever arrives. That endpoint proxies the account's PDS, so the
@@ -2586,7 +2607,6 @@ them.
   agreeing — so this ends a disagreement where unrepresentable meant "store
   everything" on one side and "panic" on the other. Found reviewing #206, which
   added the third knob and therefore a third way in.
-
 
 - **Publication entries get a stable date instead of one that resets itself.** `site.standard.document`
   makes `publishedAt` optional, and an entry stored without a date takes
@@ -2740,7 +2760,6 @@ them.
   load-sensitive TLS failure filed as #195. Measured on the merged branch, not
   carried forward — drafts of this line have said 877, 884, 885, 888, 889, 891
   and 893, none of them measured when written.
-
 
 - **A mock that serves a different body per request**, which this suite did not
   have. The fixed-body servers answer every request identically, so a paging
