@@ -384,10 +384,13 @@ fn static_header_layer(
 /// normal reading; they are bounded by needing a valid session. `GET /login`,
 /// `GET /claim` and `GET /oauth/callback` are NOT here: the first resolves a
 /// handle, the second consumes a reservation, and the callback exchanges a code
-/// with no session at all. `/favicon.ico` is a served file. `/static/*` needs
-/// no entry: a nested service sets no `MatchedPath`, so its requests are reads
-/// that matched no route (measured, and pinned by
-/// `the_limiter_keys_on_the_matched_route_through_the_router`).
+/// with no session at all. `/favicon.ico` is a served file. `/static/<file>`
+/// needs no entry: a nested service's paths set no `MatchedPath`, so they are
+/// reads that matched no route. Bare `/static` and `/static/` do match,
+/// because axum registers a nested service's prefix, with and without the
+/// slash, as routes of their own (measured); they are reads like any file
+/// under them, so they are exempt (found in review of #323). Both are
+/// pinned by `the_limiter_keys_on_the_matched_route_through_the_router`.
 ///
 /// `rate_limit_exemptions_match_the_router` keeps this in step with
 /// [`router`]: an entry naming no route, or a GET route left unclassified,
@@ -408,6 +411,8 @@ const RATE_LIMIT_EXEMPT_READS: &[&str] = &[
     "/oauth/client-metadata.json",
     "/oauth/jwks.json",
     "/favicon.ico",
+    "/static",
+    "/static/",
 ];
 
 /// The GET routes that ARE limited, for `rate_limit_exemptions_match_the_router`:
@@ -7129,10 +7134,15 @@ mod tests {
     }
 
     /// The `(method, path)` routes [`router`] registers, read from this file's
-    /// own source: `.route("…", get(…).post(…))` and `.route_service` (a GET).
-    /// `.nest_service` is left out: it sets no `MatchedPath`, so the limiter sees
-    /// its requests as unmatched reads (see [`is_rate_limited`]). There is no API
-    /// to list an axum `Router`'s routes, so the router's text is the route table.
+    /// own source: `.route("…", get(…).post(…))`, `.route_service` (a GET), and
+    /// `.nest_service("/prefix", …)` as GETs of `/prefix` and `/prefix/`. A nested
+    /// service's own paths (`/static/style.css`) set no `MatchedPath`, so the
+    /// limiter sees them as unmatched reads; but axum also registers the bare
+    /// prefix, with and without its slash, as routes, which do set one. Skipping `.nest_service` left
+    /// `GET /static` limited and unclassified (found in review of #323; pinned
+    /// by `the_limiter_keys_on_the_matched_route_through_the_router`). There is
+    /// no API to list an axum `Router`'s routes, so the router's text is the
+    /// route table.
     fn router_routes() -> Vec<(&'static str, String)> {
         let src = include_str!("web.rs");
         let start = src
@@ -7142,9 +7152,16 @@ mod tests {
         let body = &body[..body.find("\n}\n").expect("end of router()")];
         let mut out = Vec::new();
         let mut rest = body;
-        while let Some(at) = rest.find(".route") {
+        loop {
+            // The next `.route…` or `.nest_service` call, whichever is first.
+            let at = [rest.find(".route"), rest.find(".nest_service(")]
+                .into_iter()
+                .flatten()
+                .min();
+            let Some(at) = at else { break };
             rest = &rest[at..];
-            let kind = if rest.starts_with(".route_service(") {
+            let kind = if rest.starts_with(".route_service(") || rest.starts_with(".nest_service(")
+            {
                 "service"
             } else if rest.starts_with(".route(") {
                 "route"
@@ -7171,7 +7188,10 @@ mod tests {
             }
             let call = &rest[open + 1..end];
             let path = call.split('"').nth(1).expect("a route path").to_string();
-            if kind == "service" {
+            if rest.starts_with(".nest_service(") {
+                out.push(("GET", format!("{path}/")));
+                out.push(("GET", path));
+            } else if kind == "service" {
                 out.push(("GET", path));
             } else {
                 let handlers = &call[call.find(',').unwrap()..];
@@ -9052,6 +9072,8 @@ mod tests {
         };
         for (method, uri) in [
             ("GET", "/static/style.css"),
+            ("GET", "/static"),
+            ("GET", "/static/"),
             ("GET", "/favicon.ico"),
             ("GET", "/entries/1"),
             ("GET", "/about"),

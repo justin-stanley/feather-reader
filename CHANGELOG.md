@@ -210,6 +210,17 @@ deploying is separate.
   pages of a quiet document, a 200 KB sibling and a malformed record under a
   300 KB budget in full; the old charge cut it short.
 
+- **`GET /static` and `GET /static/` are no longer rate-limited (review of
+  #323).** The limiter keys on the route a request matched, and files under a
+  nested service match none, so `/static/style.css` was never limited. But axum
+  also registers the nested service's prefix, with and without its slash, as
+  routes of their own (measured), so those two paths were limited, and the
+  test that checks every GET route is classified never saw them, because its
+  scan of `router()` skipped `.nest_service`. Both paths are now exempt, the
+  scan reads `.nest_service("/prefix", …)` as GETs of `/prefix` and
+  `/prefix/`, and the through-the-router test requests both. Dropping either
+  exemption, or the scan's `.nest_service` case, fails the tests.
+
 - **Hostile feeds can no longer simply hold every sanitize permit (#275).**
   A timed-out sanitize can't be cancelled and keeps its permit until ammonia
   returns, which for a hostile body can be minutes; four hostile feeds (four
