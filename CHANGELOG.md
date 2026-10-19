@@ -14,7 +14,23 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.5.0 — 2026-10-19
+
+**The Node OAuth sidecar is gone; Rust is the only backend (#311).**
+feather-reader.com has run the Rust backend since the 2026-09-13 cutover and
+sees no change; an instance still on the sidecar must set an encryption key
+first, and its readers sign in once (upgrade notes). The image is
+`debian:bookworm-slim` with no Node in it. Also: `readThrough` is a published
+date and is applied on import (#287 PR 3), and `saved.entryId` follows the
+item-id rule (#290), so read state and stars carry across readers more
+completely. Hardening: rate limiting is on by default for every route (#261),
+a feed URL can't reach the shared table unvetted (#260), hostile feeds can no
+longer simply hold every sanitize permit (#275), the last publication refusals
+are filed under what the PDS sent (#280), renames keep fields other clients
+added (#272), a malformed record no longer charges its siblings' documents to a
+shared read (#284), and OAuth client authentication and `iss` checks leave
+evidence in the log (#262). One schema change, which 0.4.10 can still boot on.
+Shipped as `v0.5.0-rc.1` to staging first (#294).
 
 ### Upgrade notes
 
@@ -64,6 +80,23 @@ deploying is separate.
     `FEATHERREADER_REPO_BACKEND=rust` on the release you roll back to.
   - Metric rows 0.4.x recorded under the `sidecar` backend stay in the
     database and are skipped when read.
+
+- **Record format: `saved.entryId` (#290).** New saved records carry the
+  publisher's id, a standard.site document's `at://` URI, or the link, rather
+  than FeatherReader's own stand-in, and omit it for an item with no portable
+  id. Records already written keep resolving: an old stand-in still matches.
+  Rolling back to 0.4.10 keeps reading the new records, which it matches by
+  `url`.
+
+- **Rate limiting covers every route by default (#261).** Nothing the reader's
+  pages send is newly limited. What is: `HEAD` on `/login`, `/claim` and
+  `/oauth/callback`, a GET to a POST-only route, methods other than GET, HEAD
+  and POST, and a POST that matched no route. A script that polls one of these
+  may now see `429`s.
+
+- **Capacity defaults are unchanged** (`max_feeds_global`, the poll batch, the
+  DB watermark). They are measured on this rc (#263) and any change ships in a
+  later release.
 
 ### Removed
 
@@ -350,6 +383,11 @@ deploying is separate.
   revoking the tokens at the PDS. Test:
   `purge_did_data_removes_only_the_callers_rows` now seeds an `oauth_state`
   row for both DIDs and checks only the victim's goes.
+
+### Dependencies
+
+- tokio bumped (#318); the GitHub Actions minor and patch group, 4 updates
+  (#319).
 
 ### CI
 
