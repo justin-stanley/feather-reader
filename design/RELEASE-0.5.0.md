@@ -308,13 +308,19 @@ defaults; for the release after, with the measurement re-run):
 - `max_feeds_global` set from storage rather than 10,000: either lower it to
   what the volume holds, or grow the Fly volume (about $0.15 per GB-month;
   10 GB holds roughly ten times as many feeds), after which throughput binds.
+  **Growing the volume alone changes nothing:** the watermark is a fixed byte
+  count (`FEATHERREADER_DB_SIZE_WATERMARK_BYTES = "805306368"` in `fly.toml`),
+  not a share of the volume, so polling would still pause at ~1,500 feeds. It
+  has to be raised with the volume, keeping the headroom the boot-time
+  watermark-vs-free-space check expects (found in review).
 - Compress stored bodies (#336): deflate-6 measured 2.78× on real bodies,
   about 1.9× more feeds per GB, in two releases so every rollback stays
   seamless.
 
 **For D4 (registration):** at the shipped defaults the instance holds about
 1,500 feeds of this mix before polling pauses, and serves about 3,000 an hour;
-both rise with the proposals above.
+both rise with the proposals above (the first only if the watermark rises with
+any bigger volume).
 
 ### Hardening that lands in 0.5.0 if ready
 
