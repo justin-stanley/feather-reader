@@ -353,6 +353,15 @@ deploying is separate.
 
 ### CI
 
+- **A capacity bench, `bench/` (#263).** A standalone crate, like `bot/`:
+  `synthfeeds` serves N deterministic RSS feeds with production-like body
+  sizes, churn, `304`s and a fixed share of slow, 404, 500 and oversized feeds,
+  and prints the SQL that registers them; `collect.sh` samples a running
+  instance's memory, CPU and database (read-only) into CSV. Its documents are
+  checked against the app's own parser (feed-rs). A new CI job gives it the
+  bot's gates (build, test, clippy, fmt, deny, audit). The measurement itself
+  runs on staging on `v0.5.0-rc.1`; see `bench/README.md`.
+
 - **The upgrade-boot gate runs no Node in an image (#311).** It health-checked
   the candidate with `docker exec … node -e fetch(…)` and seeded the previous
   release's database with `node:sqlite` from the previous image. 0.5.0 removes
