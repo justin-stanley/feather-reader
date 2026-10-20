@@ -7,9 +7,18 @@
 //! the worst; zstd was no smaller without a dictionary and needs a C library
 //! (the spike's numbers are on #336).
 //!
-//! **Format:** one tag byte, then the codec's bytes. The tag is what lets a
-//! later release change codec without another column: a reader that meets a
-//! tag it doesn't know treats the blob as no body, never as text.
+//! **Format:** one tag byte, then the codec's bytes. The tag says two things:
+//! the codec, and whether the blob is **the only copy** of the body or a copy
+//! **beside** the plain `content_html` ([`StoredAs`]). A reader that meets a tag it
+//! doesn't know treats the blob as no body, never as text.
+//!
+//! **Why the second thing is in the tag** (found in review): a row whose plain
+//! copy is NULL is ambiguous without it. Step 2 of #336 stores rows with only
+//! a compressed copy, but 0.5.0, after a rollback, also leaves rows like that:
+//! it doesn't know `content_z`, so when a publisher removes a body it clears
+//! `content_html` and leaves the old compressed copy behind. A copy written
+//! beside a plain one is never the body on its own; only one written as the
+//! only copy is.
 //!
 //! **Bounded on the way out.** A blob is decompressed to at most `max` bytes,
 //! the cap the body was stored under, so a corrupt or tampered row can't
@@ -18,15 +27,38 @@
 
 use std::io::Write;
 
-/// Deflate (RFC 1951), level 6, via `flate2`'s pure-Rust `miniz_oxide` backend.
+/// Deflate (RFC 1951), level 6, via `flate2`'s pure-Rust `miniz_oxide` backend,
+/// written **beside** a plain copy (#336 step 1). Never the body on its own.
 pub const TAG_DEFLATE: u8 = 1;
+
+/// The same codec, written as **the only copy** (#336 step 2). Read here so a
+/// rollback from step 2 to step 1 still reads step 2's rows.
+pub const TAG_DEFLATE_SOLE: u8 = 2;
+
+/// Which copy a decoded blob was, from its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredAs {
+    /// Written beside the plain copy: never the body on its own.
+    BesidePlain,
+    /// Written as the only copy: the body when the plain copy is NULL.
+    Sole,
+}
 
 const LEVEL: u32 = 6;
 
-/// `html` compressed, tagged.
+/// `html` compressed, tagged as written beside the plain copy.
 pub fn encode(html: &str) -> Vec<u8> {
+    encode_tagged(html, TAG_DEFLATE)
+}
+
+/// `html` compressed, tagged as the only copy. Step 2's writer (#336).
+pub fn encode_sole(html: &str) -> Vec<u8> {
+    encode_tagged(html, TAG_DEFLATE_SOLE)
+}
+
+fn encode_tagged(html: &str, tag: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(html.len() / 2 + 8);
-    out.push(TAG_DEFLATE);
+    out.push(tag);
     let mut enc = flate2::write::DeflateEncoder::new(out, flate2::Compression::new(LEVEL));
     // Writing to a `Vec` cannot fail.
     enc.write_all(html.as_bytes())
@@ -43,11 +75,18 @@ pub fn encode(html: &str) -> Vec<u8> {
 /// (found by this module's tests); a cut-off article must be no body, never a
 /// partial one shown as whole.
 pub fn decode(blob: &[u8], max: usize) -> Option<String> {
+    decode_tagged(blob, max).map(|(_, body)| body)
+}
+
+/// [`decode`], with how the blob says it was [`StoredAs`] says it is.
+pub fn decode_tagged(blob: &[u8], max: usize) -> Option<(StoredAs, String)> {
     use flate2::{Decompress, FlushDecompress, Status};
     let (&tag, rest) = blob.split_first()?;
-    if tag != TAG_DEFLATE {
-        return None;
-    }
+    let copy = match tag {
+        TAG_DEFLATE => StoredAs::BesidePlain,
+        TAG_DEFLATE_SOLE => StoredAs::Sole,
+        _ => return None,
+    };
     let mut inflate = Decompress::new(false); // raw deflate, no zlib header
     let mut out: Vec<u8> = Vec::with_capacity(rest.len().saturating_mul(4).clamp(64, max + 1));
     loop {
@@ -84,7 +123,7 @@ pub fn decode(blob: &[u8], max: usize) -> Option<String> {
     if inflate.total_in() as usize != rest.len() {
         return None; // bytes after the end of the stream
     }
-    String::from_utf8(out).ok()
+    String::from_utf8(out).ok().map(|body| (copy, body))
 }
 
 #[cfg(test)]
@@ -119,6 +158,15 @@ mod tests {
         }
     }
 
+    /// The tag says which copy a blob is, and both decode to the body.
+    #[test]
+    fn the_tag_says_which_copy() {
+        let beside = decode_tagged(&encode("<p>b</p>"), MAX);
+        assert_eq!(beside, Some((StoredAs::BesidePlain, "<p>b</p>".into())));
+        let sole = decode_tagged(&encode_sole("<p>s</p>"), MAX);
+        assert_eq!(sole, Some((StoredAs::Sole, "<p>s</p>".into())));
+    }
+
     #[test]
     fn a_typical_body_is_smaller_compressed() {
         let body = "<p>Some ordinary prose with a <a href=\"https://example.com/\">link</a>.</p>\n"
@@ -143,7 +191,7 @@ mod tests {
         assert_eq!(decode(&[], MAX), None, "empty");
         assert_eq!(decode(&[TAG_DEFLATE], MAX), None, "a tag with no stream");
         let mut unknown = encode("<p>x</p>");
-        unknown[0] = 2;
+        unknown[0] = 3;
         assert_eq!(decode(&unknown, MAX), None, "unknown tag");
         assert_eq!(
             decode(&[TAG_DEFLATE, 0xff, 0x00, 0x13, 0x37], MAX),

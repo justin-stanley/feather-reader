@@ -97,9 +97,9 @@ pub struct Entry {
     /// unescaped (#151). Ingest sanitizing is still what keeps the stored
     /// value clean, and a clean value is what re-cleans byte-identically.
     ///
-    /// **Read from `content_z` first** (#336): the compressed copy, decoded
-    /// within `MAX_CONTENT_HTML_BYTES`. A row without one, or one that won't
-    /// decode, falls back to the `content_html` column. See the `FromRow` impl.
+    /// **Which stored copy this is** (#336): `content_html` when the row has
+    /// one; else a compressed `content_z` written as the only copy, decoded
+    /// within `MAX_CONTENT_HTML_BYTES`; else none. See the `FromRow` impl.
     pub content_html: Option<String>,
     /// When FeatherReader first fetched/stored this entry (RFC3339).
     pub fetched_at: String,
@@ -108,37 +108,38 @@ pub struct Entry {
 /// By hand, for one reason: which of the two stored copies is the body (#336).
 /// Every other column maps as the derive did.
 ///
-/// **While both are written, the plain copy is the authority.** A row with
-/// both uses `content_z` only when it decodes to exactly `content_html`;
-/// otherwise it uses `content_html`, and says so. The two differ when a writer
-/// that doesn't know `content_z` (0.5.0, after a rollback) updated the plain
-/// copy and left the compressed one behind: preferring `content_z` there showed
-/// the article as it was before the rollback, for as long as the row lived
-/// (found in review). `content_z` alone is the body only where `content_html`
-/// is NULL, which is how the next step stores rows. A compressed copy that
-/// won't decode is no body, never garbled text.
+/// **The plain copy, when there is one.** `content_z` is the body only where
+/// `content_html` is NULL **and** its tag says it was written as the only copy
+/// (`body_codec::StoredAs::Sole`, step 2's rows). Two cases this rules out, both
+/// left by 0.5.0 after a rollback, which never touches `content_z` (found in
+/// review, one after the other):
+/// - it re-stored an edited body in `content_html`: the stale compressed copy
+///   differs, and the plain one is shown;
+/// - it cleared a body the publisher removed: the compressed copy, tagged as
+///   written beside a plain one, is not the body, so there is none.
+///
+/// A compressed copy that won't decode is never shown as text.
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use crate::body_codec::StoredAs;
         let id: i64 = row.try_get("id")?;
         let plain: Option<String> = row.try_get("content_html")?;
         // Absent from a projection that never selected it: read the plain copy.
         let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
-        let decoded = packed.as_deref().map(|z| {
-            let body = crate::body_codec::decode(z, crate::feed::MAX_CONTENT_HTML_BYTES);
-            if body.is_none() {
+        let decoded = packed.as_deref().and_then(|z| {
+            let got = crate::body_codec::decode_tagged(z, crate::feed::MAX_CONTENT_HTML_BYTES);
+            if got.is_none() {
                 tracing::warn!(
                     entry = id,
                     bytes = z.len(),
                     "a stored compressed body would not decode"
                 );
             }
-            body
+            got
         });
         let content_html = match (plain, decoded) {
-            (None, Some(body)) => body,
-            (plain, None) => plain,
-            (Some(plain), Some(body)) => {
-                if body.as_deref() != Some(plain.as_str()) {
+            (Some(plain), decoded) => {
+                if decoded.as_ref().is_some_and(|(_, body)| *body != plain) {
                     tracing::warn!(
                         entry = id,
                         "the compressed body differs from the plain one (written by an older \
@@ -147,6 +148,16 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
                 }
                 Some(plain)
             }
+            (None, Some((StoredAs::Sole, body))) => Some(body),
+            (None, Some((StoredAs::BesidePlain, _))) => {
+                tracing::warn!(
+                    entry = id,
+                    "a compressed body written beside a plain one has no plain one now (cleared \
+                     by an older release after a rollback?); no body"
+                );
+                None
+            }
+            (None, None) => None,
         };
         Ok(Entry {
             id,
@@ -455,8 +466,9 @@ CREATE TABLE IF NOT EXISTS entries (
     -- every re-poll.
     guid_synthesized INTEGER NOT NULL DEFAULT 0,
     -- The body compressed (`body_codec`: a tag byte, then deflate), written
-    -- beside `content_html` from 0.5.1 (#336). Read in preference to it; 0.5.0
-    -- reads only `content_html`, which is why both are written for a release.
+    -- beside `content_html` from 0.5.1 (#336). While a row has `content_html`,
+    -- that is the body; this is the body alone only when its tag says it was
+    -- written as the only copy (#336 step 2). 0.5.0 reads only `content_html`.
     content_z    BLOB,
     UNIQUE (feed_id, guid)
 );
@@ -6555,9 +6567,9 @@ mod tests {
         Ok(())
     }
 
-    /// **Which copy is the body** (#336): the plain one while both exist and
-    /// differ, the compressed one only where the plain one is gone, and never a
-    /// compressed copy that won't decode.
+    /// **Which copy is the body** (#336): the plain one whenever it exists; a
+    /// compressed one alone only if it was written as the only copy; and never
+    /// a compressed copy that won't decode.
     #[tokio::test]
     async fn the_read_uses_the_plain_copy_as_authority_while_both_are_written() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
@@ -6579,9 +6591,8 @@ mod tests {
         };
         assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>A</p>"));
 
-        // **The rollback case** (found in review): 0.5.0 re-polls an edited
-        // article and updates only the plain copy. After upgrading again, the
-        // read must show B, not the stale compressed A.
+        // **Rollback, case 1** (found in review): 0.5.0 re-stores an edited
+        // body in the plain copy only. After upgrading again: B, not stale A.
         set("UPDATE entries SET content_html = '<p>B</p>' WHERE guid = 'r'").await?;
         assert_eq!(
             body_of(&pool, "r").await?.as_deref(),
@@ -6589,16 +6600,30 @@ mod tests {
             "a stale compressed copy hid the plain one"
         );
 
-        // Step 2's rows: no plain copy, so the compressed one is the body.
+        // **Rollback, case 2** (found in the next review): 0.5.0 clears a body
+        // the publisher removed. The compressed copy left behind was written
+        // beside a plain one, so it is not the body: there is none.
         set("UPDATE entries SET content_html = NULL WHERE guid = 'r'").await?;
         assert_eq!(
+            body_of(&pool, "r").await?,
+            None,
+            "a body the publisher removed came back from its stale compressed copy"
+        );
+
+        // Step 2's rows: no plain copy and a compressed one written as the only
+        // copy. That one is the body.
+        sqlx::query("UPDATE entries SET content_z = ?1 WHERE guid = 'r'")
+            .bind(crate::body_codec::encode_sole("<p>S</p>"))
+            .execute(&pool)
+            .await?;
+        assert_eq!(
             body_of(&pool, "r").await?.as_deref(),
-            Some("<p>A</p>"),
-            "a row with only a compressed copy was not decoded"
+            Some("<p>S</p>"),
+            "a row with only a compressed copy, written as such, was not decoded"
         );
 
         // A compressed copy that won't decode is no body, never garbage...
-        set("UPDATE entries SET content_z = x'01ff0013' WHERE guid = 'r'").await?;
+        set("UPDATE entries SET content_z = x'02ff0013' WHERE guid = 'r'").await?;
         assert_eq!(body_of(&pool, "r").await?, None);
         // ...and beside a plain copy, the plain copy is used.
         set("UPDATE entries SET content_html = '<p>C</p>' WHERE guid = 'r'").await?;

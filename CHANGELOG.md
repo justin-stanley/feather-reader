@@ -23,9 +23,11 @@ deploying is separate.
   release writes it **beside** `content_html`, not instead of it; rows written
   before it keep only `content_html`. **Rolling back to 0.5.0 works**: it never
   names the column and finds every body in `content_html`. **Upgrading again
-  after a rollback is safe too**: 0.5.0 updates only the plain copy, so while
-  both are written the plain copy is the authority, and a compressed copy it
-  left behind is never shown in its place. **Cost:** new rows store each body twice for
+  after a rollback is safe too.** 0.5.0 updates only the plain copy, editing
+  a body or clearing one the publisher removed, and leaves the compressed copy
+  behind. So the plain copy is always the body when there is one, and a
+  compressed copy is the body on its own only if its tag says it was written
+  as the only copy, which this release never does (step 2 will). **Cost:** new rows store each body twice for
   one release, about a quarter more database per new entry (bodies are ~73% of
   the file and compress ~2.8×); on feather-reader.com that is ~20 MB, far under
   the 768 MiB watermark. The next release stops writing `content_html` and
@@ -42,13 +44,17 @@ deploying is separate.
   `insert_entries` compresses every body on the blocking pool before its
   transaction, so neither the write lock nor an async worker is held while
   deflating (a body may be 2 MiB), and keep-stored keeps or replaces both
-  columns together. `Entry` is read by hand, and **while both copies are
-  written, the plain one is the authority**: a row uses `content_z` only where
-  `content_html` is NULL (how the next step stores rows); where both exist and
-  differ, which is what 0.5.0 leaves after a rollback by updating only the plain
-  copy, it uses `content_html` and logs it. Preferring `content_z` there showed
-  the article as it was before the rollback (found in review). Decoding is
-  **complete or
+  columns together. `Entry` is read by hand: **the plain copy is the body
+  whenever there is one**, and `content_z` alone only where `content_html` is
+  NULL **and** its tag says it was written as the only copy. The tag byte now
+  carries that as well as the codec: `1` is "beside a plain copy" (written
+  here, never the body on its own), `2` is "the only copy" (step 2's rows,
+  already decoded here so a rollback from step 2 reads them). Two reviews found
+  what each half rules out, both left by 0.5.0 after a rollback: an edited body
+  re-stored only in the plain copy (preferring `content_z` showed the
+  pre-rollback article), and a body the publisher removed, cleared only in the
+  plain copy (treating any NULL plain copy as "compressed only" brought it
+  back). Decoding is **complete or
   nothing**: the stream must reach its end marker and use every input byte,
   within `MAX_CONTENT_HTML_BYTES`, and be UTF-8; anything else is no body,
   logged, and the plain copy is used. Two bugs in the first draft were caught
