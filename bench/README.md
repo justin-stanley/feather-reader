@@ -80,6 +80,29 @@ On apps, with the owner's go for the tunnel entry and the staging changes:
 8. **Restore**: CPU cap off, the DB from the snapshot, `synthfeeds` stopped,
    the tunnel hostname removed.
 
+## Lessons from the first run (2026-10-19)
+
+- **Probe the app inside the container.** Staging's Caddy answers `403` to
+  anything without the Cloudflare origin header, so a probe of
+  `127.0.0.1:8095/` times the refusal. Enter the container's network namespace
+  instead: `nsenter -t "$(docker inspect -f '{{.State.Pid}}' featherreader-staging)" -n curl http://127.0.0.1:8082/stats`.
+- **apps has no `sqlite3`.** A small Python stand-in on `PATH` that handles the
+  two forms used here (a read-only query with `-separator`, and applying SQL
+  from stdin) worked; Python's `sqlite3` module is on the host.
+- **Hold the deploy lock** (`flock` on the stack's `.deploy.lock`) for a run that
+  changes staging's settings, so an auto-deploy can't recreate the container
+  mid-run.
+- **Change settings with a compose override** (`docker compose -f compose.yaml
+  -f override.yaml up -d`), not by editing `compose.yaml`; put it back with
+  `compose.yaml` alone. A run past the watermark needs it raised, or polling
+  pauses and throughput can't be measured.
+- **Check edge caching once:** `cf-cache-status: DYNAMIC` on a feed means every
+  poll reaches `synthfeeds`.
+- **Don't `pkill -f` a pattern from the same remote shell:** it matches the
+  shell's own command line. Stop by PID.
+
+Results: design/RELEASE-0.5.0.md §7.
+
 ## From numbers to settings
 
 - **Poll batch / concurrency**: the highest throughput with peak memory under
