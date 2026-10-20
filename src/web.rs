@@ -1600,6 +1600,13 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.5.1",
+        date: "2026-10-20",
+        summary: "Article bodies are now also stored compressed, so the next \
+                  release can store far more feeds in the same space. Nothing \
+                  you read changes.",
+    },
+    Release {
         version: "0.5.0",
         date: "2026-10-20",
         summary: "FeatherReader now runs as one Rust program, with nothing \
@@ -8585,7 +8592,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#050--2026-10-20"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#051--2026-10-20"
         );
     }
 
