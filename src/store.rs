@@ -77,7 +77,7 @@ pub struct Feed {
 }
 
 /// A cached article/item belonging to a [`Feed`]. Shared cache (not per-DID).
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub id: i64,
     pub feed_id: i64,
@@ -96,9 +96,49 @@ pub struct Entry {
     /// [`crate::sanitized_html::SanitizedHtml`], and never emits this `String`
     /// unescaped (#151). Ingest sanitizing is still what keeps the stored
     /// value clean, and a clean value is what re-cleans byte-identically.
+    ///
+    /// **Read from `content_z` first** (#336): the compressed copy, decoded
+    /// within `MAX_CONTENT_HTML_BYTES`. A row without one, or one that won't
+    /// decode, falls back to the `content_html` column. See the `FromRow` impl.
     pub content_html: Option<String>,
     /// When FeatherReader first fetched/stored this entry (RFC3339).
     pub fetched_at: String,
+}
+
+/// By hand, for one reason: the body comes from `content_z` when it decodes,
+/// else from `content_html` (#336). Every other column maps as the derive did.
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        let id: i64 = row.try_get("id")?;
+        let plain: Option<String> = row.try_get("content_html")?;
+        // Absent from a projection that never selected it: read the plain copy.
+        let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
+        let content_html = match packed {
+            None => plain,
+            Some(z) => match crate::body_codec::decode(&z, crate::feed::MAX_CONTENT_HTML_BYTES) {
+                Some(body) => Some(body),
+                None => {
+                    tracing::warn!(
+                        entry = id,
+                        bytes = z.len(),
+                        "a stored compressed body would not decode; using the plain copy"
+                    );
+                    plain
+                }
+            },
+        };
+        Ok(Entry {
+            id,
+            feed_id: row.try_get("feed_id")?,
+            guid: row.try_get("guid")?,
+            url: row.try_get("url")?,
+            title: row.try_get("title")?,
+            author: row.try_get("author")?,
+            published: row.try_get("published")?,
+            content_html,
+            fetched_at: row.try_get("fetched_at")?,
+        })
+    }
 }
 
 /// One row of a LIST view — deliberately **without** `content_html`.
@@ -393,6 +433,10 @@ CREATE TABLE IF NOT EXISTS entries (
     -- by its `url`, 2 is left out (local-only). Set by ingest; refreshed on
     -- every re-poll.
     guid_synthesized INTEGER NOT NULL DEFAULT 0,
+    -- The body compressed (`body_codec`: a tag byte, then deflate), written
+    -- beside `content_html` from 0.5.1 (#336). Read in preference to it; 0.5.0
+    -- reads only `content_html`, which is why both are written for a release.
+    content_z    BLOB,
     UNIQUE (feed_id, guid)
 );
 -- The list and prev/next queries order on `COALESCE(published, fetched_at)`
@@ -964,6 +1008,17 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
             .await
             .context("commit the guid_synthesized migration")?;
     }
+
+    // entries.content_z — the body compressed (#336), from 0.5.1. Added after
+    // guid_synthesized so an upgraded table has the fresh column order. Rows
+    // written before it stay NULL here and are read from `content_html`.
+    ensure_column(
+        pool,
+        "PRAGMA table_info(entries)",
+        "content_z",
+        "ALTER TABLE entries ADD COLUMN content_z BLOB",
+    )
+    .await?;
 
     // read_cursor.watermark_basis — `read_through` is a PUBLISHED date from
     // 0.5.0 (#287 PR 3). Before, compaction measured it on
@@ -1977,6 +2032,14 @@ pub async fn insert_entries(
     entries: &[NewEntry],
     max_entries_per_feed: i64,
 ) -> Result<u64> {
+    // Compressed BEFORE the transaction, so the write lock is never held
+    // while deflating (#336): one per entry, in the order the loop below binds
+    // them. ~70 µs for a typical body.
+    let mut packed = entries
+        .iter()
+        .map(|e| e.content_html.as_deref().map(crate::body_codec::encode))
+        .collect::<Vec<_>>()
+        .into_iter();
     let mut tx = pool.begin().await.context("begin insert_entries tx")?;
     let mut count: u64 = 0;
     // `entries` is ONE fetch of the feed (#287 review). Two id-less items that
@@ -2009,8 +2072,8 @@ pub async fn insert_entries(
             r#"
             INSERT INTO entries
                 (feed_id, guid, url, title, author, published, content_html, fetched_at,
-                 guid_synthesized)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
+                 guid_synthesized, content_z)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11)
             ON CONFLICT (feed_id, guid) DO UPDATE SET
                 url          = excluded.url,
                 title        = excluded.title,
@@ -2018,6 +2081,10 @@ pub async fn insert_entries(
                 published    = excluded.published,
                 content_html = CASE WHEN ?9 THEN entries.content_html
                                     ELSE excluded.content_html END,
+                -- Kept or replaced WITH content_html, never apart: the two are
+                -- one body in two forms (#336).
+                content_z    = CASE WHEN ?9 THEN entries.content_z
+                                    ELSE excluded.content_z END,
                 -- Refreshed on every poll: this is the back-fill for rows that
                 -- predate the column (#287).
                 guid_synthesized = excluded.guid_synthesized
@@ -2033,6 +2100,7 @@ pub async fn insert_entries(
         .bind(&fetched_at)
         .bind(e.keep_stored_content)
         .bind(flag)
+        .bind(packed.next().flatten())
         .execute(&mut *tx)
         .await
         .with_context(|| format!("insert entry {} failed", e.guid))?;
@@ -6007,7 +6075,7 @@ mod tests {
         // this green.
         let (sql, _) = list_entries_sql(ListView::All, None);
         assert!(
-            !sql.contains("content_html") && !sql.contains("e.*"),
+            !sql.contains("content_html") && !sql.contains("content_z") && !sql.contains("e.*"),
             "the list query reads the article body: {sql}"
         );
 
@@ -6382,6 +6450,157 @@ mod tests {
         assert_eq!(read().await?, 1, "the upsert did not refresh the flag");
         insert_entries(&pool, feed_id, &[row(false)], 0).await?;
         assert_eq!(read().await?, 0, "the parsed item decides, both ways");
+        Ok(())
+    }
+
+    // ---- #336: the body is written twice, and read compressed first --------
+
+    /// The body as the single-entry read sees it: `SELECT e.*` through
+    /// `Entry`'s `FromRow`, as `web::get_entry_by_id` does.
+    async fn body_of(pool: &SqlitePool, guid: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_as::<_, Entry>("SELECT e.* FROM entries e WHERE e.guid = ?1")
+                .bind(guid)
+                .fetch_one(pool)
+                .await?
+                .content_html,
+        )
+    }
+
+    async fn columns_of(
+        pool: &SqlitePool,
+        guid: &str,
+    ) -> Result<(Option<String>, Option<Vec<u8>>)> {
+        Ok(
+            sqlx::query_as("SELECT content_html, content_z FROM entries WHERE guid = ?1")
+                .bind(guid)
+                .fetch_one(pool)
+                .await?,
+        )
+    }
+
+    /// **Both columns are written, as one body** (#336 release N): the plain
+    /// copy for a rollback to 0.5.0, which reads only `content_html`, and the
+    /// compressed one, which decodes to the same text.
+    #[tokio::test]
+    async fn a_body_is_written_plain_and_compressed() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://z.example/f.xml").await?;
+        let body = "<p>Ünïcödé body, long enough to compress. </p>".repeat(50);
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "z1".into(),
+                content_html: Some(body.clone()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let (plain, packed) = columns_of(&pool, "z1").await?;
+        assert_eq!(plain.as_deref(), Some(body.as_str()), "the plain copy");
+        let packed = packed.expect("no compressed copy was written");
+        assert!(
+            packed.len() < body.len(),
+            "the compressed copy is not smaller"
+        );
+        assert_eq!(
+            crate::body_codec::decode(&packed, crate::feed::MAX_CONTENT_HTML_BYTES).as_deref(),
+            Some(body.as_str())
+        );
+        assert_eq!(body_of(&pool, "z1").await?.as_deref(), Some(body.as_str()));
+
+        // No body, no compressed copy.
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "z0".into(),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        assert_eq!(columns_of(&pool, "z0").await?, (None, None));
+        assert_eq!(body_of(&pool, "z0").await?, None);
+        Ok(())
+    }
+
+    /// **The read prefers the compressed copy, and falls back to the plain
+    /// one** when there is none (a row written before 0.5.1) or it won't decode.
+    #[tokio::test]
+    async fn the_read_prefers_content_z_and_falls_back_to_content_html() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://zr.example/f.xml").await?;
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "r".into(),
+                content_html: Some("<p>the body</p>".into()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        let set = |sql: &'static str| {
+            let pool = pool.clone();
+            async move { sqlx::query(sql).execute(&pool).await }
+        };
+
+        set("UPDATE entries SET content_html = '<p>plain differs</p>' WHERE guid = 'r'").await?;
+        assert_eq!(
+            body_of(&pool, "r").await?.as_deref(),
+            Some("<p>the body</p>"),
+            "the compressed copy was not preferred"
+        );
+
+        set("UPDATE entries SET content_z = NULL WHERE guid = 'r'").await?;
+        assert_eq!(
+            body_of(&pool, "r").await?.as_deref(),
+            Some("<p>plain differs</p>"),
+            "a row with no compressed copy did not read the plain one"
+        );
+
+        set("UPDATE entries SET content_z = x'01ff0013' WHERE guid = 'r'").await?;
+        assert_eq!(
+            body_of(&pool, "r").await?.as_deref(),
+            Some("<p>plain differs</p>"),
+            "a corrupt compressed copy did not fall back to the plain one"
+        );
+        Ok(())
+    }
+
+    /// **Keep-stored keeps both columns together** (#336): a poll that could
+    /// not sanitize a body leaves the stored one, in both forms, and a later
+    /// poll replaces both.
+    #[tokio::test]
+    async fn keep_stored_keeps_both_forms_of_the_body() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://zk.example/f.xml").await?;
+        let row = |body: Option<&str>, keep: bool| NewEntry {
+            guid: "k".into(),
+            content_html: body.map(str::to_owned),
+            keep_stored_content: keep,
+            ..Default::default()
+        };
+        insert_entries(&pool, feed_id, &[row(Some("<p>first</p>"), false)], 0).await?;
+        let first = columns_of(&pool, "k").await?;
+        insert_entries(&pool, feed_id, &[row(None, true)], 0).await?;
+        assert_eq!(
+            columns_of(&pool, "k").await?,
+            first,
+            "keep-stored changed a column"
+        );
+        insert_entries(&pool, feed_id, &[row(Some("<p>second</p>"), false)], 0).await?;
+        let (plain, packed) = columns_of(&pool, "k").await?;
+        assert_eq!(plain.as_deref(), Some("<p>second</p>"));
+        assert_eq!(
+            crate::body_codec::decode(&packed.expect("packed"), 1 << 20).as_deref(),
+            Some("<p>second</p>"),
+            "the compressed copy was not replaced with the plain one"
+        );
         Ok(())
     }
 
@@ -11204,6 +11423,18 @@ mod tests {
         assert_upgrades_from(
             "v0.4.10",
             include_str!("../tests/fixtures/schema-v0.4.10.sql"),
+            false,
+        )
+        .await
+    }
+
+    /// 0.5.0 is what 0.5.1 upgrades from (#336): it has `watermark_basis` and
+    /// `first_fetched_at`, and no `content_z`, which this release adds.
+    #[tokio::test]
+    async fn a_v0_5_0_database_upgrades_to_the_current_schema() -> Result<()> {
+        assert_upgrades_from(
+            "v0.5.0",
+            include_str!("../tests/fixtures/schema-v0.5.0.sql"),
             false,
         )
         .await

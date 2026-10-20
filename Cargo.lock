@@ -820,6 +820,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "feed-rs",
+ "flate2",
  "getrandom 0.4.3",
  "hickory-resolver",
  "libc",

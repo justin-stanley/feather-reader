@@ -35,6 +35,7 @@
 
 // The module tree; the layout owns the wiring between subsystems.
 pub mod atproto;
+pub mod body_codec;
 pub mod config;
 pub mod feed;
 pub mod lexicon;

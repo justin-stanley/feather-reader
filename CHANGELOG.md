@@ -14,6 +14,41 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Upgrade notes
+
+- **Schema: `entries.content_z` (#336).** Added by `ALTER TABLE` on first boot,
+  a nullable `BLOB`: each body compressed (a tag byte, then deflate). This
+  release writes it **beside** `content_html`, not instead of it, and reads it
+  first; rows written before it keep only `content_html` and are read from
+  there. **Rolling back to 0.5.0 works**: it never names the column and finds
+  every body in `content_html`. **Cost:** new rows store each body twice for
+  one release, about a quarter more database per new entry (bodies are ~73% of
+  the file and compress ~2.8×); on feather-reader.com that is ~20 MB, far under
+  the 768 MiB watermark. The next release stops writing `content_html` and
+  compresses older rows (#336 step 2), which is where the space comes back.
+
+### Changed
+
+- **Stored bodies are also written compressed, and read compressed first
+  (#336, step 1 of 2).** `body_codec` stores a body as one tag byte then
+  deflate at level 6 (`flate2` on its pure-Rust `miniz_oxide` backend, already
+  in the tree). #336's spike measured 2.78× on 3,190 real bodies from 50 feeds,
+  ~70 µs to compress a typical body and under a millisecond to decompress the
+  worst; zstd was no smaller without a dictionary and needs a C library.
+  `insert_entries` compresses every body before its transaction, so the write
+  lock is never held while deflating, and keep-stored keeps or replaces both
+  columns together. `Entry` is read by hand: the body comes from `content_z`
+  when it decodes, else from `content_html`. Decoding is **complete or
+  nothing**: the stream must reach its end marker and use every input byte,
+  within `MAX_CONTENT_HTML_BYTES`, and be UTF-8; anything else is no body,
+  logged, and the plain copy is used. Two bugs in the first draft were caught
+  by its tests: `flate2`'s `Read` adapter returned a truncated stream's prefix
+  as if it were the whole body, and decoding with `FlushDecompress::Finish`
+  failed for any body bigger than the first output buffer. A fixture of the
+  0.5.0 schema, generated from the released image, joins the upgrade tests.
+
 ## 0.5.0 — 2026-10-20
 
 **The Node OAuth sidecar is gone; Rust is the only backend (#311).**
