@@ -10196,6 +10196,20 @@ mod tests {
         )
         .await
         .unwrap();
+        // **As a plain row.** `insert_entries` stores bodies compressed, and a
+        // compressed copy over the cap decodes to no body at all (#336), so an
+        // over-size body can only reach the renderer as plain `content_html`:
+        // the writer that skipped `feed.rs`, or a row from before 0.5.2.
+        sqlx::query(
+            "UPDATE entries SET content_html = ?1, content_z = NULL WHERE guid = 'oversize-body'",
+        )
+        .bind(format!(
+            "<p>{}OVERSIZE</p>",
+            "a".repeat(crate::sanitized_html::MAX_RENDER_HTML_BYTES)
+        ))
+        .execute(&state.db)
+        .await
+        .unwrap();
         store::replace_sub_refs(&state.db, did, &[feed])
             .await
             .unwrap();
