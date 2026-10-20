@@ -7,7 +7,7 @@
 >
 > **Per-item status (audited 2026-10-05).** Stages 1–3 are done: PR #101, the
 > auto_vacuum migration run 2026-09-13 (ops runbook), and PR #110. Both
-> follow-ups are done. Stage 4 checks 1, 2 and 4 have no recorded evidence (issue #262).
+> follow-ups are done. Stage 4 check 4 is recorded, and 1 and 2 on staging; production evidence for 1 and 2 is pending (issue #262).
 
 Prod is **0.2.8 on the sidecar backend** (`curl https://feather-reader.com/health`
 → `ok featherreader/0.2.8`, checked 2026-09-13). `main` is 76 commits behind this
@@ -282,10 +282,13 @@ sidecar path never reads it.
 
 ## Stage 4 — prod tests
 
-> Status (audited 2026-10-05): 3 and 5 have run in practice, since every login
-> and sync has used the rust backend since PR #110. No captured evidence is
-> recorded for 1 (`client_assertion_type`), 2 (revocation response status) or 4
-> (a post-cutover `live_pds` run); tracked in issue #262.
+> Status (2026-10-19): 3 and 5 have run in practice, since every login and sync
+> has used the rust backend since PR #110. 4 is captured (below). 1 and 2 are
+> captured **on staging** (below), which runs the same code against a live PDS
+> but publishes its own client metadata and key: they show the code path, not
+> feather-reader.com's published key. **Production evidence for 1 and 2 is
+> pending**: the evidence lines ship in 0.5.0, so the first production sign-in
+> and sign-out after it deploys records them (issue #262 stays open for that).
 >
 > **4 — captured 2026-10-18** (`cargo test --lib -- --ignored --nocapture
 > live_pds`, against `justin-stanley.com`): resolved to
@@ -294,18 +297,23 @@ sidecar path never reads it.
 > mismatched issuer, by `same_issuer`"; revocation advertised at
 > `https://pds.justin-stanley.com/oauth/revoke`. Test passed.
 >
-> **1 and 2 — instrumented, capture pending.** Every client-authenticated
-> request now logs its evidence: `oauth client authentication` with `step`
-> (`par`, `token`, `refresh`, `revoke`), `client_auth` and `assertion_type`
-> read from the form actually sent, `endpoint_host` and `status`; and the
-> callback logs `authorization response \`iss\` matched (RFC 9207)`. No
-> secret is in either line. To capture: once staging runs `v0.5.0-rc.1`, sign
-> in and out with the staging test account, then
-> `docker logs featherreader-staging 2>&1 | grep -E "oauth client authentication|iss. matched"`.
-> Expected: `step="par"` and `step="token"` with
-> `client_auth="private_key_jwt"`, the jwt-bearer `assertion_type` and
-> `status=2xx` (1); `step="revoke"` with `status=200` (2). Record the lines here
-> and close #262.
+> **1 and 2 — captured 2026-10-19** on staging (`v0.5.0-rc.1`, image
+> `sha256:2d1bfa30…f2c2`, the published rc digest), signing the staging test
+> account in and out. From `docker logs featherreader-staging`:
+>
+> ```text
+> 13:11:07Z oauth client authentication step="par"    client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=201
+> 13:11:12Z authorization response `iss` matched (RFC 9207) issuer=https://pds.justin-stanley.com
+> 13:11:12Z oauth client authentication step="token"  client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=200
+> 13:11:28Z oauth client authentication step="revoke" client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=200
+> ```
+>
+> 1: the PDS fetched the client metadata and JWKS and accepted a
+> `private_key_jwt` assertion at PAR (201) and the token endpoint (200), and
+> the method is read from the form that was sent, not from configuration.
+> 2: RFC 7009 revocation answered 200 on sign-out. The callback's `iss` check
+> ran on a live response. **On production:** pending the first sign-in and
+> sign-out after 0.5.0 deploys (#262).
 
 These are the two claims that have been unverifiable from a dev box all along,
 because both require a real PDS to fetch our client metadata at the real
