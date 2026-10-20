@@ -29,7 +29,13 @@ version = 2
 #   ignore = [
 #     # RUSTSEC-YYYY-NNNN: <crate> — <why un-actionable> — <tracking link>
 #   ]
-ignore = []
+# Mirrored in .cargo/audit.toml, which is what the `cargo audit` CI job reads.
+ignore = [
+    # RUSTSEC-2026-0374: basic-toml unmaintained — compile-time only, via the
+    # askama_derive proc-macro reading our own askama.toml; askama 0.16.1 (newest)
+    # still depends on it — https://rustsec.org/advisories/RUSTSEC-2026-0374
+    "RUSTSEC-2026-0374",
+]
 
 [licenses]
 # version 2: `allow` is the allowlist; anything not listed is an error. We only

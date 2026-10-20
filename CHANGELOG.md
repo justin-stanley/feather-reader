@@ -14,6 +14,20 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### CI
+
+- **`cargo audit` ignores RUSTSEC-2026-0374 (`basic-toml` unmaintained), with
+  a reason.** The advisory, published 2026-09-26, failed the required audit
+  job on every PR. `basic-toml` comes in only through `askama_derive`, a
+  proc-macro that reads this repo's own `askama.toml` at compile time; it never
+  runs in the server or sees untrusted input, and it is unmaintained, not
+  vulnerable. `askama` 0.16.1 is the newest release and still depends on it,
+  so there is no upgrade to take. The exception is in `.cargo/audit.toml`
+  (what the job reads) and mirrored in `deny.toml`, to be dropped when askama
+  moves off `basic-toml`.
+
 ## 0.5.0 — 2026-10-19
 
 **The Node OAuth sidecar is gone; Rust is the only backend (#311).**
