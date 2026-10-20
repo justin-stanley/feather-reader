@@ -113,8 +113,8 @@ pub struct Entry {
 /// (`body_codec::StoredAs::Sole`, step 2's rows). Two cases this rules out, both
 /// left by 0.5.0 after a rollback, which never touches `content_z` (found in
 /// review, one after the other):
-/// - it re-stored an edited body in `content_html`: the stale compressed copy
-///   differs, and the plain one is shown;
+/// - it re-stored an edited body in `content_html`: the plain one is shown,
+///   and the stale compressed copy is not even decoded;
 /// - it cleared a body the publisher removed: the compressed copy, tagged as
 ///   written beside a plain one, is not the body, so there is none.
 ///
@@ -124,40 +124,41 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
         use crate::body_codec::StoredAs;
         let id: i64 = row.try_get("id")?;
         let plain: Option<String> = row.try_get("content_html")?;
-        // Absent from a projection that never selected it: read the plain copy.
-        let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
-        let decoded = packed.as_deref().and_then(|z| {
-            let got = crate::body_codec::decode_tagged(z, crate::feed::MAX_CONTENT_HTML_BYTES);
-            if got.is_none() {
-                tracing::warn!(
-                    entry = id,
-                    bytes = z.len(),
-                    "a stored compressed body would not decode"
-                );
-            }
-            got
-        });
-        let content_html = match (plain, decoded) {
-            (Some(plain), decoded) => {
-                if decoded.as_ref().is_some_and(|(_, body)| *body != plain) {
-                    tracing::warn!(
-                        entry = id,
-                        "the compressed body differs from the plain one (written by an older \
-                         release after a rollback?); using the plain one"
-                    );
+        // Decompressed ONLY when there is no plain copy: the plain copy is the
+        // body whenever it exists, so inflating up to 2 MiB to compare would be
+        // blocking work on an async worker on every view, and a stale row would
+        // log on every view too (found in review).
+        let content_html = match plain {
+            Some(plain) => Some(plain),
+            None => {
+                // Absent from a projection that never selected it: no body.
+                let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
+                match packed.as_deref().map(|z| {
+                    (
+                        z.len(),
+                        crate::body_codec::decode_tagged(z, crate::feed::MAX_CONTENT_HTML_BYTES),
+                    )
+                }) {
+                    None => None,
+                    Some((_, Some((StoredAs::Sole, body)))) => Some(body),
+                    Some((_, Some((StoredAs::BesidePlain, _)))) => {
+                        tracing::warn!(
+                            entry = id,
+                            "a compressed body written beside a plain one has no plain one now \
+                             (cleared by an older release after a rollback?); no body"
+                        );
+                        None
+                    }
+                    Some((bytes, None)) => {
+                        tracing::warn!(
+                            entry = id,
+                            bytes,
+                            "a stored compressed body would not decode"
+                        );
+                        None
+                    }
                 }
-                Some(plain)
             }
-            (None, Some((StoredAs::Sole, body))) => Some(body),
-            (None, Some((StoredAs::BesidePlain, _))) => {
-                tracing::warn!(
-                    entry = id,
-                    "a compressed body written beside a plain one has no plain one now (cleared \
-                     by an older release after a rollback?); no body"
-                );
-                None
-            }
-            (None, None) => None,
         };
         Ok(Entry {
             id,

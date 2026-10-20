@@ -35,8 +35,7 @@ deploying is separate.
 
 ### Changed
 
-- **Stored bodies are also written compressed, and read compressed first
-  (#336, step 1 of 2).** `body_codec` stores a body as one tag byte then
+- **Stored bodies are also written compressed (#336, step 1 of 2).** `body_codec` stores a body as one tag byte then
   deflate at level 6 (`flate2` on its pure-Rust `miniz_oxide` backend, already
   in the tree). #336's spike measured 2.78× on 3,190 real bodies from 50 feeds,
   ~70 µs to compress a typical body and under a millisecond to decompress the
@@ -45,8 +44,9 @@ deploying is separate.
   transaction, so neither the write lock nor an async worker is held while
   deflating (a body may be 2 MiB), and keep-stored keeps or replaces both
   columns together. `Entry` is read by hand: **the plain copy is the body
-  whenever there is one**, and `content_z` alone only where `content_html` is
-  NULL **and** its tag says it was written as the only copy. The tag byte now
+  whenever there is one** (and the compressed copy isn't even decoded then,
+  so a view does no extra inflating), and `content_z` alone only where
+  `content_html` is NULL **and** its tag says it was written as the only copy. The tag byte now
   carries that as well as the codec: `1` is "beside a plain copy" (written
   here, never the body on its own), `2` is "the only copy" (step 2's rows,
   already decoded here so a rollback from step 2 reads them). Two reviews found
