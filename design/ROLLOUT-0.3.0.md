@@ -7,7 +7,7 @@
 >
 > **Per-item status (audited 2026-10-05).** Stages 1–3 are done: PR #101, the
 > auto_vacuum migration run 2026-09-13 (ops runbook), and PR #110. Both
-> follow-ups are done. Stage 4 check 4 is recorded, and 1 and 2 on staging; production evidence for 1 and 2 is pending (issue #262).
+> follow-ups are done. All Stage 4 checks have recorded evidence, 1 and 2 on production since 2026-10-20 (issue #262).
 
 Prod is **0.2.8 on the sidecar backend** (`curl https://feather-reader.com/health`
 → `ok featherreader/0.2.8`, checked 2026-09-13). `main` is 76 commits behind this
@@ -282,13 +282,10 @@ sidecar path never reads it.
 
 ## Stage 4 — prod tests
 
-> Status (2026-10-19): 3 and 5 have run in practice, since every login and sync
-> has used the rust backend since PR #110. 4 is captured (below). 1 and 2 are
-> captured **on staging** (below), which runs the same code against a live PDS
-> but publishes its own client metadata and key: they show the code path, not
-> feather-reader.com's published key. **Production evidence for 1 and 2 is
-> pending**: the evidence lines ship in 0.5.0, so the first production sign-in
-> and sign-out after it deploys records them (issue #262 stays open for that).
+> Status (2026-10-20): **all five checks have evidence.** 3 and 5 have run in
+> practice since PR #110. 4 is captured (below). 1 and 2 are captured on staging
+> and, on 2026-10-20, **on production** against feather-reader.com's own
+> published client metadata and key (below). Issue #262 is closed.
 >
 > **4 — captured 2026-10-18** (`cargo test --lib -- --ignored --nocapture
 > live_pds`, against `justin-stanley.com`): resolved to
@@ -312,8 +309,22 @@ sidecar path never reads it.
 > `private_key_jwt` assertion at PAR (201) and the token endpoint (200), and
 > the method is read from the form that was sent, not from configuration.
 > 2: RFC 7009 revocation answered 200 on sign-out. The callback's `iss` check
-> ran on a live response. **On production:** pending the first sign-in and
-> sign-out after 0.5.0 deploys (#262).
+> ran on a live response.
+>
+> **1 and 2 — on production, 2026-10-20** (`0.5.0`, Fly release v41, image
+> `sha256:ec5d453f…f4b82`), the first sign-in and sign-out after the deploy.
+> From `fly logs -a featherreader`:
+>
+> ```text
+> 21:07:02Z oauth client authentication step="par"    client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=201
+> 21:07:13Z authorization response `iss` matched (RFC 9207) issuer=https://pds.justin-stanley.com
+> 21:07:13Z oauth client authentication step="token"  client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=200
+> 21:07:25Z oauth client authentication step="revoke" client_auth="private_key_jwt" assertion_type="urn:ietf:params:oauth:client-assertion-type:jwt-bearer" endpoint_host=pds.justin-stanley.com status=200
+> ```
+>
+> The PDS fetched `https://feather-reader.com/oauth/client-metadata.json` and
+> the JWKS and verified the assertion against production's published key at
+> PAR (201) and the token endpoint (200); revocation answered 200 (#262).
 
 These are the two claims that have been unverifiable from a dev box all along,
 because both require a real PDS to fetch our client metadata at the real
