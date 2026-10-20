@@ -68,6 +68,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 # pinned to askama <0.13). `askama_web` provides the axum IntoResponse glue.
 # Default features minus `config`, which only reads an `askama.toml` (this repo
 # has none) and is what pulls in `basic-toml`, unmaintained (RUSTSEC-2026-0374).
+# Compressed article bodies (#336): deflate on the pure-Rust `miniz_oxide`
+# backend, already in the tree through reqwest's gzip support.
+flate2 = "1"
 askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
 askama_web = { version = "0.16", features = ["axum-0.8"] }
 

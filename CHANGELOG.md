@@ -14,6 +14,55 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Upgrade notes
+
+- **Schema: `entries.content_z` (#336).** Added by `ALTER TABLE` on first boot,
+  a nullable `BLOB`: each body compressed (a tag byte, then deflate). This
+  release writes it **beside** `content_html`, not instead of it; rows written
+  before it keep only `content_html`. **Rolling back to 0.5.0 works**: it never
+  names the column and finds every body in `content_html`. **Upgrading again
+  after a rollback is safe too.** 0.5.0 updates only the plain copy, editing
+  a body or clearing one the publisher removed, and leaves the compressed copy
+  behind. So the plain copy is always the body when there is one, and a
+  compressed copy is the body on its own only if its tag says it was written
+  as the only copy, which this release never does (step 2 will). **Cost:** new rows store each body twice for
+  one release, about a quarter more database per new entry (bodies are ~73% of
+  the file and compress ~2.8×); on feather-reader.com that is ~20 MB, far under
+  the 768 MiB watermark. The next release stops writing `content_html` and
+  compresses older rows (#336 step 2), which is where the space comes back.
+
+### Changed
+
+- **Stored bodies are also written compressed (#336, step 1 of 2).** `body_codec` stores a body as one tag byte then
+  deflate at level 6 (`flate2` on its pure-Rust `miniz_oxide` backend, already
+  in the tree). #336's spike measured 2.78× on 3,190 real bodies from 50 feeds,
+  ~70 µs to compress a typical body and under a millisecond to decompress the
+  worst; zstd was no smaller without a dictionary and needs a C library.
+  `insert_entries` compresses every body on the blocking pool before its
+  transaction, so neither the write lock nor an async worker is held while
+  deflating (a body may be 2 MiB), and keep-stored keeps or replaces both
+  columns together. `Entry` is read by hand: **the plain copy is the body
+  whenever there is one** (and the compressed copy isn't even decoded then,
+  so a view does no extra inflating), and `content_z` alone only where
+  `content_html` is NULL **and** its tag says it was written as the only copy. The tag byte now
+  carries that as well as the codec: `1` is "beside a plain copy" (written
+  here, never the body on its own), `2` is "the only copy" (step 2's rows,
+  already decoded here so a rollback from step 2 reads them). Two reviews found
+  what each half rules out, both left by 0.5.0 after a rollback: an edited body
+  re-stored only in the plain copy (preferring `content_z` showed the
+  pre-rollback article), and a body the publisher removed, cleared only in the
+  plain copy (treating any NULL plain copy as "compressed only" brought it
+  back). Decoding is **complete or
+  nothing**: the stream must reach its end marker and use every input byte,
+  within `MAX_CONTENT_HTML_BYTES`, and be UTF-8; anything else is no body,
+  logged, and the plain copy is used. Two bugs in the first draft were caught
+  by its tests: `flate2`'s `Read` adapter returned a truncated stream's prefix
+  as if it were the whole body, and decoding with `FlushDecompress::Finish`
+  failed for any body bigger than the first output buffer. A fixture of the
+  0.5.0 schema, generated from the released image, joins the upgrade tests.
+
 ## 0.5.0 — 2026-10-20
 
 **The Node OAuth sidecar is gone; Rust is the only backend (#311).**
