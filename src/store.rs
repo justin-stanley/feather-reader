@@ -105,27 +105,48 @@ pub struct Entry {
     pub fetched_at: String,
 }
 
-/// By hand, for one reason: the body comes from `content_z` when it decodes,
-/// else from `content_html` (#336). Every other column maps as the derive did.
+/// By hand, for one reason: which of the two stored copies is the body (#336).
+/// Every other column maps as the derive did.
+///
+/// **While both are written, the plain copy is the authority.** A row with
+/// both uses `content_z` only when it decodes to exactly `content_html`;
+/// otherwise it uses `content_html`, and says so. The two differ when a writer
+/// that doesn't know `content_z` (0.5.0, after a rollback) updated the plain
+/// copy and left the compressed one behind: preferring `content_z` there showed
+/// the article as it was before the rollback, for as long as the row lived
+/// (found in review). `content_z` alone is the body only where `content_html`
+/// is NULL, which is how the next step stores rows. A compressed copy that
+/// won't decode is no body, never garbled text.
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
         let id: i64 = row.try_get("id")?;
         let plain: Option<String> = row.try_get("content_html")?;
         // Absent from a projection that never selected it: read the plain copy.
         let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
-        let content_html = match packed {
-            None => plain,
-            Some(z) => match crate::body_codec::decode(&z, crate::feed::MAX_CONTENT_HTML_BYTES) {
-                Some(body) => Some(body),
-                None => {
+        let decoded = packed.as_deref().map(|z| {
+            let body = crate::body_codec::decode(z, crate::feed::MAX_CONTENT_HTML_BYTES);
+            if body.is_none() {
+                tracing::warn!(
+                    entry = id,
+                    bytes = z.len(),
+                    "a stored compressed body would not decode"
+                );
+            }
+            body
+        });
+        let content_html = match (plain, decoded) {
+            (None, Some(body)) => body,
+            (plain, None) => plain,
+            (Some(plain), Some(body)) => {
+                if body.as_deref() != Some(plain.as_str()) {
                     tracing::warn!(
                         entry = id,
-                        bytes = z.len(),
-                        "a stored compressed body would not decode; using the plain copy"
+                        "the compressed body differs from the plain one (written by an older \
+                         release after a rollback?); using the plain one"
                     );
-                    plain
                 }
-            },
+                Some(plain)
+            }
         };
         Ok(Entry {
             id,
@@ -2032,14 +2053,21 @@ pub async fn insert_entries(
     entries: &[NewEntry],
     max_entries_per_feed: i64,
 ) -> Result<u64> {
-    // Compressed BEFORE the transaction, so the write lock is never held
-    // while deflating (#336): one per entry, in the order the loop below binds
+    // Compressed BEFORE the transaction, so the write lock is never held while
+    // deflating, and on the blocking pool, so an async worker isn't either
+    // (#336; the second found in review): a body may be 2 MiB, and every poll
+    // re-stores every body. One per entry, in the order the loop below binds
     // them. ~70 µs for a typical body.
-    let mut packed = entries
-        .iter()
-        .map(|e| e.content_html.as_deref().map(crate::body_codec::encode))
-        .collect::<Vec<_>>()
-        .into_iter();
+    let bodies: Vec<Option<String>> = entries.iter().map(|e| e.content_html.clone()).collect();
+    let mut packed = tokio::task::spawn_blocking(move || {
+        bodies
+            .iter()
+            .map(|b| b.as_deref().map(crate::body_codec::encode))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("compressing entry bodies")?
+    .into_iter();
     let mut tx = pool.begin().await.context("begin insert_entries tx")?;
     let mut count: u64 = 0;
     // `entries` is ONE fetch of the feed (#287 review). Two id-less items that
@@ -6527,10 +6555,11 @@ mod tests {
         Ok(())
     }
 
-    /// **The read prefers the compressed copy, and falls back to the plain
-    /// one** when there is none (a row written before 0.5.1) or it won't decode.
+    /// **Which copy is the body** (#336): the plain one while both exist and
+    /// differ, the compressed one only where the plain one is gone, and never a
+    /// compressed copy that won't decode.
     #[tokio::test]
-    async fn the_read_prefers_content_z_and_falls_back_to_content_html() -> Result<()> {
+    async fn the_read_uses_the_plain_copy_as_authority_while_both_are_written() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let feed_id = feed_for_item_ids(&pool, "https://zr.example/f.xml").await?;
         insert_entries(
@@ -6538,7 +6567,7 @@ mod tests {
             feed_id,
             &[NewEntry {
                 guid: "r".into(),
-                content_html: Some("<p>the body</p>".into()),
+                content_html: Some("<p>A</p>".into()),
                 ..Default::default()
             }],
             0,
@@ -6548,27 +6577,36 @@ mod tests {
             let pool = pool.clone();
             async move { sqlx::query(sql).execute(&pool).await }
         };
+        assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>A</p>"));
 
-        set("UPDATE entries SET content_html = '<p>plain differs</p>' WHERE guid = 'r'").await?;
+        // **The rollback case** (found in review): 0.5.0 re-polls an edited
+        // article and updates only the plain copy. After upgrading again, the
+        // read must show B, not the stale compressed A.
+        set("UPDATE entries SET content_html = '<p>B</p>' WHERE guid = 'r'").await?;
         assert_eq!(
             body_of(&pool, "r").await?.as_deref(),
-            Some("<p>the body</p>"),
-            "the compressed copy was not preferred"
+            Some("<p>B</p>"),
+            "a stale compressed copy hid the plain one"
         );
 
-        set("UPDATE entries SET content_z = NULL WHERE guid = 'r'").await?;
+        // Step 2's rows: no plain copy, so the compressed one is the body.
+        set("UPDATE entries SET content_html = NULL WHERE guid = 'r'").await?;
         assert_eq!(
             body_of(&pool, "r").await?.as_deref(),
-            Some("<p>plain differs</p>"),
-            "a row with no compressed copy did not read the plain one"
+            Some("<p>A</p>"),
+            "a row with only a compressed copy was not decoded"
         );
 
+        // A compressed copy that won't decode is no body, never garbage...
         set("UPDATE entries SET content_z = x'01ff0013' WHERE guid = 'r'").await?;
-        assert_eq!(
-            body_of(&pool, "r").await?.as_deref(),
-            Some("<p>plain differs</p>"),
-            "a corrupt compressed copy did not fall back to the plain one"
-        );
+        assert_eq!(body_of(&pool, "r").await?, None);
+        // ...and beside a plain copy, the plain copy is used.
+        set("UPDATE entries SET content_html = '<p>C</p>' WHERE guid = 'r'").await?;
+        assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>C</p>"));
+
+        // A row written before 0.5.1: no compressed copy at all.
+        set("UPDATE entries SET content_z = NULL WHERE guid = 'r'").await?;
+        assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>C</p>"));
         Ok(())
     }
 

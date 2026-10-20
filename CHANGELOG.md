@@ -20,10 +20,12 @@ deploying is separate.
 
 - **Schema: `entries.content_z` (#336).** Added by `ALTER TABLE` on first boot,
   a nullable `BLOB`: each body compressed (a tag byte, then deflate). This
-  release writes it **beside** `content_html`, not instead of it, and reads it
-  first; rows written before it keep only `content_html` and are read from
-  there. **Rolling back to 0.5.0 works**: it never names the column and finds
-  every body in `content_html`. **Cost:** new rows store each body twice for
+  release writes it **beside** `content_html`, not instead of it; rows written
+  before it keep only `content_html`. **Rolling back to 0.5.0 works**: it never
+  names the column and finds every body in `content_html`. **Upgrading again
+  after a rollback is safe too**: 0.5.0 updates only the plain copy, so while
+  both are written the plain copy is the authority, and a compressed copy it
+  left behind is never shown in its place. **Cost:** new rows store each body twice for
   one release, about a quarter more database per new entry (bodies are ~73% of
   the file and compress ~2.8×); on feather-reader.com that is ~20 MB, far under
   the 768 MiB watermark. The next release stops writing `content_html` and
@@ -37,10 +39,16 @@ deploying is separate.
   in the tree). #336's spike measured 2.78× on 3,190 real bodies from 50 feeds,
   ~70 µs to compress a typical body and under a millisecond to decompress the
   worst; zstd was no smaller without a dictionary and needs a C library.
-  `insert_entries` compresses every body before its transaction, so the write
-  lock is never held while deflating, and keep-stored keeps or replaces both
-  columns together. `Entry` is read by hand: the body comes from `content_z`
-  when it decodes, else from `content_html`. Decoding is **complete or
+  `insert_entries` compresses every body on the blocking pool before its
+  transaction, so neither the write lock nor an async worker is held while
+  deflating (a body may be 2 MiB), and keep-stored keeps or replaces both
+  columns together. `Entry` is read by hand, and **while both copies are
+  written, the plain one is the authority**: a row uses `content_z` only where
+  `content_html` is NULL (how the next step stores rows); where both exist and
+  differ, which is what 0.5.0 leaves after a rollback by updating only the plain
+  copy, it uses `content_html` and logs it. Preferring `content_z` there showed
+  the article as it was before the rollback (found in review). Decoding is
+  **complete or
   nothing**: the stream must reach its end marker and use every input byte,
   within `MAX_CONTENT_HTML_BYTES`, and be UTF-8; anything else is no body,
   logged, and the plain copy is used. Two bugs in the first draft were caught
