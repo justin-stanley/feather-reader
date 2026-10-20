@@ -66,7 +66,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 # --- HTML templating (compile-time, embedded in the binary) --------------
 # askama 0.16 dropped the separate `askama_axum` integration crate (deprecated,
 # pinned to askama <0.13). `askama_web` provides the axum IntoResponse glue.
-askama = "0.16"
+# Default features minus `config`, which only reads an `askama.toml` (this repo
+# has none) and is what pulls in `basic-toml`, unmaintained (RUSTSEC-2026-0374).
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
 askama_web = { version = "0.16", features = ["axum-0.8"] }
 
 # --- serde ---------------------------------------------------------------
