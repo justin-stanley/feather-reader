@@ -293,8 +293,11 @@ so they measure throughput rather than the pause):
 - **The mix is heavier than real feeds.** Synthetic bodies average ~12 KB, plus
   1% of 2,000-item feeds. Real bodies measured 2.7 KB on staging's own
   entries, 6.3 KB across 53 public feeds (#336's spike) and 11.9 KB in an
-  earlier production sample. So ~510 KB per feed is a pessimistic figure; a
-  read-only size check of the production database would pin the real one.
+  earlier production sample. So ~510 KB per feed is a pessimistic figure.
+  **Production, 2026-10-19:** `featherreader.db` was 14.4 MB plus a 4.2 MB WAL
+  for 111 feeds (5,483 entries), about **130–165 KB per feed**: a quarter to a
+  third of the synthetic figure, so roughly three times as many real feeds fit
+  under the same watermark (~5,000 under 768 MiB) before #336.
 - **`docker --cpus` is a hard quota, not Fly's credit model.** Fly's
   `shared-cpu-1x` guarantees ~1/16 of a core and bursts on credit. Average use
   (≤ 4%) is under that baseline; bursts (16–21%) would draw on credit.
@@ -318,7 +321,8 @@ defaults; for the release after, with the measurement re-run):
   seamless.
 
 **For D4 (registration):** at the shipped defaults the instance holds about
-1,500 feeds of this mix before polling pauses, and serves about 3,000 an hour;
+1,500 feeds of this mix (~5,000 of production's real feeds) before polling
+pauses, and serves about 3,000 an hour;
 both rise with the proposals above (the first only if the watermark rises with
 any bigger volume).
 
