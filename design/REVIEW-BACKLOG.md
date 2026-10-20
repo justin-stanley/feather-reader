@@ -564,14 +564,13 @@ on the evidence it is a good one.
 ## Still unverified for 0.3.0 (not code — validation)
 
 - `private_key_jwt` against production.
-  > Partly done (2026-10-19): the code path is verified on staging at
-  > `v0.5.0-rc.1` (PAR 201 and token 200 with `private_key_jwt` and the
-  > jwt-bearer assertion type against pds.justin-stanley.com). Staging
-  > publishes its own client metadata and key, so feather-reader.com's own is
-  > still unshown; the first production sign-in after 0.5.0 deploys records it
+  > Done (2026-10-20): on production at 0.5.0 (Fly v41), PAR 201 and token 200
+  > with `private_key_jwt` and the jwt-bearer assertion type, verified by
+  > pds.justin-stanley.com against feather-reader.com's published client
+  > metadata and key; first shown on staging 2026-10-19
   > (design/ROLLOUT-0.3.0.md, Stage 4; #262).
 - Revocation against a live PDS.
-  > Done (2026-10-19): revocation answered 200 on a staging sign-out against
-  > pds.justin-stanley.com. Production's own is recorded with the item above.
+  > Done (2026-10-19 on staging, 2026-10-20 on production): revocation answered
+  > 200 on sign-out against pds.justin-stanley.com.
 - The full container has never been started.
   > Done: the container has run in production since v0.3.0.
