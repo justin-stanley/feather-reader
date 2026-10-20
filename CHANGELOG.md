@@ -14,6 +14,49 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Upgrade notes
+
+- **Bodies are stored compressed only (#336, step 2 of 2). Roll back to 0.5.1,
+  not 0.5.0.** New bodies go into `entries.content_z` alone, tagged as the
+  only copy, with `content_html` NULL. A one-time sweep, three minutes after
+  boot, converts every older row the same way and then reclaims the space.
+  - **Rolling back to 0.5.1 works**: it reads compressed-only rows (step 1
+    already did), and its own writes go back to storing both copies, which
+    this release sweeps again on its next boot.
+  - **Rolling back to 0.5.0 is not supported** once the sweep has run: 0.5.0
+    never reads `content_z`, so every swept body would show as missing until
+    re-polled. The upgrade-boot gate tests 0.5.1, which is where production is.
+  - **Cost:** one short write per stored body, in batches of 200 with a pause
+    between, and one compression each (~70 µs). On feather-reader.com that is
+    a few thousand rows and seconds.
+  - **Where the space comes back:** in an `auto_vacuum = INCREMENTAL` database
+    (new databases, or after `--migrate-auto-vacuum`), `reclaim` shrinks the
+    file. In `NONE` mode the freed pages stay on the freelist and are reused by
+    later writes; the DB-size watermark measures used pages, so the capacity
+    comes back either way, but the file on disk only shrinks in INCREMENTAL.
+
+### Changed
+
+- **Stored bodies are compressed only (#336, step 2 of 2).** `insert_entries`
+  writes `content_z` with `body_codec::encode_sole` (tag `2`, "the only copy")
+  and `content_html` NULL. A one-shot task (`run_body_compaction`, not a loop:
+  once every row is converted there is nothing left to do) clears leftover
+  beside-copies whose plain copy is gone, then pages through rows that still
+  have a plain body with `store::compact_bodies_batch`: it **re-derives** each
+  compressed copy from the plain one (an existing tag-1 copy may be stale from
+  a rollback), compresses on the blocking pool, and converts a row only if its
+  plain copy is still the one it read, so a concurrent poll's write wins. It
+  checks for shutdown between batches and resumes on the next boot; when it
+  finishes it runs `reclaim`. A test plants a poll's write between the
+  sweep's read and its write and checks the newer body survives; without the
+  guard it doesn't. Seven mutations of the write path and the sweep each fail a
+  test. Tests that read stored bodies now read them
+  through `Entry`, the way the reader does; two whose fixtures assumed plain
+  storage were adjusted (an over-size body is planted as a plain row, which is
+  the only way one can exist; the reclaim test uses incompressible bodies).
+
 ## 0.5.1 — 2026-10-20
 
 Article bodies are now also stored compressed, beside the plain copy (#336,
