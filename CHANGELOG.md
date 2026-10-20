@@ -14,21 +14,7 @@ deploying is separate.
 
 ---
 
-## Unreleased
-
-### CI
-
-- **`cargo audit` ignores RUSTSEC-2026-0374 (`basic-toml` unmaintained), with
-  a reason.** The advisory, published 2026-09-26, failed the required audit
-  job on every PR. `basic-toml` comes in only through `askama_derive`, a
-  proc-macro that reads this repo's own `askama.toml` at compile time; it never
-  runs in the server or sees untrusted input, and it is unmaintained, not
-  vulnerable. `askama` 0.16.1 is the newest release and still depends on it,
-  so there is no upgrade to take. The exception is in `.cargo/audit.toml`
-  (what the job reads) and mirrored in `deny.toml`, to be dropped when askama
-  moves off `basic-toml`.
-
-## 0.5.0 — 2026-10-19
+## 0.5.0 — 2026-10-20
 
 **The Node OAuth sidecar is gone; Rust is the only backend (#311).**
 feather-reader.com has run the Rust backend since the 2026-09-13 cutover and
@@ -44,7 +30,7 @@ are filed under what the PDS sent (#280), renames keep fields other clients
 added (#272), a malformed record no longer charges its siblings' documents to a
 shared read (#284), and OAuth client authentication and `iss` checks leave
 evidence in the log (#262). One schema change, which 0.4.10 can still boot on.
-Shipped as `v0.5.0-rc.1` to staging first (#294).
+Also patches TLS certificate validation (RUSTSEC-2026-0381, -0382, -0383). Shipped as `v0.5.0-rc.2` to staging first (#294).
 
 ### Upgrade notes
 
@@ -398,8 +384,25 @@ Shipped as `v0.5.0-rc.1` to staging first (#294).
   `purge_did_data_removes_only_the_callers_rows` now seeds an `oauth_state`
   row for both DIDs and checks only the victim's goes.
 
+### Security
+
+- **TLS certificate validation: `rustls-webpki` 0.103.15 → 0.103.16 and
+  `webpki-roots` / `webpki-root-certs` 1.0.8 → 1.0.10.** RUSTSEC-2026-0382
+  (2026-10-20): certificate verification could accept distrusted
+  intermediates. RUSTSEC-2026-0381 / -0383 (2026-10-19): the bundled roots
+  trusted distrusted emSign intermediates. Every outbound fetch (feeds, PDSes,
+  OAuth) validates certificates through these. Patch-level updates; the invite
+  bot's lockfile is updated too.
+
 ### Dependencies
 
+- **`basic-toml` is gone from the tree (RUSTSEC-2026-0374, unmaintained).** It
+  came in only through askama's `config` feature, on by default, which reads an
+  `askama.toml` this repo doesn't have. `askama` now has default features off
+  and `derive`, `std` and `urlencode` on, which drops `basic-toml` (and `glob`)
+  from `Cargo.lock`, with no ignore entry. Templates and their output are
+  unchanged: with no `askama.toml`, askama used its built-in defaults before
+  and still does.
 - tokio bumped (#318); the GitHub Actions minor and patch group, 4 updates
   (#319).
 
