@@ -14,7 +14,16 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.5.1 — 2026-10-20
+
+Article bodies are now also stored compressed, beside the plain copy (#336,
+step 1 of 2): deflate at level 6, about 2.8× smaller on real bodies. Nothing
+reads the compressed copy yet while the plain one exists, so this release
+changes nothing a reader sees; it puts the codec and the second copy in place
+so the next release can drop the plain copy and get the space back. One schema
+column, which 0.5.0 never names. Also records the #263 capacity results and
+the production evidence for `private_key_jwt` and revocation (#262). Shipped
+as `v0.5.1-rc.1` to staging first (#294).
 
 ### Upgrade notes
 
@@ -62,6 +71,15 @@ deploying is separate.
   as if it were the whole body, and decoding with `FlushDecompress::Finish`
   failed for any body bigger than the first output buffer. A fixture of the
   0.5.0 schema, generated from the released image, joins the upgrade tests.
+
+### CI
+
+- **The upgrade-boot gate starts from 0.5.0 (#339)**, the release production
+  runs: each candidate is proven to upgrade from it and roll back to it.
+
+### Dependencies
+
+- `taiki-e/install-action` 2.87.28 → 2.87.29 (#332).
 
 ## 0.5.0 — 2026-10-20
 
