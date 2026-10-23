@@ -64,12 +64,12 @@ and the title, and every existing reader of it keeps working. For publications, 
 
 | Event | Today | With A |
 |---|---|---|
-| Subscribe to a publication (form, `POST /subscriptions`) | writes `rss.subscription` with `url = at://did/site.standard.publication/rkey` | then, if no `graph.subscription` for that publication exists in the reader's repo, creates one |
+| Subscribe to a publication (form, `POST /subscriptions`) | writes `rss.subscription` with `url = at://did/site.standard.publication/rkey` | then, if no `graph.subscription` for that publication exists in the reader's repo, creates one **and records its rkey locally as FeatherReader's**. If one already exists (another app made it), it's left alone and nothing is recorded |
 | OPML import containing at:// publication URLs | `applyWrites`, 200 per call | the `graph.subscription` creates go in the same batches |
-| Unsubscribe (`POST /subscriptions/{rkey}/delete`) | deletes the `rss.subscription` | also deletes **every** `graph.subscription` in the reader's repo for that publication (see the decision below) |
+| Unsubscribe (`POST /subscriptions/{rkey}/delete`) | deletes the `rss.subscription` | also deletes the `graph.subscription` **FeatherReader created**, by its recorded rkey. Records from other apps are never touched |
 | Rename / re-folder | `putRecord` with `swapRecord` | no change |
 | Account delete (`POST /account/delete`) | purges local rows; PDS records stay | unchanged: the `graph.subscription` records stay with the user, the same as `rss.*` |
-| Existing publication subscriptions (19 rows in production, one reader, as of 0.4.0) | — | **backfill** on the reader's next sign-in: create the missing `graph.subscription` records, once, idempotently |
+| Existing publication subscriptions (19 rows in production, one reader, as of 0.4.0) | — | **backfill** on the reader's next sign-in: create the missing `graph.subscription` records (recording their rkeys), once, idempotently |
 
 **A failed write doesn't fail the subscribe**, the same as the `rss.subscription` write today
 (`web.rs` logs it and keeps the local row). The next sign-in's backfill pass repairs it.
@@ -86,21 +86,33 @@ sign in again. If FeatherReader moves to granular scopes, this collection has to
 **Behind a flag.** `FEATHERREADER_STANDARD_SITE_GRAPH`, off by default. Turn it on on staging first,
 then in production.
 
+### Rule: only FeatherReader's own records
+
+**FeatherReader never edits or deletes a `graph.subscription` it didn't create** (owner decision,
+2026-10-23). It's the reader's data, written by another app, and that app may act on it, for
+example by sending a newsletter.
+
+- **Ownership is tracked locally.** A `graph.subscription` record has no "created by" field, so
+  FeatherReader keeps a table of the rkeys it created (`standard_site_graph_records`: did, rkey,
+  publication). It deletes by rkey, and only rkeys in that table.
+- **If the local row is lost** (a restore, or a purge followed by signing in again), FeatherReader
+  treats the record as unknown and leaves it. Leaving a stray subscription record behind is the
+  safe failure. Deleting someone else's record is not.
+- **The deleted record must still be ours.** Before deleting, re-read the record and check that it
+  still names the same publication. If it doesn't, drop the local row and leave the record.
+- **Unsubscribe copy.** If the reader is still subscribed through another app's record, the page
+  says so ("Still subscribed in another app"), and FeatherReader doesn't offer to change that.
+
 ### Decisions for the owner
 
-1. **Unsubscribe deletes records FeatherReader didn't create.** The record means "this person
-   subscribes to this publication" for every app that reads it. If a reader subscribed on Leaflet
-   first, unsubscribing in FeatherReader deletes that record too, so they're unsubscribed on Leaflet
-   as well. **Recommended: delete them all, and say so on the unsubscribe button** ("Unsubscribes
-   in other Standard.site apps too"). The alternative, deleting only the records FeatherReader
-   created, leaves the reader still subscribed elsewhere. Once import (below) exists, it would also
-   re-add the subscription on the next sign-in.
-2. **Import.** Reading the reader's existing `graph.subscription` records lets FeatherReader pick up
+1. **Import.** Reading the reader's existing `graph.subscription` records lets FeatherReader pick up
    subscriptions made in other apps. **Recommended: a one-click offer on `/manage`** ("Found 12
    Standard.site subscriptions from other apps — add them?") rather than a silent auto-add. Import
-   adds feeds, so it has to respect the per-user and global feed caps, and adding feeds nobody
-   asked for here would surprise the reader. This is a second PR after the write path.
-3. **Privacy copy.** `rss.subscription` records are already public, but a `graph.subscription` record
+   adds feeds, so it has to respect the per-user and global feed caps. Because other apps'
+   records are never deleted, **the import must not offer a publication the reader unsubscribed
+   from in FeatherReader**: keep a local "unsubscribed here" marker per publication and skip those.
+   This is a second PR after the write path.
+2. **Privacy copy.** `rss.subscription` records are already public, but a `graph.subscription` record
    is in a lexicon that Bluesky's Atmosphere screen and other apps index and may display ("X
    subscribed to Y"). Say this on `/privacy` and on the subscribe form when the flag is on.
 
@@ -110,16 +122,18 @@ then in production.
   record type, plus a vetted wrapper like `VettedSubscription`. The vetting checks that `publication`
   is a DID-form `at://…/site.standard.publication/…`.
 - `repo.rs` / `oauth/xrpc.rs`: `list_graph_subscriptions`, `add_graph_subscription`,
-  `remove_graph_subscriptions_for(publication)`. Reuse the hardened `list_all_records` path (caps,
+  `remove_own_graph_subscription(rkey)` (only rkeys from the local ownership table). Reuse the hardened `list_all_records` path (caps,
   cursor loop, 2xx error-envelope refusal).
 - `web.rs`: calls these from `add_subscription`, `delete_subscription` and the OPML import, when
   the feed kind is `publication` and the flag is on.
+- The ownership table and the backfill marker go in **one new migration**.
 - Backfill: run once per sign-in, after the session is established, in the background; it never
   blocks the page. A local marker (`users.graph_backfilled_at`) keeps it to one pass. The marker
   goes in a **new migration**, and that migration is tested by upgrading from the released 0.5.x
   schema, not only against a fresh database (see the 0.3.9 crash loop).
 - Tests: the record shape against the published schema; matching handle-form against DID-form;
-  unsubscribe deletes all matches; a failed write keeps the local row; backfill is idempotent; the
+  **unsubscribe never deletes a record FeatherReader didn't create** (another app's record for the same
+  publication survives; a lost ownership row means nothing is deleted); a failed write keeps the local row; backfill is idempotent; the
   flag off means no `site.standard.*` writes at all (fake PDS log).
 
 ---
