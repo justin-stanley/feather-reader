@@ -1,7 +1,7 @@
 # Roadmap
 
 > **As of 2026-10-24.** Latest release: **0.5.1** (2026-10-20). Replaces any earlier roadmap notes:
-> 0.4.0 was Standard.site support, 0.5.0 was Rust-only, and opening registration was never part of
+> The PR-by-PR plan is [`IMPLEMENTATION-PLAN.md`](IMPLEMENTATION-PLAN.md). 0.4.0 was Standard.site support, 0.5.0 was Rust-only, and opening registration was never part of
 > either.
 
 Each release ships the way 0.5.x did: an `-rc.N` tag soaks on staging (#294); the upgrade is tested
@@ -17,7 +17,7 @@ and production deploys only on the owner's go.
 | **Next** | **0.6, daily driver**: the list keeps its place; an All view | #345, #346, #347 | the All view's mark-all-read scope |
 | **Gate** | **Registration (D4)**: raise the beta cap or not | #263 | the owner's, after 0.5.2 and 0.6 |
 | **Then** | **0.7, Atmosphere**: Standard.site subscriptions | #348 | ownership field on `rss.subscription`; per-reader opt-in |
-| **Ongoing** | Spec · hardening · network indexer · private data | #287, #327, #295 | the NSID authority (#287) |
+| **Ongoing** | Spec questions · hardening · network indexer · private data | #287, #327, #295 | the NSID authority (#287) |
 
 ---
 
@@ -32,7 +32,9 @@ bodies, and roughly 1.9× more feeds per GB.
   the plain copy, so check whether 0.5.1 can still boot on the result.
 - After it runs in production: **re-measure** database size per feed with the #263 method. That
   number feeds the registration gate.
-- **#327** (cancellable ingest sanitizer) ships in 0.5.2 if it's ready. It doesn't block.
+- **Fix: "Mark all read" in a folder marks every feed.** The form posts no folder scope
+  (`index.html:49`, `web.rs:3498`). It's small; ship it in 0.5.2, or as 0.5.3.
+- **#327** (cancellable ingest sanitizer) needs an approach chosen first; see the plan. It doesn't block.
 
 ## Now, outside a release — a FeatherReader publication (#349)
 
@@ -87,8 +89,8 @@ AppView, and in every Standard.site app. Design: `design/ATMOSPHERE-STANDARD-SIT
 - **Never touch another app's records** (decided).
 - **Ownership survives a lost local database** (owner decision): store the at-uri of the record
   FeatherReader created in an optional field on the reader's own `community.lexicon.rss.subscription`.
-  This changes the owner's lexicon, so it lands with #287's Lexicon JSON. The local table is only a
-  cache.
+  This changes the owner's lexicon: one optional field, added to the existing Lexicon JSON. If the owner
+  declines, a local table holds ownership instead.
 - **Per-reader opt-in**, off by default (recommended over an instance flag alone). The AppView shows
   subscribers' profiles, and the backfill would publish records nobody chose.
 - Follow-ups in later releases: **import** of other apps' subscriptions (a one-click offer on
@@ -102,11 +104,14 @@ unfinished and behind a flag, while the publication (#349) covers the time-sensi
 
 ## Ongoing tracks
 
-- **Spec (#287).** PR 1 is the Lexicon JSON for `subscription`, `folder`, `saved` and `readState`, with
-  tests that validate records against it. Open: undated-item ids, what `readThrough` is compared
-  against, and **the NSID authority**: `community.lexicon.rss` sits under Lexicon Community, and
-  `_lexicon.rss.lexicon.community` has no DNS record, so the lexicon doesn't resolve. 0.7's
-  ownership field depends on PR 1.
+- **Spec (#287).** Its three PRs are merged (#288, #289, #321; #290 closed by #322). The Lexicon
+  JSON exists for all four records, with validation tests. What's left are the open questions:
+  - **the NSID authority**: `community.lexicon.rss` sits under Lexicon Community, and
+    `_lexicon.rss.lexicon.community` has no DNS record, so the lexicon doesn't resolve;
+  - unknown-field preservation on `saved` and `readState`;
+  - `maxLength` on titles and names.
+
+  Close #287 into those.
 - **Hardening.** #327, plus whatever review rounds turn up. Every release keeps the rule of testing
   the upgrade from the released schema.
 - **Network indexer experiment (#295).** A standalone crate on the `bot/` pattern, scoped to one DID,
@@ -125,7 +130,7 @@ unfinished and behind a flag, while the publication (#349) covers the time-sensi
 ## Decisions for the owner
 
 1. #349 hosting: Hugo subdomain (recommended), FeatherReader-served, or Leaflet/pckt.
-2. 0.6: the All view's mark-all-read scope.
+2. 0.6: the All view's mark-all-read scope (the plan recommends: everything listed when the page was rendered).
 3. D4: the beta cap after the 0.5.2 measurement.
 4. 0.7: the ownership field on `rss.subscription`; per-reader opt-in vs the instance flag.
 5. #287: approach Lexicon Community about publishing `community.lexicon.rss`.
