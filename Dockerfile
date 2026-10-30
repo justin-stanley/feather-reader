@@ -5,12 +5,12 @@
 # removed in 0.5.0, #311; Rust is the only OAuth client.)
 #
 # Grounded in the source tree (read, not guessed):
-#   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021 / rust 1.94
-#     (MSRV bumped from 1.82 to track current stable: sqlx 0.9 requires rustc
-#     1.94 and askama 0.16 requires 1.88 — a 1.82 builder can't even parse
-#     askama's `edition2024` manifest. ci.yml builds on `@stable`, not on this
-#     pin, so CI cannot notice it falling behind; it must move with the dep
-#     floor).
+#   * Rust bin is `featherreader` (Cargo.toml [[bin]]), edition 2021. MSRV is
+#     1.94 (Cargo.toml `rust-version`: sqlx 0.9 requires rustc 1.94 and askama
+#     0.16 requires 1.88 — a 1.82 builder can't even parse askama's
+#     `edition2024` manifest). The builder below is current stable instead
+#     (1.99), matching ci.yml's `@stable`, so the shipped binary is built by the
+#     compiler CI tests with. Dependabot's docker ecosystem keeps it moving.
 #     sqlx `sqlite-bundled` + `tls-rustls-ring` and reqwest `rustls` mean NO
 #     system libsqlite3 / OpenSSL are needed at runtime.
 #   * The DB schema is EMBEDDED in the binary (src/store.rs) — there is no
@@ -20,7 +20,7 @@
 #     runtime WORKDIR MUST contain `static/`. (Miss this and every /static/* 404s.)
 #
 # Runtime base is `debian:bookworm-slim` (glibc): the same Debian release as the
-# rust:1.94-bookworm builder, so the Rust binary + the (static) Caddy binary run
+# rust:1.99-bookworm builder, so the Rust binary + the (static) Caddy binary run
 # on it unchanged. It was `node:24-bookworm-slim` — itself Debian bookworm —
 # until 0.5.0 removed the Node sidecar; nothing else in the image needs Node.
 #
@@ -32,7 +32,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust builder: compile the `featherreader` binary.
 # ---------------------------------------------------------------------------
-FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS rust-build
+FROM rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS rust-build
 
 # PART C toggle: when ENABLE_SBOM=1 the binary is built with `cargo auditable`,
 # which embeds the exact dependency graph into the ELF so `cargo audit bin` (and
@@ -69,12 +69,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---------------------------------------------------------------------------
 # Stage 2 — Caddy binary source (static CGO_ENABLED=0 Go binary; libc-agnostic).
 # ---------------------------------------------------------------------------
-FROM caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 AS caddy-src
+FROM caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f AS caddy-src
 
 # ---------------------------------------------------------------------------
 # Stage 3 — Runtime: debian:bookworm-slim (glibc, matching the builder).
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 
 # tini for correct PID1 semantics (zombie reaping + signal forwarding);
 # ca-certificates for outbound HTTPS (feed fetch + atproto — rustls ships its own

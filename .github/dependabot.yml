@@ -30,17 +30,20 @@ updates:
         update-types: [minor, patch]
 
   # --- Docker ---------------------------------------------------------------
-  # NOT ENABLED. The Dockerfile is at the repo root (directory "/"), and its
-  # base images (rust, debian, caddy) are pinned by digest and bumped by hand;
-  # ci.yml's Caddyfile job validates against the caddy digest the Dockerfile
-  # pins. Left in as a placeholder so the wiring is one uncomment away.
-  # - package-ecosystem: docker
-  #   directory: "/"
-  #   schedule:
-  #     interval: weekly
-  #   open-pull-requests-limit: 3
-  #   commit-message:
-  #     prefix: "deps(docker)"
-  #   groups:
-  #     docker-minor-patch:
-  #       update-types: [minor, patch]
+  # Base images (rust, caddy, debian) in the app's Dockerfile and bench/'s, all
+  # pinned as `name:<version>@sha256:<index digest>`. Dependabot bumps the tag
+  # and digest together. Enabled 2026-10-25: by hand they had drifted five Rust
+  # releases behind. ci.yml's Caddyfile job reads the caddy pin out of the
+  # Dockerfile, so a caddy bump is validated against the new version.
+  # Debian release moves (bookworm -> trixie) are not version bumps and stay
+  # manual: the builder and runtime must move together.
+  - package-ecosystem: docker
+    directories: ["/", "/bench"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(docker)"
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
