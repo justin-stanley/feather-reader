@@ -27,6 +27,7 @@
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64ct::{Base64UrlUnpadded, Encoding as _};
 use p256::elliptic_curve::sec1::ToSec1Point as _;
 use p256::elliptic_curve::zeroize::Zeroizing;
 use p256::SecretKey;
@@ -96,24 +97,31 @@ fn thumbprint_of_members(jwk: &Value) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(digest(&SHA256, canonical.as_bytes()).as_ref()))
 }
 
+/// Unpadded base64url length of a 32-byte P-256 coordinate.
+const COORDINATE_B64_LEN: usize = 43;
+
 /// Decode one fixed-width JWK coordinate (`x`, `y` or `d`): unpadded base64url
-/// of exactly the 32 bytes of a P-256 field element. A shorter or longer value
-/// is refused rather than padded, so a truncated key cannot load as a
-/// different one.
+/// of exactly the 32 bytes of a P-256 field element, refused at any other
+/// length so the error says what is wrong.
+///
+/// `base64ct`, not `base64`, because `d` is the private scalar: its decoder is
+/// constant-time (as `p256` 0.13's JWK import was) and writes straight into the
+/// zeroizing buffer, with no intermediate heap copy.
 fn coordinate(jwk: &Value, name: &str) -> Result<Zeroizing<[u8; 32]>> {
-    let raw = Zeroizing::new(
-        URL_SAFE_NO_PAD
-            .decode(member(jwk, name)?)
-            .map_err(|_| anyhow!("JWK member `{name}` is not unpadded base64url"))?,
-    );
-    let mut out = Zeroizing::new([0u8; 32]);
-    if raw.len() != out.len() {
+    let encoded = member(jwk, name)?;
+    if encoded.len() != COORDINATE_B64_LEN {
         bail!(
-            "JWK member `{name}` is {} bytes; a P-256 coordinate is 32",
-            raw.len()
+            "JWK member `{name}` is {} characters; a P-256 coordinate is {COORDINATE_B64_LEN}",
+            encoded.len()
         );
     }
-    out.copy_from_slice(&raw);
+    let mut out = Zeroizing::new([0u8; 32]);
+    let decoded = Base64UrlUnpadded::decode(encoded, out.as_mut_slice())
+        .map_err(|_| anyhow!("JWK member `{name}` is not unpadded base64url"))?
+        .len();
+    if decoded != out.len() {
+        bail!("JWK member `{name}` is {decoded} bytes; a P-256 coordinate is 32");
+    }
     Ok(out)
 }
 
@@ -182,7 +190,8 @@ impl SigningKey {
         // the derived public key would silently change the JWKS and thumbprint
         // a PDS has cached for this `kid`.
         let derived = public_members(&secret);
-        if derived["x"] != URL_SAFE_NO_PAD.encode(*x) || derived["y"] != URL_SAFE_NO_PAD.encode(*y)
+        if derived["x"] != Base64UrlUnpadded::encode_string(x.as_slice())
+            || derived["y"] != Base64UrlUnpadded::encode_string(y.as_slice())
         {
             bail!("not a valid P-256 private JWK: `x`/`y` do not match `d`");
         }
@@ -205,7 +214,9 @@ impl SigningKey {
             .ok_or_else(|| anyhow!("JWK did not serialize to an object"))?;
         obj.insert(
             "d".into(),
-            json!(URL_SAFE_NO_PAD.encode(self.secret.to_bytes())),
+            json!(Base64UrlUnpadded::encode_string(&Zeroizing::new(
+                self.secret.to_bytes()
+            ))),
         );
         obj.insert("kid".into(), json!(self.kid));
         obj.insert("alg".into(), json!(ALG));
@@ -637,31 +648,85 @@ mod tests {
         }
     }
 
-    /// Each coordinate is exactly 32 bytes. A short `d` is not left-padded into
-    /// some other scalar, and an out-of-range or zero `d` is not a key.
+    /// Each coordinate is exactly 32 bytes of unpadded base64url. Each case is
+    /// matched on its error, so one cannot pass by tripping a different check
+    /// (a short `x` would also fail the `x`/`y`-match check, for instance).
     #[test]
     fn a_private_jwk_with_a_malformed_coordinate_is_refused() {
         let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
         let jose: serde_json::Value = serde_json::from_str(JOSE_PRIVATE_JWK).unwrap();
-        let d = URL_SAFE_NO_PAD.decode(jose["d"].as_str().unwrap()).unwrap();
-        let x = URL_SAFE_NO_PAD.decode(jose["x"].as_str().unwrap()).unwrap();
-        for (member, value) in [
-            ("d", b64(&d[1..])),
-            ("d", b64(&[&d[..], &[0u8][..]].concat())),
-            ("d", b64(&[0xffu8; 32])),
-            ("d", b64(&[0u8; 32])),
-            ("x", b64(&x[1..])),
-            ("d", "not base64!".to_string()),
-            ("crv", "P-384".to_string()),
-            ("kty", "OKP".to_string()),
+        let s = |m: &str| jose[m].as_str().unwrap().to_string();
+        let d = URL_SAFE_NO_PAD.decode(s("d")).unwrap();
+        let x = URL_SAFE_NO_PAD.decode(s("x")).unwrap();
+        let std_alphabet_y = s("y").replace('-', "+").replace('_', "/");
+        assert_ne!(std_alphabet_y, s("y"), "the vector's y must contain - or _");
+        for (member, value, expected) in [
+            ("d", b64(&d[1..]), "a P-256 coordinate is 43"),
+            (
+                "d",
+                b64(&[&d[..], &[0u8][..]].concat()),
+                "a P-256 coordinate is 43",
+            ),
+            ("x", b64(&x[1..]), "a P-256 coordinate is 43"),
+            ("d", format!("{}=", s("d")), "a P-256 coordinate is 43"),
+            ("d", "!".repeat(43), "not unpadded base64url"),
+            ("y", std_alphabet_y, "not unpadded base64url"),
+            ("d", b64(&[0xffu8; 32]), "not a scalar in range"),
+            ("d", b64(&[0u8; 32]), "not a scalar in range"),
+            ("crv", "P-384".to_string(), "not a P-256 private JWK"),
+            ("kty", "OKP".to_string(), "not a P-256 private JWK"),
         ] {
             let mut jwk = jose.clone();
             jwk[member] = serde_json::json!(value);
+            let err = SigningKey::from_jwk_json(&jwk.to_string(), KID)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {member} = {value:?}"));
             assert!(
-                SigningKey::from_jwk_json(&jwk.to_string(), KID).is_err(),
-                "accepted {member} = {value:?}"
+                err.to_string().contains(expected),
+                "{member} = {value:?}: expected {expected:?}, got {err}"
             );
         }
+    }
+
+    /// The classic encoder bug is dropping a leading zero byte, so a coordinate
+    /// that starts with 0x00 would come out 42 characters. Pin that it does
+    /// not, for `d` and for each of `x` and `y`, by searching scalars until
+    /// each case occurs (about 1 in 256 per coordinate).
+    #[test]
+    fn coordinates_with_a_leading_zero_byte_keep_their_full_width() {
+        let decoded = |v: &serde_json::Value, m: &str| {
+            let text = v[m].as_str().unwrap();
+            assert_eq!(text.len(), COORDINATE_B64_LEN, "{m} lost width");
+            URL_SAFE_NO_PAD.decode(text).unwrap()
+        };
+        let mut seen = [false; 3];
+        let mut scalar = [0u8; 32];
+        scalar[1] = 1; // d[0] == 0: the `d` case holds for every candidate
+        for n in 0u16..=u16::MAX {
+            scalar[30..].copy_from_slice(&n.to_be_bytes());
+            let Ok(secret) = SecretKey::from_slice(&scalar) else {
+                continue;
+            };
+            let key = SigningKey {
+                secret,
+                kid: KID.to_string(),
+            };
+            let jwk: serde_json::Value = serde_json::from_str(&key.to_jwk_json().unwrap()).unwrap();
+            let lead = ["d", "x", "y"].map(|m| decoded(&jwk, m)[0] == 0);
+            if !lead.iter().zip(seen).any(|(&l, s)| l && !s) {
+                continue;
+            }
+            let back = SigningKey::from_jwk_json(&jwk.to_string(), KID).unwrap();
+            assert_eq!(back.secret.to_bytes(), key.secret.to_bytes());
+            assert_eq!(back.public_jwk().unwrap(), key.public_jwk().unwrap());
+            for (s, l) in seen.iter_mut().zip(lead) {
+                *s |= l;
+            }
+            if seen.iter().all(|&s| s) {
+                return;
+            }
+        }
+        panic!("no scalar with a leading-zero x and y found: {seen:?}");
     }
 
     /// The persisted JWK is the PRIVATE one (it has to be — it is the signing
