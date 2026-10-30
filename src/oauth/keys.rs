@@ -111,7 +111,7 @@ fn coordinate(jwk: &Value, name: &str) -> Result<Zeroizing<[u8; 32]>> {
     let encoded = member(jwk, name)?;
     if encoded.len() != COORDINATE_B64_LEN {
         bail!(
-            "JWK member `{name}` is {} characters; a P-256 coordinate is {COORDINATE_B64_LEN}",
+            "JWK member `{name}` is {} bytes long; a P-256 coordinate is {COORDINATE_B64_LEN}",
             encoded.len()
         );
     }
@@ -119,25 +119,34 @@ fn coordinate(jwk: &Value, name: &str) -> Result<Zeroizing<[u8; 32]>> {
     let decoded = Base64UrlUnpadded::decode(encoded, out.as_mut_slice())
         .map_err(|_| anyhow!("JWK member `{name}` is not unpadded base64url"))?
         .len();
-    if decoded != out.len() {
-        bail!("JWK member `{name}` is {decoded} bytes; a P-256 coordinate is 32");
-    }
+    // 43 valid characters always decode to exactly 32 bytes (and base64ct
+    // rejects non-zero trailing bits), so this cannot fire.
+    debug_assert_eq!(decoded, out.len());
     Ok(out)
 }
 
-/// The public members of `secret`'s JWK: `kty`, `crv`, and the affine `x`/`y`
-/// coordinates as unpadded base64url. `p256` 0.14 dropped its `jwk` feature, so
-/// this is the encoding it used to provide (RFC 7518 §6.2.1).
-fn public_members(secret: &SecretKey) -> Value {
+/// The affine `x`/`y` coordinates of `secret`'s public key, big-endian.
+fn public_xy(secret: &SecretKey) -> ([u8; 32], [u8; 32]) {
     // Uncompressed SEC1: 0x04 || x (32 bytes) || y (32 bytes).
     let point = secret.public_key().to_sec1_point(false);
     let bytes = point.as_bytes();
     debug_assert_eq!(bytes.len(), 65);
+    let (mut x, mut y) = ([0u8; 32], [0u8; 32]);
+    x.copy_from_slice(&bytes[1..33]);
+    y.copy_from_slice(&bytes[33..65]);
+    (x, y)
+}
+
+/// The public members of `secret`'s JWK: `kty`, `crv`, and `x`/`y` as unpadded
+/// base64url. `p256` 0.14 dropped its `jwk` feature, so this is the encoding it
+/// used to provide (RFC 7518 §6.2.1).
+fn public_members(secret: &SecretKey) -> Value {
+    let (x, y) = public_xy(secret);
     json!({
         "kty": "EC",
         "crv": "P-256",
-        "x": URL_SAFE_NO_PAD.encode(&bytes[1..33]),
-        "y": URL_SAFE_NO_PAD.encode(&bytes[33..65]),
+        "x": URL_SAFE_NO_PAD.encode(x),
+        "y": URL_SAFE_NO_PAD.encode(y),
     })
 }
 
@@ -189,10 +198,8 @@ impl SigningKey {
         // where they disagree (as `p256`'s JWK import did), because publishing
         // the derived public key would silently change the JWKS and thumbprint
         // a PDS has cached for this `kid`.
-        let derived = public_members(&secret);
-        if derived["x"] != Base64UrlUnpadded::encode_string(x.as_slice())
-            || derived["y"] != Base64UrlUnpadded::encode_string(y.as_slice())
-        {
+        let (dx, dy) = public_xy(&secret);
+        if dx != *x || dy != *y {
             bail!("not a valid P-256 private JWK: `x`/`y` do not match `d`");
         }
         // Prefer the kid already in the file: it is what a PDS may have cached
@@ -660,6 +667,15 @@ mod tests {
         let x = URL_SAFE_NO_PAD.decode(s("x")).unwrap();
         let std_alphabet_y = s("y").replace('-', "+").replace('_', "/");
         assert_ne!(std_alphabet_y, s("y"), "the vector's y must contain - or _");
+        // The 43rd character carries 4 data bits and 2 bits that must be zero;
+        // setting the low bit makes it the same 32 bytes, non-canonically.
+        let non_canonical_d = {
+            let mut d = s("d");
+            let last = d.pop().unwrap();
+            assert_eq!(last, '4', "the vector's d must end in '4' (low bits 00)");
+            d.push('5');
+            d
+        };
         for (member, value, expected) in [
             ("d", b64(&d[1..]), "a P-256 coordinate is 43"),
             (
@@ -671,6 +687,7 @@ mod tests {
             ("d", format!("{}=", s("d")), "a P-256 coordinate is 43"),
             ("d", "!".repeat(43), "not unpadded base64url"),
             ("y", std_alphabet_y, "not unpadded base64url"),
+            ("d", non_canonical_d, "not unpadded base64url"),
             ("d", b64(&[0xffu8; 32]), "not a scalar in range"),
             ("d", b64(&[0u8; 32]), "not a scalar in range"),
             ("crv", "P-384".to_string(), "not a P-256 private JWK"),

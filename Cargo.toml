@@ -115,10 +115,11 @@ getrandom = "0.4"
 # to 0.23; until then leave the pin where reqwest is.
 ring = "0.17"
 base64 = "0.23"
-# Constant-time base64url for the OAuth signing key's private scalar `d`
-# (src/oauth/keys.rs), where `base64`'s table lookups are data-dependent. It is
-# what `p256` 0.13's JWK import used; already in the lock via the RustCrypto
-# stack, so this adds no package.
+# Constant-time base64url for decoding the OAuth signing key's JWK coordinates
+# and encoding its private scalar `d` (src/oauth/keys.rs), where `base64`'s
+# table lookups are data-dependent. Public values (x/y on export, thumbprints)
+# still use `base64`. It is what `p256` 0.13's JWK import used; already in the
+# lock via the RustCrypto stack, so this adds no package.
 base64ct = { version = "1.8", features = ["alloc"] }
 # Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
 # internal-only helper; `subtle` is the maintained option and is already in the
