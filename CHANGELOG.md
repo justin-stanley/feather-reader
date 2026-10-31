@@ -22,8 +22,10 @@ less space, and they are most of the database, so the same space holds far
 more feeds. Nothing a reader sees changes.
 **Roll back to 0.5.1, not 0.5.0.** Also clears three RustSec advisories, among
 them a non-constant-time bignum in the OAuth signing key's curve crate (#354),
-and brings the build and CI images and actions up to date. Shipped as
-`v0.5.2-rc.1` to staging first (#294).
+and brings the build and CI images and actions up to date. **Fixes sign-in**,
+which did nothing in Chrome and on iOS: the sign-in form's redirect to the
+PDS was blocked by the app's own CSP. Shipped to staging first (#294) as
+`v0.5.2-rc.1`, where the sign-in bug was found, then `v0.5.2-rc.2`.
 
 ### Upgrade notes
 
@@ -85,6 +87,33 @@ and brings the build and CI images and actions up to date. Shipped as
   through `Entry`, the way the reader does; two whose fixtures assumed plain
   storage were adjusted (an over-size body is planted as a plain row, which is
   the only way one can exist; the reclaim test uses incompressible bodies).
+
+### Fixed
+
+- **Sign-in did nothing after "Continue"** in Chrome, and on iOS (WebKit).
+  `POST /login` answered with a `303` straight to the PDS's authorization
+  endpoint, and the CSP's `form-action 'self'` applies to where a form
+  submission ends up, redirects included. So the browser refused the
+  cross-origin hop silently and the sign-in page stayed put. A comment in
+  `start_oauth` had assumed the directive ignores redirects. It now answers
+  with a page (`continue_to_pds`, `login_continue.html`) that sends the browser
+  on with a meta refresh, plus a link. A refresh is a new navigation, not the
+  form's, so the CSP stays as strict as it was. The page is `no-store`, since
+  its URL carries the login's `request_uri`.
+  - **Found on staging** (2026-10-31): each attempt pushed its authorization
+    request, and the PDS accepted it (`201`), but no callback ever came back.
+    In Chrome, the page's `securitypolicyviolation` event reported
+    `form-action`, enforced.
+  - **Checked in Chrome** against the same CSP: the `303` is blocked, and the
+    rendered page goes through to the URL with its query intact.
+  - **Production (0.5.1) has the same code and CSP**, so the same failure is
+    expected there for new sign-ins in these browsers. Existing sessions are
+    unaffected.
+  - Tests drive `oauth_started`, the success branch of `start_oauth`: the
+    answer is `200` with no `Location`, it carries the `SameSite=Lax`
+    browser-binding cookie, both the refresh and the link decode to exactly
+    the PDS's URL, it is `no-store`, and a hostile URL stays inside its
+    attributes. `GET /login?handle=` takes the same path.
 
 ### Security
 

@@ -306,7 +306,7 @@ fn require_endpoint(metadata: &Value, field: &str, issuer: &str) -> Result<Strin
     //
     // RFC 8414 does not require co-location, so this is a hardening choice
     // rather than a conformance check — and it is made deliberately, because
-    // `authorization_endpoint` is a URL this app 303s a browser to from its own
+    // `authorization_endpoint` is a URL this app sends a browser to from its own
     // `/login`. Without it, anyone who can start a login with a `did:web` they
     // control turns `/login` into an arbitrary-https-redirect on our origin: the
     // chain is self-consistent, every other discovery check passes, and the
@@ -565,7 +565,7 @@ mod tests {
 
     /// **An endpoint on a foreign origin is refused.**
     ///
-    /// `authorization_endpoint` is a URL the app 303s a browser to from its own
+    /// `authorization_endpoint` is a URL the app sends a browser to from its own
     /// `/login`. Left unconstrained, anyone who can start a login with a
     /// `did:web` they control turns `/login` into an arbitrary-https-redirect on
     /// our origin — every other discovery check passes, because the hostile
