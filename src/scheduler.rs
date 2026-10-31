@@ -489,7 +489,7 @@ const BODY_COMPACTION_PAUSE: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct CompactionSummary {
     /// Leftover compressed copies cleared (see
-    /// [`store::clear_beside_copies_without_plain`]).
+    /// [`store::clear_beside_copies_batch`]).
     cleared: u64,
     /// Rows converted to a compressed-only body.
     converted: usize,
@@ -543,18 +543,45 @@ async fn run_body_compaction(db: store::Pool, mut shutdown: watch::Receiver<()>)
     }
 }
 
-/// The sweep itself: clear leftover compressed copies, then convert batches
-/// until none is left, checking for shutdown between batches.
+/// The sweep itself: if any plain body is left to convert, clear leftover
+/// compressed copies, then convert batches until none is left, checking for
+/// shutdown between batches.
+///
+/// **Nothing to convert means nothing to clear, and no work at all.** A
+/// leftover beside-copy only appears after an older release ran, and every
+/// older release stores plain bodies, so the boots that can find one are the
+/// boots with plain bodies. Gating on that keeps the clearing pass (which reads
+/// every compressed body) off every boot of a converted database.
 async fn compact_bodies(
     db: &store::Pool,
     shutdown: &mut watch::Receiver<()>,
     batch: i64,
     pause: Duration,
 ) -> anyhow::Result<CompactionSummary> {
-    let mut sum = CompactionSummary {
-        cleared: store::clear_beside_copies_without_plain(db).await?,
-        ..Default::default()
-    };
+    let mut sum = CompactionSummary::default();
+    if !store::compressible_plain_bodies_exist(db).await? {
+        return Ok(sum);
+    }
+    let mut after_id = 0;
+    loop {
+        if shutdown.has_changed().unwrap_or(true) {
+            sum.interrupted = true;
+            return Ok(sum);
+        }
+        let done = store::clear_beside_copies_batch(db, after_id, batch).await?;
+        if done.scanned == 0 {
+            break;
+        }
+        sum.cleared += done.converted as u64;
+        after_id = done.last_id;
+        tokio::select! {
+            _ = shutdown_fired(shutdown) => {
+                sum.interrupted = true;
+                return Ok(sum);
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
     let mut after_id = 0;
     loop {
         if shutdown.has_changed().unwrap_or(true) {
@@ -2619,5 +2646,68 @@ mod tests {
         assert!(!sum.interrupted);
         assert_eq!(sum.converted, 3);
         assert_eq!(store::plain_bodies_remaining(&pool).await.unwrap(), 0);
+    }
+
+    /// **A plain body over the size bound stays plain** (found in review): the
+    /// reader decodes a compressed body only up to `MAX_CONTENT_HTML_BYTES`, so
+    /// converting one would destroy text that is readable on disk today. The
+    /// sweep still converts the rest and still finishes.
+    #[tokio::test]
+    async fn the_body_sweep_leaves_an_over_size_plain_body_plain() {
+        let pool = compaction_fixture().await;
+        // `feed::MAX_CONTENT_HTML_BYTES` (2 MiB) is crate-private to the
+        // library; any body past it will do.
+        let huge = format!("<p>{}</p>", "a".repeat(2 * 1024 * 1024));
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, fetched_at, content_html) \
+             SELECT feed_id, 'huge', '2026-10-20T00:00:00Z', ?1 FROM entries LIMIT 1",
+        )
+        .bind(&huge)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            sum.converted, 3,
+            "the in-bound bodies were not all converted"
+        );
+        assert!(!sum.interrupted);
+        assert_eq!(
+            columns(&pool, "huge").await,
+            (Some(huge), None),
+            "the over-size plain body was converted"
+        );
+        // It doesn't count as work, so the next boot doesn't run the sweep.
+        assert!(!store::compressible_plain_bodies_exist(&pool).await.unwrap());
+        assert_eq!(
+            compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+                .await
+                .unwrap(),
+            CompactionSummary::default()
+        );
+    }
+
+    /// **No plain body to convert, no clearing pass** (found in review): the
+    /// clearing reads every compressed body, so on a converted database it must
+    /// not run on every boot. A leftover can only appear after an older release
+    /// ran, and those store plain bodies, so this gate loses nothing in the
+    /// supported paths; the leftover is dead bytes either way.
+    #[tokio::test]
+    async fn the_body_sweep_does_nothing_without_a_plain_body() {
+        let pool = compaction_fixture().await;
+        sqlx::query("DELETE FROM entries WHERE content_html IS NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let removed = columns(&pool, "removed").await;
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(sum, CompactionSummary::default());
+        assert_eq!(columns(&pool, "removed").await, removed);
     }
 }

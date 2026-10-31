@@ -1660,6 +1660,12 @@ pub struct CompactBatch {
 /// **Guarded against a concurrent write**: each row is converted only if its
 /// `content_html` is still the value read here. A poll that re-stored the row
 /// meanwhile has already written it compressed-only, and wins.
+///
+/// **A plain body over [`crate::feed::MAX_CONTENT_HTML_BYTES`] stays plain.**
+/// The reader decodes a compressed body only up to that bound, so converting
+/// one would destroy text that is still on disk today (the reader shows it as
+/// too large to render). Only rows stored before the ingest bound (#205) can
+/// be that big; they are left as they are (found in review).
 pub async fn compact_bodies_batch(
     pool: &SqlitePool,
     after_id: i64,
@@ -1695,10 +1701,13 @@ async fn plan_compaction(
 ) -> Result<Vec<CompactionRow>> {
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, content_html FROM entries \
-         WHERE content_html IS NOT NULL AND id > ?1 ORDER BY id LIMIT ?2",
+         WHERE content_html IS NOT NULL AND id > ?1 \
+           AND length(CAST(content_html AS BLOB)) <= ?3 \
+         ORDER BY id LIMIT ?2",
     )
     .bind(after_id)
     .bind(limit)
+    .bind(crate::feed::MAX_CONTENT_HTML_BYTES as i64)
     .fetch_all(pool)
     .await
     .context("listing plain bodies to compress")?;
@@ -1741,22 +1750,74 @@ async fn apply_compaction(pool: &SqlitePool, plan: &[CompactionRow]) -> Result<u
     Ok(converted)
 }
 
+/// Whether any row has a plain body the sweep would convert (#336 step 2):
+/// the sweep's "is there work this boot" check. Within the size bound, as in
+/// [`compact_bodies_batch`], so over-size plain rows (left plain on purpose)
+/// don't make every boot look like it has work.
+///
+/// Reading `content_html IS NOT NULL` needs only each row's record header, not
+/// the compressed bodies, so on a converted database this costs one pass over
+/// the headers.
+pub async fn compressible_plain_bodies_exist(pool: &SqlitePool) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM entries \
+         WHERE content_html IS NOT NULL AND length(CAST(content_html AS BLOB)) <= ?1)",
+    )
+    .bind(crate::feed::MAX_CONTENT_HTML_BYTES as i64)
+    .fetch_one(pool)
+    .await
+    .context("checking for plain bodies to compress")
+}
+
 /// Clear compressed copies written beside a plain one whose plain copy is gone
-/// (#336 step 2): what 0.5.0 leaves after a rollback when a publisher removes a
-/// body, since it clears `content_html` and never touches `content_z`. Such a
-/// copy is never the body (`Entry`'s `FromRow`), so this only drops dead bytes.
-/// Returns how many it cleared.
-pub async fn clear_beside_copies_without_plain(pool: &SqlitePool) -> Result<u64> {
+/// (#336 step 2), among the next `limit` rows with `id > after_id`: what 0.5.0
+/// leaves after a rollback when a publisher removes a body, since it clears
+/// `content_html` and never touches `content_z`. Such a copy is never the body
+/// (`Entry`'s `FromRow`), so this only drops dead bytes.
+///
+/// **Batched by id window**, like [`compact_bodies_batch`]: telling a beside-copy
+/// from a sole copy reads the tag byte, and SQLite loads the whole value to do
+/// that, so one statement over the table would read nearly every compressed
+/// body under the write lock (found in review). The window is picked from the
+/// rowid alone. `scanned` is the rows in the window, `converted` the copies
+/// cleared.
+pub async fn clear_beside_copies_batch(
+    pool: &SqlitePool,
+    after_id: i64,
+    limit: i64,
+) -> Result<CompactBatch> {
+    let (scanned, last_id): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(id) FROM \
+         (SELECT id FROM entries WHERE id > ?1 ORDER BY id LIMIT ?2)",
+    )
+    .bind(after_id)
+    .bind(limit)
+    .fetch_one(pool)
+    .await
+    .context("picking the next window of rows")?;
+    let Some(last_id) = last_id else {
+        return Ok(CompactBatch {
+            last_id: after_id,
+            ..Default::default()
+        });
+    };
     let done = sqlx::query(
         "UPDATE entries SET content_z = NULL \
-         WHERE content_html IS NULL AND content_z IS NOT NULL \
-           AND substr(content_z, 1, 1) = ?1",
+         WHERE id > ?1 AND id <= ?2 \
+           AND content_html IS NULL AND content_z IS NOT NULL \
+           AND substr(content_z, 1, 1) = ?3",
     )
+    .bind(after_id)
+    .bind(last_id)
     .bind(vec![crate::body_codec::TAG_DEFLATE])
     .execute(pool)
     .await
     .context("clearing compressed copies whose plain copy is gone")?;
-    Ok(done.rows_affected())
+    Ok(CompactBatch {
+        scanned: scanned as usize,
+        converted: done.rows_affected() as usize,
+        last_id,
+    })
 }
 
 /// How many rows still have a plain body (#336 step 2): the sweep's progress.
