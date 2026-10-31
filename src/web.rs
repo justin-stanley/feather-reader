@@ -665,7 +665,8 @@ async fn rate_limit(
 async fn cache_control(req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     // The logged-out landing is only cacheable when it's the bare form — a
-    // `?handle=` GET kicks off OAuth (a redirect), which must not be cached.
+    // `?handle=` GET kicks off OAuth (the page that sends the browser to the
+    // PDS, `continue_to_pds`), which must not be cached.
     let is_login_landing = path == "/login"
         && req.method() == axum::http::Method::GET
         && !req.uri().query().unwrap_or("").contains("handle=");
@@ -4828,17 +4829,7 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
     {
         Ok(started) => {
             info!(%handle, "pushed authorization request; sending the browser to the PDS");
-            let mut resp = continue_to_pds(state, &started.authorize_url);
-            set_cookie(
-                &mut resp,
-                &cookie::sign_value(
-                    OAUTH_BINDING_COOKIE,
-                    &started.binding_token,
-                    &state.config.cookie_secret,
-                    OAUTH_BINDING_MAX_AGE_SECS,
-                ),
-            );
-            resp
+            oauth_started(state, &started)
         }
         Err(err) => {
             // The handle the user typed is logged; the error is not shown
@@ -4847,6 +4838,24 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
             login_error(state, "Could not start login for that handle.")
         }
     }
+}
+
+/// The answer to a login whose authorization request the PDS accepted: the
+/// page that sends the browser on ([`continue_to_pds`]), carrying the
+/// browser-binding cookie the callback is checked against. Split from
+/// [`start_oauth`] so a test can pin both without a PDS.
+fn oauth_started(state: &AppState, started: &crate::oauth::login::StartedLogin) -> Response {
+    let mut resp = continue_to_pds(state, &started.authorize_url);
+    set_cookie(
+        &mut resp,
+        &cookie::sign_value(
+            OAUTH_BINDING_COOKIE,
+            &started.binding_token,
+            &state.config.cookie_secret,
+            OAUTH_BINDING_MAX_AGE_SECS,
+        ),
+    );
+    resp
 }
 
 /// The answer to the sign-in form: a page that sends the browser on to the
@@ -7942,12 +7951,24 @@ mod tests {
     async fn the_login_continues_to_the_pds_by_refresh_not_redirect() {
         let state = test_state(&[]).await;
         let url = "https://pds.example/oauth/authorize?client_id=https%3A%2F%2Fapp.example%2Fm.json&request_uri=urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Areq-1";
-        let resp = continue_to_pds(&state, url);
+        let started = crate::oauth::login::StartedLogin {
+            authorize_url: url.to_string(),
+            binding_token: "binding-token-1".to_string(),
+        };
+        let resp = oauth_started(&state, &started);
         assert_eq!(
             resp.status(),
             StatusCode::OK,
             "a redirect is what form-action blocks"
         );
+        let binding = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|c| c.starts_with(&format!("{OAUTH_BINDING_COOKIE}=")))
+            .expect("the browser-binding cookie must be set on the page");
+        assert!(binding.contains("SameSite=Lax"), "{binding}");
         assert!(resp.headers().get(header::LOCATION).is_none());
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),

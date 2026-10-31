@@ -109,10 +109,11 @@ PDS was blocked by the app's own CSP. Shipped to staging first (#294) as
   - **Production (0.5.1) has the same code and CSP**, so the same failure is
     expected there for new sign-ins in these browsers. Existing sessions are
     unaffected.
-  - Tests: the answer is `200` with no `Location`, both the refresh and the
-    link decode to exactly the PDS's URL, it is `no-store`, and a hostile URL
-    stays inside its attributes. Reverting to the redirect fails the first
-    test.
+  - Tests drive `oauth_started`, the success branch of `start_oauth`: the
+    answer is `200` with no `Location`, it carries the `SameSite=Lax`
+    browser-binding cookie, both the refresh and the link decode to exactly
+    the PDS's URL, it is `no-store`, and a hostile URL stays inside its
+    attributes. `GET /login?handle=` takes the same path.
 
 ### Security
 
