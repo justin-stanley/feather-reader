@@ -27,6 +27,9 @@
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64ct::{Base64UrlUnpadded, Encoding as _};
+use p256::elliptic_curve::sec1::ToSec1Point as _;
+use p256::elliptic_curve::zeroize::Zeroizing;
 use p256::SecretKey;
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
@@ -94,6 +97,59 @@ fn thumbprint_of_members(jwk: &Value) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(digest(&SHA256, canonical.as_bytes()).as_ref()))
 }
 
+/// Unpadded base64url length of a 32-byte P-256 coordinate.
+const COORDINATE_B64_LEN: usize = 43;
+
+/// Decode one fixed-width JWK coordinate (`x`, `y` or `d`): unpadded base64url
+/// of exactly the 32 bytes of a P-256 field element, refused at any other
+/// length so the error says what is wrong.
+///
+/// `base64ct`, not `base64`, because `d` is the private scalar: its decoder is
+/// constant-time (as `p256` 0.13's JWK import was) and writes straight into the
+/// zeroizing buffer, with no intermediate heap copy.
+fn coordinate(jwk: &Value, name: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let encoded = member(jwk, name)?;
+    if encoded.len() != COORDINATE_B64_LEN {
+        bail!(
+            "JWK member `{name}` is {} bytes long; a P-256 coordinate is {COORDINATE_B64_LEN}",
+            encoded.len()
+        );
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    let decoded = Base64UrlUnpadded::decode(encoded, out.as_mut_slice())
+        .map_err(|_| anyhow!("JWK member `{name}` is not unpadded base64url"))?
+        .len();
+    // 43 valid characters always decode to exactly 32 bytes (and base64ct
+    // rejects non-zero trailing bits), so this cannot fire.
+    debug_assert_eq!(decoded, out.len());
+    Ok(out)
+}
+
+/// The affine `x`/`y` coordinates of `secret`'s public key, big-endian.
+fn public_xy(secret: &SecretKey) -> ([u8; 32], [u8; 32]) {
+    // Uncompressed SEC1: 0x04 || x (32 bytes) || y (32 bytes).
+    let point = secret.public_key().to_sec1_point(false);
+    let bytes = point.as_bytes();
+    debug_assert_eq!(bytes.len(), 65);
+    let (mut x, mut y) = ([0u8; 32], [0u8; 32]);
+    x.copy_from_slice(&bytes[1..33]);
+    y.copy_from_slice(&bytes[33..65]);
+    (x, y)
+}
+
+/// The public members of `secret`'s JWK: `kty`, `crv`, and `x`/`y` as unpadded
+/// base64url. `p256` 0.14 dropped its `jwk` feature, so this is the encoding it
+/// used to provide (RFC 7518 §6.2.1).
+fn public_members(secret: &SecretKey) -> Value {
+    let (x, y) = public_xy(secret);
+    json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(x),
+        "y": URL_SAFE_NO_PAD.encode(y),
+    })
+}
+
 /// The confidential client's long-lived ES256 signing key.
 pub struct SigningKey {
     secret: SecretKey,
@@ -129,17 +185,23 @@ impl SigningKey {
         if v.get("d").is_none() {
             bail!("JWK has no `d` member; a signing key must be a private key");
         }
-        // Hand p256 only the members it defines, so an unexpected extra member
-        // can never make a valid key fail to parse.
-        let minimal = json!({
-            "kty": member(&v, "kty")?,
-            "crv": member(&v, "crv")?,
-            "x": member(&v, "x")?,
-            "y": member(&v, "y")?,
-            "d": member(&v, "d")?,
-        });
-        let secret = SecretKey::from_jwk_str(&minimal.to_string())
-            .map_err(|err| anyhow!("not a valid P-256 private JWK: {err}"))?;
+        // Only the members RFC 7518 defines are read, so an unexpected extra
+        // member can never make a valid key fail to parse.
+        let (kty, crv) = (member(&v, "kty")?, member(&v, "crv")?);
+        if kty != "EC" || crv != "P-256" {
+            bail!("not a P-256 private JWK (kty {kty:?}, crv {crv:?})");
+        }
+        let (x, y) = (coordinate(&v, "x")?, coordinate(&v, "y")?);
+        let secret = SecretKey::from_slice(coordinate(&v, "d")?.as_slice())
+            .map_err(|_| anyhow!("not a valid P-256 private JWK: `d` is not a scalar in range"))?;
+        // `d` alone determines the key; `x`/`y` are redundant. Refuse a file
+        // where they disagree (as `p256`'s JWK import did), because publishing
+        // the derived public key would silently change the JWKS and thumbprint
+        // a PDS has cached for this `kid`.
+        let (dx, dy) = public_xy(&secret);
+        if dx != *x || dy != *y {
+            bail!("not a valid P-256 private JWK: `x`/`y` do not match `d`");
+        }
         // Prefer the kid already in the file: it is what a PDS may have cached
         // against the published JWKS.
         let kid = v
@@ -153,11 +215,16 @@ impl SigningKey {
     /// The PRIVATE JWK, for persistence. Carries `kid`/`alg`/`key_ops` so a
     /// rollback to the sidecar finds the key under the same identifier.
     pub fn to_jwk_json(&self) -> Result<String> {
-        let mut v: Value =
-            serde_json::to_value(self.secret.to_jwk()).context("serializing the private JWK")?;
+        let mut v = public_members(&self.secret);
         let obj = v
             .as_object_mut()
             .ok_or_else(|| anyhow!("JWK did not serialize to an object"))?;
+        obj.insert(
+            "d".into(),
+            json!(Base64UrlUnpadded::encode_string(&Zeroizing::new(
+                self.secret.to_bytes()
+            ))),
+        );
         obj.insert("kid".into(), json!(self.kid));
         obj.insert("alg".into(), json!(ALG));
         // `key_ops`, not `use`, on the PRIVATE JWK: `jose` warns that a private
@@ -174,14 +241,10 @@ impl SigningKey {
 
     /// The PUBLIC JWK — what `/jwks.json` serves. Never contains `d`.
     pub fn public_jwk(&self) -> Result<Value> {
-        let mut v: Value = serde_json::to_value(self.secret.public_key().to_jwk())
-            .context("serializing the public JWK")?;
+        let mut v = public_members(&self.secret);
         let obj = v
             .as_object_mut()
             .ok_or_else(|| anyhow!("JWK did not serialize to an object"))?;
-        // Defensive: the public JWK must never carry the private scalar, whatever
-        // the upstream serializer does.
-        obj.remove("d");
         obj.insert("kid".into(), json!(self.kid));
         obj.insert("alg".into(), json!(ALG));
         obj.insert("use".into(), json!("sig"));
@@ -556,6 +619,131 @@ mod tests {
         let json = key.to_jwk_json().unwrap();
         let back = SigningKey::from_jwk_json(&json, KID).unwrap();
         assert_eq!(back.thumbprint().unwrap(), key.thumbprint().unwrap());
+    }
+
+    /// The JWK encoding is ours since `p256` 0.14 dropped its `jwk` feature, so
+    /// pin it to an independent implementation: a key `jose` exported must come
+    /// back out with byte-identical `x`, `y` and `d`, or a key file written
+    /// before the upgrade would publish a different JWKS.
+    #[test]
+    fn a_jose_key_exports_byte_identical_members() {
+        let jose: serde_json::Value = serde_json::from_str(JOSE_PRIVATE_JWK).unwrap();
+        let key = SigningKey::from_jwk_json(JOSE_PRIVATE_JWK, KID).unwrap();
+        let private: serde_json::Value = serde_json::from_str(&key.to_jwk_json().unwrap()).unwrap();
+        let public = key.public_jwk().unwrap();
+        for m in ["kty", "crv", "x", "y", "d"] {
+            assert_eq!(private[m], jose[m], "private JWK member {m}");
+        }
+        for m in ["kty", "crv", "x", "y"] {
+            assert_eq!(public[m], jose[m], "public JWK member {m}");
+        }
+    }
+
+    /// `d` alone determines the key, so a file whose `x`/`y` disagree with it is
+    /// corrupt. Loading it anyway would publish a JWKS a PDS has never seen.
+    #[test]
+    fn a_private_jwk_whose_public_half_does_not_match_d_is_refused() {
+        let other: serde_json::Value =
+            serde_json::from_str(&SigningKey::generate(KID).to_jwk_json().unwrap()).unwrap();
+        for m in ["x", "y"] {
+            let mut jwk: serde_json::Value = serde_json::from_str(JOSE_PRIVATE_JWK).unwrap();
+            jwk[m] = other[m].clone();
+            let err = SigningKey::from_jwk_json(&jwk.to_string(), KID)
+                .err()
+                .unwrap_or_else(|| panic!("accepted a JWK with a foreign `{m}`"));
+            assert!(err.to_string().contains("do not match"), "{err}");
+        }
+    }
+
+    /// Each coordinate is exactly 32 bytes of unpadded base64url. Each case is
+    /// matched on its error, so one cannot pass by tripping a different check
+    /// (a short `x` would also fail the `x`/`y`-match check, for instance).
+    #[test]
+    fn a_private_jwk_with_a_malformed_coordinate_is_refused() {
+        let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+        let jose: serde_json::Value = serde_json::from_str(JOSE_PRIVATE_JWK).unwrap();
+        let s = |m: &str| jose[m].as_str().unwrap().to_string();
+        let d = URL_SAFE_NO_PAD.decode(s("d")).unwrap();
+        let x = URL_SAFE_NO_PAD.decode(s("x")).unwrap();
+        let std_alphabet_y = s("y").replace('-', "+").replace('_', "/");
+        assert_ne!(std_alphabet_y, s("y"), "the vector's y must contain - or _");
+        // The 43rd character carries 4 data bits and 2 bits that must be zero;
+        // setting the low bit makes it the same 32 bytes, non-canonically.
+        let non_canonical_d = {
+            let mut d = s("d");
+            let last = d.pop().unwrap();
+            assert_eq!(last, '4', "the vector's d must end in '4' (low bits 00)");
+            d.push('5');
+            d
+        };
+        for (member, value, expected) in [
+            ("d", b64(&d[1..]), "a P-256 coordinate is 43"),
+            (
+                "d",
+                b64(&[&d[..], &[0u8][..]].concat()),
+                "a P-256 coordinate is 43",
+            ),
+            ("x", b64(&x[1..]), "a P-256 coordinate is 43"),
+            ("d", format!("{}=", s("d")), "a P-256 coordinate is 43"),
+            ("d", "!".repeat(43), "not unpadded base64url"),
+            ("y", std_alphabet_y, "not unpadded base64url"),
+            ("d", non_canonical_d, "not unpadded base64url"),
+            ("d", b64(&[0xffu8; 32]), "not a scalar in range"),
+            ("d", b64(&[0u8; 32]), "not a scalar in range"),
+            ("crv", "P-384".to_string(), "not a P-256 private JWK"),
+            ("kty", "OKP".to_string(), "not a P-256 private JWK"),
+        ] {
+            let mut jwk = jose.clone();
+            jwk[member] = serde_json::json!(value);
+            let err = SigningKey::from_jwk_json(&jwk.to_string(), KID)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {member} = {value:?}"));
+            assert!(
+                err.to_string().contains(expected),
+                "{member} = {value:?}: expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    /// The classic encoder bug is dropping a leading zero byte, so a coordinate
+    /// that starts with 0x00 would come out 42 characters. Pin that it does
+    /// not, for `d` and for each of `x` and `y`, by searching scalars until
+    /// each case occurs (about 1 in 256 per coordinate).
+    #[test]
+    fn coordinates_with_a_leading_zero_byte_keep_their_full_width() {
+        let decoded = |v: &serde_json::Value, m: &str| {
+            let text = v[m].as_str().unwrap();
+            assert_eq!(text.len(), COORDINATE_B64_LEN, "{m} lost width");
+            URL_SAFE_NO_PAD.decode(text).unwrap()
+        };
+        let mut seen = [false; 3];
+        let mut scalar = [0u8; 32];
+        scalar[1] = 1; // d[0] == 0: the `d` case holds for every candidate
+        for n in 0u16..=u16::MAX {
+            scalar[30..].copy_from_slice(&n.to_be_bytes());
+            let Ok(secret) = SecretKey::from_slice(&scalar) else {
+                continue;
+            };
+            let key = SigningKey {
+                secret,
+                kid: KID.to_string(),
+            };
+            let jwk: serde_json::Value = serde_json::from_str(&key.to_jwk_json().unwrap()).unwrap();
+            let lead = ["d", "x", "y"].map(|m| decoded(&jwk, m)[0] == 0);
+            if !lead.iter().zip(seen).any(|(&l, s)| l && !s) {
+                continue;
+            }
+            let back = SigningKey::from_jwk_json(&jwk.to_string(), KID).unwrap();
+            assert_eq!(back.secret.to_bytes(), key.secret.to_bytes());
+            assert_eq!(back.public_jwk().unwrap(), key.public_jwk().unwrap());
+            for (s, l) in seen.iter_mut().zip(lead) {
+                *s |= l;
+            }
+            if seen.iter().all(|&s| s) {
+                return;
+            }
+        }
+        panic!("no scalar with a leading-zero x and y found: {seen:?}");
     }
 
     /// The persisted JWK is the PRIVATE one (it has to be — it is the signing

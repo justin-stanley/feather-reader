@@ -115,17 +115,27 @@ getrandom = "0.4"
 # to 0.23; until then leave the pin where reqwest is.
 ring = "0.17"
 base64 = "0.23"
+# Constant-time base64url for decoding the OAuth signing key's JWK coordinates
+# and encoding its private scalar `d` (src/oauth/keys.rs), where `base64`'s
+# table lookups are data-dependent. Public values (x/y on export, thumbprints)
+# still use `base64`. It is what `p256` 0.13's JWK import used; already in the
+# lock via the RustCrypto stack, so this adds no package.
+base64ct = { version = "1.8", features = ["alloc"] }
 # Constant-time comparison. ring's `verify_slices_are_equal` is deprecated as an
 # internal-only helper; `subtle` is the maintained option and is already in the
 # tree, so this adds no package to the lock either.
 subtle = "2"
 
 # --- P-256 for the OAuth confidential-client signing key -----------------
-# The `jwk` feature is the reason for this dep: it gives first-class JWK
-# import/export, so the key file stays in the SAME format the Node sidecar
-# writes and a rollback can still read it. The alternative was hand-parsing
-# PKCS#8 DER out of `ring` to recover the private scalar — more code, in the
-# one place where a silent bug is worst.
+# ES256 signing plus the raw scalar and SEC1 point, so the key file stays a
+# JWK in the SAME format the Node sidecar writes and a rollback can still read
+# it. The alternative was hand-parsing PKCS#8 DER out of `ring` to recover the
+# private scalar — more code, in the one place where a silent bug is worst.
+#
+# 0.14 (2026-10, for RUSTSEC-2026-0387: 0.13's `crypto-bigint` 0.5 is not
+# constant-time) dropped the `jwk` feature 0.13 was taken for. The JWK
+# encoding now lives in `src/oauth/keys.rs` (`coordinate`, `public_members`),
+# pinned by a test against a key `jose` exported.
 #
 # NOT `atproto-oauth`/`atproto-identity`: their `jwk`/`dpop`/`pkce` primitives
 # are exactly what is wanted, but `reqwest` is a NON-optional dependency of
@@ -134,11 +144,11 @@ subtle = "2"
 # guard does not cover — for functions that never touch the network. Version
 # 0.13 is the same one `atproto-identity` itself pins.
 #
-# Cost, stated plainly: 20 pure crypto/encoding packages, and it newly
-# duplicates `hmac` and `rand_core` (the RustCrypto 0.10-era stack beside the
-# newer one already present). `deny.toml` only warns on multiple versions, so
-# this is recorded here rather than left for it to catch.
-p256 = { version = "0.13", features = ["jwk"] }
+# Cost, stated plainly: pure crypto/encoding packages only. 0.13 duplicated
+# `hmac` and `rand_core` (its RustCrypto stack beside the newer one already
+# present); 0.14 is on the newer stack, so that duplication is gone. The
+# remaining `digest` 0.10/0.11 split comes from `sqlx`'s `sha2`, not from here.
+p256 = "0.14"
 # --- DNS, for atproto handle resolution ----------------------------------
 # Handle -> DID resolves by `_atproto.<handle>` TXT record, and DNS is the
 # PREFERRED method per the handle spec -- not a fallback. This is not optional:
