@@ -1865,6 +1865,15 @@ struct EntryActionBarTemplate {
     toggled: &'static str,
 }
 
+/// The page that sends the browser on to the PDS ([`continue_to_pds`]).
+#[derive(Template)]
+#[template(path = "login_continue.html")]
+struct LoginContinueTemplate {
+    card: Card,
+    /// The PDS's authorization endpoint with this login's `request_uri`.
+    authorize_url: String,
+}
+
 /// The login stub (`GET /login`).
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -4801,17 +4810,8 @@ where
 
 /// Begin the OAuth handshake for `handle`: push the authorization request,
 /// hold the pending login, and set the browser-binding cookie the callback is
-/// checked against.
-///
-/// **On `form-action 'self'` and this redirect.** This answers a form POST with
-/// a redirect straight to the PDS — cross-origin — while the app's CSP carries
-/// `form-action 'self'`. Browsers have historically disagreed about whether
-/// that directive applies to redirects following a form submission. It does
-/// not, in practice: the Node sidecar's flow, live in production until the
-/// 2026-09-13 cutover, was `POST /login` -> 303 to the same-origin
-/// `/oauth/login` -> 302 to the PDS, cross-origin, under this same CSP, and a
-/// browser checking the whole redirect chain would have blocked that. One
-/// checking only the form's action URL sees `/login` either way.
+/// checked against. The browser is sent on to the PDS by
+/// [`continue_to_pds`], not by a redirect.
 async fn start_oauth(state: &AppState, handle: &str) -> Response {
     let Some(runtime) = state.oauth.as_deref() else {
         warn!("the OAuth runtime is absent");
@@ -4827,8 +4827,8 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
     .await
     {
         Ok(started) => {
-            info!(%handle, "pushed authorization request; redirecting to the PDS");
-            let mut resp = Redirect::to(&started.authorize_url).into_response();
+            info!(%handle, "pushed authorization request; sending the browser to the PDS");
+            let mut resp = continue_to_pds(state, &started.authorize_url);
             set_cookie(
                 &mut resp,
                 &cookie::sign_value(
@@ -4847,6 +4847,31 @@ async fn start_oauth(state: &AppState, handle: &str) -> Response {
             login_error(state, "Could not start login for that handle.")
         }
     }
+}
+
+/// The answer to the sign-in form: a page that sends the browser on to the
+/// PDS's authorization endpoint with a meta refresh, and a link if the refresh
+/// doesn't fire.
+///
+/// **Not a redirect, because of `form-action 'self'`.** Browsers apply that
+/// directive to where a form submission ends up, redirects included: Chrome
+/// and WebKit refuse a `303` from `POST /login` to the PDS, silently, and the
+/// sign-in page just stays put (found on staging, 2026-10-31; an earlier
+/// comment here assumed the directive ignored redirects). A refresh is a new
+/// navigation, not the form's, so the directive does not apply to it, and the
+/// CSP stays as strict as it is. Checked in Chrome against the same CSP: the
+/// `303` is blocked, the refresh goes through.
+fn continue_to_pds(state: &AppState, authorize_url: &str) -> Response {
+    let mut resp = render(&LoginContinueTemplate {
+        card: Card::private(&state.config),
+        authorize_url: authorize_url.to_string(),
+    });
+    // One-time: the URL carries this login's `request_uri`.
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 /// Clear the browser-binding cookie. Called on every terminal outcome of a
@@ -7906,6 +7931,99 @@ mod tests {
             resp.headers().get(header::LOCATION).unwrap(),
             "/beta/redeem"
         );
+    }
+
+    /// **The sign-in form is answered with a page, not a redirect** (staging,
+    /// 2026-10-31): `form-action 'self'` makes Chrome and WebKit refuse a
+    /// cross-origin redirect after the form POST, silently. The page sends the
+    /// browser on with a meta refresh and a link, both to exactly the PDS's
+    /// URL, and is never cached (the URL carries this login's request_uri).
+    #[tokio::test]
+    async fn the_login_continues_to_the_pds_by_refresh_not_redirect() {
+        let state = test_state(&[]).await;
+        let url = "https://pds.example/oauth/authorize?client_id=https%3A%2F%2Fapp.example%2Fm.json&request_uri=urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Areq-1";
+        let resp = continue_to_pds(&state, url);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a redirect is what form-action blocks"
+        );
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let attr = |prefix: &str| {
+            let start = body
+                .find(prefix)
+                .unwrap_or_else(|| panic!("no {prefix:?} in {body}"))
+                + prefix.len();
+            let end = start + body[start..].find('"').unwrap();
+            // What the browser reads: the attribute value, entity-decoded.
+            decode_entities(&body[start..end])
+        };
+        assert_eq!(attr(r#"<meta http-equiv="refresh" content="0; url="#), url);
+        assert_eq!(attr(r#"<a class="btn btn-primary" href=""#), url);
+    }
+
+    /// Decode the character references askama emits (`&#38;`, `&#x27;`,
+    /// `&amp;`, …), as a browser does when it reads an attribute.
+    fn decode_entities(s: &str) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(i) = rest.find('&') {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            let Some(j) = tail.find(';') else {
+                out.push_str(tail);
+                return out;
+            };
+            let name = &tail[1..j];
+            let ch = match name {
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "apos" => Some('\''),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            match ch {
+                Some(c) => out.push(c),
+                None => out.push_str(&tail[..=j]),
+            }
+            rest = &tail[j + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The URL comes from the PDS's metadata, so it is untrusted text: it must
+    /// stay inside its attributes.
+    #[tokio::test]
+    async fn the_continue_page_escapes_the_pds_url() {
+        let state = test_state(&[]).await;
+        let resp = continue_to_pds(
+            &state,
+            r#"https://pds.example/a?x="><script>alert(1)</script>"#,
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body.contains("<script>alert"),
+            "the URL broke out of its attribute"
+        );
+        assert!(!body.contains(r#"x="><"#), "the URL closed its attribute");
     }
 
     #[tokio::test]
