@@ -31,16 +31,17 @@ deploying is separate.
     bodies show as empty. It doesn't crash and deletes nothing, but a re-poll
     doesn't reliably bring a body back: a `304` changes nothing, and an item
     that has left its feed is never re-stored. **The recovery is upgrading
-    again** (to 0.5.1 or 0.5.2), which shows every body. One thing does not
-    recover: a body a publisher removed while 0.5.0 ran comes back, because
+    again** (to 0.5.1 or 0.5.2), which shows every body. One thing is not
+    undone: a body the publisher removed while 0.5.0 ran reappears, because
     0.5.0 leaves the compressed copy behind and a sole copy can't be told from
     a current one. The upgrade-boot gate tests 0.5.1, which is where
     production is.
   - **Cost:** one short write per stored body, in batches of 200 with a pause
     between, and one compression each (~70 µs). On feather-reader.com that is
-    a few thousand rows and seconds. Leftover copies are cleared in the same
-    batches. A boot with no plain body left to convert does neither, so a
-    converted database pays nothing per boot.
+    a few thousand rows and seconds. Leftover copies are cleared first, in a
+    separate pass of 200-row windows. A boot with no plain body left to
+    convert does neither, so a converted database pays one scan of the
+    entries' row headers per boot and reads no bodies.
   - **A plain body over 2 MiB stays plain.** Only a row stored before the
     ingest bound (#205) can be that large. The reader decodes a compressed
     body only up to that bound, so converting one would destroy it.
@@ -87,7 +88,10 @@ deploying is separate.
   this, the seeded entry had no body and the scheduler was off, so nothing
   read a stored body. Checked both ways: 0.5.1 → 0.5.1 passes, and with 0.5.0
   as the previous release it fails on the compressed-only body, which is the
-  unsupported rollback the upgrade notes describe.
+  unsupported rollback the upgrade notes describe. The compressed-only row is
+  written by the script (Python's `zlib`, raw deflate), so the gate checks the
+  stored format a rollback must read, not this build's own encoder; unit tests
+  cover `encode_sole`. Each page fetch now has a timeout.
 
 ## 0.5.1 — 2026-10-20
 

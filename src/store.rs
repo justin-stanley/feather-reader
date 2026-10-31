@@ -133,6 +133,21 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
             None => {
                 // Absent from a projection that never selected it: no body.
                 let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
+                // A copy tagged as written beside a plain one is never the body
+                // without it, so look at the tag before inflating: such a row
+                // would otherwise decompress up to 2 MiB on an async worker on
+                // every view, only to be discarded (found in review).
+                let packed = match packed {
+                    Some(z) if z.first() == Some(&crate::body_codec::TAG_DEFLATE) => {
+                        tracing::warn!(
+                            entry = id,
+                            "a compressed body written beside a plain one has no plain one now \
+                             (cleared by an older release after a rollback?); no body"
+                        );
+                        None
+                    }
+                    other => other,
+                };
                 match packed.as_deref().map(|z| {
                     (
                         z.len(),

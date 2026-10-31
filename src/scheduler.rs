@@ -2690,6 +2690,36 @@ mod tests {
         );
     }
 
+    /// A plain body of exactly the bound converts and reads back: the filter
+    /// is `<=` on the same byte count the reader's cap uses (found in review).
+    #[tokio::test]
+    async fn the_body_sweep_converts_a_body_exactly_at_the_bound() {
+        use feather_reader::body_codec::{decode_tagged, StoredAs};
+        let pool = compaction_fixture().await;
+        const BOUND: usize = 2 * 1024 * 1024; // feed::MAX_CONTENT_HTML_BYTES
+        let edge = format!("<p>{}</p>", "a".repeat(BOUND - "<p></p>".len()));
+        assert_eq!(edge.len(), BOUND);
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, fetched_at, content_html) \
+             SELECT feed_id, 'edge', '2026-10-20T00:00:00Z', ?1 FROM entries LIMIT 1",
+        )
+        .bind(&edge)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_keep, mut rx) = watch::channel(());
+        compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        let (plain, z) = columns(&pool, "edge").await;
+        assert_eq!(plain, None, "the body at the bound was left plain");
+        assert_eq!(
+            decode_tagged(&z.expect("compressed"), BOUND),
+            Some((StoredAs::Sole, edge)),
+            "the body at the bound does not read back within the reader's cap"
+        );
+    }
+
     /// **No plain body to convert, no clearing pass** (found in review): the
     /// clearing reads every compressed body, so on a converted database it must
     /// not run on every boot. A leftover can only appear after an older release

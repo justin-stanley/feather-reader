@@ -130,7 +130,7 @@ boot_and_check_health() { # image, label
     fi
     # An HTTP/1.0 GET over bash's /dev/tcp, printed as "<status> <body>", the
     # shape the case below matches. bash is in every release's image.
-    health="$(docker exec "$box" bash -c '
+    health="$(docker exec "$box" timeout 10 bash -c '
       exec 3<>/dev/tcp/127.0.0.1/8082 || exit 1
       printf "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3
       IFS=" " read -r _ status _ <&3 || exit 1
@@ -147,7 +147,7 @@ boot_and_check_health() { # image, label
   local id marker page
   for pair in "$plain_id:upgrade-boot-plain-body" "$sole_id:upgrade-boot-sole-body"; do
     id="${pair%%:*}" marker="${pair#*:}"
-    page="$(docker exec "$box" bash -c '
+    page="$(docker exec "$box" timeout 10 bash -c '
       exec 3<>/dev/tcp/127.0.0.1/8082 || exit 1
       printf "GET /entries/'"$id"' HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3
       cat <&3' 2>/dev/null || true)"
