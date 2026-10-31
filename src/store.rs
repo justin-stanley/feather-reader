@@ -1676,7 +1676,7 @@ pub struct CompactBatch {
 /// `content_html` is still the value read here. A poll that re-stored the row
 /// meanwhile has already written it compressed-only, and wins.
 ///
-/// **A plain body over [`crate::feed::MAX_CONTENT_HTML_BYTES`] stays plain.**
+/// **A plain body over `feed::MAX_CONTENT_HTML_BYTES` (2 MiB) stays plain.**
 /// The reader decodes a compressed body only up to that bound, so converting
 /// one would destroy text that is still on disk today (the reader shows it as
 /// too large to render). Only rows stored before the ingest bound (#205) can
