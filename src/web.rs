@@ -1600,6 +1600,12 @@ impl Release {
 /// `releases_are_newest_first_and_link_the_tag_and_changelog` pins the shape.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.5.2",
+        date: "2026-10-31",
+        summary: "Article bodies are now stored compressed only, so the same \
+                  space holds far more feeds. Nothing you read changes.",
+    },
+    Release {
         version: "0.5.1",
         date: "2026-10-20",
         summary: "Article bodies are now also stored compressed, so the next \
@@ -8592,7 +8598,7 @@ mod tests {
         assert_eq!(latest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             latest.changelog_url(),
-            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#051--2026-10-20"
+            "https://github.com/justin-stanley/feather-reader/blob/main/CHANGELOG.md#052--2026-10-31"
         );
     }
 

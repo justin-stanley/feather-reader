@@ -14,7 +14,16 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.5.2 — 2026-10-31
+
+Article bodies are now stored compressed only (#336, step 2 of 2), and a
+one-time sweep after boot converts the older rows. Bodies take about 2.8×
+less space, and they are most of the database, so the same space holds far
+more feeds. Nothing a reader sees changes.
+**Roll back to 0.5.1, not 0.5.0.** Also clears three RustSec advisories, among
+them a non-constant-time bignum in the OAuth signing key's curve crate (#354),
+and brings the build and CI images and actions up to date. Shipped as
+`v0.5.2-rc.1` to staging first (#294).
 
 ### Upgrade notes
 
@@ -77,8 +86,27 @@ deploying is separate.
   storage were adjusted (an over-size body is planted as a plain row, which is
   the only way one can exist; the reclaim test uses incompressible bodies).
 
+### Security
+
+- **RUSTSEC-2026-0385, -0386 and -0387 (#354).** `cargo audit` failed every
+  run from 2026-10-25.
+  - `crypto-bigint` 0.5.5 (-0387, timing variability in operations meant to
+    be constant-time) came in through `p256` 0.13, the OAuth client's ES256
+    signing key. **`p256` 0.13 → 0.14**, on `crypto-bigint` 0.7.
+  - `ctutils` 0.4.2 → 0.4.7 (-0385, via `digest`).
+  - `tokio` 1.53.0 → 1.54.1 in the invite bot (-0386).
+- `p256` 0.14 dropped the `jwk` feature, so the key file's JWK encoding moved
+  into `src/oauth/keys.rs`. Coordinates are decoded and `d` encoded with
+  constant-time `base64ct`, as 0.13 did, and a private JWK whose `x`/`y`
+  don't match `d` is still refused. **The key file format is unchanged.**
+  Tests pin the encoding byte-for-byte to a key `jose` exported, and cover
+  leading-zero coordinates, non-canonical and padded base64, and every
+  malformed member. The signing code compiled unchanged.
+
 ### CI
 
+- **The upgrade-boot gate starts from 0.5.1 (#343)**, the release production
+  runs.
 - **The upgrade-boot gate now checks that bodies render, not just that the
   app boots.** Step 2 seeds a plain body as releases before 0.5.2 stored it.
   After the candidate migrates, a compressed-only body is planted as 0.5.2
@@ -92,6 +120,18 @@ deploying is separate.
   written by the script (Python's `zlib`, raw deflate), so the gate checks the
   stored format a rollback must read, not this build's own encoder; unit tests
   cover `encode_sole`. Each page fetch now has a timeout.
+
+### Dependencies
+
+- Build images (#350): `rust` 1.94 → 1.99 (bookworm), `caddy` 2 → 2.11.7
+  (alpine), `debian:bookworm-slim` re-pinned, all by digest. Dependabot now
+  watches them.
+- `tokio` 1.53.3 → 1.54.1, `flate2` 1.1.9 → 1.1.10, `libc` 0.2.190 → 0.2.191
+  (#351).
+- Actions (#352): `taiki-e/install-action` 2.87.29 → 2.87.32,
+  `github/codeql-action` 4.39.0 → 4.39.1, `rust-lang/crates-io-auth-action`
+  1.0.5 → 1.0.6, `docker/login-action` 4.6.0 → 4.7.0. `Swatinem/rust-cache`
+  re-pinned (#353).
 
 ## 0.5.1 — 2026-10-20
 
