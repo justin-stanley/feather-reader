@@ -133,6 +133,21 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Entry {
             None => {
                 // Absent from a projection that never selected it: no body.
                 let packed: Option<Vec<u8>> = row.try_get("content_z").ok().flatten();
+                // A copy tagged as written beside a plain one is never the body
+                // without it, so look at the tag before inflating: such a row
+                // would otherwise decompress up to 2 MiB on an async worker on
+                // every view, only to be discarded (found in review).
+                let packed = match packed {
+                    Some(z) if z.first() == Some(&crate::body_codec::TAG_DEFLATE) => {
+                        tracing::warn!(
+                            entry = id,
+                            "a compressed body written beside a plain one has no plain one now \
+                             (cleared by an older release after a rollback?); no body"
+                        );
+                        None
+                    }
+                    other => other,
+                };
                 match packed.as_deref().map(|z| {
                     (
                         z.len(),
@@ -466,10 +481,11 @@ CREATE TABLE IF NOT EXISTS entries (
     -- by its `url`, 2 is left out (local-only). Set by ingest; refreshed on
     -- every re-poll.
     guid_synthesized INTEGER NOT NULL DEFAULT 0,
-    -- The body compressed (`body_codec`: a tag byte, then deflate), written
-    -- beside `content_html` from 0.5.1 (#336). While a row has `content_html`,
-    -- that is the body; this is the body alone only when its tag says it was
-    -- written as the only copy (#336 step 2). 0.5.0 reads only `content_html`.
+    -- The body compressed (`body_codec`: a tag byte, then deflate). 0.5.1 wrote
+    -- it beside `content_html` (tag 1); from 0.5.2 it is the only copy (tag 2)
+    -- and `content_html` is NULL, with older rows converted by
+    -- `compact_bodies_batch` (#336). While a row has `content_html`, that is
+    -- the body; this is the body alone only when tagged as the only copy.
     content_z    BLOB,
     UNIQUE (feed_id, guid)
 );
@@ -1636,6 +1652,211 @@ async fn main_db_path(pool: &SqlitePool) -> Option<String> {
         .flatten()
 }
 
+/// What one [`compact_bodies_batch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompactBatch {
+    /// Rows with a plain body that the batch looked at.
+    pub scanned: usize,
+    /// Of those, rows it converted to a compressed-only body.
+    pub converted: usize,
+    /// The highest id it looked at: where the next batch starts.
+    pub last_id: i64,
+}
+
+/// Convert up to `limit` rows with `id > after_id` that still have a plain
+/// body to a compressed-only one (#336 step 2).
+///
+/// **Re-derived from the plain copy, every time**, never by keeping an
+/// existing `content_z`: a row 0.5.0 touched after a rollback can carry a
+/// stale compressed copy beside a current plain one, so the plain copy is the
+/// only trustworthy source. Compression runs on the blocking pool; the write is
+/// one short transaction.
+///
+/// **Guarded against a concurrent write**: each row is converted only if its
+/// `content_html` is still the value read here. A poll that re-stored the row
+/// meanwhile has already written it compressed-only, and wins.
+///
+/// **A plain body over `feed::MAX_CONTENT_HTML_BYTES` (2 MiB) stays plain.**
+/// The reader decodes a compressed body only up to that bound, so converting
+/// one would destroy text that is still on disk today (the reader shows it as
+/// too large to render). Only rows stored before the ingest bound (#205) can
+/// be that big; they are left as they are (found in review).
+pub async fn compact_bodies_batch(
+    pool: &SqlitePool,
+    after_id: i64,
+    limit: i64,
+) -> Result<CompactBatch> {
+    let plan = plan_compaction(pool, after_id, limit).await?;
+    let Some(&(last_id, _, _)) = plan.last() else {
+        return Ok(CompactBatch {
+            last_id: after_id,
+            ..Default::default()
+        });
+    };
+    let scanned = plan.len();
+    let converted = apply_compaction(pool, &plan).await?;
+    Ok(CompactBatch {
+        scanned,
+        converted,
+        last_id,
+    })
+}
+
+/// One row the sweep will convert: its id, the plain body it read, and that
+/// body compressed as the only copy.
+type CompactionRow = (i64, String, Vec<u8>);
+
+/// The read half of [`compact_bodies_batch`]: the rows, and their bodies
+/// compressed on the blocking pool. Split from the write half so a test can
+/// change a row in between, as a concurrent poll would.
+async fn plan_compaction(
+    pool: &SqlitePool,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<CompactionRow>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, content_html FROM entries \
+         WHERE content_html IS NOT NULL AND id > ?1 \
+           AND length(CAST(content_html AS BLOB)) <= ?3 \
+         ORDER BY id LIMIT ?2",
+    )
+    .bind(after_id)
+    .bind(limit)
+    .bind(crate::feed::MAX_CONTENT_HTML_BYTES as i64)
+    .fetch_all(pool)
+    .await
+    .context("listing plain bodies to compress")?;
+    tokio::task::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|(id, body)| {
+                let z = crate::body_codec::encode_sole(&body);
+                (id, body, z)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("compressing plain bodies")
+}
+
+/// The write half of [`compact_bodies_batch`]: one short transaction, each
+/// row converted only if its plain copy is still the one planned from.
+async fn apply_compaction(pool: &SqlitePool, plan: &[CompactionRow]) -> Result<usize> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin compact_bodies_batch tx")?;
+    let mut converted = 0;
+    for (id, body, z) in plan {
+        let done = sqlx::query(
+            "UPDATE entries SET content_z = ?1, content_html = NULL \
+             WHERE id = ?2 AND content_html = ?3",
+        )
+        .bind(z)
+        .bind(id)
+        .bind(body)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("compressing the body of entry {id}"))?;
+        converted += done.rows_affected() as usize;
+    }
+    tx.commit()
+        .await
+        .context("commit compact_bodies_batch tx")?;
+    Ok(converted)
+}
+
+/// Whether any row has a plain body the sweep would convert (#336 step 2):
+/// the sweep's "is there work this boot" check. Within the size bound, as in
+/// [`compact_bodies_batch`], so over-size plain rows (left plain on purpose)
+/// don't make every boot look like it has work.
+///
+/// Reading `content_html IS NOT NULL` needs only each row's record header, not
+/// the compressed bodies, so on a converted database this costs one pass over
+/// the headers.
+pub async fn compressible_plain_bodies_exist(pool: &SqlitePool) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM entries \
+         WHERE content_html IS NOT NULL AND length(CAST(content_html AS BLOB)) <= ?1)",
+    )
+    .bind(crate::feed::MAX_CONTENT_HTML_BYTES as i64)
+    .fetch_one(pool)
+    .await
+    .context("checking for plain bodies to compress")
+}
+
+/// Clear compressed copies written beside a plain one whose plain copy is gone
+/// (#336 step 2), among the next `limit` rows with `id > after_id`: what 0.5.0
+/// leaves after a rollback when a publisher removes a body, since it clears
+/// `content_html` and never touches `content_z`. Such a copy is never the body
+/// (`Entry`'s `FromRow`), so this only drops dead bytes.
+///
+/// **Batched by id window**, like [`compact_bodies_batch`]: telling a beside-copy
+/// from a sole copy reads the tag byte, and SQLite loads the whole value to do
+/// that, so one statement over the table would read nearly every compressed
+/// body under the write lock (found in review). The window is picked from the
+/// rowid alone. `scanned` is the rows in the window, `converted` the copies
+/// cleared.
+pub async fn clear_beside_copies_batch(
+    pool: &SqlitePool,
+    after_id: i64,
+    limit: i64,
+) -> Result<CompactBatch> {
+    let (scanned, last_id): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(id) FROM \
+         (SELECT id FROM entries WHERE id > ?1 ORDER BY id LIMIT ?2)",
+    )
+    .bind(after_id)
+    .bind(limit)
+    .fetch_one(pool)
+    .await
+    .context("picking the next window of rows")?;
+    let Some(last_id) = last_id else {
+        return Ok(CompactBatch {
+            last_id: after_id,
+            ..Default::default()
+        });
+    };
+    let done = sqlx::query(
+        "UPDATE entries SET content_z = NULL \
+         WHERE id > ?1 AND id <= ?2 \
+           AND content_html IS NULL AND content_z IS NOT NULL \
+           AND substr(content_z, 1, 1) = ?3",
+    )
+    .bind(after_id)
+    .bind(last_id)
+    .bind(vec![crate::body_codec::TAG_DEFLATE])
+    .execute(pool)
+    .await
+    .context("clearing compressed copies whose plain copy is gone")?;
+    Ok(CompactBatch {
+        scanned: scanned as usize,
+        converted: done.rows_affected() as usize,
+        last_id,
+    })
+}
+
+/// How many rows still have a plain body (#336 step 2): the sweep's progress.
+pub async fn plain_bodies_remaining(pool: &SqlitePool) -> Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE content_html IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .context("counting plain bodies")
+}
+
+/// The body of the entry with `guid`, read the way the single-entry reader
+/// reads it (`SELECT e.*` through `Entry`). For tests, which must not read the
+/// `content_html` column directly now that it is usually NULL (#336).
+#[cfg(test)]
+pub(crate) async fn stored_body(pool: &SqlitePool, guid: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_as::<_, Entry>("SELECT e.* FROM entries e WHERE e.guid = ?1")
+            .bind(guid)
+            .fetch_one(pool)
+            .await?
+            .content_html,
+    )
+}
+
 /// Freelist pages returned to the OS per `incremental_vacuum` step. At a 4 KiB
 /// page that is ~8 MiB per batch — a short lock hold, and few enough steps that
 /// a large reclaim is tens of statements rather than thousands.
@@ -2071,11 +2292,15 @@ pub async fn insert_entries(
     // (#336; the second found in review): a body may be 2 MiB, and every poll
     // re-stores every body. One per entry, in the order the loop below binds
     // them. ~70 µs for a typical body.
+    //
+    // **The only copy, from 0.5.2** (#336 step 2): tagged as such, with no
+    // plain `content_html` beside it. 0.5.1 reads these; 0.5.0 does not, so
+    // 0.5.1 is the release to roll back to.
     let bodies: Vec<Option<String>> = entries.iter().map(|e| e.content_html.clone()).collect();
     let mut packed = tokio::task::spawn_blocking(move || {
         bodies
             .iter()
-            .map(|b| b.as_deref().map(crate::body_codec::encode))
+            .map(|b| b.as_deref().map(crate::body_codec::encode_sole))
             .collect::<Vec<_>>()
     })
     .await
@@ -2137,7 +2362,8 @@ pub async fn insert_entries(
         .bind(&e.title)
         .bind(&e.author)
         .bind(&e.published)
-        .bind(&e.content_html)
+        // No plain copy: the body is `content_z` alone (?11).
+        .bind(None::<String>)
         .bind(&fetched_at)
         .bind(e.keep_stored_content)
         .bind(flag)
@@ -5778,10 +6004,7 @@ mod tests {
         assert_eq!(entries[1].guid, "guid-1");
         // The body is stored, but it is NOT in the list projection — that is the
         // point of `EntryListRow`. Read it the way the single-entry reader does.
-        let body: Option<String> =
-            sqlx::query_scalar("SELECT content_html FROM entries WHERE guid = 'guid-1'")
-                .fetch_one(&pool)
-                .await?;
+        let body = stored_body(&pool, "guid-1").await?;
         assert_eq!(body.as_deref(), Some("<p>hello</p>"));
 
         // Re-inserting the same GUID dedups (updates in place, no new row).
@@ -6520,11 +6743,12 @@ mod tests {
         )
     }
 
-    /// **Both columns are written, as one body** (#336 release N): the plain
-    /// copy for a rollback to 0.5.0, which reads only `content_html`, and the
-    /// compressed one, which decodes to the same text.
+    /// **A body is written compressed, as the only copy** (#336 step 2): no
+    /// plain `content_html`, and a `content_z` tagged as the only copy, which
+    /// decodes to the body. 0.5.1 reads these rows, which is what makes it the
+    /// release to roll back to.
     #[tokio::test]
-    async fn a_body_is_written_plain_and_compressed() -> Result<()> {
+    async fn a_body_is_written_compressed_as_the_only_copy() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let feed_id = feed_for_item_ids(&pool, "https://z.example/f.xml").await?;
         let body = "<p>Ünïcödé body, long enough to compress. </p>".repeat(50);
@@ -6540,15 +6764,16 @@ mod tests {
         )
         .await?;
         let (plain, packed) = columns_of(&pool, "z1").await?;
-        assert_eq!(plain.as_deref(), Some(body.as_str()), "the plain copy");
+        assert_eq!(plain, None, "a plain copy was written");
         let packed = packed.expect("no compressed copy was written");
         assert!(
             packed.len() < body.len(),
             "the compressed copy is not smaller"
         );
         assert_eq!(
-            crate::body_codec::decode(&packed, crate::feed::MAX_CONTENT_HTML_BYTES).as_deref(),
-            Some(body.as_str())
+            crate::body_codec::decode_tagged(&packed, crate::feed::MAX_CONTENT_HTML_BYTES),
+            Some((crate::body_codec::StoredAs::Sole, body.clone())),
+            "not tagged as the only copy, or not the body"
         );
         assert_eq!(body_of(&pool, "z1").await?.as_deref(), Some(body.as_str()));
 
@@ -6590,6 +6815,15 @@ mod tests {
             let pool = pool.clone();
             async move { sqlx::query(sql).execute(&pool).await }
         };
+        assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>A</p>"));
+        // From here, a row as 0.5.1 wrote it: a plain copy, and a compressed one
+        // tagged as written beside it.
+        sqlx::query(
+            "UPDATE entries SET content_html = '<p>A</p>', content_z = ?1 WHERE guid = 'r'",
+        )
+        .bind(crate::body_codec::encode("<p>A</p>"))
+        .execute(&pool)
+        .await?;
         assert_eq!(body_of(&pool, "r").await?.as_deref(), Some("<p>A</p>"));
 
         // **Rollback, case 1** (found in review): 0.5.0 re-stores an edited
@@ -6636,11 +6870,11 @@ mod tests {
         Ok(())
     }
 
-    /// **Keep-stored keeps both columns together** (#336): a poll that could
-    /// not sanitize a body leaves the stored one, in both forms, and a later
-    /// poll replaces both.
+    /// **Keep-stored keeps the stored body as it is** (#336), whichever form
+    /// the row is in (a plain row the sweep hasn't reached, or a compressed
+    /// one), and a later poll replaces it with a compressed-only body.
     #[tokio::test]
-    async fn keep_stored_keeps_both_forms_of_the_body() -> Result<()> {
+    async fn keep_stored_keeps_the_stored_body_in_either_form() -> Result<()> {
         let pool = init_url("sqlite::memory:").await?;
         let feed_id = feed_for_item_ids(&pool, "https://zk.example/f.xml").await?;
         let row = |body: Option<&str>, keep: bool| NewEntry {
@@ -6657,13 +6891,68 @@ mod tests {
             first,
             "keep-stored changed a column"
         );
+
+        // A row the sweep hasn't reached: plain, with a compressed copy beside.
+        sqlx::query(
+            "UPDATE entries SET content_html = '<p>old</p>', content_z = ?1 WHERE guid = 'k'",
+        )
+        .bind(crate::body_codec::encode("<p>old</p>"))
+        .execute(&pool)
+        .await?;
+        let plain_row = columns_of(&pool, "k").await?;
+        insert_entries(&pool, feed_id, &[row(None, true)], 0).await?;
+        assert_eq!(
+            columns_of(&pool, "k").await?,
+            plain_row,
+            "keep-stored changed a plain row"
+        );
+
         insert_entries(&pool, feed_id, &[row(Some("<p>second</p>"), false)], 0).await?;
         let (plain, packed) = columns_of(&pool, "k").await?;
-        assert_eq!(plain.as_deref(), Some("<p>second</p>"));
+        assert_eq!(plain, None, "a re-stored body kept a plain copy");
         assert_eq!(
-            crate::body_codec::decode(&packed.expect("packed"), 1 << 20).as_deref(),
-            Some("<p>second</p>"),
-            "the compressed copy was not replaced with the plain one"
+            crate::body_codec::decode_tagged(&packed.expect("packed"), 1 << 20),
+            Some((crate::body_codec::StoredAs::Sole, "<p>second</p>".into())),
+        );
+        Ok(())
+    }
+
+    /// **A poll that re-stores a row mid-sweep wins** (#336 step 2): the sweep
+    /// converts a row only if its plain copy is still the one it read. Without
+    /// the guard, the sweep's older body would overwrite the poll's newer one.
+    #[tokio::test]
+    async fn a_row_re_stored_during_the_sweep_keeps_the_newer_body() -> Result<()> {
+        let pool = init_url("sqlite::memory:").await?;
+        let feed_id = feed_for_item_ids(&pool, "https://zc.example/f.xml").await?;
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, fetched_at, content_html) \
+             VALUES (?1, 'c', '2026-10-20T00:00:00Z', '<p>old</p>')",
+        )
+        .bind(feed_id)
+        .execute(&pool)
+        .await?;
+        let plan = plan_compaction(&pool, 0, 10).await?;
+        assert_eq!(plan.len(), 1);
+        // A poll re-stores the item between the sweep's read and its write.
+        insert_entries(
+            &pool,
+            feed_id,
+            &[NewEntry {
+                guid: "c".into(),
+                content_html: Some("<p>new</p>".into()),
+                ..Default::default()
+            }],
+            0,
+        )
+        .await?;
+        assert_eq!(
+            apply_compaction(&pool, &plan).await?,
+            0,
+            "the sweep wrote anyway"
+        );
+        assert_eq!(
+            stored_body(&pool, "c").await?.as_deref(),
+            Some("<p>new</p>")
         );
         Ok(())
     }
@@ -9406,12 +9695,26 @@ mod tests {
         )
         .await?;
 
-        // Insert a large batch so the file allocates real pages.
+        // Insert a large batch so the file allocates real pages. The bodies are
+        // pseudo-random: stored compressed (#336), a run of one letter takes
+        // almost no space, and the delete below would then free too few pages
+        // to see.
+        let noise = |seed: u64| {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..400)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    char::from(b'a' + (x % 26) as u8)
+                })
+                .collect::<String>()
+        };
         let entries: Vec<NewEntry> = (0..2000)
             .map(|i| NewEntry {
                 guid: format!("guid-{i}"),
                 title: Some(format!("Entry number {i} with some padding text")),
-                content_html: Some("<p>".to_string() + &"x".repeat(400) + "</p>"),
+                content_html: Some("<p>".to_string() + &noise(i) + "</p>"),
                 published: Some("2026-01-01T00:00:00Z".to_string()),
                 ..Default::default()
             })

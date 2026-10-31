@@ -4625,11 +4625,17 @@ mod sanitize_off_runtime_tests {
         (pool, feed, body)
     }
 
+    /// Every stored body by guid, read the way the reader reads it (through
+    /// `Entry`): the column alone is NULL since bodies are stored compressed
+    /// (#336).
     async fn bodies(pool: &SqlitePool) -> Vec<(String, Option<String>)> {
-        sqlx::query_as("SELECT guid, content_html FROM entries ORDER BY guid")
+        sqlx::query_as::<_, crate::store::Entry>("SELECT e.* FROM entries e ORDER BY e.guid")
             .fetch_all(pool)
             .await
             .unwrap()
+            .into_iter()
+            .map(|e| (e.guid, e.content_html))
+            .collect()
     }
 
     async fn validators(pool: &SqlitePool, url: &str) -> (Option<String>, Option<String>) {

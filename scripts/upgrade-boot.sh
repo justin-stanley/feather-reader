@@ -18,9 +18,18 @@
 #      at:// publication without `kind`, and an entry without
 #      `guid_synthesized`), so backfills run on real data
 #   3. candidate migrates that volume
-#   4. candidate boots fully (scheduler off, no network) and answers /health
-#   5. previous image boots fully again on the migrated volume and answers
-#      /health (rollback)
+#   4. candidate boots fully (scheduler off, no network), answers /health,
+#      and renders two stored bodies (below)
+#   5. previous image boots fully again on the migrated volume, answers
+#      /health, and renders the same two bodies (rollback)
+#
+# The bodies (#336): a plain one seeded in step 2, as every release before
+# 0.5.2 stored it, and a compressed-only one planted after step 3, as 0.5.2
+# stores it (tag byte 2, then raw deflate). Booting proves the schema; only
+# rendering proves a rolled-back release can still READ what the candidate
+# wrote. The page is fetched as FEATHERREADER_DEV_DID, which needs that DID in
+# beta_access and a sub_ref row for the feed (with no network the PDS listing
+# fails and the cached sub_refs are used). Needs python3 for the deflate.
 #
 # Needs docker, and sqlite3 on the host. **Nothing runs Node in an image**: the
 # database is a host directory bind-mounted at /data, seeded with the host's
@@ -36,6 +45,7 @@ prev="${1:?usage: upgrade-boot.sh <previous-image> <candidate-image>}"
 cand="${2:?usage: upgrade-boot.sh <previous-image> <candidate-image>}"
 
 command -v sqlite3 >/dev/null || { echo "upgrade-boot.sh: needs sqlite3 on the host" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "upgrade-boot.sh: needs python3 on the host" >&2; exit 2; }
 
 data="$(mktemp -d)"
 box="fr-upgrade-boot-$$"
@@ -77,12 +87,33 @@ INSERT INTO feeds (url) VALUES ('at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.stan
 INSERT INTO entries (feed_id, guid, url, fetched_at)
   SELECT id, '5813b43a0512aaef2750311bf4d978a', 'https://n.example/post', '2026-01-01T00:00:00Z'
   FROM feeds WHERE url = 'https://example.com/feed.xml';
+-- A body as every release before 0.5.2 stored it: plain, in content_html.
+INSERT INTO entries (feed_id, guid, url, fetched_at, content_html)
+  SELECT id, 'upgrade-boot-plain', 'https://n.example/plain', '2026-01-01T00:00:00Z',
+         '<p>upgrade-boot-plain-body</p>'
+  FROM feeds WHERE url = 'https://example.com/feed.xml';
 SQL
 seeded="$(sqlite3 "$db" "SELECT (SELECT COUNT(*) FROM feeds) || ' ' || (SELECT COUNT(*) FROM entries)")"
-[ "$seeded" = "2 1" ] || fail "the seed did not land (feeds, entries: ${seeded:-none})"
+[ "$seeded" = "2 2" ] || fail "the seed did not land (feeds, entries: ${seeded:-none})"
 
 step "3/5 candidate migrates it ($cand)"
 run "$cand" --migrate-auto-vacuum || fail "the candidate could not migrate a database the previous release created"
+
+# A body as 0.5.2 stores it: compressed only (tag 2 = the only copy, then raw
+# deflate, RFC 1951), content_html NULL. Planted after the migration because
+# content_z only exists from 0.5.1. Plus what DEV_DID needs to read both.
+dev_did="did:plc:upgradeboot"
+sole_hex="$(python3 -c 'import zlib; c = zlib.compressobj(6, zlib.DEFLATED, -15); print((bytes([2]) + c.compress(b"<p>upgrade-boot-sole-body</p>") + c.flush()).hex())')"
+sqlite3 "$db" <<SQL || fail "could not plant the compressed-only body"
+INSERT INTO entries (feed_id, guid, url, fetched_at, content_html, content_z)
+  SELECT id, 'upgrade-boot-sole', 'https://n.example/sole', '2026-01-01T00:00:00Z', NULL, X'$sole_hex'
+  FROM feeds WHERE url = 'https://example.com/feed.xml';
+INSERT INTO beta_access (did, granted_by, granted_at) VALUES ('$dev_did', 'upgrade-boot', 0);
+INSERT INTO sub_ref (did, feed_id) SELECT '$dev_did', id FROM feeds WHERE url = 'https://example.com/feed.xml';
+SQL
+plain_id="$(sqlite3 "$db" "SELECT id FROM entries WHERE guid = 'upgrade-boot-plain'")"
+sole_id="$(sqlite3 "$db" "SELECT id FROM entries WHERE guid = 'upgrade-boot-sole'")"
+[ -n "$plain_id" ] && [ -n "$sole_id" ] || fail "the body rows are missing after the migration"
 
 # A full boot — not just the schema path — that must answer /health with 200.
 boot_and_check_health() { # image, label
@@ -90,6 +121,7 @@ boot_and_check_health() { # image, label
   docker run -d --name "$box" --network none "${as_me[@]}" -v "$data:/data" \
     -e FEATHERREADER_ENV=dev -e FEATHERREADER_DB=/data/featherreader.db \
     -e FEATHERREADER_BIND=127.0.0.1:8082 -e FEATHERREADER_DISABLE_SCHEDULER=1 \
+    -e FEATHERREADER_DEV_DID="$dev_did" \
     --entrypoint /app/featherreader "$image" >/dev/null
   for _ in $(seq 1 30); do
     if [ "$(docker inspect -f '{{.State.Running}}' "$box" 2>/dev/null)" != "true" ]; then
@@ -98,7 +130,7 @@ boot_and_check_health() { # image, label
     fi
     # An HTTP/1.0 GET over bash's /dev/tcp, printed as "<status> <body>", the
     # shape the case below matches. bash is in every release's image.
-    health="$(docker exec "$box" bash -c '
+    health="$(docker exec "$box" timeout 10 bash -c '
       exec 3<>/dev/tcp/127.0.0.1/8082 || exit 1
       printf "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3
       IFS=" " read -r _ status _ <&3 || exit 1
@@ -111,6 +143,21 @@ boot_and_check_health() { # image, label
     "200 ok"*) echo "$health" | head -2 ;;
     *) docker logs "$box" 2>&1 | tail -20 >&2; fail "the $label did not report healthy: ${health:-no answer}" ;;
   esac
+  # Each stored body must render on its entry page.
+  local id marker page
+  for pair in "$plain_id:upgrade-boot-plain-body" "$sole_id:upgrade-boot-sole-body"; do
+    id="${pair%%:*}" marker="${pair#*:}"
+    page="$(docker exec "$box" timeout 10 bash -c '
+      exec 3<>/dev/tcp/127.0.0.1/8082 || exit 1
+      printf "GET /entries/'"$id"' HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3
+      cat <&3' 2>/dev/null || true)"
+    case "$page" in
+      "HTTP/1."?" 200"*) ;;
+      *) docker logs "$box" 2>&1 | tail -20 >&2; fail "the $label did not serve entry $id: $(printf '%s' "$page" | head -1)" ;;
+    esac
+    grep -q "$marker" <<<"$page" || { docker logs "$box" 2>&1 | tail -20 >&2; fail "the $label served entry $id without its body ($marker)"; }
+    echo "entry $id renders its body ($marker)"
+  done
   docker rm -f "$box" >/dev/null
 }
 

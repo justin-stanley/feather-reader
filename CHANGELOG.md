@@ -14,6 +14,85 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Upgrade notes
+
+- **Bodies are stored compressed only (#336, step 2 of 2). Roll back to 0.5.1,
+  not 0.5.0.** New bodies go into `entries.content_z` alone, tagged as the
+  only copy, with `content_html` NULL. A one-time sweep, three minutes after
+  boot, converts every older row the same way and then reclaims the space.
+  - **Rolling back to 0.5.1 works**: it reads compressed-only rows (step 1
+    already did), and its own writes go back to storing both copies, which
+    this release sweeps again on its next boot.
+  - **Rolling back to 0.5.0 is not supported once 0.5.2 has run at all**, not
+    only once the sweep has: from the first poll, every body 0.5.2 stores is
+    compressed-only, and 0.5.0 never reads `content_z`. Under 0.5.0 those
+    bodies show as empty. It doesn't crash and deletes nothing, but a re-poll
+    doesn't reliably bring a body back: a `304` changes nothing, and an item
+    that has left its feed is never re-stored. **The recovery is upgrading
+    again** (to 0.5.1 or 0.5.2), which shows every body. One thing is not
+    undone: a body the publisher removed while 0.5.0 ran reappears, because
+    0.5.0 leaves the compressed copy behind and a sole copy can't be told from
+    a current one. The upgrade-boot gate tests 0.5.1, which is where
+    production is.
+  - **Cost:** one short write per stored body, in batches of 200 with a pause
+    between, and one compression each (~70 µs). On feather-reader.com that is
+    a few thousand rows and seconds. Leftover copies are cleared first, in a
+    separate pass of 200-row windows. A boot with no plain body left to
+    convert does neither, so a converted database pays one scan of the
+    entries' row headers per boot and reads no bodies.
+  - **A plain body over 2 MiB stays plain.** Only a row stored before the
+    ingest bound (#205) can be that large. The reader decodes a compressed
+    body only up to that bound, so converting one would destroy it.
+  - **Where the space comes back:** in an `auto_vacuum = INCREMENTAL` database
+    (new databases, or after `--migrate-auto-vacuum`), `reclaim` shrinks the
+    file. In `NONE` mode the freed pages stay on the freelist and are reused by
+    later writes; the DB-size watermark measures used pages, so the capacity
+    comes back either way, but the file on disk only shrinks in INCREMENTAL.
+
+### Changed
+
+- **Stored bodies are compressed only (#336, step 2 of 2).** `insert_entries`
+  writes `content_z` with `body_codec::encode_sole` (tag `2`, "the only copy")
+  and `content_html` NULL. A one-shot task (`run_body_compaction`, not a loop:
+  once every row is converted there is nothing left to do) first checks that
+  any plain body is left to convert (`store::compressible_plain_bodies_exist`)
+  and otherwise does nothing. It then clears leftover beside-copies whose
+  plain copy is gone, in id windows of 200 (`store::clear_beside_copies_batch`;
+  telling the tags apart reads each compressed body, so one statement would
+  read nearly the whole table under the write lock), then pages through rows
+  that still have a plain body within the 2 MiB bound with
+  `store::compact_bodies_batch`: it **re-derives** each
+  compressed copy from the plain one (an existing tag-1 copy may be stale from
+  a rollback), compresses on the blocking pool, and converts a row only if its
+  plain copy is still the one it read, so a concurrent poll's write wins. It
+  checks for shutdown between batches and resumes on the next boot; when it
+  finishes it runs `reclaim`. A test plants a poll's write between the
+  sweep's read and its write and checks the newer body survives; without the
+  guard it doesn't. Seven mutations of the write path and the sweep each fail a
+  test, and three more for the review fixes (no size bound, no gate, an empty
+  clearing window). Tests that read stored bodies now read them
+  through `Entry`, the way the reader does; two whose fixtures assumed plain
+  storage were adjusted (an over-size body is planted as a plain row, which is
+  the only way one can exist; the reclaim test uses incompressible bodies).
+
+### CI
+
+- **The upgrade-boot gate now checks that bodies render, not just that the
+  app boots.** Step 2 seeds a plain body as releases before 0.5.2 stored it.
+  After the candidate migrates, a compressed-only body is planted as 0.5.2
+  stores it. The candidate boot and the rollback boot must each serve both
+  entry pages with their bodies, fetched as `FEATHERREADER_DEV_DID` (given
+  beta access and a cached `sub_ref`, since the gate has no network). Before
+  this, the seeded entry had no body and the scheduler was off, so nothing
+  read a stored body. Checked both ways: 0.5.1 → 0.5.1 passes, and with 0.5.0
+  as the previous release it fails on the compressed-only body, which is the
+  unsupported rollback the upgrade notes describe. The compressed-only row is
+  written by the script (Python's `zlib`, raw deflate), so the gate checks the
+  stored format a rollback must read, not this build's own encoder; unit tests
+  cover `encode_sole`. Each page fetch now has a timeout.
+
 ## 0.5.1 — 2026-10-20
 
 Article bodies are now also stored compressed, beside the plain copy (#336,

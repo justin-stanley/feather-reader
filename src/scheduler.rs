@@ -421,14 +421,22 @@ pub fn spawn(state: AppState, shutdown: watch::Receiver<()>) -> Vec<tokio::task:
         handles.push(l.spawn_at(state.clone(), shutdown.clone(), startup));
     }
 
-    // The two loops with NO startup offset. `run_metrics_flusher` deliberately
-    // fires immediately at boot; `run_flusher` swallows its first tick. Neither
-    // is in `Loop`, so neither is covered by the distinctness invariant — stated
-    // here because the test's message would otherwise read as covering all loops.
+    // The tasks with NO startup offset. `run_metrics_flusher` deliberately
+    // fires immediately at boot; `run_flusher` swallows its first tick; the body
+    // sweep below waits out its own delay. None is in `Loop`, so none is covered
+    // by the distinctness invariant — stated here because the test's message
+    // would otherwise read as covering all loops.
     handles.push({
         let state = state.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_metrics_flusher(state, shutdown).await })
+    });
+    // One-shot, not in `Loop`: it runs once per boot, after its own delay, and
+    // ends when every body is compressed (#336 step 2).
+    handles.push({
+        let db = state.db.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { run_body_compaction(db, shutdown).await })
     });
     // Last: consumes the un-cloned `state` / `shutdown` by move.
     handles.push(tokio::spawn(
@@ -460,6 +468,141 @@ fn for_each_loop(mut f: impl FnMut(Loop)) {
 /// is dropped — the shared "time to stop" signal both loops select on.
 async fn shutdown_fired(rx: &mut watch::Receiver<()>) {
     let _ = rx.changed().await;
+}
+
+// ---------------------------------------------------------------------------
+// Body compaction (#336 step 2)
+// ---------------------------------------------------------------------------
+
+/// Delay before the body sweep starts: past boot, the first poll ticks and the
+/// local loops' own offsets, so it doesn't add to the busiest minute.
+const BODY_COMPACTION_STARTUP_DELAY: Duration = Duration::from_secs(180);
+
+/// Rows per [`store::compact_bodies_batch`]: one short write transaction each.
+const BODY_COMPACTION_BATCH: i64 = 200;
+
+/// Pause between batches, so a poll or a page load waiting on the write lock
+/// gets in.
+const BODY_COMPACTION_PAUSE: Duration = Duration::from_millis(200);
+
+/// What a body sweep did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CompactionSummary {
+    /// Leftover compressed copies cleared (see
+    /// [`store::clear_beside_copies_batch`]).
+    cleared: u64,
+    /// Rows converted to a compressed-only body.
+    converted: usize,
+    /// Batches run.
+    batches: usize,
+    /// Stopped by shutdown before it finished.
+    interrupted: bool,
+}
+
+/// Compress every stored body that still has a plain copy, once per boot
+/// (#336 step 2), then return the freed pages to the OS.
+///
+/// **Why once per boot and not a loop:** from 0.5.2 every write is already
+/// compressed-only, so after one complete pass nothing is left to do. A
+/// rollback to 0.5.1 writes plain copies again; the next boot of 0.5.2 sweeps
+/// those.
+async fn run_body_compaction(db: store::Pool, mut shutdown: watch::Receiver<()>) {
+    tokio::select! {
+        _ = shutdown_fired(&mut shutdown) => return,
+        _ = tokio::time::sleep(BODY_COMPACTION_STARTUP_DELAY) => {}
+    }
+    match compact_bodies(
+        &db,
+        &mut shutdown,
+        BODY_COMPACTION_BATCH,
+        BODY_COMPACTION_PAUSE,
+    )
+    .await
+    {
+        Ok(sum) => {
+            if sum.converted > 0 || sum.cleared > 0 {
+                info!(
+                    converted = sum.converted,
+                    cleared = sum.cleared,
+                    batches = sum.batches,
+                    interrupted = sum.interrupted,
+                    "body compaction: stored bodies compressed"
+                );
+                if !sum.interrupted {
+                    // The plain copies' pages are on the freelist now; give them
+                    // back so the file and the DB-size watermark actually fall.
+                    if let Err(err) = store::reclaim(&db).await {
+                        warn!(%err, "body compaction: reclaim after compressing failed");
+                    }
+                }
+            } else {
+                debug!("body compaction: every stored body is already compressed");
+            }
+        }
+        Err(err) => error!(%err, "body compaction failed; plain bodies stay readable"),
+    }
+}
+
+/// The sweep itself: if any plain body is left to convert, clear leftover
+/// compressed copies, then convert batches until none is left, checking for
+/// shutdown between batches.
+///
+/// **Nothing to convert means nothing to clear, and no work at all.** A
+/// leftover beside-copy only appears after an older release ran, and every
+/// older release stores plain bodies, so the boots that can find one are the
+/// boots with plain bodies. Gating on that keeps the clearing pass (which reads
+/// every compressed body) off every boot of a converted database.
+async fn compact_bodies(
+    db: &store::Pool,
+    shutdown: &mut watch::Receiver<()>,
+    batch: i64,
+    pause: Duration,
+) -> anyhow::Result<CompactionSummary> {
+    let mut sum = CompactionSummary::default();
+    if !store::compressible_plain_bodies_exist(db).await? {
+        return Ok(sum);
+    }
+    let mut after_id = 0;
+    loop {
+        if shutdown.has_changed().unwrap_or(true) {
+            sum.interrupted = true;
+            return Ok(sum);
+        }
+        let done = store::clear_beside_copies_batch(db, after_id, batch).await?;
+        if done.scanned == 0 {
+            break;
+        }
+        sum.cleared += done.converted as u64;
+        after_id = done.last_id;
+        tokio::select! {
+            _ = shutdown_fired(shutdown) => {
+                sum.interrupted = true;
+                return Ok(sum);
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+    let mut after_id = 0;
+    loop {
+        if shutdown.has_changed().unwrap_or(true) {
+            sum.interrupted = true;
+            return Ok(sum);
+        }
+        let done = store::compact_bodies_batch(db, after_id, batch).await?;
+        if done.scanned == 0 {
+            return Ok(sum);
+        }
+        sum.batches += 1;
+        sum.converted += done.converted;
+        after_id = done.last_id;
+        tokio::select! {
+            _ = shutdown_fired(shutdown) => {
+                sum.interrupted = true;
+                return Ok(sum);
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,9 +1825,10 @@ mod tests {
     /// and the round that introduced `for_each_loop` to close the third form
     /// also introduced the mis-named test that hid this one.
     ///
-    /// The `+ 2` is the two loops with no startup offset: the metrics flusher
-    /// (which fires immediately at boot, deliberately) and the read-state
-    /// flusher. Neither is in `Loop`.
+    /// The `+ 3` is the three tasks with no startup offset: the metrics flusher
+    /// (which fires immediately at boot, deliberately), the read-state flusher,
+    /// and the one-shot body sweep (#336 step 2, which waits out its own
+    /// delay). None is in `Loop`.
     #[tokio::test]
     async fn spawn_starts_every_registered_loop() {
         // `spawn` returns early with an empty Vec when the kill switch is set,
@@ -1700,8 +1844,8 @@ mod tests {
         let handles = spawn(state, rx);
         assert_eq!(
             handles.len(),
-            Loop::ALL.len() + 2,
-            "`spawn` started {} tasks for {} registered loops + 2 unoffset ones \
+            Loop::ALL.len() + 3,
+            "`spawn` started {} tasks for {} registered loops + 3 unoffset ones \
              — it is not starting one task per registry entry",
             handles.len(),
             Loop::ALL.len(),
@@ -2369,5 +2513,231 @@ mod tests {
             1,
             "the unflushed cursor must remain dirty after a failed attempt",
         );
+    }
+
+    // -- #336 step 2: the body sweep -----------------------------------------
+
+    async fn compaction_fixture() -> store::Pool {
+        let pool = store::init_url("sqlite::memory:").await.unwrap();
+        let feed_id = store::upsert_feed(
+            &pool,
+            &store::NewFeed::new(
+                store::FeedUrl::vetted("https://sweep.example/feed.xml", false).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let put = |guid: &'static str, plain: Option<&'static str>, z: Option<Vec<u8>>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO entries (feed_id, guid, fetched_at, content_html, content_z) \
+                     VALUES (?1, ?2, '2026-10-20T00:00:00Z', ?3, ?4)",
+                )
+                .bind(feed_id)
+                .bind(guid)
+                .bind(plain)
+                .bind(z)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        use feather_reader::body_codec::{encode, encode_sole};
+        // As 0.5.1 wrote it: plain, and a compressed copy beside it.
+        put("v051", Some("<p>v051</p>"), Some(encode("<p>v051</p>"))).await;
+        // From before 0.5.1: plain only.
+        put("v050", Some("<p>v050</p>"), None).await;
+        // A rollback to 0.5.0 re-stored an edited body: the plain copy is current,
+        // the compressed one stale.
+        put(
+            "stale",
+            Some("<p>current</p>"),
+            Some(encode("<p>stale</p>")),
+        )
+        .await;
+        // A rollback to 0.5.0 cleared a removed body: a leftover beside-copy.
+        put("removed", None, Some(encode("<p>removed</p>"))).await;
+        // Already as 0.5.2 writes it.
+        put("sole", None, Some(encode_sole("<p>sole</p>"))).await;
+        pool
+    }
+
+    async fn columns(pool: &store::Pool, guid: &str) -> (Option<String>, Option<Vec<u8>>) {
+        sqlx::query_as("SELECT content_html, content_z FROM entries WHERE guid = ?1")
+            .bind(guid)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// **The sweep leaves every body compressed-only and unchanged** (#336
+    /// step 2): re-derived from the plain copy (so a stale compressed copy is
+    /// replaced, not kept), leftover beside-copies cleared, already-converted
+    /// rows untouched, across several batches.
+    #[tokio::test]
+    async fn the_body_sweep_compresses_every_plain_body_from_the_plain_copy() {
+        use feather_reader::body_codec::{decode_tagged, StoredAs};
+        let pool = compaction_fixture().await;
+        let sole_before = columns(&pool, "sole").await;
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            sum,
+            CompactionSummary {
+                cleared: 1,
+                converted: 3,
+                batches: 2,
+                interrupted: false
+            }
+        );
+        assert_eq!(store::plain_bodies_remaining(&pool).await.unwrap(), 0);
+        for (guid, body) in [
+            ("v051", "<p>v051</p>"),
+            ("v050", "<p>v050</p>"),
+            ("stale", "<p>current</p>"),
+        ] {
+            let (plain, z) = columns(&pool, guid).await;
+            assert_eq!(plain, None, "{guid} kept a plain copy");
+            assert_eq!(
+                decode_tagged(&z.expect("compressed"), 1 << 20),
+                Some((StoredAs::Sole, body.to_string())),
+                "{guid}: not the plain body, tagged as the only copy"
+            );
+        }
+        assert_eq!(
+            columns(&pool, "removed").await,
+            (None, None),
+            "the leftover was kept"
+        );
+        assert_eq!(
+            columns(&pool, "sole").await,
+            sole_before,
+            "a converted row was rewritten"
+        );
+
+        // A second pass finds nothing.
+        let again = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(again, CompactionSummary::default());
+    }
+
+    /// A shutdown stops the sweep between batches, and it resumes cleanly on
+    /// the next run: nothing is half-converted.
+    #[tokio::test]
+    async fn the_body_sweep_stops_on_shutdown_and_resumes() {
+        let pool = compaction_fixture().await;
+        let (tx, mut rx) = watch::channel(());
+        tx.send(()).unwrap();
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(sum.interrupted);
+        assert_eq!(sum.batches, 0, "a batch ran after shutdown");
+        assert_eq!(store::plain_bodies_remaining(&pool).await.unwrap(), 3);
+
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!sum.interrupted);
+        assert_eq!(sum.converted, 3);
+        assert_eq!(store::plain_bodies_remaining(&pool).await.unwrap(), 0);
+    }
+
+    /// **A plain body over the size bound stays plain** (found in review): the
+    /// reader decodes a compressed body only up to `MAX_CONTENT_HTML_BYTES`, so
+    /// converting one would destroy text that is readable on disk today. The
+    /// sweep still converts the rest and still finishes.
+    #[tokio::test]
+    async fn the_body_sweep_leaves_an_over_size_plain_body_plain() {
+        let pool = compaction_fixture().await;
+        // `feed::MAX_CONTENT_HTML_BYTES` (2 MiB) is crate-private to the
+        // library; any body past it will do.
+        let huge = format!("<p>{}</p>", "a".repeat(2 * 1024 * 1024));
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, fetched_at, content_html) \
+             SELECT feed_id, 'huge', '2026-10-20T00:00:00Z', ?1 FROM entries LIMIT 1",
+        )
+        .bind(&huge)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            sum.converted, 3,
+            "the in-bound bodies were not all converted"
+        );
+        assert!(!sum.interrupted);
+        assert_eq!(
+            columns(&pool, "huge").await,
+            (Some(huge), None),
+            "the over-size plain body was converted"
+        );
+        // It doesn't count as work, so the next boot doesn't run the sweep.
+        assert!(!store::compressible_plain_bodies_exist(&pool).await.unwrap());
+        assert_eq!(
+            compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+                .await
+                .unwrap(),
+            CompactionSummary::default()
+        );
+    }
+
+    /// A plain body of exactly the bound converts and reads back: the filter
+    /// is `<=` on the same byte count the reader's cap uses (found in review).
+    #[tokio::test]
+    async fn the_body_sweep_converts_a_body_exactly_at_the_bound() {
+        use feather_reader::body_codec::{decode_tagged, StoredAs};
+        let pool = compaction_fixture().await;
+        const BOUND: usize = 2 * 1024 * 1024; // feed::MAX_CONTENT_HTML_BYTES
+        let edge = format!("<p>{}</p>", "a".repeat(BOUND - "<p></p>".len()));
+        assert_eq!(edge.len(), BOUND);
+        sqlx::query(
+            "INSERT INTO entries (feed_id, guid, fetched_at, content_html) \
+             SELECT feed_id, 'edge', '2026-10-20T00:00:00Z', ?1 FROM entries LIMIT 1",
+        )
+        .bind(&edge)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_keep, mut rx) = watch::channel(());
+        compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        let (plain, z) = columns(&pool, "edge").await;
+        assert_eq!(plain, None, "the body at the bound was left plain");
+        assert_eq!(
+            decode_tagged(&z.expect("compressed"), BOUND),
+            Some((StoredAs::Sole, edge)),
+            "the body at the bound does not read back within the reader's cap"
+        );
+    }
+
+    /// **No plain body to convert, no clearing pass** (found in review): the
+    /// clearing reads every compressed body, so on a converted database it must
+    /// not run on every boot. A leftover can only appear after an older release
+    /// ran, and those store plain bodies, so this gate loses nothing in the
+    /// supported paths; the leftover is dead bytes either way.
+    #[tokio::test]
+    async fn the_body_sweep_does_nothing_without_a_plain_body() {
+        let pool = compaction_fixture().await;
+        sqlx::query("DELETE FROM entries WHERE content_html IS NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let removed = columns(&pool, "removed").await;
+        let (_keep, mut rx) = watch::channel(());
+        let sum = compact_bodies(&pool, &mut rx, 2, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(sum, CompactionSummary::default());
+        assert_eq!(columns(&pool, "removed").await, removed);
     }
 }
