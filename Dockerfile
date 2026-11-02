@@ -32,7 +32,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust builder: compile the `featherreader` binary.
 # ---------------------------------------------------------------------------
-FROM rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS rust-build
+FROM rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS rust-build
 
 # PART C toggle: when ENABLE_SBOM=1 the binary is built with `cargo auditable`,
 # which embeds the exact dependency graph into the ELF so `cargo audit bin` (and
