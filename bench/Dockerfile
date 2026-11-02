@@ -7,7 +7,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 COPY --from=build /src/target/release/synthfeeds /usr/local/bin/synthfeeds
 USER 65534:65534
 ENV SYNTH_BIND=0.0.0.0:8263
