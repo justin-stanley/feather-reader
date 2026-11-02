@@ -97,7 +97,7 @@ jobs:
       # Config is deny.toml at the repo root; feature evaluation is set there
       # (`[graph] all-features = true`).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -134,7 +134,7 @@ jobs:
       # `cargo install ... || true`, which masked an install failure and let the
       # next step die command-not-found — a green job that skipped the RustSec scan.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -184,7 +184,7 @@ jobs:
       # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` OR-expression resolves to a
       # permissive branch automatically.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -197,7 +197,7 @@ jobs:
       # green-looking job that never actually ran the RustSec scan. install-action
       # fails the job loudly if the tool can't be fetched. (Cheap nit.)
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-audit@0.22.2
 
@@ -242,7 +242,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -250,7 +250,7 @@ jobs:
         run: cargo-deny check bans licenses sources
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-audit@0.22.2
 
