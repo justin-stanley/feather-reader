@@ -3,7 +3,7 @@
 {% block title %}{{ title }} — FeatherReader{% endblock %}
 
 {% block body %}
-<div class="shell" id="shell">
+<div class="shell" id="shell" hx-boost="true">
 
   <header class="topbar">
     <a class="icon-btn" href="/{% if !back_qs.is_empty() %}?{{ back_qs }}{% endif %}" aria-label="Back to list">
