@@ -35,10 +35,24 @@ deploying is separate.
   reader back to the top of it. `keyboard.js` saves the position per tab
   (`sessionStorage`) on `pagehide` and puts it back on load; without storage
   the rail starts at the top, as before. Checked in Chromium across a real
-  navigation. Client-side navigation, the larger ask in #345, is not part of
-  this.
+  navigation.
 
 ### Changes
+
+- **Moving around the app no longer reloads the page** (#345). The reader's
+  list, an entry and the manage page boost their links and forms with the
+  htmx already in the page: the next page is fetched and swapped in, and the
+  address bar and history follow. The rail keeps its place across the swap.
+  `HX-Boosted` requests get the response a plain browser gets, so a handler's
+  fragment branch can never blank a page (a test sends one to the mark-read
+  handler, and fails with the old check). htmx keeps no page snapshots:
+  they would copy article text into localStorage, so back and forward reload
+  the page. The OPML export, a download, is not boosted; links that open
+  elsewhere never were. `keyboard.js` now looks its elements up when an
+  event fires, since a swap replaces them. Checked in Chromium on the real
+  router: no reload across feed, entry, mark-all-read and back to the list;
+  `m` and `?` work on swapped-in pages; the mobile drawer opens and closes
+  before and after a swap; back reloads; a 404 shows its page.
 
 - **An "All feeds" entry at the top of the rail** (#346), with the total
   unread count. Leaving a feed or folder scope used to take clicking the brand

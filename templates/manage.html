@@ -3,7 +3,7 @@
 {% block title %}Manage feeds — FeatherReader{% endblock %}
 
 {% block body %}
-<div class="shell" id="shell">
+<div class="shell" id="shell" hx-boost="true">
 
   <header class="topbar">
     <a class="icon-btn" href="/" aria-label="Back to unread">
@@ -164,7 +164,7 @@
                    accept=".opml,.xml,text/xml,text/x-opml" />
             <button class="btn" type="submit">Import OPML</button>
           </form>
-          <a class="btn" href="/opml/export" download="featherreader-subscriptions.opml">Export OPML</a>
+          <a class="btn" href="/opml/export" download="featherreader-subscriptions.opml" hx-boost="false">Export OPML</a>
           <p class="opml-note">
             Import writes one subscription record per feed into your PDS.
             Export is always available — leaving must be as easy as arriving.
