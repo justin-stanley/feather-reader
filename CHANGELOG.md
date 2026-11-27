@@ -14,7 +14,24 @@ deploying is separate.
 
 ---
 
-## Unreleased
+## 0.5.3 — 2026-11-27
+
+Moving around the app no longer reloads the page (#345): the next page is
+swapped in, and the sidebar keeps its place. **Fixes "Mark all read" in a
+folder, which marked every feed read** (#347); it now marks exactly the list
+on screen and returns to it. Adds an **All feeds** entry to the sidebar (#346).
+Also clears six RustSec advisories (#367), among them a sanitizer fix in
+`ammonia`, the only XSS defence for article bodies, and replaces the
+unmaintained `chrono` with `jiff`. No schema change: **rolling back to 0.5.2
+is seamless.** Shipped to staging first (#294) as `v0.5.3-rc.1`.
+
+### Upgrade notes
+
+- **No migration, nothing to do.** Nothing since 0.5.2 changes the schema or
+  how anything is stored. Timestamps are written byte-for-byte as before
+  (pinned by 50 cases recorded from chrono before it was removed; see
+  Security), so 0.5.2 reads everything 0.5.3 writes, and back.
+- The upgrade-boot gate starts from 0.5.2 (#357), the release production runs.
 
 ### Fixes
 
@@ -77,6 +94,39 @@ deploying is separate.
   version, outside the tree, with no lifecycle scripts. Removing any one of
   the fixes above fails it. Locally:
   `cargo test --lib browser_smoke -- --ignored --nocapture`.
+
+### Security
+
+- **Six RustSec advisories cleared (#367).** `cargo audit -D warnings` had
+  been failing every Dependabot PR since mid-November; `main` had not run CI
+  since 2026-10-31, before the advisories were published.
+  - **`ammonia` 4.2.4 → 4.2.5 (RUSTSEC-2026-0533).** It sanitizes every
+    article body, at ingest and again at render, and the result is emitted
+    unescaped, so a mutation-XSS in its SVG/MathML handling was reachable from
+    any subscribed feed.
+  - `libsqlite3-sys` → 0.40.0 (-0459; `sqlx` 0.9.0 → 0.9.1, and `rusqlite`
+    0.43 in the invite bot), `quinn-udp` 0.5.15 → 0.5.16 (-0538), `url`
+    2.5.8 → 2.5.9 (-0592, all three workspaces), `rustix` 1.1.4 → 1.1.6
+    (-0486, invite bot).
+  - **`chrono` is gone (-0543, unmaintained)**, replaced by `jiff` in all
+    three workspaces rather than ignored. `feed-rs` 3.0 → 3.1, which already
+    uses `jiff`, and `sqlx`'s `chrono` feature dropped. Every timestamp is
+    formatted and parsed in one module, `src/time.rs`, because the store
+    compares them as strings: a stray fractional second would sort wrong and
+    fail nowhere. chrono's behaviour was recorded before removal, as 50 cases
+    the parser still has to match. Two differences, both deliberate: a leap
+    second (`:60`) reads as `:59`, and `9999-12-31T23:59:59Z`, past `jiff`'s
+    range, is refused rather than clamped.
+
+### Dependencies
+
+- Production image (#358, #359): `debian:bookworm-slim` and `rust:1.99-bookworm`
+  re-pinned to new digests. CI doesn't build the production image, so the rc
+  tag's `release-image.yml` run is the first build on them.
+- Bench image (#360, #361): the same two bases, re-pinned.
+- Actions (#366): eight updates, among them `docker/login-action` 4.7.0 →
+  4.8.0 and `ossf/scorecard-action` 2.5.0 → 2.6.0; `github/codeql-action`,
+  `actions/dependency-review-action` and `taiki-e/install-action` re-pinned.
 
 ## 0.5.2 — 2026-10-31
 
