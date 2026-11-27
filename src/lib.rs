@@ -50,6 +50,7 @@ pub mod safe_link;
 pub mod sanitized_html;
 pub mod standard_site;
 pub mod store;
+pub mod time;
 pub mod vetted;
 pub mod web;
 

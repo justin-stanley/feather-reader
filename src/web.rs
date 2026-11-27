@@ -56,6 +56,7 @@
 //! All PDS reads and writes route through [`AppState::repo`], to the OAuth
 //! client in `oauth::xrpc`.
 
+use crate::time::TimestampExt as _;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -812,7 +813,7 @@ const HEALTH_FIRST_TICK_GRACE_SECS: i64 = 5 * 60;
 /// (which needs a live admin session) is exactly as unreachable as the thing it
 /// would diagnose, while this is reachable with `curl`.
 async fn health(State(state): State<AppState>) -> Response {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time::now().as_second();
     let rh = &state.runtime_health;
 
     use crate::runtime_health::DbProbe;
@@ -1124,11 +1125,11 @@ fn fetching_state(rh: &crate::runtime_health::RuntimeHealth, now_unix: i64) -> &
 
 /// `GET /stats` — public poll health.
 async fn stats(State(state): State<AppState>) -> Response {
-    let now = chrono::Utc::now();
+    let now = crate::time::now();
     let health = match store::poll_health(
         &state.db,
-        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        &now.rfc3339_secs(),
+        &(now - jiff::SignedDuration::from_hours(1)).rfc3339_secs(),
     )
     .await
     {
@@ -1183,9 +1184,9 @@ async fn stats(State(state): State<AppState>) -> Response {
         in_backoff: health.in_backoff,
         badly_broken: health.badly_broken,
         failure_kinds: health.failure_kinds,
-        fetching: fetching_state(&state.runtime_health, now.timestamp()),
+        fetching: fetching_state(&state.runtime_health, now.as_second()),
         deferred_no_permit: deferred,
-        starved_since: starved_since.map(|since| humanise_ago(Some(now.timestamp() - since))),
+        starved_since: starved_since.map(|since| humanise_ago(Some(now.as_second() - since))),
     })
 }
 
@@ -2627,10 +2628,10 @@ async fn index(
                             // Bounded to one nudge per feed per poll interval —
                             // see `mark_feed_due`. Unbounded, a reload loop here
                             // becomes outbound amplification.
-                            let stale_before = (chrono::Utc::now()
-                                - chrono::Duration::from_std(state.config.poll_interval)
-                                    .unwrap_or_else(|_| chrono::Duration::hours(1)))
-                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            let stale_before = (crate::time::now()
+                                - jiff::SignedDuration::try_from(state.config.poll_interval)
+                                    .unwrap_or_else(|_| jiff::SignedDuration::from_hours(1)))
+                            .rfc3339_secs();
                             if let Err(err) =
                                 store::mark_feed_due(pool, feed_url, &stale_before).await
                             {
@@ -5392,7 +5393,7 @@ async fn preflight_code(state: &AppState, code: &str) -> Result<(), store::Redee
         Some(r) => r,
         None => return Err(store::RedeemError::NotFound),
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time::now().as_second();
     match status.as_str() {
         "active" if expires_at >= now => Ok(()),
         "active" => Err(store::RedeemError::Expired),
@@ -6903,7 +6904,7 @@ async fn build_entry_row(
 
 /// RFC3339 "now" (UTC) — shared by handlers that stamp/compare timestamps.
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    crate::time::now_rfc3339()
 }
 
 #[cfg(test)]
@@ -7399,7 +7400,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("UPDATE invite_codes SET expires_at = ?1 WHERE code = ?2")
-            .bind(chrono::Utc::now().timestamp() - 3600)
+            .bind(crate::time::now().as_second() - 3600)
             .bind(&expired)
             .execute(&state.db)
             .await
@@ -8717,7 +8718,9 @@ mod tests {
         for r in RELEASES {
             assert_eq!(parse(r.version).len(), 3, "{}", r.version);
             assert!(
-                chrono::NaiveDate::parse_from_str(r.date, "%Y-%m-%d").is_ok(),
+                // Strict: chrono's `%Y-%m-%d` also took `2026-1-1` and `26-01-01`,
+                // so this assertion used to be weaker than its own message.
+                crate::time::parse_rfc3339(&format!("{}T00:00:00Z", r.date)).is_some(),
                 "{} is not YYYY-MM-DD",
                 r.date
             );
@@ -15505,10 +15508,8 @@ mod tests {
         // Not merely "moved off 2099" — rescheduled on the CADENCE, not a
         // backoff. A mutation that reschedules successes with backoff_for(1)
         // (5 min) also moves it off 2099, so the interval is asserted.
-        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
-        let delta = parsed
-            .signed_duration_since(chrono::Utc::now())
-            .num_seconds();
+        let parsed = crate::time::parse_rfc3339(&next).unwrap();
+        let delta = parsed.duration_since(crate::time::now()).as_secs();
         let cadence = state.config.poll_interval.as_secs() as i64;
         assert!(
             (cadence - 60..=cadence + 60).contains(&delta),
@@ -15564,10 +15565,8 @@ mod tests {
         // left with a NULL next_poll that `due_feeds` sorts first and re-polls
         // on the very next tick.
         let next = row.2.expect("a failed direct poll left next_poll NULL");
-        let parsed = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
-        let delta = parsed
-            .signed_duration_since(chrono::Utc::now())
-            .num_seconds();
+        let parsed = crate::time::parse_rfc3339(&next).unwrap();
+        let delta = parsed.duration_since(crate::time::now()).as_secs();
         assert!(
             (240..=360).contains(&delta),
             "expected ~300s backoff after one failure, got {delta}s (next_poll={next})"
@@ -15629,11 +15628,11 @@ mod tests {
         .await
         .unwrap();
 
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let health = store::poll_health(
             &state.db,
-            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &now.rfc3339_secs(),
+            &(now - jiff::SignedDuration::from_hours(1)).rfc3339_secs(),
         )
         .await
         .unwrap();
@@ -15684,11 +15683,11 @@ mod tests {
                     .unwrap();
             }
         }
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let health = store::poll_health(
             &state.db,
-            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &now.rfc3339_secs(),
+            &(now - jiff::SignedDuration::from_hours(1)).rfc3339_secs(),
         )
         .await
         .unwrap();
@@ -15840,7 +15839,7 @@ mod tests {
         // starts "unknown" and the uptime branch below drives it explicitly.
         state
             .runtime_health
-            .set_started_at(chrono::Utc::now().timestamp());
+            .set_started_at(crate::time::now().as_second());
 
         let (status, body) = body_of(state.clone()).await;
         assert_eq!(status, StatusCode::OK);
@@ -15880,7 +15879,7 @@ mod tests {
 
         // A stale heartbeat is likewise reported, not fatal.
         let stale_after = health_tick_stale_secs(configured_poll_tick());
-        let long_ago = chrono::Utc::now().timestamp() - (stale_after + 60);
+        let long_ago = crate::time::now().as_second() - (stale_after + 60);
         state.runtime_health.poll_tick_completed(long_ago);
         let (status, body) = body_of(state.clone()).await;
         assert_eq!(
@@ -15899,7 +15898,7 @@ mod tests {
         state.runtime_health.poll_tick_completed(0); // reset to "never"
         state
             .runtime_health
-            .set_started_at(chrono::Utc::now().timestamp() - (HEALTH_FIRST_TICK_GRACE_SECS + 60));
+            .set_started_at(crate::time::now().as_second() - (HEALTH_FIRST_TICK_GRACE_SECS + 60));
         let (status, body) = body_of(state.clone()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -15997,7 +15996,7 @@ mod tests {
         // Ticking: running.
         state
             .runtime_health
-            .poll_tick_completed(chrono::Utc::now().timestamp());
+            .poll_tick_completed(crate::time::now().as_second());
         let body = render(state.clone()).await;
         assert!(
             body.contains("running"),
@@ -16051,7 +16050,7 @@ mod tests {
             "the row shows on an instance that never deferred"
         );
 
-        let ten_min_ago = chrono::Utc::now().timestamp() - 600;
+        let ten_min_ago = crate::time::now().as_second() - 600;
         starvation.record_no_permit(ten_min_ago);
         starvation.record_no_permit(ten_min_ago + 1);
         starvation.record_no_permit(ten_min_ago + 2);
