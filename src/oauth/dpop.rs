@@ -132,7 +132,7 @@ pub fn proof(
     claims.insert("jti".into(), json!(new_jti()));
     claims.insert("htm".into(), json!(method.to_ascii_uppercase()));
     claims.insert("htu".into(), json!(htu(url)?));
-    claims.insert("iat".into(), json!(chrono::Utc::now().timestamp()));
+    claims.insert("iat".into(), json!(crate::time::now().as_second()));
     if let Some(token) = access_token {
         let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
         claims.insert("ath".into(), json!(URL_SAFE_NO_PAD.encode(digest.as_ref())));
@@ -474,7 +474,7 @@ mod tests {
         let key = SigningKey::generate(KID);
         let (_, claims) = parts(&proof(&key, "POST", "https://x.example/t", None, None).unwrap());
         assert_eq!(claims["htm"], "POST");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time::now().as_second();
         let iat = claims["iat"].as_i64().unwrap();
         assert!((now - iat).abs() < 5, "iat {iat} is not close to {now}");
     }

@@ -24,7 +24,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 /// Configuration, from the environment (`SYNTH_*`).
 #[derive(Clone, Debug)]
@@ -184,24 +184,24 @@ impl Feed {
 /// The simulated clock: real time since start, scaled.
 #[derive(Clone, Copy, Debug)]
 struct Clock {
-    start: DateTime<Utc>,
+    start: Timestamp,
     scale: f64,
 }
 
 impl Clock {
-    fn sim_secs(&self, now: DateTime<Utc>) -> u64 {
-        let real = (now - self.start).num_milliseconds().max(0) as f64 / 1_000.0;
+    fn sim_secs(&self, now: Timestamp) -> u64 {
+        let real = (now - self.start).as_millis().max(0) as f64 / 1_000.0;
         (real * self.scale) as u64
     }
 
     /// The real time at which simulated second `sim` falls. May be before
     /// start, for the backlog the first document carries.
-    fn real_at(&self, sim: i64) -> DateTime<Utc> {
-        self.start + chrono::Duration::milliseconds(((sim as f64 / self.scale) * 1_000.0) as i64)
+    fn real_at(&self, sim: i64) -> Timestamp {
+        self.start + SignedDuration::from_millis(((sim as f64 / self.scale) * 1_000.0) as i64)
     }
 
     /// When item `k` of `feed` was published, in real time.
-    fn published(&self, feed: &Feed, k: u64) -> DateTime<Utc> {
+    fn published(&self, feed: &Feed, k: u64) -> Timestamp {
         let period = feed.period.unwrap_or(DAY) as i64;
         // Item `latest(0)` is published at or just before start.
         let newest_at_start = feed.latest(0) as i64;
@@ -265,8 +265,8 @@ fn body_bytes(seed: u64, feed: u64, k: u64) -> usize {
     6_000 + (u * 12_000.0) as usize
 }
 
-fn http_date(t: DateTime<Utc>) -> String {
-    t.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+fn http_date(t: Timestamp) -> String {
+    t.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 /// The RSS document for `feed` at simulated time `sim`.
@@ -281,7 +281,9 @@ fn render(seed: u64, clock: &Clock, feed: &Feed, sim: u64) -> String {
          <description>Capacity bench feed {i}</description>\
          <lastBuildDate>{date}</lastBuildDate>\n",
         i = feed.index,
-        date = clock.published(feed, latest).to_rfc2822(),
+        date = clock
+            .published(feed, latest)
+            .strftime("%a, %d %b %Y %H:%M:%S +0000"),
     );
     for k in (first..=latest).rev() {
         let body = match feed.behaviour {
@@ -299,7 +301,9 @@ fn render(seed: u64, clock: &Clock, feed: &Feed, sim: u64) -> String {
              <pubDate>{date}</pubDate>\
              <description><![CDATA[{body}]]></description></item>",
             i = feed.index,
-            date = clock.published(feed, k).to_rfc2822(),
+            date = clock
+                .published(feed, k)
+                .strftime("%a, %d %b %Y %H:%M:%S +0000"),
         );
     }
     out.push_str("</channel></rss>\n");
@@ -376,7 +380,7 @@ async fn serve_feed(
         Behaviour::Normal | Behaviour::Big => {}
     }
 
-    let sim = app.clock.sim_secs(Utc::now());
+    let sim = app.clock.sim_secs(Timestamp::now());
     let latest = feed.latest(sim);
     let etag = format!("\"{seed}-{index}-{latest}\"");
     let last_modified = http_date(app.clock.published(&feed, latest));
@@ -411,12 +415,12 @@ async fn serve_feed(
 
 async fn stats(State(app): State<App>) -> Json<serde_json::Value> {
     let c = &app.counters;
-    let now = Utc::now();
+    let now = Timestamp::now();
     Json(serde_json::json!({
         "feeds": app.config.feeds,
         "seed": app.config.seed,
         "time_scale": app.config.time_scale,
-        "started": app.clock.start.to_rfc3339(),
+        "started": app.clock.start.to_string(),
         "sim_secs": app.clock.sim_secs(now),
         "requests": c.requests.load(Relaxed),
         "ok": c.ok.load(Relaxed),
@@ -435,18 +439,18 @@ async fn stats(State(app): State<App>) -> Json<serde_json::Value> {
 /// re-seed for the next size doesn't inherit past-due rows and backoff from
 /// the last run. Its stored entries stay; restore the snapshot between sizes
 /// for a clean database (bench/README.md).
-fn seed_sql(base: &str, n: u64, spread_secs: u64, now: DateTime<Utc>) -> String {
+fn seed_sql(base: &str, n: u64, spread_secs: u64, now: Timestamp) -> String {
     let base = base.trim_end_matches('/');
     let mut out = String::from("BEGIN;\n");
     for i in 0..n {
-        let at = now + chrono::Duration::seconds((i * spread_secs / n.max(1)) as i64);
+        let at = now + SignedDuration::from_secs((i * spread_secs / n.max(1)) as i64);
         let _ = writeln!(
             out,
             "INSERT INTO feeds (url, kind, next_poll) VALUES ('{base}/f/{i}.xml', 'rss', '{}') \
              ON CONFLICT (url) DO UPDATE SET next_poll = excluded.next_poll, \
              consecutive_errors = 0, last_error_kind = NULL, last_error = NULL, \
              etag = NULL, last_modified = NULL;",
-            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            at.strftime("%Y-%m-%dT%H:%M:%SZ")
         );
     }
     out.push_str("COMMIT;\n");
@@ -501,7 +505,7 @@ async fn main() -> Result<()> {
             }
             let n: u64 = n.parse().context("N")?;
             let spread: u64 = spread.parse().context("SPREAD_SECS")?;
-            print!("{}", seed_sql(base, n, spread, Utc::now()));
+            print!("{}", seed_sql(base, n, spread, Timestamp::now()));
             return Ok(());
         }
         Some(_) => usage(),
@@ -510,7 +514,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let app = App {
         clock: Clock {
-            start: Utc::now(),
+            start: Timestamp::now(),
             scale: config.time_scale,
         },
         config: Arc::new(config.clone()),
@@ -534,7 +538,6 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use chrono::TimeZone;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -547,7 +550,7 @@ mod tests {
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             }),
             clock: Clock {
-                start: Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, 0).unwrap(),
+                start: "2026-10-18T00:00:00Z".parse::<Timestamp>().unwrap(),
                 scale,
             },
             counters: Arc::default(),
@@ -725,7 +728,7 @@ mod tests {
     /// The seed SQL registers every feed once, spread over the window.
     #[test]
     fn seed_sql_spreads_first_polls() {
-        let now = Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, 0).unwrap();
+        let now = "2026-10-18T00:00:00Z".parse::<Timestamp>().unwrap();
         let sql = seed_sql("https://synth.example/", 4, 3_600, now);
         assert_eq!(sql.matches("INSERT INTO feeds").count(), 4);
         assert_eq!(sql.matches("ON CONFLICT (url) DO UPDATE").count(), 4);

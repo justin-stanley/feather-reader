@@ -127,7 +127,7 @@ async fn run() -> Result<()> {
     // supervisor that tears the machine down whenever a child exits.
     state
         .runtime_health
-        .set_started_at(chrono::Utc::now().timestamp());
+        .set_started_at(feather_reader::time::now().as_second());
 
     // 5. Shutdown fan-out. SIGINT (Ctrl-C) or SIGTERM flips this watch channel;
     //    the HTTP server and both background tasks each hold a receiver and stop.
@@ -480,7 +480,7 @@ async fn revoke_all_sessions(
 
     // A clock, not a timestamp: each sign-out mints a 60-second client
     // assertion, so the time must be read per session (see `revoke_all`).
-    let clock = || chrono::Utc::now().timestamp();
+    let clock = || feather_reader::time::now().as_second();
     let report = match feather_reader::oauth::revoke::revoke_all(&runtime, http, db, clock).await {
         Ok(report) => report,
         Err(err) => {
