@@ -7,6 +7,7 @@
 //! them (#117). `scheduler` keeps the *scheduling* — the interval loop and the
 //! DID selection; this module owns the domain logic.
 
+use crate::time::TimestampExt as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tracing::{info, warn};
@@ -293,12 +294,9 @@ impl Carried {
 /// `updatedAt` / `readThrough` come from any client, with any offset or
 /// precision. An unparseable side is never the later one.
 fn later(a: &str, b: &str) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(a),
-        chrono::DateTime::parse_from_rfc3339(b),
-    ) {
-        (Ok(a), Ok(b)) => a > b,
-        (Ok(_), Err(_)) => true,
+    match (crate::time::parse_rfc3339(a), crate::time::parse_rfc3339(b)) {
+        (Some(a), Some(b)) => a > b,
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -544,10 +542,7 @@ async fn plan_guid_merge(
 /// or before `08:00:00.5`. `None` for anything unparseable, which then covers
 /// nothing.
 fn stored_instant(raw: &str) -> Option<String> {
-    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| {
-        t.with_timezone(&chrono::Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    })
+    crate::time::parse_rfc3339(raw).map(|t| t.rfc3339_secs())
 }
 
 /// Apply a [`MergePlan`]'s imports. Returns how many entries were written.
@@ -958,7 +953,7 @@ fn build_record(
         (Some(local), Some(remote)) if later(remote, local) => Some(remote.to_string()),
         (Some(local), _) => Some(local.to_string()),
         (None, remote) => remote
-            .filter(|r| chrono::DateTime::parse_from_rfc3339(r).is_ok())
+            .filter(|r| crate::time::parse_rfc3339(r).is_some())
             .map(str::to_string),
     };
 

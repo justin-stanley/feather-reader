@@ -24,10 +24,10 @@
 //! [`store::NewFeed`] / [`store::NewEntry`]; dedup is by feed-native GUID via
 //! [`store::insert_entries`]'s `ON CONFLICT (feed_id, guid)` upsert.
 
+use crate::time::TimestampExt as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
 use feed_rs::model::{Entry as RawEntry, Feed as RawFeed, Link as RawLink, Text};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::{Client, StatusCode};
@@ -1744,7 +1744,9 @@ async fn sanitize_off_runtime(
         }
         // `Ok(Err(_))` is a closed semaphore, which this never does.
         Ok(Err(_)) | Err(_) => {
-            let starved = limits.starvation.record_no_permit(Utc::now().timestamp());
+            let starved = limits
+                .starvation
+                .record_no_permit(crate::time::now().as_second());
             if starved >= STARVED_ALERT_SECS {
                 tracing::error!(
                     starved_secs = starved,
@@ -2116,6 +2118,18 @@ fn feed_metadata(parsed: &RawFeed) -> (Option<String>, Option<String>) {
 /// dropped inside the closure and touches no state of ours.
 fn parse_feed(body: &[u8]) -> Result<RawFeed> {
     let parsed = std::panic::catch_unwind(|| {
+        // **Test seam — `#[cfg(test)]`, so a release build does not contain it.**
+        // The guard below exists for parser panics nobody has found yet, which
+        // is exactly why it cannot be tested with a real one: the fixture that
+        // used to reach a feed-rs panic stopped reaching it the day feed-rs
+        // fixed that bug (3.1), and a test that depends on an upstream bug
+        // existing goes vacuous the moment it is fixed. This probe panics on
+        // purpose, inside the same `catch_unwind`, on the same path a real one
+        // would take.
+        #[cfg(test)]
+        if body == tests::PARSER_PANIC_PROBE {
+            panic!("test probe: the feed parser panicked");
+        }
         feed_rs::parser::Builder::new()
             .id_generator(entry_id)
             .build()
@@ -2296,8 +2310,8 @@ fn entry_author(e: &RawEntry) -> Option<String> {
 /// credible `<updated>` keeps the good date. That helps Atom, and RSS 2 only
 /// when the item carries an `<atom:updated>` (read since feed-rs 3.0):
 /// otherwise `feed-rs` copies `published` into `updated` when `updated` is
-/// absent (`parser/rss2/mod.rs`), so the second candidate holds the same value
-/// and the fall-through is a no-op. Worth keeping where two independent dates
+/// absent (`parser/rss/rss2/mod.rs`, still so in 3.1), so the second candidate
+/// holds the same value and the fall-through is a no-op. Worth keeping where two independent dates
 /// exist; worth not overstating where they do not.
 ///
 /// **The ceiling is [`MAX_FUTURE_PUBLISHED_DAYS`], NOT the publication path's
@@ -2314,10 +2328,12 @@ fn entry_author(e: &RawEntry) -> Option<String> {
 /// is what makes a row permanently unsweepable, un-evictable and first in the
 /// list.
 fn entry_time(e: &RawEntry) -> Option<String> {
-    let ceiling = Utc::now() + chrono::Duration::days(MAX_FUTURE_PUBLISHED_DAYS);
-    e.published
-        .filter(|d| *d <= ceiling)
-        .or_else(|| e.updated.filter(|d| *d <= ceiling))
+    let ceiling = crate::time::now() + crate::time::days(MAX_FUTURE_PUBLISHED_DAYS);
+    let credible = |d: &Option<jiff::ZonedDateTime>| {
+        d.as_ref().map(|z| z.timestamp()).filter(|t| *t <= ceiling)
+    };
+    credible(&e.published)
+        .or_else(|| credible(&e.updated))
         .map(fmt_time)
 }
 
@@ -2541,13 +2557,13 @@ fn dedup_hasher() -> siphasher::sip::SipHasher13 {
 
 /// Format a chrono timestamp as RFC3339 (UTC, seconds precision) to match the
 /// store's string columns.
-pub(crate) fn fmt_time(dt: DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+pub(crate) fn fmt_time(dt: crate::time::Timestamp) -> String {
+    dt.rfc3339_secs()
 }
 
 /// "Now" in the store's RFC3339 shape.
 fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::time::now_rfc3339()
 }
 
 /// A stable GUID derived from an entry's title + first link, for feeds that
@@ -3063,7 +3079,9 @@ mod tests {
         // not a clock a few minutes fast. Refusing those would leave real
         // articles undated and dateless on screen, which is why the bound is two
         // days rather than the publication path's five-minute skew grace.
-        let soon = (Utc::now() + chrono::Duration::hours(14)).to_rfc2822();
+        let soon = (crate::time::now() + jiff::SignedDuration::from_hours(14))
+            .strftime("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
         let near = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &soon);
         let parsed = parse_feed(near.as_bytes()).expect("should parse");
         assert!(
@@ -3078,7 +3096,9 @@ mod tests {
         );
 
         // And the bound still bounds: a month out is refused.
-        let far = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
+        let far = (crate::time::now() + crate::time::days(30))
+            .strftime("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
         let month = future.replace("Sat, 01 Jan 2999 00:00:00 GMT", &far);
         let parsed = parse_feed(month.as_bytes()).expect("should parse");
         let e = normalize_entry(&parsed.entries[0]);
@@ -3558,10 +3578,13 @@ mod tests {
         );
     }
 
-    /// Author strings that make feed-rs 3.0 panic: its name/address splitter
-    /// (`parser/util/mod.rs`, `parse_person_name_email`) slices one byte either
+    /// A body [`parse_feed`] panics on, by construction, under `cfg(test)` only.
+    pub(super) const PARSER_PANIC_PROBE: &[u8] = b"<feather-reader-test-probe panic-the-parser/>";
+
+    /// Author strings that made feed-rs 3.0 panic: its name/address splitter
+    /// (`parser/util/mod.rs`, `parse_person_name_email`) sliced one byte either
     /// side of the address, which is not a character boundary when a multi-byte
-    /// character touches it.
+    /// character touches it. Fixed in feed-rs 3.1; kept as a regression record.
     const PANICKING_AUTHORS: [&str; 3] = [
         "jose@example.com（José）",
         "«zoe@example.com» Zoë Long Name Here",
@@ -3610,21 +3633,33 @@ mod tests {
         ]
     }
 
-    /// **A parser panic is a parse failure, not a crash.** feed-rs 3.0 panics
-    /// on [`PANICKING_AUTHORS`]. Uncaught, the panic escaped `poll_feed`, killed
-    /// the poll task after the scheduler had already moved `next_poll`, and
-    /// recorded no failure — the feed stopped updating with nothing to say why.
+    /// **A parser panic is a parse failure, not a crash.** Uncaught, a panic in
+    /// feed-rs escaped `poll_feed`, killed the poll task after the scheduler had
+    /// already moved `next_poll`, and recorded no failure — the feed stopped
+    /// updating with nothing to say why. feed-rs 3.0 did this on
+    /// [`PANICKING_AUTHORS`].
+    ///
+    /// The guard is exercised with [`PARSER_PANIC_PROBE`] rather than with those
+    /// authors, because feed-rs 3.1 fixed that bug and this test's own tripwire
+    /// ("the fixture no longer reaches the panic") fired on the upgrade. A guard
+    /// for unknown panics cannot be pinned to a known one.
     #[test]
     fn a_feed_rs_panic_is_returned_as_an_error() {
+        let err = match parse_feed(PARSER_PANIC_PROBE) {
+            Ok(_) => panic!("the probe parsed; the guard was not exercised"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("panicked"), "{err}");
+
+        // And the upstream fix is recorded: every document that used to panic
+        // feed-rs 3.0 now parses. If a later feed-rs regresses, the guard above
+        // still turns it into an error rather than a dead poll task.
         for v in PANICKING_AUTHORS {
             for (slot, doc) in documents_with_author(v) {
-                let err = match parse_feed(doc.as_bytes()) {
-                    Ok(_) => {
-                        panic!("{slot} {v:?}: parsed; the fixture no longer reaches the panic")
-                    }
-                    Err(e) => format!("{e:#}"),
-                };
-                assert!(err.contains("panicked"), "{slot} {v:?}: {err}");
+                assert!(
+                    parse_feed(doc.as_bytes()).is_ok(),
+                    "{slot} {v:?}: feed-rs panics on this again",
+                );
             }
         }
         // The same slots with an ASCII neighbour parse normally.
@@ -3637,8 +3672,7 @@ mod tests {
     /// `FailureKind::Parse`, so it is backed off and its `last_error` says why.
     #[tokio::test]
     async fn a_poll_of_a_feed_that_panics_the_parser_is_a_parse_failure() {
-        let doc = &documents_with_author(PANICKING_AUTHORS[0])[0].1;
-        let base = crate::net::tests::serve_body(doc.as_bytes().to_vec()).await;
+        let base = crate::net::tests::serve_body(PARSER_PANIC_PROBE.to_vec()).await;
         let port: u16 = base
             .trim_end_matches('/')
             .rsplit(':')
@@ -4078,7 +4112,7 @@ mod tests {
         for _ in 0..5 {
             crate::store::bump_feed_errors(&pool, url, FailureKind::Fetch, "down").await?;
         }
-        let before = chrono::Utc::now();
+        let before = crate::time::now();
         settle_poll(
             &pool,
             url,
@@ -4094,8 +4128,8 @@ mod tests {
             .bind(url)
             .fetch_one(&pool)
             .await?;
-        let next = chrono::DateTime::parse_from_rfc3339(&next)?.with_timezone(&chrono::Utc);
-        let delay = (next - before).num_seconds();
+        let next = crate::time::parse_rfc3339(&next).expect("next_poll is RFC3339");
+        let delay = (next - before).as_secs();
         let expected = backoff_for(6).as_secs() as i64;
         assert!(
             (delay - expected).abs() <= 60,
@@ -4946,8 +4980,8 @@ mod sanitize_off_runtime_tests {
             after.consecutive_errors, 1,
             "the deferral changed the error count"
         );
-        let next = DateTime::parse_from_rfc3339(after.next_poll.as_deref().unwrap()).unwrap();
-        let in_secs = (next.with_timezone(&Utc) - Utc::now()).num_seconds();
+        let next = crate::time::parse_rfc3339(after.next_poll.as_deref().unwrap()).unwrap();
+        let in_secs = (next - crate::time::now()).as_secs();
         assert!(
             (3500..=3600).contains(&in_secs),
             "next poll in {in_secs}s, not on the {cadence:?} cadence"
@@ -5447,7 +5481,7 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
         let short = limits(sem, SHORT);
         assert_eq!(short.starvation.snapshot(), (0, None));
         let held = sem.acquire().await.unwrap();
-        let before = Utc::now().timestamp();
+        let before = crate::time::now().as_second();
         for feed in ["https://one.test/feed", "https://two.test/feed"] {
             assert_eq!(
                 sanitize_off_runtime(feed, ORDINARY_B.to_string(), short).await,
@@ -5460,7 +5494,7 @@ xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Content
             "a deferral for want of a permit went uncounted"
         );
         let since = since.expect("a starved instance did not record since when");
-        assert!(since >= before && since <= Utc::now().timestamp());
+        assert!(since >= before && since <= crate::time::now().as_second());
 
         drop(held);
         assert_eq!(

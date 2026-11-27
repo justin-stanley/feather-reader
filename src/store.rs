@@ -18,6 +18,7 @@
 //!
 //! Errors propagate as [`anyhow::Result`]; nothing in the non-test paths panics.
 
+use crate::time::TimestampExt as _;
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{ConnectOptions, FromRow, Row};
@@ -646,7 +647,7 @@ CREATE TABLE IF NOT EXISTS repo_timing_total (
 /// `*_at` columns. Uses `chrono` to match the shape written by [`crate::feed`]
 /// and [`crate::web`] (one timestamp format across the whole crate).
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    crate::time::now_rfc3339()
 }
 
 /// Open the per-DID SQLite cache described by [`Config`] (its `db_path`), run
@@ -991,9 +992,8 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     // again to be corrected, so it would stay first in the list and survive the
     // per-feed cap. Cleared, `fetched_at` dates it. The same bound ingest uses;
     // a no-op once there are none.
-    let ceiling = (chrono::Utc::now()
-        + chrono::Duration::days(crate::feed::MAX_FUTURE_PUBLISHED_DAYS))
-    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let ceiling = (crate::time::now() + crate::time::days(crate::feed::MAX_FUTURE_PUBLISHED_DAYS))
+        .rfc3339_secs();
     sqlx::query("UPDATE entries SET published = NULL WHERE published > ?1")
         .bind(&ceiling)
         .execute(pool)
@@ -1440,9 +1440,10 @@ pub async fn bump_feed_errors(
 /// needs ([`FeedUrl`]). Every caller reschedules a row it just read, so nothing
 /// relied on the insert. Only `next_poll` is written.
 pub async fn set_next_poll(pool: &SqlitePool, url: &str, delay: std::time::Duration) -> Result<()> {
-    let next = chrono::Utc::now()
-        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
-    let next_poll = next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let next = crate::time::now()
+        + jiff::SignedDuration::try_from(delay)
+            .unwrap_or_else(|_| jiff::SignedDuration::from_hours(1));
+    let next_poll = next.rfc3339_secs();
     sqlx::query("UPDATE feeds SET next_poll = ?1 WHERE url = ?2")
         .bind(next_poll)
         .bind(url)
@@ -1498,14 +1499,15 @@ pub async fn stagger_unscheduled(
     if ids.is_empty() {
         return Ok(0);
     }
-    let now = chrono::Utc::now();
-    let spread = chrono::Duration::from_std(spread).unwrap_or_else(|_| chrono::Duration::hours(1));
+    let now = crate::time::now();
+    let spread = jiff::SignedDuration::try_from(spread)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_hours(1));
     let n = ids.len() as i32;
     let mut tx = pool.begin().await.context("begin stagger")?;
     for (i, id) in ids.iter().enumerate() {
         // Evenly spaced, the first due now: slot i of n across the spread.
         let at = now + spread * i as i32 / n;
-        let next_poll = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let next_poll = at.rfc3339_secs();
         sqlx::query("UPDATE feeds SET next_poll = ?1 WHERE id = ?2 AND next_poll IS NULL")
             .bind(next_poll)
             .bind(id)
@@ -2520,7 +2522,7 @@ pub async fn prune_old_entries(
     hard_days: i64,
     publication_days: i64,
 ) -> Result<u64> {
-    let now = chrono::Utc::now();
+    let now = crate::time::now();
     // **A window too large to be a date disables that pass; it must not panic.**
     //
     // `chrono::Duration::days` and `DateTime - TimeDelta` both panic out of
@@ -2540,7 +2542,7 @@ pub async fn prune_old_entries(
     // other — `Config::retention_for` exists to keep them agreeing. An
     // unrepresentable window meant "store everything" there and "panic" here.
     let at = |d: i64, knob: &str| -> Option<String> {
-        let cutoff = chrono::Duration::try_days(d).and_then(|w| now.checked_sub_signed(w));
+        let cutoff = crate::time::try_days(d).and_then(|w| now.checked_sub(w).ok());
         if cutoff.is_none() {
             tracing::warn!(
                 days = d,
@@ -2549,7 +2551,7 @@ pub async fn prune_old_entries(
                  disabled for this sweep rather than failing the sweeper"
             );
         }
-        cutoff.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        cutoff.map(|t| t.rfc3339_secs())
     };
 
     let cutoff = (days > 0).then(|| at(days, "retention_days")).flatten();
@@ -4582,9 +4584,7 @@ pub async fn import_remote_read_state(
     // The read/unread mark is the remote record's own time, in UTC, so it
     // compares with local marks as instants. An unparseable one is no known
     // time (NULL), never "now".
-    let remote_marked_at = chrono::DateTime::parse_from_rfc3339(remote_updated_at)
-        .ok()
-        .map(utc_timestamp);
+    let remote_marked_at = crate::time::parse_rfc3339(remote_updated_at).map(utc_timestamp);
 
     let (read_through, mut read_ids, mut unread_ids) = cursor_sets(&mut tx, did, feed_url).await?;
     let mut written = 0;
@@ -4665,7 +4665,7 @@ pub async fn import_remote_read_state(
 /// offset or precision — is normalised to UTC `...Z` when it wins. An
 /// unparseable `remote` never wins.
 pub(crate) fn later_timestamp(local: &str, remote: &str) -> String {
-    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    let parse = |s: &str| crate::time::parse_rfc3339(s);
     match (parse(local), parse(remote)) {
         (Some(l), Some(r)) if r > l => utc_timestamp(r),
         (None, Some(r)) => utc_timestamp(r),
@@ -4673,9 +4673,8 @@ pub(crate) fn later_timestamp(local: &str, remote: &str) -> String {
     }
 }
 
-fn utc_timestamp(t: chrono::DateTime<chrono::FixedOffset>) -> String {
-    t.with_timezone(&chrono::Utc)
-        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+fn utc_timestamp(t: crate::time::Timestamp) -> String {
+    t.rfc3339_auto()
 }
 
 /// Create a CLEAN cursor for `did` on `feed_url`, stamped `updated_at`, if
@@ -4695,7 +4694,7 @@ pub async fn create_clean_cursor(
     feed_url: &str,
     updated_at: &str,
 ) -> Result<bool> {
-    let Ok(at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+    let Some(at) = crate::time::parse_rfc3339(updated_at) else {
         return Ok(false);
     };
     let res = sqlx::query(
@@ -4734,7 +4733,7 @@ pub async fn create_clean_cursor(
 
 /// Unix-epoch seconds for "now" — the integer time base for the beta tables.
 pub(crate) fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
+    crate::time::now().as_second()
 }
 
 /// The invite-code alphabet: uppercase letters + digits with the
@@ -5486,9 +5485,9 @@ pub async fn poll_health(pool: &SqlitePool, now: &str, hour_ago: &str) -> Result
 /// unparseable. Never negative: a clock skew that puts a poll in the future
 /// reads as "just now" rather than as a negative age.
 fn secs_between(then: Option<&str>, now: &str) -> Option<i64> {
-    let then = chrono::DateTime::parse_from_rfc3339(then?).ok()?;
-    let now = chrono::DateTime::parse_from_rfc3339(now).ok()?;
-    Some((now - then).num_seconds().max(0))
+    let then = crate::time::parse_rfc3339(then?)?;
+    let now = crate::time::parse_rfc3339(now)?;
+    Some((now - then).as_secs().max(0))
 }
 
 #[cfg(test)]
@@ -5606,7 +5605,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
         )
         .await?;
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = crate::time::now_rfc3339();
         let first = due_feeds(&pool, &now, 1).await?;
         assert_eq!(first[0].url, "https://overdue.example/feed.xml");
         Ok(())
@@ -5727,8 +5726,7 @@ mod tests {
                 },
             )
             .await?;
-            let old = (chrono::Utc::now() - chrono::Duration::days(30))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let old = (crate::time::now() - crate::time::days(30)).rfc3339_secs();
             insert_entries(
                 &pool,
                 feed_id,
@@ -5797,10 +5795,7 @@ mod tests {
             },
         )
         .await?;
-        let age = |d: i64| {
-            (chrono::Utc::now() - chrono::Duration::days(d))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        };
+        let age = |d: i64| (crate::time::now() - crate::time::days(d)).rfc3339_secs();
         insert_entries(
             &pool,
             feed_id,
@@ -5865,10 +5860,7 @@ mod tests {
             feed_id,
             &[NewEntry {
                 guid: "ancient".to_string(),
-                published: Some(
-                    (chrono::Utc::now() - chrono::Duration::days(9999))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                ),
+                published: Some((crate::time::now() - crate::time::days(9999)).rfc3339_secs()),
                 ..Default::default()
             }],
             0,
@@ -6133,8 +6125,7 @@ mod tests {
             },
         )
         .await?;
-        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let tomorrow = (crate::time::now() + crate::time::days(1)).rfc3339_secs();
         for (guid, published) in [
             ("bogus", "2999-01-01T00:00:00Z"),
             ("soon", tomorrow.as_str()),
@@ -7268,11 +7259,8 @@ mod tests {
         let (feed_id, [a, b, ..]) = item_id_rows(&pool).await?;
         replace_sub_refs(&pool, did, &[feed_id]).await?;
         let recent = |s: Option<String>| -> bool {
-            let t = chrono::DateTime::parse_from_rfc3339(&s.expect("stamped")).unwrap();
-            (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
-                .num_seconds()
-                .abs()
-                < 60
+            let t = crate::time::parse_rfc3339(&s.expect("stamped")).unwrap();
+            (crate::time::now() - t).as_secs().abs() < 60
         };
         // mark_read, both values.
         mark_read(&pool, did, a, true).await?;
@@ -9007,11 +8995,11 @@ mod tests {
             .execute(&pool)
             .await?;
         }
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let health = poll_health(
             &pool,
-            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            &(now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            &now.rfc3339_secs(),
+            &(now - jiff::SignedDuration::from_hours(1)).rfc3339_secs(),
         )
         .await?;
         let mut kinds = health.failure_kinds.clone();
@@ -9433,8 +9421,7 @@ mod tests {
             // ONE variant per fixture — running both against the same database
             // measured the second against an already-emptied table, which
             // reported a 0-row "win" the first time this was written.
-            let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let cutoff = (crate::time::now() - crate::time::days(30)).rfc3339_secs();
             let t = std::time::Instant::now();
             let deleted = if old_list_form {
                 // The shape `prune_old_entries` used to have: the pinned set as
@@ -9879,8 +9866,7 @@ mod tests {
 
         // A year old, and READ by somebody — so the window's own sparing rule
         // ("starred or unread survives") cannot be what keeps either row.
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(365)).rfc3339_secs();
         for feed_id in [rss, publication] {
             insert_entries(
                 &pool,
@@ -9954,8 +9940,7 @@ mod tests {
             },
         )
         .await?;
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         let recent = now_rfc3339();
         insert_entries(
             &pool,
@@ -9977,8 +9962,7 @@ mod tests {
             0,
         )
         .await?;
-        let long_ago = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let long_ago = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         insert_entries(
             &pool,
             rss,
@@ -10060,8 +10044,7 @@ mod tests {
             },
         )
         .await?;
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(1_000))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(1_000)).rfc3339_secs();
         insert_entries(
             &pool,
             feed_id,
@@ -10134,8 +10117,7 @@ mod tests {
         .await?;
 
         let recent = now_rfc3339();
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(365)).rfc3339_secs();
 
         // One fresh (published now), one ancient (published a year ago), and one
         // UNDATED-but-freshly-fetched (published NULL, fetched_at now) — the last
@@ -10230,8 +10212,7 @@ mod tests {
         // Caller subscribes so mark-read is authorized to project into the cursor.
         replace_sub_refs(&pool, did, &[feed_id]).await?;
 
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(365)).rfc3339_secs();
         let recent = now_rfc3339();
         insert_entries(
             &pool,
@@ -10371,8 +10352,7 @@ mod tests {
             },
         )
         .await?;
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         // Deliberately not a multiple of PRUNE_BATCH, so the final batch is
         // short and the loop has to keep going to the empty one.
         let count = (PRUNE_BATCH * 2 + 137) as usize;
@@ -10522,8 +10502,7 @@ mod tests {
             },
         )
         .await?;
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         let entries: Vec<NewEntry> = (0..4)
             .map(|i| NewEntry {
                 guid: format!("busy-{i}"),
@@ -10550,8 +10529,7 @@ mod tests {
             .execute(&mut *blocker)
             .await?;
 
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let cutoff = (crate::time::now() - crate::time::days(180)).rfc3339_secs();
         let outcome = sweep_tolerating_busy(
             &sweep_pool,
             "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
@@ -10645,8 +10623,7 @@ mod tests {
             },
         )
         .await?;
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         let entries: Vec<NewEntry> = (0..3)
             .map(|i| NewEntry {
                 guid: format!("calm-{i}"),
@@ -10656,8 +10633,7 @@ mod tests {
             .collect();
         insert_entries(&pool, feed_id, &entries, 1_000).await?;
 
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let cutoff = (crate::time::now() - crate::time::days(180)).rfc3339_secs();
         match sweep_tolerating_busy(
             &pool,
             "SELECT id FROM entries WHERE COALESCE(published, fetched_at) < ?1",
@@ -10749,8 +10725,7 @@ mod tests {
             BATCHES >= 5,
             "the 50% ceiling assumes ~1/BATCHES; below 5 batches correct code              false-fails",
         );
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         let entries: Vec<NewEntry> = (0..(PRUNE_BATCH * BATCHES) as usize)
             .map(|i| NewEntry {
                 guid: format!("lock-{i}"),
@@ -10866,8 +10841,7 @@ mod tests {
         // across a whole pass is a real production invariant (see its own doc)
         // and remains untested; that needs a test with actual cursors, not this
         // one.
-        let hard_cutoff = (chrono::Utc::now() - chrono::Duration::days(180))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let hard_cutoff = (crate::time::now() - crate::time::days(180)).rfc3339_secs();
         let t0 = std::time::Instant::now();
         let outcome = sweep_tolerating_busy(
             &pool,
@@ -11130,8 +11104,7 @@ mod tests {
             },
         )
         .await?;
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         let guids = [
             "nobody-touched",      // no state row at all -> evicted
             "both-read-unstarred", // two DIDs, both read+unstarred -> evicted
@@ -11322,8 +11295,7 @@ mod tests {
             },
         )
         .await?;
-        let old = (chrono::Utc::now() - chrono::Duration::days(400))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old = (crate::time::now() - crate::time::days(400)).rfc3339_secs();
         insert_entries(
             &pool,
             feed_id,
@@ -11385,8 +11357,7 @@ mod tests {
             },
         )
         .await?;
-        let ancient = (chrono::Utc::now() - chrono::Duration::days(365))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let ancient = (crate::time::now() - crate::time::days(365)).rfc3339_secs();
         let entries: Vec<NewEntry> = (0..2000)
             .map(|i| NewEntry {
                 guid: format!("guid-{i}"),
@@ -12892,8 +12863,7 @@ mod tests {
     // ── retention is a CACHE policy, not a data-retention policy ────────────
 
     async fn aged_entry(pool: &SqlitePool, url: &str, days_old: i64) -> i64 {
-        let when = (chrono::Utc::now() - chrono::Duration::days(days_old))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let when = (crate::time::now() - crate::time::days(days_old)).rfc3339_secs();
         sqlx::query("INSERT INTO feeds (url) VALUES (?1) ON CONFLICT(url) DO NOTHING")
             .bind("https://f.example/feed")
             .execute(pool)

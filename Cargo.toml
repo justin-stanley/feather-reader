@@ -38,7 +38,7 @@ tower-http = { version = "0.7", features = ["fs", "trace", "set-header"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "json"] }
 
 # --- feed parsing --------------------------------------------------------
-feed-rs = "3.0"
+feed-rs = "3.1"
 # A specified hash for stored dedup keys (`feed::dedup_hasher`); std's
 # `DefaultHasher` may change between Rust releases. Already in the tree via
 # feed-rs and phf.
@@ -57,7 +57,6 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls-ring",
     "sqlite-bundled",
     "migrate",
-    "chrono",
     # `derive` pulls in sqlx-macros so the store's row structs can
     # `#[derive(FromRow)]` — the derive macro, not just the `FromRow` trait.
     "derive",
@@ -87,7 +86,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- time / dates --------------------------------------------------------
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1", features = ["serde"] }
 
 # --- URL parsing (feed autodiscovery, canonicalization) ------------------
 url = "2"
