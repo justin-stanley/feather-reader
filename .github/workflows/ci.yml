@@ -367,3 +367,41 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Test scripts/release-notes.sh
         run: bash scripts/test-release-notes.sh
+
+  browser-smoke:
+    name: Browser smoke (boosted navigation)
+    # static/keyboard.js and the htmx boost (#345) run only in a browser, so no
+    # Rust test exercises them. This serves the web router on a test fixture
+    # and drives it in Chromium with scripts/browser-smoke.mjs: no reload
+    # between pages, the rail's place and focus, a POST error keeping its URL,
+    # the loading state, the offline alert, shortcuts and the phone drawer.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+
+      - name: Syntax-check the page scripts
+        run: |
+          node --check static/keyboard.js
+          node --check scripts/browser-smoke.mjs
+
+      # The one npm package CI installs, only to drive a browser: an exact
+      # version, outside the tree, with no lifecycle scripts run.
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts \
+            --prefix "$RUNNER_TEMP/pw" playwright@1.63.0
+          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Browser smoke test
+        run: cargo test --locked --lib browser_smoke -- --ignored --nocapture
+        env:
+          NODE_PATH: ${{ runner.temp }}/pw/node_modules

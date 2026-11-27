@@ -53,10 +53,30 @@ deploying is separate.
   router: no reload across feed, entry, mark-all-read and back to the list;
   `m` and `?` work on swapped-in pages; the mobile drawer opens and closes
   before and after a swap; back reloads; a 404 shows its page.
+  What a page load gave for free is put back by hand (found in review of
+  #369):
+  - **Focus** moves to the new page's heading, so a screen reader announces
+    it and Tab starts there.
+  - **Loading feedback:** a thin bar and a dimmed page while the next page
+    loads, after a short delay so a fast swap doesn't flicker.
+  - **A form that gets no answer** says so, in an alert at the top of the
+    page. A link that gets none falls back to a real navigation.
+  - **A POST answered with a page** (an error) keeps the address the reader
+    was on, so a reload never GETs a POST-only URL and lands on a 405.
 
 - **An "All feeds" entry at the top of the rail** (#346), with the total
   unread count. Leaving a feed or folder scope used to take clicking the brand
   logo. It keeps the current view (All / Unread / Starred).
+
+### CI
+
+- **A browser smoke test** (`Browser smoke (boosted navigation)`): the web
+  router on a test fixture, driven in Chromium by
+  `scripts/browser-smoke.mjs`. `keyboard.js` and the boost run only in a
+  browser, so no Rust test reaches them. Playwright is installed at an exact
+  version, outside the tree, with no lifecycle scripts. Removing any one of
+  the fixes above fails it. Locally:
+  `cargo test --lib browser_smoke -- --ignored --nocapture`.
 
 ## 0.5.2 — 2026-10-31
 

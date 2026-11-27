@@ -17316,4 +17316,36 @@ mod tests {
             r#"<meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":true}' />"#
         ));
     }
+
+    /// **Boosted navigation in a real browser** (#345): serves the router on
+    /// the mark-all-read fixture and runs `scripts/browser-smoke.mjs` against
+    /// it in Chromium — no reload between pages, the rail's place and focus,
+    /// a POST error keeping its URL, the loading state, the offline alert, the
+    /// reader's shortcuts and the phone drawer before and after a swap.
+    ///
+    /// Ignored by default: it needs Node and Playwright with Chromium, which
+    /// the Rust toolchain does not bring. Run it with
+    /// `cargo test --lib browser_smoke -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs Node + Playwright (Chromium); see scripts/browser-smoke.mjs"]
+    async fn browser_smoke_boosted_navigation() {
+        let (state, _ids) = mark_all_fixture().await;
+        let cookie = session_cookie(&state, MARK_DID, None);
+        let value = cookie.split_once('=').expect("name=value").1.to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/browser-smoke.mjs");
+        let status = tokio::process::Command::new("node")
+            .arg(script)
+            .arg(&base)
+            .arg(&value)
+            .status()
+            .await
+            .expect("node is not installed");
+        server.abort();
+        assert!(status.success(), "the browser smoke test failed: {status}");
+    }
 }

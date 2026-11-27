@@ -68,6 +68,18 @@
   });
 
   /* ---- boosted navigation (#345) -------------------------------------- */
+  var root = document.documentElement;
+  function navigating(on) { root.classList.toggle("is-navigating", on); }
+
+  /* Feedback while the next page loads: a boosted fetch shows no browser
+   * spinner, so a slow page would look like a dead click. */
+  document.addEventListener("htmx:beforeRequest", function (e) {
+    if (e.detail.boosted) navigating(true);
+  });
+  document.addEventListener("htmx:afterRequest", function (e) {
+    if (e.detail.boosted) navigating(false);
+  });
+
   document.addEventListener("htmx:beforeSwap", function (e) {
     if (!e.detail.boosted) return;
     /* An error page is still a page: show it, as a reload would have,
@@ -79,16 +91,64 @@
     var rail = railEl();
     railTop = rail ? rail.scrollTop : 0;
   });
-  document.addEventListener("htmx:afterSwap", function (e) {
-    if (e.detail.boosted) restoreRail(railTop);
-  });
-  /* No answer (offline, a dropped connection): fall back to a real
-   * navigation, so the browser shows its own error instead of nothing. */
-  document.addEventListener("htmx:sendError", function (e) {
-    var elt = e.detail.elt;
-    if (e.detail.boosted && elt instanceof HTMLAnchorElement) {
-      window.location.assign(elt.href);
+
+  /* A POST that answers with a page (an error, or a page without a redirect)
+   * would push its POST-only URL: a reload or a later Back would then GET it
+   * and land on a 405. Keep the address the reader was on instead. A POST
+   * that redirected (the usual case) lands on a GET URL, which is pushed. */
+  document.addEventListener("htmx:beforeHistoryUpdate", function (e) {
+    var d = e.detail;
+    if (!d.boosted || !d.requestConfig || d.requestConfig.verb === "get") return;
+    if (!d.history || !d.pathInfo) return;
+    var landed = new URL(d.history.path, location.href);
+    var posted = new URL(d.pathInfo.requestPath, location.href);
+    if (landed.pathname === posted.pathname) {
+      d.history.type = "replace";
+      d.history.path = location.pathname + location.search + location.hash;
     }
+  });
+
+  /* After the swap: put the rail back where it was, and move focus to the
+   * new page's heading, as a page load would reset it, so a screen reader
+   * announces the page and Tab starts from it rather than from a link that
+   * no longer exists. */
+  document.addEventListener("htmx:afterSwap", function (e) {
+    if (!e.detail.boosted) return;
+    restoreRail(railTop);
+    var content = byId("content");
+    var heading = content && content.querySelector("h1");
+    var target = heading || content;
+    if (target) {
+      if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+      target.focus({ preventScroll: true });
+    }
+  });
+
+  /* No answer (offline, a dropped connection). A link falls back to a real
+   * navigation, so the browser shows its own error. A form can't be replayed
+   * safely, so say plainly that it did not go through. */
+  var OFFLINE_NOTE = "Couldn't reach FeatherReader, so that didn't go through. " +
+    "Check your connection and try again.";
+  function sayOffline() {
+    var content = byId("content");
+    if (!content) { window.alert(OFFLINE_NOTE); return; }
+    var note = byId("fr-offline");
+    if (!note) {
+      note = document.createElement("p");
+      note.id = "fr-offline";
+      note.className = "flash error";
+      note.setAttribute("role", "alert");
+      content.insertBefore(note, content.firstChild);
+    }
+    note.textContent = OFFLINE_NOTE;
+    note.scrollIntoView({ block: "nearest" });
+  }
+  document.addEventListener("htmx:sendError", function (e) {
+    navigating(false);
+    if (!e.detail.boosted) return;
+    var elt = e.detail.elt;
+    if (elt instanceof HTMLAnchorElement) window.location.assign(elt.href);
+    else sayOffline();
   });
 
   /* ---- list cursor (j / k) --------------------------------------------- */
