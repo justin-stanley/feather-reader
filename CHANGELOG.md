@@ -35,14 +35,48 @@ deploying is separate.
   reader back to the top of it. `keyboard.js` saves the position per tab
   (`sessionStorage`) on `pagehide` and puts it back on load; without storage
   the rail starts at the top, as before. Checked in Chromium across a real
-  navigation. Client-side navigation, the larger ask in #345, is not part of
-  this.
+  navigation.
 
 ### Changes
+
+- **Moving around the app no longer reloads the page** (#345). The reader's
+  list, an entry and the manage page boost their links and forms with the
+  htmx already in the page: the next page is fetched and swapped in, and the
+  address bar and history follow. The rail keeps its place across the swap.
+  `HX-Boosted` requests get the response a plain browser gets, so a handler's
+  fragment branch can never blank a page (a test sends one to the mark-read
+  handler, and fails with the old check). htmx keeps no page snapshots:
+  they would copy article text into localStorage, so back and forward reload
+  the page. The OPML export, a download, is not boosted; links that open
+  elsewhere never were. `keyboard.js` now looks its elements up when an
+  event fires, since a swap replaces them. Checked in Chromium on the real
+  router: no reload across feed, entry, mark-all-read and back to the list;
+  `m` and `?` work on swapped-in pages; the mobile drawer opens and closes
+  before and after a swap; back reloads; a 404 shows its page.
+  What a page load gave for free is put back by hand (found in review of
+  #369):
+  - **Focus** moves to the new page's heading, so a screen reader announces
+    it and Tab starts there.
+  - **Loading feedback:** a thin bar and a dimmed page while the next page
+    loads, after a short delay so a fast swap doesn't flicker.
+  - **A form that gets no answer** says so, in an alert at the top of the
+    page. A link that gets none falls back to a real navigation.
+  - **A POST answered with a page** (an error) keeps the address the reader
+    was on, so a reload never GETs a POST-only URL and lands on a 405.
 
 - **An "All feeds" entry at the top of the rail** (#346), with the total
   unread count. Leaving a feed or folder scope used to take clicking the brand
   logo. It keeps the current view (All / Unread / Starred).
+
+### CI
+
+- **A browser smoke test** (`Browser smoke (boosted navigation)`): the web
+  router on a test fixture, driven in Chromium by
+  `scripts/browser-smoke.mjs`. `keyboard.js` and the boost run only in a
+  browser, so no Rust test reaches them. Playwright is installed at an exact
+  version, outside the tree, with no lifecycle scripts. Removing any one of
+  the fixes above fails it. Locally:
+  `cargo test --lib browser_smoke -- --ignored --nocapture`.
 
 ## 0.5.2 — 2026-10-31
 

@@ -35,6 +35,10 @@
     <meta name="theme-color" content="#faf8f3" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#191714" media="(prefers-color-scheme: dark)" />
     <link rel="stylesheet" href="/static/style.css" />
+    {#- Boosted navigation (#345) keeps no page snapshots: htmx would otherwise
+        copy each page, article text included, into localStorage. Back and
+        forward reload the page instead. -#}
+    <meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":true}' />
     <script src="/static/htmx.min.js" defer></script>
     <script src="/static/keyboard.js" defer></script>
     {% block head %}{% endblock %}

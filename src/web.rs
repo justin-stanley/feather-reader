@@ -6450,11 +6450,17 @@ fn set_cookie(resp: &mut Response, cookie: &str) {
     }
 }
 
-/// Whether the request came from htmx (the `HX-Request` header).
+/// Whether the request came from an htmx control that swaps a FRAGMENT (the
+/// `HX-Request` header). A boosted navigation (#345: the shell's links and
+/// forms, `HX-Boosted`) sends `HX-Request` too, but it swaps in a whole page,
+/// so it gets the same response, redirects included, as a plain browser.
 fn is_htmx(headers: &HeaderMap) -> bool {
-    headers
-        .get("HX-Request")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+    let is = |name: &str| {
+        headers
+            .get(name)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+    };
+    is("HX-Request") && !is("HX-Boosted")
 }
 
 /// Whether a mark-read / star request originated from the single-entry READER
@@ -17235,5 +17241,111 @@ mod tests {
         let a = link(&body);
         assert!(a.contains(r#"href="/""#), "{a}");
         assert!(a.contains(r#"aria-current="page""#), "{a}");
+    }
+
+    /// **A boosted navigation is not a fragment request** (#345). htmx sends
+    /// `HX-Request` on a boosted link or form too, but it swaps in the whole
+    /// page, so the handlers' fragment branches (an empty 200, a row) would
+    /// blank it. Only a plain htmx control's request counts.
+    #[test]
+    fn a_boosted_request_is_not_a_fragment_request() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, v.parse().unwrap());
+            }
+            h
+        };
+        assert!(is_htmx(&headers(&[("HX-Request", "true")])));
+        assert!(!is_htmx(&headers(&[
+            ("HX-Request", "true"),
+            ("HX-Boosted", "true")
+        ])));
+        assert!(!is_htmx(&headers(&[])));
+    }
+
+    /// The same, through a real handler: a boosted POST to mark an entry read
+    /// is answered with the redirect a plain form gets, not a row fragment.
+    #[tokio::test]
+    async fn a_boosted_mark_read_post_redirects_like_a_plain_form() {
+        let (state, _ids) = mark_all_fixture().await;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries LIMIT 1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let cookie = session_cookie(&state, MARK_DID, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/entries/{id}/read"))
+                    .header(header::COOKIE, cookie)
+                    .header("HX-Request", "true")
+                    .header("HX-Boosted", "true")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("read=true"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// **The shell pages navigate without reloading** (#345): their `#shell`
+    /// carries `hx-boost`, and htmx keeps no page snapshots in localStorage.
+    /// The OPML export is a download, which a boost would swap in as a page.
+    #[test]
+    fn the_shell_pages_are_boosted_and_the_download_is_not() {
+        for (name, src) in [
+            ("index", include_str!("../templates/index.html")),
+            ("entry", include_str!("../templates/entry.html")),
+            ("manage", include_str!("../templates/manage.html")),
+        ] {
+            assert!(
+                src.contains(r#"<div class="shell" id="shell" hx-boost="true">"#),
+                "{name}.html's shell is not boosted"
+            );
+        }
+        let manage = include_str!("../templates/manage.html");
+        let export = &manage[manage.find(r#"href="/opml/export""#).unwrap()..];
+        assert!(
+            export[..export.find('>').unwrap()].contains(r#"hx-boost="false""#),
+            "the OPML export link is boosted"
+        );
+        assert!(include_str!("../templates/base.html").contains(
+            r#"<meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":true}' />"#
+        ));
+    }
+
+    /// **Boosted navigation in a real browser** (#345): serves the router on
+    /// the mark-all-read fixture and runs `scripts/browser-smoke.mjs` against
+    /// it in Chromium — no reload between pages, the rail's place and focus,
+    /// a POST error keeping its URL, the loading state, the offline alert, the
+    /// reader's shortcuts and the phone drawer before and after a swap.
+    ///
+    /// Ignored by default: it needs Node and Playwright with Chromium, which
+    /// the Rust toolchain does not bring. Run it with
+    /// `cargo test --lib browser_smoke -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs Node + Playwright (Chromium); see scripts/browser-smoke.mjs"]
+    async fn browser_smoke_boosted_navigation() {
+        let (state, _ids) = mark_all_fixture().await;
+        let cookie = session_cookie(&state, MARK_DID, None);
+        let value = cookie.split_once('=').expect("name=value").1.to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/browser-smoke.mjs");
+        let status = tokio::process::Command::new("node")
+            .arg(script)
+            .arg(&base)
+            .arg(&value)
+            .status()
+            .await
+            .expect("node is not installed");
+        server.abort();
+        assert!(status.success(), "the browser smoke test failed: {status}");
     }
 }

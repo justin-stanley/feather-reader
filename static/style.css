@@ -1544,6 +1544,39 @@ html[data-overlay="1"] .kbd-overlay {
   border-color: color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
+/* Boosted navigation (#345): while the next page loads, a thin bar runs
+   along the top and the page dims slightly, after a short delay so a fast
+   swap doesn't flicker. keyboard.js sets .is-navigating on <html>. */
+.is-navigating body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 100;
+  height: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: fr-navigating 1.2s var(--ease) 0.15s infinite;
+  opacity: 0;
+}
+
+.is-navigating #content {
+  opacity: 0.6;
+  transition: opacity var(--dur-2) var(--ease) 0.15s;
+}
+
+@keyframes fr-navigating {
+  0%   { opacity: 1; transform: scaleX(0); }
+  70%  { opacity: 1; transform: scaleX(0.8); }
+  100% { opacity: 0; transform: scaleX(1); }
+}
+
+/* Focus moved to a page's heading after a boosted swap is for the cursor of
+   assistive tech, not a control: no ring. */
+#content h1[tabindex="-1"]:focus,
+#content[tabindex="-1"]:focus {
+  outline: none;
+}
+
 /* htmx: anything with .htmx-indicator shows only during a request */
 .htmx-indicator {
   display: none;
