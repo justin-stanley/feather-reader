@@ -23,7 +23,7 @@
 //! * `POST /entries/{id}/star` — star/unstar; writes a
 //!   `community.lexicon.rss.saved` record to the user's PDS.
 //! * `POST /saved/{rkey}/delete` — unsave a `saved` record.
-//! * `POST /read-all` — mark-all-read (per feed via `?feed=…`, else everything).
+//! * `POST /read-all` — mark-all-read in a scope (`?feed=…` / `?folder=…`, else everything).
 //! * `POST /subscriptions` — subscribe by URL (autodiscover → PDS record).
 //! * `POST /subscriptions/{rkey}/delete` — unsubscribe (delete the PDS record).
 //! * `POST /subscriptions/{rkey}/rename` — retitle / move a feed to a folder.
@@ -1355,6 +1355,24 @@ struct Nav {
     manage_active: bool,
 }
 
+impl Nav {
+    /// Unread entries across every subscribed feed: the "All feeds" rail
+    /// entry's count, the sum of the per-feed counts the rail already shows.
+    fn total_unread(&self) -> i64 {
+        self.folders
+            .iter()
+            .flat_map(|f| f.feeds.iter())
+            .chain(self.loose_feeds.iter())
+            .map(|f| f.unread)
+            .sum()
+    }
+
+    /// Whether the unscoped list (every feed) is the page being shown.
+    fn all_feeds_selected(&self) -> bool {
+        self.scope_qs.is_empty() && !self.manage_active
+    }
+}
+
 /// The subscribe input's `pattern` when standard.site is on, and the input is
 /// `type="text"` (see `templates/manage.html`). It keeps the browser asking for
 /// a scheme, as `type="url"` did, while admitting `at://`. Matched in any case,
@@ -1464,8 +1482,11 @@ struct IndexTemplate {
     entries: Vec<EntryRow>,
     /// The list heading (the selected view/feed/folder name).
     heading: String,
-    /// Whether a feed scope is active (enables per-feed mark-all-read).
-    feed_scope: Option<String>,
+    /// Where "Mark all read" posts: `/read-all` with this list's feed/folder
+    /// scope and view, so it marks what is on screen and comes back to it
+    /// (#347). Carrying only a FEED scope made a folder view post a bare
+    /// `/read-all`, which marked every feed read.
+    mark_all_href: String,
     /// Total CACHED entries in this scope + view across ALL pages. The count used
     /// to be `entries.len()`, which was the same number only because the list was
     /// unpaged — the thing this change exists to stop.
@@ -2843,7 +2864,11 @@ async fn index(
         (h.to_string(), String::new())
     };
 
-    let feed_scope = selected_feed.map(str::to_string);
+    let mark_all_href = if entry_scope_qs.is_empty() {
+        "/read-all".to_string()
+    } else {
+        format!("/read-all?{entry_scope_qs}")
+    };
     let nav = build_nav(&user, &view, scope_qs, folder_views, loose_feeds, false);
 
     // Pager links. `entry_scope_qs` already carries feed/folder/view, so the
@@ -2876,7 +2901,7 @@ async fn index(
         nav,
         entries,
         heading,
-        feed_scope,
+        mark_all_href,
         total,
         // Whole-list figure, so it sits beside `total` without double counting.
         // The per-page slice is composed above and is not a heading number.
@@ -3502,20 +3527,17 @@ async fn feed_url_for_id(pool: &store::Pool, feed_id: i64) -> Option<String> {
 // Mark-all-read
 // ---------------------------------------------------------------------------
 
-/// Query for `POST /read-all` — an optional `?feed=<url>` scopes it to one feed;
-/// absent means mark everything read.
-#[derive(Debug, Deserialize, Default)]
-struct ReadAllQuery {
-    #[serde(default)]
-    feed: Option<String>,
-}
-
-/// `POST /read-all` — mark every entry read for the current DID, optionally
-/// scoped to one feed (mark-all-read per feed or globally).
+/// `POST /read-all` — mark read every entry in a reading scope for the current
+/// DID: one feed (`?feed=`), one folder (`?folder=`), or, with neither, every
+/// subscribed feed. `?view=` is not a filter here (unread is unread); it rides
+/// along so the redirect lands on the list the reader was looking at (#347).
+///
+/// The scope resolves through the same [`scope_urls_for`] / [`scoped_feed_ids`]
+/// as the list itself, so the button marks exactly the feeds that list shows.
 async fn mark_all_read(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<ReadAllQuery>,
+    Query(q): Query<EntryQuery>,
 ) -> Result<Response, WebError> {
     let did = match current_did(&state, &headers).await {
         Some(d) => d,
@@ -3523,25 +3545,30 @@ async fn mark_all_read(
     };
     let pool = &state.db;
 
-    // Refresh the caller's `sub_ref` projection so the scoped mark-read writes
+    // Also refreshes the caller's `sub_ref` projection, so the mark-read writes
     // only ever touch feeds this DID actually subscribes to.
-    resolve_subscriptions(&state, &did).await;
-
-    if let Some(feed_url) = q.feed.as_deref() {
-        if let Ok(Some(feed)) = store::get_feed_by_url(pool, feed_url).await {
-            store::mark_feed_read(pool, &did, feed.id, true).await?;
-        }
-        return Ok(Redirect::to(&format!("/?feed={}", qenc(feed_url))).into_response());
-    }
-
-    // Global: mark every subscribed feed read. Fan out over the DID's feeds
-    // (bounded by the per-DID subscription cap) using the batched per-feed path,
-    // rather than one UPDATE round-trip per unread entry (unbounded) — same end
-    // state, but O(feeds) statements instead of O(unread entries).
-    for feed_id in store::subscribed_feed_ids(pool, &did).await? {
+    let subs = resolve_subscriptions(&state, &did).await;
+    let scope_urls = scope_urls_for(&subs, q.feed.as_deref(), q.folder.as_deref());
+    // Unscoped: every subscribed feed. A scope that matches nothing marks
+    // nothing — never everything.
+    let feed_ids = match scoped_feed_ids(&subs, &scope_urls) {
+        Some(ids) => ids,
+        None => store::subscribed_feed_ids(pool, &did).await?,
+    };
+    // Fan out over the scope's feeds (bounded by the per-DID subscription cap)
+    // with the batched per-feed path: O(feeds) statements, not one per unread
+    // entry.
+    for feed_id in feed_ids {
         store::mark_feed_read(pool, &did, feed_id, true).await?;
     }
-    Ok(Redirect::to("/").into_response())
+
+    let back = scope_query(&q);
+    let to = if back.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{back}")
+    };
+    Ok(Redirect::to(&to).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -17001,5 +17028,212 @@ mod tests {
             body.contains("Kept folder"),
             "the exported OPML lost the folder: {body}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mark-all-read scope (#347)
+    // -----------------------------------------------------------------------
+
+    const MARK_DID: &str = "did:plc:markallread";
+    const WORK_FEED: &str = "https://work.example/feed.xml";
+    const FUN_FEED: &str = "https://fun.example/feed.xml";
+    const LOOSE_FEED: &str = "https://loose.example/feed.xml";
+
+    fn work_folder() -> String {
+        format!("at://{MARK_DID}/{}/work", lexicon::nsid::FOLDER)
+    }
+
+    /// A reader subscribed to three feeds — one in "Work", one in "Fun", one in
+    /// no folder — each with one unread entry. Returns the state and the feed
+    /// ids by URL.
+    async fn mark_all_fixture() -> (AppState, std::collections::HashMap<&'static str, i64>) {
+        let sub = |rkey: &str, url: &str, folder: Option<String>| {
+            let mut value = serde_json::json!({
+                "$type": lexicon::nsid::SUBSCRIPTION,
+                "url": url,
+                "createdAt": "2026-01-01T00:00:00Z",
+            });
+            if let Some(f) = folder {
+                value["folder"] = serde_json::json!(f);
+            }
+            serde_json::json!({
+                "uri": format!("at://{MARK_DID}/{}/{rkey}", lexicon::nsid::SUBSCRIPTION),
+                "cid": "bafy",
+                "value": value,
+            })
+        };
+        let folder = |rkey: &str, name: &str| {
+            serde_json::json!({
+                "uri": format!("at://{MARK_DID}/{}/{rkey}", lexicon::nsid::FOLDER),
+                "cid": "bafy",
+                "value": {
+                    "$type": lexicon::nsid::FOLDER,
+                    "name": name,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                },
+            })
+        };
+        let subs = serde_json::json!([
+            sub("s-work", WORK_FEED, Some(work_folder())),
+            sub(
+                "s-fun",
+                FUN_FEED,
+                Some(format!("at://{MARK_DID}/{}/fun", lexicon::nsid::FOLDER))
+            ),
+            sub("s-loose", LOOSE_FEED, None),
+        ]);
+        let folders = serde_json::json!([folder("work", "Work"), folder("fun", "Fun")]);
+        let pds = spawn_collections_pds(move |collection| {
+            Some(match collection {
+                c if c == lexicon::nsid::SUBSCRIPTION => subs.clone(),
+                c if c == lexicon::nsid::FOLDER => folders.clone(),
+                _ => serde_json::json!([]),
+            })
+        })
+        .await;
+        let mut state = test_state_on_pds(&[MARK_DID], &pds).await;
+        std::sync::Arc::get_mut(&mut state.config).unwrap().dev_did = Some(MARK_DID.to_string());
+        let mut ids = std::collections::HashMap::new();
+        for url in [WORK_FEED, FUN_FEED, LOOSE_FEED] {
+            let id = store::upsert_feed(
+                &state.db,
+                &store::NewFeed {
+                    url: url.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            store::insert_entries(
+                &state.db,
+                id,
+                &[star_entry(&format!("{url}#1"), &format!("{url}/1"), false)],
+                0,
+            )
+            .await
+            .unwrap();
+            ids.insert(url, id);
+        }
+        let all: Vec<i64> = ids.values().copied().collect();
+        store::replace_sub_refs(&state.db, MARK_DID, &all)
+            .await
+            .unwrap();
+        (state, ids)
+    }
+
+    /// `POST <uri>` as the fixture's reader; returns the redirect target.
+    async fn post_read_all(state: &AppState, uri: &str) -> String {
+        let cookie = session_cookie(state, MARK_DID, None);
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{uri}");
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The feeds that still have unread entries, by URL, sorted.
+    async fn still_unread(
+        state: &AppState,
+        ids: &std::collections::HashMap<&'static str, i64>,
+    ) -> Vec<&'static str> {
+        let counts = store::unread_counts_by_feed(&state.db, MARK_DID)
+            .await
+            .unwrap();
+        let mut out: Vec<&'static str> = ids
+            .iter()
+            .filter(|(_, id)| counts.get(id).copied().unwrap_or(0) > 0)
+            .map(|(url, _)| *url)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// **Mark all read in a folder marks that folder, not everything** (#347).
+    /// The form posted a bare `/read-all` from a folder view, because only a
+    /// FEED scope was carried, and the handler read that as "everything".
+    #[tokio::test]
+    async fn mark_all_read_in_a_folder_marks_only_that_folder() {
+        let (state, ids) = mark_all_fixture().await;
+        let folder_qs = format!("folder={}", qenc(&work_folder()));
+
+        // The rendered form carries the folder scope...
+        let (status, body) = page_body(state.clone(), MARK_DID, &format!("/?{folder_qs}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let action = format!(r#"action="/read-all?{}""#, folder_qs.replace('&', "&#38;"));
+        assert!(
+            body.contains(&action),
+            "no {action} in the folder view: {body}"
+        );
+
+        // ...and the handler honours it, then returns to the same view.
+        let back = post_read_all(&state, &format!("/read-all?{folder_qs}")).await;
+        assert_eq!(back, format!("/?{folder_qs}"));
+        assert_eq!(still_unread(&state, &ids).await, vec![FUN_FEED, LOOSE_FEED]);
+    }
+
+    /// The view rides along too, so marking read from "All" stays on "All".
+    #[tokio::test]
+    async fn mark_all_read_returns_to_the_view_it_came_from() {
+        let (state, ids) = mark_all_fixture().await;
+        let qs = format!("feed={}&view=all", qenc(WORK_FEED));
+        let (_, body) = page_body(state.clone(), MARK_DID, &format!("/?{qs}")).await;
+        let action = format!(r#"action="/read-all?{}""#, qs.replace('&', "&#38;"));
+        assert!(body.contains(&action), "no {action}: {body}");
+
+        let back = post_read_all(&state, &format!("/read-all?{qs}")).await;
+        assert_eq!(back, format!("/?{qs}"));
+        assert_eq!(still_unread(&state, &ids).await, vec![FUN_FEED, LOOSE_FEED]);
+    }
+
+    /// Unscoped is still everything, and returns to the unscoped list.
+    #[tokio::test]
+    async fn mark_all_read_unscoped_marks_every_subscribed_feed() {
+        let (state, ids) = mark_all_fixture().await;
+        assert_eq!(post_read_all(&state, "/read-all").await, "/");
+        assert!(still_unread(&state, &ids).await.is_empty());
+    }
+
+    /// **The rail has an "All feeds" entry** (#346): leaving a feed or folder
+    /// scope took clicking the brand logo. It links to the unscoped list in the
+    /// current view, carries the total unread count, and is current only there.
+    #[tokio::test]
+    async fn the_rail_has_an_all_feeds_entry_that_leaves_the_scope() {
+        let (state, _ids) = mark_all_fixture().await;
+        let link = |body: &str| -> String {
+            let at = body.find("rail-all").expect("no All feeds entry");
+            let a = &body[at..];
+            a[..a.find("</a>").unwrap()].to_string()
+        };
+
+        // Scoped to a folder, "All feeds" is the way out, keeping the view.
+        let (_, body) = page_body(
+            state.clone(),
+            MARK_DID,
+            &format!("/?folder={}&view=all", qenc(&work_folder())),
+        )
+        .await;
+        let a = link(&body);
+        assert!(a.contains(r#"href="/?view=all""#), "{a}");
+        assert!(!a.contains("aria-current"), "{a}");
+        assert!(a.contains(r#"<span class="feed-count">3</span>"#), "{a}");
+
+        // Unscoped, it is the current page and links to plain `/`.
+        let (_, body) = page_body(state.clone(), MARK_DID, "/").await;
+        let a = link(&body);
+        assert!(a.contains(r#"href="/""#), "{a}");
+        assert!(a.contains(r#"aria-current="page""#), "{a}");
     }
 }

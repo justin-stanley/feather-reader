@@ -14,6 +14,36 @@ deploying is separate.
 
 ---
 
+## Unreleased
+
+### Fixes
+
+- **"Mark all read" in a folder marked every feed read** (#347). The form
+  carried only a feed scope, so a folder view posted a bare `/read-all`, which
+  the handler reads as "everything". The form now carries the list's whole
+  scope (feed or folder) and view, and the handler resolves it through the
+  same `scope_urls_for` / `scoped_feed_ids` as the list it sits on, so it
+  marks exactly the feeds on screen. It then returns to that same list rather
+  than to `/` or `/?feed=`, which dropped the folder and the view. Established
+  by a test that marks a folder read with feeds in another folder and outside
+  any folder: it marked all three before the fix and one after. The scope,
+  the redirect and the form's action were each mutated in isolation, and each
+  mutation fails the tests.
+- **The rail keeps its scroll position across page loads** (#345, #347).
+  Every navigation is a full page load, which rebuilt the rail scrolled to the
+  top, so picking a feed far down a long list, or marking all read, threw the
+  reader back to the top of it. `keyboard.js` saves the position per tab
+  (`sessionStorage`) on `pagehide` and puts it back on load; without storage
+  the rail starts at the top, as before. Checked in Chromium across a real
+  navigation. Client-side navigation, the larger ask in #345, is not part of
+  this.
+
+### Changes
+
+- **An "All feeds" entry at the top of the rail** (#346), with the total
+  unread count. Leaving a feed or folder scope used to take clicking the brand
+  logo. It keeps the current view (All / Unread / Starred).
+
 ## 0.5.2 — 2026-10-31
 
 Article bodies are now stored compressed only (#336, step 2 of 2), and a

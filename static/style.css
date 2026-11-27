@@ -532,6 +532,11 @@ kbd {
   list-style: none;
 }
 
+/* "All feeds" sits above the folders, set apart from them. */
+.rail-all {
+  margin-bottom: var(--s3);
+}
+
 .feed-link {
   display: flex;
   align-items: center;
