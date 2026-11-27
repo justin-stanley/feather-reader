@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
             requested_scope: SCOPE.to_string(),
             request_uri: par.request_uri.clone(),
             app_return_to: None,
-            expires_at: chrono::Utc::now().timestamp() + par.expires_in.min(600),
+            expires_at: feather_reader::time::now().as_second() + par.expires_in.min(600),
         },
     )
     .await?;
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
         &codec,
         &callback,
         Some(&binding_token),
-        chrono::Utc::now().timestamp(),
+        feather_reader::time::now().as_second(),
     )
     .await?;
     println!("  binding    OK (state consumed, cookie matched)");
@@ -281,7 +281,7 @@ async fn main() -> Result<()> {
         granted_scope: tokens.granted_scope.clone(),
         expires_at: tokens
             .expires_in
-            .map(|s| chrono::Utc::now().timestamp() + s),
+            .map(|s| feather_reader::time::now().as_second() + s),
     };
     store::put_session(&pool, &codec, &session).await?;
     println!("  session    stored and read back AAD-bound");
@@ -388,7 +388,7 @@ async fn run_writes(
     let record = json!({
         "$type": collection,
         "note": "feather-reader OAuth spike; safe to delete",
-        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "createdAt": feather_reader::time::now_rfc3339(),
     });
 
     let written = repo
@@ -407,14 +407,14 @@ async fn run_writes(
     let updated = json!({
         "$type": collection,
         "note": "feather-reader OAuth spike; updated",
-        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "createdAt": feather_reader::time::now_rfc3339(),
     });
     repo.put_record(collection, &rkey, &SpikeRecord(updated), None)
         .await?;
     println!("  put        OK (same rkey)");
 
     // applyWrites: a batch create, to prove the batch body is accepted.
-    let batch_rkey = format!("spike{}", chrono::Utc::now().timestamp());
+    let batch_rkey = format!("spike{}", feather_reader::time::now().as_second());
     repo.apply_writes(&[WriteOp::Create {
         collection: collection.to_string(),
         rkey: Some(batch_rkey.clone()),

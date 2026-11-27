@@ -664,7 +664,7 @@ impl RelayClient {
             collection: collection.to_string(),
             repos,
             truncated,
-            observed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            observed_at: crate::time::now_rfc3339(),
         }
     }
 }

@@ -425,7 +425,7 @@ fn build_post_record(post: &RenderedPost, mention_did: &str) -> serde_json::Valu
     json!({
         "$type": "app.bsky.feed.post",
         "text": post.text,
-        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "createdAt": jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
         "facets": [{
             "index": {
                 "byteStart": post.mention.byte_start,
