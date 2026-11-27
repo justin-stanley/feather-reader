@@ -25,6 +25,21 @@
          {% if nav.view == "starred" %}aria-current="page"{% endif %}>Starred</a>
     </div>
 
+    {% if !nav.folders.is_empty() || !nav.loose_feeds.is_empty() %}
+      {# Every feed at once (#346): the way back out of a feed or folder scope,
+         which was only the brand link before. Keeps the current view. #}
+      <ul class="feed-list rail-all">
+        <li>
+          <a class="feed-link{% if nav.total_unread() > 0 %} has-unread{% endif %}"
+             href="/{% if nav.view != "unread" %}?view={{ nav.view }}{% endif %}"
+             {% if nav.all_feeds_selected() %}aria-current="page"{% endif %}>
+            <span class="feed-name">All feeds</span>
+            {% if nav.total_unread() > 0 %}<span class="feed-count">{{ nav.total_unread() }}</span>{% endif %}
+          </a>
+        </li>
+      </ul>
+    {% endif %}
+
     {% for folder in nav.folders %}
       <div class="folder">
         <h2 class="folder-name">

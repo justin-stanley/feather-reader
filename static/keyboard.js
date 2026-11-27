@@ -3,6 +3,9 @@
  * 1. Mobile drawer toggle.
  * 2. Keyboard shortcuts: j/k move cursor, o open, m read, s star,
  *    A mark-all-read, ? shortcuts overlay, Esc close.
+ * 3. The rail keeps its scroll position across page loads, so picking a
+ *    feed far down the list, or marking all read, does not throw the reader
+ *    back to the top of it (#345, #347).
  *
  * In the real app the shortcuts drive the EXISTING htmx controls (they click
  * the real buttons) rather than toggling demo classes, so every action goes
@@ -25,6 +28,25 @@
   if (toggle) toggle.addEventListener("click", function () { setDrawer(true); });
   if (close) close.addEventListener("click", function () { setDrawer(false); });
   if (scrim) scrim.addEventListener("click", function () { setDrawer(false); });
+
+  /* ---- rail scroll position ------------------------------------------- */
+  /* Every navigation is a full page load, which rebuilds the rail scrolled to
+   * the top. Saved per tab (sessionStorage) when the page goes away, put back
+   * when the next one loads. Storage can be unavailable (private modes,
+   * blocked site data): then the rail simply starts at the top, as before. */
+  var railScroll = document.querySelector(".rail-scroll");
+  var RAIL_KEY = "featherreader.railScroll";
+  if (railScroll) {
+    try {
+      var saved = parseInt(sessionStorage.getItem(RAIL_KEY), 10);
+      if (saved > 0) railScroll.scrollTop = saved;
+    } catch (_) { /* no storage: start at the top */ }
+    window.addEventListener("pagehide", function () {
+      try {
+        sessionStorage.setItem(RAIL_KEY, String(railScroll.scrollTop));
+      } catch (_) { /* no storage: nothing to keep */ }
+    });
+  }
 
   /* ---- shortcuts overlay ---------------------------------------------- */
   var overlay = document.getElementById("kbd-overlay");
