@@ -50,7 +50,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
 use sqlx::Row;
 use tokio::sync::{watch, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
@@ -665,7 +664,7 @@ pub async fn run_poller(state: AppState, mut shutdown: watch::Receiver<()>, star
                 // erroring, which is a different condition from the loop being
                 // wedged, and `/health` reports them differently. A tick that
                 // hangs forever never reaches here, which is the point.
-                state.runtime_health.poll_tick_completed(Utc::now().timestamp());
+                state.runtime_health.poll_tick_completed(feather_reader::time::now().as_second());
             }
         }
     }
@@ -1418,7 +1417,7 @@ pub async fn run_pending_sweeper(
                 break;
             }
             _ = ticker.tick() => {
-                let now = Utc::now().timestamp();
+                let now = feather_reader::time::now().as_second();
                 match feather_reader::oauth::store::sweep_expired_pending(&state.db, now).await {
                     Ok(0) => debug!("pending-login sweeper: nothing to expire"),
                     Ok(n) => info!(swept = n, "pending-login sweeper: removed abandoned logins"),
@@ -1479,8 +1478,12 @@ pub async fn run_metrics_flusher(state: AppState, mut shutdown: watch::Receiver<
 /// One flush. A metrics write must never be able to take anything else down, so
 /// a failure is logged and the loop continues.
 async fn flush_metrics_once(state: &AppState) {
-    if let Err(err) =
-        feather_reader::metrics::flush(&state.metrics, &state.db, Utc::now().timestamp()).await
+    if let Err(err) = feather_reader::metrics::flush(
+        &state.metrics,
+        &state.db,
+        feather_reader::time::now().as_second(),
+    )
+    .await
     {
         warn!(%err, "could not persist repo timings");
     }
@@ -1608,7 +1611,7 @@ async fn dids_with_dirty_cursors(pool: &Pool) -> anyhow::Result<Vec<String>> {
 /// Current time as an RFC3339 string (UTC, second precision) — the shape the
 /// store's timestamp columns use.
 fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    feather_reader::time::now_rfc3339()
 }
 
 #[cfg(test)]
@@ -1704,10 +1707,8 @@ mod tests {
         // own input never reached the calculation it named. The value here
         // is `feed::backoff_for(1)` = 5 min; the bin cannot see that private
         // function, so the window is written out.
-        let after_dt = chrono::DateTime::parse_from_rfc3339(&after)
-            .expect("next_poll is RFC3339")
-            .with_timezone(&chrono::Utc);
-        let delay = (after_dt - chrono::Utc::now()).num_seconds();
+        let after_dt = feather_reader::time::parse_rfc3339(&after).expect("next_poll is RFC3339");
+        let delay = (after_dt - feather_reader::time::now()).as_secs();
         assert!(
             (240..=360).contains(&delay),
             "a first failure must land on its 5-minute backoff, not the lease: next_poll={after} ({delay}s out)"
@@ -2485,7 +2486,7 @@ mod tests {
                 refresh_token: "rt".into(),
                 token_type: "DPoP".into(),
                 granted_scope: "atproto".into(),
-                expires_at: Some(Utc::now().timestamp() + 3600),
+                expires_at: Some(feather_reader::time::now().as_second() + 3600),
             },
         )
         .await

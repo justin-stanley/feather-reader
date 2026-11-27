@@ -2272,15 +2272,15 @@ pub(crate) fn decode_s32_tid(rkey: &str) -> Option<u64> {
 ///
 /// The bounds are not a slug detector — see [`TID_FLOOR_MICROS`] for why they
 /// cannot be, and for what they do guarantee instead.
-pub(crate) fn tid_timestamp(rkey: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn tid_timestamp(rkey: &str) -> Option<crate::time::Timestamp> {
     // The low 10 bits are the clock id; the rest is microseconds since the
     // epoch, and clearing bit 63 above bounds it well inside `i64`.
     let micros = i64::try_from(decode_s32_tid(rkey)? >> 10).ok()?;
     if micros < TID_FLOOR_MICROS {
         return None;
     }
-    let at = chrono::DateTime::from_timestamp_micros(micros)?;
-    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(CLOCK_SKEW_GRACE_SECS);
+    let at = crate::time::from_micros(micros)?;
+    let ceiling = crate::time::now() + jiff::SignedDuration::from_secs(CLOCK_SKEW_GRACE_SECS);
     (at <= ceiling).then_some(at)
 }
 
@@ -5211,16 +5211,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tid_minted_slightly_ahead_of_our_clock_is_still_believed() {
-        let now = chrono::Utc::now();
-        let of = |at: chrono::DateTime<chrono::Utc>| {
-            encode_s32_tid((at.timestamp_micros() as u64) << 10)
-        };
+        let now = crate::time::now();
+        let of = |at: crate::time::Timestamp| encode_s32_tid((at.as_microsecond() as u64) << 10);
         assert!(
-            tid_timestamp(&of(now + chrono::Duration::seconds(2))).is_some(),
+            tid_timestamp(&of(now + jiff::SignedDuration::from_secs(2))).is_some(),
             "a PDS two seconds fast must not leave a fresh document undated"
         );
         assert_eq!(
-            tid_timestamp(&of(now + chrono::Duration::hours(1))),
+            tid_timestamp(&of(now + jiff::SignedDuration::from_hours(1))),
             None,
             "an hour ahead is a broken clock or a slug, not skew"
         );
@@ -5228,14 +5226,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tid_timestamp_is_bounded_at_both_ends() {
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let of = |micros: i64| encode_s32_tid((micros as u64) << 10);
 
         // A TID minted now dates to now.
         let fresh = TidGenerator::new().next();
         let dated = tid_timestamp(&fresh).expect("a freshly minted TID has a timestamp");
         assert!(
-            (now - chrono::Duration::minutes(1)..=now + chrono::Duration::minutes(1))
+            (now - jiff::SignedDuration::from_mins(1)..=now + jiff::SignedDuration::from_mins(1))
                 .contains(&dated),
             "{fresh} dated to {dated}, not to now ({now})"
         );
@@ -5253,7 +5251,7 @@ pub(crate) mod tests {
 
         // In the future: not a date. A slug of 13 s32 characters lands here,
         // which is the case this bound exists for.
-        let far_future = (now + chrono::Duration::days(365)).timestamp_micros();
+        let far_future = (now + crate::time::days(365)).as_microsecond();
         assert_eq!(
             tid_timestamp(&of(far_future)),
             None,

@@ -255,13 +255,13 @@ pub fn entries_from_records(
     // an identical one not. (`tid_timestamp` reads the clock again for its own
     // ceiling; that only ever tightens a bound five minutes away, so it needs
     // no such agreement.)
-    let now = chrono::Utc::now();
+    let now = crate::time::now();
     // The SAME allowance the record-key branch gets. A publisher's clock runs
     // ahead of ours as readily as a PDS's does, and judging a stated date
     // against a bare `now` while the rkey below gets five minutes discarded a
     // perfectly good date and left the newest post undated — dated, then, by
     // when we first saw it rather than when it was written.
-    let ceiling = now + chrono::Duration::seconds(crate::atproto::CLOCK_SKEW_GRACE_SECS);
+    let ceiling = now + jiff::SignedDuration::from_secs(crate::atproto::CLOCK_SKEW_GRACE_SECS);
     records
         .iter()
         .filter_map(|record| {
@@ -292,8 +292,7 @@ pub fn entries_from_records(
                 published: doc
                     .published_at
                     .as_deref()
-                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .and_then(crate::time::parse_rfc3339)
                     .filter(|d| *d <= ceiling)
                     .or_else(|| {
                         AtUri::parse(&record.uri)
@@ -374,7 +373,7 @@ pub fn entries_from_records(
 fn ingest_floor(
     retention_days: u32,
     retention_hard_days: u32,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time::Timestamp,
 ) -> Option<String> {
     let days = if retention_days > 0 {
         retention_days
@@ -383,8 +382,8 @@ fn ingest_floor(
     } else {
         return None;
     };
-    let window = chrono::Duration::try_days(days.into())?;
-    now.checked_sub_signed(window).map(crate::feed::fmt_time)
+    let window = crate::time::try_days(days.into())?;
+    now.checked_sub(window).ok().map(crate::feed::fmt_time)
 }
 
 /// Persist one publication read, and say what the poll amounted to.
@@ -453,7 +452,7 @@ pub async fn store_publication(
     }
 
     // See [`ingest_floor`] for which of the two windows this is, and why.
-    let floor = ingest_floor(retention_days, retention_hard_days, chrono::Utc::now());
+    let floor = ingest_floor(retention_days, retention_hard_days, crate::time::now());
     let rows: Vec<crate::store::NewEntry> = read
         .entries
         .into_iter()
@@ -490,7 +489,7 @@ pub async fn store_publication(
         &crate::store::PolledFeed {
             title: read.publication.name.clone(),
             site_url: Some(read.publication.url.clone()),
-            last_polled: Some(crate::feed::fmt_time(chrono::Utc::now())),
+            last_polled: Some(crate::feed::fmt_time(crate::time::now())),
             ..Default::default()
         },
     )
@@ -957,7 +956,7 @@ pub(crate) mod tests {
     }
 
     fn days_ago(n: i64) -> String {
-        crate::feed::fmt_time(chrono::Utc::now() - chrono::Duration::days(n))
+        crate::feed::fmt_time(crate::time::now() - crate::time::days(n))
     }
 
     const PUB_URL: &str = "at://did:plc:ohutz6x5acjmpuulp3x7wxxc/site.standard.publication/3lab";
@@ -1166,14 +1165,12 @@ pub(crate) mod tests {
     #[test]
     fn a_publications_floor_is_its_archive_ceiling_not_the_rss_window() {
         let config = crate::config::Config::default();
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-29T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = crate::time::parse_rfc3339("2026-09-29T12:00:00Z").unwrap();
 
         let (days, hard) = config.retention_for(crate::feed::FeedKind::Publication);
         let floor = ingest_floor(days, hard, now).expect("a publication has an ingest floor");
         let expected = crate::feed::fmt_time(
-            now - chrono::Duration::days(config.publication_retention_days.into()),
+            now - crate::time::days(config.publication_retention_days.into()),
         );
         assert_eq!(
             floor, expected,
@@ -1192,7 +1189,7 @@ pub(crate) mod tests {
              ({rss_floor}), so a months-old document would still be dropped",
         );
         let a_real_publications_newest_document =
-            crate::feed::fmt_time(now - chrono::Duration::days(109));
+            crate::feed::fmt_time(now - crate::time::days(109));
         assert!(
             a_real_publications_newest_document.as_str() >= floor.as_str(),
             "the newest document a real publication offered would be refused at \
@@ -1213,9 +1210,7 @@ pub(crate) mod tests {
     /// itself.
     #[test]
     fn the_ingest_floor_is_the_window_the_sweep_would_use() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let now = crate::time::parse_rfc3339("2026-09-26T12:00:00Z").unwrap();
 
         assert_eq!(
             ingest_floor(14, 180, now).as_deref(),
@@ -1486,7 +1481,7 @@ pub(crate) mod tests {
     ///
     /// **Fixed, not minted.** A test that mints a TID expects "about now", and
     /// "about now" is satisfied by any source of the current time — including a
-    /// fallback that has had the rkey ripped out of it and returns `Utc::now()`
+    /// fallback that has had the rkey ripped out of it and returns `crate::time::now()`
     /// instead. Both tests named for the rkey fallback used to survive exactly
     /// that mutation. A historical key with a stated answer cannot.
     const PAST_TID: &str = "3jzfcijpj2z2a";
@@ -3204,7 +3199,7 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.oauth.plc_directory = plc;
 
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = crate::time::now_rfc3339();
         // The publication loop's own selection, so A0 tests what runs.
         let feed =
             crate::store::due_feeds_of_kind(&pool, &now, crate::feed::FeedKind::Publication, 50)
@@ -3661,7 +3656,7 @@ pub(crate) mod tests {
         let records = vec![publication("p", "https://example.com")];
         let (site, pubn) = publication_from_records("p", &records).unwrap();
         let slightly_ahead =
-            crate::feed::fmt_time(chrono::Utc::now() + chrono::Duration::seconds(10));
+            crate::feed::fmt_time(crate::time::now() + jiff::SignedDuration::from_secs(10));
         let docs = vec![rec(
             nsid::STANDARD_DOCUMENT,
             "self",
